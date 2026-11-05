@@ -163,3 +163,11 @@ These still inherit the hub's whole environment:
 The hub's runtime updater (`runtime_update.rs`) clears its environment with its own list, which
 keeps the proxy variables; its `--version` check goes through `run_version` and gets the probe
 environment above.
+
+## Which session variable names the caller's vendor
+
+`fl-wire` resolves the caller's route (`capture_env_route_from`) and persona
+(`resolve_persona_traced`) from the session variables in its environment. Every subshell of an
+Antigravity session inherits `ANTIGRAVITY_CONVERSATION_ID`, so an explicit `CODEX_THREAD_ID`,
+`MUSE_SESSION_ID`, `GROK_SESSION_ID` or `CLAUDE_SESSION_ID` takes precedence over it. A real Agy
+session whose shell also exports one of those resolves as that vendor.

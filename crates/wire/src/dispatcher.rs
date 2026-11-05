@@ -601,31 +601,50 @@ struct CapturedRun {
     stderr: String,
 }
 
-/// Read `stream` to the end on a thread, keeping the first [`CAPTURE_LIMIT_BYTES`].
-fn capture_stream<R: std::io::Read + Send + 'static>(
-    stream: Option<R>,
-) -> std::sync::mpsc::Receiver<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+/// A stream being read on a thread: the bytes kept so far, and a signal that the stream ended.
+struct StreamCapture {
+    kept: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ended: std::sync::mpsc::Receiver<()>,
+}
+
+impl StreamCapture {
+    /// Wait for the stream to end until `deadline`, then return what has arrived. A stream that
+    /// is still open at the deadline yields the bytes read so far.
+    fn finish_by(&self, deadline: Instant) -> String {
+        let _ = self
+            .ended
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let kept = self.kept.lock().unwrap_or_else(|err| err.into_inner());
+        String::from_utf8_lossy(&kept).into_owned()
+    }
+}
+
+/// Read `stream` to the end on a thread, keeping the first [`CAPTURE_LIMIT_BYTES`] as they arrive.
+fn capture_stream<R: std::io::Read + Send + 'static>(stream: Option<R>) -> StreamCapture {
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, ended) = std::sync::mpsc::channel();
+    let shared = std::sync::Arc::clone(&kept);
     std::thread::spawn(move || {
-        let mut kept = Vec::new();
         if let Some(mut stream) = stream {
             let mut buf = [0_u8; 4096];
             while let Ok(n) = stream.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
+                let mut kept = shared.lock().unwrap_or_else(|err| err.into_inner());
                 let room = CAPTURE_LIMIT_BYTES.saturating_sub(kept.len());
                 kept.extend_from_slice(&buf[..n.min(room)]);
             }
         }
-        let _ = tx.send(String::from_utf8_lossy(&kept).into_owned());
+        let _ = tx.send(());
     });
-    rx
+    StreamCapture { kept, ended }
 }
 
 /// [`run_status_with_timeout`] that also captures stdout and stderr (each bounded by
-/// [`CAPTURE_LIMIT_BYTES`]). The deadline and kill rule are the same; a stream that stays open
-/// after the child exits is cut off after [`CAPTURE_DRAIN_GRACE`].
+/// [`CAPTURE_LIMIT_BYTES`]). The deadline and kill rule are the same. Both streams share one
+/// [`CAPTURE_DRAIN_GRACE`] after the child exits; a stream still open then (a grandchild holds
+/// the pipe) keeps the output that already arrived.
 fn run_captured_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<CapturedRun> {
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -633,10 +652,11 @@ fn run_captured_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::R
     let out = capture_stream(child.stdout.take());
     let err = capture_stream(child.stderr.take());
     let status = wait_with_deadline(&mut child, timeout)?;
+    let drain_deadline = Instant::now() + CAPTURE_DRAIN_GRACE;
     Ok(CapturedRun {
         status,
-        stdout: out.recv_timeout(CAPTURE_DRAIN_GRACE).unwrap_or_default(),
-        stderr: err.recv_timeout(CAPTURE_DRAIN_GRACE).unwrap_or_default(),
+        stdout: out.finish_by(drain_deadline),
+        stderr: err.finish_by(drain_deadline),
     })
 }
 
@@ -896,11 +916,14 @@ fn run_grok_turn(
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))
 }
 
-/// Whether a failed `grok -r` run says the session does not exist (grok 1.0.70 prints
-/// `Session "<id>" not found locally` and `Failed to restore session from remote`).
+/// Whether a failed `grok -r` run says the session does not exist. Only stderr counts: in
+/// headless `-p` mode stdout is the model's own output, so a turn that ran and then failed
+/// (a tool printing "file not found") must not start a second turn. grok 1.0.70 prints
+/// `Session "<id>" not found locally` and `Failed to restore session from remote` to stderr.
 fn grok_session_missing(run: &CapturedRun) -> bool {
-    let said = format!("{} {}", run.stderr, run.stdout).to_ascii_lowercase();
-    said.contains("not found") || said.contains("failed to restore session")
+    let said = run.stderr.to_ascii_lowercase();
+    (said.contains("session") && said.contains("not found"))
+        || said.contains("failed to restore session")
 }
 
 fn deliver_to_agy_route(
@@ -5175,6 +5198,40 @@ exit 0"#,
         let err = run_grok_headless(&bin, "sid-3", None, "hi").unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
         assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-3\n");
+    }
+
+    #[test]
+    fn grok_headless_ignores_not_found_printed_on_stdout_by_a_turn_that_ran() {
+        let tmp = TempDir::new().unwrap();
+        let (bin, calls) = grok_call_log(
+            tmp.path(),
+            r#"if [ "$4" = "-r" ]; then echo 'tool error: file not found'; echo 'turn failed' >&2; exit 1; fi
+echo 'Error: Session ID sid-5 is already in use' >&2
+exit 1"#,
+        );
+        let err = run_grok_headless(&bin, "sid-5", None, "hi").unwrap_err();
+        assert!(err.contains("turn failed"), "{err}");
+        assert!(!err.contains("already in use"), "{err}");
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-5\n");
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipes_does_not_discard_what_the_cli_printed() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let bin = write_script(
+            tmp.path(),
+            "daemonizing-agy.sh",
+            "echo 'rpc refused: bad token' >&2\nsleep 10 &\nexit 1",
+        );
+        let started = Instant::now();
+        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(bin), "t", "b").unwrap_err();
+        let took = started.elapsed();
+        assert!(err.contains("rpc refused: bad token"), "{err}");
+        assert!(took < Duration::from_secs(5), "bounded: {took:?}");
     }
 
     #[test]

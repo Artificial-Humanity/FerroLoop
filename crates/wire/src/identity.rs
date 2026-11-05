@@ -2596,7 +2596,8 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
 /// `ANTIGRAVITY_CONVERSATION_ID` is inherited by every subshell an Antigravity session starts,
 /// so a caller there that registers a Codex, Muse or Grok agent names that session through its
 /// own variable (`CODEX_THREAD_ID`, `MUSE_SESSION_ID`, `GROK_SESSION_ID`). Those explicit
-/// session ids come before the inherited Antigravity one. A `CLAUDE_SESSION_ID` without a
+/// session ids come before the inherited Antigravity one, so a real Agy session whose shell
+/// also exports one of them resolves as that vendor. A `CLAUDE_SESSION_ID` without a
 /// Claude messaging socket yields no Claude route, and it must not become an Antigravity one.
 fn capture_env_route_from(
     get_env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
@@ -2825,8 +2826,9 @@ fn resolve_persona_traced(
         ("CODEX_THREAD_ID", "codex"),
         ("MUSE_SESSION_ID", "muse"),
         ("GROK_SESSION_ID", "grok"),
-        // Last: every subshell of an Antigravity session inherits this id, so it must not
-        // preempt a session id the caller passed for another vendor.
+        // Last: every subshell of an Antigravity session inherits this id, so an explicit
+        // CLAUDE_SESSION_ID, CODEX_THREAD_ID, MUSE_SESSION_ID or GROK_SESSION_ID takes
+        // precedence over it (same rule as `capture_env_route_from`).
         ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
     ] {
         if let Some(sid) = get_str(env_var)
