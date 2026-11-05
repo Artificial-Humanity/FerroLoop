@@ -148,16 +148,17 @@ fl project delete <slug> [--reassign-to <target_slug> | --decommission-agents]
 lowercase kebab-case (`my-project`) unless `--slug` gives one. A slug is 1 to 64 of lowercase
 letters, digits, `-` and `_`, starting with a letter, and it never changes. `fl project init
 <dir>` is `create` under its earlier name: with neither `--path` nor `--virtual` the argument
-is the directory, and the name is `--name`, else the directory's lowercase name, else the name
-the config already gives that root. A slug names one kind: a project cannot take a virtual
+is the directory, and the slug is, in this order: `--slug`; the slug the config already gives
+that root; the slug of `--name`; the directory's lowercase name. A slug names one kind: a project cannot take a virtual
 group's slug, nor a group a project's.
 
 A directory-backed project is made in this order, leaving what is already right alone:
 
 1. **Directory.** The path is made if it does not exist. **Git is not touched** unless
-   `--git-init` is given: then a directory with no repository gets `git init`, and a repository
-   with no commit gets an empty one, message `chore: initial commit`, authored by `--by`
-   (default `fl`). A directory with a `HEAD` is never changed.
+   `--git-init` is given: then a directory with no `.git` of its own gets `git init` (also when it
+   lies inside another repository, which is left alone), and a repository with no commit gets an
+   empty one, message `chore: initial commit`, authored by `--by` (default `fl`). A directory
+   with its own `HEAD` is never changed.
 2. **Stores.** The project's store `<slug>.fls` goes beside the workspace store (the
    `[state].store` of the config, else `$XDG_DATA_HOME/fl`). It holds the project and its
    routing map: the areas `backlog`, `code`, `design`, `product`, `security`, `tests` and `ux`,

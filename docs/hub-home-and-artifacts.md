@@ -148,7 +148,7 @@ config block can be renamed but not moved or given a tracker. It broadcasts `pro
 | `403` | the caller is not the Owner |
 | `404` | (`PATCH`, `DELETE`) no project has that slug (`DELETE`: or no `reassign_to` project) |
 | `409` | the slug is registered at another root, the root under another slug, the slug is the other kind (a project's slug for a group, or the reverse), the path is another project's, the tracker is a different one (`POST`), or the store holds another project |
-| `500` | git, a store or the config file failed |
+| `500` | git, a store or the config file failed, or the config file is not valid TOML (the message names the file) |
 
 `DELETE /api/v1/projects/:slug` deletes a project or a virtual group, with the flow of
 `fl project delete` run by the Hub. **Owner only** (`403` before the slug is looked at). The body
@@ -175,13 +175,24 @@ files, then the directory.
   project from a store file in `$HOME/.local/share/fl`, so the slug is still listed, with a
   `null` path, until `delete_store` removes the file as well.
 * **`delete_store: true`** deletes `<slug>.fls` and its `<slug>.fls.sock` and
-  `<slug>.fls.migrate.lock` files. The workspace store and another project's store are refused.
+  `<slug>.fls.migrate.lock` files. The file must be named like a store (`.fls`, or the older
+  `.redb`) and be in `$HOME/.local/share/fl` or be the store the project's own config block
+  names. The workspace store and another project's store are refused.
 * **`delete_dir: true`** deletes the project's registered directory, after these checks, all made
-  before anything changes (`400`, with the reason, when one fails): it exists, is a directory and
-  not a symbolic link, resolves to at least three path components, and is the path the config,
-  the area and the workspace store record; it is not `/`, the Hub's home directory or one above
-  it, the workspace root or one above it, a directory holding another registered project, one
-  holding or inside the stores or config directory, or one holding a store or config file.
+  before anything changes (`400`, with the reason, when one fails): the registered path is
+  absolute, has no `..`, is its own canonical path (no symbolic link in it), exists, is a
+  directory and not a symbolic link, has at least three path components, and is the path the
+  config, the area and the workspace store record. It is not `/`, a workspace root itself (it
+  holds `.agents/memory` or `Notes`), the Hub's home directory or one above it, a workspace root
+  or one above it, a directory holding another registered project, one holding or inside the
+  stores or config directory, or one holding a store or config file. The home directory is the
+  Hub's, else `$HOME`; with neither known the directory is not deleted. The workspace roots are
+  looked for at or above the Hub's repository, at or above and up to two levels below the home
+  directory, and at or above the `fl` executable; with none found anywhere the directory is not
+  deleted. Every one of these checks runs again after the agents have moved and right before the
+  removal. One change stays possible between that last check and the removal: another process
+  that swaps an ancestor of the directory for a symbolic link in that window. `fl` holds no
+  handle on the directory, so a directory that others can rename is not safe to delete this way.
 * A virtual group refuses `delete_store` and `delete_dir` (`400`). An unknown slug is `404`,
   so a repeat is `404`.
 
@@ -194,6 +205,10 @@ A `200` answers, and broadcasts `project.deleted` on the `projects` channel:
 
 A failure to delete the store files or the directory happens after the unregistration, which is
 not undone: the answer is still `200`, the flag stays `false`, and an `error` field says why.
+
+The lock that serializes edits of `config.toml` is held inside one process. A `fl` command and
+the Hub that write the file at the same moment are not serialized, and one block can be lost; run
+one writer at a time.
 
 A virtual group has no store and no records: `GET /api/v1/records?project=<slug>` and the
 per-project artifacts-directory routes below answer `404` for it.

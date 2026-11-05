@@ -1157,6 +1157,13 @@ fn virtual_outcome(area: AreaRecord, registered: bool) -> InitOutcome {
 /// With no home given, `$XDG_CONFIG_HOME/fl/config.toml` (absolute values only) or
 /// `$HOME/.config/fl/config.toml`, the CLI's own rule. `None` when none applies.
 pub fn user_config_path(home: Option<&Path>) -> Option<PathBuf> {
+    // Unit tests of this crate name a temporary home; one that does not would read (and could
+    // write) the developer's own config.
+    #[cfg(test)]
+    assert!(
+        home.is_some(),
+        "a test must name a temporary home, never the real config of the machine"
+    );
     let base = match home {
         Some(h) => h.join(".config"),
         None => std::env::var_os("XDG_CONFIG_HOME")
