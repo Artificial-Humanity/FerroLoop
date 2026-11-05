@@ -604,7 +604,7 @@ pub fn execute_send(
         };
         match client
             .request(&LocalRequest::Send { args })
-            .map_err(&uncertain)?
+            .map_err(uncertain)?
         {
             LocalResponse::Sent { message, receipts } => return Ok((message, receipts)),
             other => return Err(uncertain(format!("unexpected daemon response: {other:?}"))),

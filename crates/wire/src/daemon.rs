@@ -2,8 +2,9 @@
 //!
 //! After a crash, an accepted pending message may or may not have been pushed before its
 //! receipt was updated. Startup does not scan or replay these ambiguous messages; they remain
-//! readable in the inbox for manual recovery. Push ordering applies within one daemon lifetime;
-//! cross-restart ordering and durable dispatch claims are deferred to Record #143.
+//! readable in the inbox for manual recovery. A no-route delivery likewise stays in the inbox
+//! after its worker exits; a later push can overtake it. A live recipient worker preserves its
+//! queued push order. Durable backlog ordering and dispatch claims are deferred to Record #143.
 //!
 //! If a delivery is unresolved or a recipient exceeds its in-memory dispatch limit, later
 //! sends to that recipient remain in its inbox for the lifetime of this daemon. The operator
@@ -368,7 +369,7 @@ struct Subscriber {
 /// Limits keep a stuck vendor from causing unbounded threads or queued metadata. Messages beyond
 /// a recipient's metadata bound remain persisted in the inbox for manual recovery.
 const MAX_DISPATCH_RECIPIENTS: usize = 128;
-/// Parked queues retain current-process, never-attempted messages without consuming workers.
+/// Bound queued recipient metadata independently of active workers.
 const MAX_TRACKED_RECIPIENTS: usize = 512;
 const MAX_QUEUED_PER_RECIPIENT: usize = 1024;
 const MAX_OVERFLOW_RECIPIENTS: usize = 128;
@@ -407,6 +408,12 @@ struct DaemonInner<S> {
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
     empty_exit_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    fail_next_worker_spawn: AtomicBool,
+    #[cfg(test)]
+    queue_limit_override: AtomicUsize,
+    #[cfg(test)]
+    registration_locked_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     peers: Mutex<BTreeMap<u64, (String, Sender<PeerFrame>)>>,
     subscribers: Mutex<Vec<Subscriber>>,
     next_peer_id: Mutex<u64>,
@@ -553,7 +560,7 @@ where
         let Some(queue) = queues.get_mut(recipient) else {
             return Ok(());
         };
-        if queue.worker_active || queue.overflowed {
+        if queue.worker_active || queue.pending.is_empty() {
             return Ok(());
         }
         if active >= MAX_DISPATCH_RECIPIENTS {
@@ -563,18 +570,23 @@ where
         queue.waiting_for_capacity = false;
         queue.waiting_for_route = false;
         queue.worker_active = true;
-        let owner = Arc::clone(self);
-        let name = recipient.to_string();
-        if let Err(error) = std::thread::Builder::new()
-            .name("fl-wire-dispatch".into())
-            .spawn(move || owner.run_recipient_queue(name))
-        {
-            let queue = queues.get_mut(recipient).expect("queue exists");
-            queue.worker_active = false;
-            queue.overflowed = true;
-            queue.pending.clear();
+        if let Err(error) = self.spawn_recipient_worker(recipient.to_string()) {
+            self.retain_overflow_fence(recipient);
+            queues.remove(recipient);
             return Err(format!("could not start delivery worker: {error}"));
         }
+        Ok(())
+    }
+
+    fn spawn_recipient_worker(self: &Arc<Self>, recipient: String) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_worker_spawn.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected worker spawn failure"));
+        }
+        let owner = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("fl-wire-dispatch".into())
+            .spawn(move || owner.run_recipient_queue(recipient))?;
         Ok(())
     }
 
@@ -586,7 +598,7 @@ where
         let mut queues = lock(&self.dispatch_queues);
         let names: Vec<_> = queues
             .iter()
-            .filter(|(_, queue)| queue.waiting_for_capacity && !queue.overflowed)
+            .filter(|(_, queue)| queue.waiting_for_capacity && !queue.pending.is_empty())
             .map(|(name, _)| name.clone())
             .collect();
         for name in names {
@@ -610,7 +622,6 @@ where
         now: At,
     ) -> Result<(), String> {
         let mut queues = lock(&self.dispatch_queues);
-        let mut blocked = lock(&self.overflow_recipients);
         let mut errors = Vec::new();
         for receipt in recipients {
             if matches!(
@@ -626,36 +637,39 @@ where
                 {
                     continue;
                 }
-                if queue.overflowed || queue.pending.len() >= MAX_QUEUED_PER_RECIPIENT {
+                #[cfg(test)]
+                let queue_limit = self.queue_limit_override.load(Ordering::SeqCst);
+                #[cfg(not(test))]
+                let queue_limit = MAX_QUEUED_PER_RECIPIENT;
+                if queue.overflowed || queue.pending.len() >= queue_limit {
                     queue.overflowed = true;
+                    queue.route_generation = queue.route_generation.wrapping_add(1);
+                    let wake = queue.waiting_for_route && !queue.pending.is_empty();
+                    if wake && let Err(error) = self.start_queued_worker(&mut queues, &name) {
+                        warn(&format!("{}: {error}", sanitize_for_warning(&name)));
+                    }
                     errors.push(name);
                     continue;
                 }
                 queue.pending.push_back((msg.id.clone(), now.clone()));
                 // An arrival during an in-flight no-route lookup is also a wake request.
-                // Otherwise the worker can park after this arrival without observing it.
+                // Otherwise the worker can exit after this arrival without observing it.
                 queue.route_generation = queue.route_generation.wrapping_add(1);
-                // A new arrival can make a previously unavailable passive route discoverable.
-                // Retry the oldest never-started item first, without reading stored history.
-                if queue.waiting_for_route
-                    && let Err(error) = self.start_queued_worker(&mut queues, &name)
-                {
+                let wake = queue.waiting_for_route;
+                if wake && let Err(error) = self.start_queued_worker(&mut queues, &name) {
                     warn(&format!("{}: {error}", sanitize_for_warning(&name)));
                     errors.push(name);
                 }
                 continue;
             }
-            if blocked.contains(&name) || self.overflow_capacity_exhausted.load(Ordering::SeqCst) {
+            if lock(&self.overflow_recipients).contains(&name)
+                || self.overflow_capacity_exhausted.load(Ordering::SeqCst)
+            {
                 errors.push(name);
                 continue;
             }
             if queues.len() >= MAX_TRACKED_RECIPIENTS {
-                if blocked.len() < MAX_OVERFLOW_RECIPIENTS {
-                    blocked.insert(name.clone());
-                } else {
-                    self.overflow_capacity_exhausted
-                        .store(true, Ordering::SeqCst);
-                }
+                self.retain_overflow_fence(&name);
                 errors.push(name);
                 continue;
             }
@@ -732,17 +746,31 @@ where
                     let _ = resume.recv_timeout(Duration::from_secs(5));
                 }
             }
-            let mut wait_for_route = false;
-            if let Some(queue) = lock(&self.dispatch_queues).get_mut(&recipient) {
+            let mut evicted_no_route = false;
+            let mut parked_no_route = false;
+            let mut unresolved = false;
+            let mut queues = lock(&self.dispatch_queues);
+            if let Some(queue) = queues.get_mut(&recipient) {
                 queue.in_flight = None;
                 match outcome {
                     DispatchOutcome::Resolved => {}
                     DispatchOutcome::NoRoute => {
-                        queue.pending.push_front((job.0.clone(), job.1));
                         if queue.route_generation == job.2 {
-                            queue.waiting_for_route = true;
-                            queue.worker_active = false;
-                            wait_for_route = true;
+                            if queue.overflowed {
+                                // The accepted prefix must remain ordered and wakeable; only
+                                // messages beyond the bound stay exclusively in the inbox.
+                                queue.pending.push_front((job.0.clone(), job.1));
+                                queue.waiting_for_route = true;
+                                queue.worker_active = false;
+                                parked_no_route = true;
+                            } else {
+                                // No route and no concurrent wake: leave messages in the inbox.
+                                evicted_no_route = true;
+                            }
+                        } else {
+                            // Registration or a new arrival raced discovery. Retry the oldest
+                            // message while still owning this recipient's worker.
+                            queue.pending.push_front((job.0.clone(), job.1));
                         }
                     }
                     DispatchOutcome::Unconfirmed => {
@@ -750,22 +778,25 @@ where
                         queue.pending.clear();
                         queue.overflowed = true;
                         queue.worker_active = false;
+                        unresolved = true;
                     }
                 }
             }
-            if wait_for_route {
+            if evicted_no_route {
+                queues.remove(&recipient);
+            }
+            if unresolved {
+                // Fence and remove while holding the same map lock: no sender may create
+                // a replacement worker between those two actions.
+                self.retain_overflow_fence(&recipient);
+                queues.remove(&recipient);
+            }
+            drop(queues);
+            if evicted_no_route || parked_no_route {
                 self.wake_capacity_waiters();
                 return;
             }
-            if matches!(outcome, DispatchOutcome::Unconfirmed) {
-                // Move the fence while holding the queue map lock, so a concurrent enqueue
-                // cannot start a replacement worker between removal and fencing.
-                let mut queues = lock(&self.dispatch_queues);
-                if queues.get(&recipient).is_some_and(|queue| queue.overflowed) {
-                    self.retain_overflow_fence(&recipient);
-                    queues.remove(&recipient);
-                }
-                drop(queues);
+            if unresolved {
                 warn(&format!(
                     "delivery unresolved for message {}; later messages for {} remain pending",
                     job.0,
@@ -790,24 +821,20 @@ where
 
     /// Wake only work admitted by this daemon instance. A pre-startup Pending receipt may
     /// already have been delivered and must not be replayed from the store.
-    fn wake_recipient_after_registration(self: &Arc<Self>, persona: &str) {
-        let Some(recipient) = normalize_persona(persona) else {
-            return;
-        };
-        let mut queues = lock(&self.dispatch_queues);
-        let Some(queue) = queues.get_mut(&recipient) else {
+    fn wake_recipient_after_registration(
+        self: &Arc<Self>,
+        queues: &mut BTreeMap<String, RecipientDispatchQueue>,
+        recipient: &str,
+    ) {
+        let Some(queue) = queues.get_mut(recipient) else {
             return;
         };
         queue.route_generation = queue.route_generation.wrapping_add(1);
-        if !queue.waiting_for_route || queue.overflowed {
-            return;
-        }
-        if let Err(error) = self.start_queued_worker(&mut queues, &recipient) {
-            drop(queues);
-            warn(&format!(
-                "could not resume delivery worker for {}: {error}; messages remain in inbox",
-                sanitize_for_warning(&recipient)
-            ));
+        if !queue.pending.is_empty()
+            && !queue.worker_active
+            && let Err(error) = self.start_queued_worker(queues, recipient)
+        {
+            warn(&format!("{}: {error}", sanitize_for_warning(recipient)));
         }
     }
 
@@ -959,6 +986,13 @@ where
                             );
                         }
                     }
+                    // Keep the worker from evicting its queue while a route is published.
+                    let mut queues = lock(&self.dispatch_queues);
+                    #[cfg(test)]
+                    if let Some((entered, resume)) = lock(&self.registration_locked_hook).take() {
+                        let _ = entered.send(());
+                        let _ = resume.recv_timeout(Duration::from_secs(5));
+                    }
                     let before = routes.clone();
                     if explicit {
                         routes.upsert_explicit(&persona, route, now.clone());
@@ -974,8 +1008,10 @@ where
                             None,
                         );
                     }
+                    // Route publication and the worker's wake generation must be observed
+                    // together: a no-route worker may not evict in between them.
+                    self.wake_recipient_after_registration(&mut queues, &norm);
                 }
-                self.wake_recipient_after_registration(&persona);
                 (LocalResponse::RouteRegistered, None)
             }
             LocalRequest::UnregisterRoute { persona } => {
@@ -1407,6 +1443,12 @@ where
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
         empty_exit_hook: Mutex::new(None),
+        #[cfg(test)]
+        fail_next_worker_spawn: AtomicBool::new(false),
+        #[cfg(test)]
+        queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
+        #[cfg(test)]
+        registration_locked_hook: Mutex::new(None),
         peers: Mutex::new(BTreeMap::new()),
         subscribers: Mutex::new(Vec::new()),
         next_peer_id: Mutex::new(0),
@@ -1613,6 +1655,9 @@ mod tests {
             overflow_capacity_exhausted: AtomicBool::new(false),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
+            fail_next_worker_spawn: AtomicBool::new(false),
+            queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
+            registration_locked_hook: Mutex::new(None),
             peers: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
             next_peer_id: Mutex::new(0),
@@ -1640,6 +1685,234 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn registering_route_drains_parked_overflowed_prefix_then_fences() {
+        let rig = rig();
+        let mut ids = Vec::new();
+        let mut pending = VecDeque::new();
+        for subject in ["first", "second", "third"] {
+            let (message, _) = rig
+                .inner
+                .store
+                .send_wire(mail("overflow", subject))
+                .unwrap();
+            pending.push_back((message.id.clone(), now_at()));
+            ids.push(message.id);
+        }
+        lock(&rig.inner.dispatch_queues).insert(
+            "overflow".into(),
+            RecipientDispatchQueue {
+                pending,
+                overflowed: true,
+                ..Default::default()
+            },
+        );
+        let socket = rig._tmp.path().join("overflow.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "overflow".into(),
+            explicit: true,
+            route: VendorRoute::Webhook {
+                socket_path: socket,
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut received = Vec::new();
+        while received.len() < ids.len() && Instant::now() < deadline {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                received.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received, ids,
+            "overflowed accepted prefix must drain in order"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while lock(&rig.inner.dispatch_queues).contains_key("overflow") {
+            assert!(Instant::now() < deadline, "drained queue not removed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(lock(&rig.inner.overflow_recipients).contains("overflow"));
+    }
+
+    #[test]
+    fn no_route_queue_reaching_limit_drains_accepted_prefix_on_registration() {
+        let rig = rig();
+        rig.inner.queue_limit_override.store(2, Ordering::SeqCst);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((entered_tx, resume_rx));
+        let (first, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("limited", "first"),
+        });
+        let LocalResponse::Sent { message: first, .. } = first else {
+            panic!("first send failed")
+        };
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut ids = vec![first.id];
+        for subject in ["second", "third", "overflow"] {
+            let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+                args: mail("limited", subject),
+            });
+            let LocalResponse::Sent { message, .. } = response else {
+                panic!("send failed")
+            };
+            ids.push(message.id);
+        }
+        assert!(lock(&rig.inner.dispatch_queues)["limited"].overflowed);
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let parked = lock(&rig.inner.dispatch_queues)
+                .get("limited")
+                .is_some_and(|q| q.waiting_for_route && q.overflowed && !q.worker_active);
+            if parked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "overflowed no-route prefix did not park"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let socket = rig._tmp.path().join("limited.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "limited".into(),
+            explicit: true,
+            route: VendorRoute::Webhook {
+                socket_path: socket,
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut received = Vec::new();
+        while received.len() < 3 && Instant::now() < deadline {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                received.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(received, ids[..3]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(&rig.inner.overflow_recipients).contains("limited") {
+            assert!(Instant::now() < deadline, "drained overflow was not fenced");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!lock(&rig.inner.dispatch_queues).contains_key("limited"));
+        assert_eq!(
+            rig.inner.store.list_wire_receipts(&ids[3]).unwrap()[0].status,
+            DeliveryStatus::Pending
+        );
+    }
+
+    #[test]
+    fn route_publication_and_no_route_eviction_are_serialized() {
+        let rig = rig();
+        let (no_route_tx, no_route_rx) = mpsc::channel();
+        let (resume_worker_tx, resume_worker_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((no_route_tx, resume_worker_rx));
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("register-race", "first"),
+        });
+        let LocalResponse::Sent { message, .. } = response else {
+            panic!("send failed")
+        };
+        no_route_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let socket = rig._tmp.path().join("register-race.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (resume_register_tx, resume_register_rx) = mpsc::channel();
+        *lock(&rig.inner.registration_locked_hook) = Some((locked_tx, resume_register_rx));
+        let inner = Arc::clone(&rig.inner);
+        let register = std::thread::spawn(move || {
+            inner
+                .handle_local_request(LocalRequest::RegisterRoute {
+                    persona: "register-race".into(),
+                    explicit: true,
+                    route: VendorRoute::Webhook {
+                        socket_path: socket,
+                    },
+                })
+                .0
+        });
+        locked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        resume_worker_tx.send(()).unwrap();
+        resume_register_tx.send(()).unwrap();
+        assert!(matches!(
+            register.join().unwrap(),
+            LocalResponse::RouteRegistered
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            if let Ok((stream, _)) = listener.accept() {
+                break stream;
+            }
+            assert!(Instant::now() < deadline, "registration wake was lost");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WireMessage>(&line).unwrap().id,
+            message.id
+        );
+    }
+
+    #[test]
+    fn capacity_waiter_with_overflowed_prefix_starts_when_slot_frees() {
+        let rig = rig();
+        let (message, _) = rig.inner.store.send_wire(mail("waiter", "first")).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((entered_tx, resume_rx));
+        let mut queues = lock(&rig.inner.dispatch_queues);
+        queues.insert(
+            "waiter".into(),
+            RecipientDispatchQueue {
+                pending: VecDeque::from([(message.id, now_at())]),
+                overflowed: true,
+                waiting_for_capacity: true,
+                ..Default::default()
+            },
+        );
+        drop(queues);
+        rig.inner.wake_capacity_waiters();
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("overflowed capacity waiter was not started");
+        assert!(
+            lock(&rig.inner.dispatch_queues)
+                .get("waiter")
+                .unwrap()
+                .worker_active,
+            "overflow must fence new messages without stranding its accepted prefix"
+        );
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(&rig.inner.dispatch_queues)
+            .get("waiter")
+            .is_some_and(|q| q.waiting_for_route && !q.worker_active)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "capacity waiter did not park after no-route result"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -1738,17 +2011,36 @@ mod tests {
     }
 
     #[test]
-    fn parked_offline_recipients_do_not_exhaust_active_worker_slots() {
+    fn no_route_workers_release_entries_and_leave_messages_in_inbox() {
         let rig = rig();
         for n in 0..=MAX_DISPATCH_RECIPIENTS {
-            lock(&rig.inner.dispatch_queues).insert(
-                format!("offline-{n}"),
-                RecipientDispatchQueue {
-                    waiting_for_route: true,
+            let name = format!("offline-{n}");
+            let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+                args: mail(&name, "pending"),
+            });
+            assert!(matches!(response, LocalResponse::Sent { .. }));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lock(&rig.inner.dispatch_queues).contains_key(&name) {
+                assert!(
+                    Instant::now() < deadline,
+                    "idle queue was retained for {name}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let inbox = rig
+                .inner
+                .store
+                .list_wire_inbox(&WireFilter {
+                    recipient: Some(name),
+                    unread_only: true,
                     ..Default::default()
-                },
-            );
+                })
+                .unwrap();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].receipt.status, DeliveryStatus::Pending);
         }
+        assert!(lock(&rig.inner.dispatch_queues).is_empty());
+        assert!(lock(&rig.inner.overflow_recipients).is_empty());
         let socket = rig._tmp.path().join("live.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1764,16 +2056,59 @@ mod tests {
         });
         assert!(matches!(response, LocalResponse::Sent { .. }));
         let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if listener.accept().is_ok() {
-                break;
-            }
+        while listener.accept().is_err() {
             assert!(
                 Instant::now() < deadline,
-                "parked queues blocked a live recipient"
+                "offline recipients blocked a live recipient"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn no_route_exit_parks_the_accepted_overflow_prefix() {
+        let rig = rig();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((entered_tx, resume_rx));
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("offline", "pending"),
+        });
+        assert!(matches!(response, LocalResponse::Sent { .. }));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        lock(&rig.inner.dispatch_queues)
+            .get_mut("offline")
+            .unwrap()
+            .overflowed = true;
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let parked = lock(&rig.inner.dispatch_queues)
+                .get("offline")
+                .is_some_and(|q| {
+                    q.waiting_for_route && !q.worker_active && q.overflowed && q.pending.len() == 1
+                });
+            if parked {
+                break;
+            }
+            assert!(Instant::now() < deadline, "overflow prefix was not parked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!lock(&rig.inner.overflow_recipients).contains("offline"));
+    }
+
+    #[test]
+    fn worker_spawn_failure_fences_and_removes_the_queue() {
+        let rig = rig();
+        rig.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::SeqCst);
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("spawn-failure", "persisted"),
+        });
+        assert!(matches!(response, LocalResponse::Sent { .. }));
+        assert!(!lock(&rig.inner.dispatch_queues).contains_key("spawn-failure"));
+        assert!(lock(&rig.inner.overflow_recipients).contains("spawn-failure"));
     }
 
     #[test]
@@ -2017,37 +2352,19 @@ mod tests {
     }
 
     #[test]
-    fn registration_wakes_only_current_process_unstarted_messages_in_fifo_order() {
+    fn late_registration_does_not_replay_evicted_no_route_message() {
         let rig = rig();
-        let (first, _) = rig.inner.handle_local_request(LocalRequest::Send {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
             args: mail("new-route", "first"),
         });
-        let LocalResponse::Sent { message: first, .. } = first else {
-            panic!("first send failed")
+        let LocalResponse::Sent { message, .. } = response else {
+            panic!("send failed")
         };
         let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if lock(&rig.inner.dispatch_queues)
-                .get("new-route")
-                .is_some_and(|queue| queue.waiting_for_route)
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "first message did not wait for route"
-            );
+        while lock(&rig.inner.dispatch_queues).contains_key("new-route") {
+            assert!(Instant::now() < deadline, "no-route queue was retained");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let (second, _) = rig.inner.handle_local_request(LocalRequest::Send {
-            args: mail("new-route", "second"),
-        });
-        let LocalResponse::Sent {
-            message: second, ..
-        } = second
-        else {
-            panic!("second send failed")
-        };
         let socket = rig._tmp.path().join("late-route.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2059,74 +2376,13 @@ mod tests {
             },
         });
         assert!(matches!(response, LocalResponse::RouteRegistered));
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut ids = Vec::new();
-        while ids.len() < 2 && Instant::now() < deadline {
-            if let Ok((stream, _)) = listener.accept() {
-                let mut line = String::new();
-                BufReader::new(stream).read_line(&mut line).unwrap();
-                ids.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
-            } else {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        assert_eq!(ids, vec![first.id, second.id]);
-    }
-
-    #[test]
-    fn new_message_retries_current_process_queue_after_route_is_discovered() {
-        let rig = rig();
-        let (first, _) = rig.inner.handle_local_request(LocalRequest::Send {
-            args: mail("passive-route", "first"),
-        });
-        let LocalResponse::Sent { message: first, .. } = first else {
-            panic!("first send failed")
-        };
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if lock(&rig.inner.dispatch_queues)
-                .get("passive-route")
-                .is_some_and(|queue| queue.waiting_for_route)
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "first message did not wait for route"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let socket = rig._tmp.path().join("passive-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        lock(&rig.inner.routes).upsert_explicit(
-            "passive-route",
-            VendorRoute::Webhook {
-                socket_path: socket,
-            },
-            now_at(),
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            listener.accept().is_err(),
+            "registration replayed an evicted message"
         );
-        let (second, _) = rig.inner.handle_local_request(LocalRequest::Send {
-            args: mail("passive-route", "second"),
-        });
-        let LocalResponse::Sent {
-            message: second, ..
-        } = second
-        else {
-            panic!("second send failed")
-        };
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut ids = Vec::new();
-        while ids.len() < 2 && Instant::now() < deadline {
-            if let Ok((stream, _)) = listener.accept() {
-                let mut line = String::new();
-                BufReader::new(stream).read_line(&mut line).unwrap();
-                ids.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
-            } else {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        assert_eq!(ids, vec![first.id, second.id]);
+        let receipts = rig.inner.store.list_wire_receipts(&message.id).unwrap();
+        assert_eq!(receipts[0].status, DeliveryStatus::Pending);
     }
 
     #[test]
@@ -2765,6 +3021,16 @@ mod tests {
         // Set up a webhook Unix listener for Kayla on host B to verify push delivery + auto-Ack propagation
         let webhook_sock = tmp.path().join("kayla-webhook.sock");
         let webhook_listener = UnixListener::bind(&webhook_sock).unwrap();
+        let routes_b = tmp.path().join("routes-b.json");
+        let mut routes = RouteTable::load(Some(&routes_b));
+        routes.upsert_explicit(
+            "synthetic-recipient",
+            VendorRoute::Webhook {
+                socket_path: webhook_sock,
+            },
+            now_at(),
+        );
+        routes.save(Some(&routes_b)).unwrap();
 
         let sock_b = tmp.path().join("wire-b.sock");
         let _daemon_b = spawn_daemon(
@@ -2773,7 +3039,7 @@ mod tests {
                 node_id: "node-b".into(),
                 host: "host-b".into(),
                 socket_path: sock_b.clone(),
-                routes_path: Some(tmp.path().join("routes-b.json")),
+                routes_path: Some(routes_b),
                 home_override: Some(tmp.path().to_path_buf()),
                 listen_addr: None,
                 peers: vec![format!("ws://{addr_a}/wire")],
@@ -2788,18 +3054,6 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for SyncBatch");
             std::thread::sleep(Duration::from_millis(20));
         }
-
-        // Register Kayla's webhook route on daemon B (which also dispatches pending messages)
-        let mut client_b = LocalClient::connect(&sock_b, Duration::from_secs(1)).unwrap();
-        client_b
-            .request(&LocalRequest::RegisterRoute {
-                persona: "synthetic-recipient".into(),
-                explicit: false,
-                route: VendorRoute::Webhook {
-                    socket_path: webhook_sock,
-                },
-            })
-            .unwrap();
 
         // Accept the pushed boot_msg on Kayla's webhook socket
         let (wh_stream, _) = webhook_listener.accept().unwrap();
