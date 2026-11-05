@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App, { THEME_STORAGE_KEY } from "../App";
 import { HubApiClient } from "../api/client";
@@ -494,8 +494,15 @@ describe("PhoneMoreSheet", () => {
 });
 
 describe("Phone More sheet focus handling", () => {
+  const originalWidth = window.innerWidth;
+  const originalHeight = window.innerHeight;
+
   beforeEach(() => {
     window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    setViewport(originalWidth, originalHeight);
   });
 
   it("makes the background inert while open and restores it on close", () => {
@@ -521,5 +528,132 @@ describe("Phone More sheet focus handling", () => {
     expect(screen.getByTestId("contextual-help-drawer")).toBeInTheDocument();
     expect(screen.getByTestId("phone-tab-more")).not.toHaveFocus();
     expect(screen.getByTestId("phone-view")).not.toHaveAttribute("inert");
+  });
+});
+
+describe("Phone unread tracking follows the phone view", () => {
+  const originalWidth = window.innerWidth;
+  const originalHeight = window.innerHeight;
+
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    setViewport(originalWidth, originalHeight);
+  });
+
+  function makeJarvisApi() {
+    let stamp = "t1";
+    let turns: Array<Record<string, unknown>> = [
+      { index: 1, role: "assistant", content: "First status.", thinking: null, tool_calls: [] },
+    ];
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) {
+        return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
+      }
+      if (url.includes("/sess-jarvis/transcript")) {
+        return json({ session_id: "sess-jarvis", turns, is_busy: false, queue: [] });
+      }
+      if (url.includes("/api/v1/sessions")) {
+        return json({
+          sessions: [
+            { id: "sess-jarvis", source: "route", adapter: "claude", persona: "jarvis", status: "active", updated_at: stamp },
+          ],
+        });
+      }
+      if (url.includes("/api/v1/agents/liveness")) return json({ liveness: [] });
+      if (url.includes("/api/v1/agents")) return json({ agents: [], areas: [], routes: [] });
+      return json({});
+    });
+    return {
+      apiClient: new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch }),
+      reply(content: string) {
+        const index = turns.length + 1;
+        turns = [...turns, { index, role: "assistant", content, thinking: null, tool_calls: [] }];
+        stamp = `t${index}`;
+        act(() => {
+          fireEvent(window, new Event("focus"));
+        });
+      },
+    };
+  }
+
+  async function selectJarvisOnPhone() {
+    await waitFor(() => expect(screen.getByTestId("phone-tab-agents")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("phone-tab-agents"));
+    fireEvent.click(await screen.findByTestId("agent-row-jarvis"));
+    expect(screen.getByTestId("phone-shell")).toHaveAttribute("data-phone-view", "chat");
+    // Let the first observation settle so history is the baseline.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  it("badges the selected agent's reply while the phone is off Chat, and clears it on return", async () => {
+    const api = makeJarvisApi();
+    setViewport(390, 844);
+    render(<App apiClient={api.apiClient} wsClient={makeStubWsClient()} />);
+    await selectJarvisOnPhone();
+    expect(screen.queryByTestId("phone-agents-unread-badge")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("phone-tab-board"));
+    api.reply("Done, take a look.");
+    expect(await screen.findByTestId("phone-agents-unread-badge")).toHaveTextContent("1");
+    // The badge must persist: nothing may auto-mark the reply read while Board is on screen.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.getByTestId("phone-agents-unread-badge")).toHaveTextContent("1");
+
+    fireEvent.click(screen.getByTestId("phone-tab-chat"));
+    await waitFor(() => expect(screen.queryByTestId("phone-agents-unread-badge")).toBeNull());
+  });
+
+  it("marks a reply read while on Chat, even after a desktop session left a non-chat tab", async () => {
+    const api = makeJarvisApi();
+    setViewport(1280, 800);
+    render(<App apiClient={api.apiClient} wsClient={makeStubWsClient()} />);
+    fireEvent.click(await screen.findByTestId("agent-row-jarvis"));
+    fireEvent.click(within(screen.getByTestId("cockpit-tab-bar")).getByRole("tab", { name: "Terminal" }));
+    resizeTo(390, 844);
+    expect(screen.getByTestId("phone-shell")).toHaveAttribute("data-phone-view", "chat");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    api.reply("Fresh reply while reading Chat.");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.queryByTestId("phone-agents-unread-badge")).toBeNull();
+  });
+});
+
+describe("Phone roster ignores desktop roster state", () => {
+  const originalWidth = window.innerWidth;
+  const originalHeight = window.innerHeight;
+
+  afterEach(() => {
+    setViewport(originalWidth, originalHeight);
+  });
+
+  it("renders the embedded roster closed and uncollapsed whatever the desktop state, without a close control", () => {
+    window.localStorage.clear();
+    renderAt(1280, 800);
+    // Desktop state: roster open as a console host, then collapsed.
+    fireEvent.click(within(screen.getByTestId("cockpit-tab-bar")).getByRole("tab", { name: "Terminal" }));
+    expect(screen.getByTestId("roster-sidebar")).toHaveAttribute("data-mobile-open", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close Roster" }));
+    expect(screen.getByTestId("roster-sidebar")).toHaveAttribute("data-desktop-collapsed", "true");
+
+    resizeTo(390, 844);
+    fireEvent.click(screen.getByTestId("phone-tab-agents"));
+    const roster = screen.getByTestId("roster-sidebar");
+    expect(roster).toHaveAttribute("data-embedded", "true");
+    expect(roster).toHaveAttribute("data-mobile-open", "false");
+    expect(roster).toHaveAttribute("data-desktop-collapsed", "false");
+    expect(screen.queryByRole("button", { name: "Close Roster" })).toBeNull();
+
+    resizeTo(1280, 800);
+    expect(screen.getByTestId("roster-sidebar")).toHaveAttribute("data-desktop-collapsed", "true");
   });
 });

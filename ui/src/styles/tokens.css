@@ -806,50 +806,11 @@ button.fd-badge:hover:not(:disabled) {
 }
 
 @media (max-width: 767px) {
-  .fd-main,
-  .fd-workspace,
   .fd-pane {
     width: 100% !important;
     max-width: 100% !important;
     min-width: 0 !important;
     overflow-x: hidden !important;
-  }
-
-  .fd-header {
-    padding: 6px 10px;
-    gap: 8px;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-
-  .fd-header::-webkit-scrollbar {
-    display: none;
-  }
-
-  .fd-three-tier-bar {
-    flex-wrap: nowrap !important;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-
-  .fd-three-tier-bar::-webkit-scrollbar {
-    display: none;
-  }
-
-  .fd-tier-group {
-    flex-wrap: nowrap !important;
-    min-width: 0;
-    flex-shrink: 1;
-    overflow: hidden;
-    padding: 3px 6px;
-    gap: 5px;
-  }
-
-  .fd-tier-group > .fd-tier-label {
-    display: none;
   }
 }
 
@@ -864,18 +825,6 @@ button.fd-badge:hover:not(:disabled) {
   .fd-composer {
     padding: 6px 8px !important;
     gap: 4px !important;
-  }
-
-  .fd-header {
-    min-height: 44px;
-    padding: 4px 8px;
-    gap: 4px;
-    overflow-x: hidden;
-  }
-
-  .fd-three-tier-bar {
-    gap: 4px !important;
-    overflow-x: hidden !important;
   }
 
   [data-testid="ferrodeck-brand-title"] {
@@ -898,66 +847,6 @@ button.fd-badge:hover:not(:disabled) {
   [data-testid="session-cwd-badge"],
   [data-testid="active-context-tier-badge"] {
     display: none !important;
-  }
-
-  .fd-tier-agent,
-  [data-testid="tier-agent-nav"] {
-    flex-direction: row !important;
-    align-items: center !important;
-    justify-content: center;
-    padding: 4px 10px !important;
-    flex: 0 1 auto !important;
-    min-width: 0;
-  }
-
-  .fd-tier-agent-identity {
-    justify-content: center;
-    max-width: 100%;
-  }
-
-  .fd-workspace {
-    position: relative;
-  }
-
-  .fd-workspace.is-split {
-    flex-direction: row;
-  }
-
-  .fd-workspace.is-split > .fd-pane:first-child {
-    display: flex !important;
-    width: 100% !important;
-    min-width: 0 !important;
-    max-width: 100% !important;
-  }
-
-  .fd-right-split-backdrop {
-    display: block;
-    position: absolute;
-    inset: 0;
-    background-color: rgba(5, 7, 11, 0.52);
-    z-index: 21;
-  }
-
-  .fd-workspace.is-split > .fd-right-split-pane {
-    position: absolute !important;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    left: 0;
-    width: 100% !important;
-    min-width: 0 !important;
-    max-width: 100% !important;
-    overflow-y: auto !important;
-    flex: none !important;
-    z-index: 22;
-    background-color: var(--bg-surface);
-    border-left: 1px solid var(--border-strong) !important;
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.55);
-  }
-
-  .fd-workspace.is-split > .fd-pane {
-    border-right: none;
-    border-bottom: none;
   }
 
   .fd-modal-backdrop {
@@ -1012,8 +901,7 @@ button.fd-badge:hover:not(:disabled) {
 
 @media (max-width: 480px) {
   .fd-sidebar,
-  .fd-pane,
-  .fd-right-split-pane {
+  .fd-pane {
     min-width: 0 !important;
     max-width: 100% !important;
     overflow-y: auto;
@@ -1027,8 +915,7 @@ button.fd-badge:hover:not(:disabled) {
 
   .fd-modal .fd-card [style*="grid-template-columns"],
   .fd-sidebar .fd-card [style*="grid-template-columns"],
-  .fd-pane .fd-card [style*="grid-template-columns"],
-  .fd-right-split-pane .fd-card [style*="grid-template-columns"] {
+  .fd-pane .fd-card [style*="grid-template-columns"] {
     grid-template-columns: minmax(0, 1fr) !important;
   }
 }

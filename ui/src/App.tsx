@@ -1924,7 +1924,10 @@ export const App: React.FC<AppProps> = ({
     )
       .trim()
       .toLowerCase();
-    const viewingChat = activeTab === "chat" || splitView;
+    // Phone navigation never writes desktop state, so the phone view alone says what is on screen.
+    // (Wire Mail without an agent falls back to Artifacts, never Chat, so phoneView is exact.)
+    const viewingChat =
+      deviceLayout === "phone" ? phoneView === "chat" : activeTab === "chat" || splitView;
     setLastSeenAssistantTurnIndex((prev) => {
       let next: Record<string, number> | null = null;
       for (const [agentKey, turns] of Object.entries(transcriptsByAgent)) {
@@ -1942,7 +1945,7 @@ export const App: React.FC<AppProps> = ({
       }
       return next ?? prev;
     });
-  }, [transcriptsByAgent, selectedAgent, selectedAgentName, activeTab, splitView]);
+  }, [transcriptsByAgent, selectedAgent, selectedAgentName, activeTab, splitView, deviceLayout, phoneView]);
 
   // Compute unread user-directed assistant counts per agent
   const unreadByAgent = useMemo<Record<string, number>>(
@@ -2311,7 +2314,9 @@ export const App: React.FC<AppProps> = ({
     return res;
   };
 
-  const renderSecondaryPane = (paneTab: CockpitTab | LeftPanelTab) => {
+  // Chat and the roster have their own elements (chatPaneElement, renderRosterSidebar); every
+  // caller passes one of the remaining tool panes.
+  const renderSecondaryPane = (paneTab: Exclude<CockpitTab | LeftPanelTab, "chat" | "roster">) => {
     switch (paneTab) {
       case "triage":
         return (
@@ -2400,12 +2405,14 @@ export const App: React.FC<AppProps> = ({
               });
             }}
             onClose={
-              splitView
-                ? () => {
-                    setSplitView(false);
-                    setActiveTab("chat");
-                  }
-                : undefined
+              deviceLayout === "phone"
+                ? () => navigatePhone("chat")
+                : splitView
+                  ? () => {
+                      setSplitView(false);
+                      setActiveTab("chat");
+                    }
+                  : undefined
             }
           />
         );
@@ -2496,58 +2503,6 @@ export const App: React.FC<AppProps> = ({
         return <VaultGatePane authority={authority} apiClient={apiClient} />;
       case "state":
         return <FerroStatePane authority={authority} apiClient={apiClient} />;
-      case "chat":
-      default:
-        return (
-          <ChatPane
-            agentName={selectedAgent?.name_key ?? null}
-            agentDisplayName={selectedAgent?.display_name ?? null}
-            agentRole={selectedAgent?.role ?? null}
-            agentProject={selectedAgent?.project ?? null}
-            adapter={activeAdapter}
-            model={activeModel}
-            thinkingLevel={activeSession?.thinking_level ?? null}
-            availableModels={
-              activeSession?.available_models ??
-              activeRoute?.available_models ??
-              null
-            }
-            executionMode={
-              activeSession?.execution_mode ?? activeRoute?.execution_mode
-            }
-            sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
-            turns={transcriptTurns}
-            contextUsage={sessionContextUsage}
-            quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
-            isBusy={isSessionBusy}
-            inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
-            queue={sessionQueue}
-            loading={loading}
-            wsConnected={wsConnected}
-            agentSettingsOpen={agentSettingsOpen}
-            onOpenAgentSettings={() => {
-              setSettingsOriginMemento(null);
-              setAgentSettingsOpen(true);
-            }}
-            onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
-            returnToSettingsLabel={returnToSettingsLabel}
-            onReturnToSettings={handleReturnToOriginSettings}
-            onRefresh={() => void refreshSessionsAndTranscript()}
-            onSendPrompt={handleSendPrompt}
-            onSendQueuedNow={handleSendQueuedNow}
-            onCancelQueued={handleCancelQueued}
-            onUpdateQueued={handleUpdateQueued}
-            onDecommissionSession={handleDecommissionSession}
-            onInterruptSession={handleInterruptSession}
-            onSetSessionModel={handleSetSessionModel}
-            onOpenArtifact={handleOpenArtifact}
-            onOpenHelpTopic={(topic) => {
-              setHelpTopic(topic);
-              setHelpDrawerOpen(true);
-            }}
-            apiClient={apiClient}
-          />
-        );
     }
   };
 
@@ -2794,8 +2749,7 @@ export const App: React.FC<AppProps> = ({
   const isTabletOverlay = tabletMaster === "overlay";
   const isTabletDocked = tabletMaster === "docked";
   const tabletDockedWidth = resolveTabletDockedWidth(currentInnerWidth);
-  const leftSidebarOpen =
-    isMobileViewport || isTabletOverlay ? mobileRosterOpen : !desktopSidebarCollapsed;
+  const leftSidebarOpen = isTabletOverlay ? mobileRosterOpen : !desktopSidebarCollapsed;
 
   // Rotating between tablet portrait and landscape keeps the selected agent and transcript;
   // only the roster arrangement follows the mode.
@@ -2980,14 +2934,18 @@ export const App: React.FC<AppProps> = ({
       themeMode={themeMode}
       onToggleTheme={handleToggleTheme}
       onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
-      isOpen={mobileRosterOpen}
-      isCollapsedDesktop={isTabletOverlay ? false : desktopSidebarCollapsed}
-      onClose={() => {
-        setMobileRosterOpen(false);
-        if (!isTabletOverlay) {
-          setDesktopSidebarCollapsed(true);
-        }
-      }}
+      isOpen={embedded ? false : mobileRosterOpen}
+      isCollapsedDesktop={embedded || isTabletOverlay ? false : desktopSidebarCollapsed}
+      onClose={
+        embedded
+          ? undefined
+          : () => {
+              setMobileRosterOpen(false);
+              if (!isTabletOverlay) {
+                setDesktopSidebarCollapsed(true);
+              }
+            }
+      }
       leftPanelTab={leftPanelTab}
       onSelectLeftPanelTab={handleSelectLeftPanelTab}
       consoleContent={
