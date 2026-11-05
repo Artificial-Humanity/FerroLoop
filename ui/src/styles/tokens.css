@@ -693,7 +693,7 @@ button.fd-badge:hover:not(:disabled) {
 .fd-watch-kpi-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
+  gap: 4px;
 }
 
 @container (min-width: 420px) {
@@ -854,6 +854,23 @@ button.fd-badge:hover:not(:disabled) {
   [data-testid="session-cwd-badge"],
   [data-testid="active-context-tier-badge"] {
     display: none !important;
+  }
+
+  .fd-tier-agent,
+  [data-testid="tier-agent-nav"] {
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center;
+    gap: 2px !important;
+    padding: 3px 8px !important;
+    flex: 1 1 auto !important;
+    min-width: 0;
+  }
+
+  .fd-tier-agent-identity,
+  .fd-tier-agent-meta {
+    justify-content: center;
+    max-width: 100%;
   }
 
   .fd-workspace {

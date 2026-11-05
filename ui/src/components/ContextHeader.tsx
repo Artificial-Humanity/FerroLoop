@@ -535,7 +535,11 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           </span>
 
           {selectedAgent ? (
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, whiteSpace: "nowrap" }}>
+            <div
+              className="fd-tier-agent-identity"
+              data-testid="tier-agent-identity"
+              style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, whiteSpace: "nowrap" }}
+            >
               <span
                 style={{
                   fontWeight: 700,
@@ -554,59 +558,71 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               </span>
             </div>
           ) : (
-            <span
-              style={{ fontWeight: 600, color: "var(--text-muted)", whiteSpace: "nowrap" }}
-              title="Active Agent Name"
+            <div
+              className="fd-tier-agent-identity"
+              data-testid="tier-agent-identity"
+              style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, whiteSpace: "nowrap" }}
             >
-              No Agent Selected
-            </span>
-          )}
-
-          {agentSessions.length > 0 && (
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, whiteSpace: "nowrap" }}>
-              {agentSessions.length > 1 && (
-                <select
-                  aria-label="Active Session"
-                  title="Switch Active Session"
-                  data-testid="session-selector"
-                  className="fd-select fd-mono"
-                  style={{ fontSize: "11px", padding: "4px 8px" }}
-                  value={activeSession?.id ?? ""}
-                  onChange={(e) => onSelectSession(e.target.value)}
-                >
-                  {agentSessions.map((sess) => (
-                    <option key={sess.id} value={sess.id}>
-                      [{sess.adapter}] {sess.persona || "session"} ({sess.id.slice(-8)})
-                    </option>
-                  ))}
-                </select>
-              )}
-
-              {activeSession?.adapter && (
-                <span
-                  className={getAdapterBadgeClass(activeSession.adapter)}
-                  title="Agent Harness / Adapter"
-                  style={{ flexShrink: 0 }}
-                >
-                  {activeSession.adapter}
-                </span>
-              )}
+              <span
+                style={{ fontWeight: 600, color: "var(--text-muted)", whiteSpace: "nowrap" }}
+                title="Active Agent Name"
+              >
+                No Agent Selected
+              </span>
             </div>
           )}
 
-          <span
-            className="fd-badge"
-            data-testid="active-project-badge"
-            title="Current Project"
-            style={{
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
+          <div
+            className="fd-tier-agent-meta"
+            data-testid="tier-agent-meta"
+            style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}
           >
-            {selectedAgent?.project ?? "Workspace"}
-          </span>
+            {agentSessions.length > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, whiteSpace: "nowrap" }}>
+                {agentSessions.length > 1 && (
+                  <select
+                    aria-label="Active Session"
+                    title="Switch Active Session"
+                    data-testid="session-selector"
+                    className="fd-select fd-mono"
+                    style={{ fontSize: "11px", padding: "4px 8px" }}
+                    value={activeSession?.id ?? ""}
+                    onChange={(e) => onSelectSession(e.target.value)}
+                  >
+                    {agentSessions.map((sess) => (
+                      <option key={sess.id} value={sess.id}>
+                        [{sess.adapter}] {sess.persona || "session"} ({sess.id.slice(-8)})
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                {activeSession?.adapter && (
+                  <span
+                    className={getAdapterBadgeClass(activeSession.adapter)}
+                    title="Agent Harness / Adapter"
+                    style={{ flexShrink: 0 }}
+                  >
+                    {activeSession.adapter}
+                  </span>
+                )}
+              </div>
+            )}
+
+            <span
+              className="fd-badge"
+              data-testid="active-project-badge"
+              title="Current Project"
+              style={{
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {selectedAgent?.project ?? "Workspace"}
+            </span>
+          </div>
 
           <div
             style={{
@@ -630,21 +646,17 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           className={`fd-tier-group fd-tier-system${activeTier === "system" ? " is-active-tier" : ""}`}
           data-testid="tier-system-nav"
           data-active-tier={activeTier === "system" ? "true" : undefined}
-          style={
-            activeTier === "system"
-              ? { position: "relative" }
-              : {
-                  position: "absolute",
-                  width: "1px",
-                  height: "1px",
-                  padding: 0,
-                  margin: "-1px",
-                  overflow: "hidden",
-                  clip: "rect(0, 0, 0, 0)",
-                  whiteSpace: "nowrap",
-                  border: 0,
-                }
-          }
+          style={{
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: 0,
+          }}
         >
           <div
             style={{
@@ -734,25 +746,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             flexShrink: 0,
           }}
         >
-          {!mobileSidebarOpen && onOpenSettingsModal && (
-            <button
-              type="button"
-              data-testid="header-settings-btn"
-              className="fd-btn"
-              onClick={onOpenSettingsModal}
-              title="Open Settings (Agents, System, Products, Appearance, Accessibility, Auth)"
-              aria-label="Open Settings"
-              style={{ flexShrink: 0, padding: "5px 8px" }}
-            >
-              <span
-                className="fd-gear-icon"
-                aria-hidden="true"
-                style={{ fontSize: "16px", lineHeight: 1 }}
-              >
-                ⚙
-              </span>
-            </button>
-          )}
           <button
             type="button"
             data-testid="split-view-toggle"

@@ -369,7 +369,11 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
   const adapterEntries = Object.entries(stats?.by_adapter ?? {});
 
   return (
-    <section className="fd-pane" data-testid="hub-drawer">
+    <section
+      className="fd-pane"
+      data-testid="hub-drawer"
+      style={{ overflowY: "auto", overflowX: "hidden" }}
+    >
       {/* Sub-navigation Toolbar */}
       <div
         style={{
@@ -379,97 +383,128 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
           padding: "8px 16px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
+          flexShrink: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+        <div
+          data-testid="hub-header-top-row"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            width: "100%",
+            minWidth: 0,
+          }}
+        >
           <strong
             data-testid="hub-pane-title"
             style={{ fontSize: "14px", color: "var(--text-primary)" }}
           >
             Hub &amp; Architecture
           </strong>
+          {onRefresh && (
+            <button
+              type="button"
+              className="fd-btn"
+              data-testid="hub-refresh-btn"
+              aria-label={loading ? "Refreshing..." : "Refresh"}
+              title="Refresh"
+              onClick={onRefresh}
+              disabled={loading}
+              style={{ marginLeft: "auto", padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path
+                  d="M13.5 8A5.5 5.5 0 0 1 3.7 11.45"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M2.5 8A5.5 5.5 0 0 1 12.3 4.55"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                />
+                <polyline
+                  points="10.2 4.8 12.5 4.7 12.2 2.4"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <polyline
+                  points="5.8 11.2 3.5 11.3 3.8 13.6"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          )}
         </div>
         <div
+          data-testid="hub-subtab-grid"
           style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "8px",
-            flexWrap: "wrap",
+            display: "grid",
+            gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+            gap: "6px",
+            width: "100%",
+            minWidth: 0,
           }}
         >
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
           <button
             type="button"
             data-testid="subtab-workflows"
+            title="Workflows (fl flow)"
             className={`fd-btn ${subTab === "workflows" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "workflows"}
             onClick={() => setSubTab("workflows")}
+            style={{ justifyContent: "center", whiteSpace: "nowrap" }}
           >
-            Workflows (fl flow)
+            Workflows
           </button>
           <button
             type="button"
             data-testid="subtab-routines"
+            title="Scheduled Routines"
             className={`fd-btn ${subTab === "routines" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "routines"}
             onClick={() => setSubTab("routines")}
+            style={{ justifyContent: "center", whiteSpace: "nowrap" }}
           >
-            Scheduled Routines
+            Routines
           </button>
           <button
             type="button"
             data-testid="subtab-arch"
+            title="Architecture Conformance (fl arch)"
             className={`fd-btn ${subTab === "architecture" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "architecture"}
             onClick={() => setSubTab("architecture")}
-            style={{
-              display: "inline-flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              lineHeight: 1.2,
-              padding: "6px 10px",
-            }}
+            style={{ justifyContent: "center", whiteSpace: "nowrap" }}
           >
-            <span>Architecture Conformance</span>{" "}
-            <span className="fd-mono" style={{ fontSize: "10.5px", opacity: 0.8 }}>
-              (fl arch)
-            </span>
+            Architecture
           </button>
           <button
             type="button"
             data-testid="subtab-stats"
+            title="Telemetry & Regret Audit (fl stats)"
             className={`fd-btn ${subTab === "stats" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "stats"}
             onClick={() => setSubTab("stats")}
-            style={{
-              display: "inline-flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              lineHeight: 1.2,
-              padding: "6px 10px",
-            }}
+            style={{ justifyContent: "center", whiteSpace: "nowrap" }}
           >
-            <span>Telemetry &amp; Regret Audit</span>{" "}
-            <span className="fd-mono" style={{ fontSize: "10.5px", opacity: 0.8 }}>
-              (fl stats)
-            </span>
+            Telemetry
           </button>
-        </div>
-
-        {onRefresh && (
-          <button type="button" className="fd-btn" onClick={onRefresh} disabled={loading}>
-            {loading ? "Refreshing..." : "Refresh"}
-          </button>
-        )}
         </div>
       </div>
 
       <div
-        className="fd-scroll"
-        style={{ display: "flex", flexDirection: "column", gap: "16px" }}
+        data-testid="hub-drawer-body"
+        style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: "16px" }}
       >
         {error && (
           <div
@@ -555,24 +590,30 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
               <div
                 style={{
                   display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
+                  flexDirection: "column",
+                  gap: "6px",
                 }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                  <span
-                    style={{
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    3-Tier MCP &amp; Agent Posture (Desired · Applied · Live)
-                  </span>
+                <span
+                  style={{
+                    fontSize: "12px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.05em",
+                    color: "var(--text-muted)",
+                  }}
+                >
+                  3-TIER MCP &amp; AGENT POSTURE
+                </span>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
                   <span
                     className="fd-badge"
                     data-testid="hub-posture-summary-badge"
@@ -597,18 +638,17 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                       ? `All ${reports.length} Synced`
                       : `${driftedReports.length} Drifted / ${reports.length} Total`}
                   </span>
-                </div>
 
-                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="fd-btn"
-                    data-testid="hub-posture-dryrun-btn"
-                    style={{ fontSize: "11px", padding: "3px 8px" }}
-                    onClick={() => setPostureDryRunOpen((prev) => !prev)}
-                  >
-                    {postureDryRunOpen ? "Hide Dry-Run" : "Dry-Run Preview"}
-                  </button>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "auto" }}>
+                    <button
+                      type="button"
+                      className="fd-btn"
+                      data-testid="hub-posture-dryrun-btn"
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => setPostureDryRunOpen((prev) => !prev)}
+                    >
+                      {postureDryRunOpen ? "Hide Dry-Run" : "Dry-Run Preview"}
+                    </button>
                   {driftedReports.length > 0 && (
                     <button
                       type="button"
@@ -642,6 +682,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                       Rollback
                     </button>
                   )}
+                  </div>
                 </div>
               </div>
 

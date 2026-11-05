@@ -666,24 +666,17 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         <pre
           data-testid="terminal-output-log"
           aria-live="polite"
-          className="fd-mono"
+          className="fd-mono sr-only"
           style={{
-            margin: 0,
-            padding: "10px 12px",
-            borderRadius: "var(--radius-md)",
-            border: "1px solid var(--border-subtle)",
-            backgroundColor: "var(--bg-surface)",
-            color: "var(--text-secondary)",
-            fontSize: "12px",
-            maxHeight: "180px",
-            minWidth: 0,
-            maxWidth: "100%",
-            boxSizing: "border-box",
-            overflowX: "hidden",
-            overflowY: "auto",
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-            wordBreak: "break-word",
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: 0,
             textAlign: "left",
           }}
         >
@@ -693,15 +686,16 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 
       {/* Quick Command Input Bar */}
       <form
+        data-testid="terminal-quick-command-form"
         onSubmit={handleQuickCommandSubmit}
         style={{
           borderTop: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
           padding: "8px",
           display: "flex",
-          flexDirection: "column",
+          flexDirection: "row",
           gap: "8px",
-          alignItems: "flex-start",
+          alignItems: "center",
         }}
       >
         <input
@@ -711,13 +705,13 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           className="fd-input fd-mono"
           value={commandInput}
           onChange={(e) => setCommandInput(e.target.value)}
-          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+          style={{ flex: 1, width: "100%", minWidth: 0, boxSizing: "border-box" }}
         />
         <button
           type="submit"
           className="fd-btn fd-btn-primary"
           disabled={!commandInput.trim()}
-          style={{ alignSelf: "flex-start" }}
+          style={{ flexShrink: 0, whiteSpace: "nowrap" }}
         >
           Send Command
         </button>

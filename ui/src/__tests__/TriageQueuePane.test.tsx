@@ -340,9 +340,20 @@ describe("Record #90 — Operator Today & Incidents Triage Queue", () => {
 
     const sidebar = screen.getByTestId("roster-sidebar");
     fireEvent.click(within(sidebar).getByTestId("roster-triage-toggle-btn"));
-    expect(within(sidebar).getByTestId("triage-queue-pane")).toBeInTheDocument();
+    const triagePane = within(sidebar).getByTestId("triage-queue-pane");
+    expect(triagePane).toBeInTheDocument();
+    expect(triagePane.style.overflowY).toBe("auto");
+    expect(triagePane.style.overflowX).toBe("hidden");
+    expect(within(triagePane).getByTestId("triage-incident-list")).not.toHaveClass(
+      "fd-scroll",
+    );
     expect(within(sidebar).getByTestId("triage-pane-title")).toHaveTextContent(
       "Today & Incidents",
     );
+    const headerActions = within(triagePane).getByTestId("triage-header-actions");
+    expect(headerActions.style.marginLeft).toBe("auto");
+    const refreshBtn = within(headerActions).getByTestId("triage-refresh-btn");
+    expect(refreshBtn).toHaveAttribute("aria-label", "Refresh");
+    expect(refreshBtn.querySelector("svg")).not.toBeNull();
   });
 });

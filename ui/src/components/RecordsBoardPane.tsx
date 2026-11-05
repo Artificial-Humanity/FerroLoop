@@ -407,7 +407,8 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
         display: "flex",
         flexDirection: "column",
         height: "100%",
-        overflow: "hidden",
+        overflowY: "auto",
+        overflowX: "hidden",
         minWidth: 0,
       }}
     >
@@ -423,22 +424,126 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           minWidth: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+            width: "100%",
+            minWidth: 0,
+          }}
+        >
           <strong style={{ fontSize: "14px" }}>Project Records &amp; Kanban Board</strong>
-          <select
-            aria-label="Select Project"
-            data-testid="board-project-select"
-            className="fd-select fd-mono"
-            style={{ fontSize: "12px", padding: "4px 8px", minWidth: 0, maxWidth: "100%" }}
-            value={project}
-            onChange={(e) => setProject(e.target.value)}
+          <div
+            data-testid="board-project-actions-row"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "nowrap",
+              flex: "1 1 auto",
+              minWidth: 0,
+            }}
           >
-            {projectOptions.map((proj) => (
-              <option key={proj} value={proj}>
-                {proj}
-              </option>
-            ))}
-          </select>
+            <select
+              aria-label="Select Project"
+              data-testid="board-project-select"
+              className="fd-select fd-mono"
+              style={{ fontSize: "12px", padding: "4px 8px", minWidth: 0, maxWidth: "100%" }}
+              value={project}
+              onChange={(e) => setProject(e.target.value)}
+            >
+              {projectOptions.map((proj) => (
+                <option key={proj} value={proj}>
+                  {proj}
+                </option>
+              ))}
+            </select>
+            <div
+              data-testid="board-actions-group"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                flexWrap: "nowrap",
+                flexShrink: 0,
+                marginLeft: "auto",
+              }}
+            >
+              <button
+                type="button"
+                data-testid="board-new-record-btn"
+                aria-label="+ New Record"
+                title="New Record"
+                className={`fd-btn${showCreateForm ? " fd-btn-active" : " fd-btn-primary"}`}
+                style={{ padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
+                onClick={() => setShowCreateForm((prev) => !prev)}
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <line
+                    x1="8"
+                    y1="3"
+                    x2="8"
+                    y2="13"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                  />
+                  <line
+                    x1="3"
+                    y1="8"
+                    x2="13"
+                    y2="8"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
+              <button
+                type="button"
+                data-testid="board-refresh-btn"
+                aria-label={loading ? "Refreshing..." : "Refresh"}
+                title="Refresh"
+                className="fd-btn"
+                style={{ padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
+                onClick={() => void loadRecords(project)}
+                disabled={loading}
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path
+                    d="M13.5 8A5.5 5.5 0 0 1 3.7 11.45"
+                    stroke="currentColor"
+                    strokeWidth="1.45"
+                    strokeLinecap="round"
+                  />
+                  <path
+                    d="M2.5 8A5.5 5.5 0 0 1 12.3 4.55"
+                    stroke="currentColor"
+                    strokeWidth="1.45"
+                    strokeLinecap="round"
+                  />
+                  <polyline
+                    points="10.2 4.8 12.5 4.7 12.2 2.4"
+                    stroke="currentColor"
+                    strokeWidth="1.45"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <polyline
+                    points="5.8 11.2 3.5 11.3 3.8 13.6"
+                    stroke="currentColor"
+                    strokeWidth="1.45"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            </div>
+          </div>
         </div>
 
         <div
@@ -450,6 +555,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
             flex: "1 1 200px",
             justifyContent: "flex-end",
             minWidth: 0,
+            width: "100%",
           }}
         >
           <input
@@ -462,40 +568,13 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
               fontSize: "12px",
               padding: "5px 10px",
               flex: "1 1 220px",
+              width: "100%",
               minWidth: 0,
               maxWidth: "100%",
             }}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
-          <div
-            data-testid="board-actions-group"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              flexWrap: "wrap",
-              flexShrink: 0,
-            }}
-          >
-            <button
-              type="button"
-              data-testid="board-new-record-btn"
-              className={`fd-btn${showCreateForm ? " fd-btn-active" : " fd-btn-primary"}`}
-              onClick={() => setShowCreateForm((prev) => !prev)}
-            >
-              + New Record
-            </button>
-            <button
-              type="button"
-              data-testid="board-refresh-btn"
-              className="fd-btn"
-              onClick={() => void loadRecords(project)}
-              disabled={loading}
-            >
-              {loading ? "Refreshing..." : "Refresh"}
-            </button>
-          </div>
         </div>
       </div>
 
@@ -538,7 +617,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
                 ? {
                     gridColumn: "1 / -1",
                     display: "grid",
-                    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
                     gap: "6px",
                   }
                 : {
@@ -794,7 +873,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           selectedBucket !== "all" || isNarrow ? "single-column" : "multi-column"
         }
         style={{
-          flex: 1,
+          flexShrink: 0,
           display: "grid",
           gridTemplateColumns:
             selectedBucket !== "all" || isNarrow
@@ -802,7 +881,6 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
               : "repeat(3, minmax(220px, 1fr))",
           gap: "12px",
           padding: "12px 14px",
-          overflow: "auto",
           alignItems: "stretch",
           minWidth: 0,
         }}
@@ -843,8 +921,6 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
                 background: isDragOver
                   ? "rgba(56, 189, 248, 0.06)"
                   : "var(--bg-surface, rgba(15, 23, 42, 0.4))",
-                overflow: "hidden",
-                minHeight: "220px",
                 minWidth: 0,
               }}
             >
@@ -878,13 +954,12 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
 
               {/* Swimlane Cards */}
               <div
+                data-testid={`swimlane-cards-${lane.state}`}
                 style={{
-                  flex: 1,
                   padding: "10px",
                   display: "flex",
                   flexDirection: "column",
                   gap: "8px",
-                  overflowY: "auto",
                 }}
               >
                 {laneRecords.length === 0 ? (

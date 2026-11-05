@@ -219,7 +219,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     const cmdInput = screen.getByLabelText("Shell Command") as HTMLInputElement;
     expect(cmdInput.style.width).toBe("100%");
     const cmdForm = cmdInput.closest("form") as HTMLFormElement;
-    expect(cmdForm.style.flexDirection).toBe("column");
+    expect(cmdForm.style.flexDirection).toBe("row");
     unmountTerm();
 
     // 3. HubDrawer: Workflow Definition occupies full row (1 1 100%)
@@ -859,8 +859,17 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(tabBar).toHaveStyle({ flexShrink: "0" });
     expect(scrollBody).toHaveStyle({ overflowY: "auto" });
 
-    // 1. Agents sub-tabs
-    expect(screen.getByTestId("agents-subtab-bar")).toBeInTheDocument();
+    // 1. Agents sub-tabs (non-sticky sub-tab bar and unified single scroll container without nested overflowY: auto)
+    const agentsSubTabBar = screen.getByTestId("agents-subtab-bar");
+    expect(agentsSubTabBar).toBeInTheDocument();
+    expect(agentsSubTabBar.style.position).toBe("");
+    const agentsList = screen.getByTestId("settings-agents-list");
+    expect(agentsList.style.maxHeight).toBe("");
+    expect(agentsList.style.overflowY).toBe("");
+    const roleRegistryList = screen.getByTestId("role-registry-list");
+    expect(roleRegistryList.style.maxHeight).toBe("");
+    expect(roleRegistryList.style.overflowY).toBe("");
+
     const rosterSubTab = screen.getByTestId("agents-subtab-roster");
     const rolesSubTab = screen.getByTestId("agents-subtab-roles");
     const cloudSessionsSubTab = screen.getByTestId("agents-subtab-cloud-sessions");
@@ -870,6 +879,10 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     const rolesPanel = screen.getByTestId("agents-subpanel-roles");
     const cloudSessionsPanel = screen.getByTestId("agents-subpanel-cloud-sessions");
     const localRuntimesPanel = screen.getByTestId("agents-subpanel-local-runtimes");
+    expect(cloudSessionsPanel.style.overflowY).toBe("");
+    expect(cloudSessionsPanel.style.maxHeight).toBe("");
+    expect(localRuntimesPanel.style.overflowY).toBe("");
+    expect(localRuntimesPanel.style.maxHeight).toBe("");
 
     expect(rosterSubTab).toHaveAttribute("aria-selected", "true");
     expect(rolesSubTab).toHaveAttribute("aria-selected", "false");
@@ -906,7 +919,9 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
 
     // 2. System sub-tabs
     fireEvent.click(screen.getByTestId("settings-tab-system"));
-    expect(screen.getByTestId("system-subtab-bar")).toBeInTheDocument();
+    const systemSubTabBar = screen.getByTestId("system-subtab-bar");
+    expect(systemSubTabBar).toBeInTheDocument();
+    expect(systemSubTabBar.style.position).toBe("");
 
     const sysGeneralTab = screen.getByTestId("system-subtab-general");
     const sysStorageTab = screen.getByTestId("system-subtab-storage");
@@ -969,9 +984,9 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       />,
     );
 
-    expect(
-      screen.getByTestId("project-settings-subtab-bar"),
-    ).toBeInTheDocument();
+    const projectSubTabBar = screen.getByTestId("project-settings-subtab-bar");
+    expect(projectSubTabBar).toBeInTheDocument();
+    expect(projectSubTabBar.style.position).toBe("");
 
     const overviewTab = screen.getByTestId("project-tab-overview");
     const agentsTab = screen.getByTestId("project-tab-agents");
@@ -1257,15 +1272,21 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       // Disabled by default on mobile (even if legacy fd_show_safe_margins was "true")
       expect(screen.queryByTestId("ios-safe-area-overlay")).toBeNull();
 
-      // Header settings button is rendered in ContextHeader when left sidebar is collapsed
-      expect(screen.getByTestId("header-settings-btn")).toBeInTheDocument();
+      // Redundant header settings button is removed from ContextHeader (Record #118)
+      expect(screen.queryByTestId("header-settings-btn")).toBeNull();
 
-      // Chat toolbar also exposes left and right panel show/hide toggles
-      expect(screen.getByTestId("chat-toolbar-left-panel-toggle")).toBeInTheDocument();
-      expect(screen.getByTestId("chat-toolbar-right-panel-toggle")).toBeInTheDocument();
+      // Top-center agent context renders identity and meta sub-rows for vertical stacking on mobile
+      const agentNav = screen.getByTestId("tier-agent-nav");
+      expect(agentNav.querySelector(".fd-tier-agent-identity")).not.toBeNull();
+      expect(agentNav.querySelector(".fd-tier-agent-meta")).not.toBeNull();
 
-      // Enable via Settings -> Appearance -> Show iOS Safe-Area Margins
-      fireEvent.click(screen.getByTestId("header-settings-btn"));
+      // Duplicate panel show/hide toggles are removed from ChatPane toolbar (kept only in ContextHeader)
+      expect(screen.queryByTestId("chat-toolbar-left-panel-toggle")).toBeNull();
+      expect(screen.queryByTestId("chat-toolbar-right-panel-toggle")).toBeNull();
+
+      // Enable via Left Sidebar -> Settings -> Appearance -> Show iOS Safe-Area Margins
+      fireEvent.click(screen.getByTestId("mobile-sidebar-toggle-btn"));
+      fireEvent.click(screen.getByTestId("settings-modal-btn"));
       fireEvent.click(screen.getByTestId("settings-tab-appearance"));
       const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
       expect(toggle.checked).toBe(false);

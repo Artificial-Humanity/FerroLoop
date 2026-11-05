@@ -755,7 +755,12 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
   };
 
   return (
-    <section className="fd-pane" data-testid="ferrostate-pane" aria-label="FerroState">
+    <section
+      className="fd-pane"
+      data-testid="ferrostate-pane"
+      aria-label="FerroState"
+      style={{ overflowY: "auto", overflowX: "hidden" }}
+    >
       <div
         style={{
           display: "flex",
@@ -768,71 +773,105 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
           flexShrink: 0,
         }}
       >
-        <strong
-          data-testid="ferrostate-pane-title"
-          style={{ fontSize: "14px", color: "var(--text-primary)" }}
+        <div
+          data-testid="ferrostate-header-top-row"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            width: "100%",
+            minWidth: 0,
+          }}
         >
-          FerroState
-        </strong>
+          <strong
+            data-testid="ferrostate-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            FerroState
+          </strong>
+          <div
+            data-testid="ferrostate-header-counts"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              marginLeft: "auto",
+              flexShrink: 0,
+            }}
+          >
+            <span className="fd-badge" data-testid="memory-count">
+              Memory {memoryCount}
+            </span>
+            <span className="fd-badge" data-testid="handoff-count">
+              Handoffs {handoffCount}
+            </span>
+          </div>
+        </div>
         <span className="fd-badge" data-testid="ferrostate-badge">
           Durable Memory, Handoffs &amp; Structural Code Index
         </span>
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-          <span className="fd-badge" data-testid="memory-count">
-            Memory {memoryCount}
-          </span>
-          <span className="fd-badge" data-testid="handoff-count">
-            Handoffs {handoffCount}
-          </span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+        <div
+          data-testid="ferrostate-actions-row"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            flexWrap: "nowrap",
+            width: "100%",
+          }}
+        >
           <button
             type="button"
             className="fd-btn"
-            style={{ minHeight: "36px" }}
+            style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
             data-testid="checkpoint-btn"
             disabled={busyCheckpoint}
             onClick={() => void handleCheckpoint()}
           >
             {busyCheckpoint ? "Saving…" : "Snapshot Checkpoint"}
           </button>
-            {isOwner &&
-              (pendingImport ? (
-                <>
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    style={{ minHeight: "36px" }}
-                    data-testid="import-workspace-confirm-btn"
-                    disabled={busyImport}
-                    onClick={() => void handleImport()}
-                  >
-                    {busyImport ? "Importing…" : "Confirm Import"}
-                  </button>
-                  <button
-                    type="button"
-                    className="fd-btn"
-                    style={{ minHeight: "36px" }}
-                    onClick={() => setPendingImport(false)}
-                  >
-                    Cancel
-                  </button>
-                </>
-              ) : (
+          {isOwner &&
+            (pendingImport ? (
+              <>
+                <button
+                  type="button"
+                  className="fd-btn fd-btn-primary"
+                  style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                  data-testid="import-workspace-confirm-btn"
+                  disabled={busyImport}
+                  onClick={() => void handleImport()}
+                >
+                  {busyImport ? "Importing…" : "Confirm Import"}
+                </button>
                 <button
                   type="button"
                   className="fd-btn"
-                  style={{ minHeight: "36px" }}
-                  data-testid="import-workspace-btn"
-                  onClick={() => setPendingImport(true)}
+                  style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                  onClick={() => setPendingImport(false)}
                 >
-                  Import Workspace (.agents/memory &amp; Notes)
+                  Cancel
                 </button>
-              ))}
-          </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="fd-btn"
+                style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                data-testid="import-workspace-btn"
+                title="Import Workspace (.agents/memory & Notes)"
+                onClick={() => setPendingImport(true)}
+              >
+                Import Workspace
+              </button>
+            ))}
+        </div>
       </div>
 
-      <div className="fd-scroll" style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+      <div
+        data-testid="ferrostate-body"
+        style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: "20px" }}
+      >
         <div
           data-testid="token-gain-bar"
           className="fd-card"

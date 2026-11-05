@@ -309,10 +309,40 @@ export const RuntimesQuotasPanel: React.FC<RuntimesQuotasPanelProps> = ({ apiCli
             type="button"
             className="fd-btn"
             data-testid="runtimes-refresh-btn"
+            aria-label={loading ? "Loading…" : "Refresh"}
+            title="Refresh"
             disabled={busy}
             onClick={() => void load()}
+            style={{ padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
           >
-            {loading ? "Loading…" : "Refresh"}
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M13.5 8A5.5 5.5 0 0 1 3.7 11.45"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+              />
+              <path
+                d="M2.5 8A5.5 5.5 0 0 1 12.3 4.55"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+              />
+              <polyline
+                points="10.2 4.8 12.5 4.7 12.2 2.4"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <polyline
+                points="5.8 11.2 3.5 11.3 3.8 13.6"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
           </button>
         </div>
         {QUOTA_VENDORS.map(({ adapter, label }) => {

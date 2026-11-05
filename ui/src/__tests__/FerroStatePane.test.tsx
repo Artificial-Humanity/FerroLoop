@@ -332,7 +332,17 @@ describe("FerroStatePane", () => {
     render(<FerroStatePane authority={OWNER} apiClient={client} />);
     await screen.findByTestId("state-entry-pr-review-policy");
 
-    fireEvent.click(screen.getByTestId("import-workspace-btn"));
+    const pane = screen.getByTestId("ferrostate-pane");
+    expect(pane.style.overflowY).toBe("auto");
+    expect(pane.style.overflowX).toBe("hidden");
+    expect(screen.getByTestId("ferrostate-body")).not.toHaveClass("fd-scroll");
+
+    const actionsRow = screen.getByTestId("ferrostate-actions-row");
+    expect(actionsRow.style.flexWrap).toBe("nowrap");
+    const importBtn = screen.getByTestId("import-workspace-btn");
+    expect(importBtn).toHaveTextContent("Import Workspace");
+
+    fireEvent.click(importBtn);
     expect(
       calls.some((c) => c.url === "/api/v1/state/import-workspace"),
     ).toBe(false);

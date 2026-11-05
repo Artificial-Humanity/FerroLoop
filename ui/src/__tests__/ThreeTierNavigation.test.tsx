@@ -392,4 +392,60 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
 
     unmount();
   });
+
+  it("Record #118: omits header-settings-btn and structures tier-agent-nav with .fd-tier-agent-identity and .fd-tier-agent-meta sub-rows", () => {
+    const ferris = DEFAULT_WORKSPACE_AGENTS.find((a) => a.name_key === "ferris")!;
+    render(
+      <ContextHeader
+        selectedAgent={ferris}
+        sessions={[
+          {
+            id: "sess-ferris-1",
+            source: "route",
+            persona: "ferris",
+            adapter: "antigravity",
+            status: "active",
+            cwd: "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop",
+          },
+        ]}
+        selectedSessionId="sess-ferris-1"
+        onSelectSession={vi.fn()}
+        activeTab="chat"
+        onSelectTab={vi.fn()}
+        splitView={false}
+        onToggleSplitView={vi.fn()}
+        themeMode="dark"
+        onToggleTheme={vi.fn()}
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        wsConnected={true}
+        onlineNodesCount={1}
+        onOpenNodesModal={vi.fn()}
+        onOpenSettingsModal={vi.fn()}
+        onOpenAgentSettings={vi.fn()}
+        onOpenSpinUpModal={vi.fn()}
+        onOpenPairingModal={vi.fn()}
+        mobileSidebarOpen={false}
+      />,
+    );
+
+    expect(screen.queryByTestId("header-settings-btn")).toBeNull();
+
+    const agentNav = screen.getByTestId("tier-agent-nav");
+    const identityRow = within(agentNav).getByTestId("tier-agent-identity");
+    const metaRow = within(agentNav).getByTestId("tier-agent-meta");
+
+    expect(identityRow).toHaveClass("fd-tier-agent-identity");
+    expect(within(identityRow).getByText("Ferris")).toBeInTheDocument();
+    expect(within(identityRow).getByText(/lead/i)).toBeInTheDocument();
+
+    expect(metaRow).toHaveClass("fd-tier-agent-meta");
+    expect(within(metaRow).getByText("antigravity")).toBeInTheDocument();
+    expect(within(metaRow).getByTestId("active-project-badge")).toHaveTextContent(
+      "FerroLoop",
+    );
+
+    const systemNav = screen.getByTestId("tier-system-nav");
+    expect(systemNav.style.position).toBe("absolute");
+    expect(systemNav.style.clip).toBe("rect(0px, 0px, 0px, 0px)");
+  });
 });
