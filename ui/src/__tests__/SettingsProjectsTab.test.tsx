@@ -250,7 +250,7 @@ describe("Settings Projects tab", () => {
       screen.getByTestId("settings-project-view-agents-research-group"),
     );
     expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
-      "research-group",
+      "Research Group",
     );
   });
 
@@ -477,6 +477,71 @@ describe("Settings Projects tab", () => {
       expect(screen.queryByTestId("new-project-modal")).toBeNull();
       fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
       expect(screen.getByTestId("new-project-modal")).toBeInTheDocument();
+    });
+
+    describe("View Agents on a project that was just created", () => {
+      const FRESH: ProjectSummary = {
+        ...PLAIN,
+        id: "fresh",
+        slug: "fresh",
+        name: "Fresh Start",
+        path: "/work/fresh",
+        purpose: null,
+      };
+      const agentsFor = (project: string, key: string) => ({
+        id: `urn:fl:agent:${key}`,
+        name_key: key,
+        display_name: key,
+        project,
+        role: "assistant",
+        status: "active" as const,
+      });
+
+      async function createFresh(client: HubApiClient) {
+        await openProjectsTab();
+        fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+        fireEvent.change(screen.getByTestId("new-project-name"), {
+          target: { value: "Fresh Start" },
+        });
+        fireEvent.change(screen.getByTestId("new-project-path"), {
+          target: { value: "/work/fresh" },
+        });
+        await act(async () => {
+          fireEvent.click(screen.getByTestId("new-project-submit"));
+        });
+        void client;
+        fireEvent.click(screen.getByTestId("settings-project-view-agents-fresh"));
+      }
+
+      const expectFiltered = () => {
+        expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
+          "Fresh Start",
+        );
+        expect(screen.getByTestId("settings-agent-row-nova")).toBeInTheDocument();
+        expect(screen.queryByTestId("settings-agent-row-orion")).toBeNull();
+      };
+
+      it("filters by the new project while the shared list has not caught up", async () => {
+        const { client } = makeClient([PLAIN], createHandler(FRESH));
+        await renderModal(client, {
+          projects: [PLAIN],
+          projectsFromHub: true,
+          refreshProjects: vi.fn(async () => {}),
+          projectsLoaded: true,
+          agents: [agentsFor("fresh", "nova"), agentsFor("sonora", "orion")],
+        });
+        await createFresh(client);
+        expectFiltered();
+      });
+
+      it("works in standalone mode without shared props", async () => {
+        const { client } = makeClient([PLAIN], createHandler(FRESH));
+        await renderModal(client, {
+          agents: [agentsFor("fresh", "nova"), agentsFor("sonora", "orion")],
+        });
+        await createFresh(client);
+        expectFiltered();
+      });
     });
 
     it("shows the new card and calls onProjectsChanged once after a create", async () => {
@@ -1046,7 +1111,7 @@ describe("Settings Projects tab", () => {
       });
       fireEvent.click(screen.getByTestId("settings-tab-agents"));
       expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
-        "research-group",
+        "Research Group",
       );
     });
 

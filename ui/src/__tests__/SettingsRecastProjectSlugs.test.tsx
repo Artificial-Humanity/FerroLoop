@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { HubApiClient } from "../api/client";
@@ -23,6 +23,9 @@ function summary(slug: string, name: string): ProjectSummary {
 
 const FELIX = summary("felix-ui", "Felix UI");
 const SONORA = summary("sonora", "Sonora");
+const VOICE = summary("sonora-voice", "Sonora Voice");
+const FERRO = summary("ferroloop", "FerroLoop");
+const ALL = [FELIX, SONORA, VOICE, FERRO];
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -74,7 +77,7 @@ async function flush() {
 }
 
 describe("SettingsModal Re-Cast project slugs", () => {
-  async function openRecast(project: string) {
+  async function openRecast(project: string, list: ProjectSummary[] = [FELIX, SONORA]) {
     const { client, calls } = makeClient();
     render(
       <SettingsModal
@@ -83,7 +86,7 @@ describe("SettingsModal Re-Cast project slugs", () => {
         authority={{ tier: "owner", login: "lmcfarlin" }}
         apiClient={client}
         agents={[agent(project)]}
-        projects={[FELIX, SONORA]}
+        projects={list}
       />,
     );
     await flush();
@@ -125,10 +128,34 @@ describe("SettingsModal Re-Cast project slugs", () => {
     });
     expect(recastCall(calls)?.body.project).toBe("old-lab");
   });
+
+  it("sends the slug of a project the agent holds by display name, select untouched", async () => {
+    for (const [project, slug] of [
+      ["Sonora Voice", "sonora-voice"],
+      ["FerroLoop", "ferroloop"],
+      ["sonora voice", "sonora-voice"],
+    ]) {
+      const { calls, select } = await openRecast(project, ALL);
+      expect(select).toHaveValue(slug);
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("recast-submit-btn-ferris"));
+      });
+      expect(recastCall(calls)?.body.project).toBe(slug);
+      cleanup();
+    }
+  });
+
+  it("sends an unknown project unchanged", async () => {
+    const { calls } = await openRecast("Mystery Lab", ALL);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("recast-submit-btn-ferris"));
+    });
+    expect(recastCall(calls)?.body.project).toBe("Mystery Lab");
+  });
 });
 
 describe("AgentSettingsModal Re-Cast project slugs", () => {
-  async function openRecast(project: string) {
+  async function openRecast(project: string, list: ProjectSummary[] = [FELIX, SONORA]) {
     const { client, calls } = makeClient();
     render(
       <AgentSettingsModal
@@ -154,7 +181,7 @@ describe("AgentSettingsModal Re-Cast project slugs", () => {
         decommissioning={false}
         onOpenDecommissionModal={() => {}}
         apiClient={client}
-        projects={[FELIX, SONORA]}
+        projects={list}
       />,
     );
     await flush();
@@ -188,6 +215,30 @@ describe("AgentSettingsModal Re-Cast project slugs", () => {
       fireEvent.click(screen.getByTestId("recast-submit-btn-ferris"));
     });
     expect(recastCall(calls)?.body.project).toBe("old-lab");
+  });
+
+  it("sends the slug of a project the agent holds by display name, select untouched", async () => {
+    for (const [project, slug] of [
+      ["Sonora Voice", "sonora-voice"],
+      ["FerroLoop", "ferroloop"],
+      ["sonora voice", "sonora-voice"],
+    ]) {
+      const { calls, select } = await openRecast(project, ALL);
+      expect(select).toHaveValue(slug);
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("recast-submit-btn-ferris"));
+      });
+      expect(recastCall(calls)?.body.project).toBe(slug);
+      cleanup();
+    }
+  });
+
+  it("sends an unknown project unchanged", async () => {
+    const { calls } = await openRecast("Mystery Lab", ALL);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("recast-submit-btn-ferris"));
+    });
+    expect(recastCall(calls)?.body.project).toBe("Mystery Lab");
   });
 });
 

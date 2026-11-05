@@ -57,7 +57,8 @@ export interface ProjectChoice {
 
 /**
  * The options of a project dropdown that sends a slug (`value`) and shows a name (`label`),
- * plus the value that stands for `current`. A `current` project that is not in the list (a
+ * plus the value that stands for `current`: the slug of the choice it matches by slug or, failing
+ * that, by display name (case-insensitive). A `current` project that is not in the list (a
  * legacy agent project) is listed first, as itself, and kept as the raw value.
  */
 export function projectChoices(
@@ -73,7 +74,11 @@ export function projectChoices(
     if (!choices.some((c) => c.value === e.value)) choices.push(e);
   }
   const raw = current ?? "";
-  const match = choices.find((c) => c.value === raw.trim().toLowerCase());
+  const key = raw.trim().toLowerCase();
+  // A slug first, then a display name: an agent may hold "Sonora Voice" for `sonora-voice`.
+  const match =
+    choices.find((c) => c.value === key) ??
+    choices.find((c) => c.label.trim().toLowerCase() === key);
   if (match) return { choices, value: match.value };
   if (raw) choices.unshift({ value: raw, label: raw });
   return { choices, value: raw };

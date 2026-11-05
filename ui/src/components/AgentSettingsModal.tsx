@@ -562,8 +562,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastStatusBanner(null);
     try {
       const client = apiClient ?? new HubApiClient();
+      // Send what the select shows: the slug of the matched project, else the raw value.
       const res = await client.recastAgent(agentKey, {
-        project: recastProject,
+        project: projectChoices(projects, recastProject).value,
         role: effectiveRole,
         replace_lead: confirmOverrides
           ? (recastConflict ? recastConflict.replaceLead : true)

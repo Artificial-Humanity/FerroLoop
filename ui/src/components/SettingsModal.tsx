@@ -1538,6 +1538,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     if (sharedProjectList && projectsFromHub) setProjectList([...sharedProjects]);
   }, [sharedProjectList, projectsFromHub, sharedProjects]);
+  // One list for the filter and slug resolution: the shared list in its order, each entry
+  // replaced by the modal's own (fresher after a create or rename), then entries only the
+  // modal knows. The shared list lags until its refresh lands and is absent when standalone.
+  const effectiveProjects = useMemo<ProjectSummary[]>(() => {
+    const own = new Map(
+      projectList.map((p) => [p.slug.trim().toLowerCase(), p] as const),
+    );
+    const seen = new Set<string>();
+    const out: ProjectSummary[] = [];
+    for (const p of sharedProjects) {
+      const key = p.slug.trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(own.get(key) ?? p);
+    }
+    for (const p of projectList) {
+      const key = p.slug.trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(p);
+    }
+    return out;
+  }, [sharedProjects, projectList]);
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
   const [ownProjectManagement, setOwnProjectManagement] = useState<
@@ -1941,12 +1964,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [propAgents, loadedAgents]);
 
   const projectOptions = useMemo<string[]>(() => {
-    const out: string[] = [...baseProjectOptions];
+    const out: string[] = projectOptionLabels(effectiveProjects);
     const addProjectOption = (raw?: string | null) => {
       const trimmed = (raw ?? "").trim();
       if (!trimmed || trimmed.toLowerCase() === "all") return;
       // An agent's project is a slug; list it under the project's display name.
-      const known = findProject(sharedProjects, trimmed);
+      const known = findProject(effectiveProjects, trimmed);
       const label = known ? projectLabel(known) : trimmed;
       const lower = label.toLowerCase();
       if (!out.some((opt) => opt.toLowerCase() === lower)) {
@@ -1960,8 +1983,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     addProjectOption(selectedProjectFilter);
     return out;
   }, [
-    baseProjectOptions,
-    sharedProjects,
+    effectiveProjects,
     effectiveAgents,
     initialProject,
     selectedProjectFilter,
@@ -1972,26 +1994,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       resolveProjectFilterValue(
         selectedProjectFilter,
         projectOptions,
-        sharedProjects,
+        effectiveProjects,
       ),
-    [selectedProjectFilter, projectOptions, sharedProjects],
+    [selectedProjectFilter, projectOptions, effectiveProjects],
   );
 
   // A project that leaves the shared list (deleted here or elsewhere) must not stay the
   // active filter; a renamed one stays, under its new label. The filter holds a label, so
   // the slug of the filtered project is remembered from the list that still had it.
   const filterSlugRef = useRef<string | null>(null);
-  const previousProjectsRef = useRef<readonly ProjectSummary[]>(sharedProjects);
+  const previousProjectsRef = useRef<readonly ProjectSummary[]>(effectiveProjects);
   useEffect(() => {
     const previous = previousProjectsRef.current;
-    previousProjectsRef.current = sharedProjects;
+    previousProjectsRef.current = effectiveProjects;
     const active = selectedProjectFilter.trim();
     if (!active || active.toLowerCase() === "all") {
       filterSlugRef.current = null;
       return;
     }
-    const inCurrent = findProject(sharedProjects, active);
-    if (previous === sharedProjects) {
+    const inCurrent = findProject(effectiveProjects, active);
+    if (previous === effectiveProjects) {
       if (inCurrent) filterSlugRef.current = inCurrent.slug;
       return;
     }
@@ -2002,7 +2024,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       return;
     }
     if (!slug) return;
-    const renamed = sharedProjects.find(
+    const renamed = effectiveProjects.find(
       (p) => p.slug.trim().toLowerCase() === slug.trim().toLowerCase(),
     );
     if (renamed) {
@@ -2012,14 +2034,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       filterSlugRef.current = null;
       setSelectedProjectFilter("all");
     }
-  }, [sharedProjects, selectedProjectFilter]);
+  }, [effectiveProjects, selectedProjectFilter]);
 
   const filteredAgents = useMemo<AgentRecord[]>(() => {
     if (!resolvedProjectFilter || resolvedProjectFilter === "all") {
       return effectiveAgents;
     }
     // Agents carry the project slug; the filter holds the display name.
-    const known = findProject(sharedProjects, resolvedProjectFilter);
+    const known = findProject(effectiveProjects, resolvedProjectFilter);
     const targets = new Set<string>([resolvedProjectFilter.toLowerCase()]);
     if (known) {
       targets.add(known.slug.trim().toLowerCase());
@@ -2028,7 +2050,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return effectiveAgents.filter((ag) =>
       targets.has((ag.project || "Workspace").toLowerCase()),
     );
-  }, [effectiveAgents, resolvedProjectFilter, sharedProjects]);
+  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects]);
 
   const allFilteredSelected = useMemo(() => {
     if (filteredAgents.length === 0) return false;
@@ -2139,8 +2161,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const armedConflict = recastReplaceLeadArmed[key];
     try {
       const client = apiClient ?? new HubApiClient();
+      // Send what the select shows: the slug of the matched project, else the raw value.
       const res = await client.recastAgent(key, {
-        project: draft.project,
+        project: projectChoices(effectiveProjects, draft.project, [
+          { value: WORKSPACE_PROJECT.toLowerCase(), label: WORKSPACE_PROJECT },
+        ]).value,
         role: effectiveRole,
         replace_lead: confirmOverrides
           ? (armedConflict ? armedConflict.replaceLead : true)
@@ -2338,8 +2363,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const record =
       projectsArtifactsDirs[slug] ??
       artifactsDirInfoFromProject(
-        projectList.find((p) => p.slug.trim().toLowerCase() === slug) ??
-          sharedProjects.find((p) => p.slug.trim().toLowerCase() === slug),
+        effectiveProjects.find((p) => p.slug.trim().toLowerCase() === slug),
       );
     const overrideFromSettings = settings.project_artifacts_dirs?.[slug] ?? null;
     const artifactsDir =
@@ -2648,6 +2672,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const isProjectScoped =
     Boolean(initialProject) || resolvedProjectFilter !== "all";
+  const scopedProject = findProject(effectiveProjects, resolvedProjectFilter);
   const scopedProjectName =
     resolvedProjectFilter !== "all"
       ? resolvedProjectFilter
@@ -2839,14 +2864,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Project-scoped Settings has no Projects tab, so the row stays here (Issue #207) */}
-        {initialProject && (
+        {initialProject && scopedProject?.kind !== "virtual" && (
           <ProjectArtifactsDirRow
-            slug={
-              (
-                findProject(projectList, resolvedProjectFilter) ??
-                findProject(sharedProjects, resolvedProjectFilter)
-              )?.slug ?? resolvedProjectFilter
-            }
+            slug={scopedProject?.slug ?? resolvedProjectFilter}
             displayName={resolvedProjectFilter}
             artifactsDir={projectArtifactsDirProps}
           />
@@ -10149,7 +10169,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           const armedConflict = recastReplaceLeadArmed[key];
           // The hub takes a project slug; the dropdown shows the display name.
           const { choices: projectOptions, value: draftProjectValue } =
-            projectChoices(sharedProjects, draft.project, [
+            projectChoices(effectiveProjects, draft.project, [
               {
                 value: WORKSPACE_PROJECT.toLowerCase(),
                 label: WORKSPACE_PROJECT,
