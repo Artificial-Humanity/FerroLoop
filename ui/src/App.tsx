@@ -433,6 +433,7 @@ export const App: React.FC<AppProps> = ({
     fromHub: projectsFromHub,
     loaded: projectsLoaded,
     error: projectsError,
+    projectManagement,
     refresh: refreshProjects,
   } = useProjects(apiClient);
   const wsClientRef = useRef<HubWsClient | null>(null);
@@ -3216,6 +3217,7 @@ export const App: React.FC<AppProps> = ({
         refreshProjects={refreshProjects}
         projectsError={projectsError}
         projectsLoaded={projectsLoaded}
+        projectManagement={projectManagement}
         onProjectsChanged={() => void refreshProjects()}
         onDecommissionAgent={async (targetId, mode) => {
           const res = await apiClient.decommissionSession(targetId, mode);

@@ -59,8 +59,10 @@ interface DeleteProjectResponse {
 * **Artifact directories.** Every `ProjectSummary` carries `id` (equal to `slug`),
   `artifacts_dir`, `default_artifacts_dir` and `effective_artifacts_dir` (Lead, 2026-11-05), so
   one `GET /api/v1/projects` feeds both the cards and the existing artifacts-directory flow.
-  If an older hub omits them, the client falls back to
-  `GET /api/v1/projects/:id/artifacts-dir` for that entry. The create form has no
+  The UI reads the artifact information from the project list entries when they carry it
+  (including the create and edit replies, which are merged in at once), and otherwise from the
+  separate artifacts-dir list fetched when Settings opens. There is no per-entry
+  `GET /api/v1/projects/:id/artifacts-dir` fallback. The create form has no
   artifacts-directory field; the card sets it after creation.
 * The path is editable on `PATCH`. Changing it is a Directory Project action only, and the edit
   form warns that the registered directory changes while files stay where they are.
@@ -76,6 +78,8 @@ interface DeleteProjectResponse {
 * **Artifacts directory.** The per-project row moves from the Agents tab into each card. The
   change-directory modal and its handlers are reused, not rewritten. The system-level row stays
   in System.
+  Project-scoped Settings (`initialProject`) keeps the artifacts-directory row in its summary
+  card, because that view has no Projects tab.
 * **Create form.** A modal with a kind selector. `Directory Project`: name and auto-derived slug,
   directory path (required), purpose, `Initialize Git repository (git init)` (default off), GitHub
   tracker and credential (`app` or `env`). `Virtual Group / Scope`: name and slug and purpose only. The

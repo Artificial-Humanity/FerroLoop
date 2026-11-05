@@ -92,8 +92,27 @@ describe("HubApiClient projects", () => {
         artifacts_dir: null,
         default_artifacts_dir: "/a",
         effective_artifacts_dir: "/a",
+        legacy: true,
       },
       FULL,
+    ]);
+  });
+
+  it("listProjects marks only entries with no slug, name and kind as legacy", async () => {
+    const { client } = makeClient(() =>
+      json({
+        projects: [
+          { id: "old", effective_artifacts_dir: "/a/old" },
+          { id: "named", name: "Named" },
+          FULL,
+        ],
+      }),
+    );
+    const out = await client.listProjects();
+    expect(out.map((p) => [p.slug, p.legacy === true])).toEqual([
+      ["old", true],
+      ["named", false],
+      ["ferro", false],
     ]);
   });
 

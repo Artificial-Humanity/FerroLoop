@@ -676,6 +676,8 @@ function normalizeProjectEntry(entry: unknown): ProjectSummary | null {
         : "";
   if (!slug) return null;
   const isLegacy = typeof e.slug !== "string" || !e.slug;
+  // An older hub's entry: nothing but an id and artifact directories.
+  const marksLegacy = isLegacy && !e.name && !e.kind;
   const out: ProjectSummary = isLegacy
     ? {
         id: slug,
@@ -690,6 +692,7 @@ function normalizeProjectEntry(entry: unknown): ProjectSummary | null {
         active_agent_count: 0,
       }
     : { ...(e as unknown as ProjectSummary), id: slug, slug };
+  if (marksLegacy) out.legacy = true;
   // Artifact-directory fields pass through when present; they are never invented.
   if (e.artifacts_dir === null || typeof e.artifacts_dir === "string") {
     out.artifacts_dir = e.artifacts_dir;
@@ -1547,7 +1550,8 @@ export class HubApiClient {
 
   /**
    * Project entries for the Projects tab and the shared project list. An older hub answers with
-   * `{id, ...artifact dirs}` entries only; those map to a plain directory project.
+   * `{id, ...artifact dirs}` entries only; those map to a plain directory project and carry
+   * `legacy: true`, so callers can tell that the hub cannot manage projects.
    */
   public async listProjects(): Promise<ProjectSummary[]> {
     const res = await this.request<{ projects?: unknown }>("/api/v1/projects");

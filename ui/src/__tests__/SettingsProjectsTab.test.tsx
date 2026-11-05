@@ -1050,4 +1050,240 @@ describe("Settings Projects tab", () => {
       expect(screen.queryByTestId("delete-project-modal")).toBeNull();
     });
   });
+
+  describe("older hubs without project management", () => {
+    const LEGACY_ENTRIES = [
+      { id: "ferroloop", artifacts_dir: null, default_artifacts_dir: "/a/ferroloop", effective_artifacts_dir: "/a/ferroloop" },
+      { id: "sonora", artifacts_dir: null, default_artifacts_dir: "/a/sonora", effective_artifacts_dir: "/a/sonora" },
+    ];
+    const NOTICE =
+      "This hub does not support project management. Update the hub to create, edit or delete projects.";
+
+    it("shows the notice and no cards or Create for a legacy reply", async () => {
+      const { client } = makeClient(LEGACY_ENTRIES as unknown as ProjectSummary[]);
+      await renderModal(client);
+      await openProjectsTab();
+      expect(screen.getByTestId("settings-projects-unsupported")).toHaveTextContent(NOTICE);
+      expect(screen.queryByTestId("settings-project-card-ferroloop")).toBeNull();
+      expect(screen.queryByTestId("settings-projects-create-btn")).toBeNull();
+      expect(screen.queryByTestId("settings-projects-empty")).toBeNull();
+      expect(screen.queryByTestId("settings-projects-error")).toBeNull();
+    });
+
+    it("shows the same notice when the endpoint answers 404", async () => {
+      const { client } = makeClient([], () => json({ error: "not found" }, 404));
+      await renderModal(client);
+      await openProjectsTab();
+      expect(screen.getByTestId("settings-projects-unsupported")).toHaveTextContent(NOTICE);
+      expect(screen.queryByTestId("settings-projects-error")).toBeNull();
+      expect(screen.queryByTestId("settings-projects-create-btn")).toBeNull();
+    });
+
+    it("does not flash the notice before the first load completes", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((res) => {
+        release = res;
+      });
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/projects") && (init?.method ?? "GET") === "GET") {
+          await gate;
+          return json({ projects: [PLAIN] });
+        }
+        return json({});
+      });
+      const client = new HubApiClient({
+        baseUrl: "http://hub.test",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+      await renderModal(client);
+      await openProjectsTab();
+      expect(screen.queryByTestId("settings-projects-unsupported")).toBeNull();
+      expect(screen.getByTestId("settings-projects-loading")).toBeInTheDocument();
+      await act(async () => {
+        release();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.queryByTestId("settings-projects-unsupported")).toBeNull();
+      expect(screen.getByTestId("settings-project-card-sonora")).toBeInTheDocument();
+    });
+
+    it("renders only the notice when the tab is told management is unsupported", () => {
+      render(
+        <ProjectsSettingsTab
+          projects={[PLAIN]}
+          loading={false}
+          error={null}
+          projectManagement="unsupported"
+          onViewAgents={vi.fn()}
+          artifactsDir={{
+            getState: () => ({ effectiveDir: "/x", artifactsDir: null }),
+            onChange: vi.fn(),
+            status: null,
+          }}
+        />,
+      );
+      expect(screen.getByTestId("settings-projects-unsupported")).toBeInTheDocument();
+      expect(screen.queryByTestId("settings-project-card-sonora")).toBeNull();
+      expect(screen.queryByTestId("settings-projects-create-btn")).toBeNull();
+      expect(screen.queryByTestId("settings-project-edit-sonora")).toBeNull();
+      expect(screen.queryByTestId("settings-project-delete-sonora")).toBeNull();
+    });
+  });
+
+  describe("tab states", () => {
+    const noDirs = {
+      getState: () => ({ effectiveDir: "/x", artifactsDir: null }),
+      onChange: vi.fn(),
+      status: null,
+    };
+
+    it("shows a failed refresh as a banner above the cards when a list exists", () => {
+      render(
+        <ProjectsSettingsTab
+          projects={[PLAIN]}
+          loading={false}
+          error="boom"
+          onViewAgents={vi.fn()}
+          artifactsDir={noDirs}
+        />,
+      );
+      const banner = screen.getByTestId("settings-projects-error");
+      const card = screen.getByTestId("settings-project-card-sonora");
+      expect(banner).toHaveTextContent("Could not load projects: boom");
+      expect(
+        banner.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it("shows only the error when there is no list at all", () => {
+      render(
+        <ProjectsSettingsTab
+          projects={[]}
+          loading={false}
+          error="boom"
+          onViewAgents={vi.fn()}
+          artifactsDir={noDirs}
+        />,
+      );
+      expect(screen.getByTestId("settings-projects-error")).toBeInTheDocument();
+      expect(screen.queryByTestId("settings-projects-empty")).toBeNull();
+      expect(screen.queryByTestId("settings-project-card-sonora")).toBeNull();
+    });
+
+    it("matches the artifacts status to a card with an uppercase slug", () => {
+      render(
+        <ProjectsSettingsTab
+          projects={[{ ...PLAIN, id: "Sonora-X", slug: "Sonora-X" }]}
+          loading={false}
+          error={null}
+          onViewAgents={vi.fn()}
+          artifactsDir={{
+            ...noDirs,
+            status: { slug: "sonora-x", message: "Updated Sonora artifacts directory." },
+          }}
+        />,
+      );
+      expect(screen.getByTestId("project-artifacts-dir-status")).toHaveTextContent(
+        "Updated Sonora artifacts directory.",
+      );
+    });
+  });
+
+  describe("artifacts directories by slug", () => {
+    const FOO: ProjectSummary = {
+      id: "foo-bar",
+      slug: "foo-bar",
+      name: "Foo Bar",
+      kind: "project",
+      path: "/work/foo-bar",
+      has_git: false,
+      purpose: null,
+      tracker: null,
+      store_path: null,
+      active_agent_count: 0,
+      artifacts_dir: null,
+      default_artifacts_dir: "/art/foo-bar",
+      effective_artifacts_dir: "/art/foo-bar",
+    };
+
+    it("keys the project-scoped artifacts row by slug, not by the display name", async () => {
+      const { client, calls } = makeClient([FOO], (url, method, body) => {
+        if (url.endsWith("/api/v1/projects/foo-bar/artifacts-dir") && method === "POST") {
+          const b = body as { new_path: string | null };
+          return json({
+            artifacts_dir: b.new_path,
+            default_artifacts_dir: "/art/foo-bar",
+            effective_artifacts_dir: b.new_path,
+            migrated_files: 0,
+            migrated_bytes: 0,
+          });
+        }
+        return null;
+      });
+      await renderModal(client, {
+        initialProject: "Foo Bar",
+        projects: [FOO],
+        projectsFromHub: true,
+        refreshProjects: vi.fn(async () => {}),
+        projectsLoaded: true,
+      });
+      const row = screen.getByTestId("settings-project-artifacts-dir-row");
+      expect(within(row).getByTestId("settings-project-artifacts-dir-value")).toHaveTextContent(
+        "/art/foo-bar",
+      );
+      fireEvent.click(within(row).getByTestId("settings-project-change-artifacts-dir-btn"));
+      fireEvent.change(screen.getByTestId("change-artifacts-dir-new-path"), {
+        target: { value: "/mnt/foo" },
+      });
+      fireEvent.click(screen.getByTestId("change-artifacts-dir-migrate-checkbox"));
+      fireEvent.click(screen.getByTestId("change-artifacts-dir-confirm-btn"));
+      await within(row).findByTestId("project-artifacts-dir-status");
+      const post = calls.find((c) => c.method === "POST" && c.url.includes("artifacts-dir"));
+      expect(post?.url).toBe("http://hub.test/api/v1/projects/foo-bar/artifacts-dir");
+    });
+
+    it("shows the artifacts directory of a project created after Settings opened", async () => {
+      const created: ProjectSummary = {
+        ...FOO,
+        id: "fresh",
+        slug: "fresh",
+        name: "Fresh",
+        default_artifacts_dir: "/data/art/fresh-default",
+        effective_artifacts_dir: "/data/art/new",
+      };
+      const { client } = makeClient([PLAIN], (url, method) =>
+        url.endsWith("/api/v1/projects") && method === "POST" ? json(created, 201) : null,
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.change(screen.getByTestId("new-project-name"), { target: { value: "Fresh" } });
+      fireEvent.change(screen.getByTestId("new-project-path"), { target: { value: "/work/fresh" } });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      const card = screen.getByTestId("settings-project-card-fresh");
+      expect(within(card).getByTestId("settings-project-artifacts-dir-value")).toHaveTextContent(
+        "/data/art/new",
+      );
+    });
+
+    it("seeds a card from its list entry when the artifacts list has no record for it", async () => {
+      const late = { ...FOO, id: "late", slug: "late", name: "Late", effective_artifacts_dir: "/data/art/late" };
+      const { client } = makeClient([PLAIN]);
+      await renderModal(client, {
+        projects: [PLAIN, late],
+        projectsFromHub: true,
+        refreshProjects: vi.fn(async () => {}),
+        projectsLoaded: true,
+      });
+      await openProjectsTab();
+      const card = screen.getByTestId("settings-project-card-late");
+      expect(within(card).getByTestId("settings-project-artifacts-dir-value")).toHaveTextContent(
+        "/data/art/late",
+      );
+    });
+  });
 });

@@ -184,4 +184,69 @@ describe("project helpers", () => {
     expect(findProject(list, "all")).toBeUndefined();
     expect(findProject(list, null)).toBeUndefined();
   });
+
+  describe("projectManagement", () => {
+    const legacy = (slug: string): ProjectSummary => ({ ...project(slug), name: slug, legacy: true });
+
+    it("is available before the first load completes and for a new-style reply", async () => {
+      const pending = deferred<ProjectSummary[]>();
+      const { result } = renderHook(() => useProjects({ listProjects: () => pending.promise }));
+      expect(result.current.loaded).toBe(false);
+      expect(result.current.projectManagement).toBe("available");
+      await act(async () => {
+        pending.resolve([project("alpha", "Alpha")]);
+      });
+      expect(result.current.projectManagement).toBe("available");
+      expect(result.current.fromHub).toBe(true);
+    });
+
+    it("treats a reply where every entry is legacy as no management support", async () => {
+      const listProjects = vi.fn(async () => [legacy("ferroloop"), legacy("sonora")]);
+      const { result } = renderHook(() => useProjects({ listProjects }));
+      await waitFor(() => expect(result.current.loaded).toBe(true));
+      expect(result.current.projectManagement).toBe("unsupported");
+      expect(result.current.fromHub).toBe(false);
+      expect(result.current.error).toBeNull();
+      expect(result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+      expect(projectLabels(result.current.projects)).toContain("FerroLoop");
+    });
+
+    it("keeps a mixed reply as a normal list", async () => {
+      const listProjects = vi.fn(async () => [legacy("ferroloop"), project("alpha", "Alpha")]);
+      const { result } = renderHook(() => useProjects({ listProjects }));
+      await waitFor(() => expect(result.current.loaded).toBe(true));
+      expect(result.current.projectManagement).toBe("available");
+      expect(result.current.fromHub).toBe(true);
+    });
+
+    it.each([404, 405])("is unsupported on a %i", async (status) => {
+      const listProjects = vi.fn(async () => {
+        throw new HubApiError(status, "nope");
+      });
+      const { result } = renderHook(() => useProjects({ listProjects }));
+      await waitFor(() => expect(result.current.loaded).toBe(true));
+      expect(result.current.projectManagement).toBe("unsupported");
+    });
+
+    it("is unsupported when the client has no listProjects method", async () => {
+      const { result } = renderHook(() => useProjects({}));
+      await waitFor(() => expect(result.current.loaded).toBe(true));
+      expect(result.current.projectManagement).toBe("unsupported");
+    });
+
+    it("stays available for an empty reply and for a server error", async () => {
+      const empty = renderHook(() => useProjects({ listProjects: async () => [] }));
+      await waitFor(() => expect(empty.result.current.loaded).toBe(true));
+      expect(empty.result.current.projectManagement).toBe("available");
+      const failing = renderHook(() =>
+        useProjects({
+          listProjects: async () => {
+            throw new HubApiError(500, "boom");
+          },
+        }),
+      );
+      await waitFor(() => expect(failing.result.current.loaded).toBe(true));
+      expect(failing.result.current.projectManagement).toBe("available");
+    });
+  });
 });

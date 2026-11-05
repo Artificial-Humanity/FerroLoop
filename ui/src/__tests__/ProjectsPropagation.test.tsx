@@ -35,7 +35,7 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-type ProjectsMode = "ok" | "error" | "missing";
+type ProjectsMode = "ok" | "error" | "missing" | "legacy";
 
 /** A fake hub: the project list lives in `state.projects` and POST/DELETE change it. */
 function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
@@ -66,6 +66,17 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
       if (method === "GET") {
         if (state.mode === "error") return json({ error: "boom" }, 500);
         if (state.mode === "missing") return json({ error: "not found" }, 404);
+        if (state.mode === "legacy") {
+          // The hub that predates project management: ids and artifact directories only.
+          return json({
+            projects: state.projects.map((p) => ({
+              id: p.slug,
+              artifacts_dir: null,
+              default_artifacts_dir: `/art/${p.slug}`,
+              effective_artifacts_dir: `/art/${p.slug}`,
+            })),
+          });
+        }
         return json({ projects: state.projects });
       }
     }
@@ -283,40 +294,59 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(spinUpOptions()).toEqual(["ferroloop", "sonora"]);
   });
 
-  it("follows a renamed project in the Agents filter and resets it on delete", async () => {
-    const { client } = makeHub([FERRO, SONORA, COUNCIL]);
+  it("follows a project renamed on the hub in the Agents filter", async () => {
+    const table = summary("council", "The Council", "virtual");
+    const { client, state } = makeHub([FERRO, SONORA, table]);
     await renderApp(client);
     await openSettings();
-    await openProjectsTab();
 
-    fireEvent.click(screen.getByTestId("settings-project-view-agents-council"));
-    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Council");
-    fireEvent.click(screen.getByTestId("settings-tab-projects"));
+    // Pick the project by its label, the way a user does.
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
+      target: { value: "The Council" },
+    });
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("The Council");
 
-    fireEvent.click(screen.getByTestId("settings-project-edit-council"));
-    fireEvent.change(screen.getByTestId("edit-project-name"), {
-      target: { value: "Round Table" },
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("edit-project-submit"));
-    });
-    await waitFor(() => expect(screen.queryByTestId("edit-project-modal")).toBeNull());
-    await waitFor(() =>
-      expect(screen.getByTestId("settings-project-card-council")).toHaveTextContent(
-        "Round Table",
-      ),
+    // Someone else renames it on the hub; the next refresh in this session picks it up.
+    state.projects = state.projects.map((p) =>
+      p.slug === "council" ? { ...p, name: "Round Table" } : p,
     );
+    await openProjectsTab();
+    fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+    fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+    fireEvent.change(screen.getByTestId("new-project-name"), { target: { value: "Zeta" } });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("new-project-submit"));
+    });
+    await waitFor(() => expect(screen.queryByTestId("new-project-modal")).toBeNull());
+    await waitFor(() =>
+      expect(screen.getByTestId("project-group-zeta")).toBeInTheDocument(),
+    );
+
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
     await waitFor(() => expect(filterOptions()).toContain("Round Table"));
+    expect(filterOptions()).not.toContain("The Council");
     expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Round Table");
+  });
 
-    fireEvent.click(screen.getByTestId("settings-tab-projects"));
-    fireEvent.click(screen.getByTestId("settings-project-delete-council"));
-    await act(async () => {
-      fireEvent.click(screen.getByTestId("delete-project-submit"));
+  it("resets the Agents filter when the project it points at is deleted elsewhere", async () => {
+    const table = summary("council", "The Council", "virtual");
+    const { client, state } = makeHub([FERRO, SONORA, table]);
+    await renderApp(client);
+    await openSettings();
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
+      target: { value: "The Council" },
     });
+    state.projects = state.projects.filter((p) => p.slug !== "council");
+    await openProjectsTab();
+    fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+    fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+    fireEvent.change(screen.getByTestId("new-project-name"), { target: { value: "Zeta" } });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("new-project-submit"));
+    });
+    await waitFor(() => expect(screen.getByTestId("project-group-zeta")).toBeInTheDocument());
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
-    await waitFor(() => expect(filterOptions()).not.toContain("Round Table"));
+    await waitFor(() => expect(filterOptions()).not.toContain("The Council"));
     expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("all");
   });
 
@@ -398,5 +428,44 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(spinUpOptions()).toContain("council");
     // The filtered project is preselected.
     expect(screen.getByTestId("spin-up-project-select")).toHaveValue("council");
+  });
+
+  it.each<[string, ProjectsMode]>([
+    ["a legacy reply", "legacy"],
+    ["a 404", "missing"],
+  ])("shows the unsupported notice and keeps the built-in labels on %s", async (_label, mode) => {
+    const { client } = makeHub([FERRO, SONORA], mode);
+    await renderApp(client);
+
+    // No empty groups from the hub's ids; the agent's own group is still there.
+    expect(screen.getByTestId("project-group-ferroloop")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-group-sonora")).toBeNull();
+    expect(screen.queryByTestId("project-group-lucida")).toBeNull();
+
+    await openSettings();
+    expect(filterOptions()).toContain("FerroLoop");
+    expect(filterOptions()).not.toContain("ferroloop");
+    await openProjectsTab();
+    expect(screen.getByTestId("settings-projects-unsupported")).toHaveTextContent(
+      "This hub does not support project management. Update the hub to create, edit or delete projects.",
+    );
+    expect(screen.queryByTestId("settings-projects-create-btn")).toBeNull();
+    expect(screen.queryByTestId("settings-project-card-ferroloop")).toBeNull();
+    expect(screen.queryByTestId("settings-project-edit-ferroloop")).toBeNull();
+    await closeSettings();
+
+    await openSpinUp();
+    expect(spinUpOptions()).toContain("ferroloop");
+    expect(spinUpOptions()).toContain("lucida");
+  });
+
+  it("shows the cards and no notice for a new-style reply", async () => {
+    const { client } = makeHub([FERRO, SONORA]);
+    await renderApp(client);
+    await openSettings();
+    await openProjectsTab();
+    expect(screen.queryByTestId("settings-projects-unsupported")).toBeNull();
+    expect(screen.getByTestId("settings-project-card-ferroloop")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-projects-create-btn")).toBeInTheDocument();
   });
 });

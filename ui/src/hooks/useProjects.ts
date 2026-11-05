@@ -103,6 +103,12 @@ export interface ProjectsState {
   error: string | null;
   /** True when `projects` came from the hub, false for the built-in fallback. */
   fromHub: boolean;
+  /**
+   * Whether the hub can create, edit and delete projects. `unsupported` when it answered 404
+   * or 405, replied with legacy entries only, or the client has no `listProjects`. It stays
+   * `available` until the first load settles, so the UI does not flash a notice.
+   */
+  projectManagement: "available" | "unsupported";
   /** Reloads the list. Overlapping calls resolve in order; the latest one wins. */
   refresh: () => Promise<void>;
 }
@@ -110,6 +116,10 @@ export interface ProjectsState {
 interface ProjectsClient {
   listProjects?: () => Promise<ProjectSummary[]>;
 }
+
+const EMPTY_REPLY = "No project list";
+
+type ProjectManagement = ProjectsState["projectManagement"];
 
 function isEndpointMissing(err: unknown): boolean {
   return err instanceof HubApiError && (err.status === 404 || err.status === 405);
@@ -125,6 +135,7 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
     loaded: false,
     error: null,
     fromHub: false,
+    projectManagement: "available",
   });
   const clientRef = useRef(apiClient);
   clientRef.current = apiClient;
@@ -137,7 +148,13 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
     const client = clientRef.current;
     let next: Omit<ProjectsState, "refresh">;
     if (!client || typeof client.listProjects !== "function") {
-      next = { projects: [...FALLBACK_PROJECTS], loaded: true, error: null, fromHub: false };
+      next = {
+        projects: [...FALLBACK_PROJECTS],
+        loaded: true,
+        error: null,
+        fromHub: false,
+        projectManagement: "unsupported",
+      };
     } else {
       try {
         const list = await client.listProjects();
@@ -147,13 +164,37 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
         // list until the next non-empty reply, because `listProjects` cannot tell an
         // empty list from a malformed one.
         if (!Array.isArray(list) || list.length === 0) {
-          throw new HubApiError(404, "No project list");
+          throw new HubApiError(404, EMPTY_REPLY);
         }
-        next = { projects: list, loaded: true, error: null, fromHub: true };
+        if (list.every((p) => p.legacy === true)) {
+          // The hub that serves only `{id, artifact dirs}` cannot manage projects: use the
+          // built-in list for labels, roster and Spin-Up, and never show those entries.
+          hubListRef.current = null;
+          next = {
+            projects: [...FALLBACK_PROJECTS],
+            loaded: true,
+            error: null,
+            fromHub: false,
+            projectManagement: "unsupported",
+          };
+        } else {
+          next = {
+            projects: list,
+            loaded: true,
+            error: null,
+            fromHub: true,
+            projectManagement: "available",
+          };
+        }
       } catch (err) {
         // Keep the last list the hub gave us over regressing to the built-in one.
         const kept = hubListRef.current;
         const missing = isEndpointMissing(err);
+        // An empty or malformed reply is thrown as a 404 above; only a real HubApiError
+        // from the endpoint (or the shortcut message) tells an absent endpoint.
+        const emptyReply = err instanceof HubApiError && err.message === EMPTY_REPLY;
+        const management: ProjectManagement =
+          missing && !emptyReply ? "unsupported" : "available";
         next = {
           projects: kept ?? [...FALLBACK_PROJECTS],
           loaded: true,
@@ -163,6 +204,7 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
               ? err.message
               : "Failed to load projects",
           fromHub: kept !== null,
+          projectManagement: management,
         };
       }
     }

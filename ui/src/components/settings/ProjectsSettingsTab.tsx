@@ -19,6 +19,11 @@ export interface ProjectsSettingsTabProps {
   projects: ProjectSummary[];
   loading: boolean;
   error: string | null;
+  /**
+   * `unsupported` when the hub cannot create, edit or delete projects (an older hub): the tab
+   * then shows a notice instead of cards and offers no Create, Edit or Delete.
+   */
+  projectManagement?: "available" | "unsupported";
   onViewAgents: (slug: string) => void;
   artifactsDir: ProjectsArtifactsDirProps;
   /** Receives the clicked button so the caller can return focus to it. */
@@ -50,7 +55,9 @@ export function ProjectArtifactsDirRow({
 }): ReactNode {
   const info = artifactsDir.getState(slug);
   const status =
-    artifactsDir.status?.slug === slug ? artifactsDir.status.message : null;
+    artifactsDir.status?.slug.toLowerCase() === slug.toLowerCase()
+      ? artifactsDir.status.message
+      : null;
   return (
     <div
       data-testid="settings-project-artifacts-dir-row"
@@ -277,6 +284,34 @@ function ProjectCard({
 
 export function ProjectsSettingsTab(props: ProjectsSettingsTabProps): ReactNode {
   const { projects, loading, error } = props;
+  if (props.projectManagement === "unsupported") {
+    return (
+      <div
+        data-testid="settings-projects-tab"
+        style={{ display: "flex", flexDirection: "column", gap: "12px" }}
+      >
+        <div
+          role="status"
+          data-testid="settings-projects-unsupported"
+          className="fd-card"
+          style={{ fontSize: "12px", color: "var(--text-muted)" }}
+        >
+          This hub does not support project management. Update the hub to create, edit or
+          delete projects.
+        </div>
+      </div>
+    );
+  }
+  const errorBanner = error ? (
+    <div
+      role="alert"
+      data-testid="settings-projects-error"
+      className="fd-card"
+      style={{ fontSize: "12px", color: "var(--text-secondary)" }}
+    >
+      Could not load projects: {error}
+    </div>
+  ) : null;
   return (
     <div
       data-testid="settings-projects-tab"
@@ -317,23 +352,17 @@ export function ProjectsSettingsTab(props: ProjectsSettingsTabProps): ReactNode 
         </div>
       )}
 
-      {error ? (
-        <div
-          role="alert"
-          data-testid="settings-projects-error"
-          className="fd-card"
-          style={{ fontSize: "12px", color: "var(--text-secondary)" }}
-        >
-          Could not load projects: {error}
-        </div>
-      ) : loading && projects.length === 0 ? (
+      {errorBanner}
+      {projects.length > 0 ? (
+        projects.map((p) => <ProjectCard key={p.slug} project={p} props={props} />)
+      ) : error ? null : loading ? (
         <div
           data-testid="settings-projects-loading"
           style={{ fontSize: "12px", color: "var(--text-muted)" }}
         >
           Loading projects...
         </div>
-      ) : projects.length === 0 ? (
+      ) : (
         <div
           data-testid="settings-projects-empty"
           className="fd-card"
@@ -341,8 +370,6 @@ export function ProjectsSettingsTab(props: ProjectsSettingsTabProps): ReactNode 
         >
           No projects registered yet.
         </div>
-      ) : (
-        projects.map((p) => <ProjectCard key={p.slug} project={p} props={props} />)
       )}
     </div>
   );

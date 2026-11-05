@@ -825,6 +825,11 @@ export interface SettingsModalProps {
   projectsError?: string | null;
   /** True once the shared list's first load has settled (shared mode only). */
   projectsLoaded?: boolean;
+  /**
+   * Whether the hub can create, edit and delete projects (shared mode only; standalone mode
+   * derives it from its own load). Defaults to `available`.
+   */
+  projectManagement?: "available" | "unsupported";
   onDecommissionAgent?: (
     targetId: string,
     mode: DecommissionMode,
@@ -875,6 +880,22 @@ function projectOptionLabels(projects: readonly ProjectSummary[]): string[] {
     out.push(WORKSPACE_PROJECT);
   }
   return out;
+}
+
+/** The artifact-directory fields a project summary carries, or `undefined` when it has none. */
+function artifactsDirInfoFromProject(
+  project: ProjectSummary | undefined,
+): Partial<ProjectArtifactsDirInfo> | undefined {
+  if (!project) return undefined;
+  const info: Partial<ProjectArtifactsDirInfo> = {};
+  if (project.artifacts_dir !== undefined) info.artifacts_dir = project.artifacts_dir;
+  if (project.default_artifacts_dir) {
+    info.default_artifacts_dir = project.default_artifacts_dir;
+  }
+  if (project.effective_artifacts_dir) {
+    info.effective_artifacts_dir = project.effective_artifacts_dir;
+  }
+  return Object.keys(info).length > 0 ? info : undefined;
 }
 
 export function resolveProjectFilterValue(
@@ -1395,6 +1416,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   refreshProjects,
   projectsError,
   projectsLoaded,
+  projectManagement: sharedProjectManagement = "available",
   onDecommissionAgent,
   onBulkSessionAction,
   themeMode: propThemeMode,
@@ -1518,6 +1540,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [sharedProjectList, projectsFromHub, sharedProjects]);
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
+  const [ownProjectManagement, setOwnProjectManagement] = useState<
+    "available" | "unsupported"
+  >("available");
+  const projectManagement = sharedProjectList
+    ? sharedProjectManagement
+    : ownProjectManagement;
   const refreshProjectsRef = useRef(refreshProjects);
   refreshProjectsRef.current = refreshProjects;
   const [newProjectOpen, setNewProjectOpen] = useState(false);
@@ -1534,6 +1562,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSelectedProjectFilter,
     onProjectsChanged,
   });
+  const mergeProjectArtifactsDirs = (project: ProjectSummary) => {
+    const info = artifactsDirInfoFromProject(project);
+    if (!info) return;
+    const key = project.slug.trim().toLowerCase();
+    setProjectsArtifactsDirs((prev) => ({
+      ...prev,
+      [key]: { ...prev[key], id: key, ...info } as ProjectArtifactsDirInfo,
+    }));
+  };
   const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
     useState<DedicatedArtifactLayoutState>(
       () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
@@ -1808,16 +1845,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       client
         .listProjects()
         .then((list) => {
-          if (!cancelled) {
-            setProjectList(Array.isArray(list) ? list : []);
-          }
+          if (cancelled) return;
+          const entries = Array.isArray(list) ? list : [];
+          // An older hub lists only `{id, artifact dirs}` entries: it cannot manage projects.
+          const legacy = entries.length > 0 && entries.every((p) => p.legacy === true);
+          setOwnProjectManagement(legacy ? "unsupported" : "available");
+          setProjectList(legacy ? [] : entries);
         })
         .catch((err: unknown) => {
-          if (!cancelled) {
-            setProjectListError(
-              err instanceof Error ? err.message : "Failed to load projects",
-            );
+          if (cancelled) return;
+          if (
+            err instanceof HubApiError &&
+            (err.status === 404 || err.status === 405)
+          ) {
+            setOwnProjectManagement("unsupported");
+            return;
           }
+          setOwnProjectManagement("available");
+          setProjectListError(
+            err instanceof Error ? err.message : "Failed to load projects",
+          );
         })
         .finally(() => {
           if (!cancelled) setProjectListLoading(false);
@@ -2285,7 +2332,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const getProjectArtifactsDirState = (projectName: string) => {
     const slug = projectName.trim().toLowerCase();
-    const record = projectsArtifactsDirs[slug];
+    // The artifacts list is fetched once when Settings opens; a project made since then has
+    // no record there, so its own list entry (the hub sends the fields on every summary,
+    // including the create and edit replies) seeds the state.
+    const record =
+      projectsArtifactsDirs[slug] ??
+      artifactsDirInfoFromProject(
+        projectList.find((p) => p.slug.trim().toLowerCase() === slug) ??
+          sharedProjects.find((p) => p.slug.trim().toLowerCase() === slug),
+      );
     const overrideFromSettings = settings.project_artifacts_dirs?.[slug] ?? null;
     const artifactsDir =
       record?.artifacts_dir !== undefined
@@ -2387,7 +2442,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setArtifactsDirModalTarget(null);
       } else {
         const projectName = artifactsDirModalTarget.project;
-        const projectLabel = artifactsDirModalTarget.label;
+        const dirLabel = artifactsDirModalTarget.label;
         const info = getProjectArtifactsDirState(projectName);
         const nextPathPayload =
           trimmed === "" || trimmed === info.defaultDir ? null : trimmed;
@@ -2431,8 +2486,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setProjectArtifactsDirStatus({
           slug: info.slug,
           message: artifactsDirMigrate
-            ? `Updated ${projectLabel} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
-            : `Updated ${projectLabel} artifacts directory to ${nextEffective}.`,
+            ? `Updated ${dirLabel} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
+            : `Updated ${dirLabel} artifacts directory to ${nextEffective}.`,
         });
         setArtifactsDirModalTarget(null);
       }
@@ -2786,7 +2841,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {/* Project-scoped Settings has no Projects tab, so the row stays here (Issue #207) */}
         {initialProject && (
           <ProjectArtifactsDirRow
-            slug={resolvedProjectFilter}
+            slug={
+              (
+                findProject(projectList, resolvedProjectFilter) ??
+                findProject(sharedProjects, resolvedProjectFilter)
+              )?.slug ?? resolvedProjectFilter
+            }
             displayName={resolvedProjectFilter}
             artifactsDir={projectArtifactsDirProps}
           />
@@ -4987,6 +5047,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               projects={projectList}
               loading={sharedProjectList ? projectsLoaded === false : projectListLoading}
               error={sharedProjectList ? (projectsError ?? null) : projectListError}
+              projectManagement={projectManagement}
               onViewAgents={(slug) => {
                 setSelectedProjectFilter(slug);
                 setProjectArtifactsDirStatus(null);
@@ -10365,6 +10426,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           returnFocusTo={newProjectOpenerRef}
           onClose={() => setNewProjectOpen(false)}
           onCreated={(created) => {
+            mergeProjectArtifactsDirs(created);
             setProjectList((prev) =>
               prev.some((p) => p.slug === created.slug)
                 ? prev.map((p) => (p.slug === created.slug ? created : p))
@@ -10379,7 +10441,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           apiClient={apiClient ?? new HubApiClient()}
           returnFocusTo={projectModals.editOpenerRef}
           onClose={projectModals.closeEdit}
-          onSaved={projectModals.onSaved}
+          onSaved={(saved) => {
+            mergeProjectArtifactsDirs(saved);
+            projectModals.onSaved(saved);
+          }}
         />
         <DeleteProjectModal
           isOpen={projectModals.deleteTarget !== null}
@@ -10395,7 +10460,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {artifactsDirModalTarget && (() => {
           const isSystem = artifactsDirModalTarget.scope === "system";
           const projectName = !isSystem ? artifactsDirModalTarget.project : null;
-          const projectLabel = !isSystem ? artifactsDirModalTarget.label : null;
+          const dirLabel = !isSystem ? artifactsDirModalTarget.label : null;
           const projectInfo = projectName
             ? getProjectArtifactsDirState(projectName)
             : null;
@@ -10463,7 +10528,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     {isSystem
                       ? "Change System Artifacts Directory"
-                      : `Change ${projectLabel} Artifacts Directory`}
+                      : `Change ${dirLabel} Artifacts Directory`}
                   </strong>
                   <button
                     type="button"
@@ -10489,7 +10554,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 >
                   {isSystem
                     ? "Override the hub-wide artifacts root directory, or reset to the default [home]/artifacts path."
-                    : `Override the artifacts directory for ${projectLabel}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
+                    : `Override the artifacts directory for ${dirLabel}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
                 </p>
 
                 <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>

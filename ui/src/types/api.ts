@@ -274,6 +274,11 @@ export interface ProjectSummary {
   artifacts_dir?: string | null;
   default_artifacts_dir?: string;
   effective_artifacts_dir?: string;
+  /**
+   * Set by `listProjects()` on an entry an older hub served: it had no `slug`, `name` or
+   * `kind`, only an `id` and artifact directories. Never sent by a hub.
+   */
+  legacy?: boolean;
 }
 
 export interface CreateProjectRequest {
