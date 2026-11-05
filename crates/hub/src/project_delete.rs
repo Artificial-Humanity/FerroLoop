@@ -270,7 +270,7 @@ pub(crate) fn home_dirs(
         .collect();
     if homes.is_empty() {
         return Err(
-            "the home directory is unknown ($HOME is not set and none was given), so it cannot              be checked that the directory is not the home directory or above it"
+            "the home directory is unknown ($HOME is not set and none was given), so it cannot be checked that the directory is not the home directory or above it"
                 .into(),
         );
     }
@@ -338,7 +338,7 @@ impl DirCheck<'_> {
         // that moves it) would name one directory in the registration and delete another.
         if canon != raw {
             return Err(refuse(format!(
-                "the registered path `{registered}` is not its own canonical path `{}` (a                  symbolic link in it, or a `.` or `..` component)",
+                "the registered path `{registered}` is not its own canonical path `{}` (a symbolic link in it, or a `.` or `..` component)",
                 canon.display()
             )));
         }
@@ -413,7 +413,10 @@ impl DirCheck<'_> {
         // workspace: fail closed.
         if self.ctx.workspace_roots.is_empty() && fl_core::find_workspace_root(&canon).is_none() {
             return Err(refuse(
-                "no workspace root could be found (no `.agents/memory` or `Notes` directory at                  or above the current directory, at or above or just below the home                  directory, or at or above the `fl` executable), so it cannot be told whether                  the directory holds the workspace"
+                "no workspace root could be found (no `.agents/memory` or `Notes` directory at \
+                 or above the current directory, at or above or just below the home directory, \
+                 or at or above the `fl` executable), so it cannot be told whether the \
+                 directory holds the workspace"
                     .into(),
             ));
         }
@@ -588,7 +591,8 @@ fn check_store(
                 .any(|r| *r == real || r.with_extension(FLS) == real);
         if is_store_file && !own {
             return Err(refuse(format!(
-                "`{}` is neither in the stores' directory `{}` nor the store this project                  registers",
+                "`{}` is neither in the stores' directory `{}` nor the store this project \
+                 registers",
                 file.display(),
                 store_dir.display()
             )));

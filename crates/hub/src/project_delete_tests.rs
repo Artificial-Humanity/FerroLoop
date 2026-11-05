@@ -15,11 +15,11 @@ use tempfile::TempDir;
 use crate::lifecycle::{self, LifecycleEnv, SpinUpRequest};
 use crate::project_delete::hooks::{self, Fault};
 use crate::project_delete::{
-    DeleteContext, DeleteError, DeleteOutcome, DeleteRequest, delete_project_in, home_dirs,
+    DeleteContext, DeleteError, DeleteOutcome, DeleteRequest, delete_project_in,
     locate_workspace_roots,
 };
 use crate::project_init::{InitError, InitPaths, InitRequest, init_project};
-use crate::project_list::{ProjectSummary, list_projects};
+use crate::project_list::{ProjectSummary, StoreHint, list_projects};
 
 struct Fx {
     _tmp: TempDir,
@@ -146,10 +146,24 @@ impl Fx {
         env_home: Option<PathBuf>,
         roots: &[PathBuf],
     ) -> Result<DeleteOutcome, DeleteError> {
+        self.call_stores(slug, req, home, env_home, roots, &[])
+    }
+
+    /// [`Fx::call_in`] with the per-project stores the caller knows of (the Hub's data
+    /// directory, or the CLI's).
+    fn call_stores(
+        &self,
+        slug: &str,
+        req: &DeleteRequest,
+        home: Option<&Path>,
+        env_home: Option<PathBuf>,
+        roots: &[PathBuf],
+        stores: &[StoreHint],
+    ) -> Result<DeleteOutcome, DeleteError> {
         let env = LifecycleEnv::new(Some(&self.home));
         let ctx = DeleteContext {
             paths: &self.paths,
-            stores: &[],
+            stores,
             home,
             workspace_roots: roots,
             lifecycle: &env,
@@ -652,6 +666,293 @@ fn it_refuses_a_project_with_no_directory() {
         |_| {},
     ));
     assert!(why.contains("no registered directory"), "{why}");
+}
+
+#[test]
+fn it_refuses_a_directory_that_is_itself_a_workspace_root_wherever_the_caller_stands() {
+    let fx = Fx::new();
+    for (name, marker) in [("agentsy", ".agents/memory"), ("notesy", "Notes")] {
+        let root = fx.project(name);
+        fs::create_dir_all(root.join(marker)).unwrap();
+        // The known roots name another directory: the candidate's own markers decide.
+        let before = fx.snapshot(&[&root]);
+        let why = refused(fx.call_in(
+            name,
+            &dir_req(),
+            Some(&fx.home),
+            Some(fx.home.clone()),
+            &[fx.ws_root.clone()],
+        ));
+        assert!(why.contains("is a workspace root"), "{marker}: {why}");
+        assert_eq!(before, fx.snapshot(&[&root]));
+    }
+}
+
+#[test]
+fn it_fails_closed_when_no_workspace_root_is_known_anywhere() {
+    let fx = Fx::new();
+    let root = fx.project("alpha");
+    let before = fx.snapshot(&[&root]);
+    let why = refused(fx.call_in(
+        "alpha",
+        &dir_req(),
+        Some(&fx.home),
+        Some(fx.home.clone()),
+        &[],
+    ));
+    assert!(why.contains("no workspace root could be found"), "{why}");
+    assert_eq!(before, fx.snapshot(&[&root]), "nothing changed");
+    // The same deletion goes through once a root is known.
+    let out = fx.call("alpha", &dir_req()).unwrap();
+    assert!(out.dir_deleted, "{out:?}");
+}
+
+#[test]
+fn a_workspace_root_above_the_directory_is_found_without_one_given() {
+    let fx = Fx::new();
+    // The project lies inside a workspace: the marker above it satisfies the lookup.
+    fs::create_dir_all(fx.base.join("work/Notes")).unwrap();
+    let root = fx.project_at(&fx.base.join("work/inside/alpha"));
+    let out = fx
+        .call_in(
+            "alpha",
+            &dir_req(),
+            Some(&fx.home),
+            Some(fx.home.clone()),
+            &[],
+        )
+        .unwrap();
+    assert!(out.dir_deleted && !root.exists(), "{out:?}");
+    assert!(fx.base.join("work/Notes").is_dir());
+}
+
+#[test]
+fn locate_workspace_roots_looks_at_the_start_the_home_and_the_executable() {
+    let fx = Fx::new();
+    let nowhere = fx.base.join("work/none");
+    fs::create_dir_all(&nowhere).unwrap();
+    assert!(
+        locate_workspace_roots(&[&nowhere], &[], None).is_empty(),
+        "no marker anywhere: none"
+    );
+    let start = fx.base.join("ws/sub/deep");
+    fs::create_dir_all(&start).unwrap();
+    fs::create_dir_all(fx.base.join("ws/.agents/memory")).unwrap();
+    assert_eq!(
+        locate_workspace_roots(&[&start], &[], None),
+        [fx.base.join("ws")]
+    );
+    // Below the home directory: `~/Projects/<name>`.
+    let below = fx.home.join("Projects/mine/Notes");
+    fs::create_dir_all(&below).unwrap();
+    assert_eq!(
+        locate_workspace_roots(&[&nowhere], &[&fx.home], None),
+        [fx.home.join("Projects/mine")]
+    );
+    // Beside the executable.
+    fs::create_dir_all(fx.base.join("ws/bin")).unwrap();
+    let exe = fx.base.join("ws/bin/fl");
+    assert_eq!(
+        locate_workspace_roots(&[&nowhere], &[], Some(&exe)),
+        [fx.base.join("ws")]
+    );
+    // Without duplicates.
+    assert_eq!(
+        locate_workspace_roots(&[&start, &start], &[], Some(&exe)),
+        [fx.base.join("ws")]
+    );
+}
+
+#[test]
+fn it_refuses_the_directory_when_no_home_directory_is_known() {
+    let fx = Fx::new();
+    let root = fx.project("alpha");
+    let before = fx.snapshot(&[&root]);
+    let why = refused(fx.call_in("alpha", &dir_req(), None, None, &[fx.ws_root.clone()]));
+    assert!(why.contains("home directory is unknown"), "{why}");
+    assert_eq!(before, fx.snapshot(&[&root]));
+    // An empty `$HOME` is no home either.
+    let why = refused(fx.call_in(
+        "alpha",
+        &dir_req(),
+        None,
+        Some(PathBuf::new()),
+        &[fx.ws_root.clone()],
+    ));
+    assert!(why.contains("home directory is unknown"), "{why}");
+    // Either one is enough.
+    assert!(
+        fx.call_in(
+            "alpha",
+            &dir_req(),
+            None,
+            Some(fx.home.clone()),
+            &[fx.ws_root.clone()]
+        )
+        .unwrap()
+        .dir_deleted
+    );
+}
+
+#[test]
+fn every_directory_check_runs_again_right_before_the_removal() {
+    let fx = Fx::new();
+    let root = fx.project("alpha");
+    fs::write(root.join("precious"), "x").unwrap();
+    // After the unregistration, the directory becomes a workspace root: the first run of the
+    // checks passed, the second does not.
+    let marker = root.join("Notes");
+    hooks::after_unregister(move || fs::create_dir_all(marker).unwrap());
+    let out = fx.call("alpha", &dir_req()).unwrap();
+    assert!(!out.dir_deleted, "{out:?}");
+    let error = out.error.as_deref().unwrap();
+    assert!(
+        error.contains("changed after it was checked") && error.contains("workspace root"),
+        "{error}"
+    );
+    assert!(root.join("precious").is_file());
+    assert!(fx.slugs().is_empty(), "the unregistration stands");
+}
+
+#[test]
+fn it_refuses_a_registered_path_that_is_not_its_own_canonical_form() {
+    let fx = Fx::new();
+    let work = fx.base.join("work");
+    // A `..` component.
+    fs::create_dir_all(work.join("x")).unwrap();
+    let real = fx.project("alpha");
+    fx.hand_registered("dotdot", &work.join("x/../alpha"));
+    assert_dir_refused(&fx, "dotdot", "`..` component", &[&real]);
+
+    // A link in an ancestor.
+    fs::create_dir_all(work.join("real")).unwrap();
+    let under = fx.project_at(&work.join("real/beta"));
+    std::os::unix::fs::symlink(work.join("real"), work.join("link")).unwrap();
+    fx.hand_registered("viaLink", &work.join("link/beta"));
+    assert_dir_refused(&fx, "vialink", "canonical path", &[&under]);
+    assert!(under.join(".fl/mcp.toml").is_file());
+}
+
+#[test]
+fn a_trailing_slash_on_the_registered_path_is_the_same_directory() {
+    let fx = Fx::new();
+    let root = fx.project("alpha");
+    let text = fx.config().replacen(
+        &root.display().to_string(),
+        &format!("{}/", root.display()),
+        1,
+    );
+    assert!(text.contains(&format!("{}/", root.display())), "{text}");
+    fs::write(&fx.paths.config_path, text).unwrap();
+    let out = fx.call("alpha", &dir_req()).unwrap();
+    assert!(out.dir_deleted && !root.exists(), "{out:?}");
+}
+
+#[test]
+fn delete_store_refuses_a_file_that_is_not_a_store_by_its_name() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    let victim = fx.paths.store_dir.join("alpha.txt");
+    fs::write(&victim, "x").unwrap();
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &victim.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    let before = fx.snapshot(&[&victim]);
+    let why = refused(fx.call(
+        "alpha",
+        &DeleteRequest {
+            delete_store: true,
+            ..DeleteRequest::default()
+        },
+    ));
+    assert!(why.contains("not named like a store file"), "{why}");
+    assert_eq!(before, fx.snapshot(&[&victim]));
+    assert!(victim.is_file());
+}
+
+#[test]
+fn delete_store_knows_another_projects_store_from_the_data_directory_hints() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    // `ghost` is a store file in the data directory and nothing else (no config block).
+    let ghost = fx.store_file("ghost");
+    fs::write(&ghost, "x").unwrap();
+    let hints: Vec<StoreHint> = vec![("ghost".to_string(), Some(ghost.clone()))];
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &ghost.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    let req = DeleteRequest {
+        delete_store: true,
+        ..DeleteRequest::default()
+    };
+    let before = fx.snapshot(&[&ghost]);
+    let why = refused(fx.call_stores(
+        "alpha",
+        &req,
+        Some(&fx.home),
+        Some(fx.home.clone()),
+        &[fx.ws_root.clone()],
+        &hints,
+    ));
+    assert!(why.contains("another project's store"), "{why}");
+    assert_eq!(before, fx.snapshot(&[&ghost]));
+    assert!(ghost.is_file());
+}
+
+// --- a failure in the middle -------------------------------------------------------------------
+
+#[test]
+fn a_config_that_cannot_be_written_puts_the_area_back() {
+    let fx = Fx::new();
+    let root = fx.project("alpha");
+    let area = fx.ws().get_area("alpha").unwrap().unwrap();
+    let config = fx.config();
+    hooks::inject(Fault::WriteConfig);
+    let err = fx.call("alpha", &DeleteRequest::default()).unwrap_err();
+    assert!(
+        matches!(&err, DeleteError::Init(InitError::Failed(m)) if m.contains("could not write the config")),
+        "{err:?}"
+    );
+    let back = fx.ws().get_area("alpha").unwrap().unwrap();
+    assert_eq!(back.path, area.path, "the area is back, with its path");
+    assert_eq!(fx.config(), config, "the config is as it was");
+    assert_eq!(fx.slugs(), ["alpha"], "the project is still registered");
+    assert!(root.is_dir());
+}
+
+#[test]
+fn an_area_that_cannot_be_deleted_after_the_agents_moved_says_so() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.project("beta");
+    fx.agent("Ada", "alpha", AgentRole::Assistant, &[]);
+    hooks::inject(Fault::DeleteArea);
+    let err = fx
+        .call(
+            "alpha",
+            &DeleteRequest {
+                reassign_to: Some("beta".into()),
+                ..DeleteRequest::default()
+            },
+        )
+        .unwrap_err();
+    let DeleteError::Init(InitError::Failed(m)) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        m.contains("1 agents were reassigned") && m.contains("the project is still registered"),
+        "{m}"
+    );
+    assert!(fx.slugs().contains(&"alpha".to_string()));
+    assert!(fx.config().contains("alpha"));
+    let ada = fx.ws().agent_by_name("ada").unwrap().unwrap();
+    assert_eq!(ada.project, "beta", "the agent did move");
 }
 
 // --- agents -----------------------------------------------------------------------------------

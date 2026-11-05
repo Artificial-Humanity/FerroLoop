@@ -26,10 +26,14 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        Self {
+        let env = Self {
             home: tempfile::tempdir().unwrap(),
             work: tempfile::tempdir().unwrap(),
-        }
+        };
+        // The home directory holds the test's workspace marker: a deletion that finds no
+        // workspace root anywhere refuses to remove a directory.
+        std::fs::create_dir(env.home.path().join("Notes")).unwrap();
+        env
     }
 
     fn fl(&self, cwd: &Path) -> Command {
@@ -689,10 +693,18 @@ fn delete_unregisters_by_default_and_prints_the_hubs_body() {
             "dir_deleted": false,
         })
     );
-    assert_eq!(env.slugs(), ["kept"]);
     assert!(!env.config().contains("doomed") && env.config().contains("kept"));
     assert!(root.join(".fl/mcp.toml").is_file(), "no file is deleted");
     assert!(store.is_file());
+    // The store file is still in the data directory, so the slug is still listed (with no path),
+    // as the Hub lists it; `--delete-store` removes it.
+    assert_eq!(env.slugs(), ["doomed", "kept"].map(String::from));
+    env.fl(env.work.path())
+        .args(["project", "delete", "doomed", "--delete-store"])
+        .assert()
+        .success()
+        .stdout(contains("store_deleted=true"));
+    assert!(!store.exists());
     env.fl(env.work.path())
         .args(["project", "delete", "doomed"])
         .assert()
@@ -851,16 +863,60 @@ fn delete_dir_refuses_the_home_directory_and_changes_nothing() {
 }
 
 #[test]
-fn delete_dir_refuses_the_current_workspace_root() {
+fn delete_dir_refuses_a_directory_that_is_itself_a_workspace_root() {
     let env = Env::new();
     let root = env.dir("ws");
     env.run_json("create", &["Ws", "--path", root.to_str().unwrap()]);
-    // Run from inside the project: with no workspace markers above, it is the workspace root.
-    env.fl(&root)
+    std::fs::create_dir_all(root.join(".agents/memory")).unwrap();
+    // Run from outside it: the directory's own markers decide, not where the caller stands.
+    env.fl(env.work.path())
         .args(["project", "delete", "ws", "--delete-dir"])
         .assert()
         .failure()
         .stderr(contains("workspace root"));
     assert!(root.join(".fl/mcp.toml").is_file());
     assert_eq!(env.slugs(), ["ws"]);
+}
+
+#[test]
+fn delete_dir_refuses_an_ancestor_of_the_workspace() {
+    let env = Env::new();
+    let outer = env.dir("outer");
+    env.run_json("create", &["Outer", "--path", outer.to_str().unwrap()]);
+    std::fs::create_dir_all(outer.join("inner/Notes")).unwrap();
+    env.fl(&outer.join("inner"))
+        .args(["project", "delete", "outer", "--delete-dir"])
+        .assert()
+        .failure()
+        .stderr(contains("workspace root"));
+    assert!(outer.join("inner/Notes").is_dir());
+    assert_eq!(env.slugs(), ["outer"]);
+}
+
+#[test]
+fn delete_dir_fails_closed_when_no_workspace_root_can_be_found() {
+    let env = Env::new();
+    // No marker at the working directory, at the home directory or above the project.
+    std::fs::remove_dir(env.home.path().join("Notes")).unwrap();
+    let root = env.dir("anywhere");
+    env.run_json("create", &["Anywhere", "--path", root.to_str().unwrap()]);
+    // The executable is looked at too, so it runs from a copy outside any workspace (the
+    // checkout this test runs from may be inside one).
+    let bin_dir = tempfile::tempdir().unwrap();
+    let copy = bin_dir.path().join("fl");
+    std::fs::copy(assert_cmd::cargo::cargo_bin("fl"), &copy).unwrap();
+    let mut cmd = Command::new(&copy);
+    cmd.env("HOME", env.home.path())
+        .env("XDG_CONFIG_HOME", env.home.path().join("config"))
+        .env("XDG_DATA_HOME", env.home.path().join("data"))
+        .env_remove("FL_DB")
+        .env_remove("FL_STORE_BACKEND")
+        .env("FL_TEST_SPINUP_NO_SPAWN", "1")
+        .current_dir(env.work.path());
+    cmd.args(["project", "delete", "anywhere", "--delete-dir"])
+        .assert()
+        .failure()
+        .stderr(contains("no workspace root could be found"));
+    assert!(root.join(".fl/mcp.toml").is_file());
+    assert_eq!(env.slugs(), ["anywhere"]);
 }

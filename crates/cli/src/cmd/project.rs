@@ -336,6 +336,17 @@ pub fn create(
     Ok(0)
 }
 
+/// The per-project stores in the data directory, as the Hub's list knows them: each `<slug>.fls`
+/// there, the workspace store (which lives in the same directory) not among them. Listing and
+/// deleting both use it, so the two agree on which slugs exist.
+fn store_hints(paths: &InitPaths) -> Vec<project_list::StoreHint> {
+    let workspace = paths.workspace_store.with_extension("fls");
+    project_list::scan_store_dir(&paths.store_dir, "fls")
+        .into_iter()
+        .filter(|(_, file)| file.as_deref() != Some(workspace.as_path()))
+        .collect()
+}
+
 /// `fl project list`: [`project_list::list_projects`] over this machine's config, the workspace
 /// store and the store the current directory is bound to (`bound`, with its path), the list
 /// `GET /api/v1/projects` serves.
@@ -373,11 +384,12 @@ pub fn list(
             }
         }
     }
+    let hints = store_hints(&paths);
     let projects = match workspace {
-        Some(w) => project_list::list_projects(&paths.config_path, &[], &held, w),
+        Some(w) => project_list::list_projects(&paths.config_path, &hints, &held, w),
         None => project_list::list_projects(
             &paths.config_path,
-            &[],
+            &hints,
             &held,
             &fl_core::MemStore::default(),
         ),
@@ -421,7 +433,7 @@ pub fn delete(
     let workspace_roots = project_delete::locate_workspace_roots(&[cwd], &homes, exe.as_deref());
     // The stores in the data directory, as the Hub knows them, so another project's store is
     // recognised here as it is there.
-    let hints = project_list::scan_store_dir(&paths.store_dir, "fls");
+    let hints = store_hints(&paths);
     let env = LifecycleEnv::new(None);
     let ctx = DeleteContext {
         paths: &paths,
