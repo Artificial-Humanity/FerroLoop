@@ -692,6 +692,14 @@ describe("FerroWatchPane — Subscription Quota & Usage Matrix shows allowance a
     expect(within(card).getByTestId("watch-quota-secondary-bar-claude").style.width).toBe("40%");
   });
 
+  it("labels the alert thresholds and threshold inputs as percent used", async () => {
+    const section = await renderMatrix([row("claude", "primary", 25)]);
+    expect(section).toBeInTheDocument();
+    expect(await screen.findByText("Warn at 80% used / Crit at 95% used")).toBeInTheDocument();
+    expect(screen.getByText("Warn Quota (% used)")).toBeInTheDocument();
+    expect(screen.getByText("Critical Quota (% used)")).toBeInTheDocument();
+  });
+
   it("rounds the remaining allowance to a whole percent like Settings -> Runtimes & Quotas", async () => {
     // 100 - 44.6 = 55.4 -> 55; 100 - 44.5 = 55.5 -> 56.
     const section = await renderMatrix([

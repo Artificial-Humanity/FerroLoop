@@ -4365,6 +4365,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 type="button"
                 className="fd-btn"
                 data-testid="decommission-cancel-btn"
+                autoFocus
                 disabled={decommissioning}
                 onClick={handleCloseDecommissionModal}
               >

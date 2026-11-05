@@ -1622,8 +1622,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             >
               <span>Live Alerts ({alerts.length})</span>
               <span>
-                Warn {activeThresholds.warn_quota_pct}% / Crit{" "}
-                {activeThresholds.critical_quota_pct}%
+                {`Warn at ${activeThresholds.warn_quota_pct}% used / Crit at ${activeThresholds.critical_quota_pct}% used`}
               </span>
             </div>
 
@@ -2902,7 +2901,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  <span>Warn Quota (%)</span>
+                  <span>Warn Quota (% used)</span>
                   <input
                     type="number"
                     step="any"
@@ -2923,7 +2922,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  <span>Critical Quota (%)</span>
+                  <span>Critical Quota (% used)</span>
                   <input
                     type="number"
                     step="any"

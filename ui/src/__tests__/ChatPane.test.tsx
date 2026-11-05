@@ -1495,6 +1495,99 @@ describe("ChatPane Decommission asks for a second confirmation (Record #128)", (
     expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
     expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
   });
+
+  it("focuses the safe Cancel button when the choices open and when returning from the confirmation", () => {
+    renderPane();
+    expect(screen.getByTestId("decommission-cancel-btn")).toHaveFocus();
+
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    expect(screen.getByTestId("decommission-confirm-cancel-btn")).toHaveFocus();
+    fireEvent.click(screen.getByTestId("decommission-confirm-cancel-btn"));
+    expect(screen.getByTestId("decommission-cancel-btn")).toHaveFocus();
+  });
+
+  function paneElement(
+    agentName: string,
+    sessionId: string,
+    onDecommissionSession: (mode: "prepare" | "teardown") => Promise<unknown>,
+  ) {
+    return (
+      <ChatPane
+        agentName={agentName}
+        agentDisplayName={agentName}
+        adapter="claude"
+        sessionId={sessionId}
+        turns={[]}
+        agentSettingsOpen={true}
+        onDecommissionSession={onDecommissionSession as never}
+      />
+    );
+  }
+
+  it("switching the target agent while the confirmation is open closes everything and reopens at the choices", () => {
+    const onDecommissionSession = vi.fn(async () => undefined);
+    const { rerender } = render(paneElement("kacey", "sess-kacey-01", onDecommissionSession));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+
+    rerender(paneElement("ferris", "sess-ferris-01", onDecommissionSession));
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(onDecommissionSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps the confirmation open and both buttons disabled while the teardown is in flight", async () => {
+    let resolveTeardown: () => void = () => undefined;
+    const onDecommissionSession = vi.fn(
+      () => new Promise<void>((resolve) => {
+        resolveTeardown = resolve;
+      }),
+    );
+    renderPane(onDecommissionSession as never);
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("decommission-confirm-submit-btn")).toBeDisabled();
+    });
+    expect(screen.getByTestId("decommission-confirm-cancel-btn")).toBeDisabled();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    const backdrop = screen.getByTestId("decommission-confirm-dialog").parentElement as HTMLElement;
+    fireEvent.click(backdrop);
+    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    expect(onDecommissionSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveTeardown();
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+  });
+
+  it("closes both dialogs and shows the error when the teardown fails", async () => {
+    const onDecommissionSession = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    renderPane(onDecommissionSession);
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("boom");
+  });
 });
 
 describe("Resizable chat composer (Record 57 & Record 112)", () => {
