@@ -551,6 +551,21 @@ function getLivenessBadgeStyle(
   }
 }
 
+/**
+ * Allowance still available in a quota window, as a whole percent in 0-100. The Subscription
+ * Quota & Usage Matrix shows this, the same way Settings -> Runtimes & Quotas does
+ * (`formatQuotaWindowRemaining`). `null` means the vendor reported nothing for the window.
+ */
+function quotaRemainingPct(usedPct: number | null): number | null {
+  if (usedPct === null) return null;
+  return Math.max(0, Math.min(100, Math.round(100 - usedPct)));
+}
+
+/** Used percent clamped to 0-100. The bar colour thresholds are defined on usage. */
+function clampUsedPct(usedPct: number | null): number {
+  return usedPct === null ? 0 : Math.max(0, Math.min(100, usedPct));
+}
+
 function getQuotaBarColor(
   pct: number,
   warnPct: number,
@@ -1632,8 +1647,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             >
               <span>Live Alerts ({alerts.length})</span>
               <span>
-                Warn {activeThresholds.warn_quota_pct}% / Crit{" "}
-                {activeThresholds.critical_quota_pct}%
+                {`Warn at ${activeThresholds.warn_quota_pct}% used / Crit at ${activeThresholds.critical_quota_pct}% used`}
               </span>
             </div>
 
@@ -1769,14 +1783,12 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               }}
             >
               {vendorMatrix.map((item) => {
-                const pPct =
-                  item.primaryUsedPct !== null
-                    ? Math.max(0, Math.min(100, item.primaryUsedPct))
-                    : 0;
-                const sPct =
-                  item.secondaryUsedPct !== null
-                    ? Math.max(0, Math.min(100, item.secondaryUsedPct))
-                    : 0;
+                const pUsed = clampUsedPct(item.primaryUsedPct);
+                const sUsed = clampUsedPct(item.secondaryUsedPct);
+                // The label and the bar show the allowance still available. An unknown window
+                // shows an empty bar and a dash, not a full bar.
+                const pRemaining = quotaRemainingPct(item.primaryUsedPct);
+                const sRemaining = quotaRemainingPct(item.secondaryUsedPct);
                 const isExhausted = Boolean(item.exhaustedReason);
 
                 return (
@@ -1868,9 +1880,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <span>5h Session Window</span>
                         <span className="fd-mono">
                           <span data-testid={`watch-quota-primary-pct-${item.vendor}`}>
-                            {item.primaryUsedPct !== null
-                              ? `${item.primaryUsedPct.toFixed(0)}%`
-                              : "—"}
+                            {pRemaining !== null ? `${pRemaining}% left` : "—"}
                           </span>{" "}
                           ·{" "}
                           <span data-testid={`watch-quota-primary-reset-${item.vendor}`}>
@@ -1889,10 +1899,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <div
                           data-testid={`watch-quota-primary-bar-${item.vendor}`}
                           style={{
-                            width: `${pPct}%`,
+                            width: `${pRemaining ?? 0}%`,
                             height: "100%",
                             backgroundColor: getQuotaBarColor(
-                              pPct,
+                              pUsed,
                               activeThresholds.warn_quota_pct,
                               activeThresholds.critical_quota_pct,
                               isExhausted,
@@ -1915,9 +1925,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <span>7d Weekly Window</span>
                         <span className="fd-mono">
                           <span data-testid={`watch-quota-secondary-pct-${item.vendor}`}>
-                            {item.secondaryUsedPct !== null
-                              ? `${item.secondaryUsedPct.toFixed(0)}%`
-                              : "—"}
+                            {sRemaining !== null ? `${sRemaining}% left` : "—"}
                           </span>{" "}
                           ·{" "}
                           <span data-testid={`watch-quota-secondary-reset-${item.vendor}`}>
@@ -1936,10 +1944,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <div
                           data-testid={`watch-quota-secondary-bar-${item.vendor}`}
                           style={{
-                            width: `${sPct}%`,
+                            width: `${sRemaining ?? 0}%`,
                             height: "100%",
                             backgroundColor: getQuotaBarColor(
-                              sPct,
+                              sUsed,
                               activeThresholds.warn_quota_pct,
                               activeThresholds.critical_quota_pct,
                               isExhausted,
@@ -2918,7 +2926,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  <span>Warn Quota (%)</span>
+                  <span>Warn Quota (% used)</span>
                   <input
                     type="number"
                     step="any"
@@ -2939,7 +2947,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  <span>Critical Quota (%)</span>
+                  <span>Critical Quota (% used)</span>
                   <input
                     type="number"
                     step="any"

@@ -415,11 +415,19 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
     expect(within(claudeCard).getByTestId("watch-vendor-tier-claude")).toHaveTextContent(
       "Max 20x",
     );
+    // Record #127: the matrix shows the allowance still available, not the allowance used.
+    // The fixture has claude at 92% / 64% used and codex at 28% used.
     expect(within(claudeCard).getByTestId("watch-quota-primary-pct-claude")).toHaveTextContent(
-      "92%",
+      "8% left",
     );
     expect(within(claudeCard).getByTestId("watch-quota-secondary-pct-claude")).toHaveTextContent(
-      "64%",
+      "36% left",
+    );
+    expect(within(claudeCard).getByTestId("watch-quota-primary-bar-claude").style.width).toBe(
+      "8%",
+    );
+    expect(within(claudeCard).getByTestId("watch-quota-secondary-bar-claude").style.width).toBe(
+      "36%",
     );
 
     const codexCard = within(quotasSection).getByTestId("watch-vendor-card-codex");
@@ -427,7 +435,10 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
       "Pro",
     );
     expect(within(codexCard).getByTestId("watch-quota-primary-pct-codex")).toHaveTextContent(
-      "28%",
+      "72% left",
+    );
+    expect(within(codexCard).getByTestId("watch-quota-primary-bar-codex").style.width).toBe(
+      "72%",
     );
 
     expect(within(quotasSection).getByTestId("watch-vendor-card-grok")).toBeInTheDocument();
@@ -631,6 +642,173 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
     );
     expect(screen.getByTestId("watch-rollup-agent-virtual-ferris")).toHaveTextContent(
       "$22.50 API-eq",
+    );
+  });
+});
+
+describe("FerroWatchPane — Subscription Quota & Usage Matrix shows allowance available (Record #127)", () => {
+  type QuotaRow = WatchSummaryResponse["quotas"][number];
+
+  async function renderMatrix(quotas: QuotaRow[]) {
+    const summary = makeSampleWatchSummary();
+    summary.quotas = quotas;
+    // Thresholds in the fixture: warn at 80% used, critical at 95% used.
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (payload: unknown) =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.includes("/api/v1/watch/summary")) {
+        return json(summary);
+      }
+      return json({});
+    });
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+    return screen.findByTestId("watch-quota-matrix-section");
+  }
+
+  const row = (
+    vendor: string,
+    window: "primary" | "secondary",
+    used_percent: number,
+    exhausted_reason: string | null = null,
+  ): QuotaRow => ({
+    vendor,
+    window,
+    used_percent,
+    resets_at_ms: Date.now() + 3_600_000,
+    exhausted_reason,
+  });
+
+  const color = (el: HTMLElement) => el.getAttribute("style") ?? "";
+
+  it("shows remaining allowance and a bar as wide as the remaining allowance, for both windows", async () => {
+    const section = await renderMatrix([
+      row("claude", "primary", 25),
+      row("claude", "secondary", 60),
+    ]);
+    const card = within(section).getByTestId("watch-vendor-card-claude");
+    expect(within(card).getByTestId("watch-quota-primary-pct-claude")).toHaveTextContent(
+      "75% left",
+    );
+    expect(within(card).getByTestId("watch-quota-secondary-pct-claude")).toHaveTextContent(
+      "40% left",
+    );
+    expect(within(card).getByTestId("watch-quota-primary-bar-claude").style.width).toBe("75%");
+    expect(within(card).getByTestId("watch-quota-secondary-bar-claude").style.width).toBe("40%");
+  });
+
+  it("labels the alert thresholds and threshold inputs as percent used", async () => {
+    const section = await renderMatrix([row("claude", "primary", 25)]);
+    expect(section).toBeInTheDocument();
+    expect(await screen.findByText("Warn at 80% used / Crit at 95% used")).toBeInTheDocument();
+    expect(screen.getByText("Warn Quota (% used)")).toBeInTheDocument();
+    expect(screen.getByText("Critical Quota (% used)")).toBeInTheDocument();
+  });
+
+  it("rounds the remaining allowance to a whole percent like Settings -> Runtimes & Quotas", async () => {
+    // 100 - 44.6 = 55.4 -> 55; 100 - 44.5 = 55.5 -> 56.
+    const section = await renderMatrix([
+      row("claude", "primary", 44.6),
+      row("claude", "secondary", 44.5),
+    ]);
+    const card = within(section).getByTestId("watch-vendor-card-claude");
+    expect(within(card).getByTestId("watch-quota-primary-pct-claude")).toHaveTextContent(
+      "55% left",
+    );
+    expect(within(card).getByTestId("watch-quota-secondary-pct-claude")).toHaveTextContent(
+      "56% left",
+    );
+  });
+
+  it("clamps the remaining allowance to 0-100 for out-of-range usage", async () => {
+    const section = await renderMatrix([
+      row("claude", "primary", 120),
+      row("claude", "secondary", -5),
+    ]);
+    const card = within(section).getByTestId("watch-vendor-card-claude");
+    expect(within(card).getByTestId("watch-quota-primary-pct-claude")).toHaveTextContent(
+      "0% left",
+    );
+    expect(within(card).getByTestId("watch-quota-primary-bar-claude").style.width).toBe("0%");
+    expect(within(card).getByTestId("watch-quota-secondary-pct-claude")).toHaveTextContent(
+      "100% left",
+    );
+    expect(within(card).getByTestId("watch-quota-secondary-bar-claude").style.width).toBe("100%");
+  });
+
+  it("shows a dash and an empty bar, not a full bar, when a vendor reports nothing for a window", async () => {
+    const section = await renderMatrix([row("claude", "primary", 10)]);
+    const card = within(section).getByTestId("watch-vendor-card-claude");
+    expect(within(card).getByTestId("watch-quota-secondary-pct-claude")).toHaveTextContent("—");
+    expect(within(card).getByTestId("watch-quota-secondary-pct-claude")).not.toHaveTextContent(
+      "left",
+    );
+    expect(within(card).getByTestId("watch-quota-secondary-bar-claude").style.width).toBe("0%");
+  });
+
+  it("keeps the bar colour on the usage thresholds (warn 80% used, critical 95% used)", async () => {
+    const section = await renderMatrix([
+      // 50% used -> 50% left -> ok
+      row("claude", "primary", 50),
+      // 80% used -> 20% left -> warning
+      row("claude", "secondary", 80),
+      // 95% used -> 5% left -> critical
+      row("codex", "primary", 95),
+      // 79% used -> 21% left -> still ok (just below warn)
+      row("codex", "secondary", 79),
+    ]);
+    const claude = within(section).getByTestId("watch-vendor-card-claude");
+    const codex = within(section).getByTestId("watch-vendor-card-codex");
+    expect(color(within(claude).getByTestId("watch-quota-primary-bar-claude"))).toContain(
+      "--status-ok",
+    );
+    expect(color(within(claude).getByTestId("watch-quota-secondary-bar-claude"))).toContain(
+      "--status-warning",
+    );
+    expect(color(within(codex).getByTestId("watch-quota-primary-bar-codex"))).toContain(
+      "--status-danger",
+    );
+    expect(color(within(codex).getByTestId("watch-quota-secondary-bar-codex"))).toContain(
+      "--status-ok",
+    );
+  });
+
+  it("shows both windows red for an exhausted vendor even when the numbers look healthy", async () => {
+    const section = await renderMatrix([
+      row("claude", "primary", 10, "weekly limit reached"),
+      row("claude", "secondary", 20),
+    ]);
+    const card = within(section).getByTestId("watch-vendor-card-claude");
+    expect(within(card).getByTestId("watch-quota-primary-pct-claude")).toHaveTextContent(
+      "90% left",
+    );
+    expect(color(within(card).getByTestId("watch-quota-primary-bar-claude"))).toContain(
+      "--status-danger",
+    );
+    expect(color(within(card).getByTestId("watch-quota-secondary-bar-claude"))).toContain(
+      "--status-danger",
+    );
+  });
+
+  it("reports the window with the least allowance when several sources disagree", async () => {
+    const section = await renderMatrix([
+      row("claude", "primary", 30),
+      row("claude", "primary", 70),
+    ]);
+    const card = within(section).getByTestId("watch-vendor-card-claude");
+    expect(within(card).getByTestId("watch-quota-primary-pct-claude")).toHaveTextContent(
+      "30% left",
     );
   });
 });
