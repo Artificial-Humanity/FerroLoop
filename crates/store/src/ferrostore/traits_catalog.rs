@@ -124,6 +124,25 @@ impl Catalog for FerroStore {
         })
     }
 
+    fn remove_project(&self, id: &ProjectId) -> Result<bool, StoreError> {
+        let held = self.with_read(|txn| {
+            doc::check_kind(txn, &self.label, id.iri(), Kind::Project)?;
+            Ok(doc::get_owned::<Project>(txn, &self.label, PROJECTS, id.iri())?.is_some())
+        })?;
+        if !held {
+            return Ok(false);
+        }
+        fl_core::store::check_project_removable(self, id)?;
+        self.with_write(|txn| {
+            doc::check_kind(txn, &self.label, id.iri(), Kind::Project)?;
+            let held = doc::get_owned::<Project>(txn, &self.label, PROJECTS, id.iri())?.is_some();
+            if held {
+                txn.delete(PROJECTS, id.iri().as_str());
+            }
+            Ok(held)
+        })
+    }
+
     fn add_gate(
         &self,
         project: &ProjectId,

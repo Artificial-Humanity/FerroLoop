@@ -8,7 +8,7 @@ use super::doc::{
     NEXT_STATE_REV, STATE_CONFLICTS, STATE_ENTRIES, STATE_KEYS, STATE_REVISION_IDS,
     STATE_REVISIONS, STATE_SYNC_CURSORS,
 };
-use crate::{FORMAT_WITH_STATE, decode, mint};
+use crate::{FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE, decode, mint};
 use fl_core::agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
     RegistryEventKind, validate_agent_identity,
@@ -323,10 +323,11 @@ impl AgentRegistry for FerroStore {
         let key =
             validate_slug(area_key).map_err(|err| StoreError::InvalidState(err.to_string()))?;
         self.with_write(|txn| {
-            doc::raise_format(txn, FORMAT_WITH_STATE)?;
             if doc::get_json::<AreaRecord>(txn, AREAS, &key)?.is_none() {
                 return Ok(false);
             }
+            // An older fl cannot decode the event below: it refuses the raised store instead.
+            doc::raise_format(txn, FORMAT_WITH_AREA_DELETE)?;
             txn.delete(AREAS, &key);
             let ev = RegistryEvent {
                 event_id: mint()?,
@@ -626,6 +627,7 @@ impl AgentRegistry for FerroStore {
                         doc::put_json(txn, AGENTS, rec.id.as_str(), rec)?;
                     }
                     RegistryEventKind::AreaDelete { area_key } => {
+                        doc::raise_format(txn, FORMAT_WITH_AREA_DELETE)?;
                         txn.delete(AREAS, area_key);
                     }
                     RegistryEventKind::AgentRetire { id } => {

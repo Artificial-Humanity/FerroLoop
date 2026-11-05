@@ -642,6 +642,18 @@ impl Catalog for MemStore {
         }
     }
 
+    fn remove_project(&self, id: &ProjectId) -> Result<bool, StoreError> {
+        {
+            let s = self.inner.borrow();
+            s.check_kind(&id.0, Kind::Project)?;
+            if !s.projects.contains_key(&id.0) {
+                return Ok(false);
+            }
+        }
+        crate::store::check_project_removable(self, id)?;
+        Ok(self.inner.borrow_mut().projects.remove(&id.0).is_some())
+    }
+
     fn add_gate(
         &self,
         project: &ProjectId,

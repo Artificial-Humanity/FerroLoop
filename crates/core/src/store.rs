@@ -447,6 +447,16 @@ pub trait Catalog {
             "this store cannot change a project's root".to_string(),
         ))
     }
+    /// Removes the project row `id`; `true` when there was one, `false` when there was none.
+    /// The id stays minted and is never reused. A project that holds gates, transitions,
+    /// records or a routing map is refused with [`StoreError::InvalidState`]: removing the row
+    /// would leave them behind with no project. A store that cannot do this refuses the same
+    /// way.
+    fn remove_project(&self, _id: &ProjectId) -> Result<bool, StoreError> {
+        Err(StoreError::InvalidState(
+            "this store cannot remove a project".to_string(),
+        ))
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn add_gate(
@@ -481,6 +491,26 @@ pub trait Catalog {
     /// if it never held it. A split binding asks this to check a reference
     /// that crosses into another store (GitHub tracker spec §1.3).
     fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError>;
+}
+
+/// The refusal [`Catalog::remove_project`] gives when `id` still holds gates, transitions,
+/// records or a routing map. One check for every store, so the three engines agree.
+pub fn check_project_removable<S>(store: &S, id: &ProjectId) -> Result<(), StoreError>
+where
+    S: Catalog + Tracker + crate::routing::Routes + ?Sized,
+{
+    let gates = store.list_gates(id)?.len();
+    let transitions = store.list_transitions(id)?.len();
+    let records = store.list_records(id)?.len();
+    let routed = store.routes(id)?.is_some();
+    if gates + transitions + records > 0 || routed {
+        return Err(StoreError::InvalidState(format!(
+            "project {} still holds {gates} gates, {transitions} transitions and {records}              records{}, so it is not removed",
+            id.iri(),
+            if routed { " and a routing map" } else { "" }
+        )));
+    }
+    Ok(())
 }
 
 /// Mutable state that people discuss: records and findings.

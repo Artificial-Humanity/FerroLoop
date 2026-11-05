@@ -196,7 +196,7 @@ fn run_bound<F: Fixture>(
 }
 
 /// How many cases [`catalog`] runs. Update deliberately — see [`run_suite`].
-const CATALOG_CASES: usize = 4;
+const CATALOG_CASES: usize = 5;
 /// How many cases [`tracker`] runs. Update deliberately — see [`run_suite`].
 const TRACKER_CASES: usize = 14;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
@@ -212,10 +212,11 @@ const LEDGER_CACHE_CASES: usize = 6;
 /// How many cases [`escalations`] runs. Update deliberately — see [`run_suite`].
 const ESCALATION_CASES: usize = 8;
 
-pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
+pub fn catalog<S: Catalog + Tracker + crate::routing::Routes, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         a_project_round_trips::<S>,
         a_project_root_can_be_changed_and_nothing_else::<S>,
+        a_project_is_removed_only_when_nothing_hangs_on_it::<S>,
         affirming_a_gate_moves_only_its_stamp::<S>,
         list_transitions_returns_every_transition_of_one_project_and_no_others::<S>,
     ];
@@ -626,6 +627,48 @@ fn a_project_root_can_be_changed_and_nothing_else<S: Catalog>(s: &S) {
             .is_err()
     );
     assert_eq!(s.list_projects().unwrap().len(), 1);
+}
+
+fn a_project_is_removed_only_when_nothing_hangs_on_it<S: Catalog + Tracker>(s: &S) {
+    let keep = s.add_project("/tmp/keep").unwrap();
+    let gone = s.add_project("/tmp/gone").unwrap();
+    assert!(s.remove_project(&gone).unwrap());
+    assert_eq!(s.get_project(&gone).unwrap(), None);
+    let left: Vec<_> = s
+        .list_projects()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(left, vec![keep.clone()]);
+    // Asking again changes nothing and says so.
+    assert!(!s.remove_project(&gone).unwrap());
+    // An id that is not a project is refused, never removed.
+    assert!(s.remove_project(&ProjectId(entry_iri(900))).is_err());
+
+    // A project that holds a record or a gate stays: its record would be left with no project.
+    s.add_record(&keep, "a record").unwrap();
+    assert!(matches!(
+        s.remove_project(&keep),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert_eq!(s.list_projects().unwrap().len(), 1);
+    let other = s.add_project("/tmp/other").unwrap();
+    s.add_gate(
+        &other,
+        "fmt",
+        sample_kind(),
+        sample_selector(),
+        1,
+        "abc",
+        "owner",
+    )
+    .unwrap();
+    assert!(matches!(
+        s.remove_project(&other),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert_eq!(s.list_projects().unwrap().len(), 2);
 }
 
 fn affirming_a_gate_moves_only_its_stamp<S: Catalog>(s: &S) {

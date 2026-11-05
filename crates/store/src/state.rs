@@ -19,8 +19,8 @@ use fl_core::store::{AgentRegistry, StateStore, StoreError};
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
-    ALIASES, FORMAT_WITH_STATE, HANDLE_OF, HANDLES, IDS, META, RedbStore, additive, backend,
-    decode, index_new, locate_in, mint, raise_format,
+    ALIASES, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE, HANDLE_OF, HANDLES, IDS, META, RedbStore,
+    additive, backend, decode, index_new, locate_in, mint, raise_format,
 };
 
 pub(crate) const STATE_ENTRIES: TableDefinition<&str, &str> = TableDefinition::new("state_entries");
@@ -626,7 +626,6 @@ impl AgentRegistry for RedbStore {
     fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError> {
         let key = validate_slug(area_key).map_err(|e| StoreError::InvalidState(e.to_string()))?;
         let tx = self.db.begin_write().map_err(backend)?;
-        raise_format(&tx, FORMAT_WITH_STATE)?;
         let removed = tx
             .open_table(AREAS)
             .map_err(backend)?
@@ -636,6 +635,8 @@ impl AgentRegistry for RedbStore {
         if !removed {
             return Ok(false);
         }
+        // An older fl cannot decode the event below: it refuses the raised store instead.
+        raise_format(&tx, FORMAT_WITH_AREA_DELETE)?;
         let ev = RegistryEvent {
             event_id: mint()?,
             at,
@@ -1037,6 +1038,7 @@ impl AgentRegistry for RedbStore {
                         .map_err(backend)?;
                 }
                 RegistryEventKind::AreaDelete { area_key } => {
+                    raise_format(&tx, FORMAT_WITH_AREA_DELETE)?;
                     tx.open_table(AREAS)
                         .map_err(backend)?
                         .remove(area_key.as_str())
