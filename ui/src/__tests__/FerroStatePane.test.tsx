@@ -341,7 +341,7 @@ describe("FerroStatePane", () => {
     expect(screen.getByTestId("ferrostate-body").style.overflowY).toBe("auto");
 
     const actionsRow = screen.getByTestId("ferrostate-actions-row");
-    expect(actionsRow.style.flexWrap).toBe("nowrap");
+    expect(actionsRow.style.flexWrap).toBe("wrap");
     const importBtn = screen.getByTestId("import-workspace-btn");
     expect(importBtn).toHaveTextContent("Import Workspace");
 

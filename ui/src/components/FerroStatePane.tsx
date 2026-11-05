@@ -823,14 +823,23 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             display: "flex",
             alignItems: "center",
             gap: "6px",
-            flexWrap: "nowrap",
+            flexWrap: "wrap",
             width: "100%",
+            minWidth: 0,
           }}
         >
           <button
             type="button"
             className="fd-btn"
-            style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+            style={{
+              flex: "1 1 auto",
+              minWidth: 0,
+              justifyContent: "center",
+              minHeight: "34px",
+              fontSize: "12px",
+              padding: "6px 10px",
+              whiteSpace: "nowrap",
+            }}
             data-testid="checkpoint-btn"
             disabled={busyCheckpoint}
             onClick={() => void handleCheckpoint()}
@@ -843,7 +852,15 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                 <button
                   type="button"
                   className="fd-btn fd-btn-primary"
-                  style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                  style={{
+                    flex: "1 1 auto",
+                    minWidth: 0,
+                    justifyContent: "center",
+                    minHeight: "34px",
+                    fontSize: "12px",
+                    padding: "6px 10px",
+                    whiteSpace: "nowrap",
+                  }}
                   data-testid="import-workspace-confirm-btn"
                   disabled={busyImport}
                   onClick={() => void handleImport()}
@@ -853,7 +870,16 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                 <button
                   type="button"
                   className="fd-btn"
-                  style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                  style={{
+                    flex: "1 1 auto",
+                    minWidth: 0,
+                    justifyContent: "center",
+                    minHeight: "34px",
+                    fontSize: "12px",
+                    padding: "6px 10px",
+                    whiteSpace: "nowrap",
+                  }}
+                  data-testid="import-workspace-cancel-btn"
                   onClick={() => setPendingImport(false)}
                 >
                   Cancel
@@ -863,7 +889,15 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               <button
                 type="button"
                 className="fd-btn"
-                style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                style={{
+                  flex: "1 1 auto",
+                  minWidth: 0,
+                  justifyContent: "center",
+                  minHeight: "34px",
+                  fontSize: "12px",
+                  padding: "6px 10px",
+                  whiteSpace: "nowrap",
+                }}
                 data-testid="import-workspace-btn"
                 title="Import Workspace (.agents/memory & Notes)"
                 onClick={() => setPendingImport(true)}
