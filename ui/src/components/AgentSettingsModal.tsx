@@ -619,12 +619,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
         style={{
-          width: "560px",
-          maxWidth: "calc(100vw - 32px)",
-          minWidth: "360px",
+          width: "min(560px, calc(100vw - 24px))",
+          maxWidth: "calc(100vw - 24px)",
+          minWidth: 0,
           height: "760px",
-          maxHeight: "calc(100vh - 48px)",
-          minHeight: "520px",
+          maxHeight: "calc(100dvh - 32px)",
+          minHeight: 0,
+          boxSizing: "border-box",
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
@@ -743,9 +744,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
           >
             {(
               [
-                { id: "overview", label: "Overview & Model" },
-                { id: "permissions", label: "Permissions & Sandbox" },
-                { id: "runtime", label: "MCP & Runtime" },
+                { id: "overview", visibleLabel: "Overview", srSuffix: " & Model" },
+                { id: "permissions", visibleLabel: "Permissions", srSuffix: " & Sandbox" },
+                { id: "runtime", visibleLabel: "MCP & Runtime", srSuffix: "" },
               ] as const
             ).map((tab) => {
               const isSelected = activeTab === tab.id;
@@ -762,16 +763,35 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   style={{
                     fontSize: "11.5px",
                     fontWeight: isSelected ? 700 : 500,
-                    padding: "5px 8px",
+                    padding: "5px 4px",
                     justifyContent: "center",
                     textAlign: "center",
                     whiteSpace: "nowrap",
                     overflow: "hidden",
                     textOverflow: "ellipsis",
+                    minWidth: 0,
                   }}
                   onClick={() => setActiveTab(tab.id)}
                 >
-                  {tab.label}
+                  {tab.visibleLabel}
+                  {tab.srSuffix && (
+                    <span
+                      className="sr-only"
+                      style={{
+                        position: "absolute",
+                        width: "1px",
+                        height: "1px",
+                        padding: 0,
+                        margin: "-1px",
+                        overflow: "hidden",
+                        clip: "rect(0, 0, 0, 0)",
+                        whiteSpace: "nowrap",
+                        border: 0,
+                      }}
+                    >
+                      {tab.srSuffix}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -780,11 +800,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
 
         {/* Scrollable Middle Body */}
         <div
+          className="fd-scroll"
           data-testid="agent-settings-scroll-body"
           style={{
             flex: 1,
             minHeight: 0,
             overflowY: "auto",
+            overflowX: "hidden",
             display: "flex",
             flexDirection: "column",
             gap: "12px",
@@ -882,11 +904,21 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   </span>
                 </div>
               </div>
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
                   Active Model
                 </div>
-                <span className="fd-badge fd-mono" data-testid="chat-active-model-badge">
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="chat-active-model-badge"
+                  style={{
+                    maxWidth: "100%",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    display: "inline-block",
+                  }}
+                >
                   {effectiveAdapter && effectiveAdapter.toLowerCase() !== "unknown"
                     ? `${effectiveAdapter} · `
                     : ""}
@@ -910,11 +942,11 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1fr 1fr",
+                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
                 gap: "10px",
               }}
             >
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <label
                   htmlFor="fd-agent-settings-model"
                   style={{
@@ -936,7 +968,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   disabled={!targetSessionOrAgent || switchingModel}
                   value={effectiveModel}
                   onChange={(e) => onChangeModelAndThinking(e.target.value, effectiveThinking)}
-                  style={{ width: "100%" }}
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                  }}
                 >
                   {modelOptions.length === 0 && (
                     <option value="">Default (runtime default)</option>
@@ -949,7 +986,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                 </select>
               </div>
 
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <label
                   htmlFor="fd-agent-settings-thinking"
                   style={{
@@ -971,7 +1008,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   disabled={!targetSessionOrAgent || switchingModel}
                   value={effectiveThinking}
                   onChange={(e) => onChangeModelAndThinking(effectiveModel, e.target.value)}
-                  style={{ width: "100%" }}
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                  }}
                 >
                   {thinkingOptions.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -1183,7 +1225,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     <code
                       className="fd-mono"
                       data-testid="agent-permission-vendor-preview"
-                      style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
+                      style={{
+                        fontSize: "10.5px",
+                        color: "var(--accent-primary)",
+                        overflowWrap: "anywhere",
+                        wordBreak: "break-word",
+                        minWidth: 0,
+                      }}
                     >
                       {resolveVendorPermissionPreview(
                         effectiveAdapter,
@@ -1196,11 +1244,11 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div
                     style={{
                       display: "grid",
-                      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
                       gap: "6px",
                     }}
                   >
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div
                         style={{
                           display: "flex",
@@ -1208,6 +1256,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           justifyContent: "space-between",
                           gap: "4px",
                           marginBottom: "2px",
+                          flexWrap: "wrap",
                         }}
                       >
                         <span
@@ -1244,7 +1293,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                             setAgentPermissionMode("workspace-write");
                           }
                         }}
-                        style={{ width: "100%", fontSize: "10.5px" }}
+                        style={{
+                          width: "100%",
+                          minWidth: 0,
+                          maxWidth: "100%",
+                          boxSizing: "border-box",
+                          fontSize: "10.5px",
+                        }}
                       >
                         <option value="ask">ask (default)</option>
                         <option value="accept-edits">accept-edits</option>
@@ -1254,7 +1309,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       </select>
                     </div>
 
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div
                         style={{
                           display: "flex",
@@ -1262,6 +1317,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           justifyContent: "space-between",
                           gap: "4px",
                           marginBottom: "2px",
+                          flexWrap: "wrap",
                         }}
                       >
                         <span
@@ -1295,14 +1351,20 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                             setAgentRequireFsEnforcement(false);
                           }
                         }}
-                        style={{ width: "100%", fontSize: "10.5px" }}
+                        style={{
+                          width: "100%",
+                          minWidth: 0,
+                          maxWidth: "100%",
+                          boxSizing: "border-box",
+                          fontSize: "10.5px",
+                        }}
                       >
                         <option value="vendor-default">vendor-default</option>
                         <option value="off">off (no OS sandbox)</option>
                       </select>
                     </div>
 
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div
                         style={{
                           display: "flex",
@@ -1310,6 +1372,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           justifyContent: "space-between",
                           gap: "4px",
                           marginBottom: "2px",
+                          flexWrap: "wrap",
                         }}
                       >
                         <span
@@ -1336,7 +1399,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                             ...DEFAULT_RULE_PRESET_MATRICES[nextPreset],
                           });
                         }}
-                        style={{ width: "100%", fontSize: "10.5px" }}
+                        style={{
+                          width: "100%",
+                          minWidth: 0,
+                          maxWidth: "100%",
+                          boxSizing: "border-box",
+                          fontSize: "10.5px",
+                        }}
                       >
                         <option value="read-only">read-only</option>
                         <option value="workspace">workspace</option>
@@ -1350,10 +1419,11 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div
                     style={{
                       display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "8px",
-                      flexWrap: "wrap",
+                      flexDirection: "column",
+                      alignItems: "stretch",
+                      gap: "6px",
+                      width: "100%",
+                      minWidth: 0,
                     }}
                   >
                     <label
@@ -1364,6 +1434,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                         fontSize: "10.5px",
                         color: "var(--text-secondary)",
                         cursor: "pointer",
+                        minWidth: 0,
+                        flexWrap: "wrap",
                       }}
                     >
                       <input
@@ -1377,7 +1449,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           setAgentRequireFsEnforcement(e.target.checked)
                         }
                       />
-                      <span>
+                      <span style={{ overflowWrap: "anywhere" }}>
                         require_fs_enforcement (OS boundary for
                         fs_write_protected)
                       </span>
@@ -1386,7 +1458,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       style={{
                         display: "flex",
                         alignItems: "center",
-                        gap: "4px",
+                        gap: "6px",
+                        width: "100%",
+                        minWidth: 0,
+                        flexWrap: "wrap",
                       }}
                     >
                       <label
@@ -1395,6 +1470,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           fontSize: "10px",
                           color: "var(--text-muted)",
                           fontWeight: 600,
+                          flexShrink: 0,
                         }}
                       >
                         unenforced_defaults:
@@ -1410,7 +1486,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                             e.target.value as UnenforcedDefaultsMode,
                           )
                         }
-                        style={{ fontSize: "10px", padding: "1px 4px" }}
+                        style={{
+                          fontSize: "10.5px",
+                          padding: "2px 6px",
+                          flex: 1,
+                          minWidth: 0,
+                          maxWidth: "100%",
+                          boxSizing: "border-box",
+                        }}
                       >
                         <option value="refuse">refuse (default)</option>
                         <option value="acknowledge">acknowledge</option>
@@ -1439,7 +1522,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                         setAgentRulePreset("custom");
                       }
                     }}
-                    style={{ width: "100%", fontSize: "11px" }}
+                    style={{
+                      width: "100%",
+                      minWidth: 0,
+                      maxWidth: "100%",
+                      boxSizing: "border-box",
+                      fontSize: "11px",
+                    }}
                   >
                     <option value="auto-accept">
                       auto-accept (Full autonomous bypass)
@@ -1479,6 +1568,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                             borderRadius: "4px",
                             border: "1px solid var(--border-subtle)",
                             fontSize: "10.5px",
+                            minWidth: 0,
+                            flexWrap: "wrap",
                           }}
                         >
                           <div
@@ -1502,7 +1593,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                             aria-label={`Agent permission for ${cap}`}
                             data-testid={`agent-perm-select-${cap}`}
                             className="fd-select fd-mono"
-                            style={{ fontSize: "10px", padding: "1px 4px" }}
+                            style={{
+                              fontSize: "10px",
+                              padding: "1px 4px",
+                              minWidth: 0,
+                              maxWidth: "100%",
+                            }}
                             value={agentPermissionMatrix[cap]}
                             onChange={(e) => {
                               const nextAction = e.target
@@ -1536,6 +1632,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       flexDirection: "column",
                       gap: "4px",
                       fontSize: "10.5px",
+                      minWidth: 0,
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-word",
                     }}
                   >
                     <div
@@ -1718,7 +1817,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     data-testid="agent-posture-tiers"
                     style={{
                       display: "grid",
-                      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
                       gap: "6px",
                       fontSize: "11px",
                     }}
@@ -1730,6 +1829,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                         borderRadius: "4px",
                         backgroundColor: "var(--bg-surface)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        overflowWrap: "anywhere",
+                        wordBreak: "break-word",
                       }}
                     >
                       <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -1750,6 +1852,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           posture.missingInApplied.length > 0
                             ? "1px solid rgba(245, 158, 11, 0.5)"
                             : "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        overflowWrap: "anywhere",
+                        wordBreak: "break-word",
                       }}
                     >
                       <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -1770,6 +1875,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           posture.driftKind === "stale_session"
                             ? "1px solid rgba(245, 158, 11, 0.5)"
                             : "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        overflowWrap: "anywhere",
+                        wordBreak: "break-word",
                       }}
                     >
                       <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -1945,7 +2053,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div
                     className="fd-mono"
                     data-testid="agent-bootstrap-hooks-preview"
-                    style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                    style={{
+                      fontSize: "10.5px",
+                      color: "var(--text-muted)",
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-word",
+                    }}
                   >
                     {wtPreview.bootstrapConfigPath}: {wtPreview.bootstrapHooks.join(" && ")}
                   </div>
@@ -2014,7 +2127,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div
                     className="fd-mono"
                     data-testid="agent-host-ring-buffer-usage"
-                    style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                    style={{
+                      fontSize: "10.5px",
+                      color: "var(--text-muted)",
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-word",
+                    }}
                   >
                     {hostTelemetry.supervisorUnit} · Ring Buffer:{" "}
                     {Math.round(hostTelemetry.ringBufferUsedBytes / 1024)} KB /{" "}
@@ -2037,12 +2155,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
           data-testid="agent-settings-footer"
           style={{
             flexShrink: 0,
-            paddingTop: "12px",
+            paddingTop: "8px",
             borderTop: "1px solid var(--border-subtle)",
             backgroundColor: "var(--bg-surface)",
             display: "flex",
             flexDirection: "column",
-            gap: "8px",
+            gap: "6px",
           }}
         >
           <div

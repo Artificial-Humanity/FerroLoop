@@ -243,4 +243,43 @@ describe("AgentSettingsModal 3-tab layout, pinned header, scrollable body, and p
     expect(screen.getByTestId("agent-settings-panel-runtime").style.display).toBe("flex");
     expect(screen.getByTestId("agent-settings-panel-overview").style.display).toBe("none");
   });
+
+  it("Record #119: reflows AgentSettingsModal cleanly on narrow phone viewports without horizontal overflow or clipped selects", () => {
+    render(<AgentSettingsModal {...modalProps({ initialTab: "permissions" })} />);
+
+    const modal = screen.getByTestId("agent-settings-modal");
+    expect(modal.style.minWidth).toBe("0");
+    expect(modal.style.boxSizing).toBe("border-box");
+
+    const scrollBody = screen.getByTestId("agent-settings-scroll-body");
+    expect(scrollBody).toHaveClass("fd-scroll");
+    expect(scrollBody.style.overflowX).toBe("hidden");
+
+    const tabOverview = screen.getByTestId("agent-settings-tab-overview");
+    const tabPermissions = screen.getByTestId("agent-settings-tab-permissions");
+    expect(tabOverview).toHaveTextContent("Overview & Model");
+    expect(tabOverview.querySelector(".sr-only")).toHaveTextContent("& Model");
+    expect(tabPermissions).toHaveTextContent("Permissions & Sandbox");
+    expect(tabPermissions.querySelector(".sr-only")).toHaveTextContent("& Sandbox");
+
+    const postureSelect = screen.getByTestId("agent-posture-select");
+    const sandboxSelect = screen.getByTestId("agent-sandbox-select");
+    const rulePresetSelect = screen.getByTestId("agent-rule-preset-select");
+    const unenforcedSelect = screen.getByTestId("agent-unenforced-defaults-select");
+    const modeSelect = screen.getByTestId("agent-permission-mode-select");
+    expect(postureSelect.style.boxSizing).toBe("border-box");
+    expect(sandboxSelect.style.boxSizing).toBe("border-box");
+    expect(rulePresetSelect.style.boxSizing).toBe("border-box");
+    expect(unenforcedSelect.style.boxSizing).toBe("border-box");
+    expect(modeSelect.style.boxSizing).toBe("border-box");
+
+    const compileReceipt = screen.getByTestId("agent-compile-receipt");
+    expect(compileReceipt.style.overflowWrap).toBe("anywhere");
+
+    fireEvent.click(screen.getByTestId("agent-settings-tab-runtime"));
+    const postureTiers = screen.getByTestId("agent-posture-tiers");
+    expect(postureTiers.style.gridTemplateColumns).toBe(
+      "repeat(auto-fit, minmax(140px, 1fr))",
+    );
+  });
 });
