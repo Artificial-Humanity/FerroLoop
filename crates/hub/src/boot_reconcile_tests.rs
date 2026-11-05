@@ -211,8 +211,12 @@ fn a_retired_persona_is_never_sent_the_notice_and_its_pane_is_not_killed() {
     fx.agent(&state, "Fiona", true);
     fx.route("fiona", true);
     let panes = FakePanes(Some(vec![pane("Fiona", "%6", "codex")]));
+    // A retired persona with a live route and no pane is not told either.
+    fx.agent(&state, "Gone", true);
+    fx.route("gone", true);
     reconcile_pass(&state, &host("boot-a"), &panes).unwrap();
     assert!(inbox(&state, "fiona").is_empty());
+    assert!(inbox(&state, "gone").is_empty());
 }
 
 #[test]
