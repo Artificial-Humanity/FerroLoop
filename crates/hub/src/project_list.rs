@@ -28,9 +28,10 @@ use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::project_init::{
-    CONFIG_LOCK, Credential, InitError, InitPaths, ProjectKind, Tracker, canonical_root,
-    check_store_dir_overlap, checked_display_name, checked_github, checked_purpose, config_entries,
-    conflict, failed, has_git, invalid, read_config, same_root, slug_from_display, write_atomic,
+    CONFIG_LOCK, ConfigEntry, Credential, InitError, InitPaths, ProjectKind, Tracker,
+    canonical_root, check_store_dir_overlap, checked_display_name, checked_github, checked_purpose,
+    config_entries, conflict, failed, has_git, invalid, read_config, same_root, slug_from_display,
+    write_atomic,
 };
 
 /// One project as the list shows it. It serializes with every field present; an absent value
@@ -57,6 +58,56 @@ pub struct ProjectSummary {
 /// A per-project store file the caller knows of: its slug, and where the file is (`None` when
 /// the project is listed without one, as the Hub's default project).
 pub type StoreHint = (String, Option<PathBuf>);
+
+/// The slug the workspace store's project row gets in the list: its root's directory name in
+/// lowercase, or the slug made from it when that is not a slug.
+pub(crate) fn held_slug(root: &str) -> Option<String> {
+    let base = Path::new(root).file_name().and_then(|s| s.to_str())?;
+    Some(base.to_ascii_lowercase())
+        .filter(|s| validate_slug(s).is_ok())
+        .or_else(|| slug_from_display(base).ok())
+}
+
+/// Whether the list shows `slug` as a project and not as a virtual group: a `[[project]]` block
+/// names it, a per-project store file is known for it (`stores`, the default project among
+/// them), or the workspace store holds a project row of that name (`held`). This is the one
+/// predicate [`list_projects`] and the records routes ask; an area that none of these names is a
+/// virtual group (when it has no path).
+pub(crate) fn is_project_slug(
+    slug: &str,
+    entries: &[ConfigEntry],
+    stores: &[StoreHint],
+    held: &[Project],
+) -> bool {
+    entries.iter().any(|e| e.slug().as_deref() == Some(slug))
+        || stores.iter().any(|(s, _)| s == slug)
+        || held
+            .iter()
+            .any(|p| held_slug(&p.root).as_deref() == Some(slug))
+}
+
+/// The per-project stores in `dir`: each `<slug>.<ext>` file there (not a link, at most 200
+/// entries) as a [`StoreHint`], by slug. Reads the directory and nothing else; absent is none.
+pub fn scan_store_dir(dir: &Path, ext: &str) -> Vec<StoreHint> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let suffix = format!(".{ext}");
+    let mut found: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for entry in entries.take(200).flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(suffix.as_str())) else {
+            continue;
+        };
+        if validate_slug(stem).is_ok() {
+            found.insert(stem.to_string(), entry.path());
+        }
+    }
+    found.into_iter().map(|(s, p)| (s, Some(p))).collect()
+}
 
 /// Every project and virtual group, by slug. `stores` are the per-project store files the
 /// caller knows of beyond the config (the Hub passes the ones in its data directory), and `held`
@@ -137,14 +188,8 @@ pub fn list_projects<R: AgentRegistry + ?Sized>(
     // Projects the workspace store itself holds (`fl project add` into it, or the Hub's own
     // records): named by their root's directory, like a config block with no `name`.
     for p in held {
-        let Some(base) = Path::new(&p.root).file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
         // A directory name that is no slug (`.tmpAb1`) is made into one, as a display name is.
-        let Some(slug) = Some(base.to_ascii_lowercase())
-            .filter(|s| validate_slug(s).is_ok())
-            .or_else(|| slug_from_display(base).ok())
-        else {
+        let Some(slug) = held_slug(&p.root) else {
             continue;
         };
         match out.get_mut(&slug) {
@@ -162,7 +207,7 @@ pub fn list_projects<R: AgentRegistry + ?Sized>(
         }
     }
     for (slug, area) in &areas {
-        if area.is_virtual() && !out.contains_key(slug) {
+        if area.is_virtual() && !is_project_slug(slug, &entries, stores, held) {
             out.insert(
                 slug.clone(),
                 make(slug, ProjectKind::Virtual, None, None, None),

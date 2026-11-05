@@ -16,7 +16,9 @@ use serde_json::{Value, json};
 
 use crate::api::{HttpRequest, HttpResponse, hub_home_dir, percent_decode};
 use crate::auth::HubAuthority;
-use crate::project_delete::{DeleteContext, DeleteError, DeleteRequest, delete_project};
+use crate::project_delete::{
+    DeleteContext, DeleteError, DeleteRequest, delete_project, locate_workspace_roots,
+};
 use crate::project_init::{
     Credential, InitError, InitPaths, InitRequest, ProjectKind, VirtualRequest, canonical_root,
     create_virtual, init_project, user_config_path,
@@ -379,13 +381,21 @@ pub(crate) fn handle_delete_project(
     };
     let home = hub_home_dir(state);
     let hints = records::project_store_hints(state, home.as_deref());
-    let workspace_root = fl_core::resolve_workspace_root(&state.config.repo_root);
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    let homes: Vec<&std::path::Path> = home
+        .iter()
+        .chain(env_home.iter())
+        .map(|h| h.as_path())
+        .collect();
+    let exe = std::env::current_exe().ok();
+    let workspace_roots =
+        locate_workspace_roots(&[&state.config.repo_root], &homes, exe.as_deref());
     let env = crate::api::lifecycle_env(state);
     let ctx = DeleteContext {
         paths: &paths,
         stores: &hints,
         home: home.as_deref(),
-        workspace_root: &workspace_root,
+        workspace_roots: &workspace_roots,
         lifecycle: &env,
     };
     let result = delete_project(

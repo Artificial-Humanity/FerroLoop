@@ -70,15 +70,24 @@ impl WorkspaceImportScan {
     }
 }
 
-/// First ancestor of `start` (including `start` itself) that contains a
-/// `.agents/memory` or `Notes` directory; `start` when no ancestor does.
+/// Whether `dir` holds a `.agents/memory` or `Notes` directory: the markers of a workspace root.
+pub fn is_workspace_root(dir: &Path) -> bool {
+    dir.join(".agents").join("memory").is_dir() || dir.join("Notes").is_dir()
+}
+
+/// First ancestor of `start` (including `start` itself) that is a workspace root
+/// ([`is_workspace_root`]); `None` when no ancestor is.
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|ancestor| is_workspace_root(ancestor))
+        .map(Path::to_path_buf)
+}
+
+/// [`find_workspace_root`], or `start` when no ancestor is a workspace root. A caller that must
+/// not guess (one that deletes) uses [`find_workspace_root`] instead.
 pub fn resolve_workspace_root(start: &Path) -> PathBuf {
-    for ancestor in start.ancestors() {
-        if ancestor.join(".agents").join("memory").is_dir() || ancestor.join("Notes").is_dir() {
-            return ancestor.to_path_buf();
-        }
-    }
-    start.to_path_buf()
+    find_workspace_root(start).unwrap_or_else(|| start.to_path_buf())
 }
 
 /// Derive a valid slug from an arbitrary file stem or directory name:
@@ -1348,6 +1357,18 @@ mod tests {
             resolve_workspace_root(empty.path()),
             empty.path().to_path_buf()
         );
+    }
+
+    #[test]
+    fn find_workspace_root_is_none_where_resolve_falls_back_to_the_start() {
+        let tmp = fixture();
+        let deep = tmp.path().join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(find_workspace_root(&deep), Some(tmp.path().to_path_buf()));
+        assert!(is_workspace_root(tmp.path()) && !is_workspace_root(&deep));
+        let empty = TempDir::new().unwrap();
+        assert_eq!(find_workspace_root(empty.path()), None);
+        assert!(!is_workspace_root(empty.path()));
     }
 
     #[test]

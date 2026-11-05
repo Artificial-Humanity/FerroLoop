@@ -13,8 +13,10 @@ use fl_store::AnyStore;
 use tempfile::TempDir;
 
 use crate::lifecycle::{self, LifecycleEnv, SpinUpRequest};
+use crate::project_delete::hooks::{self, Fault};
 use crate::project_delete::{
-    DeleteContext, DeleteError, DeleteOutcome, DeleteRequest, delete_project,
+    DeleteContext, DeleteError, DeleteOutcome, DeleteRequest, delete_project_in, home_dirs,
+    locate_workspace_roots,
 };
 use crate::project_init::{InitError, InitPaths, InitRequest, init_project};
 use crate::project_list::{ProjectSummary, list_projects};
@@ -29,6 +31,7 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
+        hooks::reset();
         let tmp = TempDir::new().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
         for dir in ["home", "ws", "work", "data/fl", "cfg/fl"] {
@@ -124,15 +127,42 @@ impl Fx {
         home: &Path,
         ws_root: &Path,
     ) -> Result<DeleteOutcome, DeleteError> {
+        self.call_in(
+            slug,
+            req,
+            Some(home),
+            Some(home.to_path_buf()),
+            &[ws_root.to_path_buf()],
+        )
+    }
+
+    /// A deletion with the home directories and the known workspace roots named. Nothing here
+    /// reads the process's `$HOME`.
+    fn call_in(
+        &self,
+        slug: &str,
+        req: &DeleteRequest,
+        home: Option<&Path>,
+        env_home: Option<PathBuf>,
+        roots: &[PathBuf],
+    ) -> Result<DeleteOutcome, DeleteError> {
         let env = LifecycleEnv::new(Some(&self.home));
         let ctx = DeleteContext {
             paths: &self.paths,
             stores: &[],
-            home: Some(home),
-            workspace_root: ws_root,
+            home,
+            workspace_roots: roots,
             lifecycle: &env,
         };
-        delete_project(slug, req, "tester", &ctx, || self.open_ws(), |_| {})
+        delete_project_in(
+            slug,
+            req,
+            "tester",
+            &ctx,
+            env_home,
+            || self.open_ws(),
+            |_| {},
+        )
     }
 
     fn list(&self) -> Vec<ProjectSummary> {
@@ -384,13 +414,16 @@ fn a_directory_that_cannot_be_deleted_is_reported_without_undoing_the_unregistra
     let locked = fx.base.join("work/locked");
     fs::create_dir_all(&locked).unwrap();
     let root = fx.project_at(&locked.join("alpha"));
+    // The parent is not writable, so the removal fails. A process that ignores permissions
+    // (root) is made to fail the same removal on purpose: the test asserts either way.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
-    let privileged = fs::write(locked.join("probe"), "").is_ok();
+    let ignores_permissions = fs::write(locked.join("probe"), "").is_ok();
+    if ignores_permissions {
+        let _ = fs::remove_file(locked.join("probe"));
+        hooks::inject(Fault::RemoveDir);
+    }
     let out = fx.call("alpha", &dir_req());
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-    if privileged {
-        return; // root deletes it anyway
-    }
     let out = out.unwrap();
     assert!(!out.dir_deleted);
     assert!(
@@ -606,14 +639,15 @@ fn it_refuses_a_project_with_no_directory() {
         paths: &fx.paths,
         stores: &hints,
         home: Some(&fx.home),
-        workspace_root: &fx.ws_root,
+        workspace_roots: &[fx.ws_root.clone()],
         lifecycle: &env,
     };
-    let why = refused(delete_project(
+    let why = refused(delete_project_in(
         "pathless",
         &dir_req(),
         "tester",
         &ctx,
+        Some(fx.home.clone()),
         || fx.open_ws(),
         |_| {},
     ));

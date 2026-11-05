@@ -413,13 +413,21 @@ pub fn delete(
 ) -> Result<i32> {
     let paths = places(cfg, cwd, explicit_db, default_store)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let workspace_root = fl_core::resolve_workspace_root(cwd);
+    // The workspace is looked for at the current directory, the home directory (and just below
+    // it) and the `fl` executable; the project's own ancestors are looked at by the deletion.
+    // With none found, a directory is not deleted.
+    let homes: Vec<&Path> = home.iter().map(PathBuf::as_path).collect();
+    let exe = std::env::current_exe().ok();
+    let workspace_roots = project_delete::locate_workspace_roots(&[cwd], &homes, exe.as_deref());
+    // The stores in the data directory, as the Hub knows them, so another project's store is
+    // recognised here as it is there.
+    let hints = project_list::scan_store_dir(&paths.store_dir, "fls");
     let env = LifecycleEnv::new(None);
     let ctx = DeleteContext {
         paths: &paths,
-        stores: &[],
+        stores: &hints,
         home: home.as_deref(),
-        workspace_root: &workspace_root,
+        workspace_roots: &workspace_roots,
         lifecycle: &env,
     };
     let request = DeleteRequest {
