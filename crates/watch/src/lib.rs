@@ -30,7 +30,7 @@ pub mod runtime;
 
 use fl_core::ids::ProjectId;
 use fl_core::store::{Catalog, StoreError};
-use fl_store::AnyStore;
+use fl_store::{AnyStore, MqTelemetry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -81,6 +81,9 @@ pub struct WatchSummary {
     pub quotas: Vec<WatchQuotaWindow>,
     pub alerts: Vec<WatchAlert>,
     pub thresholds: WatchThresholds,
+    /// Owner-local MQ tier counters, or unavailable for unsupported backends.
+    #[serde(default)]
+    pub mq_tier_telemetry: Option<MqTelemetry>,
 }
 
 /// What FerroWatch reads from a store for a summary, in one pass: `list_state` once,
@@ -93,6 +96,7 @@ pub struct WatchStoreSnapshot {
     pub runtime: RuntimeSnapshot,
     /// Project IRI → slug, for every project the catalog lists.
     pub project_labels: BTreeMap<String, String>,
+    pub mq_tier_telemetry: Option<MqTelemetry>,
 }
 
 /// Read a [`WatchStoreSnapshot`] of `store`, scoped to `project` when given.
@@ -111,6 +115,9 @@ pub fn read_store_snapshot(
         telemetry,
         runtime,
         project_labels,
+        mq_tier_telemetry: store
+            .as_ferro()
+            .and_then(|ferro| ferro.mq_telemetry(None).ok()),
     })
 }
 
@@ -153,6 +160,7 @@ pub fn summarize(
         quotas: all_quotas,
         alerts,
         thresholds: thresholds.clone(),
+        mq_tier_telemetry: snapshot.mq_tier_telemetry.clone(),
     })
 }
 
@@ -228,6 +236,30 @@ pub(crate) mod testkit;
 mod tests {
     use super::*;
     use fl_core::MemStore;
+
+    #[test]
+    fn snapshot_reports_owner_mq_tier_telemetry() {
+        use fl_store::{FerroStore, FerroStoreServer, MqDurability};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("store.sock");
+        let ferro = FerroStore::in_memory();
+        ferro
+            .publish_mq_with(
+                "watch-test",
+                "one",
+                &serde_json::json!(1),
+                MqDurability::Ephemeral,
+            )
+            .unwrap();
+        let _server = FerroStoreServer::bind_unix(&socket, ferro).unwrap();
+        let client = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        let store: AnyStore = client.into();
+        let snapshot = read_store_snapshot(&store, None).unwrap();
+        let topics = &snapshot.mq_tier_telemetry.unwrap().topics;
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].topic, "watch-test");
+        assert_eq!(topics[0].memory_messages, 1);
+    }
 
     #[test]
     fn project_slug_is_the_lowercased_last_component() {

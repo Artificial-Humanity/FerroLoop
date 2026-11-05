@@ -41,6 +41,8 @@ pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 /// Forwarders wake on this interval so a closed connection can join them.
 const FORWARD_PAUSE: Duration = Duration::from_millis(50);
+/// Spill overdue adaptive queues even when no client is writing.
+const MQ_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A connection that is authenticating.
 struct Handshake {
@@ -118,6 +120,40 @@ pub struct FerroStoreServer {
     bound: Bound,
     state: Arc<ServerState>,
     accept: Option<JoinHandle<()>>,
+    maintenance: Option<MaintenanceWorker>,
+}
+
+/// One server-owned worker; dropping the sender wakes its timed wait immediately.
+struct MaintenanceWorker {
+    stop: Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+impl MaintenanceWorker {
+    fn start(store: Arc<FerroStore>) -> Result<Self, StoreError> {
+        let (stop, receiver) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("fls-mq-maintenance".to_string())
+            .spawn(move || {
+                loop {
+                    match receiver.recv_timeout(MQ_MAINTENANCE_INTERVAL) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if let Err(error) = store.maintain_mq() {
+                                eprintln!("ferrostore: periodic MQ maintenance failed: {error}");
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|error| backend(format!("start MQ maintenance thread: {error}")))?;
+        Ok(Self { stop, handle })
+    }
+
+    fn stop(self) -> thread::Result<()> {
+        let _ = self.stop.send(());
+        self.handle.join()
+    }
 }
 
 impl FerroStoreServer {
@@ -181,6 +217,13 @@ impl FerroStoreServer {
             }
         };
         let state = new_state(store, auth);
+        let maintenance = match MaintenanceWorker::start(Arc::clone(&state.store)) {
+            Ok(worker) => worker,
+            Err(error) => {
+                unlink_bound(path, inode);
+                return Err(error);
+            }
+        };
         let accept_state = Arc::clone(&state);
         let path_buf = path.to_path_buf();
         let accept = match thread::Builder::new()
@@ -189,6 +232,7 @@ impl FerroStoreServer {
         {
             Ok(handle) => handle,
             Err(err) => {
+                let _ = maintenance.stop();
                 unlink_bound(&path_buf, inode);
                 return Err(backend(format!("start accept thread: {err}")));
             }
@@ -200,6 +244,7 @@ impl FerroStoreServer {
             },
             state,
             accept: Some(accept),
+            maintenance: Some(maintenance),
         })
     }
 
@@ -286,15 +331,23 @@ impl FerroStoreServer {
         }
         let tls = auth.tls().cloned();
         let state = new_state(store, auth);
+        let maintenance = MaintenanceWorker::start(Arc::clone(&state.store))?;
         let accept_state = Arc::clone(&state);
-        let accept = thread::Builder::new()
+        let accept = match thread::Builder::new()
             .name("fls-accept".to_string())
             .spawn(move || accept_loop(move || poll_tcp(&listener, tls.as_ref()), accept_state))
-            .map_err(|err| backend(format!("start accept thread: {err}")))?;
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                let _ = maintenance.stop();
+                return Err(backend(format!("start accept thread: {err}")));
+            }
+        };
         Ok(Self {
             bound: Bound::Tcp { addr: local },
             state,
             accept: Some(accept),
+            maintenance: Some(maintenance),
         })
     }
 
@@ -411,6 +464,11 @@ impl FerroStoreServer {
         // inode a unix server bound, so a replacement socket is left alone.
         // A tcp server has no filesystem path.
         self.state.shutdown.store(true, Ordering::SeqCst);
+        // Wake the worker before joining the accept loop; an in-progress spill is
+        // joined before the final flush so no maintenance races shutdown.
+        if let Some(worker) = &self.maintenance {
+            let _ = worker.stop.send(());
+        }
         shutdown_conns(&self.state);
         match &self.bound {
             Bound::Unix { path, .. } => {
@@ -421,11 +479,17 @@ impl FerroStoreServer {
             }
         }
         let joined = self.accept.take().map(|handle| handle.join());
+        let maintenance_joined = self.maintenance.take().map(MaintenanceWorker::stop);
         if let Bound::Unix { path, inode } = &self.bound {
             unlink_bound(path, *inode);
         }
         if joined.is_some_and(|result| result.is_err()) {
             return Err(backend("FerroStore accept thread panicked during shutdown"));
+        }
+        if maintenance_joined.is_some_and(|result| result.is_err()) {
+            return Err(backend(
+                "FerroStore MQ maintenance thread panicked during shutdown",
+            ));
         }
         Ok(())
     }
@@ -2473,6 +2537,101 @@ fn fail_pending(shared: &RemoteShared, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_maintenance_does_not_block_new_connections() {
+        struct StallingProbe {
+            block: AtomicBool,
+            entered: Mutex<Option<Sender<()>>>,
+            release: (Mutex<bool>, std::sync::Condvar),
+        }
+        impl super::super::MqResourceProbe for StallingProbe {
+            fn probe(&self, _: &Path) -> super::super::MqResourceSnapshot {
+                if self.block.load(Ordering::SeqCst) {
+                    if let Some(entered) = lock_mutex(&self.entered).take() {
+                        let _ = entered.send(());
+                    }
+                    let mut released = lock_mutex(&self.release.0);
+                    while !*released {
+                        released = self.release.1.wait(released).unwrap();
+                    }
+                }
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let probe = Arc::new(StallingProbe {
+            block: AtomicBool::new(false),
+            entered: Mutex::new(Some(entered_tx)),
+            release: (Mutex::new(false), std::sync::Condvar::new()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stalled.sock");
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(super::super::MqTierPolicy::default(), false, probe.clone())
+            .unwrap();
+        store
+            .publish_mq_with("events", "one", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&socket, store).unwrap();
+        probe.block.store(true, Ordering::SeqCst);
+        if entered_rx.recv_timeout(Duration::from_secs(8)).is_err() {
+            *lock_mutex(&probe.release.0) = true;
+            probe.release.1.notify_all();
+            panic!("maintenance did not start");
+        }
+        let (connected_tx, connected_rx) = mpsc::channel();
+        let socket_name = socket.display().to_string();
+        let client = thread::spawn(move || {
+            let _ = connected_tx.send(connect_unix(&socket_name).is_ok());
+        });
+        let connected = connected_rx.recv_timeout(Duration::from_secs(1));
+        *lock_mutex(&probe.release.0) = true;
+        probe.release.1.notify_all();
+        client.join().unwrap();
+        drop(server);
+        assert_eq!(connected, Ok(true), "maintenance blocked the accept loop");
+    }
+
+    #[test]
+    fn idle_server_spills_expired_adaptive_messages() {
+        struct Resources;
+        impl super::super::MqResourceProbe for Resources {
+            fn probe(&self, _: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("idle.sock");
+        let store = FerroStore::in_memory();
+        let policy = super::super::MqTierPolicy {
+            max_memory_lag: Duration::from_millis(100),
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&socket, store).unwrap();
+        let client = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        client
+            .publish_mq_with("idle", "key", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if server.store().get_doc("mq:idle", "1").unwrap().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("idle adaptive message was not spilled by the server timer");
+    }
 
     #[test]
     fn remote_maintenance_replays_one_spill_for_the_same_request_id() {
