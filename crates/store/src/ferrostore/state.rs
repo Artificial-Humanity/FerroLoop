@@ -933,6 +933,17 @@ pub(super) fn next_mq_seq(txn: &Txn, topic: &str) -> Result<u64, StoreError> {
         .ok_or_else(|| backend("mq sequence overflow"))
 }
 
+/// Seed the memory tier above both the durable high-water and any stored message.
+/// Generic document writes or imports can leave the high-water behind a live row.
+pub(super) fn next_mq_seq_for_memory(txn: &Txn, topic: &str) -> Result<u64, StoreError> {
+    let floor = mq_high_water(txn, topic)?
+        .unwrap_or(0)
+        .max(max_stored_mq_seq(txn, topic));
+    floor
+        .checked_add(1)
+        .ok_or_else(|| backend("mq sequence overflow"))
+}
+
 fn mq_high_water(txn: &Txn, topic: &str) -> Result<Option<u64>, StoreError> {
     let Some(doc) = txn.get(&mq_hw_collection(topic), MQ_HIGH_WATER_ID) else {
         return Ok(None);
@@ -1000,7 +1011,7 @@ fn load_mq(state: &DocState, topic: &str) -> Result<Vec<MqRecord>, StoreError> {
     Ok(records)
 }
 
-fn acked_seqs(state: &DocState, topic: &str, group: &str) -> BTreeSet<u64> {
+pub(super) fn acked_seqs(state: &DocState, topic: &str, group: &str) -> BTreeSet<u64> {
     let collection = format!("mq_ack:{topic}:{group}");
     let mut seqs = BTreeSet::new();
     for (id, doc) in state.docs.in_collection(&collection) {

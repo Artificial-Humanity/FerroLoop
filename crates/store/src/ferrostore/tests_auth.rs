@@ -595,6 +595,63 @@ fn a_bearer_token_gets_its_scope_and_no_more() {
     }
 }
 
+#[test]
+fn queue_reads_never_trigger_maintenance_regardless_of_token_scope() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Probe(AtomicBool);
+    impl super::MqResourceProbe for Probe {
+        fn probe(&self, _: &Path) -> super::MqResourceSnapshot {
+            super::MqResourceSnapshot {
+                available_ram_bytes: Some(if self.0.load(Ordering::SeqCst) {
+                    0
+                } else {
+                    u64::MAX
+                }),
+                free_disk_bytes: Some(u64::MAX),
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = three_tokens(dir.path());
+    let probe = Arc::new(Probe(AtomicBool::new(false)));
+    let store = FerroStore::in_memory();
+    store
+        .configure_mq(super::MqTierPolicy::default(), false, probe.clone())
+        .unwrap();
+    let server = Net::Ws.serve(store, ServerAuth::new().with_token_file(&tokens).unwrap());
+    let addr = server.local_addr();
+    let writer = Net::Ws.token_client(addr, WRITE_TOKEN).unwrap();
+    let reader = Net::Ws.token_client(addr, READ_TOKEN).unwrap();
+    let admin = Net::Ws.token_client(addr, ADMIN_TOKEN).unwrap();
+    let seq = writer
+        .publish_mq_with("events", "a", &json!(1), super::MqDurability::Adaptive)
+        .unwrap();
+    let before = server.store().stats().unwrap().last_seq;
+    probe.0.store(true, Ordering::SeqCst);
+    for client in [&reader, &writer, &admin] {
+        assert_eq!(client.poll_mq_group("events", "g", 10).unwrap()[0].seq, seq);
+        assert_eq!(
+            client.mq_telemetry(Some("events")).unwrap().topics[0].memory_messages,
+            1
+        );
+        assert_eq!(
+            server.store().stats().unwrap().last_seq,
+            before,
+            "read unexpectedly spilled queue data"
+        );
+    }
+    assert!(
+        reader.maintain_mq().is_err(),
+        "read scope must not invoke a write RPC"
+    );
+    assert_eq!(server.store().stats().unwrap().last_seq, before);
+    assert_eq!(writer.maintain_mq().unwrap(), 1);
+    assert_eq!(server.store().stats().unwrap().last_seq, before + 1);
+}
+
 fn a_bearer_token_gets_its_scope(net: Net) {
     let dir = tempfile::tempdir().unwrap();
     let tokens = three_tokens(dir.path());

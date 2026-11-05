@@ -7,8 +7,8 @@
 //! SIGTERM (`pthread_sigmask`), so every thread the store and the server
 //! start inherits the mask and no default handler kills the process part way
 //! through a write. Once the server listens, the thread waits for one of the
-//! two (`sigwait`), then drops the server (it stops accepting, closes its
-//! connections and removes its socket) and the store, and returns. The two
+//! two (`sigwait`), then stops the server, joins connections, flushes adaptive
+//! queues, and returns. Flush failures are reported. The two
 //! stay blocked after it returns, for the life of the thread: a second
 //! SIGINT during the shutdown, or while the caller prints its last line,
 //! stays pending and kills nothing, and the process exits as it means to.
@@ -159,7 +159,7 @@ pub fn serve(
     let store = open_local(path, create, "serve", w)?;
     let physical = physical_path(path, BackendKind::Ferro);
     let mut methods = Vec::new();
-    let (server, uri, tls) = match &options.tcp {
+    let (mut server, uri, tls) = match &options.tcp {
         Some(addr) => {
             let tls = options.tls_cert.is_some();
             let server = FerroStoreServer::bind_tcp(addr.as_str(), store, auth)?;
@@ -192,7 +192,7 @@ pub fn serve(
     };
     ready(&serving)?;
     let signal = signals.wait()?;
-    drop(server);
+    server.shutdown()?;
     Ok((serving, signal))
 }
 

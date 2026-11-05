@@ -165,6 +165,7 @@ pub(super) const METHODS: &[MethodRule] = &[
     method("search_bm25", Scope::Read, false),
     method("poll_mq_group", Scope::Read, false),
     method("subscribe_mq", Scope::Read, false),
+    method("mq_telemetry", Scope::Read, false),
     method("scan_column_table", Scope::Read, false),
     method("attempt_rollup", Scope::Read, false),
     method("gate_run_rollup", Scope::Read, false),
@@ -177,7 +178,11 @@ pub(super) const METHODS: &[MethodRule] = &[
     method("put_doc", Scope::Write, true),
     method("delete_doc", Scope::Write, true),
     method("publish_mq", Scope::Write, true),
+    method("publish_mq_v2", Scope::Write, true),
     method("ack_mq", Scope::Write, true),
+    method("ack_mq_v2", Scope::Write, true),
+    method("flush_mq", Scope::Write, true),
+    method("maintain_mq", Scope::Write, true),
     method("create_column_table", Scope::Write, true),
     method("append_column_rows", Scope::Write, true),
     method("create_vector_collection", Scope::Write, true),
@@ -1425,6 +1430,20 @@ fn recv_auth(read: &mut dyn JsonIo) -> Result<Value, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiered_mq_rpc_scopes_and_dedup_classification() {
+        assert!(authorize(Scope::Read, "mq_telemetry").is_ok());
+        assert!(authorize(Scope::Read, "flush_mq").is_err());
+        assert!(authorize(Scope::Read, "ack_mq_v2").is_err());
+        assert!(authorize(Scope::Read, "maintain_mq").is_err());
+        assert!(authorize(Scope::Read, "publish_mq_v2").is_err());
+        assert!(authorize(Scope::Write, "flush_mq").unwrap().writes);
+        assert!(authorize(Scope::Write, "maintain_mq").unwrap().writes);
+        assert!(authorize(Scope::Write, "ack_mq_v2").unwrap().writes);
+        assert!(authorize(Scope::Write, "publish_mq_v2").unwrap().writes);
+        assert!(!authorize(Scope::Read, "mq_telemetry").unwrap().writes);
+    }
 
     #[test]
     fn hex_round_trips_and_refuses_anything_but_64_lowercase_digits() {
