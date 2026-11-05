@@ -1277,7 +1277,7 @@ export async function executeScopedBulkSessionAction(
   };
 }
 
-export const SAFE_AREA_MARGINS_STORAGE_KEY = "fd_show_safe_margins";
+export const SAFE_AREA_MARGINS_STORAGE_KEY = "fd_show_safe_margins_v2";
 export const SAFE_AREA_MARGINS_EVENT = "fd:safe-area-margins-changed";
 
 export function readInitialShowSafeAreaMargins(): boolean {
@@ -1291,7 +1291,7 @@ export function readInitialShowSafeAreaMargins(): boolean {
   } catch {
     // Ignore storage read errors
   }
-  return window.innerWidth < 720;
+  return false;
 }
 
 export function persistShowSafeAreaMargins(enabled: boolean): void {

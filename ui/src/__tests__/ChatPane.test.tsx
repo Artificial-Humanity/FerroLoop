@@ -7,6 +7,10 @@ import {
   sessionDraftMemory,
   sessionScrollMemory,
 } from "../components/ChatPane";
+import {
+  SAFE_AREA_MARGINS_STORAGE_KEY,
+  readInitialShowSafeAreaMargins,
+} from "../components/SettingsModal";
 import type { QueuedOperatorPrompt, TranscriptTurn } from "../types/api";
 
 describe("ChatPane", () => {
@@ -303,13 +307,38 @@ describe("ChatPane", () => {
     expect(filterInput).toHaveAttribute("data-form-type", "other");
 
     const promptTextarea = screen.getByLabelText("Message");
-    expect(promptTextarea).toHaveAttribute("autocomplete", "one-time-code");
+    expect(promptTextarea).toHaveAttribute("autocomplete", "off");
+    expect(promptTextarea).not.toHaveAttribute("name");
+    expect(promptTextarea.closest("form")).toHaveAttribute("autocomplete", "off");
     expect(promptTextarea).toHaveAttribute("role", "searchbox");
     expect(promptTextarea).toHaveAttribute("data-1p-ignore", "true");
     expect(promptTextarea).toHaveAttribute("data-lpignore", "true");
     expect(promptTextarea).toHaveAttribute("data-bwignore", "true");
     expect(promptTextarea).toHaveAttribute("data-form-type", "other");
     expect(promptTextarea).toHaveAttribute("aria-autocomplete", "none");
+
+    // Verify readInitialShowSafeAreaMargins() returns false even when window.innerWidth is 390
+    // and ignores stale v1 "fd_show_safe_margins" storage key
+    const originalInnerWidth = window.innerWidth;
+    try {
+      window.localStorage.setItem("fd_show_safe_margins", "true");
+      window.localStorage.removeItem(SAFE_AREA_MARGINS_STORAGE_KEY);
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 390,
+      });
+      expect(SAFE_AREA_MARGINS_STORAGE_KEY).toBe("fd_show_safe_margins_v2");
+      expect(readInitialShowSafeAreaMargins()).toBe(false);
+    } finally {
+      window.localStorage.removeItem("fd_show_safe_margins");
+      window.localStorage.removeItem(SAFE_AREA_MARGINS_STORAGE_KEY);
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: originalInnerWidth,
+      });
+    }
 
     const actionBar = screen.getByTestId("composer-action-bar");
     const stopButton = screen.getByTestId("interrupt-session-btn");

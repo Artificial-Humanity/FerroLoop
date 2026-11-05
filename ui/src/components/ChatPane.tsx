@@ -3925,41 +3925,46 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </div>
           )}
 
-          <textarea
-            ref={textareaRef}
-            rows={1}
-            role="searchbox"
-            name="fd-dispatch-command"
-            autoComplete="one-time-code"
-            autoCorrect="off"
-            autoCapitalize="sentences"
-            spellCheck={true}
-            enterKeyHint="send"
-            data-1p-ignore="true"
-            data-lpignore="true"
-            data-bwignore="true"
-            data-form-type="other"
-            aria-autocomplete="none"
-            aria-label="Message"
-            placeholder={`Send a message to ${displayTarget}... (Ctrl+Enter to submit, paste or attach files)`}
-            className="fd-textarea fd-prompt-input"
-            value={promptText}
-            onChange={(e) => setPromptText(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            style={{
-              width: "100%",
-              resize: "vertical",
-              height: `${composerHeight}px`,
-              minHeight: `${COMPOSER_MIN_HEIGHT_PX}px`,
-              maxHeight: `${COMPOSER_MAX_HEIGHT_PX}px`,
-              border: "none",
-              outline: "none",
-              backgroundColor: "transparent",
-              padding: "2px 0",
-              fontFamily: "var(--font-sans)",
-            }}
-          />
+          <form
+            autoComplete="off"
+            onSubmit={(e) => e.preventDefault()}
+            style={{ margin: 0, width: "100%" }}
+          >
+            <textarea
+              ref={textareaRef}
+              rows={1}
+              role="searchbox"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="sentences"
+              spellCheck={true}
+              enterKeyHint="send"
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-bwignore="true"
+              data-form-type="other"
+              aria-autocomplete="none"
+              aria-label="Message"
+              placeholder={`Send a message to ${displayTarget}... (Ctrl+Enter to submit, paste or attach files)`}
+              className="fd-textarea fd-prompt-input"
+              value={promptText}
+              onChange={(e) => setPromptText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              style={{
+                width: "100%",
+                resize: "vertical",
+                height: `${composerHeight}px`,
+                minHeight: `${COMPOSER_MIN_HEIGHT_PX}px`,
+                maxHeight: `${COMPOSER_MAX_HEIGHT_PX}px`,
+                border: "none",
+                outline: "none",
+                backgroundColor: "transparent",
+                padding: "2px 0",
+                fontFamily: "var(--font-sans)",
+              }}
+            />
+          </form>
 
           <div
             data-testid="composer-action-bar"
