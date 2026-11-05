@@ -813,9 +813,9 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
         display: "flex",
         flexDirection: "column",
         height: "100%",
+        minHeight: 0,
         minWidth: 0,
-        overflowY: "auto",
-        overflowX: "hidden",
+        overflow: "hidden",
       }}
     >
       {/* Header */}
@@ -996,12 +996,17 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
 
       {/* Incident List */}
       <div
+        className="fd-scroll"
         data-testid="triage-incident-list"
         style={{
           display: "flex",
           flexDirection: "column",
           gap: "8px",
           padding: "10px 12px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
         }}
       >
         {filteredIncidents.length === 0 ? (

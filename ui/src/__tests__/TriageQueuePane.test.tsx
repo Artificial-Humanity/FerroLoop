@@ -342,11 +342,10 @@ describe("Record #90 — Operator Today & Incidents Triage Queue", () => {
     fireEvent.click(within(sidebar).getByTestId("roster-triage-toggle-btn"));
     const triagePane = within(sidebar).getByTestId("triage-queue-pane");
     expect(triagePane).toBeInTheDocument();
-    expect(triagePane.style.overflowY).toBe("auto");
-    expect(triagePane.style.overflowX).toBe("hidden");
-    expect(within(triagePane).getByTestId("triage-incident-list")).not.toHaveClass(
-      "fd-scroll",
-    );
+    expect(triagePane.style.overflow).toBe("hidden");
+    const incidentList = within(triagePane).getByTestId("triage-incident-list");
+    expect(incidentList).toHaveClass("fd-scroll");
+    expect(incidentList.style.overflowY).toBe("auto");
     expect(within(sidebar).getByTestId("triage-pane-title")).toHaveTextContent(
       "Today & Incidents",
     );

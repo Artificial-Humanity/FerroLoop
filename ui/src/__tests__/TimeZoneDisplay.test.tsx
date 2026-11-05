@@ -123,6 +123,16 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     await waitFor(() => {
       expect(tzSelect.value).toBe("UTC");
     });
+    expect(tzSelect.style.width).toBe("100%");
+    expect(tzSelect.style.boxSizing).toBe("border-box");
+    const easternOpt = Array.from(tzSelect.options).find(
+      (o) => o.value === "America/New_York",
+    );
+    expect(easternOpt?.textContent).toBe("U.S. Eastern");
+    const ukOpt = Array.from(tzSelect.options).find(
+      (o) => o.value === "Europe/London",
+    );
+    expect(ukOpt?.textContent).toBe("United Kingdom");
 
     fireEvent.change(tzSelect, { target: { value: "America/New_York" } });
     fireEvent.click(screen.getByTestId("save-settings-btn"));
@@ -829,14 +839,20 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
 
     const currencyRow = await screen.findByTestId("settings-currency-row");
     expect(currencyRow).toBeInTheDocument();
+    expect(currencyRow.style.flexDirection).toBe("column");
     const currencySelect = screen.getByTestId(
       "settings-currency-select",
     ) as HTMLSelectElement;
     expect(currencySelect.value).toBe("auto");
+    expect(currencySelect.style.width).toBe("100%");
+    expect(currencySelect.style.boxSizing).toBe("border-box");
 
     fireEvent.change(currencySelect, { target: { value: "GBP" } });
     expect(getActiveCurrency()).toBe("GBP");
     expect(resolveCurrencyCode()).toBe("GBP");
+    expect(
+      screen.getByTestId("settings-currency-resolved-summary"),
+    ).toHaveTextContent("Active currency: GBP (£ — British Pound)");
 
     fireEvent.click(screen.getByTestId("save-settings-btn"));
     expect(await screen.findByTestId("settings-saved-banner")).toHaveTextContent(
