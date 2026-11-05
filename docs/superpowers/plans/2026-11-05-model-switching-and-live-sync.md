@@ -17,15 +17,22 @@ and `cargo fmt --check` before each commit. UI task: `cd ui && npx tsc --noEmit 
 
 ## Task 2 – Pre-turn discovery (Rust)
 
-1. `crates/hub/src/discovery.rs` `generator_model_from_json`: fallback to the two `planModel`
-   pointers in spec C when no step names a model.
+1. `crates/hub/src/discovery.rs` `generator_model_from_json`: scan `/steps` (else
+   `/trajectory/steps`) newest first and return the first step with a model signal: its
+   `/metadata/generatorModel`, else `/userInput/userConfig/plannerConfig/planModel`, else
+   `/userInput/lastUserConfig/plannerConfig/planModel` (non-empty after trimming). Nothing is
+   read from the body root or `/trajectory`. The structure was confirmed against the live
+   Antigravity language server by the Lead on 2026-11-05, not by this branch's tests.
 2. Make sure the value resolves for placeholders (`MODEL_PLACEHOLDER_M26/M39/M404/M405`,
    `MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) and effort-suffixed ids through the existing
    `resolve_agy_model_info` / `split_agy_thinking_suffix`; add the missing handling.
-3. Tests with realistic JSON: step model wins over `planModel`; `userConfig` before
-   `lastUserConfig`; no steps at all; an empty string; placeholder and suffixed forms; truncated
-   body still uses the string scan. Check the real shape against a live language server when one
-   is running (read-only) and say in the report if it could not be checked.
+3. Tests with JSON shaped like the real response (steps with `"type":
+   "CORTEX_STEP_TYPE_USER_INPUT"` etc.), under `/steps` and `/trajectory/steps`: a `USER_INPUT`
+   step with no later planner step gives the pending model; `lastUserConfig` when `userConfig`
+   is absent or empty; `userConfig` before `lastUserConfig`; a later `generatorModel` beats an
+   earlier `planModel` and a later `planModel` beats an earlier `generatorModel`; signal-less
+   newer steps are skipped; blank values ignored; placeholder and suffixed forms resolve;
+   truncated body still uses the string scan and never reads `planModel`.
 
 ## Task 3 – Override supersession (Rust)
 

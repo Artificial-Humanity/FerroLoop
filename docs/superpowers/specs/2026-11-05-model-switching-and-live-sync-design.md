@@ -14,7 +14,8 @@
    `gpt-oss-120b` exists only as `-medium`.
 3. A model switch made in the Antigravity UI before the next turn is not discovered:
    `generator_model_from_json` (`crates/hub/src/discovery.rs`) reads only `metadata.generatorModel`
-   of a step, and a new conversation has no step yet.
+   of a step, and a new conversation has no planner step yet. The choice is recorded on the
+   `CORTEX_STEP_TYPE_USER_INPUT` step itself (`userInput` on the step object).
 4. `AgentSettingsModal` skips `getSessions()` whenever `executionMode` is already known, so opening
    Agent Settings never refreshes model, effort, mode or cwd. `inferVendorFromModel` classifies
    `claude-*` and `gpt-*` ids as Anthropic or OpenAI even when the session runs under Antigravity.
@@ -63,13 +64,28 @@ Agy route stores the mapped id in the hosted record (so the next launch uses it)
 
 ### C. Antigravity discovery before the first turn
 
-`generator_model_from_json` keeps `metadata.generatorModel` of the latest step first, and when no
-step names one falls back, in order, to `/userInput/userConfig/plannerConfig/planModel` and
-`/userInput/lastUserConfig/plannerConfig/planModel`. The value may be a placeholder
-(`MODEL_PLACEHOLDER_M26`, `M39`, `M404`, `M405`, `MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) or an
-effort-suffixed id; both resolve through the existing `resolve_agy_model_info` and
-`split_agy_thinking_suffix`, which must handle both. The truncated-body path
-(`parse_agy_generator_model`) keeps its string scan; the fallback applies only to complete JSON.
+`generator_model_from_json` scans the steps (`/steps`, else `/trajectory/steps`) newest first and
+returns the first step that carries a model signal. Within one step the signal is, in order,
+`/metadata/generatorModel`, `/userInput/userConfig/plannerConfig/planModel`, then
+`/userInput/lastUserConfig/plannerConfig/planModel` (empty and whitespace-only values are
+skipped). So the latest step that says anything about the model wins: a `USER_INPUT` step the
+planner has not answered yet gives the pending model, a later step with `generatorModel` replaces
+it, and a later `USER_INPUT` step (the user switched, then sent a message) replaces an earlier
+`generatorModel`. Steps with no signal (tool steps) are skipped. No steps array, an empty array, or
+no step with a signal gives no model. There is no `userInput` at the body root or under
+`/trajectory`, and nothing is read from there.
+
+The value may be a placeholder (`MODEL_PLACEHOLDER_M26`, `M39`, `M404`, `M405`,
+`MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) or an effort-suffixed id; both resolve through the existing
+`resolve_agy_model_info` and `split_agy_thinking_suffix`, which must handle both. The
+truncated-body path (`parse_agy_generator_model`) keeps its string scan and never reads
+`planModel`; the per-step read applies only to complete JSON.
+
+The response structure (`GetCascadeTrajectory` returns `{trajectory: {steps, generatorMetadata,
+metadata, ...}, status, numTotalSteps}`; `GetCascadeTrajectorySteps` returns `{steps}`; planner and
+tool steps carry `metadata.generatorModel`; `USER_INPUT` steps carry `userInput`) was confirmed
+against the live Antigravity language server by the Lead on 2026-11-05, not by this branch's
+tests, which use JSON shaped like that response.
 
 ### D. UI
 
