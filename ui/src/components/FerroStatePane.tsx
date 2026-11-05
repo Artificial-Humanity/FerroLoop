@@ -759,7 +759,13 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
       className="fd-pane"
       data-testid="ferrostate-pane"
       aria-label="FerroState"
-      style={{ overflowY: "auto", overflowX: "hidden" }}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minHeight: 0,
+        overflow: "hidden",
+      }}
     >
       <div
         style={{
@@ -869,8 +875,18 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
       </div>
 
       <div
+        className="fd-scroll"
         data-testid="ferrostate-body"
-        style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: "20px" }}
+        style={{
+          padding: "12px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "20px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+        }}
       >
         <div
           data-testid="token-gain-bar"

@@ -383,6 +383,9 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
 
     // 1. Live Alerts list
     const alertsSection = await screen.findByTestId("watch-alerts-section");
+    expect(screen.getByTestId("ferrowatch-pane").style.overflow).toBe("hidden");
+    expect(screen.getByTestId("watch-console-body")).toHaveClass("fd-scroll");
+    expect(screen.getByTestId("watch-console-body").style.overflowY).toBe("auto");
     expect(
       within(alertsSection).getByTestId("watch-alert-item-quota:claude:primary"),
     ).toHaveAttribute("data-severity", "critical");
@@ -805,8 +808,7 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
     );
     const watchPane = await screen.findByTestId("ferrowatch-pane");
     expect(watchPane).toBeInTheDocument();
-    expect(watchPane.style.overflowY).toBe("auto");
-    expect(watchPane.style.overflowX).toBe("hidden");
+    expect(watchPane.style.overflow).toBe("hidden");
 
     const topRow = within(watchPane).getByTestId("ferrowatch-header-top-row");
     expect(within(topRow).getByTestId("ferrowatch-pane-title")).toHaveTextContent(
@@ -819,7 +821,8 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
     expect(refreshBtn.querySelector("svg")).not.toBeNull();
 
     const consoleBody = within(watchPane).getByTestId("watch-console-body");
-    expect(consoleBody).not.toHaveClass("fd-scroll");
+    expect(consoleBody).toHaveClass("fd-scroll");
+    expect(consoleBody.style.overflowY).toBe("auto");
 
     unmount();
   });

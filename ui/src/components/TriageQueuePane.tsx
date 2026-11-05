@@ -813,9 +813,9 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
         display: "flex",
         flexDirection: "column",
         height: "100%",
+        minHeight: 0,
         minWidth: 0,
-        overflowY: "auto",
-        overflowX: "hidden",
+        overflow: "hidden",
       }}
     >
       {/* Header */}
@@ -824,7 +824,7 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
           display: "flex",
           flexDirection: "column",
           gap: "8px",
-          padding: "8px 12px",
+          padding: "8px 10px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
           flexShrink: 0,
@@ -836,15 +836,20 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            gap: "6px",
-            flexWrap: "nowrap",
+            gap: "4px",
+            flexWrap: "wrap",
             width: "100%",
             minWidth: 0,
           }}
         >
           <strong
             data-testid="triage-pane-title"
-            style={{ fontSize: "14px", color: "var(--text-primary)", whiteSpace: "nowrap" }}
+            style={{
+              fontSize: "13px",
+              color: "var(--text-primary)",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
           >
             Today &amp; Incidents
           </strong>
@@ -854,9 +859,9 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
             style={{
               display: "flex",
               alignItems: "center",
-              gap: "6px",
+              gap: "4px",
               marginLeft: "auto",
-              flexWrap: "nowrap",
+              flexWrap: "wrap",
               flexShrink: 0,
               minWidth: 0,
             }}
@@ -864,7 +869,12 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
             <span
               className="fd-badge"
               data-testid="triage-total-badge"
-              style={{ whiteSpace: "nowrap" }}
+              style={{
+                padding: "2px 5px",
+                fontSize: "11px",
+                whiteSpace: "nowrap",
+                flexShrink: 0,
+              }}
             >
               {activeIncidents.length}{" "}
               {activeIncidents.length === 1 ? "incident" : "incidents"}
@@ -873,7 +883,13 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
               <span
                 className="fd-badge"
                 data-testid="triage-critical-badge"
-                style={{ ...getSeverityStyle("critical"), whiteSpace: "nowrap" }}
+                style={{
+                  ...getSeverityStyle("critical"),
+                  padding: "2px 5px",
+                  fontSize: "11px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
               >
                 {criticalCount} critical
               </span>
@@ -884,7 +900,7 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
                 className="fd-btn"
                 data-testid="triage-restore-dismissed-btn"
                 onClick={() => setDismissedIds(new Set())}
-                style={{ padding: "3px 8px", fontSize: "11px", whiteSpace: "nowrap" }}
+                style={{ padding: "2px 6px", fontSize: "11px", whiteSpace: "nowrap", flexShrink: 0 }}
               >
                 Restore ({dismissedIds.size})
               </button>
@@ -900,7 +916,7 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
                 onRefresh?.();
                 void loadSupplementalData();
               }}
-              style={{ padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
+              style={{ padding: "4px 6px", lineHeight: 1, flexShrink: 0 }}
             >
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path
@@ -980,12 +996,17 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
 
       {/* Incident List */}
       <div
+        className="fd-scroll"
         data-testid="triage-incident-list"
         style={{
           display: "flex",
           flexDirection: "column",
           gap: "8px",
           padding: "10px 12px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
         }}
       >
         {filteredIncidents.length === 0 ? (

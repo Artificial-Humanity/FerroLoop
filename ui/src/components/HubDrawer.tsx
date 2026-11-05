@@ -372,7 +372,13 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
     <section
       className="fd-pane"
       data-testid="hub-drawer"
-      style={{ overflowY: "auto", overflowX: "hidden" }}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minHeight: 0,
+        overflow: "hidden",
+      }}
     >
       {/* Sub-navigation Toolbar */}
       <div
@@ -503,8 +509,18 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
       </div>
 
       <div
+        className="fd-scroll"
         data-testid="hub-drawer-body"
-        style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: "16px" }}
+        style={{
+          padding: "12px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "16px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+        }}
       >
         {error && (
           <div

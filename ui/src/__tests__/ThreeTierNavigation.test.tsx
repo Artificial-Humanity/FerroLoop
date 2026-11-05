@@ -435,10 +435,17 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     const metaRow = within(agentNav).getByTestId("tier-agent-meta");
 
     expect(identityRow).toHaveClass("fd-tier-agent-identity");
-    expect(within(identityRow).getByText("Ferris")).toBeInTheDocument();
-    expect(within(identityRow).getByText(/lead/i)).toBeInTheDocument();
+    expect(within(identityRow).getByTestId("tier-agent-name")).toHaveTextContent(
+      "Ferris",
+    );
+    const roleBadge = within(identityRow).getByTestId("tier-agent-role-badge");
+    expect(roleBadge).toHaveTextContent(/lead/i);
+    expect(roleBadge).toHaveClass("sr-only");
+    expect(roleBadge.style.position).toBe("absolute");
 
     expect(metaRow).toHaveClass("fd-tier-agent-meta");
+    expect(metaRow).toHaveClass("sr-only");
+    expect(metaRow.style.position).toBe("absolute");
     expect(within(metaRow).getByText("antigravity")).toBeInTheDocument();
     expect(within(metaRow).getByTestId("active-project-badge")).toHaveTextContent(
       "FerroLoop",

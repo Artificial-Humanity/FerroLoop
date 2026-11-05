@@ -497,6 +497,11 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
         authority={{ tier: "owner", login: "lmcfarlin" }}
       />,
     );
+    const vaultPane = screen.getByTestId("vault-gate-pane");
+    expect(vaultPane.style.overflow).toBe("hidden");
+    const vaultBody = screen.getByTestId("vault-gate-body");
+    expect(vaultBody).toHaveClass("fd-scroll");
+    expect(vaultBody.style.overflowY).toBe("auto");
     const vaultForm = screen.getByTestId("vault-secret-form");
     expect(vaultForm.style.maxWidth).toBe("100%");
     expect(vaultForm.style.boxSizing).toBe("border-box");
@@ -506,6 +511,11 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
     const { unmount: unmountHub } = render(
       <HubDrawer workflows={[]} workflowRuns={[]} />,
     );
+    const hubDrawer = screen.getByTestId("hub-drawer");
+    expect(hubDrawer.style.overflow).toBe("hidden");
+    const hubDrawerBody = screen.getByTestId("hub-drawer-body");
+    expect(hubDrawerBody).toHaveClass("fd-scroll");
+    expect(hubDrawerBody.style.overflowY).toBe("auto");
     const subtabGrid = screen.getByTestId("hub-subtab-grid");
     expect(subtabGrid.style.display).toBe("grid");
     expect(subtabGrid.style.gridTemplateColumns).toBe("repeat(2, minmax(0, 1fr))");

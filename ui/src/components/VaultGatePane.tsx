@@ -974,7 +974,13 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
       className="fd-pane"
       data-testid="vault-gate-pane"
       aria-label="Vault and Connectors"
-      style={{ overflowY: "auto", overflowX: "hidden" }}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minHeight: 0,
+        overflow: "hidden",
+      }}
     >
       <div
         style={{
@@ -1050,8 +1056,18 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
         </span>
       </div>
       <div
+        className="fd-scroll"
         data-testid="vault-gate-body"
-        style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: "20px" }}
+        style={{
+          padding: "12px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "20px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+        }}
       >
 
         {effectiveError && (

@@ -19,6 +19,7 @@ import {
   CURRENCY_OPTIONS,
   detectBrowserCurrency,
   getActiveCurrency,
+  resolveCurrencyCode,
   setActiveCurrency,
   type CurrencyPreference,
 } from "../lib/currency";
@@ -4682,10 +4683,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "12px",
-                flexWrap: "wrap",
+                flexDirection: "column",
+                alignItems: "stretch",
+                gap: "8px",
+                width: "100%",
+                minWidth: 0,
               }}
             >
               <div>
@@ -4717,7 +4719,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     timezone: e.target.value,
                   }));
                 }}
-                style={{ fontSize: "12px", padding: "5px 10px" }}
+                style={{
+                  fontSize: "12px",
+                  padding: "5px 10px",
+                  width: "100%",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                  boxSizing: "border-box",
+                }}
               >
                 {settings.timezone &&
                   !TIMEZONE_OPTIONS.some(
@@ -4738,10 +4747,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               data-testid="settings-currency-row"
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "12px",
-                flexWrap: "wrap",
+                flexDirection: "column",
+                alignItems: "stretch",
+                gap: "8px",
+                width: "100%",
+                minWidth: 0,
               }}
             >
               <div>
@@ -4762,26 +4772,67 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   locale and time zone by default).
                 </span>
               </div>
-              <select
-                aria-label="Local Currency"
-                data-testid="settings-currency-select"
-                className="fd-select fd-mono"
-                value={currencyPref}
-                onChange={(e) => {
-                  const next = setActiveCurrency(e.target.value);
-                  setCurrencyPref(next);
-                  setSettingsSaved(false);
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  width: "100%",
+                  minWidth: 0,
                 }}
-                style={{ fontSize: "12px", padding: "5px 10px" }}
               >
-                {CURRENCY_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.value === "auto"
-                      ? `Auto-Detect (${detectBrowserCurrency()})`
-                      : opt.label}
-                  </option>
-                ))}
-              </select>
+                <select
+                  aria-label="Local Currency"
+                  data-testid="settings-currency-select"
+                  className="fd-select fd-mono"
+                  value={currencyPref}
+                  onChange={(e) => {
+                    const next = setActiveCurrency(e.target.value);
+                    setCurrencyPref(next);
+                    setSettingsSaved(false);
+                  }}
+                  style={{
+                    fontSize: "12px",
+                    padding: "5px 10px",
+                    width: "100%",
+                    maxWidth: "100%",
+                    minWidth: 0,
+                    boxSizing: "border-box",
+                    whiteSpace: "normal",
+                  }}
+                >
+                  {CURRENCY_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.value === "auto"
+                        ? `Auto-Detect (${detectBrowserCurrency()})`
+                        : opt.label}
+                    </option>
+                  ))}
+                </select>
+                {(() => {
+                  const resolvedCode = resolveCurrencyCode(currencyPref);
+                  const resolvedOpt = CURRENCY_OPTIONS.find(
+                    (o) => o.value === resolvedCode,
+                  );
+                  return (
+                    <div
+                      data-testid="settings-currency-resolved-summary"
+                      className="fd-mono"
+                      style={{
+                        fontSize: "11px",
+                        color: "var(--text-secondary)",
+                        whiteSpace: "normal",
+                        overflowWrap: "anywhere",
+                        lineHeight: 1.35,
+                      }}
+                    >
+                      {currencyPref === "auto"
+                        ? `Auto-detected active currency: ${resolvedOpt?.label ?? resolvedCode}`
+                        : `Active currency: ${resolvedOpt?.label ?? resolvedCode}`}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
 
             <hr

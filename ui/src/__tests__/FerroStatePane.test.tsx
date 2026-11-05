@@ -200,6 +200,9 @@ describe("FerroStatePane", () => {
   it("renders memory and handoff cards with counts, pinned badge, and expandable body", () => {
     render(<FerroStatePane entries={SAMPLE_ENTRIES} authority={PEER} />);
 
+    expect(screen.getByTestId("ferrostate-pane").style.overflow).toBe("hidden");
+    expect(screen.getByTestId("ferrostate-body")).toHaveClass("fd-scroll");
+    expect(screen.getByTestId("ferrostate-body").style.overflowY).toBe("auto");
     expect(screen.getByTestId("ferrostate-badge")).toHaveTextContent(
       /Durable Memory, Handoffs & Structural Code Index/,
     );
@@ -333,9 +336,9 @@ describe("FerroStatePane", () => {
     await screen.findByTestId("state-entry-pr-review-policy");
 
     const pane = screen.getByTestId("ferrostate-pane");
-    expect(pane.style.overflowY).toBe("auto");
-    expect(pane.style.overflowX).toBe("hidden");
-    expect(screen.getByTestId("ferrostate-body")).not.toHaveClass("fd-scroll");
+    expect(pane.style.overflow).toBe("hidden");
+    expect(screen.getByTestId("ferrostate-body")).toHaveClass("fd-scroll");
+    expect(screen.getByTestId("ferrostate-body").style.overflowY).toBe("auto");
 
     const actionsRow = screen.getByTestId("ferrostate-actions-row");
     expect(actionsRow.style.flexWrap).toBe("nowrap");

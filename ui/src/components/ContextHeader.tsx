@@ -530,7 +530,21 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           data-active-tier={activeTier === "agent" || activeTier === "project" ? "true" : undefined}
           style={{ flexWrap: "nowrap", minWidth: 0, flex: "0 1 auto", overflow: "hidden" }}
         >
-          <span className="fd-tier-label" title="Active Agent">
+          <span
+            className="fd-tier-label sr-only"
+            title="Active Agent"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
             Agent
           </span>
 
@@ -538,9 +552,10 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             <div
               className="fd-tier-agent-identity"
               data-testid="tier-agent-identity"
-              style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, whiteSpace: "nowrap" }}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", minWidth: 0, whiteSpace: "nowrap" }}
             >
               <span
+                data-testid="tier-agent-name"
                 style={{
                   fontWeight: 700,
                   fontSize: "14px",
@@ -553,7 +568,22 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               >
                 {selectedAgent.display_name}
               </span>
-              <span className="fd-badge" title="Agent Role" style={{ flexShrink: 0 }}>
+              <span
+                className="fd-badge sr-only"
+                data-testid="tier-agent-role-badge"
+                title="Agent Role"
+                style={{
+                  position: "absolute",
+                  width: "1px",
+                  height: "1px",
+                  padding: 0,
+                  margin: "-1px",
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
+              >
                 {formatRoleLabel(selectedAgent.role)}
               </span>
             </div>
@@ -561,9 +591,10 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             <div
               className="fd-tier-agent-identity"
               data-testid="tier-agent-identity"
-              style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, whiteSpace: "nowrap" }}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", minWidth: 0, whiteSpace: "nowrap" }}
             >
               <span
+                data-testid="tier-agent-name"
                 style={{ fontWeight: 600, color: "var(--text-muted)", whiteSpace: "nowrap" }}
                 title="Active Agent Name"
               >
@@ -573,9 +604,19 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           )}
 
           <div
-            className="fd-tier-agent-meta"
+            className="fd-tier-agent-meta sr-only"
             data-testid="tier-agent-meta"
-            style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
           >
             {agentSessions.length > 0 && (
               <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, whiteSpace: "nowrap" }}>

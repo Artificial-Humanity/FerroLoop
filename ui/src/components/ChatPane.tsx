@@ -1180,6 +1180,32 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [composerHeight, setComposerHeight] = React.useState<number>(() =>
     typeof window !== "undefined" && window.innerWidth < 720 ? 48 : 80,
   );
+  const [isMobileComposer, setIsMobileComposer] = React.useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    if (window.innerWidth < 720) return true;
+    if (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0) return true;
+    if (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches
+    ) {
+      return true;
+    }
+    return false;
+  });
+  React.useEffect(() => {
+    const syncMobileComposer = () => {
+      if (typeof window === "undefined") return;
+      const touchOrMobile =
+        window.innerWidth < 720 ||
+        (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0) ||
+        (typeof window.matchMedia === "function" &&
+          window.matchMedia("(pointer: coarse)").matches);
+      setIsMobileComposer(touchOrMobile);
+    };
+    syncMobileComposer();
+    window.addEventListener("resize", syncMobileComposer);
+    return () => window.removeEventListener("resize", syncMobileComposer);
+  }, []);
   const resizeCleanupRef = React.useRef<(() => void) | null>(null);
   const [internalSlashCommands, setInternalSlashCommands] =
     React.useState<SlashCommandEntry[]>(DEFAULT_SLASH_COMMANDS);
@@ -3856,14 +3882,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               autoCorrect="off"
               autoCapitalize="sentences"
               spellCheck={true}
-              enterKeyHint="send"
+              enterKeyHint="enter"
               data-1p-ignore="true"
               data-lpignore="true"
               data-bwignore="true"
               data-form-type="other"
               aria-autocomplete="none"
               aria-label="Message"
-              placeholder={`Send a message to ${displayTarget}... (Ctrl+Enter to submit, paste or attach files)`}
+              placeholder={
+                isMobileComposer
+                  ? `Send a message to ${displayTarget}...`
+                  : `Send a message to ${displayTarget}... (Ctrl+Enter to submit, paste or attach files)`
+              }
               className="fd-textarea fd-prompt-input"
               value={promptText}
               onChange={(e) => setPromptText(e.target.value)}
