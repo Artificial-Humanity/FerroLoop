@@ -115,6 +115,9 @@ pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
 ///   has since gone back, so the override is removed;
 /// - live equals the baseline and the override was never confirmed: the vendor has not applied
 ///   the choice yet, so the override stays and is overlaid.
+///
+/// When an id key is removed, the session's persona key goes with it, unless another session of
+/// the call has no id key and relies on that persona key.
 pub fn apply_model_overrides(
     sessions: &mut [DiscoveredSessionSummary],
     overrides: &mut BTreeMap<String, ModelOverride>,
@@ -138,9 +141,28 @@ pub fn apply_model_overrides(
             }
         })
         .collect();
+    // A persona key is shadowed by the id key of every session that has both. When that id key
+    // is dropped the persona key goes with it, unless another session in this call has no id
+    // key of its own and so relies on the persona key. Decided before any removal, so the order
+    // of the sessions does not matter.
+    let shadowed: Vec<Option<String>> = sessions
+        .iter()
+        .zip(&keys)
+        .map(|(session, key)| {
+            let persona = session.persona.as_deref()?.to_ascii_lowercase();
+            let id_matched = key.as_deref() == Some(session.id.as_str());
+            let relied_on = keys.iter().zip(sessions.iter()).any(|(other_key, other)| {
+                other.id != session.id
+                    && other_key.as_deref() == Some(persona.as_str())
+                    && other_key.as_deref() != Some(other.id.as_str())
+            });
+            (id_matched && persona != session.id && overrides.contains_key(&persona) && !relied_on)
+                .then_some(persona)
+        })
+        .collect();
     // `Some(choice)` is an override still to overlay; `None` is one that was just removed.
     let mut decided: BTreeMap<String, Option<(String, Option<String>)>> = BTreeMap::new();
-    for (session, key) in sessions.iter_mut().zip(keys) {
+    for ((session, key), shadowed) in sessions.iter_mut().zip(keys).zip(shadowed) {
         let Some(key) = key else { continue };
         let live_model = session.model.as_deref().filter(|m| !m.trim().is_empty());
         if !decided.contains_key(&key)
@@ -166,6 +188,9 @@ pub fn apply_model_overrides(
                 );
             } else {
                 overrides.remove(&key);
+                if let Some(persona) = shadowed {
+                    overrides.remove(&persona);
+                }
                 decided.insert(key.clone(), None);
             }
         }
@@ -434,8 +459,87 @@ mod tests {
         apply_model_overrides(&mut sessions, &mut map);
         assert_eq!(sessions[0].model.as_deref(), Some("third"));
         assert!(!map.contains_key("claude:ada"));
-        // The persona key matched no session in either call, so it is untouched.
-        assert_eq!(map["ada"].baseline, None);
+        // The persona key was shadowed by the dropped id key, so it goes with it; otherwise the
+        // next call would match it, record the live model as its baseline and keep it.
+        assert!(!map.contains_key("ada"));
+        let mut sessions = vec![live("claude:ada", Some("Ada"), Some("third"), None)];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("third"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_shadowed_persona_key_does_not_resurrect_after_its_id_key_is_dropped() {
+        let mut map = BTreeMap::from([
+            ("claude:ada".to_string(), over("m", None)),
+            ("ada".to_string(), over("m", None)),
+        ]);
+        let run = |map: &mut BTreeMap<String, ModelOverride>, model: &str| {
+            let mut sessions = vec![live("claude:ada", Some("ada"), Some(model), None)];
+            apply_model_overrides(&mut sessions, map);
+            sessions[0].model.clone()
+        };
+        assert_eq!(run(&mut map, "old").as_deref(), Some("m"));
+        assert_eq!(run(&mut map, "third").as_deref(), Some("third"));
+        assert_eq!(run(&mut map, "third").as_deref(), Some("third"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_persona_key_that_still_serves_another_session_survives_an_id_key_drop() {
+        for reversed in [false, true] {
+            let mut map = BTreeMap::from([
+                ("claude:ada1".to_string(), over("m", None)),
+                ("ada".to_string(), over("m", None)),
+            ]);
+            let build = |m1: &str, m2: &str| {
+                let mut v = vec![
+                    live("claude:ada1", Some("Ada"), Some(m1), None),
+                    live("claude:ada2", Some("Ada"), Some(m2), None),
+                ];
+                if reversed {
+                    v.reverse();
+                }
+                v
+            };
+            let mut sessions = build("old", "old");
+            apply_model_overrides(&mut sessions, &mut map);
+            let mut sessions = build("third", "old");
+            apply_model_overrides(&mut sessions, &mut map);
+            assert!(!map.contains_key("claude:ada1"), "reversed={reversed}");
+            assert!(map.contains_key("ada"), "reversed={reversed}");
+            for s in &sessions {
+                let want = if s.id == "claude:ada1" { "third" } else { "m" };
+                assert_eq!(
+                    s.model.as_deref(),
+                    Some(want),
+                    "{} reversed={reversed}",
+                    s.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dropped_persona_key_with_no_id_key_behaves_as_before() {
+        let mut map = BTreeMap::from([
+            ("ada".to_string(), over("m", None)),
+            ("bob".to_string(), over("n", None)),
+        ]);
+        let mut sessions = vec![
+            live("claude:ada", Some("Ada"), Some("old"), None),
+            live("codex:bob", Some("Bob"), Some("old"), None),
+        ];
+        apply_model_overrides(&mut sessions, &mut map);
+        let mut sessions = vec![
+            live("claude:ada", Some("Ada"), Some("third"), None),
+            live("codex:bob", Some("Bob"), Some("old"), None),
+        ];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("third"));
+        assert_eq!(sessions[1].model.as_deref(), Some("n"));
+        assert!(!map.contains_key("ada"));
+        assert!(map.contains_key("bob"));
     }
 
     #[test]
