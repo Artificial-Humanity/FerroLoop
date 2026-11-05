@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
 import type { HubApiClient } from "../../api/client";
 import type {
   CreateProjectRequest,
@@ -12,17 +12,27 @@ export interface NewProjectModalProps {
   apiClient: Pick<HubApiClient, "createProject">;
   /** Slugs already registered; a new entry may not reuse one. */
   existingSlugs: string[];
+  /**
+   * Element that opened the modal, captured at click time by the caller.
+   * Focus returns to it when the modal closes (reading document.activeElement
+   * is unreliable: Safari and Firefox on macOS do not focus a button on click).
+   */
+  returnFocusTo?: RefObject<HTMLElement | null>;
   onClose: () => void;
   onCreated: (project: ProjectSummary) => void;
 }
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-const GITHUB_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+// owner/repo: each segment starts alphanumeric, then [\w.-]; the repo may not
+// end in ".git" (so "." and ".." can never match either).
+const GITHUB_PATTERN = /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/;
 const FOCUSABLE =
   'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
 export function deriveProjectSlug(name: string): string {
   return name
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
@@ -55,6 +65,7 @@ const FIELD_STYLE = {
 function NewProjectForm({
   apiClient,
   existingSlugs,
+  returnFocusTo,
   onClose,
   onCreated,
 }: Omit<NewProjectModalProps, "isOpen">): ReactNode {
@@ -74,6 +85,10 @@ function NewProjectForm({
 
   const dialogRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
+  const [errorFocusTick, setErrorFocusTick] = useState(0);
+  const returnFocusRef = useRef(returnFocusTo);
+  returnFocusRef.current = returnFocusTo;
   const busyRef = useRef(busy);
   busyRef.current = busy;
   const onCloseRef = useRef(onClose);
@@ -101,21 +116,30 @@ function NewProjectForm({
     errors.slug = `A project or group with the slug "${trimmedSlug}" already exists.`;
   if (isProject) {
     if (!trimmedPath) errors.path = "Directory path is required.";
-    else if (!trimmedPath.startsWith("/") && !trimmedPath.startsWith("~"))
-      errors.path = "Directory path should be absolute (start with / or ~).";
-    if (trimmedGithub && !GITHUB_PATTERN.test(trimmedGithub))
+    else if (!trimmedPath.startsWith("/"))
+      // The hub is not known to expand "~", so only absolute paths pass.
+      errors.path = "Directory path must be absolute (start with /).";
+    if (
+      trimmedGithub &&
+      (!GITHUB_PATTERN.test(trimmedGithub) || trimmedGithub.endsWith(".git"))
+    )
       errors.github = "GitHub tracker must look like owner/repo.";
   }
   const shown = attempted ? errors : {};
 
-  // Initial focus on Name; the opener's focus returns when the form unmounts.
+  // Initial focus on Name; focus returns to the opener when the form unmounts.
   useEffect(() => {
-    const opener = document.activeElement as HTMLElement | null;
     nameRef.current?.focus();
     return () => {
-      if (opener && typeof opener.focus === "function") opener.focus();
+      returnFocusRef.current?.current?.focus();
     };
   }, []);
+
+  // After a failed create the focused (now re-enabled) field was disabled
+  // while busy, so focus would be lost; park it on the submit button.
+  useEffect(() => {
+    if (errorFocusTick > 0) submitRef.current?.focus();
+  }, [errorFocusTick]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -127,9 +151,14 @@ function NewProjectForm({
 
   const trapTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Tab" || !dialogRef.current) return;
+    // Browsers tab only to the checked radio of a group.
     const items = Array.from(
       dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE),
-    ).filter((el) => !(el as HTMLInputElement).disabled);
+    ).filter(
+      (el) =>
+        !(el as HTMLInputElement).disabled &&
+        !(el instanceof HTMLInputElement && el.type === "radio" && !el.checked),
+    );
     if (items.length === 0) {
       event.preventDefault();
       return;
@@ -152,7 +181,9 @@ function NewProjectForm({
   };
 
   const submit = async () => {
-    if (busy) return;
+    // busyRef flips synchronously so a fast double submit cannot slip through
+    // before the busy state re-renders.
+    if (busyRef.current) return;
     setAttempted(true);
     setServerError(null);
     if (errors.name || errors.slug || errors.path || errors.github) {
@@ -168,6 +199,8 @@ function NewProjectForm({
         ?.focus();
       return;
     }
+    // git_init is omitted (not sent as false) unless the box is checked, so
+    // the hub keeps its own default.
     const req: CreateProjectRequest = {
       name: trimmedName,
       slug: trimmedSlug,
@@ -182,6 +215,7 @@ function NewProjectForm({
         req.credential = credential;
       }
     }
+    busyRef.current = true;
     setBusy(true);
     let created: ProjectSummary;
     try {
@@ -192,9 +226,13 @@ function NewProjectForm({
           ? err.message
           : "Could not create the project.",
       );
+      busyRef.current = false;
       setBusy(false);
+      setErrorFocusTick((n) => n + 1);
       return;
     }
+    // The project exists on the hub even if the form unmounted mid-request,
+    // so onCreated still runs.
     onCreated(created);
     onClose();
   };
@@ -345,8 +383,10 @@ function NewProjectForm({
               aria-invalid={shown.slug ? true : undefined}
               aria-describedby={describedBy("slug", Boolean(shown.slug))}
               onChange={(e) => {
-                setSlug(e.target.value);
-                setSlugManual(true);
+                const value = e.target.value;
+                // Clearing the slug hands control back to the name.
+                setSlugManual(value !== "");
+                setSlug(value === "" ? deriveProjectSlug(name) : value);
               }}
             />
             {fieldError("slug", shown.slug)}
@@ -494,6 +534,7 @@ function NewProjectForm({
               Cancel
             </button>
             <button
+              ref={submitRef}
               type="submit"
               data-testid="new-project-submit"
               className="fd-btn fd-btn-primary"

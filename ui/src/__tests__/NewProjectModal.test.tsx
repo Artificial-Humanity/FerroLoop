@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -60,6 +60,12 @@ describe("deriveProjectSlug", () => {
     expect(deriveProjectSlug("  My Cool_Project!! ")).toBe("my-cool-project");
     expect(deriveProjectSlug("--A  b--")).toBe("a-b");
     expect(deriveProjectSlug("***")).toBe("");
+  });
+
+  it("normalizes accents and leaves non-Latin names empty", () => {
+    expect(deriveProjectSlug("Café")).toBe("cafe");
+    expect(deriveProjectSlug("Über Projekt")).toBe("uber-projekt");
+    expect(deriveProjectSlug("日本語")).toBe("");
   });
 });
 
@@ -165,12 +171,15 @@ describe("NewProjectModal", () => {
     });
   });
 
-  it("accepts a home-relative path", async () => {
+  it("rejects a home-relative path because the hub does not expand it", async () => {
     const { create } = setup();
     type("new-project-name", "Alpha");
     type("new-project-path", "~/work/alpha");
     await submit();
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-project-path")).toHaveAccessibleDescription(
+      "Directory path must be absolute (start with /).",
+    );
   });
 
   it("omits git_init and credential when git init is off and no tracker is set", async () => {
@@ -183,6 +192,19 @@ describe("NewProjectModal", () => {
     expect(body).not.toHaveProperty("git_init");
     expect(body).not.toHaveProperty("credential");
     expect(body).not.toHaveProperty("github");
+  });
+
+  it("resumes deriving the slug after a manually edited slug is cleared", () => {
+    setup();
+    type("new-project-name", "First");
+    type("new-project-slug", "custom");
+    type("new-project-name", "Second");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("custom");
+    type("new-project-slug", "");
+    // Emptying re-derives from the current name right away.
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("second");
+    type("new-project-name", "Third One");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("third-one");
   });
 
   it("sends a Virtual Group without the Directory Project fields, even if typed before", async () => {
@@ -206,7 +228,6 @@ describe("NewProjectModal", () => {
       kind: "virtual",
       purpose: "Council scope",
     });
-    // Switching back would show the hidden fields empty again.
   });
 
   it("discards hidden field values when switching back to Directory Project", () => {
@@ -232,8 +253,9 @@ describe("NewProjectModal", () => {
 
     it("requires a slug", async () => {
       const { create } = setup();
-      fillProject();
-      type("new-project-slug", "");
+      // A non-Latin name derives an empty slug.
+      type("new-project-name", "日本語");
+      type("new-project-path", "/work/alpha");
       await submit();
       expect(create).not.toHaveBeenCalled();
       expect(screen.getByTestId("new-project-slug")).toHaveAccessibleDescription(
@@ -300,6 +322,29 @@ describe("NewProjectModal", () => {
       expect(create).toHaveBeenCalledTimes(1);
     });
 
+    it.each([
+      ["Artificial-Humanity/FerroLoop", true],
+      ["o/r.x", true],
+      ["o/r.git", false],
+      ["../..", false],
+      ["./.", false],
+      ["-/-", false],
+      ["https://github.com/o/r", false],
+      ["o r/x", false],
+    ])("GitHub tracker %s is valid: %s", async (value, valid) => {
+      const { create } = setup();
+      fillProject();
+      type("new-project-github", value);
+      await submit();
+      expect(create).toHaveBeenCalledTimes(valid ? 1 : 0);
+      if (!valid) {
+        expect(screen.getByTestId("new-project-github")).toHaveAttribute(
+          "aria-invalid",
+          "true",
+        );
+      }
+    });
+
     it("does not require a path for a Virtual Group", async () => {
       const { create } = setup();
       fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
@@ -327,6 +372,42 @@ describe("NewProjectModal", () => {
     expect(screen.getByTestId("new-project-submit")).not.toBeDisabled();
     expect(onClose).not.toHaveBeenCalled();
     expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("moves focus to the submit button after a failed create", async () => {
+    setup(async () => {
+      throw new Error("nope");
+    });
+    fillProject();
+    screen.getByTestId("new-project-path").focus();
+    await submit();
+    expect(screen.getByRole("alert")).toHaveTextContent("nope");
+    expect(screen.getByTestId("new-project-submit")).toHaveFocus();
+  });
+
+  it("shows a generic message for a non-Error rejection", async () => {
+    const { onClose } = setup(() => Promise.reject("boom"));
+    fillProject();
+    await submit();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not create the project.",
+    );
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("sends exactly one request when the form is submitted twice", async () => {
+    let resolve!: (p: ProjectSummary) => void;
+    const { create } = setup(
+      () => new Promise<ProjectSummary>((r) => (resolve = r)),
+    );
+    fillProject();
+    const form = screen.getByTestId("new-project-submit").closest("form")!;
+    await act(async () => {
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+    });
+    expect(create).toHaveBeenCalledTimes(1);
+    await act(async () => resolve(CREATED));
   });
 
   it("disables the form and buttons while busy and ignores close gestures", async () => {
@@ -381,31 +462,88 @@ describe("NewProjectModal", () => {
     expect(submitBtn).toHaveFocus();
   });
 
-  it("returns focus to the opener when it closes", () => {
-    function Host() {
+  it("wraps Tab around the checked radio when Virtual Group is selected", () => {
+    setup();
+    fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+    const dialog = screen.getByTestId("new-project-modal");
+    const virtual = screen.getByTestId("new-project-kind-virtual");
+    const submitBtn = screen.getByTestId("new-project-submit");
+    virtual.focus();
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(submitBtn).toHaveFocus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(virtual).toHaveFocus();
+  });
+
+  describe("returning focus to the opener", () => {
+    // The opener is deliberately not focused before the click, as Safari and
+    // Firefox on macOS do not focus a button on click.
+    function Host({
+      createProject = vi.fn(async () => CREATED),
+    }: {
+      createProject?: (req: CreateProjectRequest) => Promise<ProjectSummary>;
+    }) {
       const [open, setOpen] = useState(false);
+      const openerRef = useRef<HTMLElement | null>(null);
       return (
         <>
-          <button data-testid="opener" onClick={() => setOpen(true)}>
+          <button
+            data-testid="opener"
+            onClick={(e) => {
+              openerRef.current = e.currentTarget;
+              setOpen(true);
+            }}
+          >
             open
           </button>
           <NewProjectModal
             isOpen={open}
-            apiClient={{ createProject: vi.fn() }}
+            apiClient={{ createProject }}
             existingSlugs={[]}
+            returnFocusTo={openerRef}
             onClose={() => setOpen(false)}
             onCreated={vi.fn()}
           />
         </>
       );
     }
-    render(<Host />);
-    const opener = screen.getByTestId("opener");
-    opener.focus();
-    fireEvent.click(opener);
-    expect(screen.getByTestId("new-project-name")).toHaveFocus();
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.queryByTestId("new-project-modal")).toBeNull();
-    expect(opener).toHaveFocus();
+
+    function openIt() {
+      render(<Host />);
+      const opener = screen.getByTestId("opener");
+      expect(opener).not.toHaveFocus();
+      fireEvent.click(opener);
+      expect(screen.getByTestId("new-project-name")).toHaveFocus();
+      return opener;
+    }
+
+    it("on Escape", () => {
+      const opener = openIt();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      expect(opener).toHaveFocus();
+    });
+
+    it("on Cancel", () => {
+      const opener = openIt();
+      fireEvent.click(screen.getByTestId("new-project-cancel"));
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      expect(opener).toHaveFocus();
+    });
+
+    it("on backdrop click", () => {
+      const opener = openIt();
+      fireEvent.click(screen.getByTestId("new-project-modal-backdrop"));
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      expect(opener).toHaveFocus();
+    });
+
+    it("on a successful create", async () => {
+      const opener = openIt();
+      fillProject();
+      await submit();
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      expect(opener).toHaveFocus();
+    });
   });
 });

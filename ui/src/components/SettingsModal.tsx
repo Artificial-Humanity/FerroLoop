@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { HubApiClient, HubApiError, generatePasskeyCredentialId } from "../api/client";
 import {
   FONT_SCALE_MAX_PCT,
@@ -1465,6 +1465,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const newProjectOpenerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    // Closing Settings must not leave the New Project modal armed for reopen.
+    if (!isOpen) setNewProjectOpen(false);
+  }, [isOpen]);
   const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
     useState<DedicatedArtifactLayoutState>(
       () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
@@ -4861,7 +4866,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 setActiveTab("agents");
               }}
               artifactsDir={projectArtifactsDirProps}
-              onCreate={() => setNewProjectOpen(true)}
+              onCreate={(opener) => {
+                newProjectOpenerRef.current = opener;
+                setNewProjectOpen(true);
+              }}
             />
           </div>
         )}
@@ -10219,6 +10227,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           isOpen={newProjectOpen}
           apiClient={apiClient ?? new HubApiClient()}
           existingSlugs={projectList.map((p) => p.slug)}
+          returnFocusTo={newProjectOpenerRef}
           onClose={() => setNewProjectOpen(false)}
           onCreated={(created) => {
             setProjectList((prev) =>

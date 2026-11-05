@@ -21,7 +21,8 @@ export interface ProjectsSettingsTabProps {
   error: string | null;
   onViewAgents: (slug: string) => void;
   artifactsDir: ProjectsArtifactsDirProps;
-  onCreate?: () => void;
+  /** Receives the clicked button so the caller can return focus to it. */
+  onCreate?: (opener: HTMLElement) => void;
   onEdit?: (project: ProjectSummary) => void;
   onDelete?: (project: ProjectSummary) => void;
 }
@@ -290,7 +291,7 @@ export function ProjectsSettingsTab(props: ProjectsSettingsTabProps): ReactNode 
           data-testid="settings-projects-create-btn"
           className="fd-btn fd-btn-active"
           style={BUTTON_STYLE}
-          onClick={() => props.onCreate?.()}
+          onClick={(e) => props.onCreate?.(e.currentTarget)}
         >
           + Create Project / Group
         </button>

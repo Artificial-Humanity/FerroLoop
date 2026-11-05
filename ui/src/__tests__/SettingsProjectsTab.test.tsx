@@ -386,6 +386,9 @@ describe("Settings Projects tab", () => {
     fireEvent.click(screen.getByTestId("settings-project-delete-ferroloop"));
     fireEvent.click(screen.getByTestId("settings-project-view-agents-ferroloop"));
     expect(onCreate).toHaveBeenCalledTimes(1);
+    expect(onCreate).toHaveBeenCalledWith(
+      screen.getByTestId("settings-projects-create-btn"),
+    );
     expect(onEdit).toHaveBeenCalledWith(GIT);
     expect(onDelete).toHaveBeenCalledWith(GIT);
     expect(onViewAgents).toHaveBeenCalledWith("ferroloop");
@@ -536,16 +539,73 @@ describe("Settings Projects tab", () => {
       expect(onClose).toHaveBeenCalledTimes(1);
     });
 
-    it("returns focus to the create button after closing", async () => {
-      const { client } = makeClient();
+    it("returns focus to the create button after each way of closing", async () => {
+      // The button is never focused before the click (Safari/Firefox on macOS
+      // do not focus a button on click); the tab captures it at click time.
+      const closers: Array<() => void> = [
+        () => fireEvent.keyDown(window, { key: "Escape" }),
+        () => fireEvent.click(screen.getByTestId("new-project-cancel")),
+        () => fireEvent.click(screen.getByTestId("new-project-modal-backdrop")),
+      ];
+      for (const close of closers) {
+        const { client } = makeClient();
+        const view = await renderModal(client);
+        await openProjectsTab();
+        const btn = screen.getByTestId("settings-projects-create-btn");
+        expect(btn).not.toHaveFocus();
+        fireEvent.click(btn);
+        expect(screen.getByTestId("new-project-name")).toHaveFocus();
+        close();
+        expect(screen.queryByTestId("new-project-modal")).toBeNull();
+        expect(btn).toHaveFocus();
+        view.unmount();
+      }
+    });
+
+    it("returns focus to the create button after a successful create", async () => {
+      const { client } = makeClient([PLAIN, GIT, GROUP], createHandler(NEW_GROUP));
       await renderModal(client);
       await openProjectsTab();
       const btn = screen.getByTestId("settings-projects-create-btn");
-      btn.focus();
       fireEvent.click(btn);
-      expect(screen.getByTestId("new-project-name")).toHaveFocus();
-      fireEvent.click(screen.getByTestId("new-project-cancel"));
+      fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Council" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
       expect(btn).toHaveFocus();
+    });
+
+    it("does not reopen the New Project modal when Settings closes and reopens", async () => {
+      const { client } = makeClient();
+      const view = await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      expect(screen.getByTestId("new-project-modal")).toBeInTheDocument();
+      view.rerender(
+        <SettingsModal
+          isOpen={false}
+          onClose={vi.fn()}
+          authority={{ tier: "owner", login: "lmcfarlin" }}
+          apiClient={client}
+        />,
+      );
+      view.rerender(
+        <SettingsModal
+          isOpen={true}
+          onClose={vi.fn()}
+          authority={{ tier: "owner", login: "lmcfarlin" }}
+          apiClient={client}
+        />,
+      );
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
     });
 
     it("keeps the Projects tab and shows the server error on a failed create", async () => {
