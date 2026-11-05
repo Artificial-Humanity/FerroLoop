@@ -14,6 +14,7 @@ import {
 import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
 import {
   estimateSessionContextUsage,
+  formatContextMax,
   formatTokenCount,
   type EstimatedContextUsage,
 } from "./ChatPane";
@@ -743,7 +744,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         null;
       const contextEstimate = estimateSessionContextUsage(
         agentTurns ?? [],
-        adapter,
         explicitContextUsage,
       );
 
@@ -1223,21 +1223,29 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             ? "1px solid rgba(16, 185, 129, 0.45)"
                             : "1px solid var(--border-subtle)";
 
-                      const contextPct = Math.max(
-                        0,
-                        Math.min(100, contextEstimate.percent),
-                      );
+                      const contextPct =
+                        contextEstimate.percent === null
+                          ? null
+                          : Math.max(0, Math.min(100, contextEstimate.percent));
                       const ringRadius = 5.5;
                       const ringCircumference = 2 * Math.PI * ringRadius;
                       const ringDashOffset =
-                        ringCircumference * (1 - contextPct / 100);
+                        ringCircumference * (1 - (contextPct ?? 0) / 100);
                       const ringColor =
-                        contextPct >= 80
-                          ? "var(--status-danger)"
-                          : contextPct >= 50
-                            ? "var(--status-stale)"
-                            : "#60A5FA";
-                      const contextTitle = `Context used: ${contextPct}% (${formatTokenCount(contextEstimate.usedTokens)} / ${formatTokenCount(contextEstimate.maxTokens)} tokens)`;
+                        contextPct === null
+                          ? "var(--text-muted)"
+                          : contextPct >= 80
+                            ? "var(--status-danger)"
+                            : contextPct >= 50
+                              ? "var(--status-stale)"
+                              : "#60A5FA";
+                      const contextAssumed = contextEstimate.source === "assumed";
+                      const contextTitle =
+                        contextPct === null || contextEstimate.maxTokens === null
+                          ? contextEstimate.usedTokens === null
+                            ? "Context: no data from the hub"
+                            : `Context used: about ${formatTokenCount(contextEstimate.usedTokens)} tokens (window not reported)`
+                          : `Context used: ${contextPct}% (${formatTokenCount(contextEstimate.usedTokens ?? 0)} / ${formatContextMax(contextEstimate.maxTokens, contextEstimate.source)}${contextAssumed ? ")" : " tokens)"}`;
 
                       return (
                         <div
@@ -1454,7 +1462,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               <span
                                 role="img"
                                 data-testid={`context-ring-${key}`}
-                                data-percent={String(contextPct)}
+                                data-percent={
+                                  contextPct === null ? undefined : String(contextPct)
+                                }
+                                data-source={contextEstimate.source ?? "unknown"}
                                 title={contextTitle}
                                 aria-label={contextTitle}
                                 className="fd-badge"
@@ -1498,15 +1509,22 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                   className="fd-mono"
                                   style={{
                                     fontSize: "10px",
+                                    whiteSpace: "nowrap",
                                     color:
-                                      contextPct >= 80
-                                        ? "var(--status-danger)"
-                                        : contextPct >= 50
-                                          ? "var(--status-stale)"
-                                          : "var(--text-secondary)",
+                                      contextPct === null
+                                        ? "var(--text-muted)"
+                                        : contextPct >= 80
+                                          ? "var(--status-danger)"
+                                          : contextPct >= 50
+                                            ? "var(--status-stale)"
+                                            : "var(--text-secondary)",
                                   }}
                                 >
-                                  {contextPct}%
+                                  {contextPct === null
+                                    ? contextEstimate.usedTokens === null
+                                      ? "n/a"
+                                      : `~${formatTokenCount(contextEstimate.usedTokens)} tok`
+                                    : `${contextAssumed ? "~" : ""}${contextPct}%`}
                                 </span>
                               </span>
                             </div>

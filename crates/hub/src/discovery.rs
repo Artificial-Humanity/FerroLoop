@@ -126,11 +126,67 @@ pub struct TranscriptTurn {
     pub created_at: Option<String>,
 }
 
+/// How a session's context window (`max_tokens`) was found.
+///
+/// `Reported`: the session or the vendor said it for this session (Grok `signals.json`, a
+/// Codex rollout, a vendor setting). `Catalog`: the vendor's model catalog or cache lists it
+/// for the session's model. `Assumed`: nothing on this machine says it (a registry default or
+/// a constant). `Assumed` is the default, so JSON from before this field existed reads as such.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextWindowSource {
+    Reported,
+    Catalog,
+    #[default]
+    Assumed,
+}
+
 /// Server-measured context window token usage for a live vendor session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContextUsage {
     pub used_tokens: u64,
     pub max_tokens: u64,
+    /// How `max_tokens` was found.
+    #[serde(default)]
+    pub source: ContextWindowSource,
+    /// The window sizes the session's model offers, ascending and without duplicates, when the
+    /// vendor lists them. Empty (and left out of the JSON) when no vendor file lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_windows: Vec<u64>,
+}
+
+impl SessionContextUsage {
+    fn new(
+        used_tokens: u64,
+        max_tokens: u64,
+        source: ContextWindowSource,
+        offered_windows: Vec<u64>,
+    ) -> Self {
+        Self {
+            used_tokens,
+            max_tokens,
+            source,
+            offered_windows: normalized_windows(offered_windows),
+        }
+    }
+
+    /// A window that nothing on this machine reports: `max_tokens` is a constant or default.
+    fn assumed(used_tokens: u64, max_tokens: u64) -> Self {
+        Self::new(
+            used_tokens,
+            max_tokens,
+            ContextWindowSource::Assumed,
+            Vec::new(),
+        )
+    }
+}
+
+/// Window sizes sorted ascending with duplicates and zeros removed.
+fn normalized_windows(mut windows: Vec<u64>) -> Vec<u64> {
+    windows.retain(|&n| n > 0);
+    windows.sort_unstable();
+    windows.dedup();
+    windows
 }
 
 /// One vendor allowance window (5-hour primary, weekly secondary, or a single reset).
@@ -2810,10 +2866,11 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
             .saturating_add(json_u64_token(val.get("cache_read_tokens")))
             .saturating_add(json_u64_token(val.get("output_tokens")));
         if used_tokens > 0 {
-            latest = Some(SessionContextUsage {
+            // No file on this machine names an Antigravity model's window: assumed.
+            latest = Some(SessionContextUsage::assumed(
                 used_tokens,
-                max_tokens: 1_000_000,
-            });
+                ASSUMED_LARGE_CONTEXT_WINDOW,
+            ));
         }
     }
     latest
@@ -3200,6 +3257,98 @@ pub(crate) fn fallback_context_window(adapter: &str) -> u64 {
     registered_context_window(adapter).unwrap_or(GENERIC_CONTEXT_WINDOW)
 }
 
+/// The window assumed for Claude, Muse and Antigravity when no vendor file on this machine
+/// names the session's real window.
+const ASSUMED_LARGE_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// A model's window from the vendor model catalog: `models.<id>.info.context_window` of the
+/// Grok `models_cache.json` beside the session (in the `.grok` directory above `tpath`), and
+/// the sizes the model offers (`context_windows`). `None` when the cache, the model or a
+/// positive window is missing.
+fn grok_catalog_windows(tpath: &Path, model_id: &str) -> Option<(Option<u64>, Vec<u64>)> {
+    let grok_dir = tpath
+        .ancestors()
+        .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".grok"))?;
+    let cache = read_json_file(&grok_dir.join("models_cache.json"))?;
+    let info = cache.get("models")?.get(model_id)?.get("info")?;
+    let window = info
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0);
+    let offered = info
+        .get("context_windows")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    Some((window, normalized_windows(offered)))
+}
+
+/// The Codex `models_cache.json` `context_window` of the model the rollout `raw` ran (its
+/// newest `payload.model`, else `config.toml`'s `model`), from the `.codex` directory above
+/// `tpath`.
+fn codex_catalog_window(tpath: &Path, raw: &str) -> Option<u64> {
+    let codex_dir = tpath
+        .ancestors()
+        .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".codex"))?;
+    let tail = read_file_tail(tpath, CLAUDE_TRANSCRIPT_TAIL_BYTES);
+    let model = codex_rollout_settings(tail.as_deref().unwrap_or(raw))
+        .0
+        .or_else(|| {
+            read_toml_file(&codex_dir.join("config.toml"))
+                .and_then(|c| toml_non_empty_str(&c, "model"))
+        })?;
+    let cache = read_json_file(&codex_dir.join("models_cache.json"))?;
+    cache
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("slug").and_then(Value::as_str) == Some(model.as_str()))?
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+}
+
+/// A Muse model's `context_limit` from the `model-catalog/*.json` rows (`rows[].model_id`) in
+/// the Muse data directory above `tpath` (the one holding `model-catalog`). The search climbs
+/// from the transcript and stops at the Muse data directory itself (the first ancestor named
+/// `muse` or holding a `sessions` directory), so an unrelated `model-catalog` further up is never
+/// read. Files are read in name order; when several list the same model the first file by name
+/// wins, and within a file the first row naming `model_id` with a positive limit.
+fn muse_catalog_context_limit(tpath: &Path, model_id: &str) -> Option<u64> {
+    let mut catalog_dir = None;
+    for ancestor in tpath.ancestors() {
+        let candidate = ancestor.join("model-catalog");
+        if candidate.is_dir() {
+            catalog_dir = Some(candidate);
+            break;
+        }
+        let is_muse_data_dir =
+            ancestor.file_name().is_some_and(|n| n == "muse") || ancestor.join("sessions").is_dir();
+        if is_muse_data_dir {
+            break;
+        }
+    }
+    let catalog_dir = catalog_dir?;
+    let mut files: Vec<PathBuf> = fs::read_dir(catalog_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    files.iter().find_map(|file| {
+        read_json_file(file)?
+            .get("rows")?
+            .as_array()?
+            .iter()
+            .filter(|row| row.get("model_id").and_then(Value::as_str) == Some(model_id))
+            .find_map(|row| {
+                row.get("context_limit")
+                    .and_then(Value::as_u64)
+                    .filter(|&n| n > 0)
+            })
+    })
+}
+
 /// Read server-measured context window token usage for `session_id` when vendor session
 /// metadata (such as Grok `signals.json`/`summary.json`, Claude `message.usage`, Codex `token_count`,
 /// Antigravity `PLANNER_RESPONSE`, or Muse `model_completed`) is available.
@@ -3292,7 +3441,20 @@ fn context_usage_for_transcript(
                         .filter(|&n| n > 0)
                 })
             });
-        let max_tokens = signals_val
+        // The model the session ran: `summary.json`, else the one `signals.json` counts most.
+        let model_id = summary_val
+            .as_ref()
+            .and_then(|v| non_empty_str(v.get("current_model_id")))
+            .or_else(|| {
+                signals_val
+                    .as_ref()
+                    .and_then(|v| non_empty_str(v.get("primaryModelId")))
+            });
+        let (catalog_window, offered_windows) = model_id
+            .as_deref()
+            .and_then(|id| grok_catalog_windows(&tpath, id))
+            .unwrap_or_default();
+        let reported_max = signals_val
             .as_ref()
             .and_then(|v| v.get("contextWindowTokens").and_then(Value::as_u64))
             .filter(|&n| n > 0)
@@ -3301,14 +3463,23 @@ fn context_usage_for_transcript(
                     .as_ref()
                     .and_then(|v| v.get("context_window").and_then(Value::as_u64))
                     .filter(|&n| n > 0)
-            })
-            .unwrap_or_else(|| fallback_context_window("grok"));
+            });
+        let (max_tokens, source) = match (reported_max, catalog_window) {
+            (Some(n), _) => (n, ContextWindowSource::Reported),
+            (None, Some(n)) => (n, ContextWindowSource::Catalog),
+            (None, None) => (
+                fallback_context_window("grok"),
+                ContextWindowSource::Assumed,
+            ),
+        };
 
         if let Some(used_tokens) = used_tokens {
-            return Some(SessionContextUsage {
+            return Some(SessionContextUsage::new(
                 used_tokens,
                 max_tokens,
-            });
+                source,
+                offered_windows,
+            ));
         }
     }
 
@@ -3338,25 +3509,40 @@ fn context_usage_for_transcript(
                         .and_then(Value::as_u64)
                         .filter(|&n| n > 0)
                 });
-            let max_tokens = configured_max
-                .or_else(|| {
-                    val.pointer("/payload/info/model_context_window")
-                        .and_then(Value::as_u64)
-                        .filter(|&n| n > 0)
-                })
-                .unwrap_or_else(|| fallback_context_window("codex"));
-            if let Some(used_tokens) = used_tokens {
-                return Some(SessionContextUsage {
-                    used_tokens,
-                    max_tokens,
-                });
-            }
+            let Some(used_tokens) = used_tokens else {
+                continue;
+            };
+            let (max_tokens, source) = if let Some(n) = configured_max {
+                (n, ContextWindowSource::Reported)
+            } else if let Some(n) = val
+                .pointer("/payload/info/model_context_window")
+                .and_then(Value::as_u64)
+                .filter(|&n| n > 0)
+            {
+                (n, ContextWindowSource::Reported)
+            } else if let Some(n) = codex_catalog_window(&tpath, raw) {
+                (n, ContextWindowSource::Catalog)
+            } else {
+                (
+                    fallback_context_window("codex"),
+                    ContextWindowSource::Assumed,
+                )
+            };
+            // `max_context_window` in the cache is a cap, not a list of selectable sizes.
+            return Some(SessionContextUsage::new(
+                used_tokens,
+                max_tokens,
+                source,
+                Vec::new(),
+            ));
         }
         if let Some(max_tokens) = configured_max {
-            return Some(SessionContextUsage {
-                used_tokens: 0,
+            return Some(SessionContextUsage::new(
+                0,
                 max_tokens,
-            });
+                ContextWindowSource::Reported,
+                Vec::new(),
+            ));
         }
     }
 
@@ -3391,9 +3577,21 @@ fn context_usage_for_transcript(
                     estimated
                 };
                 if used_tokens > 0 {
-                    return Some(SessionContextUsage {
-                        used_tokens,
-                        max_tokens: 1_000_000,
+                    let model_id = non_empty_str(val.pointer("/payload/event/model"))
+                        .or_else(|| muse_transcript_model_id(raw));
+                    let catalog_limit = model_id
+                        .as_deref()
+                        .and_then(|id| muse_catalog_context_limit(&tpath, id));
+                    return Some(match catalog_limit {
+                        Some(limit) => SessionContextUsage::new(
+                            used_tokens,
+                            limit,
+                            ContextWindowSource::Catalog,
+                            Vec::new(),
+                        ),
+                        None => {
+                            SessionContextUsage::assumed(used_tokens, ASSUMED_LARGE_CONTEXT_WINDOW)
+                        }
                     });
                 }
             }
@@ -3426,10 +3624,10 @@ fn context_usage_for_transcript(
                     .and_then(Value::as_u64)
                     .filter(|&n| n > 0);
                 if let Some(used_tokens) = post_tokens {
-                    return Some(SessionContextUsage {
+                    return Some(SessionContextUsage::assumed(
                         used_tokens,
-                        max_tokens: 1_000_000,
-                    });
+                        ASSUMED_LARGE_CONTEXT_WINDOW,
+                    ));
                 }
                 // A boundary without a post-compaction size says nothing: keep looking.
                 continue;
@@ -3456,10 +3654,12 @@ fn context_usage_for_transcript(
                     .saturating_add(cache_read)
                     .saturating_add(output);
                 if used_tokens > 0 {
-                    return Some(SessionContextUsage {
+                    // No transcript or settings key on this machine records Claude's
+                    // effective window (200k or 1M): assumed.
+                    return Some(SessionContextUsage::assumed(
                         used_tokens,
-                        max_tokens: 1_000_000,
-                    });
+                        ASSUMED_LARGE_CONTEXT_WINDOW,
+                    ));
                 }
             }
         }
@@ -9216,6 +9416,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 47874,
                 max_tokens: 500000,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
             }
         );
     }
@@ -9365,6 +9567,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 65560,
                 max_tokens: 872000,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
             }
         );
     }
@@ -9430,6 +9634,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 125,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             }
         );
 
@@ -9550,6 +9756,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 9,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
     }
@@ -9657,6 +9865,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 15,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
 
@@ -9681,6 +9891,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 4,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
 
@@ -10950,6 +11162,434 @@ mod tests {
         }
     }
 
+    // --- Context window source (#134) ---------------------------------------------------
+
+    fn context_at(path: &Path) -> Option<SessionContextUsage> {
+        context_usage_for_transcript(&path.display().to_string(), &mut TranscriptReads::default())
+    }
+
+    /// A Grok session under `<home>/.grok/sessions/p/<id>/` with `chat_history.jsonl`, an
+    /// optional `signals.json` and `summary.json`, and an optional `models_cache.json`.
+    fn grok_session_files(
+        home: &Path,
+        signals: Option<serde_json::Value>,
+        summary: Option<serde_json::Value>,
+        cache: Option<serde_json::Value>,
+    ) -> PathBuf {
+        let dir = home.join(".grok/sessions/p/grok-src-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("chat_history.jsonl"), "{}\n").unwrap();
+        if let Some(v) = signals {
+            fs::write(dir.join("signals.json"), v.to_string()).unwrap();
+        }
+        if let Some(v) = summary {
+            fs::write(dir.join("summary.json"), v.to_string()).unwrap();
+        }
+        if let Some(v) = cache {
+            fs::write(home.join(".grok/models_cache.json"), v.to_string()).unwrap();
+        }
+        dir.join("chat_history.jsonl")
+    }
+
+    fn grok_cache() -> serde_json::Value {
+        serde_json::json!({"models": {
+            "grok-x": {"info": {"context_window": 256_000, "context_windows": [500_000, 256_000, 256_000]}},
+            "grok-nowindow": {"info": {"hidden": false}}
+        }})
+    }
+
+    #[test]
+    fn grok_window_from_signals_or_summary_is_reported_and_lists_the_models_sizes() {
+        let home = TempDir::new().unwrap();
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10, "contextWindowTokens": 123_456})),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            Some(grok_cache()),
+        );
+        let usage = context_at(&chat).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (123_456, ContextWindowSource::Reported)
+        );
+        // The sizes come from the cache for the session's model, ascending and deduplicated.
+        assert_eq!(usage.offered_windows, vec![256_000, 500_000]);
+
+        // `summary.json` is the second reported source.
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10})),
+            Some(serde_json::json!({"current_model_id": "grok-x", "context_window": 500_000})),
+            None,
+        );
+        let usage = context_at(&chat).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (500_000, ContextWindowSource::Reported)
+        );
+    }
+
+    #[test]
+    fn grok_without_a_reported_window_takes_the_models_cache_as_catalog() {
+        let home = TempDir::new().unwrap();
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10})),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            Some(grok_cache()),
+        );
+        assert_eq!(
+            context_at(&chat).unwrap(),
+            SessionContextUsage {
+                used_tokens: 10,
+                max_tokens: 256_000,
+                source: ContextWindowSource::Catalog,
+                offered_windows: vec![256_000, 500_000],
+            }
+        );
+        // Without a summary the signals name the model.
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10, "primaryModelId": "grok-x"})),
+            None,
+            Some(grok_cache()),
+        );
+        let usage = context_at(&chat).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (256_000, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn grok_with_no_evidence_is_assumed_at_the_registry_default() {
+        let home = TempDir::new().unwrap();
+        let signals = || Some(serde_json::json!({"contextTokensUsed": 10}));
+        let assumed = SessionContextUsage {
+            used_tokens: 10,
+            max_tokens: fallback_context_window("grok"),
+            source: ContextWindowSource::Assumed,
+            offered_windows: Vec::new(),
+        };
+        // No cache at all.
+        let chat = grok_session_files(
+            home.path(),
+            signals(),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            None,
+        );
+        assert_eq!(context_at(&chat).unwrap(), assumed);
+        // A cache that does not list the session's model, or lists it without a window.
+        for model in ["grok-unlisted", "grok-nowindow"] {
+            let chat = grok_session_files(
+                home.path(),
+                signals(),
+                Some(serde_json::json!({ "current_model_id": model })),
+                Some(grok_cache()),
+            );
+            assert_eq!(context_at(&chat).unwrap(), assumed, "{model}");
+        }
+        // No summary and no model in the signals: the cache cannot be consulted.
+        let chat = grok_session_files(home.path(), signals(), None, Some(grok_cache()));
+        assert_eq!(context_at(&chat).unwrap(), assumed);
+    }
+
+    fn codex_rollout(home: &Path, lines: &[serde_json::Value]) -> PathBuf {
+        let path = home.join(".codex/sessions/2026/11/05/rollout-src-1.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        fs::write(&path, text.join("\n")).unwrap();
+        path
+    }
+
+    fn codex_token_count(info_extra: serde_json::Value) -> serde_json::Value {
+        let mut info = serde_json::json!({"last_token_usage": {"total_tokens": 321}});
+        if let (Some(map), Some(extra)) = (info.as_object_mut(), info_extra.as_object()) {
+            map.extend(extra.clone());
+        }
+        serde_json::json!({"type": "event_msg", "payload": {"type": "token_count", "info": info}})
+    }
+
+    fn codex_cache() -> serde_json::Value {
+        serde_json::json!({"models": [
+            {"slug": "gpt-x", "visibility": "list", "context_window": 272_000, "max_context_window": 872_000},
+            {"slug": "gpt-nowindow", "visibility": "list"}
+        ]})
+    }
+
+    #[test]
+    fn codex_window_from_config_or_rollout_is_reported_with_the_existing_precedence() {
+        let home = TempDir::new().unwrap();
+        let path = codex_rollout(
+            home.path(),
+            &[codex_token_count(
+                serde_json::json!({"model_context_window": 258_400}),
+            )],
+        );
+        // The rollout's own value.
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            usage,
+            SessionContextUsage {
+                used_tokens: 321,
+                max_tokens: 258_400,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
+            }
+        );
+        // `config.toml` still wins over the rollout.
+        fs::write(
+            home.path().join(".codex/config.toml"),
+            "model_context_window = 400000\n",
+        )
+        .unwrap();
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (400_000, ContextWindowSource::Reported)
+        );
+        // With no token_count row yet, the configured value alone is reported at 0 used.
+        let path = codex_rollout(home.path(), &[serde_json::json!({"type": "session_meta"})]);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.used_tokens, usage.max_tokens, usage.source),
+            (0, 400_000, ContextWindowSource::Reported)
+        );
+    }
+
+    #[test]
+    fn codex_window_from_the_models_cache_is_catalog_and_lists_no_sizes() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        fs::write(
+            home.path().join(".codex/models_cache.json"),
+            codex_cache().to_string(),
+        )
+        .unwrap();
+        // The rollout names the model; the row carries no window.
+        let path = codex_rollout(
+            home.path(),
+            &[
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-x"}}),
+                codex_token_count(serde_json::json!({})),
+            ],
+        );
+        // `max_context_window` is a cap, not a selectable size: it is not offered.
+        assert_eq!(
+            context_at(&path).unwrap(),
+            SessionContextUsage {
+                used_tokens: 321,
+                max_tokens: 272_000,
+                source: ContextWindowSource::Catalog,
+                offered_windows: Vec::new(),
+            }
+        );
+        // With no model in the rollout, `config.toml`'s model names it.
+        let path = codex_rollout(home.path(), &[codex_token_count(serde_json::json!({}))]);
+        fs::write(
+            home.path().join(".codex/config.toml"),
+            "model = \"gpt-x\"\n",
+        )
+        .unwrap();
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (272_000, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn codex_with_no_evidence_is_assumed_at_the_fallback() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let assumed = SessionContextUsage {
+            used_tokens: 321,
+            max_tokens: fallback_context_window("codex"),
+            source: ContextWindowSource::Assumed,
+            offered_windows: Vec::new(),
+        };
+        // No cache, no model.
+        let path = codex_rollout(home.path(), &[codex_token_count(serde_json::json!({}))]);
+        assert_eq!(context_at(&path).unwrap(), assumed);
+        // A cache without the rollout's model, and one that lists it without a window.
+        fs::write(
+            home.path().join(".codex/models_cache.json"),
+            codex_cache().to_string(),
+        )
+        .unwrap();
+        for model in ["gpt-unlisted", "gpt-nowindow"] {
+            let path = codex_rollout(
+                home.path(),
+                &[
+                    serde_json::json!({"type": "turn_context", "payload": {"model": model}}),
+                    codex_token_count(serde_json::json!({})),
+                ],
+            );
+            assert_eq!(context_at(&path).unwrap(), assumed, "{model}");
+        }
+    }
+
+    fn muse_session(home: &Path, lines: &[serde_json::Value]) -> PathBuf {
+        let path = home.join(".local/share/muse/sessions/2026/11/05/muse-src-1/session.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        fs::write(&path, text.join("\n")).unwrap();
+        path
+    }
+
+    fn muse_completed(model: Option<&str>) -> serde_json::Value {
+        let mut event = serde_json::json!({
+            "kind": "model_completed",
+            "usage": {"input_tokens": 700, "output_tokens": 30}
+        });
+        if let Some(model) = model {
+            event["model"] = model.into();
+        }
+        serde_json::json!({"payload_type": "runtime.session", "payload": {"event": event}})
+    }
+
+    fn write_muse_catalog(home: &Path) {
+        write_catalog_at(&home.join(".local/share/muse/model-catalog"));
+    }
+
+    fn write_catalog_at(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("a.json"),
+            serde_json::json!({"rows": [
+                {"model_id": "muse-x", "context_limit": 1_007_997},
+                {"model_id": "muse-image", "context_limit": null}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        // A second file the first row search reaches only when the first lacks the model.
+        fs::write(
+            dir.join("b.json"),
+            serde_json::json!({"rows": [{"model_id": "muse-y", "context_limit": 64_000}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn muse_window_is_the_catalog_limit_of_the_sessions_model() {
+        let home = TempDir::new().unwrap();
+        write_muse_catalog(home.path());
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        assert_eq!(
+            context_at(&path).unwrap(),
+            SessionContextUsage {
+                used_tokens: 730,
+                max_tokens: 1_007_997,
+                source: ContextWindowSource::Catalog,
+                offered_windows: Vec::new(),
+            }
+        );
+        // A model that only a later catalog file lists.
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-y"))]);
+        assert_eq!(context_at(&path).unwrap().max_tokens, 64_000);
+        // No `model` on the event: the session metadata record names it.
+        let path = muse_session(
+            home.path(),
+            &[
+                serde_json::json!({
+                    "payload_type": "runtime.session.metadata",
+                    "payload": {"record": {"model_id": "muse-x"}}
+                }),
+                muse_completed(None),
+            ],
+        );
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (1_007_997, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn muse_with_no_catalog_evidence_is_assumed_one_million() {
+        let home = TempDir::new().unwrap();
+        let assumed = SessionContextUsage {
+            used_tokens: 730,
+            max_tokens: 1_000_000,
+            source: ContextWindowSource::Assumed,
+            offered_windows: Vec::new(),
+        };
+        // No catalog directory.
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        assert_eq!(context_at(&path).unwrap(), assumed);
+        write_muse_catalog(home.path());
+        // A model the catalog lacks, one listed without a limit, and no model at all.
+        for model in [Some("muse-unlisted"), Some("muse-image"), None] {
+            let path = muse_session(home.path(), &[muse_completed(model)]);
+            assert_eq!(context_at(&path).unwrap(), assumed, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn muse_catalog_search_stops_at_the_muse_data_directory() {
+        let home = TempDir::new().unwrap();
+        // An unrelated catalog above the Muse data directory, listing the session's model.
+        write_catalog_at(&home.path().join("model-catalog"));
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (1_000_000, ContextWindowSource::Assumed)
+        );
+        // The Muse data directory's own catalog is still found.
+        write_muse_catalog(home.path());
+        assert_eq!(context_at(&path).unwrap().max_tokens, 1_007_997);
+    }
+
+    #[test]
+    fn claude_window_is_assumed_for_both_usage_rows_and_compaction_boundaries() {
+        for rows in [
+            vec![assistant_usage_row(10_000, 500)],
+            vec![boundary_row(Some(21_546))],
+        ] {
+            let usage = claude_context(&rows).unwrap();
+            assert_eq!(usage.max_tokens, 1_000_000);
+            assert_eq!(usage.source, ContextWindowSource::Assumed);
+            assert!(usage.offered_windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn context_usage_json_carries_a_lowercase_source_and_omits_empty_offered_windows() {
+        let mut usage = SessionContextUsage::new(
+            5,
+            256_000,
+            ContextWindowSource::Catalog,
+            vec![500_000, 256_000, 500_000, 0],
+        );
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({
+                "used_tokens": 5,
+                "max_tokens": 256_000,
+                "source": "catalog",
+                "offered_windows": [256_000, 500_000]
+            })
+        );
+        usage.offered_windows.clear();
+        let json = serde_json::to_value(&usage).unwrap();
+        assert!(json.get("offered_windows").is_none(), "{json}");
+        for (source, name) in [
+            (ContextWindowSource::Reported, "reported"),
+            (ContextWindowSource::Catalog, "catalog"),
+            (ContextWindowSource::Assumed, "assumed"),
+        ] {
+            assert_eq!(serde_json::to_value(source).unwrap(), name);
+        }
+        // JSON from before the new fields still reads, as an assumed window.
+        let old: SessionContextUsage =
+            serde_json::from_str(r#"{"used_tokens":7,"max_tokens":1000000}"#).unwrap();
+        assert_eq!(old, SessionContextUsage::assumed(7, 1_000_000));
+        assert_eq!(old.source, ContextWindowSource::Assumed);
+    }
+
     #[test]
     fn a_transcript_that_names_its_window_keeps_it_and_one_that_does_not_gets_the_fallback() {
         let home = TempDir::new().unwrap();
@@ -11260,6 +11900,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 21_546,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             }
         );
         // Rows after the boundary that carry no usage do not bring the old figure back.
@@ -11377,6 +12019,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 21_546,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
     }
