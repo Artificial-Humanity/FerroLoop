@@ -276,6 +276,43 @@ describe("EditProjectModal", () => {
       },
     );
 
+    describe("legacy stored values", () => {
+      const LEGACY: ProjectSummary = {
+        ...PROJECT,
+        path: "relative/alpha",
+        tracker: { kind: "github", repo: "acme/alpha.git", credential: "app" },
+      };
+
+      it("renames a project whose stored path and tracker would not validate", async () => {
+        const { update, onSaved } = setup(LEGACY);
+        type("edit-project-name", "Alpha Two");
+        await save();
+        expect(update).toHaveBeenCalledTimes(1);
+        expect(update).toHaveBeenCalledWith("alpha", { name: "Alpha Two" });
+        expect(onSaved).toHaveBeenCalledTimes(1);
+      });
+
+      it("still validates a legacy path once it is edited", async () => {
+        const { update } = setup(LEGACY);
+        type("edit-project-path", "still/relative");
+        await save();
+        expect(update).not.toHaveBeenCalled();
+        expect(screen.getByTestId("edit-project-path")).toHaveAccessibleDescription(
+          /must be absolute/,
+        );
+      });
+
+      it("still validates a legacy tracker once it is edited", async () => {
+        const { update } = setup(LEGACY);
+        type("edit-project-github", "acme/other.git");
+        await save();
+        expect(update).not.toHaveBeenCalled();
+        expect(screen.getByTestId("edit-project-github")).toHaveAccessibleDescription(
+          "GitHub tracker must look like owner/repo.",
+        );
+      });
+    });
+
     it("does not show errors before the first save attempt", () => {
       setup();
       type("edit-project-name", "");

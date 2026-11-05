@@ -82,8 +82,12 @@ function EditProjectForm({
   const errors: { name?: string; path?: string; github?: string } = {};
   if (!trimmedName) errors.name = "Name is required.";
   if (isProject) {
-    errors.path = validateProjectPath(trimmedPath);
-    errors.github = validateGithubTracker(trimmedGithub);
+    // Only edited fields are validated: a stored legacy value must not block
+    // renaming the project.
+    if (trimmedPath !== originalPath)
+      errors.path = validateProjectPath(trimmedPath);
+    if (trimmedGithub !== originalGithub)
+      errors.github = validateGithubTracker(trimmedGithub);
   }
   const shown = attempted ? errors : {};
 
