@@ -2,6 +2,7 @@ pub mod agent;
 pub mod arch;
 pub mod attempt;
 pub mod auth;
+pub mod browse;
 pub mod check;
 pub mod doctor;
 pub mod escalate;

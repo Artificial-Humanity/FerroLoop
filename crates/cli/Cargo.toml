@@ -20,6 +20,7 @@ fl-hub = { path = "../hub" }
 fl-install = { path = "../install" }
 fl-gate = { path = "../gate" }
 fl-watch = { path = "../watch" }
+fl-browse = { path = "../browse" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
