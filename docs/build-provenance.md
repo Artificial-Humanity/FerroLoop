@@ -43,7 +43,7 @@ binary, and the dirty flag is computed from exactly those:
   `src/`, `build/`, `build.rs` and `Cargo.toml` of the crate, plus the workspace `Cargo.toml`
   and `Cargo.lock`. `fl-store` (and so `ferrostore`) builds from `fl-store` and `fl-core`;
   `fl-hub` from `fl-core`, `fl-exec`, `fl-gate`, `fl-github`, `fl-install`, `fl-store`,
-  `fl-watch` and `fl-wire`; `fl` from all of them and `fl-mcp`. Each `build.rs` lists its closure, and a test
+  `fl-watch` and `fl-wire`; `fl` from all of them, `fl-mcp` and `fl-browse`. Each `build.rs` lists its closure, and a test
   (`crates/core/tests/build_stamp.rs`) checks every list against the `Cargo.toml` files.
 * **Dirty.** `git status --porcelain` over those inputs only. A change in another crate, in
   `tests/`, in `docs/` or in `ui/` does not make the binary dirty, because it is not in the

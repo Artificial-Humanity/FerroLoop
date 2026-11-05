@@ -11,6 +11,7 @@ fn main() {
     // wider; `crates/core/tests/build_stamp.rs` checks it against the `Cargo.toml` files.
     stamp::emit(&[
         ".",
+        "../browse",
         "../core",
         "../exec",
         "../gate",

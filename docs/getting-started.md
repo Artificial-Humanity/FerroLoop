@@ -79,6 +79,7 @@ Commands:
   vault       Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway [alias: gateway]
   auth        Owner warrants: signed, scoped, expiring grants of Owner authority (`grant`, `verify`, `list`, `revoke`)
   watch       FerroWatch: telemetry rollups, agent liveness and alerts over the workspace store
+  browse      FerroBrowse: a token-efficient page snapshot and a UI and accessibility gate (no store)
   version     Print how this build was made and the versions it speaks (same as `--version [--json]`)
   install     Plan an install of the FerroLoop products (`--dry-run`), or apply it as a journaled transaction (`--yes`)
   doctor      Check this install's health and change nothing (exit 1 when a check fails)

@@ -75,6 +75,14 @@ package = "fl-watch"
 paths = ["crates/watch/**"]
 
 [[components]]
+id = "fl_browse"
+title = "FerroBrowse"
+kind = "crate"
+description = "Token-efficient accessibility snapshot of a web page (native HTML distiller, optional headless browser binary) and the UI and accessibility gate auditor behind fl browse"
+package = "fl-browse"
+paths = ["crates/browse/**"]
+
+[[components]]
 id = "fl_install"
 title = "Installer I/O"
 kind = "crate"
@@ -221,6 +229,11 @@ label = "serves /api/v1/watch summary, alerts, and rollups with discovered vendo
 from = "fl_cli"
 to = "fl_watch"
 label = "runs fl watch status, rollups, liveness, and alerts"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_browse"
+label = "runs fl browse snapshot, check, and doctor"
 
 [[edges]]
 from = "fl_install"

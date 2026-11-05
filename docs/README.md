@@ -41,6 +41,10 @@ File naming in this directory follows
   protection ends.
 * [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the six observational
   `G7.*` checks, their statuses, the exit codes, the JSON contract, and what doctor never does.
+* [browse.md](browse.md) — `fl browse`: a token-efficient accessibility snapshot of a web page
+  (`snapshot`), a UI and accessibility gate that `fl gate` can run (`check`), and the two
+  tiers behind them (`doctor`): the built-in HTML distiller and an optional headless browser
+  binary, with the check codes, exit codes and limits.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
   account-quota, and prompt-delivery shapes for Antigravity, Claude Code, Codex, Grok, and
   Muse, and the Hub fields that expose them.

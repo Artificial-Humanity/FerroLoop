@@ -121,6 +121,8 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::watch::WatchCmd,
     },
+    /// FerroBrowse: a token-efficient page snapshot and a UI and accessibility gate (no store).
+    Browse(cmd::browse::BrowseArgs),
     /// Print how this build was made and the versions it speaks (same as `--version [--json]`).
     Version {
         /// One JSON object instead of the human line.
@@ -161,6 +163,7 @@ impl Command {
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
+            | Command::Browse(_)
             | Command::Version { .. }
             | Command::Install(_)
             | Command::Doctor(_) => Vec::new(),
@@ -206,6 +209,7 @@ impl Command {
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
+            | Command::Browse(_)
             | Command::Version { .. }
             | Command::Install(_)
             | Command::Doctor(_) => false,
@@ -245,6 +249,7 @@ impl Command {
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
+            | Command::Browse(_)
             | Command::Version { .. }
             | Command::Install(_)
             | Command::Doctor(_) => false,
@@ -885,6 +890,29 @@ fn run(cli: Cli) -> Result<i32> {
         }
         other => other,
     };
+    // `fl browse` fetches its one target and reports: no store, no project, no config, so it
+    // returns before any of them is read and a broken setup cannot stop it.
+    let cli = match cli {
+        Cli {
+            db,
+            command: Command::Browse(a),
+        } => {
+            if db.is_some() {
+                bail!(
+                    "`fl browse` opens no store, so `--db` names nothing here. Drop it; the \
+                     target is the one argument"
+                );
+            }
+            return Ok(match cmd::browse::run(a) {
+                Ok(code) => code,
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    code
+                }
+            });
+        }
+        other => other,
+    };
     // `fl doctor` reads and reports: a broken config or store must not stop it, so it
     // resolves its own stores and returns before any store path is made or opened.
     let cli = match cli {
@@ -1502,6 +1530,7 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Vault { .. }
         | Command::Auth { .. }
         | Command::Watch { .. }
+        | Command::Browse(_)
         | Command::Version { .. }
         | Command::Install(_)
         | Command::Doctor(_) => {
