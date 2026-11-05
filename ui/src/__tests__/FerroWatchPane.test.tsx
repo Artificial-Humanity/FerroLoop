@@ -259,6 +259,13 @@ function makeSampleWatchSummary(): WatchSummaryResponse {
 describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness & Rollups", () => {
   it("renders alerts, vendor quota matrix, liveness table, and rollups, and executes remodel + balance actions", async () => {
     const summaryData = makeSampleWatchSummary();
+    summaryData.mq_tier_telemetry = {
+      topics: [{
+        topic: "events", active_tier: "memory", memory_messages: 2,
+        memory_bytes: 128, spilled_messages_total: 3, acked_in_memory_total: 4,
+        available_ram_bytes: 5000, free_disk_bytes: 6000,
+      }],
+    };
     const requestLog: Array<{ url: string; method: string; body?: string }> = [];
 
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -383,6 +390,8 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
 
     // 1. Live Alerts list
     const alertsSection = await screen.findByTestId("watch-alerts-section");
+    expect(screen.getByTestId("watch-mq-tier")).toHaveTextContent("events");
+    expect(screen.getByTestId("watch-mq-tier")).toHaveTextContent("128");
     expect(screen.getByTestId("ferrowatch-pane").style.overflow).toBe("hidden");
     expect(screen.getByTestId("watch-console-body")).toHaveClass("fd-scroll");
     expect(screen.getByTestId("watch-console-body").style.overflowY).toBe("auto");

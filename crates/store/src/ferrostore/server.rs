@@ -41,6 +41,8 @@ pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 /// Forwarders wake on this interval so a closed connection can join them.
 const FORWARD_PAUSE: Duration = Duration::from_millis(50);
+/// Spill overdue adaptive queues even when no client is writing.
+const MQ_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A connection that is authenticating.
 struct Handshake {
@@ -572,11 +574,18 @@ struct Accepted {
 /// at least every [`ACCEPT_PAUSE`], so no thread per connection is needed.
 fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
     let mut handlers = Vec::new();
+    let mut next_mq_maintenance = Instant::now() + MQ_MAINTENANCE_INTERVAL;
     loop {
         reap(&mut handlers);
         reap_handshakes(&state);
         if state.shutdown.load(Ordering::SeqCst) {
             break;
+        }
+        if Instant::now() >= next_mq_maintenance {
+            if let Err(error) = state.store.maintain_mq() {
+                eprintln!("ferrostore: periodic MQ maintenance failed: {error}");
+            }
+            next_mq_maintenance = Instant::now() + MQ_MAINTENANCE_INTERVAL;
         }
         match poll() {
             AcceptPoll::Conn(accepted) => {
@@ -2473,6 +2482,42 @@ fn fail_pending(shared: &RemoteShared, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_server_spills_expired_adaptive_messages() {
+        struct Resources;
+        impl super::super::MqResourceProbe for Resources {
+            fn probe(&self, _: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("idle.sock");
+        let store = FerroStore::in_memory();
+        let policy = super::super::MqTierPolicy {
+            max_memory_lag: Duration::from_millis(100),
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&socket, store).unwrap();
+        let client = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        client
+            .publish_mq_with("idle", "key", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if server.store().get_doc("mq:idle", "1").unwrap().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("idle adaptive message was not spilled by the server timer");
+    }
 
     #[test]
     fn remote_maintenance_replays_one_spill_for_the_same_request_id() {
