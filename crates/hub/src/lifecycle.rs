@@ -1624,10 +1624,15 @@ fn command_succeeds_within(cmd: &mut Command, timeout: Duration) -> bool {
 }
 
 /// The stdout of a `tmux` call that exits 0 within [`TMUX_TIMEOUT`]; `None` otherwise.
-fn tmux_stdout(args: &[&str]) -> Option<String> {
+pub(crate) fn tmux_stdout(args: &[&str]) -> Option<String> {
+    tmux_stdout_of(&tmux_bin(), args)
+}
+
+/// [`tmux_stdout`] on the tmux binary `bin`.
+pub(crate) fn tmux_stdout_of(bin: &Path, args: &[&str]) -> Option<String> {
     use std::io::Read;
 
-    let mut child = Command::new(tmux_bin())
+    let mut child = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2388,7 +2393,7 @@ fn deliver_prompt(
 }
 
 /// Route-table files a teardown prunes: the override, or the default and legacy paths.
-fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
     match home_override {
         Some(home) => vec![home.join(".cache").join("agent-bus").join("routes.json")],
         None => std::iter::once(default_routes_path())
@@ -2653,6 +2658,14 @@ pub struct DecommissionResponse {
     pub handshake_dispatched: bool,
     pub unregistered: bool,
     pub runtime_stopped: bool,
+    /// What the teardown did to the tmux restore source (the newest tmux-resurrect save), so a
+    /// host reboot does not start the stopped session again. What is pruned matches what is gone:
+    /// the whole session when it is gone, only the window when a window of a session that stays
+    /// (the shared Muse session) is gone. A runtime that still runs after the teardown is
+    /// reported as `running` and left alone. `None` when the teardown made no runtime call. A
+    /// failure is reported here and never fails the teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_source: Option<crate::restore_source::RestoreSourceOutcome>,
     pub prompt: Option<String>,
 }
 
@@ -2859,6 +2872,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
         handshake_dispatched,
         unregistered: false,
         runtime_stopped: false,
+        restore_source: None,
         prompt: Some(prompt),
     })
 }
@@ -3317,18 +3331,22 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
 
     // `true` only for a runtime this call stopped. A runtime still shared, or none at all
     // (runtime calls are off), is not reported as stopped. A runtime this lifecycle started
-    // is stopped with `kill` (a Muse window only when it carries our mark). An owner teardown
-    // of a session this lifecycle never recorded a target for (`record_for_target`: restored
-    // at boot, or started outside spin-up) stops that vendor's window (`Ada:grok`), and the
+    // is stopped with `kill` (a Muse window only when it carries our mark), then pruned as
+    // `runtime_unit` (the session, or `muse:<persona>`). An owner teardown of a session this
+    // lifecycle never recorded a target for stops that vendor's window (`Ada:grok`), and the
     // session only when the window is the session's only one, even though `runtime_spawned`
-    // is false, including an unmarked Muse window. A recorded target with
-    // the flag clear is a unit this lifecycle already decided is not ours, and stays up.
+    // is false, including an unmarked Muse window. That path prunes the same
+    // `session:window` string `kill_owner` received, so a sibling window keeps the session
+    // in the resurrect save. A recorded target with the flag clear is a unit this lifecycle
+    // already decided is not ours, and stays up; it is pruned only when it is already gone.
     // An HTTP API vendor has no tmux unit, so its teardown never stops one.
+    let mut restore_source = None;
     let runtime_stopped = if env.spawn_runtime && record.runtime_spawned {
         match &record.tmux_target {
             Some(tmux_target) => {
                 let unit = runtime_unit(tmux_target);
                 let gone = env.runtime.kill(unit, &record.session_id);
+                restore_source = Some(prune_unit_after_stop(env, unit));
                 record.runtime_spawned &= !gone;
                 gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
             }
@@ -3343,7 +3361,18 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     {
         let target_name = hosted_tmux_target(&record.vendor, &record.persona);
         let gone = env.runtime.kill_owner(&target_name, &record.session_id);
+        restore_source = Some(prune_unit_after_stop(env, &target_name));
         gone && !(is_muse_window_target(&target_name) && env.runtime.exists(&target_name))
+    } else if env.spawn_runtime
+        && !record.runtime_spawned
+        && (record.tmux_target.is_some() || vendor_has_runtime(&record.vendor))
+    {
+        let target = record
+            .tmux_target
+            .clone()
+            .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+        restore_source = Some(prune_unit_after_stop(env, runtime_unit(&target)));
+        false
     } else {
         false
     };
@@ -3372,8 +3401,48 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         handshake_dispatched: false,
         unregistered: true,
         runtime_stopped,
+        restore_source,
         prompt: None,
     })
+}
+
+/// [`prune_after_stop`] for a runtime unit ([`runtime_unit`]): a window unit (`muse:<persona>`)
+/// is `session:window`, a session unit has no window.
+fn prune_unit_after_stop(
+    env: &LifecycleEnv<'_>,
+    unit: &str,
+) -> crate::restore_source::RestoreSourceOutcome {
+    match unit.split_once(':') {
+        Some((session, window)) => prune_after_stop(env, session, Some(window)),
+        None => prune_after_stop(env, unit, None),
+    }
+}
+
+/// Prune what a teardown stopped from the restore source. The one call a kill path makes after
+/// it has stopped (or found stopped) the tmux runtime `session`, or its window `window`:
+///
+/// - the session is gone: the whole session is pruned;
+/// - the session runs and `window` is given and gone: only that window is pruned (the session's
+///   other windows stay in the save);
+/// - the session or the window still runs: nothing is pruned, because the next resurrect save
+///   would write it back; the result is [`RestoreSourceOutcome::Running`].
+///
+/// [`RestoreSourceOutcome::Running`]: crate::restore_source::RestoreSourceOutcome::Running
+pub(crate) fn prune_after_stop(
+    env: &LifecycleEnv<'_>,
+    session: &str,
+    window: Option<&str>,
+) -> crate::restore_source::RestoreSourceOutcome {
+    use crate::restore_source::{RestoreSourceOutcome, prune_session, prune_window};
+    if !env.runtime.exists(session) {
+        return prune_session(env.home_override, session);
+    }
+    match window {
+        Some(window) if !env.runtime.exists(&format!("{session}:{window}")) => {
+            prune_window(env.home_override, session, window)
+        }
+        _ => RestoreSourceOutcome::Running,
+    }
 }
 
 /// `POST /api/v1/hosted-sessions/:id/restart` response: the updated record plus the reforge prompt.
@@ -4221,6 +4290,9 @@ mod vendor_registry_tests;
 
 #[cfg(test)]
 mod muse_launch_tests;
+
+#[cfg(test)]
+mod restore_source_tests;
 
 #[cfg(test)]
 mod tests {

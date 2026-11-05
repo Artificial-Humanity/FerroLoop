@@ -14,7 +14,9 @@ peer credentials, or request ids into this document or into tests.
 
 ## What Hub exposes
 
-`SessionContextUsage` is `used_tokens` and `max_tokens`.
+`SessionContextUsage` is `used_tokens` and `max_tokens`, plus `source` (`reported`, `catalog` or
+`assumed`: how the window was found; absent in older reports) and `offered_windows` (the sizes the
+model offers, when the vendor lists them).
 
 `SessionQuotaUsage` is optional on each discovered route session and on
 `GET /api/v1/sessions/:id/transcript` next to `context_usage`:
@@ -32,6 +34,87 @@ peer credentials, or request ids into this document or into tests.
 Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and Muse
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
+
+## Host reboot behaviour
+
+A host boot can restore tmux sessions (tmux-resurrect with continuum restore). Hub keeps three
+rules for what comes back.
+
+**A decommission leaves nothing to restore.** A teardown removes what it stopped from the newest
+tmux-resurrect save (the file the `last` link names, else the newest `tmux_resurrect_*.txt`). A
+`last` link that points outside the directory is not followed. What goes matches what is gone:
+
+- A session that is gone: its `pane`, `window` and `grouped_session` lines. A `state` line (the
+  client's session and last session) is kept; only the field that names the session is emptied.
+- One window of a session that stays (a window of the shared `muse` session): its `window` line
+  and the `pane` lines of that window. A `pane` line carries only the window index, so Hub maps the
+  window name to the index first. The session's other windows, its `state` lines and its
+  `grouped_session` lines stay. The shared `muse` session itself is pruned only when it is gone.
+
+The directory is `FL_TMUX_RESURRECT_DIR` when set, else `~/.tmux/resurrect` when it exists, else
+`$XDG_DATA_HOME/tmux/resurrect`. A hub that runs with a home override ignores
+`FL_TMUX_RESURRECT_DIR`. Hub edits the file itself (a temp file with the permissions of the save,
+flushed to disk, then a rename) and does not run the plugin's `save.sh`. The first prune of a save
+keeps the old content as `<save>.bak`; a later prune keeps that first backup. A backup that cannot
+be written stops the prune. The directory keeps the newest five `tmux_resurrect_*.txt.bak` files;
+older ones are removed, and files of other names are never touched. A save that does not name the
+session or window is not touched. A continuum save that started before the runtime was killed can
+still write it back after the prune.
+
+The result is the `restore_source` field of the teardown response: `pruned`, `clean`, `no_save`,
+`running` or `failed`. It is absent when the teardown made no runtime call. `failed` and `no_save`
+never fail the teardown. Hub prunes only what is not running after the teardown: a runtime that
+Hub started is killed and then pruned, and a runtime that Hub did not start is pruned only if it
+is already gone. A session found without a hosted record (a hand-started one) is addressed by the
+target a spin-up of its vendor would use (`<Display>` for a session, `muse:<persona>` for Muse)
+and follows the same rule. A runtime that still runs and that Hub did not start is neither killed
+nor pruned; the result is `running`.
+
+**A restored pane of a retired persona loses its routes; one of an unknown persona is reported.**
+When `fl hub serve` starts, Hub lists the tmux panes. For each pane that runs a vendor CLI, the
+persona is the pane's tmux session name; an inherited `AGENT_PERSONA` is never used. In the shared
+`muse` session the persona is the pane's window name, and a pane with no window name is skipped.
+If the persona is not an active agent, Hub leaves the pane running and sends one
+`session.restore_orphan` event on the `sessions` channel (`session`, `window`, `pane_id`,
+`persona`, `reason` of `retired` or `unknown`, `command`, `boot_id`) and one line to the service
+log. The same pane is reported once per boot. The pane check runs on every pass, so a pane that
+tmux restores late is still found.
+
+Routes are removed for a `retired` persona only. Hub drops the route keyed by the persona's name,
+and every route, whatever persona it is keyed to, that names the retired pane (`tmux_pane`) or its
+window (`tmux_target`, `session:window`). Only Grok and Muse routes carry a pane or target. A Codex
+or Claude route cannot be matched to a pane, so it is dropped only by its persona key. An
+`unknown` persona keeps its routes: Hub's agent registry is not the agent bus's registry, so a live
+agent that Hub never registered (a lead, the workspace manager) looks unknown, and its routes must
+stay. The route removal is best effort: a later route scan (`RouteTable::discover_routes`) can
+find a retired route again from the running vendor transcript. Once #336 is on main, boot
+reconcile uses its tombstones, so a scan cannot bring the route back.
+
+**Each expected agent is told once per boot.** The boot is the host `boot_id`
+(`/proc/sys/kernel/random/boot_id`). The workspace runtime state entry `host-boot-epoch` holds the
+boot, the `expected` agents and the `notified` ones. Who is expected:
+
+- A saved record with a different `boot_id` proves a reboot. A new record opens whatever the
+  uptime, and `expected` is the active agents at that moment.
+- With no record, the uptime decides: a host up for at most one hour is a reboot, and `expected`
+  is the active agents now. An older host expects nobody. The host uptime and `boot_id` must both
+  be known, or nobody is expected.
+- A record with the same `boot_id` keeps its `expected` list. An agent registered after the record
+  was made is never told, and a Hub restart in the same boot tells nobody who was told already.
+
+Hub sends an expected agent that is still active one `system` message with the subject
+`Host restarted`, after it registers the routes the sessions prove from their own identity. The
+agent's route must pass the delivery check and must be live: it was found after the host booted
+(its `updated_at` is at or after the boot time), or a restored vendor-CLI pane of the persona
+exists (for Muse, a window of that name). A route saved before the reboot is not enough. No
+message goes to a retired agent or an agent that is decommissioning.
+
+The notice is at most once. Hub saves the name in the record before it sends; if the save fails
+the notice is not sent, and if the send fails (including a store that cannot be opened for the
+send) the name is removed again and the other agents are still told. A name that Hub sent in
+this process is also kept in memory. Hub makes passes every 15 seconds. It stops when no expected
+agent is pending, tmux has answered and 60 seconds have passed, and it makes at most 20 passes. The
+passes also stop when the hub shuts down.
 
 ## Runtime matrix: quotas and CLI updates
 

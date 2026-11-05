@@ -632,7 +632,9 @@ mod tests {
             full.context_usage,
             Some(SessionContextUsage {
                 used_tokens: 157,
-                max_tokens: 1_000_000
+                max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
 
@@ -673,7 +675,9 @@ mod tests {
             session.context_usage,
             Some(SessionContextUsage {
                 used_tokens: 4242,
-                max_tokens: 272_000
+                max_tokens: 272_000,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
             })
         );
     }
@@ -704,7 +708,9 @@ mod tests {
             grok.context_usage,
             Some(SessionContextUsage {
                 used_tokens: 900,
-                max_tokens: 2000
+                max_tokens: 2000,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
             })
         );
 
@@ -756,7 +762,9 @@ mod tests {
             discover(home, true).context_usage,
             Some(SessionContextUsage {
                 used_tokens: 1230,
-                max_tokens: 1_000_000
+                max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
         assert_eq!(discover(home, false).context_usage, None);

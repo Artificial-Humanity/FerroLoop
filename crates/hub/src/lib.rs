@@ -10,6 +10,7 @@ mod attachment_policy;
 mod attachments;
 pub mod auth;
 mod balance_api;
+mod boot_reconcile;
 pub mod cloud_adapters;
 pub mod commands;
 mod direct_quota;
@@ -26,6 +27,7 @@ pub mod project_init;
 pub mod project_list;
 mod projects_api;
 mod records;
+pub mod restore_source;
 pub mod runtime_matrix;
 pub mod runtime_update;
 pub mod session_actions;
@@ -65,12 +67,13 @@ pub use auth::{
     session_state_slug, sha256_hex, try_generate_hex_token,
 };
 pub use discovery::{
-    DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage, SessionQuotaUsage,
-    TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff, WorktreeFileStatus,
-    WorktreeSummary, discover_sessions, discover_sessions_with_home, is_transcript_busy,
-    list_git_worktrees, parse_jsonl_transcript, read_session_context_usage_with_home,
-    read_session_quota_usage_with_home, read_session_transcript, read_session_transcript_with_home,
-    read_worktree_diff, scan_cargo_architecture_conformance, scan_workspace_for_arch,
+    ContextWindowSource, DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage,
+    SessionQuotaUsage, TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff,
+    WorktreeFileStatus, WorktreeSummary, discover_sessions, discover_sessions_with_home,
+    is_transcript_busy, list_git_worktrees, parse_jsonl_transcript,
+    read_session_context_usage_with_home, read_session_quota_usage_with_home,
+    read_session_transcript, read_session_transcript_with_home, read_worktree_diff,
+    scan_cargo_architecture_conformance, scan_workspace_for_arch,
 };
 pub use nodes::{
     DispatchTask, FederatedTask, TaskFail, TaskResult, dispatch_task, list_node_tasks,
@@ -1134,6 +1137,9 @@ impl HubState {
         self.ws_tx.subscribe()
     }
 }
+
+#[cfg(test)]
+mod boot_reconcile_tests;
 
 #[cfg(test)]
 mod latency_tests;
