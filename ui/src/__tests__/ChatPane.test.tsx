@@ -316,6 +316,7 @@ describe("ChatPane", () => {
     expect(promptTextarea).toHaveAttribute("data-bwignore", "true");
     expect(promptTextarea).toHaveAttribute("data-form-type", "other");
     expect(promptTextarea).toHaveAttribute("aria-autocomplete", "none");
+    expect(promptTextarea).toHaveAttribute("enterKeyHint", "enter");
 
     // Verify readInitialShowSafeAreaMargins() returns false even when window.innerWidth is 390
     // and ignores stale v1 "fd_show_safe_margins" storage key
