@@ -17,7 +17,7 @@ use fl_core::finding::FindingState;
 use fl_core::ids::{Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::model::{Record, State};
-use fl_core::store::{Catalog, Handles, Ledger, Roles, StoreError, Tracker};
+use fl_core::store::{AgentRegistry, Catalog, Handles, Ledger, Roles, StoreError, Tracker};
 use fl_exec::population::ExecError;
 use fl_exec::record::{MoveOutcome, move_record};
 use fl_store::AnyStore;
@@ -204,11 +204,36 @@ fn open_project_store<'a>(
             Err(ProjectOpenError::Busy) => Err(project_busy()),
             Err(ProjectOpenError::Store(_)) => Err(store_unavailable()),
         },
-        None => state
-            .open_store()
-            .map(OpenedStore::Hub)
-            .map_err(|_| store_unavailable()),
+        None => {
+            let hub = state.open_store().map_err(|_| store_unavailable())?;
+            // A virtual group (an area with no path) has no store and no records. Without this
+            // its slug would fall through to the hub store and answer with another project's.
+            if hub
+                .get_area(slug)
+                .map_err(|_| store_unavailable())?
+                .is_some_and(|a| a.is_virtual())
+                && !own_store_is_listed(state, slug)
+            {
+                return Err(error_json(
+                    404,
+                    &format!("`{slug}` is a virtual group: it has no store and no records"),
+                ));
+            }
+            Ok(OpenedStore::Hub(hub))
+        }
     }
+}
+
+/// Whether `slug` is listed as a project by its config block (a registered project beats a
+/// same-named area with no path).
+fn own_store_is_listed(state: &HubState, slug: &str) -> bool {
+    crate::project_init::user_config_path(state.config.home_override.as_deref())
+        .and_then(|path| {
+            crate::project_init::read_config(&path)
+                .ok()
+                .and_then(|doc| crate::project_init::config_entries(&doc, &path).ok())
+        })
+        .is_some_and(|entries| entries.iter().any(|e| e.slug().as_deref() == Some(slug)))
 }
 
 /// Every project this hub can show: each project store file of the selected engine
@@ -244,6 +269,25 @@ fn available_projects_with(home: Option<&Path>, env: Option<&str>) -> Vec<String
         }
     }
     found.into_iter().collect()
+}
+
+/// The per-project store files the Hub serves, for the project list: each available project's
+/// slug with its store file (`<slug>.fls` under FerroStore) when that file exists. The default
+/// project is listed even with none.
+pub(crate) fn project_store_hints(
+    state: &HubState,
+    home: Option<&Path>,
+) -> Vec<(String, Option<PathBuf>)> {
+    let ext = store_extension_with(engine_env(state).as_deref());
+    available_projects(state, home)
+        .into_iter()
+        .map(|slug| {
+            let file = home
+                .map(|h| projects_dir(h).join(format!("{slug}.{ext}")))
+                .filter(|f| fs::symlink_metadata(f).is_ok_and(|m| m.is_file()));
+            (slug, file)
+        })
+        .collect()
 }
 
 fn store_error_response(err: &StoreError) -> HttpResponse {

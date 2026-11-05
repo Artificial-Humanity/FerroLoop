@@ -941,15 +941,15 @@ fn run(cli: Cli) -> Result<i32> {
             }
             return cmd::mcp::run(c, &cfg.mcp, &cwd);
         }
-        // `fl project init` registers a project that has no store yet, so it opens the stores
-        // itself: the project's own and the workspace's, not the one the current directory
-        // is bound to.
+        // `fl project create` registers a project that has no store yet, and `fl project list`
+        // reads the config and the workspace registry, so both open the stores themselves:
+        // the project's own and the workspace's, not the one the current directory is bound to.
         Cli {
             db,
-            command: Command::Project(cmd::project::Cmd::Init(args)),
+            command: Command::Project(cmd::project::Cmd::Create(args)),
         } => {
             let default_store = default_state_store_path()?;
-            return cmd::project::init(args, &cfg, &cwd, explicit_db(db), &default_store);
+            return cmd::project::create(args, &cfg, &cwd, explicit_db(db), &default_store);
         }
         Cli {
             db,
@@ -1222,6 +1222,7 @@ fn run(cli: Cli) -> Result<i32> {
         );
     }
     let explicit_given = explicit.is_some();
+    let explicit_for_list = explicit.clone();
     let (bound, confined) = db_path(explicit, configured)?;
     let mut iris = cli.command.iris();
     // Whether the bound store is routed (routing spec §1.3), read only when
@@ -1464,6 +1465,19 @@ fn run(cli: Cli) -> Result<i32> {
         cmd::stats::Source::Local
     };
     let result = match cli.command {
+        // The list is the config's projects and the workspace's groups, and also the projects
+        // of the store this directory is bound to.
+        Command::Project(cmd::project::Cmd::List { json }) => {
+            let default_store = default_state_store_path()?;
+            cmd::project::list(
+                json,
+                &cfg,
+                &cwd,
+                explicit_for_list,
+                &default_store,
+                (&store, &path),
+            )
+        }
         Command::Project(c) => cmd::project::run(&store, c),
         Command::Gate(c) => cmd::gate::run(&store, c),
         Command::Transition(c) => cmd::transition::run(&store, c),

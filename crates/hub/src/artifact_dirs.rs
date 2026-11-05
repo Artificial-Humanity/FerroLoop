@@ -93,7 +93,7 @@ pub(crate) fn default_system_dir(state: &HubState) -> PathBuf {
 }
 
 /// The saved settings (the defaults when there is no home or no file).
-fn current_settings(state: &HubState) -> Settings {
+pub(crate) fn current_settings(state: &HubState) -> Settings {
     hub_home_dir(state)
         .map(|home| settings::load(&home))
         .unwrap_or_default()
@@ -164,18 +164,13 @@ pub(crate) fn settings_view(state: &HubState, s: &Settings) -> Value {
     view
 }
 
-fn project_view(state: &HubState, s: &Settings, id: &str) -> Value {
+pub(crate) fn project_view(state: &HubState, s: &Settings, id: &str) -> Value {
     json!({
         "id": id,
         "artifacts_dir": s.project_artifacts_dirs.get(id),
         "default_artifacts_dir": display(&system_dir_in(state, s).join(id)),
         "effective_artifacts_dir": display(&project_dir_in(state, s, id)),
     })
-}
-
-/// One project as `GET /api/v1/projects` lists it, read from the saved settings.
-pub(crate) fn project_descriptor(state: &HubState, id: &str) -> Value {
-    project_view(state, &current_settings(state), id)
 }
 
 fn error(status: u16, message: impl Into<String>) -> HttpResponse {
@@ -820,17 +815,6 @@ fn project_slug(state: &HubState, raw: &str) -> Result<String, HttpResponse> {
     } else {
         Err(error(404, format!("no project `{slug}`")))
     }
-}
-
-/// `GET /api/v1/projects`.
-pub(crate) fn handle_get_projects(state: &HubState) -> HttpResponse {
-    let s = current_settings(state);
-    let home = hub_home_dir(state);
-    let projects: Vec<Value> = records::available_projects(state, home.as_deref())
-        .iter()
-        .map(|id| project_view(state, &s, id))
-        .collect();
-    HttpResponse::json(200, json!({ "projects": projects }))
 }
 
 /// `GET /api/v1/projects/:id/artifacts-dir`.

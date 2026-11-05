@@ -32,7 +32,7 @@ Anything else is dropped and the default applies, field by field.
 
 ## Endpoints
 
-Every route needs authentication. Every `POST` route is **Owner only**: a Peer names itself, so
+Every route needs authentication. Every `POST` and `PATCH` route is **Owner only**: a Peer names itself, so
 no finer tier can be trusted, and a Peer gets `403`.
 
 ### `GET /api/v1/settings`, `PUT /api/v1/settings`
@@ -69,48 +69,89 @@ It broadcasts `settings.updated`. Errors:
 | `409` | another relocation is running, the settings file is damaged, or (with `migrate`) a name already exists in the target |
 | `500` | a move failed; the setting is not changed and the message says how many files had moved |
 
-### `GET /api/v1/projects`
+### `GET /api/v1/projects`, `POST /api/v1/projects`, `PATCH /api/v1/projects/:slug`
+
+One shape describes a project in all three: the list, a creation and an update. There are two
+kinds ([getting-started.md](getting-started.md#create-a-project-in-one-step-fl-project-create)):
+a directory-backed project (`"kind": "project"`) and a virtual group (`"kind": "virtual"`), an
+area with no path that names a set of agents.
 
 ```json
-{ "projects": [ { "id": "ferroloop", "artifacts_dir": null,
-                  "default_artifacts_dir": "...", "effective_artifacts_dir": "..." } ] }
+{ "projects": [
+  { "id": "ferroloop", "slug": "ferroloop", "name": "FerroLoop", "kind": "project",
+    "path": "/srv/code/ferroloop", "has_git": true, "purpose": "the platform",
+    "tracker": { "kind": "github", "repo": "acme/ferroloop", "credential": "app" },
+    "store_path": "/home/me/.local/share/fl/ferroloop.fls", "active_agent_count": 5,
+    "artifacts_dir": null, "default_artifacts_dir": "...", "effective_artifacts_dir": "..." },
+  { "id": "council", "slug": "council", "name": "Council", "kind": "virtual",
+    "path": null, "has_git": false, "purpose": "the strategists", "tracker": null,
+    "store_path": null, "active_agent_count": 3,
+    "artifacts_dir": null, "default_artifacts_dir": null, "effective_artifacts_dir": null }
+] }
 ```
 
-The projects are the Hub's available projects (the default one is always present).
+Every field is always present; an absent value is `null`. `slug` (also `id`) never changes; `name`
+is the display name. `path` and `store_path` are `null` for a group. `has_git` is true when the
+root holds a `.git`, a repository with no commit included; it is read, never made. `tracker` is
+`null` or `{ "kind": "github", "repo": "owner/repo", "credential": "app" | "env" }`.
+`active_agent_count` counts active agents whose project or extra areas equal the slug or the
+area's name, ignoring case. `artifacts_dir`, `default_artifacts_dir` and `effective_artifacts_dir`
+are the project's artifacts directories (below); a group has none, so they are `null`. The list is
+ordered by slug and holds the Hub's available projects (the default one is always present), every
+`[[project]]` block of the Hub's config, and every virtual group.
 
-### `POST /api/v1/projects`
+`POST` and `PATCH` are **Owner only**: they write the Owner's config and may `git init` a path.
+Both return the project in the shape above: `201` for a new one, `200` when `POST` found it
+already made or `PATCH` set it.
 
-Makes a directory a project: the flow of `fl project init`
-([getting-started.md](getting-started.md#register-a-project-in-one-step-fl-project-init)), run
-by the Hub for the Owner. It writes the Owner's config and may `git init` the path, so it is
-Owner only.
+`POST /api/v1/projects` creates a project, with the flow of `fl project create` run by the Hub:
 
 ```json
-{ "path": "/srv/code/app", "name": "app", "github": "acme/app",
-  "credential": "app", "purpose": "the app" }
+{ "name": "My Project", "slug": "my-project", "kind": "project", "path": "/srv/code/app",
+  "purpose": "the app", "git_init": false, "github": "acme/app", "credential": "app" }
 ```
 
-Only `path` is required; unknown fields are refused. `path` must be absolute, with no `..` and no
-NUL byte; the Hub also refuses one in a system directory, under a secret's directory (`.ssh`,
-`.aws` and the like), or that is, or contains, the Hub's home. `name`, `github`, `credential` and
-`purpose` mean what the flags of `fl project init` mean. The author recorded is the caller's
-name.
-
-The config is the Hub's `$XDG_CONFIG_HOME/fl/config.toml` (default `$HOME/.config/fl/config.toml`),
-and the project's store is `$HOME/.local/share/fl/<name>.fls`, the file `GET /api/v1/projects`
-lists projects from. The workspace area goes into the Hub store. Response `201` for a
-new project, `200` when it was already initialized (nothing changes); the body is the project as
-`GET /api/v1/projects` shows it (`id`, `artifacts_dir`, `default_artifacts_dir`,
-`effective_artifacts_dir`) plus `name`, `root`, `store`, `project` (the IRI), `purpose`,
-`tracker`, `areas`, `git`, `mcp_catalog_created`, `config` and `registered`. It broadcasts
+`kind` is `"project"` (the default) or `"virtual"`; `"virtual": true` is the same as
+`"kind": "virtual"`. Unknown fields are refused. `slug` is optional (empty counts as absent):
+without it the slug is the config's for that path, else the kebab-case of `name`, else the
+directory's lowercase name. For a project, `path` is required, `git_init` defaults to `false` (Git
+is not touched unless it is `true`: `git init`, and an empty initial commit when there is no
+`HEAD`), `credential` defaults to `app` and needs `github`. `path` must be absolute, with no `..`
+and no NUL byte; the Hub also refuses one in a system directory, under a secret's directory
+(`.ssh`, `.aws` and the like), or that is, or contains, the Hub's home. For a virtual group,
+`name` is required and `path`, `git_init`, `github` and `credential` are ignored. The author
+recorded is the caller's name. The config is the Hub's `$XDG_CONFIG_HOME/fl/config.toml` (default
+`$HOME/.config/fl/config.toml`), a project's store is `$HOME/.local/share/fl/<slug>.fls`, and the
+workspace area goes into the Hub store. A group writes that area and nothing else. It broadcasts
 `project.created` on the `projects` channel.
+
+`PATCH /api/v1/projects/:slug` changes any of these, all optional:
+
+```json
+{ "name": "My Project", "purpose": "the app", "path": "/srv/code/app2",
+  "github": "acme/app", "credential": "env" }
+```
+
+`name` is the display name; the slug cannot change, and a `slug` field is refused. `purpose` is
+the purpose. `path` moves a directory-backed project to an existing directory, checked as `POST`
+checks a path and refused when another project has it; the project keeps its store, gates and
+records, which are pointed at the new root. A group has no path and refuses one. `github` sets or
+replaces the tracker (`""` clears it) and `credential` applies to it (the current tracker when
+`github` is absent, which needs one). A group has no tracker. The config block and the area change
+together: the stores are written first, then the config in one atomic replacement, and a failure
+puts the stores back. Asking for what is already so changes nothing. A project with a store but no
+config block can be renamed but not moved or given a tracker. It broadcasts `project.updated`.
 
 | Status | Cause |
 | --- | --- |
-| `400` | the body is not valid, the path or name or repository or credential cannot be used, or the path is somewhere the Hub refuses |
+| `400` | the body is not valid, nothing is asked for, or the slug, name, path, repository or credential cannot be used, or the path is somewhere the Hub refuses |
 | `403` | the caller is not the Owner |
-| `409` | the name is registered at another root, the root under another name, the project's tracker is a different one, or its store holds another project |
+| `404` | (`PATCH`) no project has that slug |
+| `409` | the slug is registered at another root, the root under another slug, the slug is the other kind (a project's slug for a group, or the reverse), the path is another project's, the tracker is a different one (`POST`), or the store holds another project |
 | `500` | git, a store or the config file failed |
+
+A virtual group has no store and no records: `GET /api/v1/records?project=<slug>` and the
+per-project artifacts-directory routes below answer `404` for it.
 
 ### `GET /api/v1/projects/:id/artifacts-dir`
 

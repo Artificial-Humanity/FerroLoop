@@ -1467,8 +1467,14 @@ export class HubApiClient {
   public async listProjectsArtifactsDirs(): Promise<ProjectsListResponse> {
     try {
       const res = await this.request<ProjectsListResponse>("/api/v1/projects");
+      // A virtual group (an area with no path) has no artifacts directory; the list holds
+      // it with those fields null, so only directory-backed projects are shown here.
       return {
-        projects: Array.isArray(res?.projects) ? res.projects : [],
+        projects: Array.isArray(res?.projects)
+          ? res.projects.filter(
+              (p) => (p as { kind?: string } | null)?.kind !== "virtual",
+            )
+          : [],
       };
     } catch (err) {
       if (err instanceof HubApiError && err.status === 404) {

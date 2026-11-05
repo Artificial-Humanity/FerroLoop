@@ -580,9 +580,9 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/settings/artifacts-dir") => {
             crate::artifact_dirs::handle_post_system_dir(state, &authority, req)
         }
-        ("GET", "/api/v1/projects") => crate::artifact_dirs::handle_get_projects(state),
+        ("GET", "/api/v1/projects") => crate::projects_api::handle_get_projects(state),
         ("POST", "/api/v1/projects") => {
-            crate::project_init::handle_post_projects(state, &authority, req)
+            crate::projects_api::handle_post_projects(state, &authority, req)
         }
         ("GET", "/api/v1/cloud/adapters") => handle_get_cloud_adapters(state),
         ("PUT", "/api/v1/cloud/adapters") => handle_put_cloud_adapters(state, &authority, req),
@@ -4996,6 +4996,15 @@ fn handle_dynamic_api_routes(
             }
             _ => {}
         }
+    }
+    // /api/v1/projects/:slug
+    if segments.len() == 4
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "projects"
+        && method == "PATCH"
+    {
+        return crate::projects_api::handle_patch_project(state, authority, segments[3], req);
     }
     // /api/v1/projects/:id/artifacts-dir. The merge routes below have six or more segments.
     if segments.len() == 5

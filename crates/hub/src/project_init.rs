@@ -1,15 +1,27 @@
-//! First-class project initialization: `fl project init <path>` and
-//! `POST /api/v1/projects` run this one flow.
+//! First-class project creation: `fl project create` (alias `init`) and `POST /api/v1/projects`
+//! run these flows.
 //!
-//! One call makes a directory a registered project: a git working tree with a `HEAD`, a
-//! `[[project]]` block in the user's config, a per-project store holding the project and the
-//! default local routing map, the project's area in the workspace store, and a starter
-//! `.fl/mcp.toml`. Running it again on the same project changes nothing that is already right.
+//! There are two kinds of project.
 //!
-//! The flow lives here, below both the CLI and the Hub, because both need the whole of it: a
-//! second copy would drift. The caller supplies the three places that differ between a CLI
-//! process and the Hub (the config file, the directory of per-project stores, the workspace
-//! store) and a function that opens the two stores once the project's name is known.
+//! - A directory-backed project (`kind` "project") is a directory, whether or not it is a Git
+//!   repository. Creating one registers it: a `[[project]]` block in the user's config, a
+//!   per-project store holding the project and the default local routing map, its area in the
+//!   workspace store, and a starter `.fl/mcp.toml`. Git is touched only on request (`git_init`):
+//!   `git init` when the directory is not a repository, and an empty initial commit when the
+//!   repository has no `HEAD`.
+//! - A virtual group (`kind` "virtual") is an area with no path in the workspace store: a name
+//!   for a group of agents, addressable as `@<slug>` on FerroWire. It has no directory, no
+//!   `[[project]]` block and no store of its own; creating one writes the workspace area and
+//!   nothing else.
+//!
+//! Running a flow again changes nothing that is already right. A slug names one kind: a
+//! directory-backed project cannot take the slug of a virtual group, nor the reverse.
+//!
+//! The flows live here, below both the CLI and the Hub, because both need the whole of them: a
+//! second copy would drift. The caller supplies the places that differ between a CLI process
+//! and the Hub (the config file, the directory of per-project stores, the workspace store) and
+//! functions that open the stores. [`crate::project_list`] lists and updates what these flows
+//! make.
 //!
 //! Nothing here reads `$HOME`, `$XDG_*` or any other environment variable: every path is an
 //! argument, so a test never reaches a real config or data directory.
@@ -29,10 +41,6 @@ use fl_store::AnyStore;
 use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::HubState;
-use crate::api::{HttpRequest, HttpResponse, hub_home_dir};
-use crate::auth::HubAuthority;
-
 /// The message of the empty commit that gives a new repository a `HEAD`.
 pub const INITIAL_COMMIT_MESSAGE: &str = "chore: initial commit";
 
@@ -47,11 +55,17 @@ const SENSITIVE_AREAS: [&str; 1] = ["security"];
 /// The longest path accepted, in bytes.
 const MAX_PATH_BYTES: usize = 4096;
 
-/// One initialization at a time in this process: the config file is read, edited and replaced
-/// whole, so two at once would lose one edit.
-static INIT_LOCK: Mutex<()> = Mutex::new(());
+/// The longest display name accepted, in characters.
+pub const MAX_NAME_CHARS: usize = 80;
 
-/// Why an initialization was refused or failed, by who is at fault.
+/// Slugs a virtual group may not take: `@all` is everyone, and `fl` is the Hub's own store.
+const RESERVED_GROUP_SLUGS: [&str; 2] = ["all", "fl"];
+
+/// One change to the config or the registry at a time in this process: the config file is
+/// read, edited and replaced whole, so two at once would lose one edit.
+pub(crate) static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+/// Why a request was refused or failed, by who is at fault.
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
     /// The request is wrong: a path, name, repository or credential that cannot be used.
@@ -61,20 +75,23 @@ pub enum InitError {
     /// tracker, another store. Nothing was changed for it.
     #[error("{0}")]
     Conflict(String),
+    /// The request names a project that does not exist.
+    #[error("{0}")]
+    NotFound(String),
     /// The machine could not do it: git, a store or a file failed.
     #[error("{0}")]
     Failed(String),
 }
 
-fn invalid(msg: impl Into<String>) -> InitError {
+pub(crate) fn invalid(msg: impl Into<String>) -> InitError {
     InitError::Invalid(msg.into())
 }
 
-fn conflict(msg: impl Into<String>) -> InitError {
+pub(crate) fn conflict(msg: impl Into<String>) -> InitError {
     InitError::Conflict(msg.into())
 }
 
-fn failed(msg: impl Into<String>) -> InitError {
+pub(crate) fn failed(msg: impl Into<String>) -> InitError {
     InitError::Failed(msg.into())
 }
 
@@ -110,28 +127,92 @@ impl FromStr for Credential {
     }
 }
 
-/// A project's tracker binding when it is not the local store.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A project's tracker binding when it is not the local store. It serializes as
+/// `{"kind": "github", "repo": "owner/repo", "credential": "app"|"env"}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tracker {
     pub github: String,
     pub credential: Credential,
 }
 
-/// What to initialize.
+impl Serialize for Tracker {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut out = s.serialize_struct("Tracker", 3)?;
+        out.serialize_field("kind", "github")?;
+        out.serialize_field("repo", &self.github)?;
+        out.serialize_field("credential", &self.credential)?;
+        out.end()
+    }
+}
+
+/// Which kind of project: see the module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKind {
+    /// A directory-backed project.
+    Project,
+    /// A virtual group: an area with no path.
+    Virtual,
+}
+
+impl ProjectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectKind::Project => "project",
+            ProjectKind::Virtual => "virtual",
+        }
+    }
+}
+
+impl FromStr for ProjectKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "project" => Ok(ProjectKind::Project),
+            "virtual" => Ok(ProjectKind::Virtual),
+            other => Err(format!(
+                "`{other}` is not a project kind: use `project` or `virtual`"
+            )),
+        }
+    }
+}
+
+/// What to create as a directory-backed project.
 #[derive(Debug, Clone)]
 pub struct InitRequest {
     /// The project root: an absolute path, made if it does not exist.
     pub path: PathBuf,
-    /// The project's name; without it, the root's lowercase directory name, or the name the
-    /// config already gives that root.
-    pub name: Option<String>,
+    /// The project's slug. Without it: the slug the config already gives that root, else the
+    /// one derived from `display_name`, else the root's lowercase directory name.
+    pub slug: Option<String>,
+    /// The name shown for the project (the area's name). Without it: the area's present name,
+    /// else the slug.
+    pub display_name: Option<String>,
     /// `owner/repo`: bind the project's tracker to this GitHub repository.
     pub github: Option<String>,
     /// The tracker's credential source; `app` when `github` is given and this is not.
     pub credential: Option<Credential>,
     /// What the project is for, as the workspace area's purpose.
     pub purpose: Option<String>,
-    /// Who is initializing, for the initial commit and the area.
+    /// Run `git init` (and make the empty initial commit when there is no `HEAD`). Git is not
+    /// touched otherwise.
+    pub git_init: bool,
+    /// Who is creating, for the initial commit and the area.
+    pub by: String,
+}
+
+/// What to create as a virtual group.
+#[derive(Debug, Clone)]
+pub struct VirtualRequest {
+    /// The group's slug; without it, derived from `display_name`.
+    pub slug: Option<String>,
+    /// The name shown for the group.
+    pub display_name: String,
+    /// What the group is for; an existing group keeps its purpose when this is `None`.
+    pub purpose: Option<String>,
+    /// Who is creating.
     pub by: String,
 }
 
@@ -140,16 +221,16 @@ pub struct InitRequest {
 pub struct InitPaths {
     /// The user config file, `config.toml`. It need not exist.
     pub config_path: PathBuf,
-    /// The directory a new project's store goes in, as `<name>.fls`.
+    /// The directory a new project's store goes in, as `<slug>.fls`.
     pub store_dir: PathBuf,
-    /// The workspace store, which a project's name must not name.
+    /// The workspace store, which a project's slug must not name.
     pub workspace_store: PathBuf,
 }
 
 /// A request checked against the config, with nothing changed yet.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    /// The project's name, a valid slug.
+    /// The project's slug, valid.
     pub slug: String,
     /// The canonical root.
     pub root: PathBuf,
@@ -158,12 +239,12 @@ pub struct Resolved {
     /// The tracker the project has, or will have, if any.
     pub tracker: Option<Tracker>,
     /// Whether the config has no block for this project yet.
-    registers: bool,
+    pub(crate) registers: bool,
     /// Whether a tracker is to be added to the block the config already has.
     adds_tracker: bool,
 }
 
-/// What happened to the repository.
+/// What happened to the repository, when `git_init` asked for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitOutcome {
     /// `git init` ran.
@@ -174,26 +255,28 @@ pub struct GitOutcome {
     pub head: String,
 }
 
-/// The created project, as `fl project init --json` prints it and `POST /api/v1/projects`
-/// returns it.
+/// What a creation did.
 #[derive(Debug, Clone, Serialize)]
 pub struct InitOutcome {
-    /// The project's name.
-    pub name: String,
-    pub root: String,
-    pub store: String,
-    /// The project's IRI in its store.
-    pub project: String,
+    pub slug: String,
+    pub kind: ProjectKind,
+    /// The project root; `None` for a virtual group.
+    pub root: Option<String>,
+    /// The project's store; `None` for a virtual group.
+    pub store: Option<String>,
+    /// The project's IRI in its store; `None` for a virtual group.
+    pub project: Option<String>,
     pub purpose: String,
     pub tracker: Option<Tracker>,
-    /// The areas the project's routing map declares.
+    /// The areas the project's routing map declares (none for a virtual group).
     pub areas: Vec<String>,
-    pub git: GitOutcome,
+    /// `None` unless `git_init` was asked for.
+    pub git: Option<GitOutcome>,
     /// `.fl/mcp.toml` was made (it was absent).
     pub mcp_catalog_created: bool,
-    /// The config file the project is registered in.
-    pub config: String,
-    /// The config had no block for the project and now has one.
+    /// The config file the project is registered in; `None` for a virtual group.
+    pub config: Option<String>,
+    /// New: a project's config block was appended, or a virtual group's area was made.
     pub registered: bool,
 }
 
@@ -206,21 +289,36 @@ pub fn default_routing_map() -> RoutingMap {
         })
 }
 
+/// Whether `root` is a Git working tree: it holds a `.git` (a directory, or the file a linked
+/// worktree has). Asks git nothing, so it never changes anything, and a repository with no
+/// commit counts.
+pub fn has_git(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join(".git")).is_ok()
+}
+
 // --- the config -------------------------------------------------------------------------------
 
 /// One `[[project]]` block, as far as initialization reads it.
 #[derive(Debug, Clone)]
-struct ConfigEntry {
-    name: Option<String>,
-    root: String,
-    store: Option<String>,
-    tracker: Option<(String, String)>,
+pub(crate) struct ConfigEntry {
+    pub(crate) name: Option<String>,
+    pub(crate) root: String,
+    pub(crate) store: Option<String>,
+    pub(crate) tracker: Option<(String, String)>,
 }
 
 impl ConfigEntry {
+    /// The tracker binding the block has, if it names a GitHub repository.
+    pub(crate) fn tracker_binding(&self) -> Option<Tracker> {
+        self.tracker.as_ref().map(|(github, credential)| Tracker {
+            github: github.clone(),
+            credential: credential.parse().unwrap_or(Credential::App),
+        })
+    }
+
     /// The name the config gives the project: `name`, else the root's directory name, in
     /// lowercase (`Entry::matches_slug`).
-    fn slug(&self) -> Option<String> {
+    pub(crate) fn slug(&self) -> Option<String> {
         match &self.name {
             Some(n) => Some(n.to_ascii_lowercase()),
             None => Path::new(&self.root)
@@ -231,7 +329,7 @@ impl ConfigEntry {
     }
 }
 
-fn read_config(path: &Path) -> Result<DocumentMut, InitError> {
+pub(crate) fn read_config(path: &Path) -> Result<DocumentMut, InitError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -245,7 +343,10 @@ fn read_config(path: &Path) -> Result<DocumentMut, InitError> {
     })
 }
 
-fn config_entries(doc: &DocumentMut, path: &Path) -> Result<Vec<ConfigEntry>, InitError> {
+pub(crate) fn config_entries(
+    doc: &DocumentMut,
+    path: &Path,
+) -> Result<Vec<ConfigEntry>, InitError> {
     let Some(item) = doc.get("project") else {
         return Ok(Vec::new());
     };
@@ -280,7 +381,7 @@ fn config_entries(doc: &DocumentMut, path: &Path) -> Result<Vec<ConfigEntry>, In
 }
 
 /// Whether two roots name one directory: equal as written, or the same after resolving links.
-fn same_root(a: &str, b: &Path) -> bool {
+pub(crate) fn same_root(a: &str, b: &Path) -> bool {
     let a = Path::new(a);
     a == b
         || match (a.canonicalize(), b.canonicalize()) {
@@ -291,7 +392,7 @@ fn same_root(a: &str, b: &Path) -> bool {
 
 /// Replaces `path` whole by a rename of a sibling temporary file, keeping the old file's
 /// permissions. A symbolic link is written through, so a config kept elsewhere stays a link.
-fn write_atomic(path: &Path, text: &str) -> Result<(), InitError> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), InitError> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => path
             .canonicalize()
@@ -323,7 +424,7 @@ fn quoted(s: &str) -> String {
     toml_edit::Value::from(s).decorated("", "").to_string()
 }
 
-/// The text of the project's block: `[[project]]`, and `[project.tracker]` when it has one.
+/// The text of a new project's block: `[[project]]`, and `[project.tracker]` when it has one.
 fn block_text(r: &Resolved) -> String {
     let mut text = format!(
         "[[project]]\nname = {}\nroot = {}\nstore = {}\n",
@@ -448,6 +549,7 @@ pub(crate) fn canonical_root(path: &Path) -> Result<PathBuf, InitError> {
     Ok(resolved)
 }
 
+/// The slug for a directory: its lowercase name.
 fn derive_slug(root: &Path) -> Result<String, InitError> {
     let base = root
         .file_name()
@@ -457,18 +559,97 @@ fn derive_slug(root: &Path) -> Result<String, InitError> {
     validate_slug(&base).map_err(|_| {
         invalid(format!(
             "cannot derive a project name from `{base}`: a name is 1 to 64 of lowercase letters, \
-             digits, `-` and `_`, starting with a letter. Pass one with --name"
+             digits, `-` and `_`, starting with a letter. Pass one with --name or --slug"
         ))
     })
 }
 
-fn checked_name(raw: &str) -> Result<String, InitError> {
+/// A slug as given: lowercase letters, digits, `-` and `_`, starting with a letter.
+pub(crate) fn checked_slug(raw: &str) -> Result<String, InitError> {
     validate_slug(raw.trim()).map_err(|_| {
         invalid(format!(
             "`{raw}` is not a project name: a name is 1 to 64 of lowercase letters, digits, \
              `-` and `_`, starting with a letter"
         ))
     })
+}
+
+/// A slug derived from a display name: lowercased, every run of other characters one `-`, no
+/// `-` at either end. `My Project` is `my-project`; `Chosen_Name` is `chosen_name`.
+pub(crate) fn slug_from_display(name: &str) -> Result<String, InitError> {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c.to_ascii_lowercase());
+        } else if c == '-' || c.is_whitespace() || c.is_ascii_punctuation() {
+            if !out.ends_with('-') {
+                out.push('-');
+            }
+        } else {
+            // Not ASCII: nothing to carry over.
+            if !out.ends_with('-') {
+                out.push('-');
+            }
+        }
+    }
+    let derived = out.trim_matches('-').to_string();
+    validate_slug(&derived).map_err(|_| {
+        invalid(format!(
+            "cannot derive a slug from the name `{name}`: a slug is 1 to 64 of lowercase \
+             letters, digits, `-` and `_`, starting with a letter. Pass one as `slug`"
+        ))
+    })
+}
+
+/// A display name: one line, 1 to [`MAX_NAME_CHARS`] characters, no control characters.
+pub(crate) fn checked_display_name(raw: &str) -> Result<String, InitError> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_NAME_CHARS
+        || name.chars().any(char::is_control)
+    {
+        return Err(invalid(format!(
+            "name: a name is one line of 1 to {MAX_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// A purpose: one line, as an area's purpose.
+pub(crate) fn checked_purpose(raw: &str) -> Result<String, InitError> {
+    validate_summary(raw).map_err(|e| invalid(format!("purpose: {e}")))
+}
+
+/// `owner/repo` or an error naming the form.
+pub(crate) fn checked_github(raw: &str) -> Result<String, InitError> {
+    let g = raw.trim();
+    if fl_github::is_owner_repo(g) {
+        Ok(g.to_string())
+    } else {
+        Err(invalid(format!(
+            "`{g}` is not a GitHub repository: name it as `owner/repo`"
+        )))
+    }
+}
+
+/// Refuses a root and the stores' directory that contain one another.
+pub(crate) fn check_store_dir_overlap(root: &Path, paths: &InitPaths) -> Result<(), InitError> {
+    let store_dir = paths.store_dir.canonicalize().unwrap_or_else(|_| {
+        paths
+            .store_dir
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| p.join(paths.store_dir.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| paths.store_dir.clone())
+    });
+    if root.starts_with(&store_dir) || store_dir.starts_with(root) {
+        return Err(invalid(format!(
+            "{} and the stores' directory {} contain one another, so it cannot be a project root",
+            root.display(),
+            store_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Checks `req` against the config and the places in `paths`. Changes nothing.
@@ -478,17 +659,12 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
         return Err(invalid("`by` is empty"));
     }
     if let Some(p) = &req.purpose {
-        validate_summary(p).map_err(|e| invalid(format!("purpose: {e}")))?;
+        checked_purpose(p)?;
     }
-    let github = match req.github.as_deref().map(str::trim) {
-        Some(g) if fl_github::is_owner_repo(g) => Some(g.to_string()),
-        Some(g) => {
-            return Err(invalid(format!(
-                "`{g}` is not a GitHub repository: name it as `owner/repo`"
-            )));
-        }
-        None => None,
-    };
+    if let Some(n) = &req.display_name {
+        checked_display_name(n)?;
+    }
+    let github = req.github.as_deref().map(checked_github).transpose()?;
     if github.is_none() && req.credential.is_some() {
         return Err(invalid(
             "a credential source names how to reach a GitHub repository: pass `github` too",
@@ -498,10 +674,11 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     let doc = read_config(&paths.config_path)?;
     let entries = config_entries(&doc, &paths.config_path)?;
     let here = entries.iter().find(|e| same_root(&e.root, &root));
-    let slug = match (&req.name, here) {
-        (Some(n), _) => checked_name(n)?,
-        (None, Some(e)) => checked_name(&e.slug().unwrap_or_default())?,
-        (None, None) => derive_slug(&root)?,
+    let slug = match (&req.slug, here, &req.display_name) {
+        (Some(s), _, _) => checked_slug(s)?,
+        (None, Some(e), _) => checked_slug(&e.slug().unwrap_or_default())?,
+        (None, None, Some(n)) => slug_from_display(n)?,
+        (None, None, None) => derive_slug(&root)?,
     };
     if let Some(e) = here
         && e.slug().as_deref() != Some(slug.as_str())
@@ -519,7 +696,7 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     {
         return Err(conflict(format!(
             "project `{slug}` is already registered at {}, not {}. Choose another name with \
-             --name",
+             --name or --slug",
             other.root,
             root.display()
         )));
@@ -532,25 +709,11 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     if fl_store::store_identity(&store) == fl_store::store_identity(&paths.workspace_store) {
         return Err(conflict(format!(
             "the store for project `{slug}` would be the workspace store {}. Choose another name \
-             with --name",
+             with --name or --slug",
             paths.workspace_store.display()
         )));
     }
-    let store_dir = paths.store_dir.canonicalize().unwrap_or_else(|_| {
-        paths
-            .store_dir
-            .parent()
-            .and_then(|p| p.canonicalize().ok())
-            .map(|p| p.join(paths.store_dir.file_name().unwrap_or_default()))
-            .unwrap_or_else(|| paths.store_dir.clone())
-    });
-    if root.starts_with(&store_dir) || store_dir.starts_with(&root) {
-        return Err(invalid(format!(
-            "{} and the stores' directory {} contain one another, so it cannot be a project root",
-            root.display(),
-            store_dir.display()
-        )));
-    }
+    check_store_dir_overlap(&root, paths)?;
 
     let existing = here.and_then(|e| e.tracker.as_ref());
     let (tracker, adds_tracker) = match (&github, existing) {
@@ -559,7 +722,8 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
             if !g.eq_ignore_ascii_case(eg) || wanted.is_some_and(|w| w != ec) {
                 return Err(conflict(format!(
                     "project `{slug}` is already bound to GitHub `{eg}` with credential `{ec}`; \
-                     fl will not rebind it. Edit {} to change the binding",
+                     creating will not rebind it. Change the binding with PATCH \
+                     /api/v1/projects/{slug}, or edit {}",
                     paths.config_path.display()
                 )));
             }
@@ -637,7 +801,7 @@ fn seed_project_store(store: &AnyStore, r: &Resolved) -> Result<(String, Vec<Str
         _ => {
             return Err(conflict(format!(
                 "the store {} already holds {}, not {}. A project's store holds only that \
-                 project: choose another name with --name",
+                 project: choose another name with --name or --slug",
                 r.store.display(),
                 held.iter()
                     .map(|p| p.root.as_str())
@@ -661,28 +825,69 @@ fn seed_project_store(store: &AnyStore, r: &Resolved) -> Result<(String, Vec<Str
     ))
 }
 
-/// Upserts the project's area in the workspace store, keeping the purpose an existing area has
-/// when the request names none.
-fn upsert_workspace_area(
+/// The registry's refusal when a project's slug is already a virtual group. The way out is
+/// named: an area made earlier for a real repository (`--create-area`) has no path either, and
+/// `fl agent area set` gives it one.
+fn virtual_slug_taken_by_group(slug: &str) -> InitError {
+    conflict(format!(
+        "`{slug}` is already a virtual group (an area with no path), so it cannot also be a \
+         directory-backed project. Choose another name with --name or --slug; or, if that area \
+         was made for this directory, give it the directory as its path with `fl agent area set \
+         {slug} --path <dir> --purpose <text> --by <you>` and run this again"
+    ))
+}
+
+/// A directory-backed project onto a virtual group's slug is refused.
+fn check_not_a_virtual_group(ws: &AnyStore, r: &Resolved) -> Result<(), InitError> {
+    if !r.registers {
+        return Ok(());
+    }
+    let area = ws
+        .get_area(&r.slug)
+        .map_err(|e| failed(format!("workspace store: {e}")))?;
+    match area {
+        Some(a) if a.is_virtual() => Err(virtual_slug_taken_by_group(&r.slug)),
+        _ => Ok(()),
+    }
+}
+
+/// Upserts the project's area in the workspace store (name, root as path, purpose). What the
+/// request does not name stays as the area has it. An area that is already right is left alone.
+/// Returns the area as it is.
+fn upsert_project_area(
     ws: &AnyStore,
     r: &Resolved,
     req: &InitRequest,
-) -> Result<String, InitError> {
+) -> Result<AreaRecord, InitError> {
     let st = |e: fl_core::store::StoreError| failed(format!("workspace store: {e}"));
-    let purpose = match (&req.purpose, ws.get_area(&r.slug).map_err(st)?) {
-        (Some(p), _) => p.clone(),
-        (None, Some(existing)) => existing.purpose,
+    let existing = ws.get_area(&r.slug).map_err(st)?;
+    let name = match (&req.display_name, &existing) {
+        (Some(n), _) => checked_display_name(n)?,
+        (None, Some(a)) => a.name.clone(),
+        (None, None) => r.slug.clone(),
+    };
+    let purpose = match (&req.purpose, &existing) {
+        (Some(p), _) => checked_purpose(p)?,
+        (None, Some(a)) => a.purpose.clone(),
         (None, None) => format!("Project {}", r.slug),
     };
-    let area = AreaRecord::new(
-        &r.slug,
-        Some(r.root.to_string_lossy().into_owned()),
-        &purpose,
-        fl_exec::stamp::now(),
-        &req.by,
-    )
-    .map_err(|e| invalid(e.to_string()))?;
-    Ok(ws.upsert_area(area).map_err(st)?.purpose)
+    let path = Some(r.root.to_string_lossy().into_owned());
+    if let Some(a) = &existing
+        && a.name == name
+        && a.purpose == purpose
+        && a.path == path
+    {
+        return Ok(a.clone());
+    }
+    ws.upsert_area(AreaRecord {
+        area_key: r.slug.clone(),
+        name,
+        path,
+        purpose,
+        updated_at: fl_exec::stamp::now(),
+        by: req.by.trim().to_string(),
+    })
+    .map_err(st)
 }
 
 /// Writes the starter `.fl/mcp.toml` when the project has none. Whatever is there is left alone.
@@ -699,27 +904,36 @@ fn ensure_mcp_catalog(root: &Path) -> Result<bool, InitError> {
     }
 }
 
-/// Initializes the project `req` names.
+/// Creates the directory-backed project `req` names.
 ///
-/// `open` opens the project's store and the workspace store once the name and the store path
-/// are known; the caller picks how (a CLI process opens them directly, the Hub through its
-/// locks). Order: nothing is changed until the request is checked; the config block is written
-/// last, so a failure before it leaves the project unregistered and a re-run finishes the job.
+/// `open_workspace` opens the workspace store and `open_project` the project's store, once the
+/// slug and the store path are known; the caller picks how (a CLI process opens them directly,
+/// the Hub through its locks). Order: nothing is changed until the request is checked against
+/// the config and the workspace registry; git runs only when `git_init` asks; the config block
+/// is written last, so a failure before it leaves the project unregistered and a re-run
+/// finishes the job.
 pub fn init_project<P, W>(
     req: &InitRequest,
     paths: &InitPaths,
-    open: impl FnOnce(&Resolved) -> Result<(P, W), InitError>,
+    open_workspace: impl FnOnce() -> Result<W, InitError>,
+    open_project: impl FnOnce(&Resolved) -> Result<P, InitError>,
 ) -> Result<InitOutcome, InitError>
 where
     P: Deref<Target = AnyStore>,
     W: Deref<Target = AnyStore>,
 {
-    let _one_at_a_time = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let resolved = resolve(req, paths)?;
+    let workspace_store = open_workspace()?;
+    check_not_a_virtual_group(&workspace_store, &resolved)?;
 
     std::fs::create_dir_all(&resolved.root)
         .map_err(|e| failed(format!("could not create {}: {e}", resolved.root.display())))?;
-    let git = ensure_git(&resolved.root, &req.by)?;
+    let git = if req.git_init {
+        Some(ensure_git(&resolved.root, &req.by)?)
+    } else {
+        None
+    };
 
     if let Some(dir) = resolved
         .store
@@ -729,9 +943,9 @@ where
         fl_store::private::create_private_dir_all(dir)
             .map_err(|e| failed(format!("could not create {}: {e}", dir.display())))?;
     }
-    let (project_store, workspace_store) = open(&resolved)?;
+    let project_store = open_project(&resolved)?;
     let (project, areas) = seed_project_store(&project_store, &resolved)?;
-    let purpose = upsert_workspace_area(&workspace_store, &resolved, req)?;
+    let area = upsert_project_area(&workspace_store, &resolved, req)?;
     drop(project_store);
     drop(workspace_store);
 
@@ -739,18 +953,123 @@ where
     upsert_config(paths, &resolved)?;
 
     Ok(InitOutcome {
-        name: resolved.slug.clone(),
-        root: resolved.root.display().to_string(),
-        store: resolved.store.display().to_string(),
-        project,
-        purpose,
+        slug: resolved.slug.clone(),
+        kind: ProjectKind::Project,
+        root: Some(resolved.root.display().to_string()),
+        store: Some(resolved.store.display().to_string()),
+        project: Some(project),
+        purpose: area.purpose,
         tracker: resolved.tracker.clone(),
         areas,
         git,
         mcp_catalog_created,
-        config: paths.config_path.display().to_string(),
+        config: Some(paths.config_path.display().to_string()),
         registered: resolved.registers,
     })
+}
+
+/// Creates the virtual group `req` names: an area with no path in the workspace store, and
+/// nothing else. No directory, no store file, no config block and no git. A group that exists
+/// is kept; the request's name and purpose, when given, replace the group's.
+pub fn create_virtual<W>(
+    req: &VirtualRequest,
+    paths: &InitPaths,
+    open_workspace: impl FnOnce() -> Result<W, InitError>,
+) -> Result<InitOutcome, InitError>
+where
+    W: Deref<Target = AnyStore>,
+{
+    let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if req.by.trim().is_empty() {
+        return Err(invalid("`by` is empty"));
+    }
+    let display = checked_display_name(&req.display_name)?;
+    let slug = match &req.slug {
+        Some(s) => checked_slug(s)?,
+        None => slug_from_display(&display)?,
+    };
+    if RESERVED_GROUP_SLUGS.contains(&slug.as_str()) {
+        return Err(invalid(format!(
+            "`{slug}` cannot be a virtual group: `@all` is everyone and `fl` is the Hub's own \
+             store. Choose another slug"
+        )));
+    }
+    let purpose = req.purpose.as_deref().map(checked_purpose).transpose()?;
+
+    // A slug names one kind. A directory-backed project holds it in the config or as a store.
+    let doc = read_config(&paths.config_path)?;
+    if let Some(e) = config_entries(&doc, &paths.config_path)?
+        .iter()
+        .find(|e| e.slug().as_deref() == Some(slug.as_str()))
+    {
+        return Err(conflict(format!(
+            "`{slug}` is already a directory-backed project at {}, so it cannot also be a \
+             virtual group. Choose another slug",
+            e.root
+        )));
+    }
+    for ext in ["fls", "redb"] {
+        let store = paths.store_dir.join(format!("{slug}.{ext}"));
+        if std::fs::symlink_metadata(&store).is_ok() {
+            return Err(conflict(format!(
+                "`{slug}` is already a project: its store {} exists. Choose another slug",
+                store.display()
+            )));
+        }
+    }
+
+    let st = |e: fl_core::store::StoreError| failed(format!("workspace store: {e}"));
+    let ws = open_workspace()?;
+    let existing = ws.get_area(&slug).map_err(st)?;
+    if let Some(a) = &existing
+        && let Some(path) = &a.path
+    {
+        return Err(conflict(format!(
+            "`{slug}` is already an area for the project at {path}, so it cannot also be a \
+             virtual group. Choose another slug"
+        )));
+    }
+    let name = display;
+    let purpose = match (&purpose, &existing) {
+        (Some(p), _) => p.clone(),
+        (None, Some(a)) => a.purpose.clone(),
+        (None, None) => format!("Virtual group {slug}"),
+    };
+    if let Some(a) = &existing
+        && a.name == name
+        && a.purpose == purpose
+    {
+        return Ok(virtual_outcome(a.clone(), false));
+    }
+    let registered = existing.is_none();
+    let saved = ws
+        .upsert_area(AreaRecord {
+            area_key: slug,
+            name,
+            path: None,
+            purpose,
+            updated_at: fl_exec::stamp::now(),
+            by: req.by.trim().to_string(),
+        })
+        .map_err(st)?;
+    Ok(virtual_outcome(saved, registered))
+}
+
+fn virtual_outcome(area: AreaRecord, registered: bool) -> InitOutcome {
+    InitOutcome {
+        slug: area.area_key,
+        kind: ProjectKind::Virtual,
+        root: None,
+        store: None,
+        project: None,
+        purpose: area.purpose,
+        tracker: None,
+        areas: Vec::new(),
+        git: None,
+        mcp_catalog_created: false,
+        config: None,
+        registered,
+    }
 }
 
 // --- the user config's place ------------------------------------------------------------------
@@ -767,107 +1086,4 @@ pub fn user_config_path(home: Option<&Path>) -> Option<PathBuf> {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?,
     };
     Some(base.join("fl").join("config.toml"))
-}
-
-// --- POST /api/v1/projects --------------------------------------------------------------------
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateProjectBody {
-    path: String,
-    name: Option<String>,
-    github: Option<String>,
-    credential: Option<String>,
-    purpose: Option<String>,
-}
-
-fn error_response(status: u16, message: &str) -> HttpResponse {
-    HttpResponse::json(status, serde_json::json!({ "error": message }))
-}
-
-fn init_error_response(e: &InitError) -> HttpResponse {
-    let status = match e {
-        InitError::Invalid(_) => 400,
-        InitError::Conflict(_) => 409,
-        InitError::Failed(_) => 500,
-    };
-    error_response(status, &e.to_string())
-}
-
-/// `POST /api/v1/projects`. Owner only: it writes the Owner's config and may `git init` the
-/// path. Runs the same initialization as `fl project init` (see the module), in the Hub's
-/// home: the config is `<home>/.config/fl/config.toml` and the project's store is
-/// `<home>/.local/share/fl/<name>.fls`, where `GET /api/v1/projects` finds it. `201` for a new
-/// project, `200` when it was already initialized.
-pub(crate) fn handle_post_projects(
-    state: &HubState,
-    authority: &HubAuthority,
-    req: &HttpRequest,
-) -> HttpResponse {
-    if !authority.is_owner() {
-        return error_response(403, "only Owner authority may create projects");
-    }
-    let body: CreateProjectBody = match req.json() {
-        Ok(body) => body,
-        Err(e) => return error_response(400, &e),
-    };
-    let credential = match body.credential.as_deref().map(str::parse::<Credential>) {
-        Some(Ok(c)) => Some(c),
-        Some(Err(e)) => return error_response(400, &e),
-        None => None,
-    };
-    let Some(home) = hub_home_dir(state) else {
-        return error_response(500, "the Hub has no home directory");
-    };
-    let Some(config_path) = user_config_path(state.config.home_override.as_deref()) else {
-        return error_response(500, "the Hub has no config directory");
-    };
-    let path = PathBuf::from(&body.path);
-    // Before anything is made: the Hub refuses a root in a system directory, a secret's
-    // directory, or the home directory itself, as it does for an artifacts directory.
-    match canonical_root(&path) {
-        Ok(root) => {
-            if let Some(reason) = crate::artifact_dirs::sensitive_reason(state, &root) {
-                return error_response(400, &reason);
-            }
-        }
-        Err(e) => return init_error_response(&e),
-    }
-    let request = InitRequest {
-        path,
-        name: body.name,
-        github: body.github,
-        credential,
-        purpose: body.purpose,
-        by: authority.actor_name().to_string(),
-    };
-    let paths = InitPaths {
-        config_path,
-        store_dir: crate::records::projects_dir(&home),
-        workspace_store: std::path::absolute(&state.config.store_path)
-            .unwrap_or_else(|_| state.config.store_path.clone()),
-    };
-    let outcome = init_project(&request, &paths, |r| {
-        let project = state.open_project_store_at(&r.store).map_err(|e| match e {
-            crate::ProjectOpenError::Busy => failed("the project's store is busy; retry"),
-            crate::ProjectOpenError::Store(e) => failed(format!("project store: {e}")),
-        })?;
-        let workspace = state
-            .open_store()
-            .map_err(|e| failed(format!("workspace store: {e}")))?;
-        Ok((project, workspace))
-    });
-    match outcome {
-        Ok(outcome) => {
-            let mut descriptor = crate::artifact_dirs::project_descriptor(state, &outcome.name);
-            if let (Some(map), Ok(serde_json::Value::Object(created))) =
-                (descriptor.as_object_mut(), serde_json::to_value(&outcome))
-            {
-                map.extend(created);
-            }
-            state.broadcast("projects", "project.created", descriptor.clone());
-            HttpResponse::json(if outcome.registered { 201 } else { 200 }, descriptor)
-        }
-        Err(e) => init_error_response(&e),
-    }
 }

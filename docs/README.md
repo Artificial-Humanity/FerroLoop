@@ -10,8 +10,8 @@ File naming in this directory follows
 ## Contents
 
 * [getting-started.md](getting-started.md) — build the CLI, register a project (in one step
-  with `fl project init`), gate a real action, and take a claim through the finding protocol,
-  with real commands and their output.
+  with `fl project create`) or a virtual group, gate a real action, and take a claim through the
+  finding protocol, with real commands and their output.
 * [sharing-gates.md](sharing-gates.md) — share a project's gates with other machines through
   a committed manifest: export, import and check.
 * [github-tracker.md](github-tracker.md) — keep a project's records and findings in a GitHub
@@ -27,7 +27,8 @@ File naming in this directory follows
   why.
 * [hub-home-and-artifacts.md](hub-home-and-artifacts.md) — where the Hub keeps its data and
   artifact registry, the per-project directories, and the Owner-only endpoints that relocate
-  them, with migration, and that create a project (`POST /api/v1/projects`).
+  them, with migration, and that list, create and update projects
+  (`GET`, `POST` and `PATCH /api/v1/projects`).
 * [build-provenance.md](build-provenance.md) — how a binary says what it was built from:
   `fl --version [--json]`, `fl version`, `ferrostore --version [--json]`, the Hub's
   `GET /api/v1/version`, the UI bundle's `build-info.json`, and the build-time stamps behind

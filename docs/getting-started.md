@@ -93,8 +93,10 @@ Options:
 
 ## 2. Register a project
 
-A project is a git working tree. The tool refuses anything that isn't one, because a
-gate's provenance is a commit — there has to be a HEAD to stamp it against.
+A project is a directory. `fl project add` registers any directory, a Git repository or not.
+A gate's provenance is a commit, though, so the gate commands (`gate add`, `check`, flows,
+manifests) need the project to be a git working tree with a `HEAD` to stamp against, and say so
+when it is not. This guide's project is one.
 
 ```
 $ mkdir -p /tmp/gs-demo/project && cd /tmp/gs-demo/project
@@ -119,48 +121,78 @@ below uses `--project 1`. Every item also has a full id, an IRI such as
 `urn:uuid:0199…`, which is what the store keeps and what every reference between items
 holds. A command accepts either; the handle is only there to be typed and read.
 
-### Register a project in one step: `fl project init`
+### Create a project in one step: `fl project create`
 
-`fl project init <path>` takes a directory (made if it does not exist) to a registered, routed
-project, whatever state it is in:
+There are two kinds of project. A **directory-backed project** is a directory, whether or not it
+is a Git repository. A **virtual group** is a name for a set of agents, with no directory, no
+store of its own and no Git, such as `council`. FerroWire reaches its members as `@<slug>`:
+every active agent whose project or extra areas include the group. A bare `<slug>` stays the
+persona of that name, so `ops` is the persona and `@ops` the group. `@council` reaches the
+`council` group's members and also every strategist; `@all` is everyone, so a group cannot be
+named `all`. A send to `@<name>` that is not a virtual group is refused, naming the way out
+(`@area:<slug>` reaches the agents of a project with a path).
 
 ```
-fl project init <path> [--name <slug>] [--github <owner/repo>] [--credential <app|env>]
-                       [--purpose <summary>] [--by <author>] [--json]
+fl project create <name> --path <dir> [--slug <slug>] [--git-init]
+                  [--github <owner/repo>] [--credential <app|env>] [--purpose <text>]
+                  [--by <author>] [--json]
+fl project create <name> --virtual [--slug <slug>] [--purpose <text>] [--by <author>] [--json]
+fl project init   <dir>  [--name <name>] ...    the same command; the argument is the directory
+fl project add    <dir>                         register a directory in the current store
+fl project list   [--json]
 ```
 
-It does these, in this order, and leaves what is already right alone:
+`<name>` is the name shown for the project (`"My Project"`); its **slug** is the name in
+lowercase kebab-case (`my-project`) unless `--slug` gives one. A slug is 1 to 64 of lowercase
+letters, digits, `-` and `_`, starting with a letter, and it never changes. `fl project init
+<dir>` is `create` under its earlier name: with neither `--path` nor `--virtual` the argument
+is the directory, and the name is `--name`, else the directory's lowercase name, else the name
+the config already gives that root. A slug names one kind: a project cannot take a virtual
+group's slug, nor a group a project's.
 
-1. **Git.** A directory with a `HEAD` is not touched. A directory with no repository gets
-   `git init`; a repository with no commit gets one. Either way the commit is empty, message
-   `chore: initial commit`, authored by `--by` (default `fl`), so `HEAD` exists and the working
-   tree is not committed.
-2. **Name.** `--name`, else the root's lowercase directory name, else the name the config already
-   gives that root. A name is 1 to 64 of lowercase letters, digits, `-` and `_`, starting with a
-   letter.
-3. **Stores.** The project's store `<name>.fls` goes beside the workspace store (the
+A directory-backed project is made in this order, leaving what is already right alone:
+
+1. **Directory.** The path is made if it does not exist. **Git is not touched** unless
+   `--git-init` is given: then a directory with no repository gets `git init`, and a repository
+   with no commit gets an empty one, message `chore: initial commit`, authored by `--by`
+   (default `fl`). A directory with a `HEAD` is never changed.
+2. **Stores.** The project's store `<slug>.fls` goes beside the workspace store (the
    `[state].store` of the config, else `$XDG_DATA_HOME/fl`). It holds the project and its
    routing map: the areas `backlog`, `code`, `design`, `product`, `security`, `tests` and `ux`,
    all routed to the local tier, `security` marked sensitive. A map the store already has is
    kept. The workspace store (`--db` or `$FL_DB` names another) gets the project's area, with
-   `--purpose` (default `Project <name>`; an existing area keeps its purpose when none is
-   given).
-4. **MCP catalog.** `<root>/.fl/mcp.toml` is written if it is absent, and never changed if it
+   the name, the root as its path and `--purpose` (default `Project <slug>`; an existing area
+   keeps its purpose when none is given).
+3. **MCP catalog.** `<root>/.fl/mcp.toml` is written if it is absent, and never changed if it
    exists.
-5. **Config.** A `[[project]]` block (`name`, `root`, `store`) is appended to
+4. **Config.** A `[[project]]` block (`name` is the slug, `root`, `store`) is appended to
    `$XDG_CONFIG_HOME/fl/config.toml`, the rest of the file untouched. The block is written last,
    by replacing the file whole, so a failure earlier leaves the project unregistered and a re-run
    finishes it. `--github owner/repo` adds a `[project.tracker]` with `credential` `app` (the
    default) or `env`; `--credential` needs `--github`. A project that has no tracker gets the one
-   asked for; one that has a tracker is never rebound.
+   asked for; creating never rebinds one that has a tracker (the Hub's
+   `PATCH /api/v1/projects/<slug>` does).
 
-Nothing is changed until the request is checked. fl refuses an empty path, a NUL, a path that is a
-file, a name that another project's block already has (at another root), a root that is already
-registered under another name, a store that holds another project, and a root that contains the
-stores' directory. Running the same command again changes nothing. `--json` prints the project:
-`name`, `root`, `store`, `project` (its IRI), `purpose`, `tracker`, `areas`, `git`,
-`mcp_catalog_created`, `config` and `registered`. The Hub does the same through
-`POST /api/v1/projects` ([hub-home-and-artifacts.md](hub-home-and-artifacts.md)).
+A virtual group is one write: its area, with no path, in the workspace store. No directory, no
+store file, no config block and no Git; `--virtual` refuses `--path`, `--git-init`, `--github`
+and `--credential`. An area made earlier with `fl agent register --create-area` has no path
+either, so it is a virtual group already; to make a directory-backed project of that slug, first
+give the area its directory with `fl agent area set <slug> --path <dir> --purpose <text> --by
+<you>`.
+
+Nothing is changed until the request is checked. fl refuses an empty path, a NUL, a path that is
+a file, a slug that another project's block already has (at another root), a root that is already
+registered under another slug, a store that holds another project, a root that contains the
+stores' directory, and a slug that is the other kind. Running the same command again changes
+nothing. `--json` prints the project as the Hub lists it (`slug`, `name`, `kind`, `path`,
+`has_git`, `purpose`, `tracker`, `store_path`, `active_agent_count`) plus `registered`, `git`
+(`null` unless `--git-init` ran), `mcp_catalog_created`, `areas` and `config`.
+
+`fl project list` shows every directory-backed project in the config and every virtual group,
+one per line: kind, slug, path (`-` for a group), tracker repository (`-` for none) and the number
+of active agents whose project or extra areas name it. With `--json` it prints the list that
+`GET /api/v1/projects` serves ([hub-home-and-artifacts.md](hub-home-and-artifacts.md)), which
+also creates (`POST`) and updates (`PATCH`) them.
 
 ## 3. Write a gate
 

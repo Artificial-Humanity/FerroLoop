@@ -1,5 +1,6 @@
-//! `fl project init`: one command from a directory to a registered, routed project. Every test
-//! runs `fl` with private config and data homes, so none reads or writes the developer's own.
+//! `fl project create` (alias `init`), `add` and `list`: from a directory, a repository or a name
+//! to a registered, routed project or a virtual group. Every test runs `fl` with private config
+//! and data homes, so none reads or writes the developer's own.
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
@@ -54,10 +55,15 @@ impl Env {
         self.work.path().canonicalize().unwrap().join(name)
     }
 
+    /// `fl project init <args> --json` (the earlier spelling).
     fn init_json(&self, args: &[&str]) -> Value {
+        self.run_json("init", args)
+    }
+
+    fn run_json(&self, verb: &str, args: &[&str]) -> Value {
         let out = self
             .fl(self.work.path())
-            .args(["project", "init"])
+            .args(["project", verb])
             .args(args)
             .arg("--json")
             .assert()
@@ -73,10 +79,17 @@ impl Env {
 fn a_new_directory_becomes_a_project_every_fl_command_accepts() {
     let env = Env::new();
     let root = env.dir("shiny");
-    let created = env.init_json(&[root.to_str().unwrap(), "--purpose", "a shiny thing"]);
+    let created = env.init_json(&[
+        root.to_str().unwrap(),
+        "--purpose",
+        "a shiny thing",
+        "--git-init",
+    ]);
 
-    assert_eq!(created["name"], "shiny");
-    assert_eq!(created["root"], root.display().to_string());
+    assert_eq!(created["slug"], "shiny");
+    assert_eq!(created["kind"], "project");
+    assert_eq!(created["path"], root.display().to_string());
+    assert_eq!(created["has_git"], true);
     assert_eq!(created["git"]["initial_commit"], true);
     assert_eq!(created["mcp_catalog_created"], true);
     assert_eq!(created["tracker"], Value::Null);
@@ -101,7 +114,7 @@ fn a_new_directory_becomes_a_project_every_fl_command_accepts() {
     );
     let store = env.home.path().join("data/fl/shiny.fls");
     assert!(store.is_file());
-    assert_eq!(created["store"], store.display().to_string());
+    assert_eq!(created["store_path"], store.display().to_string());
     env.fl(&root)
         .args(["project", "list"])
         .assert()
@@ -124,15 +137,15 @@ fn a_new_directory_becomes_a_project_every_fl_command_accepts() {
 }
 
 #[test]
-fn the_plain_output_is_the_name_the_root_and_the_store() {
+fn the_plain_output_is_the_slug_the_kind_the_root_and_the_store() {
     let env = Env::new();
     let root = env.dir("plain");
     env.fl(env.work.path())
-        .args(["project", "init", root.to_str().unwrap()])
+        .args(["project", "init", root.to_str().unwrap(), "--git-init"])
         .assert()
         .success()
         .stdout(format!(
-            "plain\t{}\t{}\n",
+            "plain\tproject\t{}\t{}\n",
             root.display(),
             env.home.path().join("data/fl/plain.fls").display()
         ))
@@ -154,9 +167,9 @@ fn a_relative_path_means_the_current_directory() {
             .clone();
         serde_json::from_slice::<Value>(&out).unwrap()
     };
-    assert_eq!(created["name"], "child");
+    assert_eq!(created["slug"], "child");
     assert_eq!(
-        created["root"],
+        created["path"],
         env.dir("base").join("child").display().to_string()
     );
     assert!(!env.dir("base").join("sub").exists());
@@ -171,14 +184,24 @@ fn a_relative_path_means_the_current_directory() {
 fn running_it_again_changes_nothing() {
     let env = Env::new();
     let root = env.dir("steady");
-    let first = env.init_json(&[root.to_str().unwrap(), "--github", "acme/steady"]);
+    let first = env.init_json(&[
+        root.to_str().unwrap(),
+        "--github",
+        "acme/steady",
+        "--git-init",
+    ]);
     let config = env.config();
     let head = git(&root, &["rev-parse", "HEAD"]);
 
-    let second = env.init_json(&[root.to_str().unwrap(), "--github", "acme/steady"]);
+    let second = env.init_json(&[
+        root.to_str().unwrap(),
+        "--github",
+        "acme/steady",
+        "--git-init",
+    ]);
     assert_eq!(first["registered"], true);
     assert_eq!(second["registered"], false);
-    assert_eq!(second["project"], first["project"]);
+    assert_eq!(second["store_path"], first["store_path"]);
     assert_eq!(second["git"]["initial_commit"], false);
     assert_eq!(second["mcp_catalog_created"], false);
     assert_eq!(env.config(), config);
@@ -209,7 +232,7 @@ fn an_existing_repository_keeps_its_history_and_gets_no_commit() {
     );
     let head = git(&root, &["rev-parse", "HEAD"]);
 
-    let created = env.init_json(&[root.to_str().unwrap()]);
+    let created = env.init_json(&[root.to_str().unwrap(), "--git-init"]);
     assert_eq!(created["git"]["initialized"], false);
     assert_eq!(created["git"]["initial_commit"], false);
     assert_eq!(created["git"]["head"], head);
@@ -229,10 +252,11 @@ fn the_github_binding_is_written_and_read_back_by_fl() {
         "--name",
         "Hosted_One",
     ]);
-    assert_eq!(created["name"], "hosted_one");
+    assert_eq!(created["slug"], "hosted_one");
+    assert_eq!(created["name"], "Hosted_One");
     assert_eq!(
         created["tracker"],
-        serde_json::json!({ "github": "acme/hosted", "credential": "env" })
+        serde_json::json!({ "kind": "github", "repo": "acme/hosted", "credential": "env" })
     );
     let config = env.config();
     assert!(config.contains("[project.tracker]"), "{config}");
@@ -249,7 +273,7 @@ fn the_github_binding_is_written_and_read_back_by_fl() {
 fn the_author_flag_names_who_made_the_commit_and_the_area() {
     let env = Env::new();
     let root = env.dir("authored");
-    env.init_json(&[root.to_str().unwrap(), "--by", "ferris"]);
+    env.init_json(&[root.to_str().unwrap(), "--by", "ferris", "--git-init"]);
     assert_eq!(git(&root, &["log", "-1", "--format=%an"]), "ferris");
     env.fl(&root)
         .args(["agent", "area", "list", "--json"])
@@ -267,7 +291,7 @@ fn bad_input_is_refused_with_a_reason_and_makes_nothing() {
         cmd.args(["project", "init"]).args(args);
         cmd.assert().failure()
     };
-    init(&[root.to_str().unwrap(), "--name", "Not A Slug"]).stderr(contains("project name"));
+    init(&[root.to_str().unwrap(), "--slug", "Not A Slug"]).stderr(contains("project name"));
     init(&[root.to_str().unwrap(), "--github", "not-a-repo"]).stderr(contains("owner/repo"));
     init(&[
         root.to_str().unwrap(),
@@ -292,7 +316,7 @@ fn bad_input_is_refused_with_a_reason_and_makes_nothing() {
 fn a_name_taken_by_another_directory_is_refused() {
     let env = Env::new();
     let first = env.dir("first");
-    env.init_json(&[first.to_str().unwrap(), "--name", "shared"]);
+    env.init_json(&[first.to_str().unwrap(), "--slug", "shared"]);
     let config = env.config();
     let second = env.dir("second");
     env.fl(env.work.path())
@@ -300,12 +324,12 @@ fn a_name_taken_by_another_directory_is_refused() {
             "project",
             "init",
             second.to_str().unwrap(),
-            "--name",
+            "--slug",
             "shared",
         ])
         .assert()
         .failure()
-        .stderr(contains("`shared` is already registered").and(contains("--name")));
+        .stderr(contains("`shared` is already registered").and(contains("--slug")));
     assert!(!second.exists());
     assert_eq!(env.config(), config);
 }
@@ -322,4 +346,258 @@ fn another_projects_config_block_and_comments_survive() {
     let after = env.config();
     assert!(after.starts_with(original), "{after}");
     assert_eq!(after.matches("[[project]]").count(), 2);
+}
+
+// --- the create shapes ------------------------------------------------------------------------
+
+#[test]
+fn create_with_a_path_takes_the_name_and_runs_no_git_by_default() {
+    let env = Env::new();
+    let root = env.dir("some-dir");
+    let created = env.run_json(
+        "create",
+        &[
+            "My Project",
+            "--path",
+            root.to_str().unwrap(),
+            "--purpose",
+            "pretty",
+        ],
+    );
+    assert_eq!(created["slug"], "my-project");
+    assert_eq!(created["name"], "My Project");
+    assert_eq!(created["kind"], "project");
+    assert_eq!(created["path"], root.display().to_string());
+    assert_eq!(created["has_git"], false);
+    assert_eq!(created["git"], Value::Null);
+    assert!(
+        !root.join(".git").exists(),
+        "no repository without --git-init"
+    );
+    assert!(root.join(".fl/mcp.toml").is_file());
+    assert!(
+        env.config().contains("name = \"my-project\""),
+        "{}",
+        env.config()
+    );
+    // A directory that is not a repository is a project every command accepts.
+    env.fl(&root)
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains("project\tmy-project\t").and(contains(root.to_str().unwrap())));
+}
+
+#[test]
+fn create_and_init_are_one_command_and_both_spellings_work() {
+    let env = Env::new();
+    let by_create = env.dir("by-create");
+    let by_init = env.dir("by-init");
+    let a = env.run_json(
+        "create",
+        &["Alpha", "--path", by_create.to_str().unwrap(), "--git-init"],
+    );
+    // The earlier form: the argument is the path.
+    let b = env.run_json("init", &[by_init.to_str().unwrap(), "--git-init"]);
+    // `init` with the new form, and `create` with the old.
+    let c = env.run_json("init", &["Gamma", "--path", env.dir("c").to_str().unwrap()]);
+    let d = env.run_json("create", &[env.dir("d").to_str().unwrap()]);
+    assert_eq!(
+        [&a, &b, &c, &d].map(|v| v["slug"].as_str().unwrap().to_string()),
+        ["alpha", "by-init", "gamma", "d"]
+    );
+    assert_eq!(a["git"]["initial_commit"], true);
+    assert_eq!(b["git"]["initial_commit"], true);
+    assert_eq!(c["git"], Value::Null);
+    assert_eq!(d["git"], Value::Null);
+    assert_eq!(env.config().matches("[[project]]").count(), 4);
+    // The earlier `--name` is the name; its slug is the kebab-case of it.
+    let e = env.run_json(
+        "init",
+        &[env.dir("e").to_str().unwrap(), "--name", "Big Name"],
+    );
+    assert_eq!(
+        (e["slug"].as_str(), e["name"].as_str()),
+        (Some("big-name"), Some("Big Name"))
+    );
+}
+
+#[test]
+fn a_virtual_group_has_no_directory_store_config_or_git() {
+    let env = Env::new();
+    let created = env.run_json(
+        "create",
+        &["Council", "--virtual", "--purpose", "the strategists"],
+    );
+    assert_eq!(created["slug"], "council");
+    assert_eq!(created["kind"], "virtual");
+    assert_eq!(created["path"], Value::Null);
+    assert_eq!(created["store_path"], Value::Null);
+    assert_eq!(created["has_git"], false);
+    assert_eq!(created["purpose"], "the strategists");
+    assert_eq!(created["registered"], true);
+
+    assert!(!env.config_path().exists(), "no config");
+    let made: Vec<String> = std::fs::read_dir(env.home.path().join("data/fl"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        made,
+        ["fl.fls"],
+        "only the workspace store, no per-project store"
+    );
+    assert_eq!(
+        std::fs::read_dir(env.work.path()).unwrap().count(),
+        0,
+        "no directory"
+    );
+
+    // Again: nothing changes. The area has no path.
+    let again = env.run_json("create", &["Council", "--virtual"]);
+    assert_eq!(again["registered"], false);
+    env.fl(env.work.path())
+        .args(["agent", "area", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("\"area_key\": \"council\"").and(contains("\"path\": null")));
+}
+
+#[test]
+fn a_virtual_group_takes_no_path_git_or_tracker_flags() {
+    let env = Env::new();
+    for flags in [
+        &["--path", "/x"][..],
+        &["--git-init"][..],
+        &["--github", "a/b"][..],
+        &["--credential", "env"][..],
+    ] {
+        let mut cmd = env.fl(env.work.path());
+        cmd.args(["project", "create", "Nope", "--virtual"])
+            .args(flags);
+        cmd.assert().failure().stderr(contains("cannot be used"));
+    }
+    assert!(!env.config_path().exists());
+    assert!(!env.home.path().join("data").exists());
+}
+
+#[test]
+fn a_slug_cannot_be_a_project_and_a_virtual_group() {
+    let env = Env::new();
+    env.run_json("create", &["Shared", "--virtual"]);
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "create",
+            "Shared",
+            "--path",
+            env.dir("shared").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("virtual group").and(contains("fl agent area set shared --path")));
+    assert!(!env.dir("shared").exists());
+    assert!(!env.config_path().exists());
+
+    env.run_json(
+        "create",
+        &["Solid", "--path", env.dir("solid").to_str().unwrap()],
+    );
+    env.fl(env.work.path())
+        .args(["project", "create", "Solid", "--virtual"])
+        .assert()
+        .failure()
+        .stderr(contains("directory-backed project"));
+}
+
+#[test]
+fn add_registers_a_directory_that_is_not_a_git_repository() {
+    let env = Env::new();
+    let plain = env.dir("plain-add");
+    std::fs::create_dir_all(&plain).unwrap();
+    let db = env.home.path().join("add.fls");
+    env.fl(env.work.path())
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "project",
+            "add",
+            plain.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains(plain.to_str().unwrap()));
+    assert!(!plain.join(".git").exists(), "add never runs git");
+    env.fl(env.work.path())
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "project",
+            "add",
+            "/no/such/dir",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("does not exist as a directory"));
+}
+
+#[test]
+fn list_shows_both_kinds_with_the_tracker_and_the_active_agents() {
+    let env = Env::new();
+    let root = env.dir("listed");
+    env.run_json(
+        "create",
+        &[
+            "Listed",
+            "--path",
+            root.to_str().unwrap(),
+            "--github",
+            "acme/listed",
+        ],
+    );
+    env.run_json("create", &["Council", "--virtual"]);
+    for (name, project) in [("ada", "listed"), ("bea", "council"), ("cy", "council")] {
+        env.fl(env.work.path())
+            .args([
+                "agent",
+                "register",
+                name,
+                "--project",
+                project,
+                "--role",
+                "assistant",
+                "--by",
+                "owner",
+            ])
+            .assert()
+            .success();
+    }
+    let out = env
+        .fl(env.work.path())
+        .args(["project", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: Vec<Value> = serde_json::from_slice(&out).unwrap();
+    assert_eq!(listed.len(), 2);
+    let by = |slug: &str| listed.iter().find(|p| p["slug"] == slug).unwrap();
+    assert_eq!(by("listed")["kind"], "project");
+    assert_eq!(by("listed")["tracker"]["repo"], "acme/listed");
+    assert_eq!(by("listed")["active_agent_count"], 1);
+    assert_eq!(by("council")["kind"], "virtual");
+    assert_eq!(by("council")["active_agent_count"], 2);
+    assert_eq!(by("council")["path"], Value::Null);
+    env.fl(env.work.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(
+            contains(format!(
+                "project\tlisted\t{}\tacme/listed\t1\n",
+                root.display()
+            ))
+            .and(contains("virtual\tcouncil\t-\t-\t2\n")),
+        );
 }
