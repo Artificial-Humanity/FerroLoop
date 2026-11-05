@@ -11,6 +11,7 @@ import {
   type PromptResponse,
   type QueuedOperatorPrompt,
   type QuotaWindowUsage,
+  type ContextWindowSource,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type SetSessionModelResponse,
@@ -720,57 +721,51 @@ export function getVendorModelOptions(
 export const BASE_SYSTEM_OVERHEAD_TOKENS = 12_000;
 
 export interface EstimatedContextUsage {
-  usedTokens: number;
-  maxTokens: number;
-  percent: number;
-}
-
-function maxTokensForAdapter(adapter?: string | null): number {
-  const normalized = (adapter ?? "").trim().toLowerCase();
-  if (
-    normalized === "antigravity" ||
-    normalized === "agy" ||
-    normalized === "argon" ||
-    normalized === "gemini" ||
-    normalized === "muse" ||
-    normalized.startsWith("muse-") ||
-    normalized === "claude" ||
-    normalized.startsWith("claude-")
-  ) {
-    return 1_000_000;
-  }
-  if (
-    normalized === "grok" ||
-    normalized.startsWith("grok-") ||
-    normalized === "codex" ||
-    normalized.startsWith("codex-")
-  ) {
-    return 500_000;
-  }
-  return 200_000;
+  /** Tokens in use; `null` when the hub reported nothing and there is no transcript to estimate from. */
+  usedTokens: number | null;
+  /** The window the hub reported; `null` when it named none (this code never invents one). */
+  maxTokens: number | null;
+  /** `usedTokens / maxTokens` in percent; `null` whenever there is no maximum. */
+  percent: number | null;
+  /** How the hub found `maxTokens`; `null` when unknown (no usage, or an older hub). */
+  source?: ContextWindowSource | null;
+  /** Sizes the model offers, ascending; empty or absent when the hub listed none. */
+  offeredWindows?: number[];
+  /** True when `usedTokens` is a local estimate from the loaded transcript, not a hub report. */
+  estimated?: boolean;
 }
 
 /**
- * Estimate active context usage from loaded transcript turns. The hub
- * returns a sliding transcript window, so this is an approximation:
- * server-reported usage, when present, always wins.
+ * Context usage for the meter. The maximum comes only from the hub's `context_usage`; with none,
+ * this returns what the loaded transcript allows (a rough used-tokens estimate) and no maximum
+ * and no percent. The hub returns a sliding transcript window, so that estimate is approximate.
  */
 export function estimateSessionContextUsage(
   turns: TranscriptTurn[],
-  adapter?: string | null,
   serverUsage?: SessionContextUsage | null,
 ): EstimatedContextUsage {
-  if (serverUsage && serverUsage.max_tokens > 0) {
+  if (serverUsage) {
     const usedTokens = Math.max(0, serverUsage.used_tokens);
+    const hasMax = serverUsage.max_tokens > 0;
     return {
       usedTokens,
-      maxTokens: serverUsage.max_tokens,
-      percent: Math.min(100, Math.round((usedTokens / serverUsage.max_tokens) * 100)),
+      maxTokens: hasMax ? serverUsage.max_tokens : null,
+      percent: hasMax
+        ? Math.min(100, Math.round((usedTokens / serverUsage.max_tokens) * 100))
+        : null,
+      source: hasMax ? (serverUsage.source ?? null) : null,
+      offeredWindows: hasMax ? (serverUsage.offered_windows ?? []) : [],
+      estimated: false,
     };
   }
-  const maxTokens = maxTokensForAdapter(adapter);
+  const none = {
+    maxTokens: null,
+    percent: null,
+    source: null,
+    offeredWindows: [],
+  };
   if (!turns || turns.length === 0) {
-    return { usedTokens: 0, maxTokens, percent: 0 };
+    return { ...none, usedTokens: null, estimated: false };
   }
   let boundaryIndex = -1;
   for (let i = turns.length - 1; i >= 0; i -= 1) {
@@ -789,11 +784,7 @@ export function estimateSessionContextUsage(
       JSON.stringify(turn.tool_calls ?? []).length;
     usedTokens += Math.ceil(chars / 4);
   }
-  return {
-    usedTokens,
-    maxTokens,
-    percent: Math.min(100, Math.round((usedTokens / maxTokens) * 100)),
-  };
+  return { ...none, usedTokens, estimated: true };
 }
 
 export function formatTokenCount(value: number): string {
@@ -804,6 +795,31 @@ export function formatTokenCount(value: number): string {
     return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
   }
   return String(value);
+}
+
+/** Tooltip for a context window's source; an unknown source (older hub) makes no claim. */
+export function contextWindowSourceTitle(
+  source: ContextWindowSource | null | undefined,
+): string | undefined {
+  switch (source) {
+    case "assumed":
+      return "No vendor file or setting names this session's window; this is a default";
+    case "reported":
+      return "Window reported by the session";
+    case "catalog":
+      return "Window from the vendor's model catalog";
+    default:
+      return undefined;
+  }
+}
+
+/** The maximum as shown to the operator: an assumed window reads "about 1m, assumed". */
+export function formatContextMax(
+  maxTokens: number,
+  source: ContextWindowSource | null | undefined,
+): string {
+  const text = formatTokenCount(maxTokens);
+  return source === "assumed" ? `about ${text}, assumed` : text;
 }
 
 export function hasQuotaUsageData(quota?: SessionQuotaUsage | null): boolean {
@@ -1327,10 +1343,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     () =>
       estimateSessionContextUsage(
         effectiveTurns,
-        adapter,
         contextUsage ?? internalContextUsage,
       ),
-    [effectiveTurns, adapter, contextUsage, internalContextUsage],
+    [effectiveTurns, contextUsage, internalContextUsage],
   );
   const effectiveQuotaUsage = quotaUsage ?? internalQuotaUsage;
   const showQuotaBadge = hasQuotaUsageData(effectiveQuotaUsage);
@@ -1342,6 +1357,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         (effectiveQuotaUsage.secondary_window?.used_percent ?? 0) >= 100),
   );
   const canCompact =
+    contextEstimate.percent !== null &&
     contextEstimate.percent >= 50 &&
     Boolean(targetSessionOrAgent) &&
     !compacting &&

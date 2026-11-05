@@ -149,93 +149,75 @@ describe("background task output guard", () => {
 });
 
 describe("estimateSessionContextUsage", () => {
-  it("returns zero usage for an empty transcript", () => {
-    expect(estimateSessionContextUsage([], "claude")).toEqual({
-      usedTokens: 0,
-      maxTokens: 1_000_000,
-      percent: 0,
+  it("returns no usage and no maximum for an empty transcript with no server usage", () => {
+    expect(estimateSessionContextUsage([])).toEqual({
+      usedTokens: null,
+      maxTokens: null,
+      percent: null,
+      source: null,
+      offeredWindows: [],
+      estimated: false,
     });
   });
 
-  it("estimates overhead plus content, thinking, and tool calls below 50%", () => {
-    const usage = estimateSessionContextUsage(
-      [turn({ index: 0, content: "x".repeat(400) })],
-      null,
-    );
+  it("estimates overhead plus content, thinking, and tool calls as used tokens only", () => {
+    const usage = estimateSessionContextUsage([turn({ index: 0, content: "x".repeat(400) })]);
     // 12_000 overhead + ceil((400 + 0 + 2) / 4) for content + "[]" tool calls.
     expect(usage.usedTokens).toBe(12_101);
-    expect(usage.maxTokens).toBe(200_000);
-    expect(usage.percent).toBe(6);
-  });
-
-  it("crosses the 50% threshold on a large transcript and caps at 100%", () => {
-    const usage = estimateSessionContextUsage(
-      [turn({ index: 0, content: "x".repeat(360_000) })],
-      null,
-    );
-    expect(usage.percent).toBe(51);
-    expect(usage.percent).toBeGreaterThanOrEqual(50);
-
-    const capped = estimateSessionContextUsage(
-      [turn({ index: 0, content: "x".repeat(2_000_000) })],
-      null,
-    );
-    expect(capped.percent).toBe(100);
+    expect(usage.estimated).toBe(true);
+    // The estimate never invents a window: no maximum and no percent.
+    expect(usage.maxTokens).toBeNull();
+    expect(usage.percent).toBeNull();
+    expect(usage.source).toBeNull();
   });
 
   it("resets the estimate at the last compaction boundary", () => {
-    const usage = estimateSessionContextUsage(
-      [
-        turn({ index: 0, content: "x".repeat(360_000) }),
-        turn({ index: 1, content: "[Compacted context] Earlier work summary." }),
-        turn({ index: 2, content: "Next step." }),
-      ],
-      null,
-    );
+    const usage = estimateSessionContextUsage([
+      turn({ index: 0, content: "x".repeat(360_000) }),
+      turn({ index: 1, content: "[Compacted context] Earlier work summary." }),
+      turn({ index: 2, content: "Next step." }),
+    ]);
     // Only the boundary turn and the short follow-up count toward usage.
     expect(usage.usedTokens).toBeLessThan(13_000);
-    expect(usage.percent).toBeLessThan(50);
   });
 
-  it("uses 1M windows for antigravity-family, muse, and claude adapters and 500k for grok and codex", () => {
-    for (const adapter of [
-      "antigravity",
-      "agy",
-      "argon",
-      "gemini",
-      "muse",
-      "muse-wonder",
-      "muse-wonder-full",
-      "claude",
-      "claude-sonnet-4-5",
-      "claude-haiku-5-5",
-    ]) {
-      expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(1_000_000);
-    }
-    for (const adapter of ["codex", "grok"]) {
-      expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(500_000);
-    }
-    expect(estimateSessionContextUsage([], null).maxTokens).toBe(200_000);
+  it("takes the maximum, percent, source and offered sizes only from the server usage", () => {
+    expect(
+      estimateSessionContextUsage([turn({ index: 0, content: "hi" })], {
+        used_tokens: 150_000,
+        max_tokens: 200_000,
+      }),
+    ).toEqual({
+      usedTokens: 150_000,
+      maxTokens: 200_000,
+      percent: 75,
+      source: null,
+      offeredWindows: [],
+      estimated: false,
+    });
+    expect(
+      estimateSessionContextUsage([], {
+        used_tokens: 5,
+        max_tokens: 256_000,
+        source: "catalog",
+        offered_windows: [256_000, 500_000],
+      }),
+    ).toMatchObject({ source: "catalog", offeredWindows: [256_000, 500_000] });
+    // A percent above 100 is capped.
+    expect(
+      estimateSessionContextUsage([], { used_tokens: 300_000, max_tokens: 200_000 }).percent,
+    ).toBe(100);
+    // A server maximum of zero names no window.
+    expect(
+      estimateSessionContextUsage([], { used_tokens: 7, max_tokens: 0, source: "assumed" }),
+    ).toMatchObject({ usedTokens: 7, maxTokens: null, percent: null, source: null });
+  });
+
+  it("formats token counts", () => {
     expect(formatTokenCount(1_000_000)).toBe("1m");
     expect(formatTokenCount(1_500_000)).toBe("1.5m");
     expect(formatTokenCount(500_000)).toBe("500k");
     expect(formatTokenCount(200_000)).toBe("200k");
-  });
-
-  it("prefers server usage and uses 500k context defaults for grok and codex", () => {
-    expect(
-      estimateSessionContextUsage([turn({ index: 0, content: "hi" })], "grok"),
-    ).toMatchObject({ maxTokens: 500_000 });
-    expect(
-      estimateSessionContextUsage([turn({ index: 0, content: "hi" })], "codex"),
-    ).toMatchObject({ maxTokens: 500_000 });
-
-    expect(
-      estimateSessionContextUsage([], "claude", {
-        used_tokens: 150_000,
-        max_tokens: 200_000,
-      }),
-    ).toEqual({ usedTokens: 150_000, maxTokens: 200_000, percent: 75 });
   });
 });
 
@@ -302,7 +284,8 @@ describe("Compact Context button", () => {
         agentDisplayName="Ferris"
         adapter={null}
         sessionId="sess-ferris-01"
-        turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
+        turns={[turn({ index: 0, role: "user", content: "Hello" })]}
+        contextUsage={{ used_tokens: 102_000, max_tokens: 200_000, source: "reported" }}
         agentSettingsOpen={true}
         onSendPrompt={onSendPrompt}
         apiClient={apiClient}
@@ -340,7 +323,8 @@ describe("Compact Context button", () => {
         agentDisplayName="Ferris"
         adapter={null}
         sessionId="sess-ferris-01"
-        turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
+        turns={[turn({ index: 0, role: "user", content: "Hello" })]}
+        contextUsage={{ used_tokens: 102_000, max_tokens: 200_000, source: "reported" }}
         agentSettingsOpen={true}
         onSendPrompt={onSendPrompt}
         apiClient={apiClient}

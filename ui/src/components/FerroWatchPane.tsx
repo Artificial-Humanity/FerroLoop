@@ -23,6 +23,11 @@ import {
 } from "../types/api";
 import { getAdapterBadgeClass } from "./RosterSidebar";
 import {
+  contextWindowSourceTitle,
+  formatContextMax,
+  formatTokenCount,
+} from "./ChatPane";
+import {
   DEFAULT_TOKENIZER_LEDGER,
   type CountedTokenizerLedgerEntry,
 } from "./FerroStatePane";
@@ -2412,6 +2417,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   const key = item.agent.trim().toLowerCase();
                   const hosted = item.hosted_session;
                   const vendor = hosted?.vendor ?? item.adapter ?? null;
+                  const contextUsage =
+                    sessions.find((sess) => sess.id === hosted?.session_id)
+                      ?.context_usage ??
+                    sessions.find(
+                      (sess) => (sess.persona || sess.id).trim().toLowerCase() === key,
+                    )?.context_usage ??
+                    null;
 
                   return (
                     <div
@@ -2516,6 +2528,38 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                             ? ` (${formatTimestamp(new Date(item.heartbeat_at_ms).toISOString(), activeTimeZone)})`
                             : ""}
                         </span>
+                      </div>
+
+                      <div
+                        data-testid={`watch-liveness-context-${key}`}
+                        data-source={contextUsage?.source ?? "unknown"}
+                        className="fd-mono"
+                        style={{
+                          fontSize: "10px",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {contextUsage && contextUsage.max_tokens > 0 ? (
+                          <>
+                            Context: {formatTokenCount(contextUsage.used_tokens)} /{" "}
+                            <span
+                              data-testid={`watch-liveness-context-max-${key}`}
+                              title={contextWindowSourceTitle(contextUsage.source)}
+                            >
+                              {formatContextMax(
+                                contextUsage.max_tokens,
+                                contextUsage.source,
+                              )}
+                            </span>
+                          </>
+                        ) : contextUsage ? (
+                          <>
+                            Context: {formatTokenCount(contextUsage.used_tokens)} used,
+                            window not reported
+                          </>
+                        ) : (
+                          "Context: not reported"
+                        )}
                       </div>
 
                       {hosted && (
