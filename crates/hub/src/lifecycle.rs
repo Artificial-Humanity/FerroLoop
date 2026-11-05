@@ -16,7 +16,7 @@ use fl_core::state::{
     HandoffEntry, MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload,
     StateScope, UpsertStateArgs, validate_slug,
 };
-use fl_core::store::{AgentRegistry, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, Catalog, StateStore, StoreError};
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
 use fl_exec::stamp;
 use fl_wire::dispatcher::{PushError, push_operator_prompt_to_route};
@@ -155,6 +155,9 @@ pub struct LifecycleEnv<'a> {
     pub runtime: &'a dyn SessionRuntime,
     /// Tells whether an API vendor's key is provisioned: [`HostKeyProbe`], or a fake in tests.
     pub key_probe: &'a dyn ApiKeyProbe,
+    /// Parent of the hub repository. A spin-up with no `cwd` may use a child directory
+    /// whose name matches the project. `None` leaves an unresolved `cwd` unset.
+    pub workspace_root: Option<&'a Path>,
 }
 
 impl<'a> LifecycleEnv<'a> {
@@ -167,6 +170,7 @@ impl<'a> LifecycleEnv<'a> {
             spawn_runtime: !disabled,
             runtime: &TmuxRuntime,
             key_probe: &HostKeyProbe,
+            workspace_root: None,
         }
     }
 }
@@ -514,9 +518,39 @@ fn launch_spec_for(
     };
     argv.push(muse_prompt_argument(prompt));
     Some(LaunchSpec {
-        env: vec![("AGENT_PERSONA".into(), persona.into())],
+        env: launch_env(persona, home.as_deref()),
         argv,
     })
+}
+
+/// `AGENT_PERSONA` plus a `PATH` that starts with `<home>/.local/bin` when that
+/// directory is not already a `PATH` entry. A new tmux session otherwise inherits
+/// the hub service path, which does not contain `fl`.
+pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = vec![("AGENT_PERSONA".into(), persona.into())];
+    if let Some(path) = path_with_local_bin(home) {
+        env.push(("PATH".into(), path));
+    }
+    env
+}
+
+fn path_with_local_bin(home: Option<&Path>) -> Option<String> {
+    let local = home?.join(".local").join("bin");
+    let current = std::env::var("PATH").unwrap_or_default();
+    Some(with_local_bin(&local, &current))
+}
+
+/// `path` unchanged when `local` is already a component; otherwise `local` first.
+fn with_local_bin(local: &Path, path: &str) -> String {
+    if std::env::split_paths(path).any(|entry| entry == local) {
+        return path.to_string();
+    }
+    let local = local.to_string_lossy();
+    if path.is_empty() {
+        local.into_owned()
+    } else {
+        format!("{local}:{path}")
+    }
 }
 
 /// The prompt as Muse's positional argument. Muse's CLI rejects a bare `--`, so nothing can
@@ -628,6 +662,7 @@ impl FakeRuntime {
             spawn_runtime: true,
             runtime: self,
             key_probe: &ProvisionedKeys,
+            workspace_root: None,
         }
     }
 
@@ -2009,18 +2044,58 @@ fn remove_routes_locked(
 /// The record is written before tmux starts, so a runtime this call opens always has a record
 /// that teardown can find; the record is then updated with what actually started.
 ///
+/// Directory a spin-up should start in when the request names none.
+///
+/// A catalog project whose directory name matches `project` wins. Otherwise a child of
+/// `workspace_root` with that name wins. Anything else stays unset, so the caller does
+/// not invent a path.
+fn resolve_project_cwd<S: Catalog>(
+    store: &S,
+    project: &str,
+    workspace_root: Option<&Path>,
+) -> Option<String> {
+    if let Ok(projects) = store.list_projects() {
+        for item in projects {
+            let root = Path::new(item.root.trim());
+            let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(project) && root.is_dir() {
+                return Some(root.display().to_string());
+            }
+        }
+    }
+    let workspace = workspace_root?;
+    let entries = std::fs::read_dir(workspace).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(project)
+        {
+            return Some(path.display().to_string());
+        }
+    }
+    None
+}
+
 /// `caller` gates hosting an unmanaged agent: an Active agent with no LIVE hosted record for this
 /// session (none, or a decommissioned one left from an earlier teardown) becomes hosted by the
 /// spin-up, after which a peer's teardown would be allowed, so only the owner may do it. A peer
 /// may still spin up a new or retired persona, or re-spin a session whose hosted record is live.
-pub fn spin_up<S: AgentRegistry + StateStore>(
+pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     req: &SpinUpRequest,
     by: &str,
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
-    let v = req.validate()?;
+    let mut v = req.validate()?;
+    if v.cwd.is_none() {
+        v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root);
+    }
     // Before any side effect: an API vendor whose key is missing would register an agent that
     // can never run.
     check_api_key(env, &v.vendor)?;
@@ -2488,8 +2563,9 @@ pub fn authorize_teardown<S: AgentRegistry>(
 /// the agent, and mark the record `decommissioned`. Safe to repeat.
 ///
 /// `caller` gates adopting a session that has no hosted record (owner only). `clear_queue` is
-/// called with each id the session may be queued under. Everything that can fail on a lookup
-/// runs before the first side effect.
+/// called with each id the session may be queued under. Another running session of the same
+/// persona keeps the persona key and the persona route; the session ids are still cleared.
+/// Everything that can fail on a lookup runs before the first side effect.
 pub fn teardown_session<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -2514,14 +2590,30 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         record.runtime_spawned = false;
     }
 
+    // Another running session of this persona (a second vendor) still owns the registry
+    // record, the persona route, and the persona-keyed queue. One lookup covers the route
+    // and queue decision and the retire guard below.
+    let persona_still_running = list_hosted_sessions(store)?.iter().any(|other| {
+        other.session_id != record.session_id
+            && other.persona.eq_ignore_ascii_case(&target.persona)
+            && other.status.eq_ignore_ascii_case(STATUS_RUNNING)
+    });
     for key in target.keys() {
+        if persona_still_running && key.eq_ignore_ascii_case(&target.persona) {
+            continue;
+        }
         clear_queue(key);
     }
-    remove_routes(
-        env.home_override,
-        &[target.persona.as_str()],
-        &[target.session_id.as_str(), target.raw_id.as_str()],
-    );
+    let session_ids = [
+        target.session_id.as_str(),
+        target.raw_id.as_str(),
+        target.discovered_id.as_str(),
+    ];
+    if persona_still_running {
+        remove_routes(env.home_override, &[], &session_ids);
+    } else {
+        remove_routes(env.home_override, &[target.persona.as_str()], &session_ids);
+    }
 
     // `true` only for a runtime this lifecycle started and has now stopped. A runtime it did not
     // start, one still running for the sessions that share it, or none at all (runtime calls are
@@ -2544,6 +2636,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
 
     if let Some(agent) = agent
         && agent.status == AgentStatus::Active
+        && !persona_still_running
     {
         store.retire_agent(&agent.id, stamp::now(), by)?;
     }
@@ -3128,7 +3221,7 @@ type SpinUpFn<'f, S> = dyn FnMut(
 /// handler holds its `HubStoreGuard` (one process-wide store lock) from target resolution to
 /// the end of the call. `fl agent remodel` is a separate process and is not serialized with the
 /// hub, as `fl agent spin-up` and `decommission` are not.
-pub fn remodel_session<S: AgentRegistry + StateStore>(
+pub fn remodel_session<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -3167,7 +3260,7 @@ thread_local! {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn remodel_with<S: AgentRegistry + StateStore>(
+fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -3462,6 +3555,7 @@ mod tests {
             spawn_runtime: false,
             runtime: &TmuxRuntime,
             key_probe: &ProvisionedKeys,
+            workspace_root: None,
         }
     }
 
@@ -4055,6 +4149,234 @@ mod tests {
         assert_eq!(rec.status, "decommissioned");
 
         teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+    }
+
+    #[test]
+    fn spin_up_uses_the_catalog_project_directory_when_cwd_is_unset() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let project_dir = workspace.path().join("FerroLoop");
+        std::fs::create_dir(&project_dir).unwrap();
+        store
+            .add_project(&project_dir.display().to_string())
+            .unwrap();
+        let out = spin_up(
+            &store,
+            &env(&home),
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let rec = find_hosted_session(&store, &[&out.session_id])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.cwd.as_deref(), Some(project_dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn spin_up_uses_a_workspace_sibling_when_the_catalog_has_no_project() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let project_dir = workspace.path().join("notes");
+        std::fs::create_dir(&project_dir).unwrap();
+        let mut request = req("felicity", "assistant", "claude");
+        request.project = "notes".into();
+        let mut env = env(&home);
+        env.workspace_root = Some(workspace.path());
+        spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+        let rec = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.cwd.as_deref(), Some(project_dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_explicit_cwd_is_kept() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let mut request = req("felicity", "assistant", "claude");
+        request.cwd = Some("/tmp/kept".into());
+        spin_up(&store, &env(&home), &request, "owner", Caller::Owner).unwrap();
+        let rec = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.cwd.as_deref(), Some("/tmp/kept"));
+    }
+
+    #[test]
+    fn teardown_does_not_retire_a_persona_that_still_has_a_running_session() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut other = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        other.session_id = "codex:felicity".into();
+        other.vendor = "codex".into();
+        other.tmux_target = Some("Felicity:codex".into());
+        other.status = STATUS_RUNNING.into();
+        persist_hosted_session(&store, &other, "owner").unwrap();
+
+        let claude = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        teardown_session(&store, &env, &claude, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+
+        let codex = SessionTarget::resolve(&store, "codex:felicity", None).unwrap();
+        teardown_session(&store, &env, &codex, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+    }
+
+    #[test]
+    fn teardown_keeps_a_running_siblings_route_and_persona_queue() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut other = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        other.session_id = "codex:felicity".into();
+        other.vendor = "codex".into();
+        other.tmux_target = Some("Felicity:codex".into());
+        other.status = STATUS_RUNNING.into();
+        persist_hosted_session(&store, &other, "owner").unwrap();
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "felicity",
+            VendorRoute::Codex {
+                thread_id: "thread-felicity".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        routes.save(Some(&path)).unwrap();
+
+        let claude = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        let mut cleared = Vec::new();
+        teardown_session(&store, &env, &claude, "owner", Caller::Owner, |k| {
+            cleared.push(k.to_string())
+        })
+        .unwrap();
+
+        let table = RouteTable::load(Some(&path));
+        let route = &table.get("felicity").expect("felicity route").route;
+        assert!(
+            matches!(
+                route,
+                VendorRoute::Codex {
+                    thread_id,
+                    cwd: None,
+                } if thread_id == "thread-felicity"
+            ),
+            "{route:?}"
+        );
+        assert!(cleared.iter().any(|key| key == "claude:felicity"));
+        assert!(
+            !cleared
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case("felicity"))
+        );
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+        let rec = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, STATUS_DECOMMISSIONED);
+    }
+
+    #[test]
+    fn teardown_retires_a_persona_whose_only_sibling_is_decommissioning() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut other = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        other.session_id = "codex:felicity".into();
+        other.vendor = "codex".into();
+        other.tmux_target = Some("Felicity:codex".into());
+        // `decommissioning` is live to `is_live_hosted`, but it must not block retire.
+        other.status = STATUS_DECOMMISSIONING.into();
+        persist_hosted_session(&store, &other, "owner").unwrap();
+
+        let claude = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        teardown_session(&store, &env, &claude, "owner", Caller::Owner, |_| {}).unwrap();
+        let rec = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, STATUS_DECOMMISSIONED);
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+    }
+
+    #[test]
+    fn launch_path_prepends_the_user_local_bin_once() {
+        let home = TempDir::new().unwrap();
+        let spec =
+            launch_spec_for(&env(&home), "codex", "felicia", None, "Take up residence.").unwrap();
+        let path = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        let local = home.path().join(".local/bin");
+        let local_bin = local.to_string_lossy();
+        assert!(path.starts_with(local_bin.as_ref()), "{path}");
+        let components = |value: &str| {
+            std::env::split_paths(value)
+                .filter(|entry| entry == &local)
+                .count()
+        };
+        assert_eq!(components(path), 1, "{path}");
+        // Process PATH is shared with other hub tests. A string that already
+        // contains this directory once must come back unchanged.
+        let seeded = format!("{local_bin}:/usr/bin");
+        let again = with_local_bin(&local, &seeded);
+        assert_eq!(again, seeded);
+        assert_eq!(components(&again), 1, "{again}");
     }
 
     #[test]
