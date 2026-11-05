@@ -1,0 +1,1 @@
+REFUSED: Codex cannot enforce `deny fs_write_protected (canonical default)` (FsWriteProtected) and the policy does not acknowledge unenforced defaults

@@ -1,0 +1,1 @@
+REFUSED: Antigravity cannot enforce `deny network_web`: the vendor has no native deny for this capability

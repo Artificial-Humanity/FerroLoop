@@ -51,6 +51,11 @@ File naming in this directory follows
 * [vendor-child-env.md](vendor-child-env.md) — the environment a spawned vendor CLI sees: the
   allow-list, each dialect's own credential variables, what is denied, and how to add a variable
   with `[adapters.<name>] env_pass` (corporate proxy and Bedrock examples).
+* [permissions.md](permissions.md) — the canonical permission policy (posture, sandbox, typed
+  capability rules), the four presets, and the pure fail-closed compiler into Claude Code,
+  Codex, Muse, Grok and Antigravity native forms: receipts, evidence classes, change classes,
+  the refusals, and what is not built yet. Design:
+  [the universal permissions spec](superpowers/specs/2026-11-03-universal-permissions-design.md).
 
 ## CLI & Hub capabilities overview
 

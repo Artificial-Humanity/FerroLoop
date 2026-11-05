@@ -1,0 +1,34 @@
+== launch_args ==
+--approval-mode
+untrusted
+--approval-judge
+off
+--permission-profile
+ro
+--sandbox-network
+restricted
+== receipts ==
+[Exact/Documented] Posture Axis: posture Plan -> --approval-mode ; untrusted ; --approval-judge ; off | plan is carried by the read-only profile
+[Exact/Documented] Posture Axis: permission profile -> --permission-profile ; ro | the strongest caller-verified profile within the policy (ceiling ReadOnly); its content is asserted by the facts
+[Exact/Documented] Sandbox Axis: sandbox vendor-default ->  | separate axis from approvals; launch-fixed
+[Exact/Documented] Capability(FsReadWorkspace) Rule: allow fs_read_workspace ->  | profiles read the workspace
+[Exact/Documented] Capability(FsReadExternal) Default: ask fs_read_external (canonical default) ->  | the approval mode and profile decide unmatched requests
+[Exact/Documented] Capability(FsWriteWorkspace) Rule: deny fs_write_workspace ->  | the read-only profile blocks every workspace write (stricter for a pattern, a class or an ask)
+[Exact/Documented] Capability(FsWriteExternal) Default: ask fs_write_external (canonical default) ->  | the approval mode and profile decide unmatched requests
+[StricterDowngrade/Unsupported] Capability(FsWriteProtected) Default: deny fs_write_protected (canonical default) ->  | no protected-path concept: the read-only profile blocks every workspace write (stricter)
+[Exact/Documented] Capability(ShellExec) Default: ask shell_exec (canonical default) ->  | the approval mode and profile decide unmatched requests
+[Exact/Documented] Capability(NetworkWeb) Rule: deny network_web -> --sandbox-network restricted | network mode restricted (a domain deny or an ask has no native form: every host is blocked)
+[Exact/Documented] Capability(McpToolCall) Default: ask mcp_tool_call (canonical default) ->  | the approval mode and profile decide unmatched requests
+== change classes ==
+Posture Respawn
+Sandbox Respawn
+Rules(FsReadWorkspace) Respawn
+Rules(FsReadExternal) Respawn
+Rules(FsWriteWorkspace) Respawn
+Rules(FsWriteExternal) Respawn
+Rules(FsWriteProtected) Respawn
+Rules(ShellExec) Respawn
+Rules(NetworkWeb) Respawn
+Rules(McpToolCall) Respawn
+requires_respawn true
+unenforced []
