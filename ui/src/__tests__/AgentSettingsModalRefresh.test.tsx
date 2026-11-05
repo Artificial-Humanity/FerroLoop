@@ -222,6 +222,53 @@ describe("AgentSettingsModal latches an operator choice over a fetched session v
     await waitFor(() => expect(mode()).toHaveTextContent("Plan"));
     expect(badge()).toHaveTextContent("claude-opus-5-5 (low)");
     expect(badge()).not.toHaveTextContent("claude-sonnet-5-5");
+    expect(modelSelect().value).toBe("claude-opus-5-5");
+  });
+
+  it("keeps a pick made after a rapid close and reopen when the first, stale response lands last", async () => {
+    const first = deferred();
+    const second = deferred();
+    const getSessions = vi
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const apiClient = clientWith(getSessions);
+    const { rerender } = render(<AgentSettingsModal {...modalProps({ apiClient })} />);
+    await waitFor(() => expect(getSessions).toHaveBeenCalledTimes(1));
+    rerender(<AgentSettingsModal {...modalProps({ apiClient, isOpen: false })} />);
+    rerender(<AgentSettingsModal {...modalProps({ apiClient })} />);
+    await waitFor(() => expect(getSessions).toHaveBeenCalledTimes(2));
+
+    // The operator picks a model while both requests are still in flight, and the parent
+    // passes the choice back as the prop.
+    fireEvent.change(modelSelect(), { target: { value: "claude-opus-5-5" } });
+    rerender(
+      <AgentSettingsModal {...modalProps({ apiClient, selectedModel: "claude-opus-5-5" })} />,
+    );
+    expect(modelSelect().value).toBe("claude-opus-5-5");
+
+    await act(async () => {
+      second.resolve({
+        sessions: [session({ model: "claude-sonnet-5-5", execution_mode: "plan" })],
+      });
+      await second.promise;
+    });
+    // The current response landed (its mode shows) and the pick survives it.
+    await waitFor(() => expect(mode()).toHaveTextContent("Plan"));
+    expect(modelSelect().value).toBe("claude-opus-5-5");
+
+    // The stale response of the first open lands last and is ignored.
+    await act(async () => {
+      first.resolve({
+        sessions: [session({ model: "claude-haiku-4-5", execution_mode: "yolo" })],
+      });
+      await first.promise;
+    });
+    expect(modelSelect().value).toBe("claude-opus-5-5");
+    expect(badge()).toHaveTextContent("claude-opus-5-5");
+    expect(badge()).not.toHaveTextContent("claude-haiku-4-5");
+    expect(mode()).toHaveTextContent("Plan");
+    expect(mode()).not.toHaveTextContent("Yolo");
   });
 
   it("keeps a thinking level picked while the request was in flight over the late response", async () => {
