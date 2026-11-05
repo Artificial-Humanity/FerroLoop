@@ -6,6 +6,15 @@ import type {
   ProjectKind,
   ProjectSummary,
 } from "../../types/api";
+import {
+  ERROR_TEXT_STYLE,
+  FIELD_STYLE,
+  HELP_STYLE,
+  LABEL_STYLE,
+  trapTabKey,
+  validateGithubTracker,
+  validateProjectPath,
+} from "./projectModalShared";
 
 export interface NewProjectModalProps {
   isOpen: boolean;
@@ -23,11 +32,6 @@ export interface NewProjectModalProps {
 }
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-// owner/repo: each segment starts alphanumeric, then [\w.-]; the repo may not
-// end in ".git" (so "." and ".." can never match either).
-const GITHUB_PATTERN = /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/;
-const FOCUSABLE =
-  'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
 export function deriveProjectSlug(name: string): string {
   return name
@@ -37,30 +41,6 @@ export function deriveProjectSlug(name: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
 }
-
-const LABEL_STYLE = {
-  fontSize: "11.5px",
-  fontWeight: 600,
-  color: "var(--text-secondary)",
-} as const;
-
-const HELP_STYLE = {
-  fontSize: "11px",
-  color: "var(--text-muted)",
-  margin: 0,
-} as const;
-
-const ERROR_TEXT_STYLE = {
-  fontSize: "11px",
-  color: "var(--diff-del-text)",
-  margin: 0,
-} as const;
-
-const FIELD_STYLE = {
-  display: "flex",
-  flexDirection: "column",
-  gap: "4px",
-} as const;
 
 function NewProjectForm({
   apiClient,
@@ -115,15 +95,8 @@ function NewProjectForm({
   else if (existingSlugs.includes(trimmedSlug))
     errors.slug = `A project or group with the slug "${trimmedSlug}" already exists.`;
   if (isProject) {
-    if (!trimmedPath) errors.path = "Directory path is required.";
-    else if (!trimmedPath.startsWith("/"))
-      // The hub is not known to expand "~", so only absolute paths pass.
-      errors.path = "Directory path must be absolute (start with /).";
-    if (
-      trimmedGithub &&
-      (!GITHUB_PATTERN.test(trimmedGithub) || trimmedGithub.endsWith(".git"))
-    )
-      errors.github = "GitHub tracker must look like owner/repo.";
+    errors.path = validateProjectPath(trimmedPath);
+    errors.github = validateGithubTracker(trimmedGithub);
   }
   const shown = attempted ? errors : {};
 
@@ -149,31 +122,8 @@ function NewProjectForm({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  const trapTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Tab" || !dialogRef.current) return;
-    // Browsers tab only to the checked radio of a group.
-    const items = Array.from(
-      dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE),
-    ).filter(
-      (el) =>
-        !(el as HTMLInputElement).disabled &&
-        !(el instanceof HTMLInputElement && el.type === "radio" && !el.checked),
-    );
-    if (items.length === 0) {
-      event.preventDefault();
-      return;
-    }
-    const first = items[0];
-    const last = items[items.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey && (active === first || !dialogRef.current.contains(active))) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && (active === last || !dialogRef.current.contains(active))) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
+  const trapTab = (event: React.KeyboardEvent<HTMLDivElement>) =>
+    trapTabKey(event, dialogRef.current);
 
   const changeName = (value: string) => {
     setName(value);

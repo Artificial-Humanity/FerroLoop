@@ -360,7 +360,7 @@ describe("Settings Projects tab", () => {
     ).toBeInTheDocument();
   });
 
-  it("passes the project to the Edit, Delete and Create callbacks", () => {
+  it("passes the project and the clicked button to the Edit, Delete and Create callbacks", () => {
     const onCreate = vi.fn();
     const onEdit = vi.fn();
     const onDelete = vi.fn();
@@ -389,8 +389,14 @@ describe("Settings Projects tab", () => {
     expect(onCreate).toHaveBeenCalledWith(
       screen.getByTestId("settings-projects-create-btn"),
     );
-    expect(onEdit).toHaveBeenCalledWith(GIT);
-    expect(onDelete).toHaveBeenCalledWith(GIT);
+    expect(onEdit).toHaveBeenCalledWith(
+      GIT,
+      screen.getByTestId("settings-project-edit-ferroloop"),
+    );
+    expect(onDelete).toHaveBeenCalledWith(
+      GIT,
+      screen.getByTestId("settings-project-delete-ferroloop"),
+    );
     expect(onViewAgents).toHaveBeenCalledWith("ferroloop");
   });
 
@@ -633,6 +639,415 @@ describe("Settings Projects tab", () => {
       expect(screen.getByTestId("new-project-name")).toHaveValue("Fresh");
       expect(onProjectsChanged).not.toHaveBeenCalled();
       expect(screen.queryByTestId("settings-project-card-fresh")).toBeNull();
+    });
+  });
+  describe("edit flow", () => {
+    const patchHandler =
+      (slug: string, respond: (body: Record<string, unknown>) => ProjectSummary) =>
+      (url: string, method: string, body: unknown): Response | null =>
+        url.endsWith(`/api/v1/projects/${slug}`) && method === "PATCH"
+          ? json(respond(body as Record<string, unknown>))
+          : null;
+
+    it("opens the Edit modal from the card and focuses Name", async () => {
+      const { client } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      expect(screen.queryByTestId("edit-project-modal")).toBeNull();
+      fireEvent.click(screen.getByTestId("settings-project-edit-ferroloop"));
+      expect(screen.getByTestId("edit-project-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("edit-project-name")).toHaveValue("FerroLoop");
+      expect(screen.getByTestId("edit-project-name")).toHaveFocus();
+    });
+
+    it("sends only the changed fields, updates the card and calls onProjectsChanged once", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client, calls } = makeClient(
+        [PLAIN, GIT, GROUP],
+        patchHandler("ferroloop", (b) => ({ ...GIT, ...b }) as ProjectSummary),
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-ferroloop"));
+      fireEvent.change(screen.getByTestId("edit-project-name"), {
+        target: { value: "Ferro Loop" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("edit-project-submit"));
+      });
+      expect(screen.queryByTestId("edit-project-modal")).toBeNull();
+      expect(
+        calls.find((c) => c.method === "PATCH")?.body,
+      ).toEqual({ name: "Ferro Loop" });
+      expect(screen.getAllByTestId("settings-project-card-ferroloop")).toHaveLength(1);
+      expect(screen.getByTestId("settings-project-card-ferroloop")).toHaveTextContent(
+        "Ferro Loop",
+      );
+      expect(onProjectsChanged).toHaveBeenCalledTimes(1);
+    });
+
+    it("clearing the tracker sends github: null", async () => {
+      const { client, calls } = makeClient(
+        [PLAIN, GIT, GROUP],
+        patchHandler("ferroloop", (b) => ({ ...GIT, tracker: null, ...b }) as ProjectSummary),
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-ferroloop"));
+      fireEvent.change(screen.getByTestId("edit-project-github"), {
+        target: { value: "" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("edit-project-submit"));
+      });
+      expect(calls.find((c) => c.method === "PATCH")?.body).toEqual({ github: null });
+      expect(screen.getByTestId("settings-project-card-ferroloop")).not.toHaveTextContent(
+        "acme/ferroloop",
+      );
+    });
+
+    it("disables Save with no change and sends nothing", async () => {
+      const { client, calls } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-sonora"));
+      expect(screen.getByTestId("edit-project-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("edit-project-submit").closest("form")!);
+      await act(async () => {});
+      expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+    });
+
+    it("a virtual group edit has no path or tracker fields", async () => {
+      const { client } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-research-group"));
+      expect(screen.getByTestId("edit-project-name")).toBeInTheDocument();
+      expect(screen.getByTestId("edit-project-purpose")).toBeInTheDocument();
+      for (const id of ["path", "github", "credential"]) {
+        expect(screen.queryByTestId(`edit-project-${id}`)).toBeNull();
+      }
+    });
+
+    it("validation blocks the request", async () => {
+      const { client, calls } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-sonora"));
+      fireEvent.change(screen.getByTestId("edit-project-path"), {
+        target: { value: "relative/dir" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("edit-project-submit"));
+      });
+      expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+      expect(screen.getByTestId("edit-project-path")).toHaveAttribute(
+        "aria-invalid",
+        "true",
+      );
+    });
+
+    it("shows the server error and keeps the dialog open", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client } = makeClient([PLAIN], (url, method) =>
+        url.endsWith("/api/v1/projects/sonora") && method === "PATCH"
+          ? json({ error: "directory does not exist" }, 400)
+          : null,
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-sonora"));
+      fireEvent.change(screen.getByTestId("edit-project-path"), {
+        target: { value: "/nope" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("edit-project-submit"));
+      });
+      expect(screen.getByTestId("edit-project-error")).toHaveTextContent(
+        /directory does not exist/,
+      );
+      expect(screen.getByTestId("edit-project-path")).toHaveValue("/nope");
+      expect(onProjectsChanged).not.toHaveBeenCalled();
+    });
+
+    it("Escape closes only the Edit modal, then Settings", async () => {
+      const onClose = vi.fn();
+      const { client } = makeClient();
+      await renderModal(client, { onClose });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-sonora"));
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByTestId("edit-project-modal")).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns focus to the Edit button after each way of closing", async () => {
+      const closers: Array<() => void> = [
+        () => fireEvent.keyDown(window, { key: "Escape" }),
+        () => fireEvent.click(screen.getByTestId("edit-project-cancel")),
+        () => fireEvent.click(screen.getByTestId("edit-project-modal-backdrop")),
+      ];
+      for (const close of closers) {
+        const { client } = makeClient();
+        const view = await renderModal(client);
+        await openProjectsTab();
+        const btn = screen.getByTestId("settings-project-edit-sonora");
+        expect(btn).not.toHaveFocus();
+        fireEvent.click(btn);
+        close();
+        expect(screen.queryByTestId("edit-project-modal")).toBeNull();
+        expect(btn).toHaveFocus();
+        view.unmount();
+      }
+    });
+
+    it("does not reopen when Settings closes and reopens", async () => {
+      const { client } = makeClient();
+      const view = await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-edit-sonora"));
+      for (const isOpen of [false, true]) {
+        view.rerender(
+          <SettingsModal
+            isOpen={isOpen}
+            onClose={vi.fn()}
+            authority={{ tier: "owner", login: "lmcfarlin" }}
+            apiClient={client}
+          />,
+        );
+      }
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.queryByTestId("edit-project-modal")).toBeNull();
+    });
+  });
+
+  describe("delete flow", () => {
+    const FULL: DeleteResponse = {
+      deleted: "ferroloop",
+      reassigned_agents: 3,
+      decommissioned_agents: 0,
+      store_deleted: true,
+      dir_deleted: false,
+    };
+    type DeleteResponse = import("../types/api").DeleteProjectResponse;
+
+    const deleteHandler =
+      (slug: string, respond: () => Response) =>
+      (url: string, method: string): Response | null =>
+        url.endsWith(`/api/v1/projects/${slug}`) && method === "DELETE"
+          ? respond()
+          : null;
+
+    it("opens the Delete dialog from the card, with the guard only for active agents", async () => {
+      const { client } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      expect(screen.getByTestId("delete-project-modal")).toBeInTheDocument();
+      expect(screen.queryByTestId("delete-project-guard")).toBeNull();
+      fireEvent.click(screen.getByTestId("delete-project-cancel"));
+      fireEvent.click(screen.getByTestId("settings-project-delete-ferroloop"));
+      expect(screen.getByTestId("delete-project-guard")).toBeInTheDocument();
+      const options = within(screen.getByTestId("delete-project-reassign-select"))
+        .getAllByRole("option")
+        .map((o) => o.getAttribute("value"));
+      expect(options).toEqual(["", "sonora", "research-group"]);
+    });
+
+    it("cancel, Escape and backdrop send nothing", async () => {
+      const { client, calls } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      const closers: Array<() => void> = [
+        () => fireEvent.keyDown(window, { key: "Escape" }),
+        () => fireEvent.click(screen.getByTestId("delete-project-cancel")),
+        () => fireEvent.click(screen.getByTestId("delete-project-modal-backdrop")),
+      ];
+      for (const close of closers) {
+        fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+        close();
+        expect(screen.queryByTestId("delete-project-modal")).toBeNull();
+      }
+      expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0);
+      expect(screen.getByTestId("settings-project-card-sonora")).toBeInTheDocument();
+    });
+
+    it("removes the card, shows a summary, calls onProjectsChanged once and focuses Create", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client, calls } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("ferroloop", () => json(FULL)),
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-ferroloop"));
+      fireEvent.click(screen.getByTestId("delete-project-reassign-radio"));
+      fireEvent.change(screen.getByTestId("delete-project-reassign-select"), {
+        target: { value: "sonora" },
+      });
+      fireEvent.click(screen.getByTestId("delete-project-delete-store"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      expect(screen.queryByTestId("delete-project-modal")).toBeNull();
+      expect(screen.queryByTestId("settings-project-card-ferroloop")).toBeNull();
+      expect(screen.getByTestId("settings-project-card-sonora")).toBeInTheDocument();
+      expect(
+        calls.find((c) => c.method === "DELETE")?.body,
+      ).toEqual({ reassign_to: "sonora", delete_store: true });
+      expect(onProjectsChanged).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("settings-projects-delete-status")).toHaveTextContent(
+        "Deleted FerroLoop. Reassigned 3 agents. Deleted the local FerroStore database.",
+      );
+      // The Delete button went away with its card.
+      expect(screen.getByTestId("settings-projects-create-btn")).toHaveFocus();
+    });
+
+    it("resets the Agents filter to all when it pointed at the deleted project", async () => {
+      const { client } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("sonora", () =>
+          json({ ...FULL, deleted: "sonora", reassigned_agents: 0, store_deleted: false }),
+        ),
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-view-agents-sonora"));
+      expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Sonora");
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      fireEvent.click(screen.getByTestId("settings-tab-agents"));
+      expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("all");
+    });
+
+    it("leaves the Agents filter alone when it pointed at another project", async () => {
+      const { client } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("sonora", () => json({ ...FULL, deleted: "sonora" })),
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-view-agents-research-group"));
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      fireEvent.click(screen.getByTestId("settings-tab-agents"));
+      expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
+        "research-group",
+      );
+    });
+
+    it("a 409 shows the active agents and reveals the guard on a stale count", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("sonora", () =>
+          json(
+            { error: "active agents", active_agent_count: 2, active_agents: ["ada", "grace"] },
+            409,
+          ),
+        ),
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      expect(screen.queryByTestId("delete-project-guard")).toBeNull();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      expect(screen.getByTestId("delete-project-error")).toHaveTextContent(
+        /2 active agents.*ada, grace/,
+      );
+      expect(screen.getByTestId("delete-project-guard")).toBeInTheDocument();
+      expect(screen.getByTestId("delete-project-submit")).toBeDisabled();
+      expect(screen.getByTestId("settings-project-card-sonora")).toBeInTheDocument();
+      expect(onProjectsChanged).not.toHaveBeenCalled();
+    });
+
+    it("keeps the dialog open on any other error", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client } = makeClient(
+        [PLAIN],
+        deleteHandler("sonora", () => json({ error: "store is locked" }, 500)),
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      fireEvent.click(screen.getByTestId("delete-project-delete-store"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      expect(screen.getByTestId("delete-project-error")).toHaveTextContent(
+        /store is locked/,
+      );
+      expect(screen.getByTestId("delete-project-delete-store")).toBeChecked();
+      expect(screen.getByTestId("settings-project-card-sonora")).toBeInTheDocument();
+      expect(onProjectsChanged).not.toHaveBeenCalled();
+    });
+
+    it("returns focus to the Delete button after each way of closing", async () => {
+      const closers: Array<() => void> = [
+        () => fireEvent.keyDown(window, { key: "Escape" }),
+        () => fireEvent.click(screen.getByTestId("delete-project-cancel")),
+        () => fireEvent.click(screen.getByTestId("delete-project-modal-backdrop")),
+      ];
+      for (const close of closers) {
+        const { client } = makeClient();
+        const view = await renderModal(client);
+        await openProjectsTab();
+        const btn = screen.getByTestId("settings-project-delete-sonora");
+        expect(btn).not.toHaveFocus();
+        fireEvent.click(btn);
+        close();
+        expect(screen.queryByTestId("delete-project-modal")).toBeNull();
+        expect(btn).toHaveFocus();
+        view.unmount();
+      }
+    });
+
+    it("Escape closes only the Delete dialog, then Settings", async () => {
+      const onClose = vi.fn();
+      const { client } = makeClient();
+      await renderModal(client, { onClose });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByTestId("delete-project-modal")).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reopen when Settings closes and reopens", async () => {
+      const { client } = makeClient();
+      const view = await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      for (const isOpen of [false, true]) {
+        view.rerender(
+          <SettingsModal
+            isOpen={isOpen}
+            onClose={vi.fn()}
+            authority={{ tier: "owner", login: "lmcfarlin" }}
+            apiClient={client}
+          />,
+        );
+      }
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.queryByTestId("delete-project-modal")).toBeNull();
     });
   });
 });

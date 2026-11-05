@@ -50,6 +50,9 @@ import {
   type ProjectsArtifactsDirProps,
 } from "./settings/ProjectsSettingsTab";
 import { NewProjectModal } from "./settings/NewProjectModal";
+import { EditProjectModal } from "./settings/EditProjectModal";
+import { DeleteProjectModal } from "./settings/DeleteProjectModal";
+import { useProjectModals } from "./settings/useProjectModals";
 
 export {
   ACP_CONFORMANCE_OPERATIONS,
@@ -1470,6 +1473,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     // Closing Settings must not leave the New Project modal armed for reopen.
     if (!isOpen) setNewProjectOpen(false);
   }, [isOpen]);
+  const projectModals = useProjectModals({
+    isOpen,
+    projectList,
+    setProjectList,
+    selectedProjectFilter,
+    setSelectedProjectFilter,
+    onProjectsChanged,
+  });
   const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
     useState<DedicatedArtifactLayoutState>(
       () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
@@ -1764,8 +1775,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      // The New Project modal handles its own Escape.
-      if (newProjectOpen) return;
+      // The New Project, Edit and Delete dialogs handle their own Escape.
+      if (newProjectOpen || projectModals.anyOpen) return;
       if (artifactsDirModalTarget) {
         if (!changingArtifactsDir) {
           setArtifactsDirModalTarget(null);
@@ -1793,6 +1804,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [
     isOpen,
     newProjectOpen,
+    projectModals.anyOpen,
     artifactsDirModalTarget,
     changingArtifactsDir,
     recastModalAgentKey,
@@ -4870,6 +4882,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 newProjectOpenerRef.current = opener;
                 setNewProjectOpen(true);
               }}
+              onEdit={projectModals.openEdit}
+              onDelete={projectModals.openDelete}
+              deleteStatus={projectModals.deleteStatus}
             />
           </div>
         )}
@@ -10237,6 +10252,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             );
             onProjectsChanged?.();
           }}
+        />
+        <EditProjectModal
+          isOpen={projectModals.editTarget !== null}
+          project={projectModals.editTarget}
+          apiClient={apiClient ?? new HubApiClient()}
+          returnFocusTo={projectModals.editOpenerRef}
+          onClose={projectModals.closeEdit}
+          onSaved={projectModals.onSaved}
+        />
+        <DeleteProjectModal
+          isOpen={projectModals.deleteTarget !== null}
+          project={projectModals.deleteTarget}
+          otherProjects={projectList}
+          apiClient={apiClient ?? new HubApiClient()}
+          returnFocusTo={projectModals.deleteOpenerRef}
+          onClose={projectModals.closeDelete}
+          onDeleted={projectModals.onDeleted}
         />
 
         {/* System / Project Change Artifacts Directory Sub-Modal (Issue #207) */}

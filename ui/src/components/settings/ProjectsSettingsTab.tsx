@@ -23,8 +23,11 @@ export interface ProjectsSettingsTabProps {
   artifactsDir: ProjectsArtifactsDirProps;
   /** Receives the clicked button so the caller can return focus to it. */
   onCreate?: (opener: HTMLElement) => void;
-  onEdit?: (project: ProjectSummary) => void;
-  onDelete?: (project: ProjectSummary) => void;
+  /** Receive the clicked button so the caller can return focus to it. */
+  onEdit?: (project: ProjectSummary, opener: HTMLElement) => void;
+  onDelete?: (project: ProjectSummary, opener: HTMLElement) => void;
+  /** Result line of the last delete. */
+  deleteStatus?: string | null;
 }
 
 const LABEL_STYLE = {
@@ -243,7 +246,7 @@ function ProjectCard({
           aria-label={`Edit ${project.name}`}
           className="fd-btn"
           style={BUTTON_STYLE}
-          onClick={() => props.onEdit?.(project)}
+          onClick={(e) => props.onEdit?.(project, e.currentTarget)}
         >
           Edit
         </button>
@@ -263,7 +266,7 @@ function ProjectCard({
           aria-label={`Delete ${project.name}`}
           className="fd-btn"
           style={BUTTON_STYLE}
-          onClick={() => props.onDelete?.(project)}
+          onClick={(e) => props.onDelete?.(project, e.currentTarget)}
         >
           Delete
         </button>
@@ -296,6 +299,23 @@ export function ProjectsSettingsTab(props: ProjectsSettingsTabProps): ReactNode 
           + Create Project / Group
         </button>
       </div>
+
+      {props.deleteStatus && (
+        <div
+          role="status"
+          data-testid="settings-projects-delete-status"
+          className="fd-card"
+          style={{
+            borderColor: "var(--diff-add-border)",
+            backgroundColor: "var(--diff-add-bg)",
+            color: "var(--diff-add-text)",
+            fontSize: "11.5px",
+            padding: "6px 10px",
+          }}
+        >
+          {props.deleteStatus}
+        </div>
+      )}
 
       {error ? (
         <div
