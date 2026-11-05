@@ -366,7 +366,7 @@ export type LeftPanelTab =
 
 export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
   { id: "roster", label: "Agent Roster" },
-  { id: "triage", label: "Today & Incidents" },
+  { id: "triage", label: "Events" },
   { id: "terminal", label: "Terminal" },
   { id: "hub", label: "Hub & Arch" },
   { id: "gate", label: "Vault & Gate" },
@@ -988,7 +988,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                   onClick={() => handleSelectLeftTab("triage")}
                   style={{ padding: "2px 8px", fontSize: "11px" }}
                 >
-                  Today &amp; Incidents
+                  Events
                 </button>
               </div>
               <input

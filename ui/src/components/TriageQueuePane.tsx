@@ -851,7 +851,7 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
               flexShrink: 0,
             }}
           >
-            Today &amp; Incidents
+            Events
           </strong>
 
           <div

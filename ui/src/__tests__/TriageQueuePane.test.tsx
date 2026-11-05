@@ -249,7 +249,7 @@ describe("Record #90 — Operator Today & Incidents Triage Queue", () => {
     );
 
     expect(screen.getByTestId("triage-pane-title")).toHaveTextContent(
-      "Today & Incidents",
+      "Events",
     );
     expect(screen.getByTestId("triage-total-badge")).toHaveTextContent(
       "8 incidents",
@@ -346,8 +346,11 @@ describe("Record #90 — Operator Today & Incidents Triage Queue", () => {
     const incidentList = within(triagePane).getByTestId("triage-incident-list");
     expect(incidentList).toHaveClass("fd-scroll");
     expect(incidentList.style.overflowY).toBe("auto");
+    expect(within(sidebar).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "Events",
+    );
     expect(within(sidebar).getByTestId("triage-pane-title")).toHaveTextContent(
-      "Today & Incidents",
+      "Events",
     );
     const headerTopRow = within(triagePane).getByTestId("triage-header-top-row");
     expect(headerTopRow.style.flexWrap).toBe("wrap");
