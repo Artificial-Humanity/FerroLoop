@@ -6,8 +6,8 @@ use crate::at::At;
 use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
-    validate_sender_name, validate_subject, validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, check_group_address,
+    resolve_recipients, validate_sender_name, validate_subject, validate_wire_body,
 };
 use crate::finding::{Finding, FindingState};
 use crate::ids::{
@@ -628,6 +628,18 @@ impl Catalog for MemStore {
 
     fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
         Ok(self.inner.borrow().projects.values().cloned().collect())
+    }
+
+    fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(&id.0, Kind::Project)?;
+        match s.projects.get_mut(&id.0) {
+            Some(p) => {
+                p.root = root.to_string();
+                Ok(())
+            }
+            None => Err(StoreError::InvalidState(format!("no project {}", id.0))),
+        }
     }
 
     fn add_gate(
@@ -1875,11 +1887,14 @@ impl MessageStore for MemStore {
         msg.validate()
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
 
+        let areas: Vec<AreaRecord> = s.areas.values().cloned().collect();
+        check_group_address(&msg.to, &areas).map_err(StoreError::InvalidState)?;
         let recipients = resolve_recipients(
             &msg.to,
             msg.sender_id.as_ref(),
             &msg.sender_name,
             &all_agents,
+            &areas,
         );
 
         s.append_wire_message(msg.clone());
@@ -2127,6 +2142,7 @@ impl MessageStore for MemStore {
                 msg.sender_id.as_ref(),
                 &msg.sender_name,
                 &all_agents,
+                &s.areas.values().cloned().collect::<Vec<_>>(),
             );
             for (rec_id, rec_name) in resolved {
                 let in_incoming = receipts.iter().any(|r| {

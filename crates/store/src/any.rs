@@ -1153,6 +1153,7 @@ delegate! {
         fn add_project(&self, root: &str) -> Result<ProjectId, StoreError>;
         fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError>;
         fn list_projects(&self) -> Result<Vec<Project>, StoreError>;
+        fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError>;
         fn add_gate(&self, project: &ProjectId, name: &str, kind: GateKind, selector: Selector, min_population: u64, authored_at_commit: &str, authored_by: &str) -> Result<GateId, StoreError>;
         fn get_gate(&self, id: &GateId) -> Result<Option<GateDef>, StoreError>;
         fn list_gates(&self, project: &ProjectId) -> Result<Vec<GateDef>, StoreError>;

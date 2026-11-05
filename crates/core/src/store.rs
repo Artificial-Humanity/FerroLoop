@@ -439,6 +439,14 @@ pub trait Catalog {
     fn add_project(&self, root: &str) -> Result<ProjectId, StoreError>;
     fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError>;
     fn list_projects(&self) -> Result<Vec<Project>, StoreError>;
+    /// Points the project at another root, changing nothing else about it (its id, gates,
+    /// records and routing stay). A store that cannot do this refuses with
+    /// [`StoreError::InvalidState`].
+    fn set_project_root(&self, _id: &ProjectId, _root: &str) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "this store cannot change a project's root".to_string(),
+        ))
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn add_gate(

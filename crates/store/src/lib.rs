@@ -1421,6 +1421,15 @@ impl Catalog for RedbStore {
         self.all_json(PROJECTS)
     }
 
+    fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError> {
+        self.check_kind(id.iri(), Kind::Project)?;
+        let Some(mut held) = self.get_json::<Project>(PROJECTS, id.iri())? else {
+            return Err(StoreError::InvalidState(format!("no project {}", id.iri())));
+        };
+        held.root = root.to_string();
+        self.put_json(PROJECTS, id.iri(), &held)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_gate(
         &self,

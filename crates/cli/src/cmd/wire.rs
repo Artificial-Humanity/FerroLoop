@@ -48,7 +48,7 @@ pub fn now_millis() -> u64 {
 
 #[derive(Subcommand)]
 pub enum WireCmd {
-    /// Send a message to a persona, AgentId URN, or group selector (`@all`, `@area:<slug>`, `@role:<role>`, `@area:<slug>/<role>`).
+    /// Send a message to a persona, AgentId URN, or group selector (`@all`, `@council`, `@<group>`, `@area:<slug>`, `@role:<role>`, `@area:<slug>/<role>`).
     Send {
         to: String,
         subject: String,

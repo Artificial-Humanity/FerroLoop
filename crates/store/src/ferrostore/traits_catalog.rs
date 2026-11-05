@@ -110,6 +110,20 @@ impl Catalog for FerroStore {
         self.with_read(|txn| doc::scan_json(txn, PROJECTS))
     }
 
+    fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError> {
+        let root = root.to_string();
+        self.with_write(|txn| {
+            doc::check_kind(txn, &self.label, id.iri(), Kind::Project)?;
+            let Some(mut held) = doc::get_owned::<Project>(txn, &self.label, PROJECTS, id.iri())?
+            else {
+                return Err(StoreError::InvalidState(format!("no project {}", id.iri())));
+            };
+            held.root = root.clone();
+            doc::put_json(txn, PROJECTS, id.iri().as_str(), &held)?;
+            Ok(())
+        })
+    }
+
     fn add_gate(
         &self,
         project: &ProjectId,

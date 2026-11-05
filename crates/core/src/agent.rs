@@ -25,6 +25,13 @@ pub struct AreaRecord {
 }
 
 impl AreaRecord {
+    /// A virtual scope is an area with no path: it names a group of agents and has no
+    /// repository, project block or project store behind it. A repo-backed project's area
+    /// carries the project root as its path.
+    pub fn is_virtual(&self) -> bool {
+        self.path.is_none()
+    }
+
     pub fn new(
         name: &str,
         path: Option<String>,
@@ -232,6 +239,9 @@ pub struct RegisterAgentArgs {
 /// - every other role (the built-in `Assistant`, developer, tester, strategist
 ///   and journalist roles, and `Custom(_)`) -> `display_name` of the active
 ///   `Lead` for `agent.project` (or `"Owner"` if none).
+///
+/// A virtual scope (an area with no path, see [`AreaRecord::is_virtual`]) follows the same rule:
+/// its agents report to the scope's active `Lead` when it has one, else to `"Owner"`.
 pub fn reports_to(agent: &AgentRecord, all_agents: &[AgentRecord]) -> String {
     match agent.role {
         AgentRole::Lead | AgentRole::LabManager => "Owner".to_string(),
@@ -902,6 +912,32 @@ mod tests {
             assert_eq!(reports_to(a, &all), "Kayla", "{}", a.role);
         }
         assert_eq!(reports_to(&elsewhere, &all), "Owner");
+    }
+
+    #[test]
+    fn reports_to_in_a_virtual_scope_is_the_scopes_active_lead_else_owner() {
+        // A scope with no lead: every role reports to the Owner.
+        let strategist = agent(1, "Ada", AgentRole::Strategist, "council");
+        let assistant = agent(2, "Bea", AgentRole::Assistant, "council");
+        let manager = agent(3, "Mgr", AgentRole::LabManager, "council");
+        let mut all = vec![strategist.clone(), assistant.clone(), manager.clone()];
+        for a in &all {
+            assert_eq!(reports_to(a, &all), "Owner", "{}", a.role);
+        }
+        // A lead of another scope does not count; the scope's own lead does, but only while
+        // it is active.
+        all.push(agent(4, "Zed", AgentRole::Lead, "ferroloop"));
+        assert_eq!(reports_to(&strategist, &all), "Owner");
+        let mut lead = agent(5, "Cal", AgentRole::Lead, "council");
+        all.push(lead.clone());
+        assert_eq!(reports_to(&strategist, &all), "Cal");
+        assert_eq!(reports_to(&assistant, &all), "Cal");
+        assert_eq!(reports_to(&lead, &all), "Owner");
+        assert_eq!(reports_to(&manager, &all), "Owner");
+        all.pop();
+        lead.status = AgentStatus::Retired;
+        all.push(lead);
+        assert_eq!(reports_to(&strategist, &all), "Owner");
     }
 
     #[test]

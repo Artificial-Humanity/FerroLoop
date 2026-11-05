@@ -196,7 +196,7 @@ fn run_bound<F: Fixture>(
 }
 
 /// How many cases [`catalog`] runs. Update deliberately — see [`run_suite`].
-const CATALOG_CASES: usize = 3;
+const CATALOG_CASES: usize = 4;
 /// How many cases [`tracker`] runs. Update deliberately — see [`run_suite`].
 const TRACKER_CASES: usize = 14;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
@@ -215,6 +215,7 @@ const ESCALATION_CASES: usize = 8;
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         a_project_round_trips::<S>,
+        a_project_root_can_be_changed_and_nothing_else::<S>,
         affirming_a_gate_moves_only_its_stamp::<S>,
         list_transitions_returns_every_transition_of_one_project_and_no_others::<S>,
     ];
@@ -599,6 +600,31 @@ fn a_cached_file_keeps_bytes_that_are_not_utf8_exactly<S: LedgerCache>(s: &S) {
 fn a_project_round_trips<S: Catalog>(s: &S) {
     let id = s.add_project("/tmp/p").unwrap();
     assert_eq!(s.get_project(&id).unwrap().unwrap().root, "/tmp/p");
+    assert_eq!(s.list_projects().unwrap().len(), 1);
+}
+
+fn a_project_root_can_be_changed_and_nothing_else<S: Catalog>(s: &S) {
+    let id = s.add_project("/tmp/p").unwrap();
+    let gate = s
+        .add_gate(
+            &id,
+            "fmt",
+            sample_kind(),
+            sample_selector(),
+            1,
+            "abc",
+            "owner",
+        )
+        .unwrap();
+    s.set_project_root(&id, "/tmp/q").unwrap();
+    assert_eq!(s.get_project(&id).unwrap().unwrap().root, "/tmp/q");
+    assert_eq!(s.list_projects().unwrap().len(), 1);
+    assert_eq!(s.get_gate(&gate).unwrap().unwrap().project, id);
+    // An id that is not a project is refused, never turned into one.
+    assert!(
+        s.set_project_root(&ProjectId(entry_iri(900)), "/x")
+            .is_err()
+    );
     assert_eq!(s.list_projects().unwrap().len(), 1);
 }
 
@@ -2545,7 +2571,7 @@ const AGENT_REGISTRY_CASES: usize = 7;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
-const MESSAGE_STORE_CASES: usize = 9;
+const MESSAGE_STORE_CASES: usize = 10;
 /// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
 const WORKFLOW_STORE_CASES: usize = 3;
 
@@ -2584,6 +2610,7 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
     let cases: &[fn(&S)] = &[
         direct_and_unregistered_persona_addressing_round_trips_across_registration::<S>,
         group_selectors_expand_active_agents_and_exclude_sender::<S>,
+        council_and_virtual_group_selectors_reach_their_members::<S>,
         ask_reply_and_thread_indexing_validate_and_correlate::<S>,
         receipt_transitions_and_batch_imports_converge_monotonically::<S>,
         wire_import_deduplicates_and_refuses_tampered_message::<S>,
@@ -3840,6 +3867,84 @@ fn group_selectors_expand_active_agents_and_exclude_sender<
         .unwrap();
     assert_eq!(role_rcpts.len(), 1);
     assert_eq!(role_rcpts[0].recipient_name, "ferris");
+}
+
+fn council_and_virtual_group_selectors_reach_their_members<
+    S: MessageStore + AgentRegistry + Catalog + Handles,
+>(
+    s: &S,
+) {
+    use crate::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
+    use crate::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+    let at = |n| At::from_unix_millis(n);
+    let area = |key: &str, path: Option<&str>| AreaRecord {
+        area_key: key.into(),
+        name: key.into(),
+        path: path.map(str::to_string),
+        purpose: "p".into(),
+        updated_at: at(1),
+        by: "owner".into(),
+    };
+    s.upsert_area(area("ops", None)).unwrap();
+    s.upsert_area(area("council", None)).unwrap();
+    s.upsert_area(area("ferroloop", Some("/work/ferroloop")))
+        .unwrap();
+    let register = |name: &str, project: &str, role: AgentRole, extra: &[&str], n: u64| {
+        s.register_agent(RegisterAgentArgs {
+            display_name: name.into(),
+            email: None,
+            project: project.into(),
+            role,
+            extra_areas: extra.iter().map(|e| e.to_string()).collect(),
+            create_area: false,
+            replace: false,
+            at: at(n),
+            by: "owner".into(),
+        })
+        .unwrap()
+    };
+    register("Ada", "ops", AgentRole::Lead, &[], 10);
+    register("Bea", "ferroloop", AgentRole::Tester, &["ops"], 11);
+    register("Cy", "council", AgentRole::Journalist, &[], 12);
+    register("Di", "ferroloop", AgentRole::Strategist, &[], 13);
+    register("Ed", "ferroloop", AgentRole::Lead, &[], 14);
+    let send = |to: &str, n: u64| {
+        s.send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "owner".into(),
+            sender_host: None,
+            to: WireAddress::parse(to).unwrap(),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "S".into(),
+            body: "B".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: at(n),
+        })
+    };
+    let names = |r: Vec<crate::ferrowire::DeliveryReceipt>| -> Vec<String> {
+        r.into_iter().map(|r| r.recipient_name).collect()
+    };
+    assert_eq!(names(send("@ops", 20).unwrap().1), ["ada", "bea"]);
+    assert_eq!(names(send("@council", 21).unwrap().1), ["cy", "di"]);
+    // `@council` is the union with the strategists even though `council` is a group too.
+    assert_eq!(names(send("@role:strategist", 22).unwrap().1), ["di"]);
+    // A real project's key and an unknown key are refused, and nothing is delivered.
+    for bad in ["@ferroloop", "@nowhere"] {
+        match send(bad, 23) {
+            Err(StoreError::InvalidState(why)) => assert!(why.contains(bad), "{why}"),
+            other => panic!("{bad}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        names(send("@area:ferroloop", 24).unwrap().1),
+        ["bea", "di", "ed"]
+    );
 }
 
 fn ask_reply_and_thread_indexing_validate_and_correlate<S: MessageStore>(s: &S) {
