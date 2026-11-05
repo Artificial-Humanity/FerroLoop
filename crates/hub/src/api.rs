@@ -6220,10 +6220,7 @@ fn handle_post_session_model(
     };
     state.set_session_model_override(
         &override_key,
-        ModelOverride {
-            model: model.clone(),
-            thinking_level: thinking_level.clone(),
-        },
+        ModelOverride::new(model.clone(), thinking_level.clone()),
     );
     // `agy --model` only takes effort-suffixed ids, so an Antigravity record keeps the mapped id
     // (a restart launches with it); every other vendor keeps the model as the operator chose it.
@@ -6666,13 +6663,7 @@ pub(crate) fn run_remodel(
                 // Keyed by the persona (and the hosted id): discovery does not know the new
                 // vendor session's id yet, and `apply_model_overrides` matches the persona.
                 for key in [out.persona.to_ascii_lowercase(), out.session_id.clone()] {
-                    state.set_session_model_override(
-                        &key,
-                        ModelOverride {
-                            model: model.clone(),
-                            thinking_level: None,
-                        },
-                    );
+                    state.set_session_model_override(&key, ModelOverride::new(model.clone(), None));
                 }
             }
         }

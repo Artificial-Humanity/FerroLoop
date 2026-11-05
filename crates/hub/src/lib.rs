@@ -567,16 +567,17 @@ impl HubState {
         guard.get(session_id).cloned()
     }
 
-    /// Session summaries with the in-memory model overrides applied.
+    /// Session summaries with the in-memory model overrides applied. An override the vendor has
+    /// superseded (see [`session_actions::apply_model_overrides`]) is removed on the way.
     pub fn with_model_overrides(
         &self,
         mut sessions: Vec<DiscoveredSessionSummary>,
     ) -> Vec<DiscoveredSessionSummary> {
-        let guard = self
+        let mut guard = self
             .model_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        session_actions::apply_model_overrides(&mut sessions, &guard);
+        session_actions::apply_model_overrides(&mut sessions, &mut guard);
         sessions
     }
 
@@ -6438,10 +6439,7 @@ mod tests {
         );
         state.set_session_model_override(
             "webhook-felicia",
-            session_actions::ModelOverride {
-                model: "model-a".into(),
-                thinking_level: None,
-            },
+            session_actions::ModelOverride::new("model-a".into(), None),
         );
         let mut frames = state.subscribe();
 
@@ -6817,12 +6815,48 @@ mod tests {
         // A session id match wins over a persona key.
         state.set_session_model_override(
             "webhook-ada",
-            session_actions::ModelOverride {
-                model: "model-c".into(),
-                thinking_level: None,
-            },
+            session_actions::ModelOverride::new("model-c".into(), None),
         );
         assert_eq!(listed_model(&state, "webhook-ada"), "model-c");
+    }
+
+    #[test]
+    fn a_live_model_report_supersedes_the_operator_override() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let live = |model: &str| {
+            vec![discovery::DiscoveredSessionSummary {
+                id: "claude:ada".to_string(),
+                source: "route".to_string(),
+                adapter: "claude".to_string(),
+                persona: Some("Ada".to_string()),
+                status: "active".to_string(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: None,
+                quota_usage: None,
+                model: Some(model.to_string()),
+                thinking_level: None,
+                available_models: Vec::new(),
+                context_usage: None,
+                execution_mode: None,
+            }]
+        };
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        // The vendor still reports the old model: the choice stays and shows.
+        let shown = state.with_model_overrides(live("model-a"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        let shown = state.with_model_overrides(live("model-a"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        // The operator switched inside the vendor UI: the override is dropped.
+        let shown = state.with_model_overrides(live("model-c"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-c"));
+        assert!(state.session_model_override("ada").is_none());
+        let shown = state.with_model_overrides(live("model-c"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-c"));
     }
 
     #[test]

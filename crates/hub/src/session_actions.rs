@@ -19,12 +19,54 @@ pub const METHOD_OPERATOR_PROMPT: &str = "operator-prompt";
 /// `method` reported when the model was recorded but nothing reached a CLI.
 pub const METHOD_OVERRIDE_ONLY: &str = "override-only";
 
+/// A live (model, thinking level) pair as discovery reported it for a session.
+type LivePair = (Option<String>, Option<String>);
+
 /// A model the operator chose for a session through `POST /api/v1/sessions/:id/model`.
 /// It lives in memory (see `HubState::set_session_model_override`) and is lost on hub restart.
+///
+/// `model` and `thinking_level` are the operator's choice. The rest is runtime state that
+/// [`apply_model_overrides`] keeps, so a model the vendor reports later can supersede the
+/// choice: `baseline` is the live pair seen the first time the override was applied, and
+/// `confirmed` is set once the vendor was seen reporting the choice. [`ModelOverride::new`]
+/// starts both empty, so a fresh `set` always starts over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelOverride {
     pub model: String,
     pub thinking_level: Option<String>,
+    baseline: Option<LivePair>,
+    confirmed: bool,
+}
+
+impl ModelOverride {
+    pub fn new(model: String, thinking_level: Option<String>) -> Self {
+        Self {
+            model,
+            thinking_level,
+            baseline: None,
+            confirmed: false,
+        }
+    }
+
+    /// Whether the live pair is the operator's choice: the model is equal ignoring ASCII case,
+    /// and so is the effort unless the choice has none, which any live effort satisfies.
+    fn matches_live(&self, live_model: &str, live_effort: Option<&str>) -> bool {
+        live_model.eq_ignore_ascii_case(&self.model)
+            && match (&self.thinking_level, live_effort) {
+                (None, _) => true,
+                (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
+                (Some(_), None) => false,
+            }
+    }
+}
+
+fn pair_eq_ignore_case(a: &LivePair, b: &LivePair) -> bool {
+    let opt = |x: &Option<String>, y: &Option<String>| match (x, y) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => false,
+    };
+    opt(&a.0, &b.0) && opt(&a.1, &b.1)
 }
 
 /// A model id the endpoint accepts: trimmed, non-empty, one line, at most
@@ -55,28 +97,89 @@ pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
     }
 }
 
-/// Put each session's override over what discovery found. An override is keyed by a session id
-/// or by a lowercased persona (see `HubState::set_session_model_override`): a session matches on
-/// its id first and its persona second. A session with no override is untouched. An override
-/// without a thinking level keeps the discovered one.
+/// Put each session's override over what discovery found, and drop an override the vendor has
+/// superseded. An override is keyed by a session id or by a lowercased persona (see
+/// `HubState::set_session_model_override`): a session matches on its id first and its persona
+/// second. A session with no override is untouched. An override without a thinking level keeps
+/// the discovered one.
+///
+/// The live pair is the session's discovered model and effort before the overlay. For each
+/// override, the first matching session that reports a model decides for every session the
+/// override matches in this call:
+/// - no live model anywhere: the override is left alone and overlaid;
+/// - no baseline yet: the live pair becomes the baseline; the override stays and is overlaid;
+/// - live equals the choice: the override is confirmed; it stays and is overlaid;
+/// - live differs from the choice and from the baseline: the vendor reports something newer, so
+///   the override is removed and the live values show;
+/// - live equals the baseline and the override was confirmed: the vendor applied the choice and
+///   has since gone back, so the override is removed;
+/// - live equals the baseline and the override was never confirmed: the vendor has not applied
+///   the choice yet, so the override stays and is overlaid.
 pub fn apply_model_overrides(
     sessions: &mut [DiscoveredSessionSummary],
-    overrides: &BTreeMap<String, ModelOverride>,
+    overrides: &mut BTreeMap<String, ModelOverride>,
 ) {
     if overrides.is_empty() {
         return;
     }
-    for session in sessions {
-        let found = overrides.get(&session.id).or_else(|| {
-            session
-                .persona
-                .as_deref()
-                .and_then(|persona| overrides.get(&persona.to_ascii_lowercase()))
-        });
-        if let Some(over) = found {
-            session.model = Some(over.model.clone());
-            if over.thinking_level.is_some() {
-                session.thinking_level = over.thinking_level.clone();
+    // Match every session before any override is removed, so a removed id key does not make its
+    // session fall through to a persona key.
+    let keys: Vec<Option<String>> = sessions
+        .iter()
+        .map(|session| {
+            if overrides.contains_key(&session.id) {
+                Some(session.id.clone())
+            } else {
+                session
+                    .persona
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .filter(|persona| overrides.contains_key(persona))
+            }
+        })
+        .collect();
+    // `Some(choice)` is an override still to overlay; `None` is one that was just removed.
+    let mut decided: BTreeMap<String, Option<(String, Option<String>)>> = BTreeMap::new();
+    for (session, key) in sessions.iter_mut().zip(keys) {
+        let Some(key) = key else { continue };
+        let live_model = session.model.as_deref().filter(|m| !m.trim().is_empty());
+        if !decided.contains_key(&key)
+            && let Some(live_model) = live_model
+            && let Some(over) = overrides.get_mut(&key)
+        {
+            let live: LivePair = (Some(live_model.to_string()), session.thinking_level.clone());
+            let keep = match over.baseline.clone() {
+                None => {
+                    over.baseline = Some(live);
+                    true
+                }
+                Some(_) if over.matches_live(live_model, session.thinking_level.as_deref()) => {
+                    over.confirmed = true;
+                    true
+                }
+                Some(baseline) => pair_eq_ignore_case(&live, &baseline) && !over.confirmed,
+            };
+            if keep {
+                decided.insert(
+                    key.clone(),
+                    Some((over.model.clone(), over.thinking_level.clone())),
+                );
+            } else {
+                overrides.remove(&key);
+                decided.insert(key.clone(), None);
+            }
+        }
+        let choice = match decided.get(&key) {
+            Some(choice) => choice.clone(),
+            // No session of this override reported a model yet: overlay it untouched.
+            None => overrides
+                .get(&key)
+                .map(|over| (over.model.clone(), over.thinking_level.clone())),
+        };
+        if let Some((model, thinking_level)) = choice {
+            session.model = Some(model);
+            if thinking_level.is_some() {
+                session.thinking_level = thinking_level;
             }
         }
     }
@@ -158,10 +261,7 @@ mod tests {
     }
 
     fn over(model: &str, thinking: Option<&str>) -> ModelOverride {
-        ModelOverride {
-            model: model.to_string(),
-            thinking_level: thinking.map(str::to_string),
-        }
+        ModelOverride::new(model.to_string(), thinking.map(str::to_string))
     }
 
     #[test]
@@ -171,13 +271,13 @@ mod tests {
             session("codex:bob", Some("Bob")),
             session("grok:cy", None),
         ];
-        let overrides = BTreeMap::from([
+        let mut overrides = BTreeMap::from([
             ("claude:ada".to_string(), over("by-id", None)),
             // A persona key that also names session 1: the id key wins.
             ("ada".to_string(), over("by-persona-loses", Some("high"))),
             ("bob".to_string(), over("by-persona", Some("high"))),
         ]);
-        apply_model_overrides(&mut sessions, &overrides);
+        apply_model_overrides(&mut sessions, &mut overrides);
         assert_eq!(sessions[0].model.as_deref(), Some("by-id"));
         // No thinking level in the override: the discovered one stays.
         assert_eq!(sessions[0].thinking_level.as_deref(), Some("low"));
@@ -192,9 +292,292 @@ mod tests {
         // `HubState::set_session_model_override` lowercases persona keys, so a key that still
         // has capitals can only match a session id exactly.
         let mut sessions = vec![session("x", Some("Ada"))];
-        let overrides = BTreeMap::from([("Ada".to_string(), over("m", None))]);
-        apply_model_overrides(&mut sessions, &overrides);
+        let mut overrides = BTreeMap::from([("Ada".to_string(), over("m", None))]);
+        apply_model_overrides(&mut sessions, &mut overrides);
         assert_eq!(sessions[0].model.as_deref(), Some("discovered-model"));
+    }
+
+    fn live(
+        id: &str,
+        persona: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> DiscoveredSessionSummary {
+        let mut s = session(id, persona);
+        s.model = model.map(str::to_string);
+        s.thinking_level = effort.map(str::to_string);
+        s
+    }
+
+    /// One apply over a single session; returns its (model, effort) afterwards.
+    fn apply_one(
+        overrides: &mut BTreeMap<String, ModelOverride>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let mut sessions = vec![live("s", None, model, effort)];
+        apply_model_overrides(&mut sessions, overrides);
+        (
+            sessions[0].model.clone(),
+            sessions[0].thinking_level.clone(),
+        )
+    }
+
+    fn pair(model: &str, effort: Option<&str>) -> (Option<String>, Option<String>) {
+        (Some(model.to_string()), effort.map(str::to_string))
+    }
+
+    fn one(key: &str, o: ModelOverride) -> BTreeMap<String, ModelOverride> {
+        BTreeMap::from([(key.to_string(), o)])
+    }
+
+    #[test]
+    fn the_first_apply_records_the_baseline_and_overlays() {
+        let mut map = one("s", over("chosen", Some("high")));
+        let got = apply_one(&mut map, Some("old"), Some("low"));
+        assert_eq!(got, pair("chosen", Some("high")));
+        let kept = &map["s"];
+        assert_eq!(kept.baseline, Some(pair("old", Some("low"))));
+        assert!(!kept.confirmed);
+        assert_eq!(
+            (kept.model.as_str(), kept.thinking_level.as_deref()),
+            ("chosen", Some("high"))
+        );
+    }
+
+    #[test]
+    fn a_live_report_equal_to_the_choice_confirms_it() {
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        let got = apply_one(&mut map, Some("chosen"), Some("high"));
+        assert_eq!(got, pair("chosen", Some("high")));
+        assert!(map["s"].confirmed);
+        assert_eq!(map["s"].baseline, Some(pair("old", Some("low"))));
+    }
+
+    #[test]
+    fn a_live_report_differing_from_baseline_and_choice_drops_the_override() {
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        let got = apply_one(&mut map, Some("third"), Some("medium"));
+        assert_eq!(got, pair("third", Some("medium")));
+        assert!(map.is_empty());
+        // Unconfirmed or confirmed, the newer report wins.
+        let mut map = one("s", over("chosen", None));
+        apply_one(&mut map, Some("old"), None);
+        apply_one(&mut map, Some("chosen"), None);
+        assert!(map["s"].confirmed);
+        let got = apply_one(&mut map, Some("third"), None);
+        assert_eq!(got, pair("third", None));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_override_is_dropped_when_the_vendor_goes_back_to_the_baseline() {
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        apply_one(&mut map, Some("chosen"), Some("high"));
+        let got = apply_one(&mut map, Some("old"), Some("low"));
+        assert_eq!(got, pair("old", Some("low")));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn an_unconfirmed_override_stays_while_the_vendor_still_reports_the_baseline() {
+        let mut map = one("s", over("chosen", Some("high")));
+        for _ in 0..3 {
+            let got = apply_one(&mut map, Some("old"), Some("low"));
+            assert_eq!(got, pair("chosen", Some("high")));
+            assert!(map.contains_key("s"));
+        }
+        assert!(!map["s"].confirmed);
+    }
+
+    #[test]
+    fn a_session_with_no_live_model_leaves_the_override_untouched() {
+        for empty in [None, Some(""), Some("  ")] {
+            let mut map = one("s", over("chosen", None));
+            let before = map.clone();
+            let got = apply_one(&mut map, empty, Some("low"));
+            assert_eq!(got, pair("chosen", Some("low")), "{empty:?}");
+            assert_eq!(map, before, "{empty:?}: no baseline is recorded");
+        }
+        // It then behaves as a first apply once a model shows.
+        let mut map = one("s", over("chosen", None));
+        apply_one(&mut map, None, None);
+        apply_one(&mut map, Some("old"), None);
+        assert_eq!(map["s"].baseline, Some(pair("old", None)));
+    }
+
+    #[test]
+    fn a_persona_keyed_override_is_superseded_like_an_id_keyed_one() {
+        let mut map = one("ada", over("chosen", None));
+        let mut sessions = vec![live("claude:ada", Some("Ada"), Some("old"), Some("low"))];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("chosen"));
+        assert_eq!(map["ada"].baseline, Some(pair("old", Some("low"))));
+        let mut sessions = vec![live("claude:ada", Some("Ada"), Some("third"), Some("low"))];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("third"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn an_id_key_dropped_in_a_call_does_not_hand_its_session_to_the_persona_key() {
+        let mut map = BTreeMap::from([
+            ("claude:ada".to_string(), over("by-id", None)),
+            ("ada".to_string(), over("by-persona", None)),
+        ]);
+        let mut sessions = vec![live("claude:ada", Some("Ada"), Some("old"), None)];
+        apply_model_overrides(&mut sessions, &mut map);
+        let mut sessions = vec![live("claude:ada", Some("Ada"), Some("third"), None)];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("third"));
+        assert!(!map.contains_key("claude:ada"));
+        // The persona key matched no session in either call, so it is untouched.
+        assert_eq!(map["ada"].baseline, None);
+    }
+
+    #[test]
+    fn an_override_without_effort_keeps_the_live_effort_and_ignores_effort_changes() {
+        let mut map = one("s", over("chosen", None));
+        assert_eq!(
+            apply_one(&mut map, Some("old"), Some("low")),
+            pair("chosen", Some("low"))
+        );
+        // The vendor now runs the chosen model at another effort: that is the choice, not a
+        // divergence.
+        assert_eq!(
+            apply_one(&mut map, Some("chosen"), Some("high")),
+            pair("chosen", Some("high"))
+        );
+        assert!(map["s"].confirmed);
+        assert_eq!(
+            apply_one(&mut map, Some("chosen"), None),
+            pair("chosen", None)
+        );
+        assert!(map.contains_key("s"));
+        // An override with an effort needs the live effort to match.
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        // chosen/low is neither the choice (chosen/high) nor the baseline (old/low).
+        apply_one(&mut map, Some("chosen"), Some("low"));
+        assert!(
+            !map.contains_key("s"),
+            "chosen/low differs from old/low and chosen/high"
+        );
+    }
+
+    #[test]
+    fn comparisons_ignore_ascii_case() {
+        let mut map = one("s", over("Chosen", Some("HIGH")));
+        apply_one(&mut map, Some("Old"), Some("Low"));
+        apply_one(&mut map, Some("chosen"), Some("high"));
+        assert!(map["s"].confirmed);
+        // Back to the baseline in another case: dropped, not read as a new model.
+        let got = apply_one(&mut map, Some("OLD"), Some("low"));
+        assert_eq!(got, pair("OLD", Some("low")));
+        assert!(map.is_empty());
+        // Unconfirmed and a baseline in another case: kept.
+        let mut map = one("s", over("chosen", None));
+        apply_one(&mut map, Some("Old"), Some("Low"));
+        assert_eq!(
+            apply_one(&mut map, Some("old"), Some("LOW")),
+            pair("chosen", Some("LOW"))
+        );
+        assert!(map.contains_key("s"));
+    }
+
+    #[test]
+    fn two_sessions_with_their_own_overrides_evolve_independently() {
+        let mut map = BTreeMap::from([
+            ("a".to_string(), over("chosen-a", None)),
+            ("b".to_string(), over("chosen-b", None)),
+        ]);
+        let mut sessions = vec![
+            live("a", None, Some("old-a"), None),
+            live("b", None, Some("old-b"), None),
+        ];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("chosen-a"));
+        assert_eq!(sessions[1].model.as_deref(), Some("chosen-b"));
+        // `a` is switched inside the vendor UI; `b` is still on its baseline.
+        let mut sessions = vec![
+            live("a", None, Some("elsewhere"), None),
+            live("b", None, Some("old-b"), None),
+        ];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("elsewhere"));
+        assert_eq!(sessions[1].model.as_deref(), Some("chosen-b"));
+        assert!(!map.contains_key("a"));
+        assert!(map.contains_key("b"));
+    }
+
+    #[test]
+    fn one_override_matching_two_sessions_is_decided_by_the_first_match() {
+        let mut map = one("ada", over("chosen", None));
+        let mut sessions = vec![
+            live("claude:ada", Some("Ada"), Some("old"), None),
+            live("codex:ada", Some("Ada"), Some("other"), None),
+        ];
+        apply_model_overrides(&mut sessions, &mut map);
+        // The first match records the baseline; the second is overlaid on that decision.
+        assert_eq!(map["ada"].baseline, Some(pair("old", None)));
+        assert_eq!(sessions[0].model.as_deref(), Some("chosen"));
+        assert_eq!(sessions[1].model.as_deref(), Some("chosen"));
+        // The first match reports a newer model: both keep their live values.
+        let mut sessions = vec![
+            live("claude:ada", Some("Ada"), Some("third"), None),
+            live("codex:ada", Some("Ada"), Some("old"), None),
+        ];
+        apply_model_overrides(&mut sessions, &mut map);
+        assert_eq!(sessions[0].model.as_deref(), Some("third"));
+        assert_eq!(sessions[1].model.as_deref(), Some("old"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn applying_repeatedly_over_the_same_live_state_is_stable() {
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        let after_first = map.clone();
+        for _ in 0..4 {
+            assert_eq!(
+                apply_one(&mut map, Some("old"), Some("low")),
+                pair("chosen", Some("high"))
+            );
+            assert_eq!(map, after_first);
+        }
+        apply_one(&mut map, Some("chosen"), Some("high"));
+        let confirmed = map.clone();
+        for _ in 0..4 {
+            assert_eq!(
+                apply_one(&mut map, Some("chosen"), Some("high")),
+                pair("chosen", Some("high"))
+            );
+            assert_eq!(map, confirmed);
+        }
+    }
+
+    #[test]
+    fn a_fresh_set_after_a_drop_starts_over() {
+        let mut map = one("s", over("chosen", None));
+        apply_one(&mut map, Some("old"), None);
+        apply_one(&mut map, Some("third"), None);
+        assert!(map.is_empty());
+        // The operator picks again while the vendor reports `third`.
+        map.insert("s".to_string(), over("again", None));
+        assert_eq!(
+            apply_one(&mut map, Some("third"), None),
+            pair("again", None)
+        );
+        assert_eq!(map["s"].baseline, Some(pair("third", None)));
+        assert!(!map["s"].confirmed);
+        // Replacing a confirmed override also resets it.
+        apply_one(&mut map, Some("again"), None);
+        assert!(map["s"].confirmed);
+        map.insert("s".to_string(), over("again", None));
+        assert_eq!(map["s"], over("again", None));
     }
 
     #[test]

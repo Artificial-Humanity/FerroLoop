@@ -90,13 +90,7 @@ fn execute_returns_the_new_session_sets_the_model_override_and_broadcasts() {
     spin_up(&state, "felicity", "assistant", "claude");
     // The operator chose a model for the old run, and a prompt waits for it.
     for key in ["felicity", "claude:felicity"] {
-        state.set_session_model_override(
-            key,
-            ModelOverride {
-                model: "claude-opus-5-5".into(),
-                thinking_level: None,
-            },
-        );
+        state.set_session_model_override(key, ModelOverride::new("claude-opus-5-5".into(), None));
         state.enqueue_session_prompt(
             key,
             Some("felicity".into()),
@@ -276,10 +270,7 @@ fn a_peer_cannot_remodel_a_hosted_session_and_nothing_changes() {
     spin_up(&state, "felicity", "assistant", "claude");
     state.set_session_model_override(
         "claude:felicity",
-        ModelOverride {
-            model: "claude-opus-5-5".into(),
-            thinking_level: None,
-        },
+        ModelOverride::new("claude-opus-5-5".into(), None),
     );
     state.enqueue_session_prompt(
         "claude:felicity",
@@ -424,10 +415,7 @@ fn a_failed_execute_broadcasts_its_outcome_and_a_restore_puts_the_override_back(
     let tmp = TempDir::new().unwrap();
     let state = hub(&tmp);
     spin_up(&state, "felicity", "assistant", "claude");
-    let chosen = ModelOverride {
-        model: "claude-opus-5-5".into(),
-        thinking_level: Some("high".into()),
-    };
+    let chosen = ModelOverride::new("claude-opus-5-5".into(), Some("high".into()));
     for key in ["felicity", "claude:felicity"] {
         state.set_session_model_override(key, chosen.clone());
     }
