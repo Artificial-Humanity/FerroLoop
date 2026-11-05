@@ -22,9 +22,12 @@ pub struct UnitDirectives {
 
 /// The `After=` / `WantedBy=` facts of one unit file.
 ///
-/// Comments and the wrong section do not count. Repeated keys are merged, which is how
-/// systemd reads them. A trailing `\` continues the line; a `#` or `;` line in that gap is
-/// skipped. Whitespace around `=` is ignored.
+/// Comments and the wrong section do not count. Repeated `After=` lines are merged; an empty
+/// `After=` does not clear an earlier one. An empty `WantedBy=` clears `WantedBy=` values
+/// already seen, and a later non-empty `WantedBy=` applies again. One matching quote pair
+/// around a `WantedBy` token is removed; quotes on `After=` stay literal. A trailing `\`
+/// continues the line. A `#` or `;` line is skipped, including one that ends in `\`, and a
+/// comment inside a continuation does not end it. Whitespace around `=` is ignored.
 pub fn user_unit_directives(text: &str) -> UnitDirectives {
     let mut section = String::new();
     let mut after = false;
@@ -41,11 +44,16 @@ pub fn user_unit_directives(text: &str) -> UnitDirectives {
         if section == "Unit"
             && let Some(value) = assignment(trimmed, "After")
         {
+            // Empty `After=` does not drop dependencies already read.
             after |= mentions_default_target(value);
         } else if section == "Install"
             && let Some(value) = assignment(trimmed, "WantedBy")
         {
-            wanted |= mentions_default_target(value);
+            if value.is_empty() {
+                wanted = false;
+            } else {
+                wanted |= mentions_wanted_by_default(value);
+            }
         }
     }
     UnitDirectives {
@@ -69,10 +77,47 @@ fn assignment<'a>(trimmed: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn mentions_default_target(value: &str) -> bool {
-    value.split_whitespace().any(|token| {
-        let token = token.strip_prefix('-').unwrap_or(token);
-        token == DEFAULT_TARGET
-    })
+    value.split_whitespace().any(mentions_default_target_token)
+}
+
+/// One leading `-` still orders (`-default.target` is the unit `default.target`).
+fn mentions_default_target_token(token: &str) -> bool {
+    let token = token.strip_prefix('-').unwrap_or(token);
+    token == DEFAULT_TARGET
+}
+
+/// `WantedBy=` is `config_parse_strv` (`EXTRACT_UNQUOTE`): one matching quote pair is removed.
+/// `After=` keeps quotes, so this is not used for it.
+fn mentions_wanted_by_default(value: &str) -> bool {
+    value.split_whitespace().any(wanted_by_token_is_default)
+}
+
+fn wanted_by_token_is_default(token: &str) -> bool {
+    if let Some(inner) = matching_quotes(token) {
+        return mentions_default_target_token(inner);
+    }
+    if let Some(rest) = token.strip_prefix('-')
+        && let Some(inner) = matching_quotes(rest)
+    {
+        // `-"default.target"` unquotes to `-default.target`; the dash strip then
+        // compares the quoted remainder itself.
+        return inner == DEFAULT_TARGET;
+    }
+    mentions_default_target_token(token)
+}
+
+/// Matching outer `"` or `'`. Mismatched or unbalanced quotes stay literal.
+fn matching_quotes(token: &str) -> Option<&str> {
+    let bytes = token.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    if (quote == b'"' || quote == b'\'') && bytes[bytes.len() - 1] == quote {
+        Some(&token[1..bytes.len() - 1])
+    } else {
+        None
+    }
 }
 
 fn logical_lines(text: &str) -> Vec<String> {
@@ -80,24 +125,24 @@ fn logical_lines(text: &str) -> Vec<String> {
     let mut buf = String::new();
     let mut continued = false;
     for raw in text.lines() {
-        // systemd skips a comment block that follows a trailing `\`, then joins the next line.
-        if continued {
-            let trimmed = raw.trim();
-            if trimmed.starts_with('#') || trimmed.starts_with(';') {
-                continue;
-            }
+        // Skip every comment line. `continue` leaves `continued` alone, so a `#`/`\` line
+        // neither joins into the value nor swallows the next directive.
+        let trimmed = raw.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
         }
+        let open = continued;
         continued = raw.ends_with('\\') && !raw.ends_with("\\\\");
         let piece = if continued {
             &raw[..raw.len() - 1]
         } else {
             raw
         };
-        if buf.is_empty() {
-            buf.push_str(piece);
-        } else {
+        if open {
             buf.push(' ');
             buf.push_str(piece.trim_start());
+        } else {
+            buf.push_str(piece);
         }
         if !continued {
             out.push(std::mem::take(&mut buf));
@@ -281,5 +326,72 @@ WantedBy=multi-user.target
         assert!(!d.after_default_target && d.wanted_by_default_target);
         let d = user_unit_directives("[Unit]\nAfter=default.target\n");
         assert!(d.after_default_target && !d.wanted_by_default_target);
+    }
+
+    #[test]
+    fn empty_wanted_by_resets_and_empty_after_does_not() {
+        let cleared = user_unit_directives("[Install]\nWantedBy=default.target\nWantedBy=\n");
+        assert!(!cleared.wanted_by_default_target);
+        let blanks = user_unit_directives("[Install]\nWantedBy=default.target\nWantedBy=   \n");
+        assert!(!blanks.wanted_by_default_target);
+        let restored = user_unit_directives(
+            "[Install]\nWantedBy=default.target\nWantedBy=\nWantedBy=default.target\n",
+        );
+        assert!(restored.wanted_by_default_target);
+
+        let kept = user_unit_directives("[Unit]\nAfter=default.target\nAfter=\n");
+        assert!(kept.after_default_target);
+        let later = user_unit_directives("[Unit]\nAfter=\nAfter=default.target\n");
+        assert!(later.after_default_target);
+    }
+
+    #[test]
+    fn wanted_by_quotes_match_and_the_same_after_quotes_do_not() {
+        // Outer quotes, quotes around a leading `-`, and a `-` outside the quotes.
+        let quoted = [
+            "\"default.target\"",
+            "'default.target'",
+            "\"-default.target\"",
+            "'-default.target'",
+            "-\"default.target\"",
+            "-'default.target'",
+        ];
+        for token in quoted {
+            let wanted = user_unit_directives(&format!("[Install]\nWantedBy={token}\n"));
+            assert!(
+                wanted.wanted_by_default_target,
+                "WantedBy={token} should match"
+            );
+            let after = user_unit_directives(&format!("[Unit]\nAfter={token}\n"));
+            assert!(
+                !after.after_default_target,
+                "After={token} keeps the quotes and must not match"
+            );
+        }
+        for token in [
+            "\"default.target'",
+            "'default.target\"",
+            "\"default.target",
+            "default.target\"",
+            "-\"default.target",
+            "-'default.target",
+        ] {
+            let wanted = user_unit_directives(&format!("[Install]\nWantedBy={token}\n"));
+            assert!(
+                !wanted.wanted_by_default_target,
+                "unbalanced WantedBy={token} must stay literal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_ending_in_backslash_does_not_swallow_the_next_directive() {
+        for line in ["# comment \\", "; comment \\"] {
+            let d = user_unit_directives(&format!("[Unit]\n{line}\nAfter=default.target\n"));
+            assert!(
+                d.after_default_target,
+                "a comment ending in \\ must not swallow the next line: {line:?}"
+            );
+        }
     }
 }

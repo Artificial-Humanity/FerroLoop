@@ -1375,7 +1375,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       () => propVersionProvenance ?? DEFAULT_VERSION_PROVENANCE,
     );
   const [verifyingVersion, setVerifyingVersion] = useState(false);
-  // Record #220 (Issue #205 Phase A3): Observational `fl doctor` 6 canonical G7 checks
+  // Record #220 (Issue #205 Phase A3): Observational `fl doctor` canonical G7 checks
   const [doctorChecks, setDoctorChecks] = useState<DoctorCheckItem[]>(
     () => propDoctorChecks ?? DEFAULT_DOCTOR_CHECKS,
   );

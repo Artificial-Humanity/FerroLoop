@@ -10,7 +10,7 @@ use fl_core::doctor::{
     DoctorInputs, DoctorReport, NodeMeta, ReceiptSource, StoreFacts, UiFacts, UnitFacts,
     UnitFileFact, VaultFacts, VaultNode, run, user_unit_directives,
 };
-use fl_core::install::{Layout, MAX_RECEIPT_BYTES};
+use fl_core::install::{BUDGET_EXCEEDED, InstallReceipt, Layout, MAX_RECEIPT_BYTES, OwnedUnit};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -112,6 +112,8 @@ const MAX_UNIT_BYTES: usize = 64 * 1024;
 /// The most `ferro*.service` names one report lists. The rest are a note, so the check
 /// cannot pass on a partial directory.
 const MAX_UNITS: usize = 32;
+/// Every `read_dir` entry counts, not only `ferro*` names. One past this stops the scan.
+const MAX_DIR_ENTRIES: usize = 4096;
 
 /// `ferrostore.service`, `ferrostore@.service`, `ferrowire.service`, `ferroloop-hub.service`,
 /// and any other `ferro*.service` in the user unit directory.
@@ -156,66 +158,184 @@ fn read_unit(name: &str, path: &Path) -> UnitFileFact {
     }
 }
 
-/// List installed `ferro*.service` units. A missing directory is "none installed", not an error.
-fn unit_facts(shown: &str, home: Option<&Path>) -> UnitFacts {
-    let dir = match expand_unit_dir(shown, home) {
-        Ok(dir) => dir,
-        Err(reason) => {
-            return UnitFacts {
-                note: Some(reason),
-                units: Vec::new(),
-            };
+struct LocatedUnit {
+    name: String,
+    path: PathBuf,
+}
+
+enum Scan {
+    /// The time budget ran out. Do not read unit files.
+    Budget,
+    Names(Vec<String>),
+}
+
+fn budget_exceeded(probe: &FsProbe) -> bool {
+    probe
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn push_note(note: &mut Option<String>, more: &str) {
+    match note {
+        Some(first) => {
+            first.push_str("; ");
+            first.push_str(more);
         }
+        None => *note = Some(more.to_string()),
+    }
+}
+
+/// List installed `ferro*.service` units. A missing directory is "none from the directory",
+/// not an error. A parsed receipt selects `layout.unit_dir` and any owned unit file whose
+/// name was not in that listing.
+fn unit_facts(
+    fallback: &str,
+    home: Option<&Path>,
+    probe: &FsProbe,
+    receipt: &ReceiptSource,
+) -> UnitFacts {
+    let parsed = match receipt {
+        ReceiptSource::Text(text) => InstallReceipt::parse(text).ok(),
+        _ => None,
     };
+    let shown = parsed
+        .as_ref()
+        .map(|r| r.layout.unit_dir.as_str())
+        .unwrap_or(fallback);
+
+    let mut note = None;
+    let mut located = Vec::new();
+    let mut stop_reads = false;
+    match expand_unit_dir(shown, home) {
+        Err(reason) => push_note(&mut note, &reason),
+        Ok(dir) => match scan_unit_dir(&dir, probe, &mut note) {
+            Scan::Budget => stop_reads = true,
+            Scan::Names(names) => {
+                for name in names {
+                    located.push(LocatedUnit {
+                        path: dir.join(&name),
+                        name,
+                    });
+                }
+            }
+        },
+    }
+    if stop_reads {
+        return UnitFacts {
+            note,
+            units: Vec::new(),
+        };
+    }
+    if let Some(parsed) = &parsed {
+        push_receipt_units(&parsed.units, home, &mut located);
+    }
+    located.sort_by(|a, b| a.name.cmp(&b.name));
+    let omitted = located.len().saturating_sub(MAX_UNITS);
+    if omitted > 0 {
+        located.truncate(MAX_UNITS);
+        push_note(
+            &mut note,
+            &format!("+{omitted} more ferro*.service units were not read"),
+        );
+    }
+    let mut units = Vec::with_capacity(located.len());
+    for unit in &located {
+        if budget_exceeded(probe) {
+            push_note(&mut note, BUDGET_EXCEEDED);
+            break;
+        }
+        units.push(read_unit(&unit.name, &unit.path));
+    }
+    UnitFacts { note, units }
+}
+
+fn push_receipt_units(units: &[OwnedUnit], home: Option<&Path>, located: &mut Vec<LocatedUnit>) {
+    for unit in units {
+        if !is_ferro_unit(&unit.name) || located.iter().any(|have| have.name == unit.name) {
+            continue;
+        }
+        let Ok(path) = expand_unit_dir(&unit.path, home) else {
+            continue;
+        };
+        // The final component must be the unit name. Do not canonicalize or follow links;
+        // `read_unit` opens with `O_NOFOLLOW`.
+        if path.file_name().and_then(|name| name.to_str()) != Some(unit.name.as_str()) {
+            continue;
+        }
+        located.push(LocatedUnit {
+            name: unit.name.clone(),
+            path,
+        });
+    }
+}
+
+fn scan_unit_dir(dir: &Path, probe: &FsProbe, note: &mut Option<String>) -> Scan {
+    if budget_exceeded(probe) {
+        push_note(note, BUDGET_EXCEEDED);
+        return Scan::Budget;
+    }
     // Follow a symlink for the directory itself (`read_dir` does too). Unit files are opened
     // separately and a symlink there is not followed.
-    match std::fs::metadata(&dir) {
+    match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
-            return UnitFacts {
-                note: Some(format!(
-                    "unit directory {} is not a directory",
-                    dir.display()
-                )),
-                units: Vec::new(),
-            };
+            push_note(
+                note,
+                &format!("unit directory {} is not a directory", dir.display()),
+            );
+            return Scan::Names(Vec::new());
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UnitFacts::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Scan::Names(Vec::new()),
         Err(e) => {
-            return UnitFacts {
-                note: Some(format!(
+            push_note(
+                note,
+                &format!(
                     "unit directory {} could not be listed ({})",
                     dir.display(),
                     e.kind()
-                )),
-                units: Vec::new(),
-            };
+                ),
+            );
+            return Scan::Names(Vec::new());
         }
     }
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            return UnitFacts {
-                note: Some(format!(
+            push_note(
+                note,
+                &format!(
                     "unit directory {} could not be listed ({})",
                     dir.display(),
                     e.kind()
-                )),
-                units: Vec::new(),
-            };
+                ),
+            );
+            return Scan::Names(Vec::new());
         }
     };
     let mut names = Vec::new();
-    let mut note = None;
-    for entry in entries {
+    for (scanned, entry) in entries.enumerate() {
+        if budget_exceeded(probe) {
+            push_note(note, BUDGET_EXCEEDED);
+            return Scan::Budget;
+        }
+        if scanned == MAX_DIR_ENTRIES {
+            push_note(
+                note,
+                &format!("unit directory scan stopped at {MAX_DIR_ENTRIES} entries"),
+            );
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                note = Some(format!(
-                    "unit directory {} could not be listed in full ({})",
-                    dir.display(),
-                    e.kind()
-                ));
+                push_note(
+                    note,
+                    &format!(
+                        "unit directory {} could not be listed in full ({})",
+                        dir.display(),
+                        e.kind()
+                    ),
+                );
                 break;
             }
         };
@@ -228,20 +348,8 @@ fn unit_facts(shown: &str, home: Option<&Path>) -> UnitFacts {
         }
     }
     names.sort();
-    let omitted = names.len().saturating_sub(MAX_UNITS);
-    if omitted > 0 {
-        names.truncate(MAX_UNITS);
-        let more = format!("+{omitted} more ferro*.service units were not read");
-        note = Some(match note {
-            Some(first) => format!("{first}; {more}"),
-            None => more,
-        });
-    }
-    let units = names
-        .iter()
-        .map(|name| read_unit(name, &dir.join(name)))
-        .collect();
-    UnitFacts { note, units }
+    names.dedup();
+    Scan::Names(names)
 }
 
 /// Gather and run.
@@ -268,6 +376,7 @@ pub fn observe(o: Observe<'_>) -> DoctorReport {
             }
         }
     };
+    let units = unit_facts(&o.layout.unit_dir, o.home.as_deref(), &probe, &receipt);
     let inputs = DoctorInputs {
         vault: vault_facts(&o),
         binary: o.binary,
@@ -277,7 +386,7 @@ pub fn observe(o: Observe<'_>) -> DoctorReport {
         probe: &probe,
         stores: o.stores,
         ui,
-        units: unit_facts(&o.layout.unit_dir, o.home.as_deref()),
+        units,
     };
     run(&inputs)
 }
