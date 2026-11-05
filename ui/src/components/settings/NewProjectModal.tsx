@@ -177,7 +177,18 @@ function NewProjectForm({
 
   const changeName = (value: string) => {
     setName(value);
-    if (!slugManual) setSlug(deriveProjectSlug(value));
+    // An emptied slug counts as "not chosen yet": editing the name refills it.
+    if (!slugManual || slug === "") {
+      setSlugManual(false);
+      setSlug(deriveProjectSlug(value));
+    }
+  };
+
+  // Leaving the slug field empty hands it back to the name.
+  const refillEmptySlug = () => {
+    if (slug !== "") return;
+    setSlugManual(false);
+    setSlug(deriveProjectSlug(name));
   };
 
   const submit = async () => {
@@ -382,11 +393,11 @@ function NewProjectForm({
               disabled={busy}
               aria-invalid={shown.slug ? true : undefined}
               aria-describedby={describedBy("slug", Boolean(shown.slug))}
+              onBlur={refillEmptySlug}
               onChange={(e) => {
-                const value = e.target.value;
-                // Clearing the slug hands control back to the name.
-                setSlugManual(value !== "");
-                setSlug(value === "" ? deriveProjectSlug(name) : value);
+                // Any edit is manual; an empty value stays empty while typing.
+                setSlugManual(true);
+                setSlug(e.target.value);
               }}
             />
             {fieldError("slug", shown.slug)}

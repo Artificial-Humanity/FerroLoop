@@ -194,15 +194,45 @@ describe("NewProjectModal", () => {
     expect(body).not.toHaveProperty("github");
   });
 
-  it("resumes deriving the slug after a manually edited slug is cleared", () => {
+  it("lets the slug be emptied and retyped without refilling it", () => {
+    setup();
+    type("new-project-name", "My App");
+    type("new-project-slug", "custom");
+    type("new-project-slug", "");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("");
+    type("new-project-slug", "b");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("b");
+    type("new-project-name", "Other");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("b");
+  });
+
+  it("re-derives an empty slug on blur", () => {
+    setup();
+    type("new-project-name", "My App");
+    type("new-project-slug", "custom");
+    type("new-project-slug", "");
+    fireEvent.blur(screen.getByTestId("new-project-slug"));
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("my-app");
+    // Derivation is live again.
+    type("new-project-name", "Third One");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("third-one");
+  });
+
+  it("does not touch a non-empty slug on blur", () => {
+    setup();
+    type("new-project-name", "My App");
+    type("new-project-slug", "custom");
+    fireEvent.blur(screen.getByTestId("new-project-slug"));
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("custom");
+  });
+
+  it("re-derives an emptied slug when the name is edited", () => {
     setup();
     type("new-project-name", "First");
     type("new-project-slug", "custom");
     type("new-project-name", "Second");
     expect(screen.getByTestId("new-project-slug")).toHaveValue("custom");
     type("new-project-slug", "");
-    // Emptying re-derives from the current name right away.
-    expect(screen.getByTestId("new-project-slug")).toHaveValue("second");
     type("new-project-name", "Third One");
     expect(screen.getByTestId("new-project-slug")).toHaveValue("third-one");
   });
