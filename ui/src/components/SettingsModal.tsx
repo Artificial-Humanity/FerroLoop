@@ -943,16 +943,16 @@ const ACTION_LABELS: Record<BulkSessionAction, string> = {
   compact: "Compact All",
   clear: "Clear All",
   reforge: "Reforge All",
-  prepare: "Prepare All",
-  teardown: "Tear Down All",
+  prepare: "Prepare All for Decommission",
+  teardown: "Decommission All",
 };
 
 const ACTION_VERBS: Record<BulkSessionAction, string> = {
   compact: "Compact",
   clear: "Clear",
   reforge: "Reforge",
-  prepare: "Prepare",
-  teardown: "Tear Down",
+  prepare: "Prepare for Decommission",
+  teardown: "Decommission",
 };
 
 const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
