@@ -2379,7 +2379,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               className="fd-btn fd-btn-danger"
               data-testid="open-decommission-modal-btn"
               disabled={!canDecommission}
-              title="Prepare graceful decommission handshake or tear down session immediately"
+              title="Prepare graceful decommission handshake or decommission the session immediately"
               onClick={() => {
                 onClose();
                 onOpenDecommissionModal();

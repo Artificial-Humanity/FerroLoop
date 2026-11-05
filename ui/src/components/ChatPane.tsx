@@ -1184,6 +1184,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const clearHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [decommissionModalOpen, setDecommissionModalOpen] = React.useState<boolean>(false);
   const [decommissionHelpVisible, setDecommissionHelpVisible] = React.useState<boolean>(false);
+  // Second step of "Decommission" (teardown): the operator confirms before the session stops.
+  const [decommissionConfirmOpen, setDecommissionConfirmOpen] = React.useState<boolean>(false);
   const [decommissioning, setDecommissioning] = React.useState<boolean>(false);
   const decommissionHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [interruptArmed, setInterruptArmed] = React.useState<boolean>(false);
@@ -1739,6 +1741,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       decommissionHelpTimerRef.current = null;
     }
     setDecommissionHelpVisible(false);
+    setDecommissionConfirmOpen(false);
     setDecommissionModalOpen(true);
   };
 
@@ -1748,6 +1751,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       decommissionHelpTimerRef.current = null;
     }
     setDecommissionHelpVisible(false);
+    setDecommissionConfirmOpen(false);
     setDecommissionModalOpen(false);
   }, []);
 
@@ -1759,12 +1763,22 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!decommissionModalOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !decommissioning) {
-        handleCloseDecommissionModal();
+        // From the confirmation step Escape goes back one step; from the choices it closes.
+        if (decommissionConfirmOpen) {
+          setDecommissionConfirmOpen(false);
+        } else {
+          handleCloseDecommissionModal();
+        }
       }
     };
     window.addEventListener("keydown", handleKeyDownEscape);
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
-  }, [decommissionModalOpen, decommissioning, handleCloseDecommissionModal]);
+  }, [
+    decommissionModalOpen,
+    decommissionConfirmOpen,
+    decommissioning,
+    handleCloseDecommissionModal,
+  ]);
 
   const handleShowDecommissionHelp = () => {
     if (decommissionHelpTimerRef.current !== null) {
@@ -1808,7 +1822,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       handleCloseDecommissionModal();
       if (currentTargetRef.current === submittedTarget) {
         setCompactFeedback(
-          mode === "prepare" ? "Prepared decommission" : "Tore down session",
+          mode === "prepare" ? "Prepared for decommission" : "Decommissioned session",
         );
       }
     } catch (err) {
@@ -4180,7 +4194,82 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </div>
       )}
 
-      {decommissionModalOpen && (
+      {decommissionModalOpen && decommissionConfirmOpen && (
+        <div
+          className="fd-modal-backdrop"
+          onClick={() => {
+            if (!decommissioning) setDecommissionConfirmOpen(false);
+          }}
+        >
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="decommission-confirm-title"
+            aria-describedby="decommission-confirm-description"
+            data-testid="decommission-confirm-dialog"
+            className="fd-modal"
+            onClick={(e) => e.stopPropagation()}
+            style={{ position: "relative", maxWidth: "460px" }}
+          >
+            <h3
+              id="decommission-confirm-title"
+              style={{
+                margin: "0 0 10px 0",
+                fontSize: "15px",
+                fontWeight: 600,
+                color: "var(--text-primary)",
+              }}
+            >
+              Confirm Decommission
+            </h3>
+            <p
+              id="decommission-confirm-description"
+              style={{
+                margin: "0 0 16px 0",
+                fontSize: "13px",
+                color: "var(--text-secondary)",
+                lineHeight: 1.5,
+              }}
+            >
+              Are you sure you want to decommission{" "}
+              <strong style={{ color: "var(--text-primary)" }}>{displayTarget}</strong>? This
+              immediately stops the runtime session, clears queues and routes, and unregisters
+              the persona.
+            </p>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="decommission-confirm-cancel-btn"
+                autoFocus
+                disabled={decommissioning}
+                onClick={() => setDecommissionConfirmOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="fd-btn fd-btn-danger"
+                data-testid="decommission-confirm-submit-btn"
+                disabled={decommissioning}
+                onClick={() => void handleDecommission("teardown")}
+              >
+                Yes, Decommission
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {decommissionModalOpen && !decommissionConfirmOpen && (
         <div
           className="fd-modal-backdrop"
           onClick={handleCloseDecommissionModal}
@@ -4222,7 +4311,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   type="button"
                   data-testid="decommission-help-btn"
                   aria-label="Help"
-                  title="Explain Prepare & Decommission vs. Tear Down"
+                  title="Explain Prepare for Decommission vs. Decommission"
                   className="fd-btn fd-help-icon-btn"
                   onClick={handleShowDecommissionHelp}
                 >
@@ -4250,13 +4339,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               >
                 <div style={{ marginBottom: "6px" }}>
                   <strong style={{ color: "var(--accent-hover)" }}>
-                    Prepare &amp; Decommission:
+                    Prepare for Decommission:
                   </strong>{" "}
                   Sends a pre-decommission state and worktree hygiene handshake prompt so the
                   agent saves STATE.md/FerroState, cleans up worktrees, and messages its Lead.
                 </div>
                 <div>
-                  <strong style={{ color: "var(--text-primary)" }}>Tear Down:</strong>{" "}
+                  <strong style={{ color: "var(--text-primary)" }}>Decommission:</strong>{" "}
                   Immediately stops the runtime session, clears queues and routes, and
                   unregisters the persona.
                 </div>
@@ -4288,6 +4377,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 type="button"
                 className="fd-btn"
                 data-testid="decommission-cancel-btn"
+                autoFocus
                 disabled={decommissioning}
                 onClick={handleCloseDecommissionModal}
               >
@@ -4298,9 +4388,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 className="fd-btn fd-btn-danger"
                 data-testid="decommission-teardown-btn"
                 disabled={decommissioning}
-                onClick={() => void handleDecommission("teardown")}
+                onClick={() => setDecommissionConfirmOpen(true)}
               >
-                Tear Down
+                Decommission
               </button>
               <button
                 type="button"
@@ -4309,7 +4399,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 disabled={decommissioning}
                 onClick={() => void handleDecommission("prepare")}
               >
-                Prepare &amp; Decommission
+                Prepare for Decommission
               </button>
             </div>
           </div>
