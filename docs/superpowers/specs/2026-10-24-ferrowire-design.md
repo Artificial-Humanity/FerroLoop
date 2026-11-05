@@ -596,8 +596,9 @@ over WebSocket from a remote peer), the dispatcher attempts immediate push deliv
      `current_dir(dir)` if `cwd` exists.
 5. **xAI Grok (`VendorRoute::Grok`):**
    * Executes `grok` (or `$FL_WIRE_GROK_BIN` override) with arguments
-     `["--no-auto-update", "--no-alt-screen", "--always-approve", "-s", <session_id>, "-p", <formatted_message>]`,
-     setting `current_dir(dir)` if `cwd` exists.
+     `["--no-auto-update", "--no-alt-screen", "--always-approve", "-r", <session_id>, "-p", <formatted_message>]`,
+     setting `current_dir(dir)` if `cwd` exists. When grok reports that the session is not found,
+     it runs once more with `-s` in place of `-r`, which creates the session.
 6. **Test / Custom Unix Socket (`VendorRoute::Webhook`):**
    * Connects to `socket_path` and writes a single JSON line containing the `WireMessage`.
 

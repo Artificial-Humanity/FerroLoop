@@ -125,8 +125,8 @@ the hub's environment) plus the variables the launch sets itself:
 | --- | --- | --- |
 | `codex queue --thread ... --message ...` (`run_codex_queue`) | Codex | none |
 | `muse exec --session-id ... --json` (`run_muse_exec`) | Muse | `MUSE_NO_AUTO_UPDATE=1` |
-| `grok --always-approve -s ... -p ...` (`run_grok_headless`) | Grok | none |
-| `agy agentapi send-message` (`deliver_to_agy_route`) | Antigravity | `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENTAPI_EXE`, and `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN` when the route or the hub has them |
+| `grok --always-approve -r ... -p ...`, then `-s` if the session is not found (`run_grok_headless`) | Grok | none |
+| `agy agentapi send-message --title=... ...` (`deliver_to_agy_route`) | Antigravity | `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENTAPI_EXE`, and `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN` when the route or the hub has them |
 
 `grok` runs with `--always-approve`, so it can start any tool; it sees no `FL_*`, `GITHUB_*` or
 other vendor's key. The test seams the hub reads (`FL_WIRE_CODEX_BIN`, `FL_WIRE_MUSE_BIN`,
