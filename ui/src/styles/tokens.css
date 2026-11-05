@@ -856,6 +856,23 @@ button.fd-badge:hover:not(:disabled) {
     display: none !important;
   }
 
+  .fd-tier-agent,
+  [data-testid="tier-agent-nav"] {
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center;
+    gap: 2px !important;
+    padding: 3px 8px !important;
+    flex: 1 1 auto !important;
+    min-width: 0;
+  }
+
+  .fd-tier-agent-identity,
+  .fd-tier-agent-meta {
+    justify-content: center;
+    max-width: 100%;
+  }
+
   .fd-workspace {
     position: relative;
   }

@@ -1257,15 +1257,21 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       // Disabled by default on mobile (even if legacy fd_show_safe_margins was "true")
       expect(screen.queryByTestId("ios-safe-area-overlay")).toBeNull();
 
-      // Header settings button is rendered in ContextHeader when left sidebar is collapsed
-      expect(screen.getByTestId("header-settings-btn")).toBeInTheDocument();
+      // Redundant header settings button is removed from ContextHeader (Record #118)
+      expect(screen.queryByTestId("header-settings-btn")).toBeNull();
+
+      // Top-center agent context renders identity and meta sub-rows for vertical stacking on mobile
+      const agentNav = screen.getByTestId("tier-agent-nav");
+      expect(agentNav.querySelector(".fd-tier-agent-identity")).not.toBeNull();
+      expect(agentNav.querySelector(".fd-tier-agent-meta")).not.toBeNull();
 
       // Chat toolbar also exposes left and right panel show/hide toggles
       expect(screen.getByTestId("chat-toolbar-left-panel-toggle")).toBeInTheDocument();
       expect(screen.getByTestId("chat-toolbar-right-panel-toggle")).toBeInTheDocument();
 
-      // Enable via Settings -> Appearance -> Show iOS Safe-Area Margins
-      fireEvent.click(screen.getByTestId("header-settings-btn"));
+      // Enable via Left Sidebar -> Settings -> Appearance -> Show iOS Safe-Area Margins
+      fireEvent.click(screen.getByTestId("mobile-sidebar-toggle-btn"));
+      fireEvent.click(screen.getByTestId("settings-modal-btn"));
       fireEvent.click(screen.getByTestId("settings-tab-appearance"));
       const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
       expect(toggle.checked).toBe(false);
