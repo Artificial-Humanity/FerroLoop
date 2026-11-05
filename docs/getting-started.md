@@ -119,6 +119,49 @@ below uses `--project 1`. Every item also has a full id, an IRI such as
 `urn:uuid:0199…`, which is what the store keeps and what every reference between items
 holds. A command accepts either; the handle is only there to be typed and read.
 
+### Register a project in one step: `fl project init`
+
+`fl project init <path>` takes a directory (made if it does not exist) to a registered, routed
+project, whatever state it is in:
+
+```
+fl project init <path> [--name <slug>] [--github <owner/repo>] [--credential <app|env>]
+                       [--purpose <summary>] [--by <author>] [--json]
+```
+
+It does these, in this order, and leaves what is already right alone:
+
+1. **Git.** A directory with a `HEAD` is not touched. A directory with no repository gets
+   `git init`; a repository with no commit gets one. Either way the commit is empty, message
+   `chore: initial commit`, authored by `--by` (default `fl`), so `HEAD` exists and the working
+   tree is not committed.
+2. **Name.** `--name`, else the root's lowercase directory name, else the name the config already
+   gives that root. A name is 1 to 64 of lowercase letters, digits, `-` and `_`, starting with a
+   letter.
+3. **Stores.** The project's store `<name>.fls` goes beside the workspace store (the
+   `[state].store` of the config, else `$XDG_DATA_HOME/fl`). It holds the project and its
+   routing map: the areas `backlog`, `code`, `design`, `product`, `security`, `tests` and `ux`,
+   all routed to the local tier, `security` marked sensitive. A map the store already has is
+   kept. The workspace store (`--db` or `$FL_DB` names another) gets the project's area, with
+   `--purpose` (default `Project <name>`; an existing area keeps its purpose when none is
+   given).
+4. **MCP catalog.** `<root>/.fl/mcp.toml` is written if it is absent, and never changed if it
+   exists.
+5. **Config.** A `[[project]]` block (`name`, `root`, `store`) is appended to
+   `$XDG_CONFIG_HOME/fl/config.toml`, the rest of the file untouched. The block is written last,
+   by replacing the file whole, so a failure earlier leaves the project unregistered and a re-run
+   finishes it. `--github owner/repo` adds a `[project.tracker]` with `credential` `app` (the
+   default) or `env`; `--credential` needs `--github`. A project that has no tracker gets the one
+   asked for; one that has a tracker is never rebound.
+
+Nothing is changed until the request is checked. fl refuses an empty path, a NUL, a path that is a
+file, a name that another project's block already has (at another root), a root that is already
+registered under another name, a store that holds another project, and a root that contains the
+stores' directory. Running the same command again changes nothing. `--json` prints the project:
+`name`, `root`, `store`, `project` (its IRI), `purpose`, `tracker`, `areas`, `git`,
+`mcp_catalog_created`, `config` and `registered`. The Hub does the same through
+`POST /api/v1/projects` ([hub-home-and-artifacts.md](hub-home-and-artifacts.md)).
+
 ## 3. Write a gate
 
 A gate names a population — the things it must examine — and a program to run against

@@ -581,6 +581,9 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
             crate::artifact_dirs::handle_post_system_dir(state, &authority, req)
         }
         ("GET", "/api/v1/projects") => crate::artifact_dirs::handle_get_projects(state),
+        ("POST", "/api/v1/projects") => {
+            crate::project_init::handle_post_projects(state, &authority, req)
+        }
         ("GET", "/api/v1/cloud/adapters") => handle_get_cloud_adapters(state),
         ("PUT", "/api/v1/cloud/adapters") => handle_put_cloud_adapters(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),

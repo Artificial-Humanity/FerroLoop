@@ -941,6 +941,16 @@ fn run(cli: Cli) -> Result<i32> {
             }
             return cmd::mcp::run(c, &cfg.mcp, &cwd);
         }
+        // `fl project init` registers a project that has no store yet, so it opens the stores
+        // itself: the project's own and the workspace's, not the one the current directory
+        // is bound to.
+        Cli {
+            db,
+            command: Command::Project(cmd::project::Cmd::Init(args)),
+        } => {
+            let default_store = default_state_store_path()?;
+            return cmd::project::init(args, &cfg, &cwd, explicit_db(db), &default_store);
+        }
         Cli {
             db,
             command: Command::Agent { cmd },

@@ -40,7 +40,7 @@ const MAX_TITLE_CHARS: usize = 500;
 const MAX_RECORD_ID_LEN: usize = 256;
 
 /// `<home>/.local/share/fl`, where per-project stores live.
-fn projects_dir(home: &Path) -> PathBuf {
+pub(crate) fn projects_dir(home: &Path) -> PathBuf {
     home.join(".local/share/fl")
 }
 

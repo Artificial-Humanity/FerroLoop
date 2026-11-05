@@ -32,7 +32,7 @@ Anything else is dropped and the default applies, field by field.
 
 ## Endpoints
 
-Every route needs authentication. Both `POST` routes are **Owner only**: a Peer names itself, so
+Every route needs authentication. Every `POST` route is **Owner only**: a Peer names itself, so
 no finer tier can be trusted, and a Peer gets `403`.
 
 ### `GET /api/v1/settings`, `PUT /api/v1/settings`
@@ -77,6 +77,40 @@ It broadcasts `settings.updated`. Errors:
 ```
 
 The projects are the Hub's available projects (the default one is always present).
+
+### `POST /api/v1/projects`
+
+Makes a directory a project: the flow of `fl project init`
+([getting-started.md](getting-started.md#register-a-project-in-one-step-fl-project-init)), run
+by the Hub for the Owner. It writes the Owner's config and may `git init` the path, so it is
+Owner only.
+
+```json
+{ "path": "/srv/code/app", "name": "app", "github": "acme/app",
+  "credential": "app", "purpose": "the app" }
+```
+
+Only `path` is required; unknown fields are refused. `path` must be absolute, with no `..` and no
+NUL byte; the Hub also refuses one in a system directory, under a secret's directory (`.ssh`,
+`.aws` and the like), or that is, or contains, the Hub's home. `name`, `github`, `credential` and
+`purpose` mean what the flags of `fl project init` mean. The author recorded is the caller's
+name.
+
+The config is the Hub's `$XDG_CONFIG_HOME/fl/config.toml` (default `$HOME/.config/fl/config.toml`),
+and the project's store is `$HOME/.local/share/fl/<name>.fls`, the file `GET /api/v1/projects`
+lists projects from. The workspace area goes into the Hub store. Response `201` for a
+new project, `200` when it was already initialized (nothing changes); the body is the project as
+`GET /api/v1/projects` shows it (`id`, `artifacts_dir`, `default_artifacts_dir`,
+`effective_artifacts_dir`) plus `name`, `root`, `store`, `project` (the IRI), `purpose`,
+`tracker`, `areas`, `git`, `mcp_catalog_created`, `config` and `registered`. It broadcasts
+`project.created` on the `projects` channel.
+
+| Status | Cause |
+| --- | --- |
+| `400` | the body is not valid, the path or name or repository or credential cannot be used, or the path is somewhere the Hub refuses |
+| `403` | the caller is not the Owner |
+| `409` | the name is registered at another root, the root under another name, the project's tracker is a different one, or its store holds another project |
+| `500` | git, a store or the config file failed |
 
 ### `GET /api/v1/projects/:id/artifacts-dir`
 

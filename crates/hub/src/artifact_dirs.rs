@@ -173,6 +173,11 @@ fn project_view(state: &HubState, s: &Settings, id: &str) -> Value {
     })
 }
 
+/// One project as `GET /api/v1/projects` lists it, read from the saved settings.
+pub(crate) fn project_descriptor(state: &HubState, id: &str) -> Value {
+    project_view(state, &current_settings(state), id)
+}
+
 fn error(status: u16, message: impl Into<String>) -> HttpResponse {
     HttpResponse::json(status, json!({ "error": message.into() }))
 }
