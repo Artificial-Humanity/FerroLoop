@@ -6355,7 +6355,9 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
 }
 
 pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
-    LifecycleEnv::new(state.config.home_override.as_deref())
+    let mut env = LifecycleEnv::new(state.config.home_override.as_deref());
+    env.workspace_root = state.config.repo_root.parent();
+    env
 }
 
 fn caller_of(authority: &HubAuthority) -> lifecycle::Caller {
