@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import type { SessionQuotaUsage } from "../types/api";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
@@ -15,7 +15,7 @@ import {
   formatModelOptionLabel,
   formatTokenCount,
   getVendorModelOptions,
-  inferVendorFromModel,
+  resolveSessionVendor,
   isAntigravityAdapter,
   type EstimatedContextUsage,
 } from "./ChatPane";
@@ -377,6 +377,21 @@ export interface AgentSettingsModalProps {
 
 export type AgentSettingsTabId = "overview" | "permissions" | "runtime";
 
+interface FetchedSessionState {
+  executionMode: string | null;
+  adapter: string | null;
+  model: string | null;
+  thinkingLevel: string | null;
+  availableModels: string[] | null;
+  /** Prop values in effect when the fetch landed. */
+  props: {
+    adapter?: string | null;
+    model?: string;
+    thinkingLevel?: string;
+    executionMode?: string | null;
+  };
+}
+
 export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   isOpen,
   onClose,
@@ -458,28 +473,37 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setPostureActionStatus(null);
     setActiveTab(initialTab);
   }, [isOpen, agentName, agentProject, agentRole, initialTab]);
-  const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
-  const [fetchedAdapter, setFetchedAdapter] = useState<string | null>(null);
-  const [fetchedModel, setFetchedModel] = useState<string | null>(null);
-  const [fetchedAvailableModels, setFetchedAvailableModels] = useState<string[] | null>(null);
+  // Session metadata read from the hub every time the modal opens. The hub may
+  // change a session's model, effort or mode behind the UI's back (an operator
+  // override can be superseded by what the vendor reports), so the session list
+  // is the source of truth and the props are only the initial values. `props`
+  // records the prop values the fetch landed against: a prop that changes later
+  // (the operator switched the model in this modal) is newer than the fetch.
+  const [fetchedSession, setFetchedSession] = useState<FetchedSessionState | null>(null);
+  const latestPropsRef = useRef<FetchedSessionState["props"] & { apiClient?: HubApiClient }>({
+    adapter,
+    model: selectedModel,
+    thinkingLevel: selectedThinkingLevel,
+    executionMode,
+  });
+  latestPropsRef.current = {
+    adapter,
+    model: selectedModel,
+    thinkingLevel: selectedThinkingLevel,
+    executionMode,
+    apiClient,
+  };
+  const canFetchSessions =
+    Boolean(apiClient) && typeof apiClient?.getSessions === "function";
   useEffect(() => {
-    setFetchedExecutionMode(null);
-    setFetchedAdapter(null);
-    setFetchedModel(null);
-    setFetchedAvailableModels(null);
-    const needsAdapter = !adapter || adapter.trim().toLowerCase() === "unknown";
-    if (
-      !isOpen ||
-      (executionMode !== undefined && !needsAdapter) ||
-      !apiClient ||
-      (!sessionId && !agentName) ||
-      typeof apiClient.getSessions !== "function"
-    ) {
+    setFetchedSession(null);
+    const client = latestPropsRef.current.apiClient;
+    if (!isOpen || !canFetchSessions || !client || (!sessionId && !agentName)) {
       return;
     }
     let cancelled = false;
     Promise.resolve()
-      .then(() => apiClient.getSessions())
+      .then(() => client.getSessions())
       .then((res) => {
         if (cancelled) return;
         const sessions = res?.sessions ?? [];
@@ -487,16 +511,21 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         const match =
           (sessionId ? sessions.find((s) => s.id === sessionId) : undefined) ??
           (wanted ? sessions.find((s) => s.persona?.trim().toLowerCase() === wanted) : undefined);
-        setFetchedExecutionMode(match?.execution_mode ?? null);
-        setFetchedAdapter(match?.adapter ?? null);
-        setFetchedModel(match?.model ?? null);
-        setFetchedAvailableModels(match?.available_models ?? null);
+        const { apiClient: _client, ...propsAtFetch } = latestPropsRef.current;
+        setFetchedSession({
+          executionMode: match?.execution_mode ?? null,
+          adapter: match?.adapter ?? null,
+          model: match?.model ?? null,
+          thinkingLevel: match?.thinking_level ?? null,
+          availableModels: match?.available_models ?? null,
+          props: propsAtFetch,
+        });
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [isOpen, executionMode, adapter, apiClient, sessionId, agentName]);
+  }, [isOpen, canFetchSessions, sessionId, agentName]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -521,22 +550,32 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
   const agentKey = (agentName || displayTarget).trim().toLowerCase();
   const targetSessionOrAgent = sessionId || agentName || "";
+  const fetchedFor = <K extends keyof FetchedSessionState["props"]>(
+    key: K,
+    current: FetchedSessionState["props"][K],
+    fetchedValue: string | null | undefined,
+  ): string | null => {
+    const value = (fetchedValue ?? "").trim();
+    if (!fetchedSession || !value) return null;
+    return current === fetchedSession.props[key] ? value : null;
+  };
+  const rawSelectedModel =
+    fetchedFor("model", selectedModel, fetchedSession?.model) ?? (selectedModel ?? "").trim();
   const rawPropAdapter = (adapter ?? "").trim();
-  const rawFetchedAdapter = (fetchedAdapter ?? "").trim();
-  const rawSelectedModel = (selectedModel ?? "").trim();
-  const rawFetchedModel = (fetchedModel ?? "").trim();
-  const knownAdapter =
-    rawPropAdapter && rawPropAdapter.toLowerCase() !== "unknown"
-      ? rawPropAdapter
-      : rawFetchedAdapter && rawFetchedAdapter.toLowerCase() !== "unknown"
-        ? rawFetchedAdapter
-        : inferVendorFromModel(rawSelectedModel || rawFetchedModel) ?? "";
-  const effectiveAdapter = knownAdapter || rawPropAdapter || rawFetchedAdapter || null;
+  const rawFetchedAdapter = fetchedSession?.adapter?.trim() ?? "";
+  const chosenAdapter =
+    rawFetchedAdapter &&
+    rawFetchedAdapter.toLowerCase() !== "unknown" &&
+    adapter === fetchedSession?.props.adapter
+      ? rawFetchedAdapter
+      : rawPropAdapter;
+  const knownAdapter = resolveSessionVendor(chosenAdapter, rawSelectedModel);
+  const effectiveAdapter = knownAdapter || chosenAdapter || null;
   const effectiveAvailableModels =
-    Array.isArray(availableModels) && availableModels.length > 0
-      ? availableModels
-      : fetchedAvailableModels;
-  const candidateModel = rawSelectedModel || rawFetchedModel;
+    fetchedSession?.availableModels && fetchedSession.availableModels.length > 0
+      ? fetchedSession.availableModels
+      : availableModels;
+  const candidateModel = rawSelectedModel;
   const isStaleAntigravityModel =
     !isAntigravityAdapter(knownAdapter) &&
     candidateModel.toLowerCase().startsWith("gemini-") &&
@@ -549,7 +588,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     effectiveAvailableModels,
   );
   const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
-  const effectiveThinking = (selectedThinkingLevel || "high").trim().toLowerCase();
+  const effectiveThinkingLevel =
+    fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
+    selectedThinkingLevel;
+  const effectiveThinking = (effectiveThinkingLevel || "high").trim().toLowerCase();
 
   const handleRecastSubmit = async (confirmOverrides = false) => {
     if (recasting || !agentKey) return;
@@ -605,7 +647,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
       : THINKING_LEVEL_OPTIONS;
   const effectiveExecutionMode =
-    executionMode !== undefined ? executionMode : fetchedExecutionMode;
+    fetchedFor("executionMode", executionMode, fetchedSession?.executionMode) ??
+    (executionMode !== undefined ? executionMode : null);
   const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
   const executionModeIsYolo = executionModeKey === "yolo";
 
@@ -954,7 +997,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     ? `${effectiveAdapter} · `
                     : ""}
                   {effectiveModel || "default"}
-                  {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
+                  {effectiveThinkingLevel ? ` (${effectiveThinkingLevel})` : ""}
                 </span>
               </div>
               {typeof turnCount === "number" && (

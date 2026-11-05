@@ -656,19 +656,27 @@ export function inferVendorFromModel(modelId?: string | null): string | null {
   return null;
 }
 
+/**
+ * Decide the vendor of a session. A known adapter always wins: Antigravity
+ * hosts `claude-*` and `gpt-oss-*` models too, so the model id only decides
+ * when the adapter is missing or `unknown`.
+ */
+export function resolveSessionVendor(
+  adapter?: string | null,
+  modelId?: string | null,
+): string {
+  const rawAdapter = (adapter ?? "").trim();
+  if (rawAdapter && rawAdapter.toLowerCase() !== "unknown") return rawAdapter;
+  return inferVendorFromModel(modelId) ?? "";
+}
+
 export function getVendorModelOptions(
   adapter?: string | null,
   currentModel?: string | null,
   availableModels?: string[] | null,
 ): string[] {
-  const rawAdapter = (adapter ?? "").trim().toLowerCase();
   const trimmedCurrent = (currentModel ?? "").trim();
-  const inferred =
-    !rawAdapter || rawAdapter === "unknown"
-      ? (inferVendorFromModel(trimmedCurrent) ?? "")
-      : "";
-  const normalized =
-    rawAdapter && rawAdapter !== "unknown" ? rawAdapter : inferred;
+  const normalized = resolveSessionVendor(adapter, trimmedCurrent).toLowerCase();
 
   let base: string[];
   if (Array.isArray(availableModels) && availableModels.length > 0) {

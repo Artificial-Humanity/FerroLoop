@@ -256,6 +256,66 @@ function makeSampleWatchSummary(): WatchSummaryResponse {
   };
 }
 
+describe("FerroWatchPane — Antigravity hosted model suffix", () => {
+  async function renderModels(vendor: string, hostedModel: string, sessionModel: string) {
+    const summary = makeSampleWatchSummary();
+    summary.telemetry.by_adapter = [
+      {
+        key: vendor,
+        attempts: 3,
+        succeeded: 3,
+        failed: 0,
+        crashed: 0,
+        timed_out: 0,
+        tokens_in: 1000,
+        tokens_out: 100,
+        cost_usd_micros: 0,
+        duration_ms: 1000,
+      },
+    ];
+    summary.health!.agents = [
+      {
+        ...summary.health!.agents[0],
+        adapter: vendor,
+        hosted_session: {
+          ...summary.health!.agents[0].hosted_session!,
+          vendor,
+          model: hostedModel,
+        },
+      },
+    ];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch })}
+        sessions={[{ id: "s1", source: "route", adapter: vendor, status: "active", model: sessionModel }]}
+      />,
+    );
+    return screen.findByTestId(`watch-rollup-adapter-${vendor}`);
+  }
+
+  it("shows one chip when the hosted record holds the effort-suffixed id of the session model", async () => {
+    const row = await renderModels("antigravity", "claude-sonnet-5-5-high", "claude-sonnet-5-5");
+    await waitFor(() =>
+      expect(row.querySelector("span")?.textContent).toBe("antigravity (claude-sonnet-5-5)"),
+    );
+  });
+
+  it("keeps the hosted model verbatim for any other vendor", async () => {
+    const row = await renderModels("claude", "claude-opus-5-5-high", "claude-opus-5-5");
+    await waitFor(() =>
+      expect(row).toHaveTextContent("(claude-opus-5-5, claude-opus-5-5-high)"),
+    );
+  });
+});
+
 describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness & Rollups", () => {
   it("renders alerts, vendor quota matrix, liveness table, and rollups, and executes remodel + balance actions", async () => {
     const summaryData = makeSampleWatchSummary();
