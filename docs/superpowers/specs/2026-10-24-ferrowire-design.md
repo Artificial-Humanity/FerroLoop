@@ -542,13 +542,20 @@ performs **passive route discovery** before dispatching to a persona (matching
 1. `discover_claude_routes`: scans `~/.claude/sessions/*.json` for live PIDs whose `"name"` is
    non-empty and does not start with `"artificial-humanity-"`, extracting `messagingSocketPath`
    and resolving `~/.claude/sessions/<pid>.<sha256(canonical_socket_path)>.key` (falling back to
-   `~/.claude/sessions/<pid>.*.key`).
+   `~/.claude/sessions/<pid>.*.key`). A session with `"nameSource": "derived"` (a name taken from
+   the worktree directory) takes the persona named by the `<session>` part of its
+   `"tmux": "<session>:<window>.<pane>"` field when that persona is already known.
 2. `discover_agy_routes`: scans `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`
    for active conversations and pairs them with `ANTIGRAVITY_LS_ADDRESS`,
    `ANTIGRAVITY_CSRF_TOKEN`, and `ANTIGRAVITY_AGENTAPI_EXE` discovered from `/proc/*/environ`
    (or `~/.gemini/antigravity-cli/cli.log` matching
    `Language server listening on random port at (\d+) for HTTP`, sharing the discovered
-   host-level `ls_address` and `csrf_token` across active Antigravity routes).
+   host-level `ls_address` and `csrf_token` across active Antigravity routes). A log whose last
+   listener is followed by `Language server shutting down` (a one-shot `agy` command) names no
+   port; the scan then reads the newest `~/.gemini/antigravity-cli/log/cli-*.log` files. A route
+   whose `ls_address` or `csrf_token` the scan corrects (or whose existing `agentapi_exe` it replaces) gets `updated_at` set to
+   the scan time, so a stale entry in the legacy agent-bus routes file does not win the merge on
+   load.
 3. `discover_codex_routes`: scans `~/.codex/session_index.jsonl` for active Codex threads.
 4. `discover_muse_routes`: scans `~/.local/share/muse/sessions/` (or `$XDG_DATA_HOME/muse/sessions/`)
    `.jsonl` files for active Meta Muse sessions.

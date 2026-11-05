@@ -304,12 +304,23 @@ impl RouteTable {
         let primary = custom_path
             .map(Path::to_path_buf)
             .unwrap_or_else(default_routes_path);
-        let mut table = Self::load_file(&primary).unwrap_or_default();
-        if custom_path.is_none()
+        let legacy = if custom_path.is_none()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
-            && let Some(legacy) = legacy_routes_path()
-            && let Some(legacy_table) = Self::load_file(&legacy)
         {
+            legacy_routes_path()
+        } else {
+            None
+        };
+        Self::load_with_legacy(&primary, legacy.as_deref())
+    }
+
+    /// The table in `primary`, with the newer entries of `legacy` (the file agent-bus sessions
+    /// write) merged in by [`RouteTable::merge_newer`], which keeps `primary`'s entry on a tie.
+    /// A discovery pass that corrects an entry in place must therefore re-stamp it, or a
+    /// `legacy` entry with a later stamp but the stale endpoint wins ([`RouteTable::discover_routes`]).
+    fn load_with_legacy(primary: &Path, legacy: Option<&Path>) -> Self {
+        let mut table = Self::load_file(primary).unwrap_or_default();
+        if let Some(legacy_table) = legacy.and_then(Self::load_file) {
             table.merge_newer(legacy_table);
         }
         table
@@ -785,7 +796,9 @@ impl RouteTable {
             {
                 self.entries.remove(&derived_key);
             }
-            let Some(persona) = resolve_claude_session_persona(home, &val, Some(&self.entries))
+            let known = |persona: &str| self.entries.contains_key(persona);
+            let Some(persona) =
+                resolve_claude_session_persona(home, &val, Some(&self.entries), &known)
             else {
                 continue;
             };
@@ -826,7 +839,11 @@ impl RouteTable {
                         .as_ref()
                         .is_none_or(|path| !agy_exe_is_usable(path))
                 {
+                    let replaced = agentapi_exe.is_some();
                     *agentapi_exe = Some(fallback.clone());
+                    if replaced {
+                        restamp_if_newer(&mut entry.updated_at, at);
+                    }
                 }
             }
             return;
@@ -835,25 +852,23 @@ impl RouteTable {
         let mut shared_csrf: Option<String> = None;
         let mut shared_exe: Option<PathBuf> = None;
 
-        // 1. Prefer live language-server HTTP port from cli.log so host reboots immediately
-        // override stale pre-reboot ports persisted in routes.json.
-        if let Ok(log_text) = fs::read_to_string(agy_dir.join("cli.log")) {
-            for line in log_text.lines().rev() {
-                if line.contains("for HTTPS") {
-                    continue;
-                }
-                if let Some(idx) = line.find("Language server listening on random port at ") {
-                    let rest = &line[idx + "Language server listening on random port at ".len()..];
-                    let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    if !port.is_empty() {
-                        let candidate = format!("127.0.0.1:{port}");
-                        // Offline temp-home discovery does not probe listeners.
-                        // Host discovery keeps scanning until a port accepts.
-                        if !check_proc || agy_ls_address_listening(&candidate) {
-                            shared_ls_addr = Some(candidate);
-                            break;
-                        }
-                    }
+        // 1. Prefer live language-server HTTP port from the agy logs so host reboots immediately
+        // override stale pre-reboot ports persisted in routes.json. `cli.log` is the newest log,
+        // but a one-shot `agy` command (`agy models`) rotates it to a log of its own that shuts
+        // its language server down within a second, while the persistent `agy remote-control
+        // serve` daemon keeps writing to the log it opened. A log whose last listener was shut
+        // down names no port, so the scan falls through to the logs next to it.
+        'logs: for log in agy_log_candidates(&agy_dir) {
+            let Ok(log_text) = fs::read_to_string(&log) else {
+                continue;
+            };
+            for port in agy_live_http_ports(&log_text) {
+                let candidate = format!("127.0.0.1:{port}");
+                // Offline temp-home discovery does not probe listeners.
+                // Host discovery keeps scanning until a port accepts.
+                if !check_proc || agy_ls_address_listening(&candidate) {
+                    shared_ls_addr = Some(candidate);
+                    break 'logs;
                 }
             }
         }
@@ -932,6 +947,7 @@ impl RouteTable {
         let resolved_shared =
             resolve_agy_exe(shared_exe.as_deref(), env_exe.as_deref(), Some(home));
         for entry in self.entries.values_mut() {
+            let mut changed = false;
             if let VendorRoute::Agy {
                 ls_address,
                 csrf_token,
@@ -939,6 +955,7 @@ impl RouteTable {
                 ..
             } = &mut entry.route
             {
+                let before = (ls_address.clone(), csrf_token.clone(), agentapi_exe.clone());
                 if shared_ls_addr.is_some() {
                     *ls_address = shared_ls_addr.clone();
                 } else if check_proc
@@ -957,6 +974,18 @@ impl RouteTable {
                 {
                     *agentapi_exe = Some(resolved_shared.clone());
                 }
+                // Filling an exe the route never had is no correction: the legacy copy holds none
+                // either, or a stale one a later scan replaces.
+                changed = before.0 != *ls_address
+                    || before.1 != *csrf_token
+                    || (before.2.is_some() && before.2 != *agentapi_exe);
+            }
+            // A corrected endpoint is a newer entry: `RouteTable::load` merges the legacy
+            // agent-bus file in by `updated_at`, and an entry that kept its old stamp would lose
+            // to a legacy copy still holding the stale pre-reboot endpoint. Nothing changed, no
+            // restamp, so a steady-state scan stays a no-op for the callers that save on change.
+            if changed {
+                restamp_if_newer(&mut entry.updated_at, at);
             }
         }
 
@@ -2559,15 +2588,31 @@ fn grok_env_route(home: Option<&Path>, session_id: String) -> Option<VendorRoute
 /// Capture the current process's vendor environment route so `fl wire` / `agent-msg`
 /// can register it in the route table automatically.
 pub fn capture_current_env_route() -> Option<VendorRoute> {
-    if let Some(sock) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET") {
+    capture_env_route_from(&|k| std::env::var_os(k))
+}
+
+/// [`capture_current_env_route`] over an injected environment.
+///
+/// `ANTIGRAVITY_CONVERSATION_ID` is inherited by every subshell an Antigravity session starts,
+/// so a caller there that registers a Codex, Muse or Grok agent names that session through its
+/// own variable (`CODEX_THREAD_ID`, `MUSE_SESSION_ID`, `GROK_SESSION_ID`). Those explicit
+/// session ids come before the inherited Antigravity one. A `CLAUDE_SESSION_ID` without a
+/// Claude messaging socket yields no Claude route, and it must not become an Antigravity one.
+fn capture_env_route_from(
+    get_env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<VendorRoute> {
+    let get_str = |k: &str| get_env(k).and_then(|v| v.into_string().ok());
+    let set = |k: &str| get_str(k).filter(|v| !v.trim().is_empty());
+    let tmux_pane = || get_str("TMUX_PANE").filter(|s| !s.trim().is_empty());
+    if let Some(sock) = get_env("CLAUDE_CODE_MESSAGING_SOCKET") {
         let socket_path = PathBuf::from(sock);
         let pid = socket_path
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(std::process::id);
-        let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
-        let key_path = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+        let session_id = get_str("CLAUDE_SESSION_ID").unwrap_or_default();
+        let key_path = get_env("HOME").map(PathBuf::from).and_then(|h| {
             resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path)
         });
         return Some(VendorRoute::Claude {
@@ -2577,60 +2622,48 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
             key_path,
         });
     }
-    if let Ok(conv_id) = std::env::var("ANTIGRAVITY_CONVERSATION_ID")
-        && !conv_id.trim().is_empty()
-    {
-        return Some(VendorRoute::Agy {
-            conversation_id: conv_id,
-            ls_pid: None,
-            ls_address: std::env::var("ANTIGRAVITY_LS_ADDRESS").ok(),
-            csrf_token: std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok(),
-            agentapi_exe: std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from),
-        });
-    }
-    if let Ok(thread_id) = std::env::var("CODEX_THREAD_ID")
-        && !thread_id.trim().is_empty()
-    {
+    if let Some(thread_id) = set("CODEX_THREAD_ID") {
         return Some(VendorRoute::Codex {
             thread_id,
             cwd: std::env::current_dir().ok(),
         });
     }
-    if let Ok(session_id) = std::env::var("MUSE_SESSION_ID")
-        && !session_id.trim().is_empty()
-    {
+    if let Some(session_id) = set("MUSE_SESSION_ID") {
         return Some(VendorRoute::Muse {
             session_id,
             cwd: std::env::current_dir().ok(),
             tmux_target: None,
-            tmux_pane: std::env::var("TMUX_PANE")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            tmux_pane: tmux_pane(),
         });
     }
-    if let Ok(session_id) = std::env::var("GROK_SESSION_ID")
-        && !session_id.trim().is_empty()
-    {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(session_id) = set("GROK_SESSION_ID") {
+        let home = get_env("HOME").map(PathBuf::from);
         // A headless `grok -p` session is not a route: fall through to the other probes.
         if let Some(route) = grok_env_route(home.as_deref(), session_id) {
             return Some(route);
         }
     }
-    if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
-        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        && let Some((session_id, cwd, tmux_pane)) =
+    if set("CLAUDE_SESSION_ID").is_none()
+        && let Some(conv_id) = set("ANTIGRAVITY_CONVERSATION_ID")
+    {
+        return Some(VendorRoute::Agy {
+            conversation_id: conv_id,
+            ls_pid: None,
+            ls_address: get_str("ANTIGRAVITY_LS_ADDRESS"),
+            csrf_token: get_str("ANTIGRAVITY_CSRF_TOKEN"),
+            agentapi_exe: get_env("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from),
+        });
+    }
+    if get_str("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Some("1")
+        && let Some(home) = get_env("HOME").map(PathBuf::from)
+        && let Some((session_id, cwd, tmux_pane_found)) =
             resolve_grok_pid_session(&home, std::process::id())
     {
         return Some(VendorRoute::Grok {
             session_id,
             cwd: cwd.or_else(|| std::env::current_dir().ok()),
             tmux_target: None,
-            tmux_pane: tmux_pane.or_else(|| {
-                std::env::var("TMUX_PANE")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            }),
+            tmux_pane: tmux_pane_found.or_else(tmux_pane),
         });
     }
     None
@@ -2767,7 +2800,16 @@ fn resolve_persona_traced(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .and_then(|s| s.parse::<u32>().ok())
-                && let Some(norm) = resolve_claude_pid_persona(&home, pid)
+                && let Some(norm) = resolve_claude_pid_persona(&home, pid, &|persona| {
+                    registry.is_some_and(|reg| {
+                        reg.list_agents(None, false).ok().is_some_and(|agents| {
+                            agents.iter().any(|a| {
+                                a.status == AgentStatus::Active
+                                    && a.name_key.eq_ignore_ascii_case(persona)
+                            })
+                        })
+                    })
+                })
             {
                 return inferred(norm);
             }
@@ -2780,10 +2822,12 @@ fn resolve_persona_traced(
     let routes = load_routes();
     for (env_var, kind) in [
         ("CLAUDE_SESSION_ID", "claude"),
-        ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
         ("CODEX_THREAD_ID", "codex"),
         ("MUSE_SESSION_ID", "muse"),
         ("GROK_SESSION_ID", "grok"),
+        // Last: every subshell of an Antigravity session inherits this id, so it must not
+        // preempt a session id the caller passed for another vendor.
+        ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
     ] {
         if let Some(sid) = get_str(env_var)
             && !sid.trim().is_empty()
@@ -2828,10 +2872,76 @@ fn resolve_persona_traced(
     inferred("unknown".to_string())
 }
 
+/// Move `stamp` forward to `at`; a stamp never moves back.
+fn restamp_if_newer(stamp: &mut At, at: &At) {
+    if at.unix_millis() > stamp.unix_millis() {
+        *stamp = at.clone();
+    }
+}
+
+/// How many `log/cli-*.log` files [`agy_log_candidates`] offers besides `cli.log`.
+const AGY_LOG_CANDIDATES: usize = 8;
+
+/// The agy logs to scan for a language-server port, best first: `cli.log` (a symlink to the
+/// newest log), then the newest `log/cli-*.log` files by modification time.
+fn agy_log_candidates(agy_dir: &Path) -> Vec<PathBuf> {
+    let mut logs = vec![agy_dir.join("cli.log")];
+    let mut dated: Vec<(u64, PathBuf)> = fs::read_dir(agy_dir.join("log"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("cli-") && name.ends_with(".log"))
+        })
+        .map(|path| (mtime_ms(&path), path))
+        .collect();
+    dated.sort_by(|a, b| b.cmp(a));
+    let head = fs::canonicalize(&logs[0]).ok();
+    logs.extend(
+        dated
+            .into_iter()
+            .map(|(_, path)| path)
+            .filter(|path| head.is_none() || fs::canonicalize(path).ok() != head)
+            .take(AGY_LOG_CANDIDATES),
+    );
+    logs
+}
+
+/// The language-server HTTP ports a log names, newest first, that were not shut down: ports
+/// logged before the last `Language server shutting down` line belong to servers that exited,
+/// so a log that ends in a shutdown yields none. HTTPS (gRPC) listeners are not the endpoint.
+fn agy_live_http_ports(log_text: &str) -> Vec<String> {
+    const LISTENING: &str = "Language server listening on random port at ";
+    let mut ports = Vec::new();
+    for line in log_text.lines() {
+        if line.contains("Language server shutting down") {
+            ports.clear();
+        } else if !line.contains("for HTTPS")
+            && let Some(idx) = line.find(LISTENING)
+        {
+            let port: String = line[idx + LISTENING.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !port.is_empty() {
+                ports.push(port);
+            }
+        }
+    }
+    ports.reverse();
+    ports
+}
+
+/// The persona a Claude `sessions/<pid>.json` belongs to. `known_personas` says whether a name is
+/// a persona the caller already knows (a route-table key, a registered agent).
 fn resolve_claude_session_persona(
     home: &Path,
     val: &serde_json::Value,
     existing_entries: Option<&BTreeMap<String, RouteEntry>>,
+    known_personas: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     let name_source = val.get("nameSource").and_then(|v| v.as_str());
     let derived_name = if name_source == Some("derived") {
@@ -2844,6 +2954,20 @@ fn resolve_claude_session_persona(
     if name_source != Some("derived")
         && let Some(name) = val.get("name").and_then(|v| v.as_str())
         && let Some(persona) = normalize_claude_session_name(name)
+    {
+        return Some(persona);
+    }
+
+    // A derived name (`felix-ui-86`, from the worktree directory) names no persona. The tmux
+    // session the agent runs in does when it is one: `"tmux": "Felix:@5.%5"` is
+    // `<session>:<window>.<pane>`.
+    if name_source == Some("derived")
+        && let Some(persona) = val
+            .get("tmux")
+            .and_then(|v| v.as_str())
+            .and_then(|tmux| tmux.split(':').next())
+            .and_then(normalize_claude_session_name)
+        && known_personas(&persona)
     {
         return Some(persona);
     }
@@ -2882,7 +3006,11 @@ fn resolve_claude_session_persona(
     None
 }
 
-fn resolve_claude_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
+fn resolve_claude_pid_persona(
+    home: &Path,
+    start_pid: u32,
+    known_personas: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let sessions_dir = home.join(".claude").join("sessions");
     let projects_dir = home.join(".claude").join("projects");
     let mut pid = start_pid;
@@ -2893,7 +3021,7 @@ fn resolve_claude_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
         let session_file = sessions_dir.join(format!("{pid}.json"));
         if let Ok(raw) = fs::read_to_string(&session_file)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(norm) = resolve_claude_session_persona(home, &val, None)
+            && let Some(norm) = resolve_claude_session_persona(home, &val, None, known_personas)
         {
             return Some(norm);
         }
@@ -4819,6 +4947,273 @@ mod tests {
             other => panic!("expected agy route, got {other:?}"),
         }
         drop(listener);
+    }
+
+    fn stale_agy_route(conversation_id: &str, ls_address: &str, csrf: &str) -> VendorRoute {
+        VendorRoute::Agy {
+            conversation_id: conversation_id.into(),
+            ls_pid: None,
+            ls_address: Some(ls_address.into()),
+            csrf_token: Some(csrf.into()),
+            agentapi_exe: Some(PathBuf::from("/bin/sh")),
+        }
+    }
+
+    fn agy_ls_address_of(table: &RouteTable, persona: &str) -> Option<String> {
+        match &table.get(persona)?.route {
+            VendorRoute::Agy { ls_address, .. } => ls_address.clone(),
+            other => panic!("expected agy route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_discovery_restamps_a_corrected_route_so_the_legacy_file_cannot_clobber_it() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        fs::create_dir_all(agy_dir.join("brain")).unwrap();
+        fs::write(
+            agy_dir.join("cli.log"),
+            "Language server listening on random port at 41547 for HTTP\n",
+        )
+        .unwrap();
+        let primary = tmp.path().join("fl-wire-routes.json");
+        let legacy = tmp.path().join("routes.json");
+        let stale = "localhost:36313";
+        let save_stale = |path: &Path, stamp_ms: u64| {
+            let mut table = RouteTable::default();
+            table.upsert(
+                "kayla",
+                stale_agy_route("conv-kayla", stale, "csrf"),
+                At::from_unix_millis(stamp_ms),
+            );
+            table.save(Some(path)).unwrap();
+        };
+        // The legacy agent-bus copy carries a later stamp than the primary's, with the stale
+        // pre-reboot endpoint.
+        save_stale(&primary, 100);
+        save_stale(&legacy, 200);
+
+        let mut table = RouteTable::load_with_legacy(&primary, None);
+        table.discover_routes(Some(&home), At::from_unix_millis(300));
+        assert_eq!(
+            agy_ls_address_of(&table, "kayla").as_deref(),
+            Some("127.0.0.1:41547")
+        );
+        assert_eq!(table.get("kayla").unwrap().updated_at.unix_millis(), 300);
+        table.save(Some(&primary)).unwrap();
+
+        let reloaded = RouteTable::load_with_legacy(&primary, Some(&legacy));
+        assert_eq!(
+            agy_ls_address_of(&reloaded, "kayla").as_deref(),
+            Some("127.0.0.1:41547"),
+            "the stale legacy entry must not win the merge"
+        );
+
+        // A scan that changes nothing leaves the stamp alone.
+        table.discover_routes(Some(&home), At::from_unix_millis(400));
+        assert_eq!(table.get("kayla").unwrap().updated_at.unix_millis(), 300);
+    }
+
+    #[test]
+    fn agy_discovery_restamps_a_replaced_exe_but_not_a_filled_one() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".gemini").join("antigravity-cli").join("brain")).unwrap();
+        let route = |conv: &str, exe: Option<&str>| VendorRoute::Agy {
+            conversation_id: conv.into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: exe.map(PathBuf::from),
+        };
+        let mut table = RouteTable::default();
+        table.upsert(
+            "stale",
+            route("c1", Some("/gone/agy.old")),
+            At::from_unix_millis(1),
+        );
+        table.upsert("unset", route("c2", None), At::from_unix_millis(1));
+        table.discover_agy_routes(home, false, &At::from_unix_millis(5));
+        assert_eq!(table.get("stale").unwrap().updated_at.unix_millis(), 5);
+        assert_eq!(table.get("unset").unwrap().updated_at.unix_millis(), 1);
+    }
+
+    #[test]
+    fn agy_discovery_skips_a_one_shot_cli_log_that_shut_its_language_server_down() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        let log_dir = agy_dir.join("log");
+        fs::create_dir_all(agy_dir.join("brain")).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        // The persistent `agy remote-control serve` daemon's log.
+        fs::write(
+            log_dir.join("cli-daemon.log"),
+            "Language server listening on random port at 44271 for HTTPS (gRPC)\n\
+             Language server listening on random port at 41699 for HTTP\n",
+        )
+        .unwrap();
+        // An `agy models` run: a listener that shuts down within a second. `cli.log` follows it.
+        fs::write(
+            log_dir.join("cli-oneshot.log"),
+            "Language server listening on random port at 38000 for HTTP\n\
+             Language server shutting down\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(log_dir.join("cli-oneshot.log"), agy_dir.join("cli.log"))
+            .unwrap();
+
+        let at = At::from_unix_millis(10);
+        let mut table = RouteTable::default();
+        table.upsert(
+            "kayla",
+            stale_agy_route("conv-kayla", "localhost:36313", "csrf"),
+            At::from_unix_millis(1),
+        );
+        table.discover_agy_routes(home, false, &at);
+        assert_eq!(
+            agy_ls_address_of(&table, "kayla").as_deref(),
+            Some("127.0.0.1:41699")
+        );
+    }
+
+    #[test]
+    fn agy_live_http_ports_ends_at_the_last_shutdown() {
+        let log = "Language server listening on random port at 1 for HTTP\n\
+                   Language server shutting down\n\
+                   Language server listening on random port at 2 for HTTP\n\
+                   Language server listening on random port at 3 for HTTPS (gRPC)\n\
+                   Language server listening on random port at 4 for HTTP\n";
+        assert_eq!(agy_live_http_ports(log), ["4", "2"]);
+        let shut = format!("{log}Language server shutting down\n");
+        assert!(agy_live_http_ports(&shut).is_empty());
+    }
+
+    fn env_of<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        }
+    }
+
+    #[test]
+    fn an_inherited_antigravity_id_does_not_preempt_an_explicit_session_id() {
+        let off = ("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+        let agy = ("ANTIGRAVITY_CONVERSATION_ID", "conv-inherited");
+        // Alone, the Antigravity id is the caller's route.
+        assert!(matches!(
+            capture_env_route_from(&env_of(&[off, agy])),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-inherited"
+        ));
+        assert!(matches!(
+            capture_env_route_from(&env_of(&[off, agy, ("CODEX_THREAD_ID", "thread-7")])),
+            Some(VendorRoute::Codex { thread_id, .. }) if thread_id == "thread-7"
+        ));
+        assert!(matches!(
+            capture_env_route_from(&env_of(&[off, agy, ("MUSE_SESSION_ID", "muse-7")])),
+            Some(VendorRoute::Muse { session_id, .. }) if session_id == "muse-7"
+        ));
+        assert!(matches!(
+            capture_env_route_from(&env_of(&[off, agy, ("GROK_SESSION_ID", "grok-7")])),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "grok-7"
+        ));
+        // A Claude session id has no route without its socket, and is not an Antigravity one.
+        assert!(
+            capture_env_route_from(&env_of(&[off, agy, ("CLAUDE_SESSION_ID", "claude-7")]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_inherited_antigravity_id_does_not_preempt_an_explicit_session_id_for_the_persona() {
+        let route = |route: VendorRoute| {
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "jarvis",
+                stale_agy_route("conv-1", "x:1", "c"),
+                At::from_unix_millis(9),
+            );
+            routes.upsert("ada", route, At::from_unix_millis(1));
+            routes
+        };
+        let routes = route(VendorRoute::Codex {
+            thread_id: "thread-7".into(),
+            cwd: None,
+        });
+        let env = env_of(&[
+            ("ANTIGRAVITY_CONVERSATION_ID", "conv-1"),
+            ("CODEX_THREAD_ID", "thread-7"),
+        ]);
+        let cwd = TempDir::new().unwrap();
+        let r = resolve_persona_traced(None, None, cwd.path(), None, || routes, &env);
+        assert_eq!(r, ("ada".to_string(), PersonaSource::Inferred));
+    }
+
+    #[test]
+    fn a_derived_claude_session_name_resolves_through_its_tmux_session() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sessions = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let sock = home.join("cc.sock");
+        fs::write(&sock, "").unwrap();
+        let session = |tmux: &str| {
+            serde_json::json!({
+                "pid": 1419570,
+                "name": "felix-ui-86",
+                "nameSource": "derived",
+                "tmux": tmux,
+                "sessionId": "felix-new-session",
+                "messagingSocketPath": sock,
+            })
+        };
+        let claude = |pid: u32, session_id: &str| VendorRoute::Claude {
+            pid,
+            session_id: session_id.into(),
+            socket_path: sock.clone(),
+            key_path: None,
+        };
+        let known = |persona: &str| persona == "felix";
+        assert_eq!(
+            resolve_claude_session_persona(home, &session("Felix:@5.%5"), None, &known).as_deref(),
+            Some("felix")
+        );
+        // A tmux session that is no known persona names nothing, and a named session wins.
+        assert_eq!(
+            resolve_claude_session_persona(home, &session("main:@1.%1"), None, &known),
+            None
+        );
+        let mut named = session("Felix:@5.%5");
+        named["nameSource"] = "user".into();
+        named["name"] = "ada".into();
+        assert_eq!(
+            resolve_claude_session_persona(home, &named, None, &known).as_deref(),
+            Some("ada")
+        );
+
+        // Through discovery: the felix route follows the new session.
+        fs::write(
+            sessions.join("1419570.json"),
+            session("Felix:@5.%5").to_string(),
+        )
+        .unwrap();
+        let mut table = RouteTable::default();
+        table.upsert(
+            "felix",
+            claude(1, "felix-old-session"),
+            At::from_unix_millis(1),
+        );
+        table.discover_routes(Some(home), At::from_unix_millis(2));
+        assert!(matches!(
+            table.get("felix").map(|e| &e.route),
+            Some(VendorRoute::Claude { pid: 1419570, session_id, .. }) if session_id == "felix-new-session"
+        ));
+        assert!(table.get("felix-ui-86").is_none());
     }
 
     #[test]
