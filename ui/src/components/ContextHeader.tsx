@@ -646,21 +646,17 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           className={`fd-tier-group fd-tier-system${activeTier === "system" ? " is-active-tier" : ""}`}
           data-testid="tier-system-nav"
           data-active-tier={activeTier === "system" ? "true" : undefined}
-          style={
-            activeTier === "system"
-              ? { position: "relative" }
-              : {
-                  position: "absolute",
-                  width: "1px",
-                  height: "1px",
-                  padding: 0,
-                  margin: "-1px",
-                  overflow: "hidden",
-                  clip: "rect(0, 0, 0, 0)",
-                  whiteSpace: "nowrap",
-                  border: 0,
-                }
-          }
+          style={{
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: 0,
+          }}
         >
           <div
             style={{

@@ -424,15 +424,27 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           minWidth: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+            width: "100%",
+            minWidth: 0,
+          }}
+        >
           <strong style={{ fontSize: "14px" }}>Project Records &amp; Kanban Board</strong>
           <div
             data-testid="board-project-actions-row"
             style={{
               display: "flex",
               alignItems: "center",
+              justifyContent: "space-between",
               gap: "8px",
               flexWrap: "nowrap",
+              flex: "1 1 auto",
               minWidth: 0,
             }}
           >
@@ -458,6 +470,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
                 gap: "6px",
                 flexWrap: "nowrap",
                 flexShrink: 0,
+                marginLeft: "auto",
               }}
             >
               <button

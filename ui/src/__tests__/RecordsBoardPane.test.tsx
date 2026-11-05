@@ -109,6 +109,7 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
     const actionsGroup = within(projectActionsRow).getByTestId(
       "board-actions-group",
     );
+    expect(actionsGroup.style.marginLeft).toBe("auto");
     const newRecordBtn = within(actionsGroup).getByTestId("board-new-record-btn");
     const refreshBtn = within(actionsGroup).getByTestId("board-refresh-btn");
     expect(newRecordBtn).toHaveAttribute("aria-label", "+ New Record");

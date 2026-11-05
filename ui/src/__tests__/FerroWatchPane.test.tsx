@@ -803,7 +803,23 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
     expect(within(sidebar).getByTestId("left-panel-active-title")).toHaveTextContent(
       "FerroWatch",
     );
-    expect(await screen.findByTestId("ferrowatch-pane")).toBeInTheDocument();
+    const watchPane = await screen.findByTestId("ferrowatch-pane");
+    expect(watchPane).toBeInTheDocument();
+    expect(watchPane.style.overflowY).toBe("auto");
+    expect(watchPane.style.overflowX).toBe("hidden");
+
+    const topRow = within(watchPane).getByTestId("ferrowatch-header-top-row");
+    expect(within(topRow).getByTestId("ferrowatch-pane-title")).toHaveTextContent(
+      "FerroWatch",
+    );
+    const headerActions = within(topRow).getByTestId("ferrowatch-header-actions");
+    expect(headerActions.style.marginLeft).toBe("auto");
+    const refreshBtn = within(headerActions).getByTestId("watch-refresh-btn");
+    expect(refreshBtn).toHaveAttribute("aria-label", "Refresh");
+    expect(refreshBtn.querySelector("svg")).not.toBeNull();
+
+    const consoleBody = within(watchPane).getByTestId("watch-console-body");
+    expect(consoleBody).not.toHaveClass("fd-scroll");
 
     unmount();
   });

@@ -443,5 +443,9 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(metaRow).getByTestId("active-project-badge")).toHaveTextContent(
       "FerroLoop",
     );
+
+    const systemNav = screen.getByTestId("tier-system-nav");
+    expect(systemNav.style.position).toBe("absolute");
+    expect(systemNav.style.clip).toBe("rect(0px, 0px, 0px, 0px)");
   });
 });
