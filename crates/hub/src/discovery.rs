@@ -4726,6 +4726,79 @@ enum HookWire<'a> {
     Quoted(&'a str),
 }
 
+/// Where the opening tag of a hook element ends: the byte index of its `>` in `rest`, the text
+/// after `<hook_prompt`. `None` unless what comes before the `>` is zero or more attributes,
+/// each after at least one ASCII whitespace character: a name (`[A-Za-z_:][A-Za-z0-9_:.-]*`)
+/// that stands alone or has `=` (ASCII whitespace around it allowed) and a double-quoted,
+/// single-quoted or unquoted value. A quoted value may hold any character (so `>` in it does
+/// not end the tag) and must be followed by ASCII whitespace or the `>`. An unquoted value is
+/// not empty and has no whitespace, quote, `=`, `<`, `>` or backtick. `<hook_prompt/>`,
+/// `<hook_prompt_x>` and non-ASCII whitespace as a separator are not tags of this element.
+fn hook_prompt_open_tag_end(rest: &str) -> Option<usize> {
+    fn skip_ws(b: &[u8], mut i: usize) -> usize {
+        while b
+            .get(i)
+            .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+        {
+            i += 1;
+        }
+        i
+    }
+    let b = rest.as_bytes();
+    let mut i = 0;
+    loop {
+        let after_ws = skip_ws(b, i);
+        if b.get(after_ws) == Some(&b'>') {
+            return Some(after_ws);
+        }
+        // An attribute needs a separator before it.
+        if after_ws == i {
+            return None;
+        }
+        i = after_ws;
+        if !b
+            .get(i)
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b':'))
+        {
+            return None;
+        }
+        while b
+            .get(i)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'.' | b'-'))
+        {
+            i += 1;
+        }
+        let eq = skip_ws(b, i);
+        if b.get(eq) != Some(&b'=') {
+            // A boolean attribute; the next round wants a separator or the `>`.
+            continue;
+        }
+        let value = skip_ws(b, eq + 1);
+        match b.get(value) {
+            Some(&q @ (b'"' | b'\'')) => {
+                // Quote bytes are ASCII, so these indices are char boundaries.
+                let close = rest[value + 1..].find(q as char)?;
+                i = value + 1 + close + 1;
+                if !b.get(i).is_some_and(|c| *c == b'>' || skip_ws(b, i) > i) {
+                    return None;
+                }
+            }
+            _ => {
+                let len = rest[value..]
+                    .find(|c: char| c == '>' || c.is_ascii_whitespace())
+                    .unwrap_or(rest.len() - value);
+                let unquoted = &rest[value..value + len];
+                if unquoted.is_empty()
+                    || unquoted.contains(|c: char| c.is_whitespace() || "\"'=<`".contains(c))
+                {
+                    return None;
+                }
+                i = value + len;
+            }
+        }
+    }
+}
+
 /// The mail text of a Codex hook turn: the whole turn is one `<hook_prompt ...>` element
 /// holding the `fl wire hook` text, `Incoming FerroWire message(s) for '<persona>':`, a blank
 /// line and then `[fl-wire ...]` mails joined by `\n\n---\n\n`. `None` unless the opening tag
@@ -4740,26 +4813,8 @@ fn hook_prompt_wire_mails(text: &str) -> Option<HookWire<'_>> {
     const MAIL: &str = "[fl-wire ";
     const JOIN: &str = "\n\n---\n\n";
     let rest = text.trim().strip_prefix(OPEN)?;
-    if !rest.starts_with(|c: char| c.is_whitespace() || c == '>') {
-        return None;
-    }
-    // The opening tag ends at the first `>` outside a quoted attribute value.
-    let mut quote = None;
-    let mut tag_end = None;
-    for (i, c) in rest.char_indices() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '>') => {
-                tag_end = Some(i);
-                break;
-            }
-            (None, '<') => return None,
-            (None, _) => {}
-        }
-    }
-    let inner = rest[tag_end? + 1..].trim().strip_suffix(CLOSE)?.trim();
+    let tag_end = hook_prompt_open_tag_end(rest)?;
+    let inner = rest[tag_end + 1..].trim().strip_suffix(CLOSE)?.trim();
     let quoted = inner.contains(OPEN) || inner.contains(CLOSE);
     // Two elements side by side are not one hook turn.
     if quoted
@@ -6380,11 +6435,11 @@ mod tests {
             format!("<hook_prompt hook_run_id=\"stop:1{preamble}{mail}</hook_prompt>"),
             "<hook_prompt hook_run_id=\"a>Incoming FerroWire message(s) for 'f':\n\n[fl-wire mail/normal] from jarvis (id: 1): s\nb</hook_prompt>".to_string(),
             format!("<hook_prompt {preamble}{mail}</hook_prompt>"),
-            // attribute and tag-name rules, not only the stray `<` rule
-            format!("<hook_prompt a=\"1\"b{preamble}{mail}</hook_prompt>"),
+            // tag-name rules (attribute rules: see the malformed-attribute test)
             format!("<hook_prompt/>{preamble}{mail}</hook_prompt>"),
-            format!("<hook_prompt\u{a0}hook_run_id=\"x\"{preamble}{mail}</hook_prompt>"),
-            format!("<hook_prompt a='x>{preamble}{mail}</hook_prompt>"),
+            format!("<hook_prompt/ >{preamble}{mail}</hook_prompt>"),
+            format!("<HOOK_PROMPT>{preamble}{mail}</HOOK_PROMPT>"),
+            format!("<hook_prompt_x a=\"1\">{preamble}{mail}</hook_prompt>"),
             // opening tag name only a prefix of the real one
             format!("<hook_prompts>{preamble}{mail}</hook_prompt>"),
             // trailing mixed content
@@ -6409,6 +6464,76 @@ mod tests {
             let (role, content) = normalize_system_turn("user", &text);
             assert_eq!(role, "user", "{text}");
             assert_eq!(content, text);
+        }
+    }
+
+    #[test]
+    fn hook_prompt_malformed_attribute_lists_stay_user_turns() {
+        // Every tag is closed with `>` and the rest is a complete valid wrapper, so only the
+        // attribute rules can reject it.
+        let mail = SCREENSHOT_MAIL;
+        let preamble = "Incoming FerroWire message(s) for 'ferris':\n\n";
+        let opens = [
+            "<hook_prompt a=\"1\"b>",
+            "<hook_prompt a='1'b>",
+            "<hook_prompt a=>",
+            "<hook_prompt a= >",
+            "<hook_prompt a=1\"x>",
+            "<hook_prompt =\"v\">",
+            "<hook_prompt 1a=\"v\">",
+            "<hook_prompt a\u{a0}b=\"v\">",
+            "<hook_prompt\u{a0}hook_run_id=\"x\">",
+            "<hook_prompt a=\"1\"\u{a0}b=\"2\">",
+            "<hook_prompt a$b=\"v\">",
+            "<hook_prompt a@=\"v\">",
+            "<hook_prompt\"a\">",
+            "<hook_prompt a=\"1\"/>",
+            "<hook_prompt a/>",
+            "<hook_prompt a=\"1\"b=\"2\">",
+            "<hook_prompt a=1=2>",
+            "<hook_prompt a=1<2>",
+            "<hook_prompt a=`x`>",
+            "<hook_prompt a='x\"y>",
+            "<hook_prompt a=\"x>",
+            "<hook_prompt a='x>",
+            "<hook_prompt a=x\u{a0}y>",
+            "<hook_prompt \u{e9}=\"v\">",
+        ];
+        for open in opens {
+            let text = format!("{open}{preamble}{mail}</hook_prompt>");
+            let (role, content) = normalize_system_turn("user", &text);
+            assert_eq!(role, "user", "{open}");
+            assert_eq!(content, text, "{open}");
+        }
+    }
+
+    #[test]
+    fn hook_prompt_well_formed_attribute_lists_are_wire_turns() {
+        let opens = [
+            HOOK_OPEN,
+            r#"<hook_prompt hook_run_id="stop:11:/h/hooks.json" event="Stop" n="2">"#,
+            "<hook_prompt a='x' b=\"y\">",
+            "<hook_prompt a=\"x>y\">",
+            "<hook_prompt a=\"x/>y\">",
+            "<hook_prompt a=\"\">",
+            "<hook_prompt a=x>",
+            "<hook_prompt a=stop:1/h/hooks.json>",
+            "<hook_prompt a=x b=y>",
+            "<hook_prompt disabled>",
+            "<hook_prompt disabled a=\"1\" hidden>",
+            "<hook_prompt a=\"1\" >",
+            "<hook_prompt \t\n a = \"1\" \r\x0c>",
+            "<hook_prompt\na=\"1\"\tb='2'>",
+            "<hook_prompt data-x.y_z:w=\"1\">",
+            "<hook_prompt _a:b=\"\u{e9}\">",
+            "<hook_prompt >",
+            "<hook_prompt\n>",
+        ];
+        for open in opens {
+            let raw = hook_wrap(open, "ferris", &[SCREENSHOT_MAIL]);
+            let (role, content) = normalize_system_turn("user", &raw);
+            assert_eq!(role, "wire:jarvis", "{open}");
+            assert_eq!(content, SCREENSHOT_CONTENT, "{open}");
         }
     }
 
