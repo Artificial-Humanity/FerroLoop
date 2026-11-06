@@ -169,7 +169,7 @@ pub fn signal_anchored_group(
     #[cfg(unix)]
     {
         let proof = prove(anchor.pid, anchor.start)?;
-        let Proof::Pinned(pin) = proof else {
+        let Proof::Pinned(_pin) = proof else {
             return Err(if matches!(proof, Proof::Gone) {
                 ContainmentRefusal::UnanchoredGroup
             } else {
@@ -179,13 +179,15 @@ pub fn signal_anchored_group(
         let ident =
             process_identity(anchor.pid).map_err(|_| ContainmentRefusal::IdentityUnproven)?;
         if ident.start != anchor.start || ident.pgid != anchor.pgid || ident.pid != anchor.pid {
-            drop(pin);
+            #[cfg(target_os = "linux")]
+            drop(_pin);
             return Err(ContainmentRefusal::IdentityUnproven);
         }
-        // The leader is still the process `pin` names, and this caller has not reaped it.
+        // Linux keeps the pidfd open through the signal. This caller has not reaped the leader.
         // Group membership cannot be reused until that leader is reaped.
         let rc = unsafe { libc::kill(-(anchor.pgid as i32), signal) };
-        drop(pin);
+        #[cfg(target_os = "linux")]
+        drop(_pin);
         if rc != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::ESRCH) {
