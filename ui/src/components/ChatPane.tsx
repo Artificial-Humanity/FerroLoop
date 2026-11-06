@@ -997,6 +997,12 @@ function recordPromptDelivery(target: string, response?: PromptResponse) {
   else sessionDeliveryReceipts.delete(target);
   for (const listener of deliveryReceiptListeners) listener();
 }
+function recordPromptRefusal(target: string) {
+  // A later refusal supersedes acceptance, but cannot resolve an earlier lost reply.
+  if (sessionDeliveryReceipts.get(target)?.stage !== "unconfirmed") {
+    recordPromptDelivery(target);
+  }
+}
 const pendingAttachmentReads = new Map<string, number>();
 const draftListeners = new Set<
   (target: string, draft: SessionDraft | null, error?: string) => void
@@ -2341,6 +2347,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         recordUnconfirmedDelivery(submittedTarget, promptId);
         return;
       }
+      if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
       const message = err instanceof Error ? err.message : "Failed to send queued message";
       sessionSendErrors.set(submittedTarget, message);
       notifyDraft(submittedTarget, null, message);
@@ -2530,6 +2537,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         recordUnconfirmedDelivery(submittedTarget);
         return;
       }
+      if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
       const message = err instanceof Error ? err.message : "Failed to send message";
       sessionSendErrors.set(submittedTarget, message);
       const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget

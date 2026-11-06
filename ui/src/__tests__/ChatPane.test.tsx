@@ -134,6 +134,70 @@ describe("ChatPane", () => {
     expect(screen.queryByText(/Delivery unconfirmed/)).toBeNull();
   });
 
+  describe.each(["app_server_accepted", "unconfirmed"] as const)("after a prior %s delivery", (previousStage) => {
+    it.each([
+      ["refused", false, false], ["refused", false, true],
+      ["refused", true, false], ["refused", true, true],
+      ["not_connected", false, false], ["not_connected", false, true],
+      ["not_connected", true, false], ["not_connected", true, true],
+      ["http403", false, false], ["http403", false, true],
+      ["http403", true, false], ["http403", true, true],
+    ] as const)("clears stale acceptance and preserves uncertainty after %s (queued=%s, callback=%s)", async (refusal, queued, callback) => {
+      const target = `prior-${previousStage}-${refusal}-${queued}-${callback}`;
+      let sends = 0;
+      const apiClient = new HubApiClient({ fetchImpl: async (_input, init) => {
+        if (init?.method !== "POST") return new Response(JSON.stringify({ turns: [], queue: [] }));
+        sends++;
+        if (sends === 1) return new Response(JSON.stringify({ session_id: target, queued: false,
+          delivered: previousStage !== "unconfirmed", delivery_stage: previousStage }));
+        return new Response(JSON.stringify(refusal === "http403" ? { error: "second input refused" } : {
+          session_id: target, queued: false, delivered: false, delivery_stage: refusal, delivery_error: "second input refused",
+        }), { status: refusal === "http403" ? 403 : 200 });
+      } });
+      window.localStorage.setItem(ALWAYS_SEND_NOW_STORAGE_KEY, "true");
+      const pane = <ChatPane agentName="freya" adapter="codex" sessionId={target} turns={[]}
+        queue={queued ? ["first", "second"].map((id) => ({ id, session_id: target, prompt: `${id} input`,
+          by: "ferris", created_at: "2026-11-06T00:00:00Z" })) : []}
+        {...(callback ? {
+          onSendPrompt: (id, payload) => apiClient.sendSessionPrompt(id, payload),
+          onSendQueuedNow: (id) => apiClient.sendQueuedPromptNow(target, id),
+        } : { apiClient })} />;
+      const view = render(pane);
+      if (queued) fireEvent.click(screen.getByTestId("queued-send-now-first"));
+      else {
+        fireEvent.change(screen.getByLabelText("Message"), { target: { value: "first input" } });
+        fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+      }
+      const previousStatus = previousStage === "unconfirmed" ? /Delivery unconfirmed/ : /Accepted by the active Codex turn/;
+      expect(await screen.findByText(previousStatus)).toBeInTheDocument();
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "second input" } });
+      if (queued) fireEvent.click(screen.getByTestId("queued-send-now-second"));
+      else fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("second input refused");
+      expect(screen.queryByText(/Accepted by the active Codex turn/)).toBeNull();
+      expect(screen.getByLabelText("Message")).toHaveValue("second input");
+      expect(window.localStorage.getItem(`ferrodeck.draft.${target}`)).toBe("second input");
+      if (previousStage === "unconfirmed") {
+        expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument();
+        if (queued) {
+          expect(screen.getByTestId("queued-send-now-first")).toBeDisabled();
+          fireEvent.click(screen.getByTestId("queued-send-now-first"));
+        }
+      } else expect(screen.queryByText(/Delivery unconfirmed/)).toBeNull();
+      expect(sends).toBe(2);
+      view.unmount();
+      const remounted = render(pane);
+      expect(screen.queryByText(/Accepted by the active Codex turn/)).toBeNull();
+      expect(screen.getByLabelText("Message")).toHaveValue("second input");
+      if (previousStage === "unconfirmed") {
+        expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument();
+        if (queued) expect(screen.getByTestId("queued-send-now-first")).toBeDisabled();
+      }
+      remounted.unmount();
+    });
+  });
+
   it.each([
     ["vendor_queued", "Queued in Codex"],
     ["app_server_accepted", "Accepted by the active Codex turn"],
