@@ -145,34 +145,60 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
   thread_id: String, generation: u64, fingerprint: Digest, executable: Option<String>, executable_digest: Option<Digest> }`.
 - `AttemptBinding { token: PhaseToken, daemon: InstanceId, worker: WorkerId, connection: ConnectionId, lane: Lane }`; `FrozenPayload {
   renderer: String, transport: Transport, expected_turn: Option<String>, bytes: Vec<u8>, digest: Digest }`. -
-  `DeliveryEvidence::{PreMutationRefused,DefinitiveNoMutation,MutationUnconfirmed,VendorQueued,AppServerAccepted{thread:String,turn:String},HookEmissionCompleted,ManualReadAck,LegacyAckUnknown}`;
+  `DeliveryEvidence::{PreMutationRefused,DefinitiveNoMutation,MutationUnconfirmed,VendorQueued,AppServerAccepted{thread:String,turn:String},HookEmissionCompleted}`;
   only the first two permit safe release; error details are separately bounded strings.
+- `AckProvenance::{ManualReadAck,LegacyAckUnknown}`; `AcknowledgmentState { manual_at:Option<At>, legacy_unknown:bool }` stores at most
+  the first verified manual ACK timestamp and one legacy/import provenance flag. `AckProvenance` classifies trusted typed inputs; no
+  unbounded event list, caller-supplied provenance or model-consumption assertion is accepted. Both fields may be present: a later explicit
+  ACK never erases the fact that an earlier imported ACK had unknown provenance.
 - `AttemptSummary { binding: AttemptBinding, route: RoutePin, frozen: Option<FrozenPayload>, prepared_at: At, armed_at: Option<At>,
   evidence: Option<DeliveryEvidence>, detail: String }`.
 - `DeliveryRecord { schema:u16, key:DeliveryKey, generation:Digest, binding:Binding, revision:Revision, eligibility:Eligibility,
-  prepares:u8, attempts:Vec<AttemptSummary>, held:Option<HoldReason>, annotation:String }`; row schema starts at 1.
-- `RecipientControl { binding:Binding, barrier:Option<DeliveryKey> }`; `Continuity { schema:u16, cutover:At, policy_hash:Digest,
-  local_epoch:u64, enabled:bool, intact:bool }`; `IdReservation { original_id:MessageId, generation:Digest }`.
-- `DeliverySnapshot { records:Vec<DeliveryRecord>, ids:Vec<IdReservation>, recipients:Vec<RecipientControl>, continuity:Continuity }`;
+  prepares:u8, attempts:Vec<AttemptSummary>, acknowledgment:AcknowledgmentState, held:Option<HoldReason>, annotation:String }`;
+  row schema starts at 1.
+- `RecipientControl { binding:Binding, revision:Revision, active:Option<DeliveryKey>, barrier:Option<DeliveryKey>, identity_conflict:bool }`;
+  `GlobalControl { revision:Revision, active_attempts:u8 }`; `Continuity { schema:u16, cutover:At, policy_hash:Digest, local_epoch:u64,
+  enabled:bool, intact:bool }`; `IdReservation { original_id:MessageId, generation:Digest }`.
+- `IdentityResolution::{Unresolved,Unique{recipient_id:AgentId,binding_revision:Revision},Conflict}`;
+  `IdentityIndexRow { key:String, resolution:IdentityResolution }`; `IdentityContext { registry:Option<AgentRecord>,
+  selector:IdentityResolution, receipt_alias:IdentityResolution }`. Collision-free bounded selector/alias keys point to durable canonical
+  IDs or a conflict summary; they never embed an unbounded list of historical aliases/attempts.
+- `DeliverySnapshot { records:Vec<DeliveryRecord>, ids:Vec<IdReservation>, recipients:Vec<RecipientControl>,
+  identities:Vec<IdentityIndexRow>, global:GlobalControl, continuity:Continuity }` exists only for local continuity boundaries (Task 6);
   `EvidenceView { lane:Lane, route:RoutePin, prepared_at:At, armed_at:Option<At>, evidence:Option<DeliveryEvidence>, detail:String,
   payload_digest:Option<Digest> }`; `DeliveryView { key:DeliveryKey, generation:Digest, binding:Binding, revision:Revision,
-  eligibility:Eligibility, prepares:u8, attempts:Vec<EvidenceView>, held:Option<HoldReason>, annotation:String, barrier:Option<DeliveryKey>
-  }` is the redacted inspection form without tokens/frozen bytes.
+  eligibility:Eligibility, prepares:u8, attempts:Vec<EvidenceView>, acknowledgment:AcknowledgmentState, held:Option<HoldReason>,
+  annotation:String, barrier:Option<DeliveryKey> }` is the redacted inspection form without tokens/frozen bytes.
 - `PrepareInput { key:DeliveryKey, generation:Digest, binding:Binding, attempt:AttemptBinding, route:RoutePin, now:At }`; `ArmInput {
   key:DeliveryKey, revision:Revision, attempt:AttemptBinding, route:RoutePin, frozen:FrozenPayload, now:At }`.
 - `ReleaseInput { key:DeliveryKey, revision:Revision, attempt:AttemptBinding, proof:DeliveryEvidence, now:At }`; `SettleInput {
   key:DeliveryKey, revision:Revision, attempt:AttemptBinding, evidence:DeliveryEvidence, detail:String, now:At }`.
-- `ManualAckInput { key:DeliveryKey, at:At }`; `EnrollmentInput { bindings:Vec<Binding>, continuity:Continuity }`. -
-  `DeliveryCommand::{Enroll(EnrollmentInput),Prepare(PrepareInput),Arm(ArmInput),Release(ReleaseInput),Settle(SettleInput),ManualAck(ManualAckInput),InvalidatePrepared{key:DeliveryKey,revision:Revision,now:At},Annotate{key:DeliveryKey,text:String},Close{key:DeliveryKey}}`.
+- `ManualAckInput { key:DeliveryKey, at:At }`; `EnrollmentInput { bindings:Vec<Binding>, continuity:Continuity }` is consumed only by
+  Task 6's disabled continuity enrollment, never a hot per-key command. -
+  `DeliveryCommand::{Prepare(PrepareInput),Arm(ArmInput),Release(ReleaseInput),Settle(SettleInput),ManualAck(ManualAckInput),InvalidatePrepared{key:DeliveryKey,revision:Revision,now:At},Annotate{key:DeliveryKey,text:String},Close{key:DeliveryKey}}`.
   - `DeliveryResult::{Prepared{record:DeliveryRecord},Armed{record:DeliveryRecord},Applied{view:DeliveryView},Refused{reason:HoldReason}}`;
   `Armed` is durable state, **not** an emission permit.
 - `WireDeliveryStore::apply_delivery(&self, command:DeliveryCommand)->Result<DeliveryResult,StoreError>`;
-  `inspect_delivery(&self,key:&DeliveryKey)->Result<Option<DeliveryView>,StoreError>`;
-  `delivery_snapshot(&self)->Result<DeliverySnapshot,StoreError>`.
-- `TransitionContext { snapshot:DeliverySnapshot, message:Option<WireMessage>, receipts:Vec<DeliveryReceipt>, agents:Vec<AgentRecord> }`;
-  `DeliveryDelta { snapshot:DeliverySnapshot, receipts:Vec<DeliveryReceipt>, result:DeliveryResult }`.
-- `transition(ctx:TransitionContext,command:DeliveryCommand)->Result<DeliveryDelta,StoreError>` validates all invariants; stores construct
-  context and apply delta inside one native atomic operation.
+  `inspect_delivery(&self,key:&DeliveryKey)->Result<Option<DeliveryView>,StoreError>`. Neither method materializes a full snapshot.
+- `TransitionContext { key:DeliveryKey, record:Option<DeliveryRecord>, reservation:Option<IdReservation>,
+  recipient:RecipientControl, global:GlobalControl, continuity:Continuity, message:Option<WireMessage>,
+  receipt:Option<DeliveryReceipt>, identity:IdentityContext }` contains only the target key and its indexed predicates.
+- `DeliveryDelta { record:Option<DeliveryRecord>, reservation:Option<IdReservation>, recipient:Option<RecipientControl>,
+  global:Option<GlobalControl>, receipt:Option<DeliveryReceipt>, result:DeliveryResult }`; `None` means no write to that slot, never deletion.
+  Index/binding enrollment and mutation maintenance use typed transactions in Tasks 5–6, not whole-snapshot replacement.
+- `transition(ctx:TransitionContext,command:DeliveryCommand)->Result<DeliveryDelta,StoreError>` validates the per-key contract. Stores
+  construct context, check predicates and apply only changed slots inside one native atomic operation. Required point reads are target
+  record, original-ID reservation, recipient control, global control, continuity, immutable message, canonical receipt, registry ID and
+  selector/receipt-alias indexes. No table/recipient/history scan or receipt-alias enumeration is permitted on this path; missing/corrupt
+  required metadata refuses rather than rebuilding from history. Independent inspection uses the same bounded key/recipient reads.
+- Prepare atomically requires `global.active_attempts < 16`, `recipient.active.is_none()`, no barrier/conflict and all target predicates;
+  committing Prepared increments the counter and sets the recipient slot together with the lifetime prepare counter. Arm keeps that slot;
+  safe release, Prepared invalidation or terminal settlement clears it/decrements exactly once. Settlement of uncertainty retains the
+  recipient barrier even after freeing active capacity. Duplicate/refused commands change neither capacity nor prepares. Serializable
+  transactions (Mem's single borrow) protect the global/recipient predicates against concurrent keys, not a separate read/count/write.
+  Indefinite retained suppression never counts as active capacity. No aggregate snapshot-size cap may block Arm rejection, settlement,
+  ACK, invalidation or safe suppression. Existing per-row bounds remain binding; reserve fixed space for ACK/hold flags so evidence
+  overflow preserves prior mutation evidence and still records suppression.
 - `canonical_generation(msg:&WireMessage)->Result<Digest,StoreError>`;
   `canonical_payload(generation:Digest,renderer:&str,bytes:&[u8])->Result<Digest,StoreError>` in `c14n.rs`.
 
@@ -226,13 +252,22 @@ assert!(matches!(fourth_prepare, DeliveryResult::Refused { reason: HoldReason::B
 
 - [ ] **Step 2: Run** `cargo test -p fl-core managed_`; expect FAIL because store trait/transition is incomplete.
 - [ ] **Step 3: Implement one mutable-borrow operation.** Re-read message, alias-resolved receipts, binding/control and revision in the
-  borrow; validate before replacing state and receipt projection together. No randomness or clock enters MemStore. Prepared expiry
+  borrow using the indexed bounded `TransitionContext`; apply only `DeliveryDelta` slots and receipt projection together. No randomness or
+  clock enters MemStore. Prepared expiry
   invalidates by CAS; arm at 20s fails; arm never acts as an expiring lease. Persist recipient barrier for unconfirmed Armed; ACK/admin
   cannot clear it. Capacity refuses without consuming another message's history.
 - [ ] **Step 4: Extend and run** `cargo test -p fl-core managed_`; expect PASS for stale revision, wrong worker, immutable digest mismatch
   at prepare/arm, expiry/ACK racing arm, identical settlement idempotence, contradictory settlement Held, evidence bounds, one frozen copy
   and barrier across new IDs. Successful queue/steer/stdout project Delivered; manual ACK projects Acked; unconfirmed preserves prior
-  receipt.
+  receipt. `managed_ack_preserves_independent_evidence` covers ACK after Armed with no outcome, settled acceptance and
+  MutationUnconfirmed: acknowledgment changes independently, original evidence/attempt count/prepares/barrier do not; idempotent repeated
+  ACK retains the first timestamp. ACK before arm invalidates Prepared without resetting counters. Include LegacyAckUnknown followed by
+  manual ACK retaining both provenance fields; manual ACK and legacy import never manufacture a mutation outcome or new attempt.
+  `managed_hot_context_independent_of_retained_history` grows unrelated settled/held rows, IDs, aliases and recipients, then instruments
+  point reads, rows decoded and delta writes for prepare/arm/settle/ACK/inspect: the same fixed lookup set and target-row work is observed.
+  `managed_capacity_predicates_are_atomic` races the last global slot across recipients and two keys of one recipient; exactly one wins,
+  refused keys keep their own prepare counters, and unrelated retained history cannot consume a target's budget. Mem uses sequential
+  competing-command/interleaving cases; Tasks 3–4 run actual concurrent durable writer races without sharing non-Sync MemStore.
 - [ ] **Step 5: Commit gate.** Fresh reviewer checks full transition table, empty post-write rejection allow-list and no model-action
   guarantee; commit `feat(core): add atomic peer delivery reference semantics` with the Freya trailer.
 
@@ -259,10 +294,14 @@ assert_eq!(reopened_barrier, committed_barrier);
 - [ ] **Step 2: Run** `cargo test -p fl-store managed_redb_`; expect FAIL for missing trait implementation.
 - [ ] **Step 3: Implement native transaction admission.** Construct transition context from one write transaction; call `transition`;
   atomically apply ledger, reservation, control and receipt/log delta. No external I/O or global route lock crosses transaction lifetime.
+  Point-read the Task 1 predicates and update the global count/recipient active slot in that same transaction; do not deserialize retained
+  history. Store control/index rows in namespaced `__wire_delivery_control_v1` keys; no extra table or full snapshot per operation.
   Allocate `FORMAT_WITH_WIRE_DELIVERY` as 10 only after rechecking `FORMAT_LADDER`; update ladder/error newest atomically with
   enrollment/first ledger write on both backends (ferro completion follows Task 4). No managed caller is connected yet.
 - [ ] **Step 4: Run** `cargo test -p fl-store managed_redb_`; expect PASS. Include corrupt/missing table and unknown row/schema checks:
-  refuse managed operations without silently creating replacements; pre-enrollment ordinary stores retain their old format.
+  refuse managed operations without silently creating replacements; pre-enrollment ordinary stores retain their old format. Run the shared
+  ACK/evidence and growing-history lookup assertions; competing keys must atomically enforce global16/recipient1 without a scan. Reopen
+  must preserve independent acknowledgment fields and original attempt evidence, including an ACK after Armed before settlement.
 - [ ] **Step 5: Commit gate.** Fresh review checks durable commit boundaries and no policy activation; commit `feat(store): persist redb
   peer delivery transitions` with the Freya trailer.
 
@@ -289,23 +328,38 @@ assert_eq!(reopened_barrier, committed_barrier);
 - [ ] **Step 2: Run** `cargo test -p fl-store managed_ferro_` and `cargo test -p fl-store managed_any_store_`; expect FAIL for missing
   implementations.
 - [ ] **Step 3: Implement native context/delta application and forwarding.** Use one durable `with_write` per transition, including
-  reservations, binding revision and receipt log. Raw remote authentication conveys no permit authority. Plan proposal: implement native delivery transactions for embedded FerroStore; an `Inner::Remote` handle returns `UnsupportedBackend` for the new delivery trait while preserving unrelated remote APIs. This is a persistence-support limitation, not an approved prohibition on remote persistence: a deployment using that backend remains disabled until its compatible local transaction path is separately reviewed. No managed prepare/arm/settle verbs are added to remote RPC. Enforce both schema step and required collection validation on reopen; never synthesize a missing managed history.
+  reservations, binding revision, indexed point reads, global/recipient capacity predicates and receipt log. Apply only `DeliveryDelta`;
+  retained history must not affect hot-operation decoding/work. Raw remote authentication conveys no permit authority.
+  **Plan proposal requiring Lead acceptance:** implement native delivery transactions for embedded FerroStore; an `Inner::Remote` handle
+  returns `UnsupportedBackend` for the new delivery trait while preserving unrelated remote APIs. This is a persistence-support limitation,
+  separate from remote permit authority, and an activation blocker for deployments requiring that backend until a compatible persistence
+  path is separately reviewed. No managed prepare/arm/settle verbs are added to remote RPC. Enforce both schema step and required
+  collection validation on reopen; never synthesize a missing managed history.
 - [ ] **Step 4: Run the Step 2 commands**; expect PASS including two local handles racing CAS, reopen counters, recipient ordering barrier
-  and unknown-format refusal. Mem/redb/ferro must yield identical conformance outcomes.
+  and unknown-format refusal. Mem/redb/ferro must yield identical conformance outcomes, including growing-history point-read/work counts,
+  global16/recipient1 atomic refusal with unchanged losing-key prepares, and independent ACK/evidence persistence across reopen.
 - [ ] **Step 5: Commit gate.** Fresh review checks native serialization rather than read-then-write emulation; commit `feat(store): add
   ferro peer delivery transactions` with the Freya trailer.
 
 ## Task 5: Identity, import/prune and every generic mutation fence
 
 **Files:** Create `crates/store/src/wire_delivery_guard.rs`; modify `crates/core/src/mem.rs`, `crates/store/src/{ferrowire,state}.rs`,
-`ferrostore/{doc,mod,traits_wire,traits_state,transaction,session,server}.rs`; preserve existing registry APIs. Unit tests stay in these
+`ferrostore/{doc,mod,traits_wire,traits_state,transaction,session,server,sync}.rs`; preserve existing registry APIs. Unit tests stay in these
 modules.
 
 **Interfaces:** Consume `Binding`, `IdReservation`, `RecipientControl`, Task 1 transition inputs. Produce internal
 `MutationOrigin::{Public,PeerSync,TypedWire,TypedRegistry,Delivery,Continuity}` and
-`admit_delivery_mutation(snapshot:&DeliverySnapshot,origin:MutationOrigin,collection:&str,id:&str,before:Option<&serde_json::Value>,after:Option<&serde_json::Value>)->Result<(),StoreError>`
-in the guard module. Origins are crate-private constructed call paths, never caller-provided strings/remote fields. Core applies equivalent
-identity/receipt/prune invariants under its own borrow without depending on fl-store.
+`MutationContext { continuity:Continuity, reservation:Option<IdReservation>, recipient:Option<RecipientControl>,
+record:Option<DeliveryRecord>, identity:IdentityContext }` and
+`admit_delivery_mutation(ctx:&MutationContext,origin:MutationOrigin,collection:&str,id:&str,before:Option<&serde_json::Value>,after:Option<&serde_json::Value>)->Result<(),StoreError>`
+in the guard module. Construct one bounded context per affected object from indexed point reads in the same transaction/overlay; no
+`DeliverySnapshot` or dependent-history scan. Original-ID reservations identify protected messages, recipient controls identify protected
+registry IDs, alias indexes resolve receipt identities and `(message,canonical recipient)` directly locates any needed record. Guard both
+old/new selector or alias keys when changed; reject ambiguous public mutations without walking dependents. Origins are crate-private
+constructed call paths, never caller-provided strings/remote fields. Core applies equivalent identity/receipt/prune invariants under its
+own borrow without depending on fl-store. Before enrollment, preserve existing ordinary mutation behavior; required managed metadata is
+validated only on the enrolled path. Add internal
+`project_delivery_sync(batch:&SyncBatch)->Result<SyncBatch,StoreError>` for the proposal below; never infer permit authority from projection.
 
 - [ ] **Step 1: Write failing tests.** `managed_all_mutation_surfaces_fenced` enumerates ordinary put/delete, batch/raw op, Transaction,
   session commit, remote raw commit, inbound sync, compact/reopen, typed send/import/update/prune, registry update/import/delete and
@@ -324,16 +378,51 @@ assert_eq!(reimported_view.prepares, pruned_view.prepares);
 - [ ] **Step 3: Implement admission at staging and final commit boundaries.** Cover all raw/unchecked paths, including `commit_if_seq`,
   `commit_remote`, inbound application and remote server handlers. Preserve managed original-ID reservations indefinitely. Resolve durable
   `AgentRecord.id`; coalesce receipt aliases transactionally; unresolved/ambiguous/conflicting histories Held. Rename retains binding;
-  recycled name cannot redirect. Imported receipts may suppress/display but never enroll, relocate, grant or clear uncertainty. Explicitly
-  exclude local ledger/handles/frozen payload from outbound batches and unchanged forwarded inbound batches: reserved `__` operations
-  currently can travel outbound. Fence inbound ordinary dependent records, remote cache-fill (`fill_doc_miss`/`install_fetched_doc`) and
-  lazy fetch as well as writes. Do not sync local delivery authority.
+  recycled name cannot redirect. Maintain canonical selector/receipt-alias indexes transactionally at enrollment and every typed registry/
+  receipt/import boundary; the hot path uses their bounded resolution/conflict summaries. A newly conflicting identity sets recipient control
+  conflict/revision so all affected keys hold on use without rewriting their retained history. Preserve distinct old histories; never merge
+  them to grant permission. Imported receipts may suppress/display but never enroll, relocate, grant or clear uncertainty; an unproven ACK
+  updates `acknowledgment.legacy_unknown`, not `AttemptSummary.evidence`. Atomic ACK projection preserves any original mutation outcome.
+  Fence inbound ordinary dependent records, remote cache-fill (`fill_doc_miss`/`install_fetched_doc`) and lazy fetch as well as writes.
+- [ ] **Step 3a: Implement the sequence-preserving projection only after Lead acceptance of this plan proposal.** Source basis:
+  `sync.rs:SyncOp:14` already supports `DeleteDoc`; `mod.rs:prepare_sync_batches:4509` requires the exact next sequence and nonempty input;
+  `:admit_inbound:4551` drops non-schema reserved deletes while the containing sequence still advances, even when all applied ops drop.
+  `:register_committed_for:4266` currently clones local ops, and `:apply_sync_batches:4216` forwards the original inbound batch. Neither is
+  safe for local delivery-private data. Define projection to remove operations on the three local delivery collections (including their
+  control/index/continuity/frozen-payload namespaces); keep ordinary permitted operations and the existing schema-version behavior in order.
+  If nothing remains, emit exactly `SyncOp::DeleteDoc { collection:"__wire_delivery_progress_v1", id:"0" }`. This constant reserved delete
+  contains no message/recipient/authority ID, token, digest, payload or evidence; it never materializes a collection and conveys no state or
+  authority. It is a wire projection only, not a fourth persisted ledger collection. Preserve the original `SyncBatch.seq`; never drop a batch, renumber, send empty input, or invent a new `Noop` variant. The
+  existing reserved-op rule makes this marker an ignored operation for compatible legacy receivers; existing too-new schema refusal remains.
+  Apply the identical idempotent projection before any adapter callback or pending enqueue, including unchanged-forwarded inbound batches,
+  adapter retries, remote sync serialization and any replay path. Inbound marker handling must bypass ordinary protected-mutation rejection
+  only for this exact constant and leave all delivery records unchanged. Projection failures use bounded generic diagnostics without raw
+  input/private fields; error/log paths and retry buffers may not retain or emit the unprojected batch. Do not weaken reserved/data fences.
+  **Bounded fail-closed reopen proposal:** current `sync.rs` documents process-local pending/cursors; `write_through_disk_commit_survives_reopen_without_an_adapter`
+  shows reopen has no adapter and `synced_seq=0`. Projection does not make pending retries durable. Keep a failed projected batch queued
+  unchanged for in-process retry; after reopen of a nonempty managed store, refuse adapter reattachment/replay under this v1 plan rather
+  than guess a cursor or resend earlier sequences. No automatic sync resume or recovery protocol is proposed. A deployment requiring sync
+  across reopen remains disabled until separately reviewed durable egress/cursor continuity exists; this limitation is a Lead-review and
+  activation blocker, distinct from remote permit authority. Scope this refusal to the managed-store path; preserve unmanaged sync behavior.
+  Local continuity export is never peer-sync recovery permission.
 - [ ] **Step 4: Add** `managed_identity_alias_conflict_holds`: unresolved name later uniquely bound works only without prior conflict;
   distinct armed aliases retain both histories and hold. Add `managed_prune_identical_reimport_stays_suppressed`: prune eligible retained
   body per protected policy, keep ID/digest/binding/outcome reservation, identical import stays suppressed, changed same-ID body
   rejects/holds. Unresolved bodies never auto-prune.
 - [ ] **Step 5: Run** `cargo test -p fl-store managed_` and `cargo test -p fl-core managed_`; expect PASS, including ACK/import racing Arm
-  and sync bypass attempts. Verify unauthorized mutation is atomic rejection, not a partially applied batch.
+  and sync bypass attempts. Verify unauthorized mutation is atomic rejection, not a partially applied batch. Add
+  `managed_guard_lookup_work_is_history_independent`: grow unrelated retained rows and measure the same indexed reads/decoded rows per
+  guarded mutation, including mixed authorized/unauthorized batches whose atomic rejection changes no row, counter or receipt.
+  `managed_sync_projection_preserves_sequences` covers consecutive all-local and mixed commits: exactly one nonempty projected batch per
+  original sequence; ordinary ops keep order/content, all-local commits contain only the constant marker. Feed them to a fixture of the
+  baseline reserved-op admission and assert the receiver's exact final store sequence with no gap; too-new schema still refuses.
+  `managed_sync_forwarding_redacts_private_ops` feeds otherwise unchanged inbound batches with private puts/deletes through forwarding,
+  including all-private input; assert projection idempotence and no local private values/IDs/tokens/payload/evidence in serialized callback,
+  queued, remote, forwarded or failure-diagnostic bytes. Ordinary permitted peer message/receipt sync semantics remain intact.
+  `managed_sync_failed_adapter_retry_reopen` fails the first callback, checks unchanged projected bytes/sequence on in-process retry and
+  exact receiver sequence after success, then reopens both disk fixtures: persisted store sequence is unchanged, adapter/pending remain
+  absent and managed adapter reattachment/replay is refused without emitting a batch. Test crash before retry similarly: no cursor advance,
+  invented success, empty batch, automatic resend or sequence renumbering. This asserts the bounded limitation, not durable pending recovery.
 - [ ] **Step 6: Commit gate.** Fresh review audits the call graph for every unchecked/native mutation surface before approving; commit
   `fix(store): fence managed wire identity and mutation paths` with the Freya trailer.
 
@@ -346,7 +435,9 @@ deployment/backup scripts change.
 **Interfaces:** Consume Task 1 snapshot/control and prior backends. Produce `ContinuityArchive { schema:u16, source_format:u64,
 snapshot:DeliverySnapshot, messages:Vec<WireMessage>, receipts:Vec<DeliveryReceipt>, agents:Vec<AgentRecord>, digest:Digest }` and
 `ContinuityReport { intact:bool, disabled:bool, rows:u64, digest:Digest }` in the new module. Define store-local extension trait
-`DeliveryContinuityStore: WireDeliveryStore` with `snapshot_delivery_continuity(&self)->Result<ContinuityArchive,StoreError>` (one
+`DeliveryContinuityStore: WireDeliveryStore` with
+`enroll_delivery_disabled(&self,input:EnrollmentInput)->Result<ContinuityReport,StoreError>` and
+`snapshot_delivery_continuity(&self)->Result<ContinuityArchive,StoreError>` (one
 consistent snapshot of delivery plus messages/receipts/registry) and
 `restore_delivery_disabled(&self,archive:&ContinuityArchive)->Result<ContinuityReport,StoreError>` (one typed native transaction); implement
 for RedbStore/FerroStore/AnyStore. APIs: `export_delivery_continuity(store:&impl
@@ -354,7 +445,8 @@ DeliveryContinuityStore)->Result<ContinuityArchive,StoreError>` and `restore_del
 DeliveryContinuityStore,archive:&ContinuityArchive)->Result<ContinuityReport,StoreError>`. No public resume or permit import API.
 
 - [ ] **Step 1: Write failing tests.** `managed_migration_copies_every_fence`: redb→ferro verifies all three collections,
-  row/digest/projection/bindings/barrier/counters and read-only source retention. `managed_restore_never_resumes`: export then restore into
+  row/digest/projection/bindings/barrier/counters, independent ACK provenance plus attempt outcomes, identity indexes, global/recipient active
+  consistency and read-only source retention. `managed_restore_never_resumes`: export then restore into
   an empty temporary store yields disabled continuity; stale/missing/corrupt archive or deleted collection refuses managed operation, no
   empty-ledger recovery. `managed_legacy_enrollment_suppresses_backlog`: Pending/Delivered→LegacyUncertain, Acked→LegacyAckUnknown, Expired
   suppressed; zero prepare/spawn/stdout/steer. Assertion anchors for the named tests (each variable is the observed result of the fixture
@@ -369,7 +461,10 @@ assert_eq!(legacy_handoffs, 0);
 - [ ] **Step 2: Run** `cargo test -p fl-store managed_migration_`, `cargo test -p fl-store managed_legacy_`, `cargo test -p fl-store --test
   wire_delivery_continuity`; expect FAIL for missing archive/verification paths.
 - [ ] **Step 3: Implement continuity-complete migration/export/restore.** Read archive content from one consistent backend snapshot; verify
-  canonical message and payload bindings, compact reservations, receipt projections and schema before publication/reopen. Existing manifest
+  canonical message and payload bindings, compact reservations, receipt projections, independent ACK provenance/outcomes and schema before
+  publication/reopen. Full retained snapshots/scans are confined to these disabled continuity/enrollment/migration boundaries; validate all
+  secondary indexes and rederive global/recipient active consistency here, never on ordinary delivery/guard paths. Enrollment canonicalizes
+  legacy receipt aliases and records unresolved/conflicting identity summaries before hot operations become available. Existing manifest
   export remains a project manifest, not a continuity backup; document its insufficiency. Extend physical checkpoint/compact/copy
   verification so managed collections cannot disappear. Restore always disables, even a valid archive; stored epoch alone never proves
   old-process fencing.
@@ -378,7 +473,10 @@ assert_eq!(legacy_handoffs, 0);
   fence attestation. Fixture binary lives under test support, not an installed historical runtime. Refuse stale restore continuity without
   claiming to detect all out-of-band snapshot replacement.
 - [ ] **Step 5: Run Step 2 commands**; expect PASS; additionally require reopened archive/migration preserves three prepares and recipient
-  barrier. No managed integration proceeds until Tasks 5–6 reviews pass.
+  barrier. Add `managed_ack_and_outcome_survive_continuity`: Armed/no-outcome, settled accepted and unconfirmed fixtures each receive
+  explicit ACK; legacy imported ACK then explicit ACK retains both provenance flags. Reopen/export/restore/migration preserve ACK and original
+  outcomes independently, without new attempts, counter reset, barrier clearance or model-consumption claim. No managed integration proceeds
+  until Tasks 5–6 reviews pass.
 - [ ] **Step 6: Commit gate.** Fresh review checks absence of automatic resume and distinction between local continuity export and peer
   synchronization; commit `feat(store): preserve disabled peer delivery continuity` with the Freya trailer.
 
@@ -540,7 +638,11 @@ owning modules.
 arm/release/replay/proof/reset/admin-enable command is added. Annotation/Close retain original fences/counters/barriers.
 
 - [ ] **Step 1: Write failing tests.** `managed_manual_ack_is_distinct`: before arm revokes Prepared; after arm records ManualReadAck
-  alongside evidence, preserves possible mutation/barrier, receipt Acked. `managed_legacy_clients_never_claim`: old acking Read/Ack rejected
+  in `DeliveryView.acknowledgment` alongside unchanged attempt evidence, preserves possible mutation/barrier, receipt Acked. Test Armed with
+  absent outcome, settled acceptance and MutationUnconfirmed separately; no extra attempt or prepare, no counter reset or barrier clearance.
+  Repeated ACK is idempotent with the first verified timestamp retained. Legacy/imported ACK sets the independent legacy flag, and a later
+  explicit ACK retains that flag alongside manual provenance and any mutation evidence. `managed_legacy_clients_never_claim`: old acking
+  Read/Ack rejected
   for managed recipients; imported unproven ACK becomes LegacyAckUnknown and suppresses; read-only inspection remains available and grants
   nothing. Assertion anchors for the named tests (each variable is the observed result of the fixture operation described above):
 
@@ -557,7 +659,9 @@ assert_eq!(fallback_handoffs, 0);
   daemon absent cannot claim/read+ACK through direct store. Managed send may persist inbox but cannot auto-dispatch through fallback. Legacy
   receipts never drive retry. Existing unmanaged/operator/non-Codex paths retain behavior.
 - [ ] **Step 4: Run Step 2 commands**; expect PASS including disconnected daemon, unsupported negotiation, forged caller intent fields,
-  managed disabling with existing fences, inspection redaction/held reasons and ACK/import races. Add
+  managed disabling with existing fences, inspection redaction/held reasons and ACK/import races. Inspection must show both ACK provenance
+  fields and the original per-attempt outcomes after ACK, including Armed without an outcome; settlement after ACK preserves Acked projection
+  and independent acknowledgment. Add
   `managed_no_fallback_send_stays_stored`: direct persisted send emits zero external handoffs.
 - [ ] **Step 5: Commit gate.** Fresh review checks no public uncertain rearm path, counters untouched by ACK/admin and no legacy automatic
   re-entry; commit `feat(wire): enforce managed ACK and compatibility boundaries` with the Freya trailer.
@@ -622,9 +726,11 @@ are explicitly `UNVERIFIED`; no secrets/session bodies/private configuration ent
   framing/runtime support and complete continuity/old-process fencing remain unproven. No mock or source test changes this verdict. No live
   inventory/probe runs without its separate authorization.
 - [ ] **Step 3: Document evidence semantics and rollback limits.**
-  VendorQueued/AppServerAccepted/HookEmissionCompleted/Unconfirmed/ManualReadAck/LegacyAckUnknown stay distinct. State recipient barrier and
+  VendorQueued/AppServerAccepted/HookEmissionCompleted/Unconfirmed attempt outcomes stay distinct from the independent persisted
+  ManualReadAck/LegacyAckUnknown provenance fields, including when both kinds of evidence coexist. State recipient barrier and
   three lifetime prepares; safe new-ID manual instruction carries duplicate-effect risk and cannot clear the original barrier. Restore stays
-  disabled; rollback retains compatible binaries with ledger intact, never old snapshot dedup claims. The artifact is input for separate
+  disabled; rollback retains compatible binaries with ledger intact, never old snapshot dedup claims. Document accepted persistence/egress
+  support limitations and the managed-only sync reattachment blocker without implying durable pending recovery. The artifact is input for separate
   JARVIS/#150 review only, never activation approval or automatic enabling.
 - [ ] **Step 4: Future final verification.** Run `cargo fmt --all --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo
   test --workspace`, `cargo test -p fl-cli --test wire_peer_delivery`, and `cargo test -p fl-store --test wire_delivery_continuity`.
@@ -645,7 +751,11 @@ fallback or grant constructor.
 
 Remaining gaps are activation evidence, not delegated implementation assumptions: exact installed transcript schema and hook host behavior;
 installed Codex build/method contracts; all resolved executable/wrapper/daemon/store writer paths and digests; compatible old/open-process
-fencing and continuity attestation. The evidence template records these as unverified. The Task 4 remote-backed persistence support limitation is an implementation-plan proposal requiring review; it does not claim that the design grants remote permit authority or forbids all remote persistence. Public docs include no private notes or operational configuration.
+fencing and continuity attestation. The evidence template records these as unverified. Two additional plan proposals require explicit Lead
+acceptance: Task 4's remote-backed persistence support limitation, and Task 5's constant reserved-delete sync projection with fail-closed
+adapter reattachment after managed-store reopen. Deployments depending on either unsupported path remain disabled until separately reviewed
+persistence/egress continuity resolves that blocker. Neither proposal grants remote permit authority or forbids all remote persistence; the
+marker carries no distributed delivery evidence/authority. Public docs include no private notes or operational configuration.
 
 This plan and the unchanged snapshot are ready for review as documentation. Implementation commands, tests and commits above have not been
 executed by this planning work. The next decision is plan acceptance and a separate explicit implementation GO; activation remains a later
