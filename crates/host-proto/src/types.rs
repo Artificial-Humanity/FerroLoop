@@ -415,6 +415,11 @@ pub enum HostResponse {
     Signaled {
         id: RequestId,
     },
+    /// Typed refusal for a verb that has no outcome payload. `Send` uses [`SendOutcome`].
+    Failed {
+        id: RequestId,
+        reason: String,
+    },
 }
 
 impl HostResponse {
@@ -426,7 +431,8 @@ impl HostResponse {
             | Self::Subscribed { id }
             | Self::Lease { id, .. }
             | Self::Sent { id, .. }
-            | Self::Signaled { id } => *id,
+            | Self::Signaled { id }
+            | Self::Failed { id, .. } => *id,
         }
     }
 }
@@ -440,6 +446,28 @@ pub enum ControlEvent {
         session_epoch: SessionEpoch,
         seq: u64,
         exit: ChildExit,
+    },
+    Spawned {
+        session: SessionId,
+        session_epoch: SessionEpoch,
+        seq: u64,
+        child: HostedChild,
+    },
+    CleanupComplete {
+        session: SessionId,
+        session_epoch: SessionEpoch,
+        seq: u64,
+    },
+    SlowSubscriber {
+        session: SessionId,
+        session_epoch: SessionEpoch,
+        seq: u64,
+    },
+    ProtocolFailure {
+        session: SessionId,
+        session_epoch: SessionEpoch,
+        seq: u64,
+        reason: String,
     },
 }
 

@@ -129,12 +129,39 @@ impl AsyncHostClient {
         let frame = encode_request(&request)?;
         let deadline = Instant::now() + self.write_timeout;
         write_client(&mut self.io, &frame, deadline).await?;
-        let response = read_response(&mut self.io, self.frame_timeout).await?;
+        let response = read_response_io(&mut self.io, self.frame_timeout).await?;
         if response.request_id().0 != id {
             return Err(HostError::Protocol("response id does not match".into()));
         }
         self.correlator.complete(id)?;
         Ok(response)
+    }
+
+    /// Writes one request and does not wait. The single-id correlator is unchanged.
+    pub async fn write_request(&mut self, request: &HostRequest) -> Result<(), HostError> {
+        if !matches!(self.mode, SessionMode::Rpc) {
+            return Err(HostError::Protocol(
+                "stream connection accepts no RPC".into(),
+            ));
+        }
+        if !crate::supports_message(self.minor, request.op_name()) {
+            return Err(HostError::Protocol(
+                "message is not in the negotiated minor".into(),
+            ));
+        }
+        let frame = encode_request(request)?;
+        let deadline = Instant::now() + self.write_timeout;
+        write_client(&mut self.io, &frame, deadline).await
+    }
+
+    /// Next response frame. Pair with `write_request` when more than one request is in flight.
+    pub async fn read_response(&mut self) -> Result<HostResponse, HostError> {
+        if !matches!(self.mode, SessionMode::Rpc) {
+            return Err(HostError::Protocol(
+                "stream connection accepts no RPC".into(),
+            ));
+        }
+        read_response_io(&mut self.io, self.frame_timeout).await
     }
 
     pub fn negotiated(&self) -> (u16, u16) {
@@ -191,6 +218,14 @@ impl BlockingHostClient {
 
     pub fn request(&mut self, request: HostRequest) -> Result<HostResponse, HostError> {
         self.runtime.block_on(self.inner.request(request))
+    }
+
+    pub fn write_request(&mut self, request: &HostRequest) -> Result<(), HostError> {
+        self.runtime.block_on(self.inner.write_request(request))
+    }
+
+    pub fn read_response(&mut self) -> Result<HostResponse, HostError> {
+        self.runtime.block_on(self.inner.read_response())
     }
 }
 
@@ -349,7 +384,7 @@ async fn write_client(
     }
 }
 
-async fn read_response(io: &mut ClientIo, timeout: Duration) -> Result<HostResponse, HostError> {
+async fn read_response_io(io: &mut ClientIo, timeout: Duration) -> Result<HostResponse, HostError> {
     let frame = read_idle_client(io, timeout).await?;
     decode_response(&frame)
 }

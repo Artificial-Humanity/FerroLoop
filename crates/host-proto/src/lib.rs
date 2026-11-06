@@ -24,21 +24,21 @@ pub use frame::{
 };
 #[cfg(unix)]
 pub use transport::interpret_ucred;
-pub use transport::{HostConn, HostListener, TokenControl};
+pub use transport::{HostConn, HostListener, ShutdownSwitch, TokenControl};
 pub use types::{
-    AuthToken, BindDisposition, CLIENT_DOMAIN, ChildExit, ChildRecord, ChildState, ControllerLease,
-    DEFAULT_MAX_SESSIONS, FRAME_READ_TIMEOUT, FirstInstance, HANDSHAKE_TIMEOUT, HostError,
-    HostEvent, HostRequest, HostResponse, HostedChild, InputState, InstanceLedger, LINE_HEADER_LEN,
-    MAX_ARG_BYTES, MAX_ARGV, MAX_ARGV_AGGREGATE, MAX_CWD_BYTES, MAX_ENV_AGGREGATE, MAX_ENV_ENTRIES,
-    MAX_ENV_NAME, MAX_ENV_VALUE, MAX_EVENT_ENVELOPE, MAX_FRAGMENTS, MAX_FRAME_PAYLOAD,
-    MAX_LINE_BYTES, MAX_REASSEMBLY_BYTES, MAX_STDOUT_BACKLOG, MAX_STDOUT_LINE, MAX_SUBSCRIBERS,
-    MAX_UNAUTH_PAYLOAD, MAX_UNAUTHENTICATED, MAX_WINDOWS_COMMAND_UNITS, MutexFastPath,
-    NamedPipeClientOptions, NamedPipeServerOptions, PROTO_MAJOR, PROTO_MINOR, PeerQuery, RequestId,
-    SERVER_DOMAIN, STDERR_TAIL_BYTES, STDIN_QUEUE_BYTES, STDIN_QUEUE_FRAMES, STDIN_WRITE_TIMEOUT,
-    SendBlock, SendOutcome, SessionEpoch, SessionId, SignalKind, SpawnKind, SpawnSpec,
-    TokenFileCreate, WRITE_TIMEOUT, WinPeerLookup, dacl_is_single_sid, decide_first_instance,
-    pipe_dacl_sddl, private_parent_ok, supports_message, validate_unix_peer, validate_win_peer,
-    windows_command_line, windows_environment_block,
+    AuthToken, BindDisposition, CLIENT_DOMAIN, ChildExit, ChildRecord, ChildState, ControlEvent,
+    ControllerLease, DEFAULT_MAX_SESSIONS, FRAME_READ_TIMEOUT, FirstInstance, HANDSHAKE_TIMEOUT,
+    HostError, HostEvent, HostRequest, HostResponse, HostedChild, InputState, InstanceLedger,
+    LINE_HEADER_LEN, MAX_ARG_BYTES, MAX_ARGV, MAX_ARGV_AGGREGATE, MAX_CWD_BYTES, MAX_ENV_AGGREGATE,
+    MAX_ENV_ENTRIES, MAX_ENV_NAME, MAX_ENV_VALUE, MAX_EVENT_ENVELOPE, MAX_FRAGMENTS,
+    MAX_FRAME_PAYLOAD, MAX_LINE_BYTES, MAX_REASSEMBLY_BYTES, MAX_STDOUT_BACKLOG, MAX_STDOUT_LINE,
+    MAX_SUBSCRIBERS, MAX_UNAUTH_PAYLOAD, MAX_UNAUTHENTICATED, MAX_WINDOWS_COMMAND_UNITS,
+    MutexFastPath, NamedPipeClientOptions, NamedPipeServerOptions, PROTO_MAJOR, PROTO_MINOR,
+    PeerQuery, RequestId, SERVER_DOMAIN, STDERR_TAIL_BYTES, STDIN_QUEUE_BYTES, STDIN_QUEUE_FRAMES,
+    STDIN_WRITE_TIMEOUT, SendBlock, SendOutcome, SessionEpoch, SessionId, SignalKind, SpawnKind,
+    SpawnSpec, TokenFileCreate, WRITE_TIMEOUT, WinPeerLookup, dacl_is_single_sid,
+    decide_first_instance, pipe_dacl_sddl, private_parent_ok, supports_message, validate_unix_peer,
+    validate_win_peer, windows_command_line, windows_environment_block,
 };
 
 use std::time::Duration;

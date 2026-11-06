@@ -1,7 +1,7 @@
 //! Authenticated listener. The accept loop admits a connection only after
 //! peer checks and the mutual proof. Later tasks reuse this handshake.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -85,6 +85,10 @@ pub struct HostConn {
     write_timeout: Duration,
     requests: Arc<AtomicUsize>,
     stream_only: bool,
+    /// Partial frame bytes. A cancelled `recv` must not discard them.
+    pending: Vec<u8>,
+    /// Set when the first byte of the current frame arrived. The first byte itself waits.
+    frame_started: Option<std::time::Instant>,
 }
 
 impl HostConn {
@@ -92,8 +96,7 @@ impl HostConn {
         if self.stream_only {
             return Err(HostError::Protocol("this connection is stream-only".into()));
         }
-        let timeout = self.frame_timeout;
-        let frame = read_idle(&mut self.io, timeout).await?;
+        let frame = self.read_buffered_frame().await?;
         if frame.kind != crate::FrameKind::Request {
             return Err(HostError::Protocol(
                 "authenticated connection expected a request".into(),
@@ -101,16 +104,177 @@ impl HostConn {
         }
         let request = decode_request(&frame)?;
         self.requests.fetch_add(1, Ordering::SeqCst);
-        if matches!(request, HostRequest::Events { .. }) {
-            self.stream_only = true;
-        }
         Ok(request)
+    }
+
+    /// A subscribed event connection accepts no further requests.
+    pub fn enter_stream(&mut self) {
+        self.stream_only = true;
+    }
+
+    /// True when the peer has closed its write half. Does not consume bytes.
+    pub fn peer_closed(&self) -> bool {
+        peer_half_closed(&self.io)
     }
 
     pub async fn respond(&mut self, response: &HostResponse) -> Result<(), HostError> {
         let frame = encode_response(response)?;
         let deadline = std::time::Instant::now() + self.write_timeout;
         write_frame(&mut self.io, &frame, deadline).await
+    }
+
+    /// One frame with this connection's absolute write deadline.
+    /// A timeout may already have written a prefix; the caller closes.
+    pub async fn write_frame(&mut self, frame: &crate::Frame) -> Result<(), HostError> {
+        let deadline = std::time::Instant::now() + self.write_timeout;
+        write_frame(&mut self.io, frame, deadline).await
+    }
+
+    /// Resolves when the peer closes. Cancel-safe: it does not consume bytes.
+    ///
+    /// A stuck read-ready bit must not spin. `select!` polls this future, and a
+    /// poll that always returns Ready would starve the request handler.
+    pub async fn wait_peer_closed(&mut self) {
+        loop {
+            if peer_half_closed(&self.io) {
+                return;
+            }
+            match &mut self.io {
+                #[cfg(unix)]
+                ConnIo::Unix(stream) => {
+                    let _ = stream.readable().await;
+                    if peer_half_closed(&self.io) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                #[cfg(windows)]
+                ConnIo::Server(_stream) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// Bound a non-reading subscriber so its writer blocks instead of buffering the backlog in the kernel.
+    pub fn shrink_send_buffer(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = match &self.io {
+                ConnIo::Unix(stream) => stream.as_raw_fd(),
+            };
+            let size: libc::c_int = 2048;
+            let _ = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &size as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
+    }
+
+    pub fn dup_shutdown(&self) -> Option<Arc<ShutdownSwitch>> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = match &self.io {
+                ConnIo::Unix(stream) => stream.as_raw_fd(),
+            };
+            let duped = unsafe { libc::dup(fd) };
+            if duped < 0 {
+                return None;
+            }
+            Some(Arc::new(ShutdownSwitch {
+                fd: AtomicI32::new(duped),
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            Some(Arc::new(ShutdownSwitch {
+                fd: AtomicI32::new(-1),
+            }))
+        }
+    }
+}
+
+/// Duplicated socket. Tripping it unblocks a writer stuck in `write`.
+pub struct ShutdownSwitch {
+    fd: AtomicI32,
+}
+
+impl ShutdownSwitch {
+    pub fn trip(&self) {
+        let fd = self.fd.swap(-1, Ordering::SeqCst);
+        if fd < 0 {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+            libc::close(fd);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+        }
+    }
+
+    /// Close the duplicate without shutting down the accepted socket.
+    pub fn disarm(self) {
+        let fd = self.fd.swap(-1, Ordering::SeqCst);
+        if fd < 0 {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::close(fd);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+        }
+    }
+}
+
+impl Drop for ShutdownSwitch {
+    fn drop(&mut self) {
+        self.trip();
+    }
+}
+
+fn peer_half_closed(io: &ConnIo) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = match io {
+            ConnIo::Unix(stream) => stream.as_raw_fd(),
+        };
+        let mut buf = [0u8; 1];
+        let n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr().cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if n == 0 {
+            return true;
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            return err.kind() != std::io::ErrorKind::WouldBlock;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = io;
+        false
     }
 }
 
@@ -361,16 +525,109 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
         write_timeout: shared.write_timeout,
         requests: Arc::clone(&shared.requests),
         stream_only: false,
+        pending: Vec::new(),
+        frame_started: None,
     })
 }
 
-async fn read_idle(io: &mut ConnIo, timeout: Duration) -> Result<crate::Frame, HostError> {
-    match io {
-        #[cfg(unix)]
-        ConnIo::Unix(stream) => auth::read_frame_idle(stream, timeout).await,
-        #[cfg(windows)]
-        ConnIo::Server(stream) => auth::read_frame_idle(stream, timeout).await,
+impl HostConn {
+    /// Full frames only. Bytes already read stay on `self` if this future is dropped.
+    async fn read_buffered_frame(&mut self) -> Result<crate::Frame, HostError> {
+        loop {
+            if let Some(frame) = take_frame(&mut self.pending)? {
+                self.frame_started = if self.pending.is_empty() {
+                    None
+                } else {
+                    Some(std::time::Instant::now())
+                };
+                return Ok(frame);
+            }
+            match fill_pending(&self.io, &mut self.pending, &mut self.frame_started)? {
+                Fill::Closed => return Err(HostError::Io("connection closed".into())),
+                Fill::Bytes => {}
+                Fill::Block => self.wait_readable().await?,
+            }
+        }
     }
+
+    async fn wait_readable(&mut self) -> Result<(), HostError> {
+        if let Some(started) = self.frame_started {
+            let deadline = started + self.frame_timeout;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(HostError::FrameTimeout);
+            }
+            return match tokio::time::timeout(deadline - now, self.readable()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(HostError::Io(err.to_string())),
+                Err(_) => Err(HostError::FrameTimeout),
+            };
+        }
+        self.readable()
+            .await
+            .map_err(|err| HostError::Io(err.to_string()))
+    }
+
+    async fn readable(&self) -> std::io::Result<()> {
+        match &self.io {
+            #[cfg(unix)]
+            ConnIo::Unix(stream) => stream.readable().await,
+            #[cfg(windows)]
+            ConnIo::Server(stream) => stream.readable().await,
+        }
+    }
+}
+
+enum Fill {
+    Closed,
+    Bytes,
+    Block,
+}
+
+fn fill_pending(
+    io: &ConnIo,
+    pending: &mut Vec<u8>,
+    started: &mut Option<std::time::Instant>,
+) -> Result<Fill, HostError> {
+    let mut buf = [0u8; 8192];
+    let read = match io {
+        #[cfg(unix)]
+        ConnIo::Unix(stream) => stream.try_read(&mut buf),
+        #[cfg(windows)]
+        ConnIo::Server(stream) => stream.try_read(&mut buf),
+    };
+    match read {
+        Ok(0) => Ok(Fill::Closed),
+        Ok(n) => {
+            if pending.is_empty() {
+                *started = Some(std::time::Instant::now());
+            }
+            pending.extend_from_slice(&buf[..n]);
+            Ok(Fill::Bytes)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+            fill_pending(io, pending, started)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(Fill::Block),
+        Err(err) => Err(HostError::Io(err.to_string())),
+    }
+}
+
+fn take_frame(pending: &mut Vec<u8>) -> Result<Option<crate::Frame>, HostError> {
+    if pending.len() < 4 {
+        return Ok(None);
+    }
+    let mut len_buf = [0u8; 4];
+    len_buf.copy_from_slice(&pending[..4]);
+    let body_len = crate::frame::checked_frame_len(u32::from_be_bytes(len_buf))?;
+    let total = 4usize.checked_add(body_len).ok_or(HostError::FrameLength)?;
+    if pending.len() < total {
+        return Ok(None);
+    }
+    let rest = pending.split_off(total);
+    let mut framed = std::mem::replace(pending, rest);
+    let body = framed.split_off(4);
+    crate::frame::decode_body(body).map(Some)
 }
 
 async fn write_frame(

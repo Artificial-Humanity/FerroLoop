@@ -49,6 +49,13 @@ fn main() {
             }
             park();
         }
+        "record" => record(rest.first().map(String::as_str)),
+        "lines" => lines(rest.first().and_then(|text| text.parse().ok()).unwrap_or(1)),
+        "flood-stdout" => flood_stdout(),
+        "flood-empty" => flood_empty(),
+        "overflow" => overflow_line(),
+        "maxline" => max_line(),
+        "stderr-and-stdout" => stderr_and_stdout(),
         _ => {
             let _ = writeln!(io::stderr(), "unknown mode");
             exit(2);
@@ -66,6 +73,106 @@ fn park() -> ! {
     loop {
         std::thread::park();
     }
+}
+
+fn record(path: Option<&str>) {
+    ready();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.expect("record path"))
+        .expect("record");
+    let mut input = io::stdin();
+    let mut buf = [0u8; 1024];
+    loop {
+        match input.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = file.write_all(&buf[..n]);
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
+fn lines(count: usize) {
+    ready();
+    let mut out = io::stdout();
+    for index in 0..count {
+        let _ = writeln!(out, "L{index}");
+    }
+    let _ = out.flush();
+    park();
+}
+
+fn flood_stdout() {
+    ready();
+    let mut out = io::stdout();
+    let chunk = vec![b'x'; 256 * 1024];
+    for _ in 0..40 {
+        let _ = out.write_all(&chunk);
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+    }
+    let _ = out.write_all(b"TAIL\n");
+    let _ = out.flush();
+    park();
+}
+
+fn flood_empty() {
+    ready();
+    let mut out = io::stdout();
+    let chunk = vec![b'\n'; 1024];
+    for _ in 0..8 {
+        let _ = out.write_all(&chunk);
+        let _ = out.flush();
+    }
+    let _ = out.write_all(b"TAIL\n");
+    let _ = out.flush();
+    park();
+}
+
+fn overflow_line() {
+    ready();
+    let mut out = io::stdout();
+    let chunk = vec![b'z'; 64 * 1024];
+    let mut left = (1 << 20) + 2;
+    while left > 0 {
+        let n = left.min(chunk.len());
+        let _ = out.write_all(&chunk[..n]);
+        left -= n;
+    }
+    let _ = out.flush();
+    park();
+}
+
+fn max_line() {
+    ready();
+    let mut out = io::stdout();
+    let chunk = vec![b'y'; 64 * 1024];
+    let mut left = 1 << 20;
+    while left > 0 {
+        let n = left.min(chunk.len());
+        let _ = out.write_all(&chunk[..n]);
+        left -= n;
+    }
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+    park();
+}
+
+fn stderr_and_stdout() {
+    ready();
+    let mut err = io::stderr();
+    let chunk = vec![b'e'; 64 * 1024];
+    for _ in 0..64 {
+        let _ = err.write_all(&chunk);
+    }
+    let _ = err.flush();
+    let mut out = io::stdout();
+    let _ = out.write_all(b"STDOUT_OK\n");
+    let _ = out.flush();
+    park();
 }
 
 fn echo() {

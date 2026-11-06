@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fl_host_proto::{
@@ -34,6 +34,9 @@ pub struct Session {
     stdout_cv: Condvar,
     stderr: Mutex<Vec<u8>>,
     cleanup_requested: AtomicBool,
+    input: Mutex<InputState>,
+    stalled: AtomicBool,
+    sink: Mutex<Option<Weak<dyn StdoutSink>>>,
     #[cfg(unix)]
     supervisor: Mutex<Option<std::process::Child>>,
     #[cfg(windows)]
@@ -102,6 +105,9 @@ impl Session {
             stdout_cv: Condvar::new(),
             stderr: Mutex::new(Vec::new()),
             cleanup_requested: AtomicBool::new(false),
+            input: Mutex::new(InputState::Writable),
+            stalled: AtomicBool::new(false),
+            sink: Mutex::new(None),
             #[cfg(unix)]
             supervisor: Mutex::new(None),
             #[cfg(windows)]
@@ -155,11 +161,19 @@ impl Session {
     }
 
     pub fn note_leader(&self, exit: ChildExit) {
-        let mut slot = self.leader.lock().unwrap_or_else(|err| err.into_inner());
-        if slot.is_none() {
-            *slot = Some(exit);
-        }
+        let fresh = {
+            let mut slot = self.leader.lock().unwrap_or_else(|err| err.into_inner());
+            if slot.is_none() {
+                *slot = Some(exit.clone());
+                true
+            } else {
+                false
+            }
+        };
         self.leader_cv.notify_all();
+        if fresh && let Some(sink) = self.sink() {
+            sink.on_leader(exit);
+        }
     }
 
     pub fn note_descendant(&self, exit: DescendantExit) {
@@ -170,11 +184,19 @@ impl Session {
     }
 
     pub fn note_cleanup(&self, report: CleanupReport) {
-        let mut slot = self.cleanup.lock().unwrap_or_else(|err| err.into_inner());
-        if slot.is_none() {
-            *slot = Some(report);
-        }
+        let fresh = {
+            let mut slot = self.cleanup.lock().unwrap_or_else(|err| err.into_inner());
+            if slot.is_none() {
+                *slot = Some(report);
+                true
+            } else {
+                false
+            }
+        };
         self.cleanup_cv.notify_all();
+        if fresh && let Some(sink) = self.sink() {
+            sink.on_cleanup(report.complete);
+        }
     }
 
     pub fn leader_exit(&self) -> Option<ChildExit> {
@@ -306,18 +328,67 @@ impl Session {
             .clone()
     }
 
+    pub(crate) fn take_stdin(&self) -> Option<File> {
+        self.stdin
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+    }
+
+    pub(crate) fn set_input(&self, input: InputState) {
+        *self.input.lock().unwrap_or_else(|err| err.into_inner()) = input;
+    }
+
+    pub(crate) fn set_stalled(&self, stalled: bool) {
+        self.stalled.store(stalled, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_sink(&self, sink: Weak<dyn StdoutSink>) {
+        *self.sink.lock().unwrap_or_else(|err| err.into_inner()) = Some(sink);
+    }
+
+    pub(crate) fn sink(&self) -> Option<Arc<dyn StdoutSink>> {
+        self.sink
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn terminate_leader(&self) -> Result<(), HostError> {
+        use std::os::windows::io::AsRawHandle;
+        let process = self.process.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(process) = process.as_ref() else {
+            return Err(HostError::Io("leader process".into()));
+        };
+        let ok = unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(process.as_raw_handle() as _, 1)
+        };
+        if ok == 0 {
+            Err(HostError::Io("terminate process".into()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn state(&self) -> ChildState {
         let exit = self.leader_exit();
         let cleanup = self.cleanup_report();
+        let input = self
+            .input
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
         let record = ChildRecord {
             session: self.session.clone(),
             session_epoch: SessionEpoch(self.epoch),
             kind: SpawnKind::Pipe,
             pid: self.vendor_pid,
-            input: InputState::Writable,
+            input,
             started_at_ms: self.started_at_ms,
             exit,
-            consumer_stalled: false,
+            consumer_stalled: self.stalled.load(Ordering::SeqCst),
         };
         if matches!(cleanup, Some(report) if report.complete) {
             ChildState::CleanupComplete(record)
@@ -342,16 +413,69 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+pub(crate) trait StdoutSink: Send + Sync {
+    fn room(&self) -> usize;
+    fn push(&self, bytes: &[u8]) -> bool;
+    fn eof(&self);
+    fn wait(&self, timeout: Duration);
+    fn on_leader(&self, exit: ChildExit);
+    fn on_cleanup(&self, complete: bool);
+    fn stopped(&self) -> bool;
+}
+
 pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
-    let mut buf = [0u8; 8192];
+    if session.sink().is_none() {
+        let mut buf = [0u8; 8192];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => {
+                    session.stdout_eof();
+                    break;
+                }
+                Ok(n) => session.push_stdout(&buf[..n]),
+                Err(_) => {
+                    session.stdout_eof();
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
-        match file.read(&mut buf) {
+        let Some(sink) = session.sink() else {
+            session.stdout_eof();
+            break;
+        };
+        if sink.stopped() {
+            sink.eof();
+            session.stdout_eof();
+            break;
+        }
+        let room = sink.room();
+        if room == 0 {
+            session.set_stalled(true);
+            sink.wait(Duration::from_millis(50));
+            continue;
+        }
+        session.set_stalled(false);
+        let n = room.min(buf.len());
+        match file.read(&mut buf[..n]) {
             Ok(0) => {
+                sink.eof();
                 session.stdout_eof();
                 break;
             }
-            Ok(n) => session.push_stdout(&buf[..n]),
+            Ok(n) => {
+                session.push_stdout(&buf[..n]);
+                if !sink.push(&buf[..n]) {
+                    sink.eof();
+                    session.stdout_eof();
+                    break;
+                }
+            }
             Err(_) => {
+                sink.eof();
                 session.stdout_eof();
                 break;
             }

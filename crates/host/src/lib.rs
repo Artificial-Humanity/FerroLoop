@@ -7,9 +7,12 @@
 //! This crate does not claim macOS adoption. The daemon reaps only the supervisor.
 
 mod child;
+mod daemon;
 mod env;
 mod identity;
+mod input;
 mod limits;
+mod output;
 mod protocol;
 mod refusal;
 mod session;
@@ -20,6 +23,7 @@ mod survivor_registry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -72,6 +76,7 @@ impl OpenOptions {
 
 pub struct Host {
     inner: Arc<HostInner>,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl std::fmt::Debug for Host {
@@ -80,16 +85,22 @@ impl std::fmt::Debug for Host {
     }
 }
 
-struct HostInner {
+pub(crate) struct HostInner {
     endpoint: HostEndpoint,
     path: PathBuf,
     registry: Mutex<Registry>,
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    pub(crate) sessions: Mutex<HashMap<String, Arc<Session>>>,
     joins: Mutex<Vec<JoinHandle<()>>>,
     spawn_gate: Mutex<()>,
-    listener: Mutex<Option<HostListener>>,
-    /// Keeps the listener task polling after `bind` returns.
-    runtime: tokio::runtime::Runtime,
+    pub(crate) listener: Mutex<Option<HostListener>>,
+    pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) stop: AtomicBool,
+    pub(crate) wake: tokio::sync::Notify,
+    pub(crate) hub: Arc<output::Hub>,
+    pub(crate) writers: Mutex<HashMap<String, Arc<input::WriterHandle>>>,
+    pub(crate) outputs: Mutex<HashMap<String, Arc<output::OutputSession>>>,
+    pub(crate) next_conn: AtomicU64,
+    shutdown_started: AtomicBool,
     supervisor_bin: PathBuf,
     fail_handshake_after_publish: bool,
     crash: Mutex<Option<CrashPoint>>,
@@ -97,9 +108,14 @@ struct HostInner {
 
 pub fn serve(config: HostConfig) -> Result<(), HostError> {
     try_backstop();
+    block_stop_signals();
     let host = Host::open(OpenOptions::new(config))?;
-    wait_for_stop()?;
-    host.shutdown()
+    host.inner
+        .handle
+        .spawn(daemon::accept_loop(Arc::clone(&host.inner)));
+    let stopped = wait_for_stop();
+    host.shutdown()?;
+    stopped
 }
 
 #[cfg(windows)]
@@ -277,7 +293,7 @@ fn phase_name(phase: Option<SessionPhase>) -> &'static str {
 impl Host {
     pub fn open(opts: OpenOptions) -> Result<Self, HostError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .build()
             .map_err(|err| HostError::Io(err.to_string()))?;
@@ -296,7 +312,9 @@ impl Host {
             let _ = publish(&path, &registry, None);
             return Err(err);
         }
+        let handle = runtime.handle().clone();
         Ok(Self {
+            runtime: Some(runtime),
             inner: Arc::new(HostInner {
                 endpoint,
                 path,
@@ -305,7 +323,14 @@ impl Host {
                 joins: Mutex::new(Vec::new()),
                 spawn_gate: Mutex::new(()),
                 listener: Mutex::new(Some(listener)),
-                runtime,
+                handle,
+                stop: AtomicBool::new(false),
+                wake: tokio::sync::Notify::new(),
+                hub: Arc::new(output::Hub::new()),
+                writers: Mutex::new(HashMap::new()),
+                outputs: Mutex::new(HashMap::new()),
+                next_conn: AtomicU64::new(1),
+                shutdown_started: AtomicBool::new(false),
                 supervisor_bin: opts.supervisor_bin,
                 fail_handshake_after_publish: opts.fail_handshake_after_publish,
                 crash: Mutex::new(opts.crash_at),
@@ -346,57 +371,7 @@ impl Host {
     }
 
     pub fn spawn(&self, spec: &SpawnSpec) -> Result<SessionHandle, HostError> {
-        let _gate = self
-            .inner
-            .spawn_gate
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        spec.validate()?;
-        if spec.kind == fl_host_proto::SpawnKind::Pty {
-            return Err(HostError::Unsupported { subject: "pty" });
-        }
-        self.require_pidfd()?;
-        let env = env::scrubbed_env(spec)?;
-        let env = env
-            .into_iter()
-            .map(|(key, value)| {
-                let key = key
-                    .into_string()
-                    .map_err(|_| HostError::Protocol("env name".into()))?;
-                let value = value
-                    .into_string()
-                    .map_err(|_| HostError::Protocol("env value".into()))?;
-                Ok((key, value))
-            })
-            .collect::<Result<Vec<_>, HostError>>()?;
-        let epoch = {
-            let registry = self
-                .inner
-                .registry
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
-            if registry
-                .sessions
-                .iter()
-                .any(|record| record.session == spec.session.as_str())
-            {
-                return Err(ContainmentRefusal::SpawnRejected.into());
-            }
-            registry.alloc_epoch()?
-        };
-        #[cfg(unix)]
-        {
-            self.spawn_unix(spec, env, epoch)
-        }
-        #[cfg(windows)]
-        {
-            self.spawn_windows(spec, env, epoch)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (spec, env, epoch);
-            Err(HostError::Unsupported { subject: "spawn" })
-        }
+        Self::spawn_session(&self.inner, spec)
     }
 
     pub fn kill(&self, session: &SessionId, epoch: SessionEpoch) -> Result<(), HostError> {
@@ -419,12 +394,43 @@ impl Host {
             .ok_or_else(|| HostError::Protocol("unknown session".into()))
     }
 
-    pub fn shutdown(self) -> Result<(), HostError> {
+    pub fn shutdown(mut self) -> Result<(), HostError> {
         self.shutdown_inner();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_millis(500));
+        }
         Ok(())
     }
 
     fn shutdown_inner(&self) {
+        if self.inner.shutdown_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.inner.stop.store(true, Ordering::SeqCst);
+        self.inner.wake.notify_one();
+        self.inner.hub.shutdown();
+        let writers: Vec<_> = self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for writer in &writers {
+            writer.shutdown();
+        }
+        let outputs: Vec<_> = self
+            .inner
+            .outputs
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for output in &outputs {
+            output.request_stop();
+        }
         let sessions: Vec<_> = self
             .inner
             .sessions
@@ -440,7 +446,6 @@ impl Host {
         for session in &sessions {
             let _ = session.wait_cleanup(deadline.saturating_duration_since(Instant::now()));
         }
-        let _runtime = &self.inner.runtime;
         let joins = std::mem::take(
             &mut *self
                 .inner
@@ -452,29 +457,112 @@ impl Host {
             let _ = join.join();
         }
         self.inner
+            .writers
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+        self.inner
+            .outputs
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+        self.inner
             .listener
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .take();
     }
 
-    fn require_pidfd(&self) -> Result<(), HostError> {
-        let _ = self.inner.endpoint.pipe_name();
+    pub(crate) fn spawn_session(
+        this: &Arc<HostInner>,
+        spec: &SpawnSpec,
+    ) -> Result<SessionHandle, HostError> {
+        let _gate = this
+            .spawn_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        spec.validate()?;
+        if spec.kind == fl_host_proto::SpawnKind::Pty {
+            return Err(HostError::Unsupported { subject: "pty" });
+        }
+        let _ = this.endpoint.pipe_name();
         #[cfg(target_os = "linux")]
         {
             check_pidfd_support()?;
         }
-        Ok(())
+        let occupied = this
+            .sessions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .filter(|session| {
+                !matches!(
+                    session.state(),
+                    fl_host_proto::ChildState::CleanupComplete(_)
+                )
+            })
+            .count();
+        if occupied >= fl_host_proto::DEFAULT_MAX_SESSIONS {
+            return Err(HostError::Protocol("session limit".into()));
+        }
+        {
+            let sessions = this.sessions.lock().unwrap_or_else(|err| err.into_inner());
+            if sessions.get(spec.session.as_str()).is_some_and(|session| {
+                !matches!(
+                    session.state(),
+                    fl_host_proto::ChildState::CleanupComplete(_)
+                )
+            }) {
+                return Err(ContainmentRefusal::SpawnRejected.into());
+            }
+        }
+        let env = env::scrubbed_env(spec)?;
+        let env = env
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key
+                    .into_string()
+                    .map_err(|_| HostError::Protocol("env name".into()))?;
+                let value = value
+                    .into_string()
+                    .map_err(|_| HostError::Protocol("env value".into()))?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, HostError>>()?;
+        let epoch = {
+            let registry = this.registry.lock().unwrap_or_else(|err| err.into_inner());
+            if registry
+                .sessions
+                .iter()
+                .any(|record| record.session == spec.session.as_str())
+            {
+                return Err(ContainmentRefusal::SpawnRejected.into());
+            }
+            registry.alloc_epoch()?
+        };
+        #[cfg(unix)]
+        {
+            Self::spawn_unix(this, spec, env, epoch)
+        }
+        #[cfg(windows)]
+        {
+            Self::spawn_windows(this, spec, env, epoch)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (this, spec, env, epoch);
+            Err(HostError::Unsupported { subject: "spawn" })
+        }
     }
 
     #[cfg(unix)]
     fn spawn_unix(
-        &self,
+        this: &Arc<HostInner>,
         spec: &SpawnSpec,
         env: Vec<(String, String)>,
         epoch: u64,
     ) -> Result<SessionHandle, HostError> {
-        let host = Arc::clone(&self.inner);
+        let host = Arc::clone(this);
         let crash = host
             .crash
             .lock()
@@ -517,7 +605,7 @@ impl Host {
             Err(err) => {
                 // Pidfd abort could not prove both processes. Keep the durable record.
                 if refusal(&err) != Some(ContainmentRefusal::CleanupUnresolved) {
-                    self.retire_epoch_keep(spec.session.as_str(), epoch);
+                    Self::retire_epoch_keep(this, spec.session.as_str(), epoch);
                 }
                 return Err(err);
             }
@@ -535,32 +623,39 @@ impl Host {
             stdin: Some(supervised.stdin),
         }));
         session.set_supervisor(supervised.child);
-        self.arm_unix(
+        this.sessions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(spec.session.as_str().to_owned(), Arc::clone(&session));
+        daemon::attach(this, &session);
+        Self::arm_unix(
+            this,
             Arc::clone(&session),
             supervised.status,
             supervised.stdout,
             supervised.stderr,
         );
-        self.inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .insert(spec.session.as_str().to_owned(), Arc::clone(&session));
         Ok(SessionHandle { inner: session })
     }
 
     #[cfg(unix)]
-    fn arm_unix(&self, session: Arc<Session>, status: File, stdout: File, stderr: File) {
-        let host = Arc::clone(&self.inner);
+    fn arm_unix(
+        this: &Arc<HostInner>,
+        session: Arc<Session>,
+        status: File,
+        stdout: File,
+        stderr: File,
+    ) {
+        let host = Arc::clone(this);
         let watched = Arc::clone(&session);
-        self.spawn_thread(move || unix_status(status, watched, host));
+        this.spawn_thread(move || unix_status(status, watched, host));
         let pumped = Arc::clone(&session);
-        self.spawn_thread(move || session::pump_stdout(stdout, pumped));
+        this.spawn_thread(move || session::pump_stdout(stdout, pumped));
         let pumped = Arc::clone(&session);
-        self.spawn_thread(move || session::pump_stderr(stderr, pumped));
+        this.spawn_thread(move || session::pump_stderr(stderr, pumped));
         let waited = Arc::clone(&session);
         // The status thread owns cleanup reports. This thread only reaps the supervisor.
-        self.spawn_thread(move || {
+        this.spawn_thread(move || {
             if let Some(mut child) = waited.take_supervisor() {
                 let _ = child.wait();
             }
@@ -569,12 +664,12 @@ impl Host {
 
     #[cfg(windows)]
     fn spawn_windows(
-        &self,
+        this: &Arc<HostInner>,
         spec: &SpawnSpec,
         env: Vec<(String, String)>,
         epoch: u64,
     ) -> Result<SessionHandle, HostError> {
-        let host = Arc::clone(&self.inner);
+        let host = Arc::clone(this);
         let crash = host
             .crash
             .lock()
@@ -611,7 +706,7 @@ impl Host {
         let spawned = match spawned {
             Ok(spawned) => spawned,
             Err(err) => {
-                self.retire_epoch_keep(spec.session.as_str(), epoch);
+                Self::retire_epoch_keep(this, spec.session.as_str(), epoch);
                 return Err(err);
             }
         };
@@ -632,40 +727,33 @@ impl Host {
             .process
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = Some(spawned.process);
-        self.arm_windows(Arc::clone(&session), spawned.stdout, spawned.stderr);
-        self.inner
-            .sessions
+        this.sessions
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .insert(spec.session.as_str().to_owned(), Arc::clone(&session));
+        daemon::attach(this, &session);
+        Self::arm_windows(this, Arc::clone(&session), spawned.stdout, spawned.stderr);
         Ok(SessionHandle { inner: session })
     }
 
     #[cfg(windows)]
-    fn arm_windows(&self, session: Arc<Session>, stdout: File, stderr: File) {
-        let host = Arc::clone(&self.inner);
+    fn arm_windows(this: &Arc<HostInner>, session: Arc<Session>, stdout: File, stderr: File) {
+        let host = Arc::clone(this);
         let watched = Arc::clone(&session);
-        self.spawn_thread(move || windows_watch(watched, host));
+        this.spawn_thread(move || windows_watch(watched, host));
         let pumped = Arc::clone(&session);
-        self.spawn_thread(move || session::pump_stdout(stdout, pumped));
+        this.spawn_thread(move || session::pump_stdout(stdout, pumped));
         let pumped = Arc::clone(&session);
-        self.spawn_thread(move || session::pump_stderr(stderr, pumped));
+        this.spawn_thread(move || session::pump_stderr(stderr, pumped));
     }
 
+    #[cfg(test)]
     fn spawn_thread(&self, work: impl FnOnce() + Send + 'static) {
-        self.inner
-            .joins
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .push(std::thread::spawn(work));
+        self.inner.spawn_thread(work);
     }
 
-    fn retire_epoch_keep(&self, session: &str, epoch: u64) {
-        let mut registry = self
-            .inner
-            .registry
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+    fn retire_epoch_keep(this: &Arc<HostInner>, session: &str, epoch: u64) {
+        let mut registry = this.registry.lock().unwrap_or_else(|err| err.into_inner());
         let had = registry
             .sessions
             .iter()
@@ -675,14 +763,26 @@ impl Host {
             registry.high_water = epoch;
         }
         if had || registry.high_water == epoch {
-            let _ = publish(&self.inner.path, &registry, None);
+            let _ = publish(&this.path, &registry, None);
         }
+    }
+}
+
+impl HostInner {
+    pub(crate) fn spawn_thread(&self, work: impl FnOnce() + Send + 'static) {
+        self.joins
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(std::thread::spawn(work));
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
         self.shutdown_inner();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_millis(500));
+        }
     }
 }
 
@@ -911,15 +1011,26 @@ fn try_backstop() {
     child::windows::backstop();
 }
 
+fn block_stop_signals() {
+    #[cfg(unix)]
+    unsafe {
+        let mut set = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
 fn wait_for_stop() -> Result<(), HostError> {
     #[cfg(unix)]
     {
+        block_stop_signals();
         unsafe {
             let mut set = std::mem::zeroed();
             libc::sigemptyset(&mut set);
             libc::sigaddset(&mut set, libc::SIGINT);
             libc::sigaddset(&mut set, libc::SIGTERM);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
             let mut sig = 0;
             if libc::sigwait(&set, &mut sig) != 0 {
                 return Err(HostError::Io("sigwait".into()));
