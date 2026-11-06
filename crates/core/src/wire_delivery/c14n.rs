@@ -173,6 +173,55 @@ mod tests {
     }
 
     #[test]
+    fn managed_c14n_full_message_with_present_options_is_literal() {
+        let msg = WireMessage {
+            id: MessageId(seq_iri(1)),
+            thread_id: MessageId(seq_iri(2)),
+            reply_to: Some(MessageId(seq_iri(3))),
+            correlation_id: Some(MessageId(seq_iri(4))),
+            sender_id: Some(crate::AgentId(seq_iri(5))),
+            sender_name: "alice".into(),
+            sender_host: Some("host.example".into()),
+            to: WireAddress::AgentName("bob".into()),
+            kind: MessageKind::Ask,
+            urgency: MessageUrgency::Urgent,
+            durable: true,
+            subject: " Hello ".into(),
+            body: "Body\né".into(),
+            created_at: At::parse("2026-11-06T00:00:00.000Z").unwrap(),
+            deadline_at: Some(At::parse("2026-11-07T00:00:00.000Z").unwrap()),
+        };
+        // Encoded independently from spec §4 with Python struct.pack(">Q", UTF-8 byte
+        // length), literal presence/bool bytes, and hashlib.sha256; no Rust encoder used.
+        // Distinct IDs pin field order, including reply_to before correlation_id.
+        let expected = unhex(concat!(
+            "0000000000000024466572726f4c6f6f702f5769726544656c69766572792f67656e65726174696f6e2f7631",
+            "000000000000002d75726e3a757569643a30303030303030302d303030302d373030302d383030302d303030303030303030303031",
+            "000000000000002d75726e3a757569643a30303030303030302d303030302d373030302d383030302d303030303030303030303032",
+            "01000000000000002d75726e3a757569643a30303030303030302d303030302d373030302d383030302d303030303030303030303033",
+            "01000000000000002d75726e3a757569643a30303030303030302d303030302d373030302d383030302d303030303030303030303034",
+            "01000000000000002d75726e3a757569643a30303030303030302d303030302d373030302d383030302d303030303030303030303035",
+            "0000000000000005616c696365",
+            "01000000000000000c686f73742e6578616d706c65",
+            "000000000000000a6167656e745f6e616d65",
+            "0000000000000003626f62",
+            "000000000000000361736b",
+            "0000000000000006757267656e74",
+            "01",
+            "00000000000000072048656c6c6f20",
+            "0000000000000007426f64790ac3a9",
+            "0000000000000018323032362d31312d30365430303a30303a30302e3030305a",
+            "010000000000000018323032362d31312d30375430303a30303a30302e3030305a"
+        ));
+        assert_eq!(expected.len(), 496);
+        assert_eq!(generation_bytes(&msg).unwrap(), expected);
+        assert_eq!(
+            canonical_generation(&msg).unwrap(),
+            digest("ea9d0cbc84a90f4c7d51e215c77f1b2b05aed644aadb34097f350cc45c2f8330")
+        );
+    }
+
+    #[test]
     fn managed_c14n_selector_tags_and_custom_roles_are_literal() {
         let id = crate::AgentId(seq_iri(9));
         let cases = [
@@ -223,6 +272,12 @@ mod tests {
         let base = canonical_generation(&original).unwrap();
         let mut alternatives = Vec::new();
         let mut msg = original.clone();
+        msg.id = MessageId(seq_iri(2));
+        alternatives.push(msg);
+        let mut msg = original.clone();
+        msg.thread_id = MessageId(seq_iri(2));
+        alternatives.push(msg);
+        let mut msg = original.clone();
         msg.reply_to = Some(MessageId(seq_iri(2)));
         alternatives.push(msg);
         let mut msg = original.clone();
@@ -232,10 +287,19 @@ mod tests {
         msg.sender_id = Some(crate::AgentId(seq_iri(2)));
         alternatives.push(msg);
         let mut msg = original.clone();
+        msg.sender_name = "carol".into();
+        alternatives.push(msg);
+        let mut msg = original.clone();
         msg.sender_host = Some("host".into());
         alternatives.push(msg);
         let mut msg = original.clone();
         msg.deadline_at = Some(At::parse("2026-11-07T00:00:00.000Z").unwrap());
+        alternatives.push(msg);
+        let mut msg = original.clone();
+        msg.kind = MessageKind::Ask;
+        alternatives.push(msg);
+        let mut msg = original.clone();
+        msg.urgency = MessageUrgency::Urgent;
         alternatives.push(msg);
         let mut msg = original.clone();
         msg.durable = true;
@@ -245,6 +309,9 @@ mod tests {
         alternatives.push(msg);
         let mut msg = original.clone();
         msg.body = "Body\n".into();
+        alternatives.push(msg);
+        let mut msg = original.clone();
+        msg.created_at = At::parse("2026-11-06T00:00:00.001Z").unwrap();
         alternatives.push(msg);
         let mut seen = std::collections::BTreeSet::new();
         for msg in alternatives {
