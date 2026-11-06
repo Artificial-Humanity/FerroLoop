@@ -436,13 +436,14 @@ fn bind_private(path: &Path) -> Result<(tokio::net::UnixListener, u64, u64), Hos
     if rc != 0 {
         return Err(HostError::Io(io::Error::last_os_error().to_string()));
     }
-    // `fchmod` on a Linux socket fd does not change the directory entry.
-    // `chmod` the path, then `fchmod`, both before listen.
+    // Set the directory entry to 0600 before listen. A Linux socket fd has
+    // separate metadata; macOS rejects fchmod on socket descriptors with EINVAL.
     if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
         let _ = std::fs::remove_file(path);
         return Err(HostError::Io(err.to_string()));
     }
-    // SAFETY: `fd` is the bound socket. 0600 is applied before listen.
+    // SAFETY: `fd` is the bound socket. Path mode 0600 is already applied.
+    #[cfg(not(target_os = "macos"))]
     if unsafe { libc::fchmod(fd.as_raw_fd(), 0o600) } != 0 {
         let _ = std::fs::remove_file(path);
         return Err(HostError::Io(io::Error::last_os_error().to_string()));
@@ -696,4 +697,25 @@ pub fn interpret_ucred(bytes: &[u8]) -> Result<u32, HostError> {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut cred).cast::<u8>(), size);
     }
     Ok(cred.uid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bound_socket_is_private_owned_and_close_on_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.sock");
+        let (listener, dev, ino) = bind_private(&path).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(meta.uid(), unix_euid());
+        assert_eq!((meta.dev(), meta.ino()), (dev, ino));
+        // SAFETY: the listener owns this open descriptor throughout the query.
+        let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
 }
