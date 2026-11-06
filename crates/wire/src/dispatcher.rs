@@ -2160,9 +2160,35 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     msg: &WireMessage,
     now: At,
 ) -> Vec<DeliveryReceipt> {
-    let Ok(receipts) = store.list_wire_receipts(&msg.id) else {
-        return Vec::new();
+    dispatch_message_selected(store, routes, home_override, msg, now, None).0
+}
+
+/// Dispatch only one recipient; the daemon schedules each recipient independently.
+pub(crate) fn dispatch_message_for_recipient<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: &str,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    dispatch_message_selected(store, routes, home_override, msg, now, Some(recipient))
+}
+
+fn dispatch_message_selected<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: Option<&str>,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
+        return (Vec::new(), None);
     };
+    if let Some(recipient) = recipient {
+        receipts.retain(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
+    }
     let deliverable = |rcpt: &DeliveryReceipt| {
         !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             && rcpt.attempts < MAX_DELIVER
@@ -2184,6 +2210,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         routes.discover_routes(home_override, now.clone());
     }
     let mut updated = Vec::new();
+    let mut attempted = false;
     for rcpt in receipts {
         if !deliverable(&rcpt) {
             continue;
@@ -2191,6 +2218,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
             continue;
         };
+        attempted = true;
         let mut pushed = dispatch_to_route(&entry.route, msg);
         if pushed.is_err() {
             // The session may have restarted since this route was learned (a new pid, socket or
@@ -2215,7 +2243,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
             updated.push(new_rcpt);
         }
     }
-    updated
+    (updated, Some(attempted))
 }
 
 /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it

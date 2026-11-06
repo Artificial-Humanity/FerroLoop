@@ -434,6 +434,7 @@ dependencies = [
  "tokio",
  "toml",
  "ureq",
+ "uuid",
 ]
 
 [[package]]
