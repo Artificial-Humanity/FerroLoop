@@ -143,13 +143,23 @@ fn mutual_nonce_proofs_reject_replay_and_reflection() {
     assert_ne!(&transcript[..20], b"fl-store/1/client");
 }
 
+// These endpoint-model tests do not touch the filesystem, but Path::is_absolute
+// still follows the host platform's path syntax.
+fn absolute_fixture_path(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    let root = PathBuf::from(r"C:\flh");
+    #[cfg(not(windows))]
+    let root = PathBuf::from("/tmp");
+    root.join(name)
+}
+
 #[test]
 fn token_debug_is_redacted() {
     let token = AuthToken::new([0xab; 32]);
     let shown = format!("{token:?} {token}");
     assert!(!shown.to_ascii_lowercase().contains("abab"));
     assert!(shown.contains("redacted"));
-    let endpoint = HostEndpoint::unix("/tmp/unique-endpoint-name.sock").unwrap();
+    let endpoint = HostEndpoint::unix(absolute_fixture_path("unique-endpoint-name.sock")).unwrap();
     assert!(!format!("{endpoint:?}").contains("unique-endpoint-name"));
     let config = HostConfig::new(endpoint);
     let shown = format!("{config:?}");
@@ -159,11 +169,14 @@ fn token_debug_is_redacted() {
 
 #[test]
 fn lock_token_registry_epochs_derive_from_endpoint() {
-    let left = HostEndpoint::unix("/tmp/a.sock").unwrap();
-    let right = HostEndpoint::unix("/tmp/b.sock").unwrap();
-    assert_eq!(left.lock_path(), PathBuf::from("/tmp/a.sock.lock"));
-    assert_eq!(left.token_path(), PathBuf::from("/tmp/a.sock.token"));
-    assert_eq!(left.state_path(), PathBuf::from("/tmp/a.sock.state.json"));
+    let left = HostEndpoint::unix(absolute_fixture_path("a.sock")).unwrap();
+    let right = HostEndpoint::unix(absolute_fixture_path("b.sock")).unwrap();
+    assert_eq!(left.lock_path(), absolute_fixture_path("a.sock.lock"));
+    assert_eq!(left.token_path(), absolute_fixture_path("a.sock.token"));
+    assert_eq!(
+        left.state_path(),
+        absolute_fixture_path("a.sock.state.json")
+    );
     assert_ne!(left.lock_path(), right.lock_path());
     assert_ne!(left.token_path(), right.token_path());
     assert_ne!(left.state_path(), right.state_path());
