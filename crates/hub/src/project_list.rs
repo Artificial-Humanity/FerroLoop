@@ -109,6 +109,54 @@ pub fn scan_store_dir(dir: &Path, ext: &str) -> Vec<StoreHint> {
     found.into_iter().map(|(s, p)| (s, Some(p))).collect()
 }
 
+/// The store file the list reports for a project: the file the process would really keep it in,
+/// not the configured name. See [`effective_store_path_with`].
+pub(crate) fn effective_store_path(configured: &Path) -> PathBuf {
+    effective_store_path_with(
+        configured,
+        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+    )
+}
+
+/// The physical store file behind the store named `configured`, for an engine selection `env`
+/// (the value of `FL_STORE_BACKEND`). A `[[project]] store` may still name the legacy
+/// `<slug>.redb`, which FerroStore keeps at the sibling `<slug>.fls`; the list reports the file
+/// that is really there, so a caller that shows or acts on the path gets a real one.
+///
+/// - an engine selection that names no engine, or a name that is not a store file's (neither
+///   `.redb` nor `.fls`; the delete flow refuses such a name, and it must keep seeing it): the
+///   path as configured;
+/// - redb (an explicit override, for a path that is not `.fls`): the path as configured;
+/// - FerroStore: the sibling `.fls`, except that a lone legacy file (no `.fls`, and the
+///   configured path is a regular file) is what is on disk, so that is reported until it is
+///   migrated. Nothing at all: the `.fls` it would be created at.
+///
+/// It looks at the file system and changes nothing: no store is opened, migrated or made.
+pub(crate) fn effective_store_path_with(configured: &Path, env: Option<&str>) -> PathBuf {
+    use fl_store::{BackendKind, choose_backend, physical_path};
+    let named_like_a_store = matches!(
+        configured.extension().and_then(|e| e.to_str()),
+        Some("redb" | "fls")
+    );
+    if !named_like_a_store {
+        return configured.to_path_buf();
+    }
+    match choose_backend(configured, env) {
+        Err(_) | Ok(BackendKind::Redb) => configured.to_path_buf(),
+        Ok(BackendKind::Ferro) => {
+            let fls = physical_path(configured, BackendKind::Ferro);
+            let legacy_only = fls != configured
+                && !fls.exists()
+                && std::fs::metadata(configured).is_ok_and(|m| m.is_file());
+            if legacy_only {
+                configured.to_path_buf()
+            } else {
+                fls
+            }
+        }
+    }
+}
+
 /// Every project and virtual group, by slug. `stores` are the per-project store files the
 /// caller knows of beyond the config (the Hub passes the ones in its data directory), and `held`
 /// are the project rows of the stores the caller has open (the workspace store; the CLI adds
@@ -162,8 +210,10 @@ pub fn list_projects<R: AgentRegistry + ?Sized>(
             .and_then(|(_, p)| p.as_ref());
         let store = e
             .store
-            .clone()
-            .or_else(|| hint.map(|p| p.display().to_string()));
+            .as_deref()
+            .map(Path::new)
+            .or(hint.map(PathBuf::as_path))
+            .map(|p| effective_store_path(p).display().to_string());
         out.entry(slug.clone()).or_insert_with(|| {
             make(
                 &slug,
@@ -181,7 +231,8 @@ pub fn list_projects<R: AgentRegistry + ?Sized>(
                 ProjectKind::Project,
                 None,
                 None,
-                path.as_ref().map(|p| p.display().to_string()),
+                path.as_ref()
+                    .map(|p| effective_store_path(p).display().to_string()),
             )
         });
     }

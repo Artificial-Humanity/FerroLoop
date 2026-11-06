@@ -425,7 +425,14 @@ impl DirCheck<'_> {
                     .iter()
                     .filter_map(|p| p.store_path.as_deref().map(PathBuf::from)),
             )
-            .chain(self.ctx.stores.iter().filter_map(|(_, f)| f.clone()));
+            .chain(self.ctx.stores.iter().filter_map(|(_, f)| f.clone()))
+            // A store is deleted with its pair, so a directory holding either name of one
+            // holds the store.
+            .flat_map(|f| {
+                let mut forms = vec![f.clone()];
+                forms.extend(both_forms(&f));
+                forms
+            });
         for file in files {
             if resolve_loose(&file).starts_with(&canon) {
                 return Err(refuse(format!(
@@ -438,13 +445,25 @@ impl DirCheck<'_> {
     }
 }
 
-/// The store files to delete: the file as the project names it (and its `.fls` form), with the
-/// `.sock` and `.migrate.lock` siblings of an `.fls`. Only what exists.
+/// Both names of the store `path` names: the legacy `.redb` and the FerroStore `.fls`. A path
+/// with any other extension is one name (an unlisted `x.txt` has no pair).
+fn both_forms(path: &Path) -> Vec<PathBuf> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("redb" | FLS) => vec![path.with_extension("redb"), path.with_extension(FLS)],
+        _ => vec![path.to_path_buf()],
+    }
+}
+
+/// The store files to delete: the whole logical store, whichever name the project gives it. The
+/// file as given comes first, then the `.redb` and the `.fls` of the same stem (a migration
+/// leaves the `.redb` beside the `.fls`), with the `.sock` and `.migrate.lock` siblings of an
+/// `.fls`. Only what exists.
 fn store_files(store: &Path) -> Vec<PathBuf> {
     let mut main = vec![store.to_path_buf()];
-    let fls = store.with_extension(FLS);
-    if fls != store {
-        main.push(fls);
+    for form in both_forms(store) {
+        if !main.contains(&form) {
+            main.push(form);
+        }
     }
     let mut out = Vec::new();
     for file in main {
@@ -471,7 +490,7 @@ fn store_files(store: &Path) -> Vec<PathBuf> {
 /// (`.fls`, or the older `.redb`), the workspace store, another project's store, a link or a
 /// directory; and one that is neither in the stores' directory nor the store this project
 /// itself registers.
-fn check_store(
+pub(crate) fn check_store(
     slug: &str,
     store: &Path,
     entries: &[ConfigEntry],
@@ -500,12 +519,12 @@ fn check_store(
                 .filter(|p| p.slug == slug)
                 .filter_map(|p| p.store_path.as_deref().map(PathBuf::from)),
         )
-        .map(|p| resolve_loose(&p))
+        .flat_map(|p| both_forms(&resolve_loose(&p)))
         .collect();
     let store_dir = resolve_loose(&paths.store_dir);
     let files = store_files(store);
     let ws = resolve_loose(&paths.workspace_store);
-    let ws_main = [ws.clone(), ws.with_extension(FLS)];
+    let ws_main: Vec<PathBuf> = std::iter::once(ws.clone()).chain(both_forms(&ws)).collect();
     let others: Vec<PathBuf> = entries
         .iter()
         .filter(|e| e.slug().as_deref() != Some(slug))
@@ -516,7 +535,7 @@ fn check_store(
                 .filter(|p| p.slug != slug)
                 .filter_map(|p| p.store_path.as_deref().map(PathBuf::from)),
         )
-        .map(|p| resolve_loose(&p))
+        .flat_map(|p| both_forms(&resolve_loose(&p)))
         .collect();
     for file in &files {
         let meta = std::fs::symlink_metadata(file)
@@ -536,10 +555,7 @@ fn check_store(
             file.extension().and_then(|e| e.to_str()),
             Some(FLS | "redb")
         );
-        let own = real.starts_with(&store_dir)
-            || registered_here
-                .iter()
-                .any(|r| *r == real || r.with_extension(FLS) == real);
+        let own = real.starts_with(&store_dir) || registered_here.contains(&real);
         if is_store_file && !own {
             return Err(refuse(format!(
                 "`{}` is neither in the stores' directory `{}` nor the store this project \
