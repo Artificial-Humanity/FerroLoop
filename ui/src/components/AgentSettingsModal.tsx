@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
+import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { FALLBACK_PROJECTS, projectChoices } from "../hooks/useProjects";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
@@ -501,6 +502,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     useState<UnenforcedDefaultsMode>("refuse");
   const [agentPermissionSavedStatus, setAgentPermissionSavedStatus] =
     useState<string | null>(null);
+  const roleCatalog = useRoles(isOpen, apiClient);
+  const recastRoleOptions = roleOptions(RECAST_ROLE_OPTIONS, roleCatalog.roles);
   const [recastModalOpen, setRecastModalOpen] = useState(false);
   const [recastProject, setRecastProject] = useState(agentProject || "Workspace");
   const [recastRole, setRecastRole] = useState(
@@ -807,7 +810,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       setRecastConflict(null);
       setRecastModalOpen(false);
       setRecastStatusBanner(
-        `Re-cast ${displayTarget} to ${recastProject} as ${effectiveRole}.`,
+        `Re-cast ${displayTarget} to ${recastProject} as ${roleLabel(effectiveRole, roleCatalog.roles)}.${res?.guidance_requires_reforge ? " Run an explicit Reforge to apply current role guidance." : ""}`,
       );
       onAgentsUpdated?.();
     } catch (err) {
@@ -1153,7 +1156,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
                     Role
                   </div>
-                  <div className="fd-mono">{canonicalizeDefaultRole(agentRole)}</div>
+                  <div className="fd-mono">{roleLabel(canonicalizeDefaultRole(agentRole), roleCatalog.roles)}</div>
                 </div>
               )}
               <div>
@@ -2758,7 +2761,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             projectChoices(projects, recastProject);
           const hasRoleOption =
             recastRole === CREATE_CUSTOM_ROLE_VALUE ||
-            RECAST_ROLE_OPTIONS.some((opt) => opt.value === recastRole);
+            recastRoleOptions.some((opt) => opt.value === recastRole);
 
           return (
             <div
@@ -2886,19 +2889,21 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       }}
                     >
                       {!hasRoleOption && (
-                        <option value={recastRole}>{recastRole}</option>
+                        <option value={recastRole}>{roleLabel(recastRole, roleCatalog.roles)}</option>
                       )}
-                      {RECAST_ROLE_OPTIONS.map((opt) => (
+                      {recastRoleOptions.map((opt) => (
                         <option key={opt.value} value={opt.value}>
                           {opt.label}
                         </option>
                       ))}
                       <option value={CREATE_CUSTOM_ROLE_VALUE}>
-                        + Create custom role...
+                        + Create User Role...
                       </option>
                     </select>
                   </div>
 
+                  {roleCatalog.loading && <div role="status">Loading roles…</div>}
+                  {roleCatalog.error && <div role="status">Role catalog: {roleCatalog.error}. Existing roles remain available.</div>}
                   {recastRole === CREATE_CUSTOM_ROLE_VALUE && (
                     <div>
                       <label
@@ -2912,12 +2917,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           textTransform: "uppercase",
                         }}
                       >
-                        Custom Role Name
+                        User Role Name
                       </label>
                       <input
                         id={`recast-custom-role-input-${agentKey}`}
                         type="text"
-                        aria-label={`Custom role for ${displayTarget}`}
+                        aria-label={`User role for ${displayTarget}`}
                         data-testid={`recast-custom-role-input-${agentKey}`}
                         className="fd-input fd-mono"
                         placeholder="e.g. reviewer or custom:reviewer"

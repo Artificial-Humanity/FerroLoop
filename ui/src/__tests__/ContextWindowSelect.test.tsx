@@ -168,15 +168,18 @@ describe("Agent Settings context window selector: the control", () => {
   });
 
   it("sends exactly { context_window: 500000 } to the session's context-window URL", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(response()), { status: 200 }));
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify(String(input).endsWith("/roles") ? [] : response()), { status: 200 }),
+    );
     const apiClient = new HubApiClient({
       baseUrl: "http://127.0.0.1:8420",
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     render(<AgentSettingsModal {...modalProps(USAGE, { apiClient, sessionId: "sess/1 a" })} />);
     pick(500_000);
-    await waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const contextRequests = () => fetchImpl.mock.calls.filter(([url]) => String(url).endsWith("/context-window"));
+    await waitFor(() => expect(contextRequests()).toHaveLength(1));
+    const [url, init] = contextRequests()[0] as unknown as [string, RequestInit];
     expect(url).toBe("http://127.0.0.1:8420/api/v1/sessions/sess%2F1%20a/context-window");
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({ context_window: 500_000 });
