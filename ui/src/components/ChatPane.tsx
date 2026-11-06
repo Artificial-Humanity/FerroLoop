@@ -4,6 +4,7 @@ import {
   DEFAULT_SLASH_COMMANDS,
   type ClearSessionMode,
   type DecommissionMode,
+  type HubAuthority,
   type DecommissionSessionResponse,
   type InterruptSessionResponse,
   type PromptAttachment,
@@ -1042,6 +1043,8 @@ export interface ChatPaneProps {
   onCloseAgentSettings?: () => void;
   returnToSettingsLabel?: string | null;
   onReturnToSettings?: () => void;
+  /** Who is operating FerroDeck; passed on to the agent settings modal. */
+  authority?: HubAuthority | null;
   splitView?: boolean;
   onToggleSplitView?: () => void;
   onOpenMobileRoster?: () => void;
@@ -1178,6 +1181,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onCloseAgentSettings,
   returnToSettingsLabel = null,
   onReturnToSettings,
+  authority = null,
   splitView = false,
   onToggleSplitView,
   onOpenMobileRoster,
@@ -4480,6 +4484,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         onAgentsUpdated={onRefresh}
         returnToSettingsLabel={returnToSettingsLabel}
         onReturnToSettings={onReturnToSettings}
+        authority={authority}
       />
     </section>
   );

@@ -832,6 +832,41 @@ fn run_muse_exec(
     Ok(())
 }
 
+/// The first live tmux target of a Grok route: its pane id, else its `session:window` target.
+fn live_grok_target(tmux_target: Option<&str>, tmux_pane: Option<&str>) -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(p) = tmux_pane.map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(p.to_string());
+    }
+    if let Some(t) = tmux_target.map(str::trim).filter(|s| !s.is_empty())
+        && !candidates.iter().any(|c| c == t)
+    {
+        candidates.push(t.to_string());
+    }
+    candidates.into_iter().find(|c| tmux_target_alive(c))
+}
+
+/// Paste `text` into a Grok route's live tmux pane and press Enter, and nothing else.
+///
+/// Unlike [`dispatch_operator_prompt_to_route`], a route whose pane (and window) is not live
+/// is an error: there is no headless `grok -p` fallback, which would be a separate process that
+/// can spend a model turn while the live TUI stays unchanged. Use it for a slash command that
+/// only means something to the running TUI. Any route that is not a Grok route is an error.
+pub fn deliver_to_live_grok_pane(route: &VendorRoute, text: &str) -> Result<(), String> {
+    let VendorRoute::Grok {
+        tmux_target,
+        tmux_pane,
+        ..
+    } = route
+    else {
+        return Err("not a grok route".to_string());
+    };
+    match live_grok_target(tmux_target.as_deref(), tmux_pane.as_deref()) {
+        Some(target) => deliver_via_tmux_paste(&target, text),
+        None => Err("the grok route's tmux pane is not live".to_string()),
+    }
+}
+
 fn deliver_to_grok_route(
     session_id: &str,
     cwd: Option<&PathBuf>,
@@ -841,21 +876,8 @@ fn deliver_to_grok_route(
 ) -> Result<(), String> {
     let use_tmux = std::env::var_os("FL_WIRE_TMUX_BIN").is_some()
         || std::env::var_os("FL_WIRE_GROK_BIN").is_none();
-    if use_tmux {
-        let mut candidates = Vec::new();
-        if let Some(p) = tmux_pane.map(str::trim).filter(|s| !s.is_empty()) {
-            candidates.push(p.to_string());
-        }
-        if let Some(t) = tmux_target.map(str::trim).filter(|s| !s.is_empty())
-            && !candidates.iter().any(|c| c == t)
-        {
-            candidates.push(t.to_string());
-        }
-        for target in &candidates {
-            if tmux_target_alive(target) {
-                return deliver_via_tmux_paste(target, text);
-            }
-        }
+    if use_tmux && let Some(target) = live_grok_target(tmux_target, tmux_pane) {
+        return deliver_via_tmux_paste(&target, text);
     }
     // A live-window placeholder has no session file yet. Headless `grok -r` with an empty id
     // would create or resume the wrong session, so it runs only after tmux delivery did not.
@@ -2829,6 +2851,66 @@ mod tests {
         assert!(cmds.contains("list-panes -t =Kacey:=muse"), "{cmds}");
         assert!(fs::read_to_string(&tmux_stdin).unwrap().contains("hello"));
         assert!(!muse_marker.exists(), "muse exec ran");
+    }
+
+    fn grok_route_in_pane() -> VendorRoute {
+        VendorRoute::Grok {
+            session_id: "gk-live".into(),
+            cwd: None,
+            tmux_target: Some("grok:ada".into()),
+            tmux_pane: Some("%12".into()),
+        }
+    }
+
+    #[test]
+    fn a_live_grok_pane_gets_the_text_pasted() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _, stdin_out) = write_fake_tmux(tmp.path(), true);
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        deliver_to_live_grok_pane(&grok_route_in_pane(), "/context-window 500000").unwrap();
+        assert_eq!(
+            fs::read_to_string(stdin_out).unwrap().trim(),
+            "/context-window 500000"
+        );
+    }
+
+    #[test]
+    fn a_dead_grok_pane_is_an_error_and_never_runs_grok_headless() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, stdin_out) = write_fake_tmux(tmp.path(), false);
+        let marker = tmp.path().join("grok-ran");
+        let grok_bin = tmp.path().join("marker-grok.sh");
+        fs::write(
+            &grok_bin,
+            format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&grok_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let _grok = EnvGuard::set("FL_WIRE_GROK_BIN", &grok_bin);
+
+        let err =
+            deliver_to_live_grok_pane(&grok_route_in_pane(), "/context-window 500000").unwrap_err();
+        assert!(err.contains("not live"), "{err}");
+        assert!(!marker.exists(), "grok ran headless");
+        assert!(!stdin_out.exists(), "something was pasted");
+        assert!(
+            !fs::read_to_string(tmux_out)
+                .unwrap()
+                .contains("load-buffer")
+        );
+        // A route that is not Grok is refused without touching tmux.
+        let other = VendorRoute::Muse {
+            session_id: "m".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: Some("%1".into()),
+        };
+        assert!(deliver_to_live_grok_pane(&other, "x").is_err());
     }
 
     #[test]

@@ -357,6 +357,8 @@ export interface HubSettings {
   effective_artifacts_dir?: string;
   /** Per-project artifacts directory overrides keyed by lowercase project slug. */
   project_artifacts_dirs?: Record<string, string>;
+  /** Default context window in tokens per vendor (`{ "grok": 500000 }`). Type only: no UI sets it yet. */
+  context_window_defaults?: Record<string, number>;
 }
 
 export type HubSettingsPatch = Partial<HubSettings>;
@@ -694,6 +696,8 @@ export interface SpinUpSessionRequest {
   allocated_port?: number;
   allocated_vite_port?: number;
   permission_policy?: unknown;
+  /** Context window in tokens to store on the record. Type only: Spin-Up has no field for it yet. */
+  context_window?: number;
 }
 
 export interface SpinUpSessionResponse {
@@ -709,6 +713,7 @@ export interface SpinUpSessionResponse {
   tmux_target?: string | null;
   hydration_dispatched: boolean;
   prompt?: string | null;
+  context_window?: number;
 }
 
 export type DecommissionMode = "prepare" | "teardown";
@@ -748,6 +753,25 @@ export interface SetSessionModelResponse {
    * running Antigravity session keeps its model; nothing is sent to it.
    */
   cli_model?: string;
+}
+
+/**
+ * Answer to `POST /api/v1/sessions/:id/context-window`. It says what the hub did, not what the
+ * vendor did: the effective window is what the session reports in `context_usage`.
+ */
+export interface SetSessionContextWindowResponse {
+  ok: boolean;
+  session_id: string;
+  vendor: string;
+  /** The size that was stored or sent; `null` when the stored value was cleared. */
+  context_window: number | null;
+  /** True when the size was saved on the hosted record. */
+  persisted: boolean;
+  /**
+   * `operator-prompt`: the text `/context-window N` was pasted into the live terminal.
+   * `stored`: saved on the hosted record; the live session was not reached (terminal not open).
+   */
+  method: "operator-prompt" | "stored";
 }
 
 export type BulkSessionAction =
@@ -1738,6 +1762,8 @@ export interface WatchHostedSession {
   role: string;
   vendor: string;
   model?: string | null;
+  /** Context window in tokens stored on the hosted record; absent when none is stored. */
+  context_window?: number;
   node_id: string;
   status: string;
   restart_count: number;

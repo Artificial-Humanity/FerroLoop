@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
-import type { ProjectSummary, SessionQuotaUsage } from "../types/api";
+import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { FALLBACK_PROJECTS, projectChoices } from "../hooks/useProjects";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
 import {
@@ -19,6 +19,7 @@ import {
   formatTokenCount,
   getVendorModelOptions,
   resolveSessionVendor,
+  canonicalAdapter,
   isAntigravityAdapter,
   type EstimatedContextUsage,
 } from "./ChatPane";
@@ -378,6 +379,34 @@ export interface AgentSettingsModalProps {
   onReturnToSettings?: () => void;
   /** The shared project list for the Re-Cast project dropdown. Defaults to the built-in list. */
   projects?: readonly ProjectSummary[];
+  /**
+   * Who is operating FerroDeck. The context window can be chosen only by an owner, so the
+   * selector is absent unless `authority.tier` is `owner` (the hub refuses a peer anyway).
+   */
+  authority?: HubAuthority | null;
+}
+
+/** What the last context window request answered; shown in the status line or the alert. */
+type ContextWindowNotice =
+  | { kind: "ok"; requested: number; method: "operator-prompt" | "stored"; persisted: boolean }
+  | { kind: "error"; text: string }
+  | { kind: "timed-out" };
+
+/** An operator's pick, kept over the reported window until the hub reports a different one. */
+interface ContextWindowPick {
+  value: number;
+  /** The `max_tokens` the hub reported when the operator picked. */
+  reportedAtPick: number | null;
+}
+
+/** How long a prompt sent to the session may go without a changed `max_tokens` report. */
+const CONTEXT_WINDOW_PICK_TIMEOUT_MS = 25_000;
+const CONTEXT_WINDOW_STATUS_ID = "fd-agent-settings-context-window-status";
+const CONTEXT_WINDOW_ERROR_ID = "fd-agent-settings-context-window-error";
+
+function vendorDisplayName(vendor: string): string {
+  const name = canonicalAdapter(vendor);
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : "";
 }
 
 export type AgentSettingsTabId = "overview" | "permissions" | "runtime";
@@ -448,6 +477,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   returnToSettingsLabel = null,
   onReturnToSettings,
   projects = FALLBACK_PROJECTS,
+  authority = null,
 }) => {
   const { pinnedAgents } = usePinnedState();
   const [activeTab, setActiveTab] = useState<AgentSettingsTabId>(initialTab);
@@ -484,6 +514,58 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const [postureOverride, setPostureOverride] =
     useState<Partial<AgentMcpPostureInput> | null>(null);
   const [postureActionStatus, setPostureActionStatus] = useState<string | null>(null);
+  // Context window choice. `contextWindowPick` is the same idea as the model latch below: the
+  // operator's pick stays on screen (also while the request is in flight and when a stale
+  // `contextEstimate` arrives) until the hub reports a different `max_tokens`.
+  const [contextWindowPick, setContextWindowPick] = useState<ContextWindowPick | null>(null);
+  const [contextWindowSending, setContextWindowSending] = useState(false);
+  const [contextWindowNotice, setContextWindowNotice] =
+    useState<ContextWindowNotice | null>(null);
+  const contextWindowSelectRef = useRef<HTMLSelectElement | null>(null);
+  const contextWindowRequestRef = useRef(0);
+  const contextWindowRefocusRef = useRef(false);
+  const reportedMaxTokens = contextEstimate.maxTokens;
+
+  useEffect(() => {
+    // A new target or a reopen drops the pick; a request still in flight is ignored on return.
+    contextWindowRequestRef.current += 1;
+    setContextWindowPick(null);
+    setContextWindowSending(false);
+    setContextWindowNotice(null);
+  }, [isOpen, sessionId, agentName]);
+  useEffect(() => {
+    // The hub reported a different window: follow the server from here on.
+    setContextWindowPick((prev) =>
+      prev && reportedMaxTokens !== prev.reportedAtPick ? null : prev,
+    );
+    // A "still reports X" message is about the old window.
+    setContextWindowNotice((prev) => (prev?.kind === "timed-out" ? null : prev));
+  }, [reportedMaxTokens]);
+  const contextWindowAwaitingReport =
+    contextWindowPick !== null &&
+    contextWindowNotice?.kind === "ok" &&
+    contextWindowNotice.method === "operator-prompt";
+  useEffect(() => {
+    // Bound the wait: if Grok refuses silently or the paste is lost, `max_tokens` never changes.
+    if (!contextWindowAwaitingReport) return;
+    const timer = setTimeout(() => {
+      setContextWindowPick(null);
+      setContextWindowNotice({ kind: "timed-out" });
+    }, CONTEXT_WINDOW_PICK_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [contextWindowAwaitingReport, contextWindowPick]);
+  useEffect(() => {
+    // A disabled select loses focus; give it back once the call is over, unless the operator
+    // has moved to another field meanwhile.
+    if (!contextWindowSending && contextWindowRefocusRef.current) {
+      contextWindowRefocusRef.current = false;
+      const select = contextWindowSelectRef.current;
+      const active = document.activeElement;
+      if (select && (active === null || active === document.body || active === select)) {
+        select.focus();
+      }
+    }
+  }, [contextWindowSending]);
 
   useEffect(() => {
     setRecastProject(agentProject || "Workspace");
@@ -660,6 +742,40 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
     selectedThinkingLevel;
   const effectiveThinking = (effectiveThinkingLevel || "high").trim().toLowerCase();
+  const contextVendor = canonicalAdapter(knownAdapter);
+  const offeredContextWindows = contextEstimate.offeredWindows ?? [];
+  const contextWindowEditable =
+    contextVendor === "grok" &&
+    authority?.tier === "owner" &&
+    Boolean(sessionId) &&
+    offeredContextWindows.length >= 2;
+  // The pick stands while the hub still reports the window it reported at pick time.
+  const activeContextWindowPick =
+    contextWindowPick && reportedMaxTokens === contextWindowPick.reportedAtPick
+      ? contextWindowPick
+      : null;
+  const shownContextWindow = activeContextWindowPick?.value ?? reportedMaxTokens;
+  const contextWindowSizeText =
+    reportedMaxTokens === null
+      ? "not reported"
+      : formatContextMax(reportedMaxTokens, contextEstimate.source);
+  const contextWindowWaiting =
+    contextWindowNotice?.kind === "ok" &&
+    contextWindowNotice.method === "operator-prompt" &&
+    activeContextWindowPick !== null &&
+    activeContextWindowPick.value !== reportedMaxTokens;
+  const contextWindowStatusText =
+    contextWindowNotice?.kind === "timed-out"
+      ? reportedMaxTokens === null
+        ? "The session has not reported a window. The change may not have been applied."
+        : `The session still reports ${contextWindowSizeText}. The change may not have been applied.`
+      : contextWindowNotice?.kind !== "ok"
+      ? ""
+      : contextWindowNotice.method === "stored"
+        ? "Saved for this agent. It is not applied to the running session (its terminal is not open)."
+        : `Requested ${formatTokenCount(contextWindowNotice.requested)}. Sent to the session; it reports the window it actually uses.${
+            contextWindowNotice.persisted ? "" : " Not saved: it will not survive a restart."
+          }`;
 
   const handleRecastSubmit = async (confirmOverrides = false) => {
     if (recasting || !agentKey) return;
@@ -708,6 +824,40 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       }
     } finally {
       setRecasting(false);
+    }
+  };
+  const handleContextWindowChange = async (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const next = Number(event.target.value);
+    if (!sessionId || contextWindowSending || !Number.isInteger(next) || next <= 0) return;
+    const token = ++contextWindowRequestRef.current;
+    setContextWindowPick({ value: next, reportedAtPick: reportedMaxTokens });
+    setContextWindowNotice(null);
+    setContextWindowSending(true);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const res = await client.setSessionContextWindow(sessionId, next);
+      if (token !== contextWindowRequestRef.current) return;
+      // A stored window is not applied to the running session: show what it really uses.
+      if (res.method === "stored") setContextWindowPick(null);
+      setContextWindowNotice({
+        kind: "ok",
+        requested: next,
+        method: res.method,
+        persisted: res.persisted,
+      });
+    } catch (err) {
+      if (token !== contextWindowRequestRef.current) return;
+      // Roll back to what the session reports.
+      setContextWindowPick(null);
+      setContextWindowNotice({
+        kind: "error",
+        text: err instanceof Error && err.message ? err.message : "Could not set the context window",
+      });
+    } finally {
+      if (token === contextWindowRequestRef.current) {
+        contextWindowRefocusRef.current = true;
+        setContextWindowSending(false);
+      }
     }
   };
   const thinkingOptions: ReadonlyArray<{ value: string; label: string }> =
@@ -1172,6 +1322,129 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div
+                data-testid="context-window-row"
+                style={{ minWidth: 0 }}
+              >
+                {contextWindowEditable ? (
+                  <>
+                    <label
+                      htmlFor="fd-agent-settings-context-window"
+                      style={{
+                        display: "block",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "4px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      Context window
+                    </label>
+                    <select
+                      id="fd-agent-settings-context-window"
+                      ref={contextWindowSelectRef}
+                      data-testid="context-window-select"
+                      className="fd-select fd-mono"
+                      disabled={contextWindowSending}
+                      aria-busy={contextWindowSending}
+                      aria-describedby={
+                        contextWindowNotice?.kind === "error"
+                          ? `${CONTEXT_WINDOW_STATUS_ID} ${CONTEXT_WINDOW_ERROR_ID}`
+                          : CONTEXT_WINDOW_STATUS_ID
+                      }
+                      value={
+                        shownContextWindow !== null &&
+                        offeredContextWindows.includes(shownContextWindow)
+                          ? String(shownContextWindow)
+                          : ""
+                      }
+                      onChange={(e) => void handleContextWindowChange(e)}
+                      style={{
+                        width: "100%",
+                        minWidth: 0,
+                        maxWidth: "100%",
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      {(shownContextWindow === null ||
+                        !offeredContextWindows.includes(shownContextWindow)) && (
+                        <option value="" disabled>
+                          Choose a size
+                        </option>
+                      )}
+                      {offeredContextWindows.map((size) => (
+                        <option key={size} value={String(size)}>
+                          {formatTokenCount(size)}
+                        </option>
+                      ))}
+                    </select>
+                    <div
+                      className="fd-mono"
+                      style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}
+                    >
+                      Effective:{" "}
+                      <span
+                        data-testid="context-window-effective"
+                        data-source={contextEstimate.source ?? "unknown"}
+                        title={contextWindowSourceTitle(contextEstimate.source)}
+                        style={
+                          contextEstimate.source === "assumed"
+                            ? { fontStyle: "italic", cursor: "help" }
+                            : undefined
+                        }
+                      >
+                        {contextWindowSizeText}
+                      </span>
+                      {contextWindowWaiting && (
+                        <span data-testid="context-window-waiting">
+                          {" "}
+                          (waiting for the session to report it)
+                        </span>
+                      )}
+                    </div>
+                    <div
+                      id={CONTEXT_WINDOW_STATUS_ID}
+                      role="status"
+                      data-testid="context-window-status"
+                      style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}
+                    >
+                      {contextWindowStatusText}
+                    </div>
+                    {contextWindowNotice?.kind === "error" && (
+                      <div
+                        id={CONTEXT_WINDOW_ERROR_ID}
+                        role="alert"
+                        data-testid="context-window-error"
+                        style={{
+                          fontSize: "11px",
+                          color: "var(--status-danger)",
+                          marginTop: "4px",
+                        }}
+                      >
+                        {contextWindowNotice.text}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div
+                    data-testid="context-window-readonly"
+                    className="fd-mono"
+                    style={{ fontSize: "12px", color: "var(--text-muted)" }}
+                  >
+                    {contextVendor === "grok"
+                      ? offeredContextWindows.length >= 2
+                        ? authority?.tier !== "owner"
+                          ? `Context window: ${contextWindowSizeText}. Only an owner can change it.`
+                          : `Context window: ${contextWindowSizeText}.`
+                        : `Context window: ${contextWindowSizeText} (no other sizes offered)`
+                      : contextVendor
+                        ? `Context window: ${contextWindowSizeText}. ${vendorDisplayName(contextVendor)}'s window cannot be selected from FerroDeck.`
+                        : `Context window: ${contextWindowSizeText}. This session's window cannot be selected from FerroDeck.`}
+                  </div>
+                )}
               </div>
             </div>
 

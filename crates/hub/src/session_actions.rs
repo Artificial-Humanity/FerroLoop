@@ -18,6 +18,10 @@ pub const METHOD_NOOP_TEST: &str = "noop-test";
 pub const METHOD_OPERATOR_PROMPT: &str = "operator-prompt";
 /// `method` reported when the model was recorded but nothing reached a CLI.
 pub const METHOD_OVERRIDE_ONLY: &str = "override-only";
+/// `method` reported when a context window was saved on the session's hosted record and nothing
+/// was sent to the running CLI. Applying a stored window at launch is separate work, so this
+/// value says "saved", not "will apply".
+pub const METHOD_STORED: &str = "stored";
 
 /// A live (model, thinking level) pair as discovery reported it for a session.
 type LivePair = (Option<String>, Option<String>);
@@ -88,6 +92,19 @@ pub fn validate_model(raw: &str) -> Result<String, String> {
         return Err("model must be a single line with no control characters".to_string());
     }
     Ok(model.to_string())
+}
+
+/// The text pasted into a live CLI to switch its model: `/model <id>`. `model` has been through
+/// [`validate_model`], so it is one line; a bracket tag such as `opus[1m]` is part of the id and
+/// is sent as is.
+pub fn model_command(model: &str) -> String {
+    format!("/model {model}")
+}
+
+/// The text pasted into a live Grok CLI to set its context window for the session:
+/// `/context-window <tokens>`. Grok accepts the raw token count as well as the short label.
+pub fn context_window_command(tokens: u64) -> String {
+    format!("/context-window {tokens}")
 }
 
 /// `low`, `medium` or `high` in any case, normalized to lowercase.
@@ -263,6 +280,26 @@ mod tests {
         }
         assert!(validate_model(&"m".repeat(MAX_MODEL_CHARS)).is_ok());
         assert!(validate_model(&"m".repeat(MAX_MODEL_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn a_bracket_model_id_is_valid_and_forms_the_model_command() {
+        for id in ["opus[1m]", "sonnet[1m]", "opus[200k]"] {
+            let model = validate_model(&format!("  {id} ")).unwrap();
+            assert_eq!(model, id);
+            assert_eq!(model_command(&model), format!("/model {id}"));
+        }
+        assert_eq!(model_command("gpt-6-sol"), "/model gpt-6-sol");
+    }
+
+    #[test]
+    fn the_context_window_command_carries_the_raw_token_count() {
+        assert_eq!(context_window_command(500_000), "/context-window 500000");
+        assert_eq!(context_window_command(1), "/context-window 1");
+        assert_eq!(
+            context_window_command(u64::MAX),
+            format!("/context-window {}", u64::MAX)
+        );
     }
 
     #[test]
