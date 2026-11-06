@@ -168,14 +168,14 @@ describe("ChatPane", () => {
         fireEvent.change(screen.getByLabelText("Message"), { target: { value: "first input" } });
         fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
       }
-      const previousStatus = previousStage === "unconfirmed" ? /Delivery unconfirmed/ : /Accepted by the active Codex turn/;
+      const previousStatus = previousStage === "unconfirmed" ? /Delivery unconfirmed/ : /Codex app server accepted the submission/;
       expect(await screen.findByText(previousStatus)).toBeInTheDocument();
       expect(screen.getByLabelText("Message")).toHaveValue("");
       fireEvent.change(screen.getByLabelText("Message"), { target: { value: "second input" } });
       if (queued) fireEvent.click(screen.getByTestId("queued-send-now-second"));
       else fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
       expect(await screen.findByRole("alert")).toHaveTextContent("second input refused");
-      expect(screen.queryByText(/Accepted by the active Codex turn/)).toBeNull();
+      expect(screen.queryByText(/Codex app server accepted the submission/)).toBeNull();
       expect(screen.getByLabelText("Message")).toHaveValue("second input");
       expect(window.localStorage.getItem(`ferrodeck.draft.${target}`)).toBe("second input");
       if (previousStage === "unconfirmed") {
@@ -188,7 +188,7 @@ describe("ChatPane", () => {
       expect(sends).toBe(2);
       view.unmount();
       const remounted = render(pane);
-      expect(screen.queryByText(/Accepted by the active Codex turn/)).toBeNull();
+      expect(screen.queryByText(/Codex app server accepted the submission/)).toBeNull();
       expect(screen.getByLabelText("Message")).toHaveValue("second input");
       if (previousStage === "unconfirmed") {
         expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument();
@@ -199,8 +199,48 @@ describe("ChatPane", () => {
   });
 
   it.each([
-    ["vendor_queued", "Queued in Codex"],
-    ["app_server_accepted", "Accepted by the active Codex turn"],
+    ["vendor_queued", "Submitted to Codex queue.", false],
+    ["vendor_queued", "Submitted to Codex queue.", true],
+    ["app_server_accepted", "Codex app server accepted the submission for the targeted turn. This receipt does not confirm model consumption.", false],
+    ["app_server_accepted", "Codex app server accepted the submission for the targeted turn. This receipt does not confirm model consumption.", true],
+  ] as const)("keeps a historical %s receipt after later transcript output (%s, queued=%s)", async (delivery_stage, status, queued) => {
+    const target = `historical-${delivery_stage}-${queued}`;
+    const onSendPrompt = vi.fn().mockResolvedValue({
+      session_id: target, queued: false, delivered: true, delivery_stage,
+    });
+    const onSendQueuedNow = vi.fn().mockResolvedValue({
+      session_id: target, queued: false, delivered: true, delivery_stage,
+    });
+    const pane = (turns: TranscriptTurn[]) => <ChatPane agentName="ferris" adapter="codex" sessionId={target}
+      turns={turns} onSendPrompt={onSendPrompt} onSendQueuedNow={onSendQueuedNow}
+      queue={queued && turns.length === 0 ? [{ id: "historical-prompt", session_id: target,
+        prompt: "Check messaging progress.", by: "operator", created_at: "2026-11-06T14:01:21Z" }] : []} />;
+    const view = render(pane([]));
+    if (queued) fireEvent.click(screen.getByTestId("queued-send-now-historical-prompt"));
+    else {
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Check messaging progress." } });
+      fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    }
+    await waitFor(() => expect(sessionDeliveryReceipts.has(target)).toBe(true));
+    const laterTurns: TranscriptTurn[] = [
+      { index: 1355, role: "user", content: "Check messaging progress.", thinking: null, tool_calls: [], created_at: "2026-11-06T14:01:21Z" },
+      { index: 1358, role: "assistant", content: "Here is the progress report.", thinking: null, tool_calls: [], created_at: "2026-11-06T14:01:46Z" },
+    ];
+    view.rerender(pane(laterTurns));
+    expect(screen.getByText("Here is the progress report.")).toBeInTheDocument();
+    expect(screen.getByText(status)).toBeInTheDocument();
+    expect(screen.queryByText(/Waiting for Codex to consume it|Accepted by the active Codex turn|Model consumption is not confirmed/)).toBeNull();
+    expect(screen.getByLabelText("Message")).toHaveValue("");
+    view.unmount();
+    render(pane(laterTurns));
+    expect(screen.getByText(status)).toBeInTheDocument();
+    expect(screen.queryByText(/Waiting for Codex to consume it|Accepted by the active Codex turn|Model consumption is not confirmed/)).toBeNull();
+    expect(queued ? onSendQueuedNow : onSendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["vendor_queued", "Submitted to Codex queue"],
+    ["app_server_accepted", "Codex app server accepted the submission"],
     ["unconfirmed", "Delivery unconfirmed"],
   ])("keeps the submitted draft cleared for explicit %s outcomes", async (delivery_stage, status) => {
     const onSendPrompt = vi.fn().mockResolvedValue({
@@ -218,8 +258,8 @@ describe("ChatPane", () => {
   });
 
   it.each([
-    ["vendor_queued", "Queued in Codex"],
-    ["app_server_accepted", "Accepted by the active Codex turn"],
+    ["vendor_queued", "Submitted to Codex queue"],
+    ["app_server_accepted", "Codex app server accepted the submission"],
     ["unconfirmed", "Delivery unconfirmed"],
   ])("retains deferred %s receipts for their submitted target across switches and remounts", async (delivery_stage, status) => {
     for (const queued of [false, true]) {
@@ -310,7 +350,7 @@ describe("ChatPane", () => {
       queue={[{ id: "fixture-queue", session_id: "codex-queued", prompt: "queued fixture", by: "ferris", created_at: "2026-11-06T00:00:00Z" }]}
       onSendQueuedNow={onSendQueuedNow} />);
     fireEvent.click(screen.getByTestId("queued-send-now-fixture-queue"));
-    const expected = delivery_stage === "vendor_queued" ? /Queued in Codex/ : delivery_stage === "app_server_accepted" ? /Accepted by the active Codex turn/ : /Delivery unconfirmed/;
+    const expected = delivery_stage === "vendor_queued" ? /Submitted to Codex queue/ : delivery_stage === "app_server_accepted" ? /Codex app server accepted the submission/ : /Delivery unconfirmed/;
     await waitFor(() => expect(screen.getByText(expected)).toBeInTheDocument());
     expect(onSendQueuedNow).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(/delivery could not be confirmed/i)).toBeNull();

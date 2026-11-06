@@ -890,10 +890,11 @@ export function codexSendNowReceipt(sessionId: string, response?: PromptResponse
   return { ...response, session_id: sessionId, delivered: false, delivery_stage: "unconfirmed" };
 }
 
+/** Historical submission evidence, not the current queue or model-consumption state. */
 export function promptDeliveryStatus(response?: PromptResponse): string | null {
   switch (response?.delivery_stage) {
-    case "vendor_queued": return "Queued in Codex. Waiting for Codex to consume it.";
-    case "app_server_accepted": return "Accepted by the active Codex turn. Model consumption is not confirmed.";
+    case "vendor_queued": return "Submitted to Codex queue.";
+    case "app_server_accepted": return "Codex app server accepted the submission for the targeted turn. This receipt does not confirm model consumption.";
     case "unconfirmed": return "Delivery unconfirmed. Check the session before resending; no automatic retry was made.";
     default: return null;
   }
