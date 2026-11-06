@@ -11,7 +11,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fl_host_proto::{HostError, windows_command_line, windows_environment_block};
 use windows_sys::Win32::Foundation::{
@@ -231,16 +231,6 @@ pub fn stable_job_quiescent(job: &OwnedHandle) -> bool {
         std::thread::sleep(Duration::from_millis(20));
         active_processes(job) == Some(0)
     }
-}
-
-pub fn wait_job_quiescent(job: &OwnedHandle, deadline: Instant) -> bool {
-    while Instant::now() < deadline {
-        if stable_job_quiescent(job) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    stable_job_quiescent(job)
 }
 
 fn active_processes(job: &OwnedHandle) -> Option<u32> {

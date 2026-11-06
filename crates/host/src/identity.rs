@@ -11,8 +11,9 @@
 //! after daemon SIGKILL. This module does not claim macOS adoption.
 
 use std::cell::Cell;
-use std::io;
 #[cfg(unix)]
+use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ pub fn set_pidfd_kill_unavailable(unavailable: bool) {
 
 use fl_host_proto::HostError;
 
+#[cfg(target_os = "linux")]
 use crate::limits::TERM_GRACE;
 use crate::refusal::ContainmentRefusal;
 
@@ -99,6 +101,7 @@ pub fn check_pidfd_support() -> Result<(), ContainmentRefusal> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn probe_forced_unavailable() -> bool {
     PROBE_UNAVAILABLE.with(|cell| cell.get())
         || std::env::var_os("FL_HOST_ASSUME_NO_PIDFD").is_some_and(|value| value == "1")

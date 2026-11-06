@@ -13,6 +13,7 @@ mod identity;
 mod input;
 mod limits;
 mod output;
+#[cfg(unix)]
 mod protocol;
 mod refusal;
 mod session;
@@ -101,7 +102,9 @@ pub(crate) struct HostInner {
     pub(crate) outputs: Mutex<HashMap<String, Arc<output::OutputSession>>>,
     pub(crate) next_conn: AtomicU64,
     shutdown_started: AtomicBool,
+    #[cfg(unix)]
     supervisor_bin: PathBuf,
+    #[cfg(unix)]
     fail_handshake_after_publish: bool,
     crash: Mutex<Option<CrashPoint>>,
 }
@@ -331,7 +334,9 @@ impl Host {
                 outputs: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 shutdown_started: AtomicBool::new(false),
+                #[cfg(unix)]
                 supervisor_bin: opts.supervisor_bin,
+                #[cfg(unix)]
                 fail_handshake_after_publish: opts.fail_handshake_after_publish,
                 crash: Mutex::new(opts.crash_at),
             }),

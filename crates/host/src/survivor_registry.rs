@@ -9,9 +9,13 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use fl_host_proto::{HostEndpoint, HostError, private_parent_ok};
+#[cfg(unix)]
+use fl_host_proto::private_parent_ok;
+use fl_host_proto::{HostEndpoint, HostError};
 use serde::{Deserialize, Serialize};
 
 use crate::refusal::ContainmentRefusal;
@@ -418,7 +422,6 @@ fn temp_name() -> Result<std::ffi::CString, HostError> {
 
 #[cfg(windows)]
 fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Result<(), HostError> {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, IntoRawHandle};
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
@@ -1113,7 +1116,7 @@ mod tests {
             leader_code: None,
             leader_signal: None,
         };
-        write_registry_fixture(&endpoint, 1, &[record.clone()]).expect("write");
+        write_registry_fixture(&endpoint, 1, std::slice::from_ref(&record)).expect("write");
         let loaded = load_registry(&endpoint).expect("load");
         assert_eq!(loaded.high_water, 1);
         assert_eq!(loaded.sessions, vec![record]);

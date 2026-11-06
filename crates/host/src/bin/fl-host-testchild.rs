@@ -282,9 +282,10 @@ fn grandchild(detach: bool) {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::zombie_processes)] // The fixture deliberately leaves a live descendant for containment.
 fn grandchild(detach: bool) {
     let _ = detach;
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap_or_default())
+    let child = std::process::Command::new(std::env::current_exe().unwrap_or_default())
         .arg("survive-eof")
         .spawn()
         .expect("grandchild");
@@ -322,8 +323,9 @@ fn orphan() {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::zombie_processes)] // The fixture deliberately orphans a live descendant.
 fn orphan() {
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap_or_default())
+    let child = std::process::Command::new(std::env::current_exe().unwrap_or_default())
         .arg("survive-eof")
         .spawn()
         .expect("grandchild");

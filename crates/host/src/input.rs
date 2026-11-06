@@ -832,7 +832,7 @@ enum WriteStep {
 fn write_some(file: &mut File, buf: &[u8], deadline: Instant) -> WriteStep {
     #[cfg(windows)]
     {
-        return write_some_windows(file, buf, deadline);
+        write_some_windows(file, buf, deadline)
     }
     #[cfg(not(windows))]
     {
@@ -915,8 +915,10 @@ fn write_some_windows(file: &mut File, buf: &[u8], deadline: Instant) -> WriteSt
         }
     }
     let _event = CloseEvent(event);
-    let mut overlapped = OVERLAPPED::default();
-    overlapped.hEvent = event;
+    let mut overlapped = OVERLAPPED {
+        hEvent: event,
+        ..Default::default()
+    };
     let mut written = 0u32;
     let to_write = u32::try_from(buf.len()).unwrap_or(u32::MAX);
     // SAFETY: `handle` is the session stdin write end, opened overlapped. `buf` stays

@@ -176,6 +176,7 @@ impl Session {
         }
     }
 
+    #[cfg(unix)]
     pub fn note_descendant(&self, exit: DescendantExit) {
         self.descendants
             .lock()

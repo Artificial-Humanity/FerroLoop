@@ -1,23 +1,34 @@
 //! Pipe-child containment. Readiness is a pipe message. Sleeps are not a barrier.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use fl_host::check_pidfd_support;
 use fl_host::{
-    CLEANUP_DEADLINE, CleanupReport, ContainmentRefusal, CrashPoint, Host, LeaderAnchor,
-    OpenOptions, ProcessIdentity, STARTUP_CLEANUP_DEADLINE, SessionHandle, SessionPhase,
-    SurvivorRecord, check_pidfd_support, process_identity, read_registry, refusal,
+    CLEANUP_DEADLINE, CleanupReport, ContainmentRefusal, Host, OpenOptions, ProcessIdentity,
+    SessionHandle, SessionPhase, process_identity, read_registry,
+};
+#[cfg(unix)]
+use fl_host::{
+    CrashPoint, LeaderAnchor, STARTUP_CLEANUP_DEADLINE, SurvivorRecord, refusal,
     signal_anchored_group, write_raw_state, write_registry_fixture,
 };
+#[cfg(target_os = "linux")]
+use fl_host_proto::BlockingHostClient;
 use fl_host_proto::{
-    BlockingHostClient, ChildState, HostConfig, HostEndpoint, SessionEpoch, SessionId, SpawnKind,
-    SpawnSpec,
+    ChildState, HostConfig, HostEndpoint, SessionEpoch, SessionId, SpawnKind, SpawnSpec,
 };
 
 fn child_bin() -> String {
@@ -73,6 +84,7 @@ fn spec(session: &str, args: &[&str]) -> SpawnSpec {
     }
 }
 
+#[cfg(unix)]
 fn read_until(mut file: impl Read + Send + 'static, needle: &str, timeout: Duration) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
     let needle = needle.to_owned();
@@ -150,6 +162,7 @@ fn wait_gone(pid: u32, start: u64, timeout: Duration) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn kill_if_same(pid: u32, start: u64) {
     if same_process(pid, start) {
         let _ = Command::new("kill")
@@ -158,12 +171,14 @@ fn kill_if_same(pid: u32, start: u64) {
     }
 }
 
+#[cfg(unix)]
 struct Tracked {
     pid: u32,
     start: u64,
     reaper: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl Tracked {
     fn spawn(mode: &str) -> (Self, String) {
         let mut cmd = Command::new(child_bin());
@@ -210,6 +225,7 @@ impl Tracked {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Tracked {
     fn drop(&mut self) {
         kill_if_same(self.pid, self.start);
@@ -219,6 +235,7 @@ impl Drop for Tracked {
     }
 }
 
+#[cfg(unix)]
 fn survivor(session: &str, epoch: u64, pid: u32, start: u64) -> SurvivorRecord {
     SurvivorRecord {
         session: session.to_owned(),
@@ -241,7 +258,9 @@ struct Spawned {
     epoch: u64,
     vendor_pid: u32,
     vendor_start: u64,
+    #[cfg(unix)]
     supervisor_pid: u32,
+    #[cfg(unix)]
     supervisor_start: u64,
     #[allow(dead_code)]
     pgid: u32,
@@ -307,16 +326,25 @@ impl Worker {
         let mut fields = line.split_whitespace();
         fields.next();
         let _session = fields.next().expect("session");
+        let epoch = fields.next().expect("epoch").parse().expect("epoch");
+        let vendor_pid = fields.next().expect("vendor").parse().expect("pid");
+        let vendor_start = fields.next().expect("start").parse().expect("start");
+        let supervisor_pid: u32 = fields.next().expect("supervisor").parse().expect("pid");
+        let supervisor_start: u64 = fields
+            .next()
+            .expect("supervisor start")
+            .parse()
+            .expect("start");
+        #[cfg(not(unix))]
+        let _ = (supervisor_pid, supervisor_start);
         Spawned {
-            epoch: fields.next().expect("epoch").parse().expect("epoch"),
-            vendor_pid: fields.next().expect("vendor").parse().expect("pid"),
-            vendor_start: fields.next().expect("start").parse().expect("start"),
-            supervisor_pid: fields.next().expect("supervisor").parse().expect("pid"),
-            supervisor_start: fields
-                .next()
-                .expect("supervisor start")
-                .parse()
-                .expect("start"),
+            epoch,
+            vendor_pid,
+            vendor_start,
+            #[cfg(unix)]
+            supervisor_pid,
+            #[cfg(unix)]
+            supervisor_start,
             pgid: fields.next().expect("pgid").parse().expect("pgid"),
         }
     }
@@ -1122,6 +1150,7 @@ fn restart_cleanup_isolates_sibling_sessions() {
     assert!(!beta.alive());
 }
 
+#[cfg(unix)]
 fn wait_path(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
@@ -1195,6 +1224,7 @@ fn spawn_record_publication_survives_crash() {
     assert!(canary.alive());
 }
 
+#[cfg(unix)]
 fn plant_temp(dir: &Path, record: &SurvivorRecord) {
     let body = serde_json::json!({
         "magic": 0x464C_4831u32,
@@ -1209,6 +1239,7 @@ fn plant_temp(dir: &Path, record: &SurvivorRecord) {
     .expect("plant");
 }
 
+#[cfg(unix)]
 fn publication_temp(dir: &Path) -> bool {
     std::fs::read_dir(dir).expect("dir").flatten().any(|entry| {
         let name = entry.file_name();
@@ -1217,6 +1248,7 @@ fn publication_temp(dir: &Path) -> bool {
     })
 }
 
+#[cfg(unix)]
 fn crash_spawn(endpoint: &HostEndpoint, point: &str) {
     let mut worker = Worker::start(
         endpoint,
