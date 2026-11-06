@@ -7987,6 +7987,121 @@ mod tests {
     }
 
     #[test]
+    fn codex_send_now_holds_pinned_queued_intent_when_route_disappears() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect());
+        for target in ["thread-fixture", "freya"] {
+            let tmp = TempDir::new().unwrap();
+            let state = test_hub_state(&tmp);
+            let bin = tmp.path().join("fake-codex");
+            let log = tmp.path().join("codex.log");
+            fs::write(
+                &bin,
+                format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let socket = tmp.path().join("control.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            unsafe {
+                std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+                std::env::set_var("FL_WIRE_CODEX_CONTROL_SOCK", &socket);
+            }
+            let route = fl_wire::identity::VendorRoute::Codex {
+                thread_id: "thread-fixture".into(),
+                cwd: Some(tmp.path().into()),
+            };
+            install_route(tmp.path(), "freya", route.clone());
+            let (item, _) = state.enqueue_session_prompt(
+                target,
+                Some("freya".into()),
+                "held original".into(),
+                "held original".into(),
+                "owner".into(),
+                vec![],
+            );
+            assert_eq!(
+                item.intended_codex_thread_id.as_deref(),
+                Some("thread-fixture")
+            );
+            fs::remove_file(tmp.path().join(".cache/agent-bus/routes.json")).unwrap();
+            let response = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{target}/queue/{}/send-now", item.id),
+                OWNER,
+                &json!({}),
+            )
+            .json_value()
+            .unwrap();
+            assert_eq!(response["delivery_stage"], "refused", "{response}");
+            assert_eq!(response["failure_stage"], "Route");
+            assert_eq!(response["delivered"], false);
+            assert_eq!(response["queue"][0]["delivery_state"], "refused");
+
+            // A restored route with a reliable idle transcript must not reinterpret Send now.
+            install_route(tmp.path(), "freya", route);
+            let sessions = tmp.path().join(".codex/sessions/2026/11/06");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(
+                sessions.join("rollout-2026-11-06T01-02-03-thread-fixture.jsonl"),
+                [
+                    json!({"type":"session_meta","payload":{"id":"thread-fixture","cwd":tmp.path()}}),
+                    json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Completed."}]}}),
+                ]
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            )
+            .unwrap();
+            {
+                let store = state.open_store().unwrap();
+                assert!(!state.is_session_busy(&store, "thread-fixture"));
+            }
+            crate::api::drain_ready_session_queues(&state);
+            let held = state.session_queue(target);
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].delivery_state, QueuedDeliveryState::Refused);
+            assert!(
+                !log.exists(),
+                "background drain queued the held prompt in Codex"
+            );
+            assert!(
+                listener.accept().is_err(),
+                "held prompt reached Codex control"
+            );
+            let cancelled = call(
+                &state,
+                "DELETE",
+                &format!("/api/v1/sessions/{target}/queue/{}", item.id),
+                OWNER,
+                &json!({}),
+            );
+            assert_eq!(cancelled.status, 200);
+            assert!(state.session_queue(target).is_empty());
+        }
+    }
+
+    #[test]
     fn codex_send_now_direct_and_queued_report_ack_idle_and_unknown_without_retry() {
         use std::os::unix::fs::PermissionsExt;
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

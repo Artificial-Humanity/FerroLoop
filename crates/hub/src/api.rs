@@ -5404,7 +5404,18 @@ fn dispatch_operator_prompt_with_intent_for_session(
         },
     )
     .ok_or_else(|| {
-        OperatorPromptError::Push(PushError::NotConnected(no_route_error(persona, session_id)))
+        let message = no_route_error(persona, session_id);
+        if intent == OperatorPromptIntent::OwnerSendNow && intended_codex_thread_id.is_some() {
+            // Route loss cannot prove the pinned thread idle. Preserve explicit intent so
+            // a queued Send now stays held instead of later falling back to ordinary input.
+            OperatorPromptError::Steer(CodexSteerError::Refused {
+                stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                reason: fl_wire::dispatcher::CodexSteerRefusalReason::InvalidResponse,
+                message,
+            })
+        } else {
+            OperatorPromptError::Push(PushError::NotConnected(message))
+        }
     })?;
     #[cfg(test)]
     AFTER_PROMPT_DISPATCH.with(|hook| {
