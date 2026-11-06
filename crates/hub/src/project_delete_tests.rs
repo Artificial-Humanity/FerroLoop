@@ -911,6 +911,375 @@ fn delete_store_knows_another_projects_store_from_the_data_directory_hints() {
     assert!(ghost.is_file());
 }
 
+// --- the store the list reports is the file that is deleted ------------------------------------
+
+fn store_req() -> DeleteRequest {
+    DeleteRequest {
+        delete_store: true,
+        ..DeleteRequest::default()
+    }
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+impl Fx {
+    /// Points `slug`'s config block at `<slug>.redb` (the legacy alias of its `.fls`).
+    fn alias_to_redb(&self, slug: &str) -> PathBuf {
+        let redb = self.paths.store_dir.join(format!("{slug}.redb"));
+        let text = self.config().replacen(
+            &self.store_file(slug).display().to_string(),
+            &redb.display().to_string(),
+            1,
+        );
+        fs::write(&self.paths.config_path, text).unwrap();
+        redb
+    }
+
+    fn make_redb(&self, redb: &Path) {
+        drop(fl_store::open_redb(redb).unwrap());
+        assert!(redb.is_file());
+    }
+
+    fn listed_store(&self, slug: &str) -> Option<String> {
+        self.list()
+            .into_iter()
+            .find(|p| p.slug == slug)
+            .and_then(|p| p.store_path)
+    }
+}
+
+/// `alpha` (and a `beta` and an unrelated `other.fls` beside it), with the store in the `.fls`
+/// form the list reports, and the `.sock` and `.migrate.lock` beside it. `configured_redb`: the
+/// config names the legacy `.redb` alias; `with_redb`: a `.redb` is left beside the `.fls`.
+/// Deletes the store and returns what went from the stores' directory.
+fn delete_alpha_store(configured_redb: bool, with_redb: bool) -> Vec<String> {
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.project("beta");
+    let fls = fx.store_file("alpha");
+    let redb = fx.paths.store_dir.join("alpha.redb");
+    if configured_redb {
+        fx.alias_to_redb("alpha");
+    }
+    if with_redb {
+        fx.make_redb(&redb);
+    }
+    fs::write(fl_store::default_socket_path_for_store(&fls), "").unwrap();
+    fs::write(fl_store::MigrationLock::path_for(&fls), "").unwrap();
+    fs::write(fx.paths.store_dir.join("other.fls"), "x").unwrap();
+    assert_eq!(
+        fx.listed_store("alpha"),
+        Some(fls.display().to_string()),
+        "the list reports the physical file"
+    );
+    let before = names(&fx.paths.store_dir);
+
+    let out = fx.call("alpha", &store_req()).unwrap();
+    assert!(out.store_deleted && out.error.is_none(), "{out:?}");
+
+    let after = names(&fx.paths.store_dir);
+    for kept in ["beta.fls", "other.fls", "fl.fls"] {
+        assert!(
+            after.iter().any(|n| n == kept),
+            "{kept} must stay: {after:?}"
+        );
+    }
+    before.into_iter().filter(|n| !after.contains(n)).collect()
+}
+
+#[test]
+fn deleting_the_store_of_a_redb_alias_removes_the_fls_and_its_siblings_only() {
+    let removed = delete_alpha_store(true, false);
+    assert!(removed.contains(&"alpha.fls".to_string()), "{removed:?}");
+    assert_eq!(
+        removed.len(),
+        3,
+        "the store, its socket and its lock: {removed:?}"
+    );
+    assert!(removed.iter().any(|n| n.ends_with(".sock")), "{removed:?}");
+    assert!(
+        removed.iter().any(|n| n.ends_with(".migrate.lock")),
+        "{removed:?}"
+    );
+}
+
+#[test]
+fn deleting_the_store_of_a_redb_alias_also_removes_the_legacy_redb_left_beside_the_fls() {
+    let removed = delete_alpha_store(true, true);
+    assert!(removed.contains(&"alpha.fls".to_string()), "{removed:?}");
+    assert!(removed.contains(&"alpha.redb".to_string()), "{removed:?}");
+    assert_eq!(removed.len(), 4, "{removed:?}");
+}
+
+#[test]
+fn deleting_the_store_named_by_its_fls_also_removes_the_legacy_redb_left_beside_it() {
+    let removed = delete_alpha_store(false, true);
+    assert!(removed.contains(&"alpha.fls".to_string()), "{removed:?}");
+    assert!(removed.contains(&"alpha.redb".to_string()), "{removed:?}");
+    assert_eq!(removed.len(), 4, "{removed:?}");
+}
+
+#[test]
+fn deleting_the_store_named_by_its_fls_removes_just_the_fls_and_its_siblings_without_a_redb() {
+    let removed = delete_alpha_store(false, false);
+    assert_eq!(removed.len(), 3, "{removed:?}");
+    assert!(!removed.contains(&"alpha.redb".to_string()));
+}
+
+#[test]
+fn a_lone_unmigrated_redb_is_the_store_that_is_deleted() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    let redb = fx.alias_to_redb("alpha");
+    fs::remove_file(fx.store_file("alpha")).unwrap();
+    fx.make_redb(&redb);
+    assert_eq!(fx.listed_store("alpha"), Some(redb.display().to_string()));
+    let out = fx.call("alpha", &store_req()).unwrap();
+    assert!(out.store_deleted && out.error.is_none(), "{out:?}");
+    assert!(!redb.exists());
+}
+
+#[test]
+fn a_symlinked_redb_beside_the_fls_is_refused_and_nothing_is_deleted() {
+    for aliased in [false, true] {
+        let fx = Fx::new();
+        fx.project("alpha");
+        if aliased {
+            fx.alias_to_redb("alpha");
+        }
+        let fls = fx.store_file("alpha");
+        let victim = fx.base.join("work/victim.txt");
+        fs::write(&victim, "precious").unwrap();
+        let link = fx.paths.store_dir.join("alpha.redb");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let before = fx.snapshot(&[&fls, &link, &victim]);
+        let why = refused(fx.call("alpha", &store_req()));
+        assert!(why.contains("link or a directory"), "{why}");
+        assert_eq!(before, fx.snapshot(&[&fls, &link, &victim]));
+        assert!(fls.is_file() && victim.is_file());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[test]
+fn another_projects_store_is_refused_in_either_form() {
+    // alpha is pointed at beta's store by its legacy name: the list reports beta.fls.
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.project("beta");
+    let beta = fx.store_file("beta");
+    let alias = fx.paths.store_dir.join("beta.redb");
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &alias.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    let before = fx.snapshot(&[&beta]);
+    let why = refused(fx.call("alpha", &store_req()));
+    assert!(why.contains("another project's store"), "{why}");
+    assert_eq!(before, fx.snapshot(&[&beta]));
+    assert!(beta.is_file());
+}
+
+#[test]
+fn the_legacy_redb_of_another_projects_store_is_refused_even_when_that_project_names_the_fls() {
+    // beta is configured by its `.fls` (which is gone) and a legacy `beta.redb` is left in the
+    // stores' directory; alpha is pointed at that `.redb`. The `.redb` belongs to beta.
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.project("beta");
+    let beta_fls = fx.store_file("beta");
+    fs::remove_file(&beta_fls).unwrap();
+    let beta_redb = fx.paths.store_dir.join("beta.redb");
+    fx.make_redb(&beta_redb);
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &beta_redb.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    assert_eq!(
+        fx.listed_store("alpha"),
+        Some(beta_redb.display().to_string())
+    );
+    let before = fx.snapshot(&[&beta_redb, &beta_fls]);
+    let why = refused(fx.call("alpha", &store_req()));
+    assert!(why.contains("another project's store"), "{why}");
+    assert_eq!(before, fx.snapshot(&[&beta_redb, &beta_fls]));
+    assert!(beta_redb.is_file());
+}
+
+#[test]
+fn the_workspace_store_is_refused_when_named_in_either_form() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    let ws_redb = fx.paths.store_dir.join("fl.redb");
+    for target in [fx.paths.workspace_store.clone(), ws_redb.clone()] {
+        let text = fx.config().replacen(
+            &fx.store_file("alpha").display().to_string(),
+            &target.display().to_string(),
+            1,
+        );
+        fs::write(&fx.paths.config_path, text).unwrap();
+        let before = fx.snapshot(&[&fx.paths.workspace_store]);
+        let why = refused(fx.call("alpha", &store_req()));
+        assert!(why.contains("workspace store"), "{why}");
+        assert_eq!(before, fx.snapshot(&[&fx.paths.workspace_store]));
+        assert!(fx.paths.workspace_store.is_file());
+        let text = fx.config().replacen(
+            &target.display().to_string(),
+            &fx.store_file("alpha").display().to_string(),
+            1,
+        );
+        fs::write(&fx.paths.config_path, text).unwrap();
+    }
+}
+
+#[test]
+fn a_workspace_store_with_another_extension_is_still_refused_at_its_fls() {
+    // FerroStore keeps a workspace store named `state.db` (or `fl`, with no extension) at
+    // `state.fls` (`fl.fls`); a project whose store is that file is the workspace store.
+    for ws_name in ["state.db", "fl"] {
+        let mut fx = Fx::new();
+        fx.paths.workspace_store = fx.paths.store_dir.join(ws_name);
+        let fls = fx.paths.workspace_store.with_extension("fls");
+        fs::write(&fls, "x").unwrap();
+        let listed = [summary("alpha", &fls)];
+        let why = crate::project_delete::check_store("alpha", &fls, &[], &listed, &fx.paths)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("is the workspace store"), "{ws_name}: {why}");
+        assert!(fls.is_file(), "{ws_name}: nothing is deleted");
+    }
+}
+
+#[test]
+fn a_legacy_redb_beside_the_workspace_store_is_refused_as_the_workspace_store() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    let ws_redb = fx.paths.store_dir.join("fl.redb");
+    fx.make_redb(&ws_redb);
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &ws_redb.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    let why = refused(fx.call("alpha", &store_req()));
+    assert!(why.contains("workspace store"), "{why}");
+    assert!(ws_redb.is_file() && fx.paths.workspace_store.is_file());
+}
+
+#[test]
+fn a_registered_store_outside_the_stores_directory_loses_both_forms() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    let outside = fx.base.join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let fls = outside.join("alpha.fls");
+    let redb = outside.join("alpha.redb");
+    drop(fl_store::open_store(&fls).unwrap());
+    fx.make_redb(&redb);
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &redb.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    assert_eq!(fx.listed_store("alpha"), Some(fls.display().to_string()));
+    let out = fx.call("alpha", &store_req()).unwrap();
+    assert!(out.store_deleted && out.error.is_none(), "{out:?}");
+    assert!(!fls.exists() && !redb.exists());
+    assert!(
+        fx.store_file("alpha").is_file(),
+        "the stores' directory file is not alpha's now"
+    );
+}
+
+fn summary(slug: &str, store: &Path) -> ProjectSummary {
+    ProjectSummary {
+        slug: slug.into(),
+        name: slug.into(),
+        kind: crate::project_init::ProjectKind::Project,
+        path: None,
+        has_git: false,
+        purpose: String::new(),
+        tracker: None,
+        store_path: Some(store.display().to_string()),
+        active_agent_count: 0,
+    }
+}
+
+#[test]
+fn check_store_places_both_forms_of_the_registered_store_and_refuses_an_unregistered_one() {
+    let fx = Fx::new();
+    let outside = fx.base.join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let fls = outside.join("alpha.fls");
+    let redb = outside.join("alpha.redb");
+    fs::write(&fls, "x").unwrap();
+    fs::write(&redb, "x").unwrap();
+
+    // Registered by its `.fls` only (the list's form): the `.redb` beside it is its pair.
+    let listed = [summary("alpha", &fls)];
+    let files = crate::project_delete::check_store("alpha", &fls, &[], &listed, &fx.paths).unwrap();
+    assert!(files.contains(&fls) && files.contains(&redb), "{files:?}");
+    // Registered by its `.redb` only: the `.fls` is its pair.
+    let listed = [summary("alpha", &redb)];
+    let files =
+        crate::project_delete::check_store("alpha", &redb, &[], &listed, &fx.paths).unwrap();
+    assert!(files.contains(&fls) && files.contains(&redb), "{files:?}");
+    // Not registered for this project, and outside the stores' directory: refused, in the
+    // form given and in the other.
+    for given in [&fls, &redb] {
+        let why = crate::project_delete::check_store("alpha", given, &[], &[], &fx.paths)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("neither in the stores' directory"), "{why}");
+    }
+    // Registered for another project: refused as that project's, whichever form it names.
+    for other in [&fls, &redb] {
+        let listed = [summary("beta", other)];
+        let why = crate::project_delete::check_store("alpha", &fls, &[], &listed, &fx.paths)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("neither in the stores' directory") || why.contains("another project"),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn it_refuses_a_directory_holding_the_legacy_alias_of_a_store() {
+    let fx = Fx::new();
+    let root = fx.project("alpha");
+    // A store inside alpha's own directory, configured by its `.redb` alias.
+    let fls = root.join("my.fls");
+    fs::write(&fls, "x").unwrap();
+    let alias = root.join("my.redb");
+    let text = fx.config().replacen(
+        &fx.store_file("alpha").display().to_string(),
+        &alias.display().to_string(),
+        1,
+    );
+    fs::write(&fx.paths.config_path, text).unwrap();
+    assert_dir_refused(&fx, "alpha", "store or config file", &[&fls, &root]);
+}
+
 // --- a failure in the middle -------------------------------------------------------------------
 
 #[test]

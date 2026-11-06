@@ -1466,6 +1466,289 @@ fn a_store_known_to_the_caller_is_a_project_even_without_a_config_block() {
     assert!(listed[1].store_path.is_some());
 }
 
+// --- the list reports the physical store file -------------------------------------------------
+
+/// A config with one hand-written `[[project]]` block, `slug`, whose `store` names `configured`
+/// (a legacy `.redb` alias, say).
+fn config_with_store(sb: &Sandbox, slug: &str, configured: &Path) {
+    let root = sb.dir(slug);
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(sb.paths.config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &sb.paths.config_path,
+        format!(
+            "[[project]]\nname = \"{slug}\"\nroot = \"{}\"\nstore = \"{}\"\n",
+            root.display(),
+            configured.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn listed_store(sb: &Sandbox, slug: &str) -> Option<String> {
+    sb.list()
+        .into_iter()
+        .find(|p| p.slug == slug)
+        .unwrap_or_else(|| panic!("no project {slug}"))
+        .store_path
+}
+
+/// A real FerroStore file at `fls` (the physical store of the default backend).
+fn make_fls(fls: &Path) {
+    drop(fl_store::open_store(fls).unwrap());
+    assert!(fls.is_file());
+}
+
+/// A real redb file at `redb`.
+fn make_redb(redb: &Path) {
+    drop(fl_store::open_redb(redb).unwrap());
+    assert!(redb.is_file());
+}
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Holds the lock that serialises tests that touch process environment variables and removes
+/// `FL_STORE_BACKEND` until dropped, then puts it back: the list reads it, and a developer's own
+/// selection must not decide what these tests see.
+struct NoBackendEnv {
+    saved: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn no_backend_env() -> NoBackendEnv {
+    let lock = crate::SECRET_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let saved = std::env::var_os(fl_store::BACKEND_ENV);
+    // SAFETY: every test that reads or sets this variable holds SECRET_ENV_LOCK.
+    unsafe { std::env::remove_var(fl_store::BACKEND_ENV) };
+    NoBackendEnv { saved, _lock: lock }
+}
+
+impl Drop for NoBackendEnv {
+    fn drop(&mut self) {
+        // SAFETY: still holding SECRET_ENV_LOCK.
+        unsafe {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(fl_store::BACKEND_ENV, v),
+                None => std::env::remove_var(fl_store::BACKEND_ENV),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_redb_alias_in_the_config_is_listed_as_the_fls_that_exists_on_disk() {
+    let _env = no_backend_env();
+    let sb = Sandbox::new();
+    let dir = sb.base.join("stores");
+    fs::create_dir_all(&dir).unwrap();
+    let redb = dir.join("site.redb");
+    let fls = dir.join("site.fls");
+    make_fls(&fls);
+    config_with_store(&sb, "site", &redb);
+
+    assert_eq!(listed_store(&sb, "site"), Some(fls.display().to_string()));
+    assert!(!redb.exists(), "listing makes no .redb");
+}
+
+#[test]
+fn a_redb_alias_with_both_files_beside_it_is_listed_as_the_fls() {
+    let _env = no_backend_env();
+    let sb = Sandbox::new();
+    let dir = sb.base.join("stores");
+    fs::create_dir_all(&dir).unwrap();
+    let redb = dir.join("site.redb");
+    let fls = dir.join("site.fls");
+    make_redb(&redb);
+    make_fls(&fls);
+    config_with_store(&sb, "site", &redb);
+
+    assert_eq!(listed_store(&sb, "site"), Some(fls.display().to_string()));
+}
+
+#[test]
+fn a_lone_unmigrated_redb_is_listed_as_the_redb_and_listing_touches_nothing() {
+    let _env = no_backend_env();
+    let sb = Sandbox::new();
+    let dir = sb.base.join("stores");
+    fs::create_dir_all(&dir).unwrap();
+    let redb = dir.join("site.redb");
+    make_redb(&redb);
+    config_with_store(&sb, "site", &redb);
+    // The workspace store is opened (and made) by the list's caller, not by the list itself.
+    drop(sb.open_ws().unwrap());
+    let bytes = fs::read(&redb).unwrap();
+    let modified = fs::metadata(&redb).unwrap().modified().unwrap();
+    let names = file_names(&dir);
+
+    assert_eq!(listed_store(&sb, "site"), Some(redb.display().to_string()));
+
+    let fls = dir.join("site.fls");
+    assert!(!fls.exists(), "listing must not migrate the redb");
+    assert!(
+        !fl_store::MigrationLock::path_for(&fls).exists(),
+        "listing must not take the migration lock"
+    );
+    assert_eq!(file_names(&dir), names, "listing created or removed a file");
+    assert_eq!(fs::read(&redb).unwrap(), bytes);
+    assert_eq!(fs::metadata(&redb).unwrap().modified().unwrap(), modified);
+}
+
+#[test]
+fn a_redb_alias_with_nothing_on_disk_is_listed_as_the_fls_it_would_be_created_at() {
+    let _env = no_backend_env();
+    let sb = Sandbox::new();
+    let dir = sb.base.join("stores");
+    fs::create_dir_all(&dir).unwrap();
+    config_with_store(&sb, "site", &dir.join("site.redb"));
+
+    assert_eq!(
+        listed_store(&sb, "site"),
+        Some(dir.join("site.fls").display().to_string())
+    );
+    assert!(file_names(&dir).is_empty(), "listing creates nothing");
+}
+
+#[test]
+fn a_scanned_hint_and_a_stores_only_project_are_listed_by_their_physical_file() {
+    let _env = no_backend_env();
+    let sb = Sandbox::new();
+    let dir = sb.base.join("stores");
+    fs::create_dir_all(&dir).unwrap();
+    let hint_fls = dir.join("hinted.fls");
+    make_fls(&hint_fls);
+    // A config block with no `store`: the hint names the file, here as a `.redb` alias.
+    let root = sb.dir("hinted");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(sb.paths.config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &sb.paths.config_path,
+        format!(
+            "[[project]]\nname = \"hinted\"\nroot = \"{}\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let only_fls = dir.join("only.fls");
+    make_fls(&only_fls);
+    let hints = vec![
+        ("hinted".to_string(), Some(dir.join("hinted.redb"))),
+        ("only".to_string(), Some(dir.join("only.redb"))),
+    ];
+    let listed =
+        list_projects(&sb.paths.config_path, &hints, &[], &*sb.open_ws().unwrap()).unwrap();
+    let store = |slug: &str| {
+        listed
+            .iter()
+            .find(|p| p.slug == slug)
+            .unwrap()
+            .store_path
+            .clone()
+    };
+    assert_eq!(store("hinted"), Some(hint_fls.display().to_string()));
+    assert_eq!(store("only"), Some(only_fls.display().to_string()));
+}
+
+#[test]
+fn effective_store_path_follows_the_backend_and_the_files_on_disk() {
+    use crate::project_list::effective_store_path_with as eff;
+    let tmp = TempDir::new().unwrap();
+    let dir = fs::canonicalize(tmp.path()).unwrap();
+    let redb = dir.join("x.redb");
+    let fls = dir.join("x.fls");
+
+    // The explicit redb override keeps the configured file, whatever is on disk.
+    assert_eq!(eff(&redb, Some("redb")), redb);
+    make_fls(&fls);
+    assert_eq!(eff(&redb, Some("redb")), redb);
+    assert_eq!(eff(&redb, Some(" REDB ")), redb);
+    // An `.fls` path is ferro whatever the environment says.
+    assert_eq!(eff(&fls, Some("redb")), fls);
+    assert_eq!(eff(&fls, None), fls);
+    assert_eq!(eff(&fls, Some("ferro")), fls);
+    // Default and explicit ferro map the alias onto the `.fls`.
+    assert_eq!(eff(&redb, None), fls);
+    assert_eq!(eff(&redb, Some("ferro")), fls);
+    assert_eq!(eff(&redb, Some("")), fls);
+    // An environment value that names no engine leaves the path as configured.
+    assert_eq!(eff(&redb, Some("sqlite")), redb);
+    assert_eq!(
+        eff(Path::new("/nowhere/y.redb"), Some("bogus")),
+        Path::new("/nowhere/y.redb")
+    );
+    // A name that is no store file's stays as configured (the delete flow refuses it by name).
+    assert_eq!(eff(&dir.join("x.txt"), None), dir.join("x.txt"));
+    assert_eq!(eff(&dir.join("x"), None), dir.join("x"));
+    // Nothing is made by asking.
+    assert_eq!(file_names(&dir), ["x.fls"]);
+}
+
+#[test]
+fn effective_store_path_keeps_a_lone_legacy_file_and_is_idempotent() {
+    use crate::project_list::effective_store_path_with as eff;
+    let tmp = TempDir::new().unwrap();
+    let dir = fs::canonicalize(tmp.path()).unwrap();
+    let redb = dir.join("x.redb");
+    make_redb(&redb);
+    assert_eq!(
+        eff(&redb, None),
+        redb,
+        "a lone legacy redb is what is on disk"
+    );
+    // A directory or a missing file is not "a file on disk": the `.fls` is where it would be.
+    let odd = dir.join("odd.redb");
+    fs::create_dir(&odd).unwrap();
+    assert_eq!(eff(&odd, None), dir.join("odd.fls"));
+    assert_eq!(eff(&dir.join("gone.redb"), None), dir.join("gone.fls"));
+    // Idempotent.
+    for p in [&redb, &odd, &dir.join("gone.redb"), &dir.join("z.fls")] {
+        let once = eff(p, None);
+        assert_eq!(eff(&once, None), once, "{}", p.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_fls_link_beside_a_redb_is_the_fls_not_a_lone_legacy_file() {
+    use crate::project_list::effective_store_path_with as eff;
+    let tmp = TempDir::new().unwrap();
+    let dir = fs::canonicalize(tmp.path()).unwrap();
+    let redb = dir.join("x.redb");
+    let fls = dir.join("x.fls");
+    make_redb(&redb);
+    std::os::unix::fs::symlink(dir.join("nowhere"), &fls).unwrap();
+    assert!(!fls.exists() && fs::symlink_metadata(&fls).is_ok());
+    // Something is at the `.fls` (open_ferro sees it too), so it is the physical store.
+    assert_eq!(eff(&redb, None), fls);
+}
+
+#[test]
+fn a_virtual_group_and_a_project_with_no_store_keep_a_null_store_path() {
+    let sb = Sandbox::new();
+    sb.virtual_group(&sb.vrequest("Council")).unwrap();
+    let root = sb.dir("bare");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(sb.paths.config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &sb.paths.config_path,
+        format!(
+            "[[project]]\nname = \"bare\"\nroot = \"{}\"\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(listed_store(&sb, "council"), None);
+    assert_eq!(listed_store(&sb, "bare"), None);
+}
+
 #[test]
 fn the_agent_matcher_ignores_case_matches_the_area_name_and_skips_the_inactive() {
     use crate::project_list::agent_in_project;
