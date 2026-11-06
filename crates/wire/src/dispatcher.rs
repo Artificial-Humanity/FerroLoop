@@ -684,6 +684,56 @@ fn failure_with_output(what: &str, run: &CapturedRun) -> String {
     }
 }
 
+pub use crate::codex_control::{
+    CodexSteerAck, CodexSteerError, CodexSteerRefusalReason, CodexSteerStage,
+};
+
+/// Submit explicit owner input to a Codex route's currently active turn, returning the server's
+/// acknowledged turn ID. The caller MUST authenticate the owner and obtain explicit intent to
+/// steer this session; a sender name or route alone is not authorization. This helper performs
+/// no authorization and is separate from ordinary queued delivery.
+///
+/// No queue, resume, turn start, or retry fallback is attempted. `Unconfirmed` means the input
+/// may already have been accepted; callers must not automatically retry or enqueue it.
+pub fn steer_codex_active_turn(
+    route: &VendorRoute,
+    body: &str,
+) -> Result<CodexSteerAck, CodexSteerError> {
+    let VendorRoute::Codex { thread_id, .. } = route else {
+        return Err(CodexSteerError::refused(
+            CodexSteerStage::Route,
+            CodexSteerRefusalReason::Unsupported,
+            "active-turn steering requires a Codex route",
+        ));
+    };
+    let sock = crate::codex_control::resolve_control_socket(
+        std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+        std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .map_err(|message| {
+        CodexSteerError::refused(
+            CodexSteerStage::Connect,
+            CodexSteerRefusalReason::Transport,
+            message,
+        )
+    })?
+    .ok_or_else(|| {
+        CodexSteerError::refused(
+            CodexSteerStage::Connect,
+            CodexSteerRefusalReason::Unsupported,
+            "active-turn steering requires a Codex control socket; queue fallback is disabled",
+        )
+    })?;
+    crate::codex_control::steer_active_turn(
+        &sock,
+        thread_id,
+        body,
+        crate::codex_control::STEER_TIMEOUT,
+    )
+}
+
 fn deliver_to_codex_route(
     thread_id: &str,
     cwd: Option<&PathBuf>,
@@ -3844,6 +3894,89 @@ mod tests {
             thread_id: thread_id.into(),
             cwd: None,
         }
+    }
+
+    #[test]
+    fn active_turn_steering_returns_ack_and_never_runs_the_queue_binary() {
+        use crate::codex_control::fake_server;
+
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let (sock, server) = fake_server::spawn(tmp.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(r#"{"id":1,"result":{}}"#);
+            c.expect_json();
+            c.expect_json();
+            c.send_text(r#"{"id":2,"result":{"thread":{"id":"thread-9","sessionId":"session-9","cliVersion":"0.166.0","createdAt":1,"updatedAt":2,"cwd":"/tmp/mock-project","ephemeral":false,"modelProvider":"openai","preview":"fixture","projectId":null,"source":"cli","status":{"type":"active","activeFlags":[]},"canAcceptDirectInput":true,"turns":[]}}}"#);
+            c.expect_json();
+            c.send_text(r#"{"id":3,"result":{"data":[{"id":"turn-7","status":"inProgress","items":[],"itemsView":"notLoaded"}],"nextCursor":null,"backwardsCursor":null}}"#);
+            c.expect_json();
+            c.send_text(r#"{"id":4,"result":{"turnId":"turn-7"}}"#);
+            c.drain_until_eof();
+        });
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+        assert_eq!(
+            steer_codex_active_turn(&codex_route("thread-9"), "owner input")
+                .unwrap()
+                .turn_id,
+            "turn-7"
+        );
+        let log = server.join().unwrap();
+        let methods: Vec<String> = log
+            .iter()
+            .filter(|frame| frame.opcode == 1)
+            .map(|frame| frame.json()["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "initialized",
+                "thread/read",
+                "thread/turns/list",
+                "turn/steer"
+            ]
+        );
+        assert!(!out.exists(), "steering must never run codex queue");
+    }
+
+    #[test]
+    fn active_turn_steering_refuses_missing_control_socket_without_queue_fallback() {
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _no_sock = EnvGuard::remove("FL_WIRE_CODEX_CONTROL_SOCK");
+        assert!(matches!(
+            steer_codex_active_turn(&codex_route("thread-9"), "hello"),
+            Err(CodexSteerError::Refused { .. })
+        ));
+        let _sock_env = EnvGuard::set(
+            "FL_WIRE_CODEX_CONTROL_SOCK",
+            &tmp.path().join("missing.sock"),
+        );
+        assert!(matches!(
+            steer_codex_active_turn(&codex_route("thread-9"), "hello"),
+            Err(CodexSteerError::Refused { .. })
+        ));
+        assert!(
+            !out.exists(),
+            "missing control socket must never fall back to queue"
+        );
+    }
+
+    #[test]
+    fn active_turn_steering_refuses_non_codex_routes() {
+        let route = VendorRoute::Webhook {
+            socket_path: PathBuf::from("/not-a-real-socket"),
+        };
+        assert!(matches!(
+            steer_codex_active_turn(&route, "hello"),
+            Err(CodexSteerError::Refused { .. })
+        ));
     }
 
     #[test]

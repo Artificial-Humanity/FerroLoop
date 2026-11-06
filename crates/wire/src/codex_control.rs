@@ -8,7 +8,10 @@
 //!
 //! The wire shapes follow `codex app-server generate-json-schema`: JSON-RPC messages carry no
 //! `"jsonrpc"` member, `initialize` takes `clientInfo {name, version}`, `initialized` is a
-//! notification, and `thread/compact/start` takes `{threadId}`.
+//! notification, and `thread/compact/start` takes `{threadId}`. Active-turn steering follows
+//! the generated Codex 0.166.0 schema: metadata-only `thread/read`, latest `thread/turns/list`,
+//! then `turn/steer` with an `expectedTurnId` precondition. Schema and mock coverage do not
+//! establish that an installed daemon exposes or accepts these methods at runtime.
 
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
@@ -25,6 +28,8 @@ use crate::ws::{WsError, compute_accept_key, read_http_headers};
 
 /// Overall budget for one compaction request (connect through the `thread/compact/start` reply).
 pub(crate) const COMPACT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall budget for active-turn socket connect, preflight, and acknowledgment.
+pub(crate) const STEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest a single socket read or write may block.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest data frame or reassembled message accepted from the server.
@@ -117,6 +122,258 @@ pub(crate) fn compact_thread(
     // Best effort: the outcome is already decided.
     let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
     outcome
+}
+
+/// An app-server acknowledgment that an existing turn accepted steering input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSteerAck {
+    pub turn_id: String,
+}
+
+/// The operation whose outcome failed to be established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexSteerStage {
+    Route,
+    Connect,
+    Handshake,
+    Initialize,
+    ThreadRead,
+    TurnsList,
+    Steer,
+}
+
+/// Machine-readable preflight or protocol refusal; it never authorizes automatic delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexSteerRefusalReason {
+    Idle,
+    NotLoaded,
+    DirectInputUnavailable,
+    NotActive,
+    NoActiveTurn,
+    InvalidResponse,
+    Unsupported,
+    Rejected,
+    Transport,
+}
+
+/// Whether a steering failure is known to have avoided accepting input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSteerError {
+    /// Preflight failed, or the server rejected steering with JSON-RPC invalid request,
+    /// method-not-found, or invalid-params. This does not authorize an automatic retry.
+    Refused {
+        stage: CodexSteerStage,
+        reason: CodexSteerRefusalReason,
+        message: String,
+    },
+    /// A steer write may have reached the server, but its acknowledgment cannot be confirmed.
+    /// Callers must not automatically retry or enqueue the same input.
+    Unconfirmed {
+        stage: CodexSteerStage,
+        message: String,
+    },
+}
+
+impl CodexSteerError {
+    pub fn stage(&self) -> CodexSteerStage {
+        match self {
+            Self::Refused { stage, .. } | Self::Unconfirmed { stage, .. } => *stage,
+        }
+    }
+
+    pub fn refusal_reason(&self) -> Option<CodexSteerRefusalReason> {
+        match self {
+            Self::Refused { reason, .. } => Some(*reason),
+            Self::Unconfirmed { .. } => None,
+        }
+    }
+
+    pub(crate) fn refused(
+        stage: CodexSteerStage,
+        reason: CodexSteerRefusalReason,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Refused {
+            stage,
+            reason,
+            message: message.into(),
+        }
+    }
+
+    fn failure(
+        stage: CodexSteerStage,
+        reason: CodexSteerRefusalReason,
+        message: impl Into<String>,
+    ) -> Self {
+        if stage == CodexSteerStage::Steer {
+            Self::Unconfirmed {
+                stage,
+                message: message.into(),
+            }
+        } else {
+            Self::refused(stage, reason, message)
+        }
+    }
+}
+
+impl std::fmt::Display for CodexSteerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { stage, message, .. } => {
+                write!(f, "Codex steering refused at {stage:?}: {message}")
+            }
+            Self::Unconfirmed { stage, message } => {
+                write!(f, "Codex steering unconfirmed at {stage:?}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CodexSteerError {}
+
+/// Steer only the latest proven active turn. No method here loads/resumes a thread, starts a
+/// turn, modifies a queue, or retries steering. The server's `expectedTurnId` precondition must
+/// reject a turn that changes between preflight and the steering request.
+pub(crate) fn steer_active_turn(
+    sock: &Path,
+    thread_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<CodexSteerAck, CodexSteerError> {
+    use CodexSteerRefusalReason as Reason;
+    use CodexSteerStage as Stage;
+    let deadline = Instant::now() + timeout;
+    let stream = connect_for_steering(sock, deadline).map_err(|e| {
+        CodexSteerError::refused(
+            Stage::Connect,
+            Reason::Transport,
+            format!(
+                "cannot connect to the Codex app-server control socket {}: {e}",
+                sock.display()
+            ),
+        )
+    })?;
+    let mut conn = Conn {
+        stream,
+        rbuf: Vec::new(),
+        rng: SystemRandom::new(),
+        deadline,
+    };
+    conn.handshake().map_err(|message| {
+        CodexSteerError::refused(Stage::Handshake, Reason::Transport, message)
+    })?;
+    conn.send_json(&json!({
+        "id": 1, "method": "initialize",
+        "params": {"clientInfo": {"name": "ferroloop", "version": "0.1.0"}},
+    }))
+    .map_err(|message| CodexSteerError::refused(Stage::Initialize, Reason::Transport, message))?;
+    conn.await_steering_response(1, "initialize", Stage::Initialize)?;
+    conn.send_json(&json!({"method": "initialized", "params": {}}))
+        .map_err(|message| {
+            CodexSteerError::refused(Stage::Initialize, Reason::Transport, message)
+        })?;
+    conn.send_json(&json!({
+        "id": 2, "method": "thread/read",
+        "params": {"threadId": thread_id, "includeTurns": false},
+    }))
+    .map_err(|message| CodexSteerError::refused(Stage::ThreadRead, Reason::Transport, message))?;
+    let metadata = conn.await_steering_response(2, "thread/read", Stage::ThreadRead)?;
+    let thread = &metadata["thread"];
+    if thread_id.trim().is_empty() || thread["id"].as_str() != Some(thread_id) {
+        return Err(CodexSteerError::refused(
+            Stage::ThreadRead,
+            Reason::InvalidResponse,
+            "thread/read did not prove the requested thread identity",
+        ));
+    }
+    let refusal = match thread["status"]["type"].as_str() {
+        Some("notLoaded") => Some(Reason::NotLoaded),
+        Some("active" | "idle") if thread["canAcceptDirectInput"].as_bool() != Some(true) => {
+            Some(Reason::DirectInputUnavailable)
+        }
+        Some("idle") => Some(Reason::Idle),
+        Some("systemError") => Some(Reason::NotActive),
+        Some("active") => None,
+        _ => Some(Reason::InvalidResponse),
+    };
+    if let Some(reason) = refusal {
+        return Err(CodexSteerError::refused(
+            Stage::ThreadRead,
+            reason,
+            "thread/read did not prove an active thread accepting direct input",
+        ));
+    }
+    conn.send_json(&json!({
+        "id": 3, "method": "thread/turns/list",
+        "params": {"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"},
+    })).map_err(|message| CodexSteerError::refused(Stage::TurnsList, Reason::Transport, message))?;
+    let turns = conn.await_steering_response(3, "thread/turns/list", Stage::TurnsList)?;
+    let latest = turns["data"]
+        .as_array()
+        .filter(|turns| turns.len() == 1)
+        .and_then(|turns| turns.first())
+        .filter(|turn| turn["status"].as_str() == Some("inProgress"));
+    let turn_id = latest
+        .and_then(|turn| turn["id"].as_str())
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            CodexSteerError::refused(
+                Stage::TurnsList,
+                Reason::NoActiveTurn,
+                "thread/turns/list did not prove one latest active turn",
+            )
+        })?;
+    // From the first write attempt onward, a transport failure cannot prove non-delivery.
+    conn.send_json(&json!({
+        "id": 4, "method": "turn/steer",
+        "params": {"threadId": thread_id, "expectedTurnId": turn_id, "input": [{"type": "text", "text": text}]},
+    })).map_err(|message| CodexSteerError::failure(Stage::Steer, Reason::Transport, message))?;
+    let outcome = conn
+        .await_steering_response(4, "turn/steer", Stage::Steer)
+        .and_then(|ack| {
+            if ack["turnId"].as_str() != Some(turn_id)
+                || ack
+                    .get("threadId")
+                    .is_some_and(|id| id.as_str() != Some(thread_id))
+            {
+                return Err(CodexSteerError::failure(
+                    Stage::Steer,
+                    Reason::InvalidResponse,
+                    "turn/steer acknowledgment did not match the requested thread and active turn",
+                ));
+            }
+            Ok(CodexSteerAck {
+                turn_id: turn_id.to_owned(),
+            })
+        });
+    // A close failure cannot change the acknowledgment's meaning.
+    let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
+    outcome
+}
+
+/// Nonblocking connect + deadline-bounded poll, with descriptor ownership held by `Socket`
+/// throughout. A full Unix backlog may fail immediately; it is never retried. Keep the
+/// compaction path unchanged. `peer_addr` prevents an unconnected writable socket from being
+/// mistaken for success on platforms whose backlog handling differs.
+fn connect_for_steering(sock: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    };
+    remaining()?;
+    let address = SockAddr::unix(sock)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.connect_timeout(&address, remaining()?)?;
+    if let Some(error) = socket.take_error()? {
+        return Err(error);
+    }
+    socket.peer_addr()?;
+    remaining()?;
+    let descriptor: std::os::fd::OwnedFd = socket.into();
+    Ok(UnixStream::from(descriptor))
 }
 
 /// Reads from a socket under an overall deadline: before every read it re-arms the socket read
@@ -291,6 +548,76 @@ impl Conn {
             }
             return String::from_utf8(bytes)
                 .map_err(|_| "Codex app-server sent a text message that is not UTF-8".to_string());
+        }
+    }
+
+    /// Steering fails closed on malformed messages or unrelated response IDs. Compaction keeps
+    /// its existing tolerant reader below. Only protocol validation errors establish refusal;
+    /// unknown/internal errors after a steer write may follow partial handling.
+    fn await_steering_response(
+        &mut self,
+        id: i64,
+        method: &str,
+        stage: CodexSteerStage,
+    ) -> Result<Value, CodexSteerError> {
+        use CodexSteerRefusalReason as Reason;
+        loop {
+            let text = self
+                .recv_text()
+                .map_err(|message| CodexSteerError::failure(stage, Reason::Transport, message))?;
+            let malformed = || {
+                CodexSteerError::failure(
+                    stage,
+                    Reason::InvalidResponse,
+                    format!("Codex app-server sent a malformed response to `{method}`"),
+                )
+            };
+            let message: Value = serde_json::from_str(&text).map_err(|_| malformed())?;
+            if !message.is_object() {
+                return Err(malformed());
+            }
+            if let Some(method) = message.get("method") {
+                if method.is_string()
+                    && message.get("result").is_none()
+                    && message.get("error").is_none()
+                {
+                    continue; // Server notification or request, never an acknowledgment.
+                }
+                return Err(malformed());
+            }
+            if message.get("id").and_then(Value::as_i64) != Some(id) {
+                return Err(CodexSteerError::failure(
+                    stage,
+                    Reason::InvalidResponse,
+                    format!("Codex app-server response ID did not match `{method}`"),
+                ));
+            }
+            return match (
+                message.get("error").filter(|error| !error.is_null()),
+                message.get("result"),
+            ) {
+                (Some(error), None) => {
+                    let description = format!(
+                        "Codex app-server rejected `{method}`: {}",
+                        describe_rpc_error(error)
+                    );
+                    let code = error.get("code").and_then(Value::as_i64);
+                    let reason = if code == Some(-32601) {
+                        Reason::Unsupported
+                    } else {
+                        Reason::Rejected
+                    };
+                    if error.get("message").is_some_and(Value::is_string)
+                        && matches!(code, Some(-32602..=-32600))
+                    {
+                        Err(CodexSteerError::refused(stage, reason, description))
+                    } else {
+                        Err(CodexSteerError::failure(stage, reason, description))
+                    }
+                }
+                (None, Some(result)) if result.is_object() => Ok(result.clone()),
+                _ => Err(malformed()),
+            };
         }
     }
 
@@ -685,6 +1012,387 @@ mod tests {
     use tempfile::TempDir;
 
     const SHORT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn steering_connect_refuses_an_expired_deadline_without_connecting() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("expired.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let error = connect_for_steering(&path, Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn steering_connect_reports_a_local_refused_socket() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("refused.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let error = connect_for_steering(&path, Instant::now() + SHORT).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    // Linux Unix sockets report EAGAIN on a full backlog without initiating a connection.
+    // The helper must fail promptly rather than block or mistake writability for success.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn steering_connect_is_bounded_when_the_local_backlog_is_full() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("backlog.sock");
+        let address = SockAddr::unix(&path).unwrap();
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&address).unwrap();
+        listener.listen(0).unwrap();
+        let filler = UnixStream::connect(&path).unwrap();
+        // Release the backlog eventually even if a regression makes connect block.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            listener.accept().unwrap();
+        });
+        let started = Instant::now();
+        let result = connect_for_steering(&path, started + Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        release.join().unwrap();
+        drop(filler);
+        assert!(
+            result.is_err(),
+            "full backlog must not yield a connected stream"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "connect took {elapsed:?}"
+        );
+    }
+
+    // These fixtures mirror the required fields of the generated Codex 0.166.0 schemas.
+    // They establish our boundary contract, not runtime vendor conformance.
+    fn active_thread_reply() -> Value {
+        json!({"id": 2, "result": {"thread": {
+            "id": "thread-9", "sessionId": "session-9", "cliVersion": "0.166.0",
+            "createdAt": 1, "updatedAt": 2, "cwd": "/tmp/mock-project", "ephemeral": false,
+            "modelProvider": "openai", "preview": "fixture", "projectId": null,
+            "source": "cli", "status": {"type": "active", "activeFlags": []},
+            "canAcceptDirectInput": true, "turns": []
+        }}})
+    }
+
+    fn active_turn_reply() -> Value {
+        json!({"id": 3, "result": {"data": [{
+            "id": "turn-7", "status": "inProgress", "items": [], "itemsView": "notLoaded"
+        }], "nextCursor": null, "backwardsCursor": null}})
+    }
+
+    fn steer_exchange(
+        replies: Vec<String>,
+        text: &str,
+        timeout: Duration,
+    ) -> (
+        Result<CodexSteerAck, CodexSteerError>,
+        Vec<fake_server::Received>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), move |c| {
+            c.handshake();
+            for (index, reply) in replies.iter().enumerate() {
+                c.expect_json();
+                c.send_text(reply);
+                if index == 0 {
+                    // Initialized notification follows a successful initialization.
+                    c.expect_json();
+                }
+            }
+            c.drain_until_eof();
+        });
+        let result = steer_active_turn(&sock, "thread-9", text, timeout);
+        (result, server.join().unwrap())
+    }
+
+    fn steer_replies() -> Vec<String> {
+        vec![
+            json!({"id": 1, "result": {}}).to_string(),
+            active_thread_reply().to_string(),
+            active_turn_reply().to_string(),
+            json!({"id": 4, "result": {"turnId": "turn-7"}}).to_string(),
+        ]
+    }
+
+    fn methods(log: &[fake_server::Received]) -> Vec<String> {
+        log.iter()
+            .filter(|frame| frame.opcode == OP_TEXT)
+            .map(|frame| frame.json()["method"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn steering_proves_active_thread_and_turn_and_preserves_escaped_input() {
+        let text = "owner says \"stop\"\nnext line\t\\ café";
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), |c| {
+            c.handshake();
+            for (index, reply) in steer_replies().iter().enumerate() {
+                c.expect_json();
+                c.send_text(r#"{"method":"thread/status/changed","params":{"threadId":"thread-9","status":{"type":"active","activeFlags":[]}}}"#);
+                c.send_text(reply);
+                if index == 0 {
+                    c.expect_json();
+                }
+            }
+            c.drain_until_eof();
+        });
+        let result = steer_active_turn(&sock, "thread-9", text, SHORT);
+        assert_eq!(
+            result.unwrap(),
+            CodexSteerAck {
+                turn_id: "turn-7".into()
+            }
+        );
+        let log = server.join().unwrap();
+        assert_eq!(
+            methods(&log),
+            [
+                "initialize",
+                "initialized",
+                "thread/read",
+                "thread/turns/list",
+                "turn/steer"
+            ]
+        );
+        assert!(log.iter().all(|frame| frame.masked));
+        assert_eq!(
+            log[2].json()["params"],
+            json!({"threadId": "thread-9", "includeTurns": false})
+        );
+        assert_eq!(
+            log[3].json()["params"],
+            json!({"threadId": "thread-9", "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"})
+        );
+        assert_eq!(
+            log[4].json()["params"],
+            json!({"threadId": "thread-9", "expectedTurnId": "turn-7", "input": [{"type": "text", "text": text}]})
+        );
+    }
+
+    #[test]
+    fn steering_idle_refusal_is_typed_and_distinct_from_other_inactive_states() {
+        for (state, direct_input, reason) in [
+            ("idle", true, CodexSteerRefusalReason::Idle),
+            (
+                "idle",
+                false,
+                CodexSteerRefusalReason::DirectInputUnavailable,
+            ),
+            ("notLoaded", true, CodexSteerRefusalReason::NotLoaded),
+            ("systemError", true, CodexSteerRefusalReason::NotActive),
+            (
+                "futureState",
+                true,
+                CodexSteerRefusalReason::InvalidResponse,
+            ),
+        ] {
+            let mut thread = active_thread_reply();
+            thread["result"]["thread"]["status"] = json!({"type": state});
+            thread["result"]["thread"]["canAcceptDirectInput"] = json!(direct_input);
+            let replies = vec![json!({"id":1,"result":{}}).to_string(), thread.to_string()];
+            let (result, log) = steer_exchange(replies, "hello", SHORT);
+            let error = result.unwrap_err();
+            assert_eq!(error.stage(), CodexSteerStage::ThreadRead);
+            assert_eq!(error.refusal_reason(), Some(reason));
+            assert_eq!(methods(&log), ["initialize", "initialized", "thread/read"]);
+        }
+    }
+
+    #[test]
+    fn steering_refuses_unproven_thread_state_before_requesting_turns() {
+        for (field, value) in [
+            ("id", json!("other-thread")),
+            ("id", Value::Null),
+            ("status", json!({"type": "idle"})),
+            ("status", json!({"type": "notLoaded"})),
+            ("status", json!({"type": "systemError"})),
+            ("status", json!({"type": "futureState"})),
+            ("status", Value::Null),
+            ("canAcceptDirectInput", json!(false)),
+            ("canAcceptDirectInput", Value::Null),
+            ("canAcceptDirectInput", json!("true")),
+        ] {
+            let mut thread = active_thread_reply();
+            thread["result"]["thread"][field] = value;
+            let replies = vec![
+                json!({"id": 1, "result": {}}).to_string(),
+                thread.to_string(),
+            ];
+            let (result, log) = steer_exchange(replies, "hello", SHORT);
+            assert!(
+                matches!(result, Err(CodexSteerError::Refused { .. })),
+                "{field}: {result:?}"
+            );
+            assert_eq!(methods(&log), ["initialize", "initialized", "thread/read"]);
+        }
+    }
+
+    #[test]
+    fn steering_refuses_missing_or_non_active_latest_turn_without_steering() {
+        for data in [
+            json!([]),
+            Value::Null,
+            json!([{"id": "turn-7", "status": "completed", "items": []}]),
+            json!([{"id": "turn-7", "status": "interrupted", "items": []}]),
+            json!([{"id": "turn-7", "status": "failed", "items": []}]),
+            json!([{"id": "turn-7", "status": "futureState", "items": []}]),
+            json!([{"id": "", "status": "inProgress", "items": []}]),
+            json!([{"id": " ", "status": "inProgress", "items": []}]),
+            json!([{"status": "inProgress", "items": []}]),
+            json!([{"id": "turn-7", "status": "inProgress", "items": []}, {"id": "turn-8", "status": "inProgress", "items": []}]),
+        ] {
+            let mut reply = active_turn_reply();
+            reply["result"]["data"] = data;
+            let mut replies = steer_replies();
+            replies.truncate(3);
+            replies[2] = reply.to_string();
+            let (result, log) = steer_exchange(replies, "hello", SHORT);
+            assert!(
+                matches!(result, Err(CodexSteerError::Refused { .. })),
+                "{result:?}"
+            );
+            assert_eq!(
+                methods(&log),
+                [
+                    "initialize",
+                    "initialized",
+                    "thread/read",
+                    "thread/turns/list"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn steering_rpc_errors_never_retry_and_only_validation_rejection_is_refused() {
+        for (stage, code, message) in [
+            (1, -32601, "method unsupported"),
+            (2, -32601, "turn listing unsupported"),
+            (3, -32601, "steering unsupported"),
+            (3, -32602, "invalid parameters"),
+            (3, -32603, "internal error"),
+            (3, -32000, "expected turn is stale"),
+            (3, -32000, "no active turn"),
+        ] {
+            let mut replies = steer_replies();
+            replies.truncate(stage + 1);
+            replies[stage] =
+                json!({"id": stage + 1, "error": {"code": code, "message": message}}).to_string();
+            let (result, log) = steer_exchange(replies, "hello", SHORT);
+            match result {
+                Err(CodexSteerError::Refused { message: error, .. })
+                    if stage < 3 || matches!(code, -32601 | -32602) =>
+                {
+                    assert!(error.contains(message), "{error}")
+                }
+                Err(CodexSteerError::Unconfirmed { message: error, .. })
+                    if stage == 3 && !matches!(code, -32601 | -32602) =>
+                {
+                    assert!(error.contains(message), "{error}")
+                }
+                result => panic!("{code}: {result:?}"),
+            }
+            assert_eq!(methods(&log).len(), stage + 2);
+            assert_eq!(
+                methods(&log)
+                    .iter()
+                    .filter(|method| *method == "turn/steer")
+                    .count(),
+                usize::from(stage == 3)
+            );
+        }
+    }
+
+    #[test]
+    fn steering_malformed_or_mismatched_ack_is_unconfirmed_without_retry() {
+        for reply in [
+            "not json",
+            r#"{"id":99,"result":{"turnId":"turn-7"}}"#,
+            r#"{"id":"4","result":{"turnId":"turn-7"}}"#,
+            r#"{"id":4,"result":{"turnId":"other-turn"}}"#,
+            r#"{"id":4,"result":{"turnId":""}}"#,
+            r#"{"id":4,"result":{"threadId":"other-thread","turnId":"turn-7"}}"#,
+            r#"{"id":4,"result":{}}"#,
+            r#"{"id":4,"result":null}"#,
+            r#"{"id":4}"#,
+            r#"{"id":4,"result":{"turnId":"turn-7"},"error":{"code":1,"message":"ambiguous"}}"#,
+        ] {
+            let mut replies = steer_replies();
+            replies[3] = reply.into();
+            let (result, log) = steer_exchange(replies, "hello", Duration::from_millis(250));
+            assert!(
+                matches!(result, Err(CodexSteerError::Unconfirmed { .. })),
+                "{reply}: {result:?}"
+            );
+            assert_eq!(
+                methods(&log),
+                [
+                    "initialize",
+                    "initialized",
+                    "thread/read",
+                    "thread/turns/list",
+                    "turn/steer"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn steering_preflight_malformed_or_wrong_rpc_id_is_refused_without_mutation() {
+        for reply in [
+            "not json",
+            r#"{"id":99,"result":{}}"#,
+            r#"{"id":2}"#,
+            r#"{"id":2,"result":null}"#,
+        ] {
+            let mut replies = steer_replies();
+            replies.truncate(2);
+            replies[1] = reply.into();
+            let (result, log) = steer_exchange(replies, "hello", Duration::from_millis(250));
+            assert!(
+                matches!(result, Err(CodexSteerError::Refused { .. })),
+                "{reply}: {result:?}"
+            );
+            assert_eq!(methods(&log), ["initialize", "initialized", "thread/read"]);
+        }
+    }
+
+    #[test]
+    fn steering_timeout_before_mutation_is_refused_and_after_write_is_unconfirmed() {
+        for stage in [1, 2, 3] {
+            let mut replies = steer_replies();
+            replies.truncate(stage); // Server drains the next request without replying.
+            let started = Instant::now();
+            let (result, log) = steer_exchange(replies, "hello", Duration::from_millis(150));
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert_eq!(
+                result.as_ref().unwrap_err().stage(),
+                match stage {
+                    1 => CodexSteerStage::ThreadRead,
+                    2 => CodexSteerStage::TurnsList,
+                    _ => CodexSteerStage::Steer,
+                }
+            );
+            match result {
+                Err(CodexSteerError::Refused { message: error, .. }) if stage < 3 => {
+                    assert!(error.contains("timed out"), "{error}")
+                }
+                Err(CodexSteerError::Unconfirmed { message: error, .. }) if stage == 3 => {
+                    assert!(error.contains("timed out"), "{error}")
+                }
+                result => panic!("stage {stage}: {result:?}"),
+            }
+            assert_eq!(methods(&log).len(), stage + 2);
+        }
+    }
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
