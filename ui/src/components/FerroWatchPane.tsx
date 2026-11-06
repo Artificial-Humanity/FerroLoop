@@ -23,6 +23,12 @@ import {
 } from "../types/api";
 import { getAdapterBadgeClass } from "./RosterSidebar";
 import {
+  canonicalAdapter,
+  contextWindowSourceTitle,
+  formatContextMax,
+  formatTokenCount,
+} from "./ChatPane";
+import {
   DEFAULT_TOKENIZER_LEDGER,
   type CountedTokenizerLedgerEntry,
 } from "./FerroStatePane";
@@ -249,6 +255,28 @@ export const DEFAULT_ACP_CONFORMANCE_MATRIX: AcpAdapterConformanceRow[] = [
     },
   },
 ];
+
+/**
+ * An Antigravity hosted record stores an effort-suffixed model id
+ * (`claude-sonnet-5-5-high`) while the session reports the base id. Strip the
+ * suffix for that vendor only so the two do not show up as separate models.
+ */
+export function normalizeHostedModelForVendor(
+  vendor: string | null | undefined,
+  model: string | null | undefined,
+): string {
+  const trimmed = (model ?? "").trim();
+  const v = (vendor ?? "").trim().toLowerCase();
+  if (v !== "antigravity") return trimmed;
+  return trimmed.replace(/-(low|medium|high)$/i, "");
+}
+
+function pushModelOnce(models: string[], model: string): void {
+  const lower = model.toLowerCase();
+  if (model && !models.some((m) => m.toLowerCase() === lower)) {
+    models.push(model);
+  }
+}
 
 export interface FerroWatchPaneProps {
   authority?: HubAuthority | null;
@@ -551,6 +579,21 @@ function getLivenessBadgeStyle(
   }
 }
 
+/**
+ * Allowance still available in a quota window, as a whole percent in 0-100. The Subscription
+ * Quota & Usage Matrix shows this, the same way Settings -> Runtimes & Quotas does
+ * (`formatQuotaWindowRemaining`). `null` means the vendor reported nothing for the window.
+ */
+function quotaRemainingPct(usedPct: number | null): number | null {
+  if (usedPct === null) return null;
+  return Math.max(0, Math.min(100, Math.round(100 - usedPct)));
+}
+
+/** Used percent clamped to 0-100. The bar colour thresholds are defined on usage. */
+function clampUsedPct(usedPct: number | null): number {
+  return usedPct === null ? 0 : Math.max(0, Math.min(100, usedPct));
+}
+
 function getQuotaBarColor(
   pct: number,
   warnPct: number,
@@ -834,10 +877,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       if (persona && !entry.activePersonas.includes(persona)) {
         entry.activePersonas.push(persona);
       }
-      const model = (sess.model ?? "").trim();
-      if (model && !entry.models.includes(model)) {
-        entry.models.push(model);
-      }
+      pushModelOnce(entry.models, (sess.model ?? "").trim());
     }
 
     for (const ag of summary?.health?.agents ?? []) {
@@ -848,10 +888,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         if (ag.active && persona && !entry.activePersonas.includes(persona)) {
           entry.activePersonas.push(persona);
         }
-        const model = (ag.hosted_session?.model ?? "").trim();
-        if (model && !entry.models.includes(model)) {
-          entry.models.push(model);
-        }
+        pushModelOnce(
+          entry.models,
+          normalizeHostedModelForVendor(vKey, ag.hosted_session?.model),
+        );
       }
     }
 
@@ -1145,7 +1185,11 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       if (key) {
         map.set(key, {
           vendor: ag.hosted_session?.vendor ?? ag.adapter ?? null,
-          model: ag.hosted_session?.model ?? null,
+          model:
+            normalizeHostedModelForVendor(
+              ag.hosted_session?.vendor ?? ag.adapter,
+              ag.hosted_session?.model,
+            ) || null,
         });
       }
     }
@@ -1632,8 +1676,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             >
               <span>Live Alerts ({alerts.length})</span>
               <span>
-                Warn {activeThresholds.warn_quota_pct}% / Crit{" "}
-                {activeThresholds.critical_quota_pct}%
+                {`Warn at ${activeThresholds.warn_quota_pct}% used / Crit at ${activeThresholds.critical_quota_pct}% used`}
               </span>
             </div>
 
@@ -1769,14 +1812,12 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               }}
             >
               {vendorMatrix.map((item) => {
-                const pPct =
-                  item.primaryUsedPct !== null
-                    ? Math.max(0, Math.min(100, item.primaryUsedPct))
-                    : 0;
-                const sPct =
-                  item.secondaryUsedPct !== null
-                    ? Math.max(0, Math.min(100, item.secondaryUsedPct))
-                    : 0;
+                const pUsed = clampUsedPct(item.primaryUsedPct);
+                const sUsed = clampUsedPct(item.secondaryUsedPct);
+                // The label and the bar show the allowance still available. An unknown window
+                // shows an empty bar and a dash, not a full bar.
+                const pRemaining = quotaRemainingPct(item.primaryUsedPct);
+                const sRemaining = quotaRemainingPct(item.secondaryUsedPct);
                 const isExhausted = Boolean(item.exhaustedReason);
 
                 return (
@@ -1868,9 +1909,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <span>5h Session Window</span>
                         <span className="fd-mono">
                           <span data-testid={`watch-quota-primary-pct-${item.vendor}`}>
-                            {item.primaryUsedPct !== null
-                              ? `${item.primaryUsedPct.toFixed(0)}%`
-                              : "—"}
+                            {pRemaining !== null ? `${pRemaining}% left` : "—"}
                           </span>{" "}
                           ·{" "}
                           <span data-testid={`watch-quota-primary-reset-${item.vendor}`}>
@@ -1889,10 +1928,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <div
                           data-testid={`watch-quota-primary-bar-${item.vendor}`}
                           style={{
-                            width: `${pPct}%`,
+                            width: `${pRemaining ?? 0}%`,
                             height: "100%",
                             backgroundColor: getQuotaBarColor(
-                              pPct,
+                              pUsed,
                               activeThresholds.warn_quota_pct,
                               activeThresholds.critical_quota_pct,
                               isExhausted,
@@ -1915,9 +1954,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <span>7d Weekly Window</span>
                         <span className="fd-mono">
                           <span data-testid={`watch-quota-secondary-pct-${item.vendor}`}>
-                            {item.secondaryUsedPct !== null
-                              ? `${item.secondaryUsedPct.toFixed(0)}%`
-                              : "—"}
+                            {sRemaining !== null ? `${sRemaining}% left` : "—"}
                           </span>{" "}
                           ·{" "}
                           <span data-testid={`watch-quota-secondary-reset-${item.vendor}`}>
@@ -1936,10 +1973,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         <div
                           data-testid={`watch-quota-secondary-bar-${item.vendor}`}
                           style={{
-                            width: `${sPct}%`,
+                            width: `${sRemaining ?? 0}%`,
                             height: "100%",
                             backgroundColor: getQuotaBarColor(
-                              sPct,
+                              sUsed,
                               activeThresholds.warn_quota_pct,
                               activeThresholds.critical_quota_pct,
                               isExhausted,
@@ -2412,6 +2449,17 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   const key = item.agent.trim().toLowerCase();
                   const hosted = item.hosted_session;
                   const vendor = hosted?.vendor ?? item.adapter ?? null;
+                  const contextUsage =
+                    sessions.find((sess) => sess.id === hosted?.session_id)
+                      ?.context_usage ??
+                    sessions.find((sess) => {
+                      if ((sess.persona || sess.id).trim().toLowerCase() !== key) return false;
+                      // Compare the vendor the row displays; a missing side matches.
+                      const shown = canonicalAdapter(vendor);
+                      const theirs = canonicalAdapter(sess.adapter);
+                      return !shown || !theirs || shown === theirs;
+                    })?.context_usage ??
+                    null;
 
                   return (
                     <div
@@ -2516,6 +2564,38 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                             ? ` (${formatTimestamp(new Date(item.heartbeat_at_ms).toISOString(), activeTimeZone)})`
                             : ""}
                         </span>
+                      </div>
+
+                      <div
+                        data-testid={`watch-liveness-context-${key}`}
+                        data-source={contextUsage?.source ?? "unknown"}
+                        className="fd-mono"
+                        style={{
+                          fontSize: "10px",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {contextUsage && contextUsage.max_tokens > 0 ? (
+                          <>
+                            Context: {formatTokenCount(contextUsage.used_tokens)} /{" "}
+                            <span
+                              data-testid={`watch-liveness-context-max-${key}`}
+                              title={contextWindowSourceTitle(contextUsage.source)}
+                            >
+                              {formatContextMax(
+                                contextUsage.max_tokens,
+                                contextUsage.source,
+                              )}
+                            </span>
+                          </>
+                        ) : contextUsage ? (
+                          <>
+                            Context: {formatTokenCount(contextUsage.used_tokens)} used,
+                            window not reported
+                          </>
+                        ) : (
+                          "Context: not reported"
+                        )}
                       </div>
 
                       {hosted && (
@@ -2918,7 +2998,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  <span>Warn Quota (%)</span>
+                  <span>Warn Quota (% used)</span>
                   <input
                     type="number"
                     step="any"
@@ -2939,7 +3019,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  <span>Critical Quota (%)</span>
+                  <span>Critical Quota (% used)</span>
                   <input
                     type="number"
                     step="any"

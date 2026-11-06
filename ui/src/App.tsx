@@ -117,6 +117,28 @@ export type TabletMaster = "docked" | "overlay";
 export const TABLET_MASTER_MIN_WIDTH_PX = 320;
 export const TABLET_MASTER_MAX_WIDTH_PX = 360;
 
+/**
+ * True when two context usage reports say the same thing, so a re-render can be skipped. The
+ * window's source and offered sizes count: a change in either at the same `max_tokens` must not
+ * be dropped.
+ */
+export function sameContextUsage(
+  a: SessionContextUsage | null | undefined,
+  b: SessionContextUsage | null | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const aw = a.offered_windows ?? [];
+  const bw = b.offered_windows ?? [];
+  return (
+    a.used_tokens === b.used_tokens &&
+    a.max_tokens === b.max_tokens &&
+    a.source === b.source &&
+    aw.length === bw.length &&
+    aw.every((w, i) => w === bw[i])
+  );
+}
+
 export function resolveTabletDockedWidth(viewportWidth: number): number {
   return Math.min(
     TABLET_MASTER_MAX_WIDTH_PX,
@@ -993,13 +1015,7 @@ export const App: React.FC<AppProps> = ({
       }
       setContextUsageByAgent((prev) => {
         const existing = prev[key];
-        if (
-          existing === usage ||
-          (existing &&
-            usage &&
-            existing.used_tokens === usage.used_tokens &&
-            existing.max_tokens === usage.max_tokens)
-        ) {
+        if (sameContextUsage(existing, usage)) {
           return prev;
         }
         return { ...prev, [key]: usage };

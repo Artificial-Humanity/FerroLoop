@@ -46,7 +46,7 @@ use fl_core::arch::{
 use fl_core::store::{AgentRegistry, Catalog, Ledger};
 use fl_exec::stamp;
 use fl_store::AnyStore;
-use fl_wire::identity::{RouteTable, VendorRoute};
+use fl_wire::identity::{RouteTable, VendorRoute, is_native_session_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -96,6 +96,11 @@ pub struct DiscoveredSessionSummary {
     /// states one. Set only by the model-info pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<String>,
+    /// True when `model` is a best guess (Antigravity's configured default, used because the
+    /// session's own trajectory named no usable model), not the model this session reported.
+    /// The model override step ignores such a model as a live report. Never serialized.
+    #[serde(skip)]
+    pub model_is_default: bool,
 }
 
 /// Normalized tool invocation inside a [`TranscriptTurn`] (spec §3.2).
@@ -121,11 +126,67 @@ pub struct TranscriptTurn {
     pub created_at: Option<String>,
 }
 
+/// How a session's context window (`max_tokens`) was found.
+///
+/// `Reported`: the session or the vendor said it for this session (Grok `signals.json`, a
+/// Codex rollout, a vendor setting). `Catalog`: the vendor's model catalog or cache lists it
+/// for the session's model. `Assumed`: nothing on this machine says it (a registry default or
+/// a constant). `Assumed` is the default, so JSON from before this field existed reads as such.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextWindowSource {
+    Reported,
+    Catalog,
+    #[default]
+    Assumed,
+}
+
 /// Server-measured context window token usage for a live vendor session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContextUsage {
     pub used_tokens: u64,
     pub max_tokens: u64,
+    /// How `max_tokens` was found.
+    #[serde(default)]
+    pub source: ContextWindowSource,
+    /// The window sizes the session's model offers, ascending and without duplicates, when the
+    /// vendor lists them. Empty (and left out of the JSON) when no vendor file lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_windows: Vec<u64>,
+}
+
+impl SessionContextUsage {
+    fn new(
+        used_tokens: u64,
+        max_tokens: u64,
+        source: ContextWindowSource,
+        offered_windows: Vec<u64>,
+    ) -> Self {
+        Self {
+            used_tokens,
+            max_tokens,
+            source,
+            offered_windows: normalized_windows(offered_windows),
+        }
+    }
+
+    /// A window that nothing on this machine reports: `max_tokens` is a constant or default.
+    fn assumed(used_tokens: u64, max_tokens: u64) -> Self {
+        Self::new(
+            used_tokens,
+            max_tokens,
+            ContextWindowSource::Assumed,
+            Vec::new(),
+        )
+    }
+}
+
+/// Window sizes sorted ascending with duplicates and zeros removed.
+fn normalized_windows(mut windows: Vec<u64>) -> Vec<u64> {
+    windows.retain(|&n| n > 0);
+    windows.sort_unstable();
+    windows.dedup();
+    windows
 }
 
 /// One vendor allowance window (5-hour primary, weekly secondary, or a single reset).
@@ -170,6 +231,9 @@ pub struct SessionQuotaUsage {
 pub struct DiscoveryStoreSnapshot {
     registered_names: BTreeSet<String>,
     attempts: Vec<DiscoveryAttemptRow>,
+    /// Hosted `vendor:persona` ids and native vendor ids of records whose status is
+    /// `decommissioned`. Discovery skips a route that still names one of them.
+    decommissioned_session_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -582,7 +646,22 @@ pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     DiscoveryStoreSnapshot {
         registered_names,
         attempts,
+        decommissioned_session_ids: decommissioned_session_ids(store),
     }
+}
+
+/// Native ids of hosted records that are still decommissioned.
+/// Persona-derived ids stored on an old record are left out, so a stale
+/// `vendor:persona` tombstone does not keep banning the name.
+fn decommissioned_session_ids(store: &AnyStore) -> BTreeSet<String> {
+    let Ok(records) = crate::lifecycle::list_hosted_sessions(store) else {
+        return BTreeSet::new();
+    };
+    let mut ids = BTreeSet::new();
+    for record in records {
+        ids.extend(crate::lifecycle::record_native_ids(&record));
+    }
+    ids
 }
 
 /// The route ordering needs agent names, but not attempt history.
@@ -595,6 +674,7 @@ pub(crate) fn snapshot_discovery_names(store: &AnyStore) -> DiscoveryStoreSnapsh
             .map(|agent| agent.name_key.to_ascii_lowercase())
             .collect(),
         attempts: Vec::new(),
+        decommissioned_session_ids: decommissioned_session_ids(store),
     }
 }
 
@@ -689,6 +769,19 @@ fn discover_sessions_impl(
     )
 }
 
+/// `true` when `route`'s native session id is in `banned`.
+/// An empty id matches nothing. A webhook route is not a vendor session.
+/// A hosted `vendor:persona` id or other persona-derived id does not match.
+fn route_was_decommissioned(banned: &BTreeSet<String>, route: &VendorRoute) -> bool {
+    if banned.is_empty() {
+        return false;
+    }
+    matches!(
+        route.session_identity(),
+        Some((_, id)) if is_native_session_id(id) && banned.contains(id)
+    )
+}
+
 /// The canonical ID used both for fast resolution and complete discovery.
 fn route_session_id(persona: &str, route: &VendorRoute) -> String {
     match route {
@@ -697,9 +790,13 @@ fn route_session_id(persona: &str, route: &VendorRoute) -> String {
         } if session_id.trim().is_empty() => {
             format!("claude-{persona}-{pid}")
         }
-        VendorRoute::Claude { session_id, .. } | VendorRoute::Grok { session_id, .. } => {
-            session_id.clone()
+        VendorRoute::Claude { session_id, .. } => session_id.clone(),
+        // A live Grok window has no transcript yet, so its route stores an empty id. An empty
+        // id would collapse every such window onto one `seen_ids` entry.
+        VendorRoute::Grok { session_id, .. } if session_id.is_empty() => {
+            format!("grok-{persona}")
         }
+        VendorRoute::Grok { session_id, .. } => session_id.clone(),
         VendorRoute::Agy {
             conversation_id, ..
         } => conversation_id.clone(),
@@ -772,6 +869,9 @@ fn discover_sessions_from_routes(
             continue;
         }
         let raw_id = route_session_id(persona, &entry.route);
+        if route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route) {
+            continue;
+        }
         let (adapter, cwd, transcript_path) = match &entry.route {
             VendorRoute::Claude { .. } => {
                 let tpath = home
@@ -835,8 +935,10 @@ fn discover_sessions_from_routes(
             VendorRoute::Grok {
                 session_id, cwd, ..
             } => {
+                // An empty id is the live-window placeholder, not a transcript name.
                 let tpath = home
                     .as_deref()
+                    .filter(|_| !session_id.is_empty())
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
                 ("grok", cwd.as_ref().map(|p| p.display().to_string()), tpath)
             }
@@ -862,6 +964,7 @@ fn discover_sessions_from_routes(
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             });
         }
     }
@@ -884,6 +987,7 @@ fn discover_sessions_from_routes(
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             });
         }
     }
@@ -937,6 +1041,7 @@ fn discover_sessions_from_routes(
             session.model = info.model;
             session.thinking_level = info.thinking_level;
             session.available_models = info.available_models;
+            session.model_is_default = info.model_is_default;
         }
     }
 
@@ -986,6 +1091,8 @@ struct SessionModelInfo {
     model: Option<String>,
     thinking_level: Option<String>,
     available_models: Vec<String>,
+    /// `model` is the configured default, not what this session's source reported.
+    model_is_default: bool,
 }
 
 fn owned_strings(list: &[&str]) -> Vec<String> {
@@ -1029,12 +1136,15 @@ fn session_model_info(
 /// record, else the default. The text comes through `files`, so it has the transcript read cap.
 // Record layout per the Lead's inspection of Muse 1.4.14; unverified against a live file.
 fn muse_model_info(transcript_path: Option<&str>, files: &mut TranscriptReads) -> SessionModelInfo {
-    let model = transcript_path
+    let session_model = transcript_path
         .and_then(|path| files.raw(path))
-        .and_then(muse_transcript_model_id)
-        .unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string());
+        .and_then(muse_transcript_model_id);
     SessionModelInfo {
-        model: Some(model),
+        // Without a metadata record the default still shows, but it is no report by the session.
+        model_is_default: session_model.is_none(),
+        model: Some(
+            session_model.unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string()),
+        ),
         thinking_level: None,
         available_models: owned_strings(&crate::lifecycle::MUSE_CATALOG_MODELS),
     }
@@ -1136,13 +1246,15 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
     })
 }
 
-/// Latest `metadata.generatorModel` in the steps of a `GetCascadeTrajectory` response
-/// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`, or
-/// `trajectory.steps`). A body cut off by the size cap is not valid JSON; the last
-/// `"generatorModel"` string in the text that did arrive is used then.
+/// The model that RUNS in a `GetCascadeTrajectory` response (`trajectory.steps`) or a
+/// `GetCascadeTrajectorySteps` response (`steps`): see [`running_model_from_json`]. This is the
+/// tail-steps parser; it never reads a requested model (`planModel`), so a window that holds
+/// only user inputs names no model and the caller falls through to the full trajectory. A body
+/// cut off by the size cap is not valid JSON; the last `"generatorModel"` string in the text
+/// that did arrive is used then.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
-        return generator_model_from_json(&val);
+        return running_model_from_json(&val);
     }
     const KEY: &str = "\"generatorModel\"";
     let mut latest = None;
@@ -1160,25 +1272,69 @@ fn parse_agy_generator_model(body: &str) -> Option<String> {
     latest
 }
 
-fn generator_model_from_json(val: &Value) -> Option<String> {
+/// The steps of a trajectory body: `steps` (a `GetCascadeTrajectorySteps` response), else
+/// `trajectory.steps` (a `GetCascadeTrajectory` response).
+fn agy_steps(val: &Value) -> Option<&Vec<Value>> {
     val.pointer("/steps")
-        .or_else(|| val.pointer("/trajectory/steps"))?
-        .as_array()?
-        .iter()
-        .rev()
-        .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")))
+        .or_else(|| val.pointer("/trajectory/steps"))
+        .and_then(Value::as_array)
 }
 
-/// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
-/// body cut off by the size cap holds the OLDEST steps, so its last `generatorModel` is a
-/// stale early model: a body that is not valid JSON names no model.
+/// Where a step says which model RAN it, in order of precedence on one step: the
+/// `generatorModel` of any planner or tool step, then the `modelUsage.model` that only a
+/// `PLANNER_RESPONSE` step carries (same placeholder form).
+const AGY_RUNNING_MODEL_POINTERS: [&str; 2] =
+    ["/metadata/generatorModel", "/metadata/modelUsage/model"];
+
+/// Where a `CORTEX_STEP_TYPE_USER_INPUT` step says which model the user REQUESTED for the turn
+/// it starts: `userConfig`, else `lastUserConfig`. The planner may keep another model (an input
+/// sent while a tool step runs, `metadata.isInterruptingStep`, is not applied to that turn).
+const AGY_REQUESTED_MODEL_POINTERS: [&str; 2] = [
+    "/userInput/userConfig/plannerConfig/planModel",
+    "/userInput/lastUserConfig/plannerConfig/planModel",
+];
+
+/// First non-blank string at any of `pointers` on the newest step that has one.
+fn newest_step_model(val: &Value, pointers: &[&str]) -> Option<String> {
+    agy_steps(val)?.iter().rev().find_map(|step| {
+        pointers
+            .iter()
+            .find_map(|pointer| non_empty_str(step.pointer(pointer)))
+    })
+}
+
+/// The model that is running: the `generatorModel` of the latest step that has one, else that
+/// step's `modelUsage.model`. Newer steps that name no model do not hide an older one. The
+/// value is a placeholder (`MODEL_PLACEHOLDER_*`).
+fn running_model_from_json(val: &Value) -> Option<String> {
+    newest_step_model(val, &AGY_RUNNING_MODEL_POINTERS)
+}
+
+/// The model the user REQUESTED, from the newest user-input step that names one. It is only a
+/// fallback for a conversation whose planner has not answered a turn yet; once any step
+/// reports a running model, that wins (see [`complete_trajectory_model_from_json`]).
+fn requested_model_from_json(val: &Value) -> Option<String> {
+    newest_step_model(val, &AGY_REQUESTED_MODEL_POINTERS)
+}
+
+/// The model of a complete trajectory: the running model, and only when no step has one (a
+/// conversation before its first turn) the requested model. The requested value is a
+/// placeholder or an effort-suffixed id.
+fn complete_trajectory_model_from_json(val: &Value) -> Option<String> {
+    running_model_from_json(val).or_else(|| requested_model_from_json(val))
+}
+
+/// [`parse_agy_generator_model`] for a body that must be complete, with the requested-model
+/// fallback. A `GetCascadeTrajectory` body cut off by the size cap holds the OLDEST steps, so
+/// its last `generatorModel` is a stale early model: a body that is not valid JSON names no
+/// model.
 fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
-    generator_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
+    complete_trajectory_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
 }
 
 /// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
 /// is returned whole with no thinking level.
-fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
+pub(crate) fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
     for level in ["low", "medium", "high"] {
         if let Some(base) = model_id.strip_suffix(&format!("-{level}"))
             && !base.is_empty()
@@ -1189,8 +1345,11 @@ fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
     (model_id.to_string(), None)
 }
 
-/// Match a trajectory placeholder (then the config's default placeholder) against the
-/// configured models. `available_models` lists each base id once, in config order.
+/// Match the trajectory's model (then the config's default placeholder) against the
+/// configured models. The trajectory value is a placeholder, or an effort-suffixed model id
+/// (`claude-sonnet-5-5-high`) as the user's pending choice can be; an id the config does not
+/// list still keeps its base model and effort. A `MODEL_` value the config does not know is
+/// skipped. `available_models` lists each base id once, in config order.
 fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) -> SessionModelInfo {
     let mut available_models: Vec<String> = Vec::new();
     for entry in &config.models {
@@ -1199,26 +1358,37 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
             available_models.push(base);
         }
     }
+    let by_config = |wanted: &str| {
+        config.models.iter().find(|entry| {
+            entry.placeholder.as_deref() == Some(wanted)
+                || entry.model_id.eq_ignore_ascii_case(wanted)
+        })
+    };
+    let mut model_is_default = false;
     let matched = [placeholder, config.default_placeholder.as_deref()]
         .into_iter()
-        .flatten()
-        .find_map(|wanted| {
-            config
-                .models
-                .iter()
-                .find(|entry| entry.placeholder.as_deref() == Some(wanted))
+        .enumerate()
+        .filter_map(|(index, wanted)| wanted.map(|wanted| (index == 1, wanted)))
+        .find_map(|(is_default, wanted)| {
+            let found = match by_config(wanted) {
+                Some(entry) => Some(split_agy_thinking_suffix(&entry.model_id)),
+                None if !wanted.starts_with("MODEL_") => {
+                    Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
+                }
+                None => None,
+            };
+            model_is_default = found.is_some() && is_default;
+            found
         });
     let (model, thinking_level) = match matched {
-        Some(entry) => {
-            let (base, level) = split_agy_thinking_suffix(&entry.model_id);
-            (Some(base), level)
-        }
+        Some((base, level)) => (Some(base), level),
         None => (None, None),
     };
     SessionModelInfo {
         model,
         thinking_level,
         available_models,
+        model_is_default,
     }
 }
 
@@ -1227,6 +1397,7 @@ fn offline_agy_model_info() -> SessionModelInfo {
         model: None,
         thinking_level: None,
         available_models: owned_strings(&AGY_DEFAULT_MODELS),
+        model_is_default: false,
     }
 }
 
@@ -1325,8 +1496,9 @@ fn agy_tail_step_offset(transcript_path: Option<&str>) -> u64 {
         .map_or(0, |index| index.saturating_sub(AGY_STEPS_TAIL_MARGIN))
 }
 
-/// Latest generator model from `GetCascadeTrajectorySteps`, which returns only the newest
-/// steps. `None` when no tail offset is known, the call fails, or the steps name no model.
+/// Latest running model from `GetCascadeTrajectorySteps`, which returns only the newest
+/// steps. `None` when no tail offset is known, the call fails, or the steps name no running
+/// model (a window of user inputs only is `None`: the requested model is not read here).
 fn agy_tail_generator_model(
     port: u16,
     csrf: &str,
@@ -1660,10 +1832,14 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 }
 
 /// A Claude session's model and effort. The transcript names the session's own model (a turn's
-/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` wins
+/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` shows
 /// when it was written after the transcript: a model changed in the Claude app or in that file
 /// shows at once, before any new transcript line exists. Without a transcript signal,
 /// `settings.json` supplies the model.
+///
+/// `settings.json` is one global file shared by every Claude session, so a model that came from
+/// it is never evidence about this session: it is always flagged `model_is_default`, newer than
+/// the transcript or not. Only a transcript signal counts as a live report.
 fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
     let transcript = transcript_path.map(Path::new);
     let from_transcript = transcript
@@ -1686,26 +1862,32 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         (Some(settings), Some(transcript)) => settings > transcript,
         _ => false,
     };
-    let (model, thinking_level) = match from_transcript {
+    let (model, thinking_level, model_is_default) = match from_transcript {
         Some((signal, effort)) if settings_newer && settings_model.is_some() => {
             let model = settings_model.clone().unwrap_or_default();
             // The transcript's command effort still holds when settings.json names that model.
             let effort = settings_effort(&model).or(effort.filter(|_| signal == model));
-            (Some(model), effort)
+            // It shows, but it is the global default and says nothing about this session
+            // (any session or write may have changed the file): never a live report.
+            (Some(model), effort, true)
         }
         Some((model, effort)) => {
             let effort = effort.or_else(|| settings_effort(&model));
-            (Some(model), effort)
+            (Some(model), effort, false)
         }
         None => {
             let effort = settings_model.as_deref().and_then(settings_effort);
-            (settings_model, effort)
+            // No transcript signal: settings.json is the global default, not what this
+            // session runs, whether or not it is newer than the transcript.
+            let is_default = settings_model.is_some();
+            (settings_model, effort, is_default)
         }
     };
     SessionModelInfo {
         model,
         thinking_level,
         available_models: owned_strings(&CLAUDE_MODELS),
+        model_is_default,
     }
 }
 
@@ -1793,15 +1975,18 @@ fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessi
     if available_models.is_empty() {
         available_models = owned_strings(&CODEX_DEFAULT_MODELS);
     }
+    let config_model = config.as_ref().and_then(|c| toml_non_empty_str(c, "model"));
+    // The config default stands in when the rollout tail names no model; it is no live report.
+    let model_is_default = session_model.is_none() && config_model.is_some();
     SessionModelInfo {
-        model: session_model
-            .or_else(|| config.as_ref().and_then(|c| toml_non_empty_str(c, "model"))),
+        model: session_model.or(config_model),
         thinking_level: session_effort.or_else(|| {
             config
                 .as_ref()
                 .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
         }),
         available_models,
+        model_is_default,
     }
 }
 
@@ -1851,10 +2036,14 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
     if available_models.is_empty() {
         available_models = owned_strings(&GROK_DEFAULT_MODELS);
     }
+    let config_model = config_str("default");
+    // The config default stands in when summary.json names no model; it is no live report.
+    let model_is_default = session_model.is_none() && config_model.is_some();
     SessionModelInfo {
-        model: session_model.or_else(|| config_str("default")),
+        model: session_model.or(config_model),
         thinking_level: config_str("default_reasoning_effort"),
         available_models,
+        model_is_default,
     }
 }
 
@@ -2718,10 +2907,11 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
             .saturating_add(json_u64_token(val.get("cache_read_tokens")))
             .saturating_add(json_u64_token(val.get("output_tokens")));
         if used_tokens > 0 {
-            latest = Some(SessionContextUsage {
+            // No file on this machine names an Antigravity model's window: assumed.
+            latest = Some(SessionContextUsage::assumed(
                 used_tokens,
-                max_tokens: 1_000_000,
-            });
+                ASSUMED_LARGE_CONTEXT_WINDOW,
+            ));
         }
     }
     latest
@@ -3108,6 +3298,98 @@ pub(crate) fn fallback_context_window(adapter: &str) -> u64 {
     registered_context_window(adapter).unwrap_or(GENERIC_CONTEXT_WINDOW)
 }
 
+/// The window assumed for Claude, Muse and Antigravity when no vendor file on this machine
+/// names the session's real window.
+const ASSUMED_LARGE_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// A model's window from the vendor model catalog: `models.<id>.info.context_window` of the
+/// Grok `models_cache.json` beside the session (in the `.grok` directory above `tpath`), and
+/// the sizes the model offers (`context_windows`). `None` when the cache, the model or a
+/// positive window is missing.
+fn grok_catalog_windows(tpath: &Path, model_id: &str) -> Option<(Option<u64>, Vec<u64>)> {
+    let grok_dir = tpath
+        .ancestors()
+        .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".grok"))?;
+    let cache = read_json_file(&grok_dir.join("models_cache.json"))?;
+    let info = cache.get("models")?.get(model_id)?.get("info")?;
+    let window = info
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0);
+    let offered = info
+        .get("context_windows")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    Some((window, normalized_windows(offered)))
+}
+
+/// The Codex `models_cache.json` `context_window` of the model the rollout `raw` ran (its
+/// newest `payload.model`, else `config.toml`'s `model`), from the `.codex` directory above
+/// `tpath`.
+fn codex_catalog_window(tpath: &Path, raw: &str) -> Option<u64> {
+    let codex_dir = tpath
+        .ancestors()
+        .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".codex"))?;
+    let tail = read_file_tail(tpath, CLAUDE_TRANSCRIPT_TAIL_BYTES);
+    let model = codex_rollout_settings(tail.as_deref().unwrap_or(raw))
+        .0
+        .or_else(|| {
+            read_toml_file(&codex_dir.join("config.toml"))
+                .and_then(|c| toml_non_empty_str(&c, "model"))
+        })?;
+    let cache = read_json_file(&codex_dir.join("models_cache.json"))?;
+    cache
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("slug").and_then(Value::as_str) == Some(model.as_str()))?
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+}
+
+/// A Muse model's `context_limit` from the `model-catalog/*.json` rows (`rows[].model_id`) in
+/// the Muse data directory above `tpath` (the one holding `model-catalog`). The search climbs
+/// from the transcript and stops at the Muse data directory itself (the first ancestor named
+/// `muse` or holding a `sessions` directory), so an unrelated `model-catalog` further up is never
+/// read. Files are read in name order; when several list the same model the first file by name
+/// wins, and within a file the first row naming `model_id` with a positive limit.
+fn muse_catalog_context_limit(tpath: &Path, model_id: &str) -> Option<u64> {
+    let mut catalog_dir = None;
+    for ancestor in tpath.ancestors() {
+        let candidate = ancestor.join("model-catalog");
+        if candidate.is_dir() {
+            catalog_dir = Some(candidate);
+            break;
+        }
+        let is_muse_data_dir =
+            ancestor.file_name().is_some_and(|n| n == "muse") || ancestor.join("sessions").is_dir();
+        if is_muse_data_dir {
+            break;
+        }
+    }
+    let catalog_dir = catalog_dir?;
+    let mut files: Vec<PathBuf> = fs::read_dir(catalog_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    files.iter().find_map(|file| {
+        read_json_file(file)?
+            .get("rows")?
+            .as_array()?
+            .iter()
+            .filter(|row| row.get("model_id").and_then(Value::as_str) == Some(model_id))
+            .find_map(|row| {
+                row.get("context_limit")
+                    .and_then(Value::as_u64)
+                    .filter(|&n| n > 0)
+            })
+    })
+}
+
 /// Read server-measured context window token usage for `session_id` when vendor session
 /// metadata (such as Grok `signals.json`/`summary.json`, Claude `message.usage`, Codex `token_count`,
 /// Antigravity `PLANNER_RESPONSE`, or Muse `model_completed`) is available.
@@ -3200,7 +3482,20 @@ fn context_usage_for_transcript(
                         .filter(|&n| n > 0)
                 })
             });
-        let max_tokens = signals_val
+        // The model the session ran: `summary.json`, else the one `signals.json` counts most.
+        let model_id = summary_val
+            .as_ref()
+            .and_then(|v| non_empty_str(v.get("current_model_id")))
+            .or_else(|| {
+                signals_val
+                    .as_ref()
+                    .and_then(|v| non_empty_str(v.get("primaryModelId")))
+            });
+        let (catalog_window, offered_windows) = model_id
+            .as_deref()
+            .and_then(|id| grok_catalog_windows(&tpath, id))
+            .unwrap_or_default();
+        let reported_max = signals_val
             .as_ref()
             .and_then(|v| v.get("contextWindowTokens").and_then(Value::as_u64))
             .filter(|&n| n > 0)
@@ -3209,14 +3504,23 @@ fn context_usage_for_transcript(
                     .as_ref()
                     .and_then(|v| v.get("context_window").and_then(Value::as_u64))
                     .filter(|&n| n > 0)
-            })
-            .unwrap_or_else(|| fallback_context_window("grok"));
+            });
+        let (max_tokens, source) = match (reported_max, catalog_window) {
+            (Some(n), _) => (n, ContextWindowSource::Reported),
+            (None, Some(n)) => (n, ContextWindowSource::Catalog),
+            (None, None) => (
+                fallback_context_window("grok"),
+                ContextWindowSource::Assumed,
+            ),
+        };
 
         if let Some(used_tokens) = used_tokens {
-            return Some(SessionContextUsage {
+            return Some(SessionContextUsage::new(
                 used_tokens,
                 max_tokens,
-            });
+                source,
+                offered_windows,
+            ));
         }
     }
 
@@ -3246,25 +3550,40 @@ fn context_usage_for_transcript(
                         .and_then(Value::as_u64)
                         .filter(|&n| n > 0)
                 });
-            let max_tokens = configured_max
-                .or_else(|| {
-                    val.pointer("/payload/info/model_context_window")
-                        .and_then(Value::as_u64)
-                        .filter(|&n| n > 0)
-                })
-                .unwrap_or_else(|| fallback_context_window("codex"));
-            if let Some(used_tokens) = used_tokens {
-                return Some(SessionContextUsage {
-                    used_tokens,
-                    max_tokens,
-                });
-            }
+            let Some(used_tokens) = used_tokens else {
+                continue;
+            };
+            let (max_tokens, source) = if let Some(n) = configured_max {
+                (n, ContextWindowSource::Reported)
+            } else if let Some(n) = val
+                .pointer("/payload/info/model_context_window")
+                .and_then(Value::as_u64)
+                .filter(|&n| n > 0)
+            {
+                (n, ContextWindowSource::Reported)
+            } else if let Some(n) = codex_catalog_window(&tpath, raw) {
+                (n, ContextWindowSource::Catalog)
+            } else {
+                (
+                    fallback_context_window("codex"),
+                    ContextWindowSource::Assumed,
+                )
+            };
+            // `max_context_window` in the cache is a cap, not a list of selectable sizes.
+            return Some(SessionContextUsage::new(
+                used_tokens,
+                max_tokens,
+                source,
+                Vec::new(),
+            ));
         }
         if let Some(max_tokens) = configured_max {
-            return Some(SessionContextUsage {
-                used_tokens: 0,
+            return Some(SessionContextUsage::new(
+                0,
                 max_tokens,
-            });
+                ContextWindowSource::Reported,
+                Vec::new(),
+            ));
         }
     }
 
@@ -3299,9 +3618,21 @@ fn context_usage_for_transcript(
                     estimated
                 };
                 if used_tokens > 0 {
-                    return Some(SessionContextUsage {
-                        used_tokens,
-                        max_tokens: 1_000_000,
+                    let model_id = non_empty_str(val.pointer("/payload/event/model"))
+                        .or_else(|| muse_transcript_model_id(raw));
+                    let catalog_limit = model_id
+                        .as_deref()
+                        .and_then(|id| muse_catalog_context_limit(&tpath, id));
+                    return Some(match catalog_limit {
+                        Some(limit) => SessionContextUsage::new(
+                            used_tokens,
+                            limit,
+                            ContextWindowSource::Catalog,
+                            Vec::new(),
+                        ),
+                        None => {
+                            SessionContextUsage::assumed(used_tokens, ASSUMED_LARGE_CONTEXT_WINDOW)
+                        }
                     });
                 }
             }
@@ -3334,10 +3665,10 @@ fn context_usage_for_transcript(
                     .and_then(Value::as_u64)
                     .filter(|&n| n > 0);
                 if let Some(used_tokens) = post_tokens {
-                    return Some(SessionContextUsage {
+                    return Some(SessionContextUsage::assumed(
                         used_tokens,
-                        max_tokens: 1_000_000,
-                    });
+                        ASSUMED_LARGE_CONTEXT_WINDOW,
+                    ));
                 }
                 // A boundary without a post-compaction size says nothing: keep looking.
                 continue;
@@ -3364,10 +3695,12 @@ fn context_usage_for_transcript(
                     .saturating_add(cache_read)
                     .saturating_add(output);
                 if used_tokens > 0 {
-                    return Some(SessionContextUsage {
+                    // No transcript or settings key on this machine records Claude's
+                    // effective window (200k or 1M): assumed.
+                    return Some(SessionContextUsage::assumed(
                         used_tokens,
-                        max_tokens: 1_000_000,
-                    });
+                        ASSUMED_LARGE_CONTEXT_WINDOW,
+                    ));
                 }
             }
         }
@@ -6175,6 +6508,408 @@ mod tests {
         assert!(parse_agy_generator_model("garbage").is_none());
     }
 
+    /// A model config that names the placeholders a trajectory's pending choice can carry, with
+    /// the mapping the language server reports: M318-M320 Gemini 3.8 Flash High/Medium/Low,
+    /// M400-M402 Claude Opus 5.5 Low/Medium/High, M403-M405 Claude Sonnet 5.5 Low/Medium/High,
+    /// M417-M419 Gemini 4 Argon High/Medium/Low.
+    const AGY_PENDING_CONFIG_FIXTURE: &str = r#"{
+        "clientModelConfigs": [
+            {"modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+            {"modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"}},
+            {"modelId":"gemini-4-argon-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M419"}},
+            {"modelId":"claude-sonnet-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}},
+            {"modelId":"claude-sonnet-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M404"}},
+            {"modelId":"claude-sonnet-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M403"}},
+            {"modelId":"claude-opus-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M402"}},
+            {"modelId":"claude-opus-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M401"}},
+            {"modelId":"claude-opus-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M400"}},
+            {"modelId":"gemini-3.8-flash-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"}},
+            {"modelId":"gemini-3.8-flash-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M319"}},
+            {"modelId":"gemini-3.8-flash-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M320"}},
+            {"modelId":"gpt-oss-120b-medium","modelOrAlias":{"model":"MODEL_OPENAI_GPT_OSS_120B_MEDIUM"}}
+        ],
+        "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M319"}}
+    }"#;
+
+    /// A `CORTEX_STEP_TYPE_USER_INPUT` step as the language server returns it: the model the
+    /// user picked sits under `userInput` on the step itself.
+    fn user_input_step(user: Option<&str>, last: Option<&str>) -> Value {
+        let mut input = serde_json::Map::new();
+        for (key, value) in [("userConfig", user), ("lastUserConfig", last)] {
+            if let Some(value) = value {
+                input.insert(
+                    key.into(),
+                    serde_json::json!({ "plannerConfig": { "planModel": value } }),
+                );
+            }
+        }
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "userInput": input,
+        })
+    }
+
+    fn planner_step(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": { "generatorModel": model },
+        })
+    }
+
+    /// A tool step that carries no model signal.
+    fn tool_step() -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": { "toolCall": { "name": "run_command" } },
+        })
+    }
+
+    /// The same steps as a `GetCascadeTrajectory` body and as a `GetCascadeTrajectorySteps` body.
+    fn agy_step_bodies(steps: &[Value]) -> [String; 2] {
+        [
+            serde_json::json!({
+                "trajectory": {
+                    "trajectoryId": "t1",
+                    "cascadeId": "c1",
+                    "steps": steps,
+                    "generatorMetadata": [],
+                    "metadata": {},
+                },
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "numTotalSteps": steps.len(),
+            })
+            .to_string(),
+            serde_json::json!({ "steps": steps }).to_string(),
+        ]
+    }
+
+    /// A planner or tool step with only a `modelUsage.model`, as a `PLANNER_RESPONSE` step can
+    /// carry it when `generatorModel` is absent.
+    fn model_usage_step(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "metadata": { "modelUsage": { "model": model } },
+        })
+    }
+
+    /// A tool step that ran under `model`: it has a `generatorModel` and no `modelUsage`.
+    fn tool_step_with_model(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_RUNNING",
+            "metadata": { "generatorModel": model, "toolCall": { "name": "run_command" } },
+        })
+    }
+
+    /// Assert that a step list names the RUNNING model `want` through both the tail parser and
+    /// the complete-body parser, in both body shapes.
+    fn assert_agy_steps_model(steps: &[Value], want: Option<&str>) {
+        for body in agy_step_bodies(steps) {
+            assert_eq!(parse_agy_generator_model(&body).as_deref(), want, "{body}");
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                want,
+                "{body}"
+            );
+        }
+    }
+
+    /// Assert that a step list has no running model: the tail parser names none and the
+    /// complete-body parser falls back to the requested model `want`.
+    fn assert_agy_requested_model_only(steps: &[Value], want: Option<&str>) {
+        for body in agy_step_bodies(steps) {
+            assert_eq!(parse_agy_generator_model(&body), None, "{body}");
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                want,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn agy_a_newer_user_input_does_not_replace_the_running_model() {
+        let steps = [
+            user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+            planner_step("MODEL_PLACEHOLDER_M418"),
+            tool_step_with_model("MODEL_PLACEHOLDER_M418"),
+            user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
+        ];
+        assert_agy_steps_model(&steps, Some("MODEL_PLACEHOLDER_M418"));
+        // An input sent while a tool step runs is flagged, and the planner keeps its model.
+        let mut interrupting = user_input_step(Some("MODEL_PLACEHOLDER_M401"), None);
+        interrupting["metadata"] = serde_json::json!({ "isInterruptingStep": true });
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M418"),
+                interrupting,
+            ],
+            Some("MODEL_PLACEHOLDER_M418"),
+        );
+        // A requested model on the step's own userInput never beats the step's generatorModel
+        // either, and a lastUserConfig is no different from a userConfig.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(None, Some("MODEL_PLACEHOLDER_M401")),
+            ],
+            Some("MODEL_PLACEHOLDER_M418"),
+        );
+    }
+
+    #[test]
+    fn agy_a_planner_step_after_a_user_input_shows_the_model_that_ran() {
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
+                planner_step("MODEL_PLACEHOLDER_M401"),
+            ],
+            Some("MODEL_PLACEHOLDER_M401"),
+        );
+        assert_agy_steps_model(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                planner_step("MODEL_PLACEHOLDER_M400"),
+            ],
+            Some("MODEL_PLACEHOLDER_M400"),
+        );
+    }
+
+    #[test]
+    fn agy_the_latest_step_with_a_running_model_wins_over_newer_silent_steps() {
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                planner_step("MODEL_PLACEHOLDER_M319"),
+                tool_step(),
+                serde_json::json!({ "type": "CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE" }),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M319"),
+        );
+        // A tool step with a generatorModel and no modelUsage counts.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M319"),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M319"),
+        );
+        // A user input, however new, hides nothing.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                tool_step(),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M400"),
+        );
+    }
+
+    #[test]
+    fn agy_model_usage_names_the_running_model_when_generator_model_is_absent() {
+        assert_agy_steps_model(
+            &[model_usage_step("MODEL_PLACEHOLDER_M420")],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+        // A newer step with only modelUsage beats an older generatorModel.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                model_usage_step("MODEL_PLACEHOLDER_M420"),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+        // generatorModel is preferred when both are present on one step.
+        let both = serde_json::json!({
+            "metadata": {
+                "generatorModel": "MODEL_PLACEHOLDER_M418",
+                "modelUsage": { "model": "MODEL_PLACEHOLDER_M420" },
+            },
+        });
+        assert_agy_steps_model(&[both], Some("MODEL_PLACEHOLDER_M418"));
+        // A blank generatorModel falls back to the same step's modelUsage.
+        let blank = serde_json::json!({
+            "metadata": {
+                "generatorModel": "  ",
+                "modelUsage": { "model": "MODEL_PLACEHOLDER_M420" },
+            },
+        });
+        assert_agy_steps_model(
+            &[planner_step("MODEL_PLACEHOLDER_M418"), blank],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+    }
+
+    #[test]
+    fn agy_before_the_first_turn_the_requested_model_is_the_only_signal() {
+        // Only user inputs: the tail parser names nothing, the complete parser reads planModel.
+        assert_agy_requested_model_only(
+            &[user_input_step(Some("MODEL_PLACEHOLDER_M405"), None)],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // lastUserConfig is used when userConfig is absent, empty or blank on the step.
+        assert_agy_requested_model_only(
+            &[user_input_step(None, Some("MODEL_PLACEHOLDER_M417"))],
+            Some("MODEL_PLACEHOLDER_M417"),
+        );
+        for blank in ["", "   "] {
+            assert_agy_requested_model_only(
+                &[user_input_step(Some(blank), Some("claude-sonnet-5-5-high"))],
+                Some("claude-sonnet-5-5-high"),
+            );
+        }
+        // userConfig wins over lastUserConfig on one step.
+        assert_agy_requested_model_only(
+            &[user_input_step(
+                Some("MODEL_PLACEHOLDER_M405"),
+                Some("MODEL_PLACEHOLDER_M417"),
+            )],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // The newest user-input step comes first, and steps with no model do not hide it.
+        assert_agy_requested_model_only(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // A newest step with only blank requests falls back to an older step's request.
+        assert_agy_requested_model_only(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+                user_input_step(Some("  "), Some("")),
+            ],
+            Some("MODEL_PLACEHOLDER_M417"),
+        );
+        // The value is trimmed.
+        assert_agy_requested_model_only(
+            &[user_input_step(Some(" gpt-oss-120b-medium "), None)],
+            Some("gpt-oss-120b-medium"),
+        );
+    }
+
+    #[test]
+    fn agy_steps_without_a_usable_model_signal_name_no_model() {
+        assert_agy_steps_model(&[], None);
+        assert_agy_steps_model(&[tool_step(), tool_step()], None);
+        // Whitespace-only and non-string values are ignored.
+        assert_agy_steps_model(&[user_input_step(Some("  "), Some(""))], None);
+        assert_agy_steps_model(
+            &[
+                serde_json::json!({ "metadata": { "generatorModel": "  " } }),
+                serde_json::json!({ "metadata": { "modelUsage": { "model": " " } } }),
+                serde_json::json!({ "metadata": { "generatorModel": 7 } }),
+                serde_json::json!({
+                    "userInput": { "userConfig": { "plannerConfig": { "planModel": 7 } } }
+                }),
+                serde_json::json!({ "userInput": { "userConfig": { "plannerConfig": {} } } }),
+            ],
+            None,
+        );
+        // A blank signal on a newer step does not hide an older one.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                serde_json::json!({ "metadata": { "generatorModel": "" } }),
+                user_input_step(Some("  "), Some("")),
+            ],
+            Some("MODEL_PLACEHOLDER_M400"),
+        );
+        // No steps array at all.
+        assert_eq!(parse_agy_generator_model(r#"{"trajectory":{}}"#), None);
+        assert_eq!(parse_agy_generator_model(r#"{"status":"IDLE"}"#), None);
+        // `userInput` is read from steps only, never from the body root or the trajectory.
+        let misplaced = r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}},"trajectory":{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}},"steps":[]}}"#;
+        assert_eq!(parse_agy_generator_model(misplaced), None);
+        assert_eq!(parse_agy_complete_generator_model(misplaced), None);
+    }
+
+    #[test]
+    fn agy_cut_off_bodies_ignore_the_requested_plan_model() {
+        // The string scan is for the tail-steps call; it never reads planModel.
+        let cut = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}}},{"metadata":{"generatorMo"#;
+        assert_eq!(parse_agy_generator_model(cut), None);
+        assert_eq!(parse_agy_complete_generator_model(cut), None);
+        let cut_with_step = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}}},{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M400"}},{"metadata":{"generatorMo"#;
+        assert_eq!(
+            parse_agy_generator_model(cut_with_step).as_deref(),
+            Some("MODEL_PLACEHOLDER_M400")
+        );
+        assert_eq!(parse_agy_complete_generator_model(cut_with_step), None);
+    }
+
+    #[test]
+    fn agy_requested_plan_model_from_a_step_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
+        let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
+        for (value, model, level) in [
+            ("MODEL_PLACEHOLDER_M417", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M405", "claude-sonnet-5-5", Some("high")),
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5", Some("high")),
+            ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
+        ] {
+            let [body, _] = agy_step_bodies(&[user_input_step(Some(value), None)]);
+            let found = parse_agy_complete_generator_model(&body);
+            assert_eq!(found.as_deref(), Some(value));
+            let info = resolve_agy_model_info(&config, found.as_deref());
+            assert_eq!(info.model.as_deref(), Some(model), "{value}");
+            assert_eq!(info.thinking_level.as_deref(), level, "{value}");
+        }
+    }
+
+    #[test]
+    fn agy_pending_plan_model_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
+        let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
+        for (value, model, level) in [
+            // Placeholders come from the model config.
+            ("MODEL_PLACEHOLDER_M417", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M405", "claude-sonnet-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M400", "claude-opus-5-5", Some("low")),
+            ("MODEL_PLACEHOLDER_M319", "gemini-3.8-flash", Some("medium")),
+            ("MODEL_PLACEHOLDER_M318", "gemini-3.8-flash", Some("high")),
+            ("MODEL_PLACEHOLDER_M320", "gemini-3.8-flash", Some("low")),
+            ("MODEL_PLACEHOLDER_M401", "claude-opus-5-5", Some("medium")),
+            ("MODEL_PLACEHOLDER_M402", "claude-opus-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M403", "claude-sonnet-5-5", Some("low")),
+            (
+                "MODEL_PLACEHOLDER_M404",
+                "claude-sonnet-5-5",
+                Some("medium"),
+            ),
+            ("MODEL_PLACEHOLDER_M418", "gemini-4-argon", Some("medium")),
+            ("MODEL_PLACEHOLDER_M419", "gemini-4-argon", Some("low")),
+            (
+                "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
+                "gpt-oss-120b",
+                Some("medium"),
+            ),
+            // Effort-suffixed ids, in the config or not, keep their effort.
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5", Some("high")),
+            ("gemini-4-argon-medium", "gemini-4-argon", Some("medium")),
+            ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
+            ("Claude-Sonnet-5-5-HIGH", "claude-sonnet-5-5", Some("high")),
+            ("claude-opus-5-5-low", "claude-opus-5-5", Some("low")),
+        ] {
+            let info = resolve_agy_model_info(&config, Some(value));
+            assert_eq!(info.model.as_deref(), Some(model), "{value}");
+            assert_eq!(info.thinking_level.as_deref(), level, "{value}");
+        }
+        // An unknown placeholder still falls back to the config default.
+        let info = resolve_agy_model_info(&config, Some("MODEL_PLACEHOLDER_M9999"));
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+    }
+
     #[test]
     fn agy_without_a_reachable_language_server_lists_the_default_models() {
         let offline = offline_agy_model_info();
@@ -6399,6 +7134,84 @@ mod tests {
         stub.shutdown();
     }
 
+    #[test]
+    fn agy_default_model_fallback_is_flagged_and_a_trajectory_model_is_not() {
+        let config = parse_agy_model_config(AGY_CONFIG_FIXTURE).expect("config parses");
+        // The trajectory's own model, by placeholder or as a plain id: not a guess.
+        for found in [Some("MODEL_PLACEHOLDER_M417"), Some("Some-Model-Low")] {
+            let info = resolve_agy_model_info(&config, found);
+            assert!(info.model.is_some(), "{found:?}");
+            assert!(!info.model_is_default, "{found:?}");
+        }
+        // No trajectory model, or one the config does not know: the default stands in.
+        for found in [None, Some("MODEL_PLACEHOLDER_M000")] {
+            let info = resolve_agy_model_info(&config, found);
+            assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"), "{found:?}");
+            assert!(info.model_is_default, "{found:?}");
+        }
+        // With no default either, there is no model and nothing to flag.
+        let mut bare = config.clone();
+        bare.default_placeholder = None;
+        let info = resolve_agy_model_info(&bare, None);
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn agy_discovery_flags_a_session_whose_trajectory_gave_no_model() {
+        // The config call succeeds and the trajectory body is unusable.
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, "not json");
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let tmp = TempDir::new().unwrap();
+        write_routes(
+            tmp.path(),
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(tmp.path());
+        let agy = session_for(&sessions, "ferris");
+        // The default still shows, but it is marked as a guess.
+        assert_eq!(agy.model.as_deref(), Some("gemini-3.8-flash"));
+        assert!(agy.model_is_default);
+        stub.shutdown();
+
+        // A real placeholder in the trajectory is a live report.
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, AGY_TRAJECTORY_FIXTURE);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            tmp.path(),
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(tmp.path());
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
+        assert!(!agy.model_is_default);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn the_default_model_marker_never_reaches_the_json() {
+        let mut summary = muse_session_with_transcript(None);
+        summary.model_is_default = true;
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("model_is_default").is_none(), "{json}");
+        assert!(!json.to_string().contains("model_is_default"));
+        // And a payload cannot set it.
+        let mut input = json.clone();
+        input["model_is_default"] = Value::Bool(true);
+        let back: DiscoveredSessionSummary = serde_json::from_value(input).unwrap();
+        assert!(!back.model_is_default);
+    }
+
     const AGY_STEPS_FIXTURE: &str = r#"{"steps":[
         {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},
         {"metadata":{}},
@@ -6574,6 +7387,83 @@ mod tests {
                 ],
                 "{cascade}: the tail call first, then the full trajectory"
             );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
+    fn agy_live_model_reads_the_running_model_and_falls_back_to_the_requested_one_only_in_full() {
+        fn leak(body: &str) -> &'static str {
+            Box::leak(body.to_string().into_boxed_str())
+        }
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
+        let pending = user_input_step(Some("MODEL_PLACEHOLDER_M405"), None);
+        // (case, steps the tail call returns, steps the full trajectory holds, model, effort,
+        //  whether the full trajectory is asked)
+        let cases = [
+            // The tail window holds a planner step before the user input: the tail decides.
+            (
+                "tail-running",
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M400"),
+                    tool_step(),
+                    pending.clone(),
+                ],
+                vec![planner_step("MODEL_PLACEHOLDER_M417")],
+                "claude-opus-5-5",
+                "low",
+                false,
+            ),
+            // The tail window holds only a user input: no running model, so the full
+            // trajectory is asked and its planner steps name the model that runs.
+            (
+                "tail-user-input-only",
+                vec![tool_step(), pending.clone()],
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M400"),
+                    tool_step(),
+                    pending.clone(),
+                ],
+                "claude-opus-5-5",
+                "low",
+                true,
+            ),
+            // First turn: no step anywhere has a running model, so the requested one shows.
+            (
+                "first-turn",
+                vec![tool_step(), pending.clone()],
+                vec![pending],
+                "claude-sonnet-5-5",
+                "high",
+                true,
+            ),
+        ];
+        for (name, tail_steps, full_steps, model, effort, asks_full) in cases {
+            let [_, tail] = agy_step_bodies(&tail_steps);
+            let [full, _] = agy_step_bodies(&full_steps);
+            let cascade: &'static str = leak(&format!("agy-live-{name}"));
+            let stub = spawn_agy_stub_with_steps(
+                AGY_PENDING_CONFIG_FIXTURE,
+                leak(&full),
+                cascade,
+                Some((200, leak(&tail))),
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                Some(&transcript),
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some(model), "{cascade}");
+            assert_eq!(info.thinking_level.as_deref(), Some(effort), "{cascade}");
+            let mut want = vec!["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"];
+            if asks_full {
+                want.push("GetCascadeTrajectory");
+            }
+            assert_eq!(stub_paths(&stub), want, "{cascade}");
             stub.shutdown();
         }
     }
@@ -7904,10 +8794,322 @@ mod tests {
     }
 
     #[test]
+    fn a_decommissioned_route_is_skipped_even_when_the_route_file_still_has_it() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        routes.upsert(
+            "cara",
+            VendorRoute::Agy {
+                conversation_id: "conv-2".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        routes.upsert(
+            "bea",
+            VendorRoute::Webhook {
+                socket_path: home.join("bea.sock"),
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::from([
+                "conv-1".to_string(),
+                "antigravity:ada".to_string(),
+            ]),
+        };
+        let sessions = discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(
+            sessions.iter().all(|session| session.id != "conv-1"),
+            "{sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|session| session.id == "conv-2"),
+            "antigravity:ada alone must not skip a different conversation: {sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|session| session.adapter == "webhook"),
+            "{sessions:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_grok_route_resolves_from_its_discovered_id() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Grok {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("Ada:grok".into()),
+                tmux_pane: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::from(["grok:ada".to_string()]),
+        };
+        let sessions = discover_route_sessions_without_model_info(&snap, Some(home));
+        let grok = sessions
+            .iter()
+            .find(|session| session.persona.as_deref() == Some("ada"))
+            .unwrap_or_else(|| panic!("missing ada: {sessions:?}"));
+        assert_eq!(grok.id, "grok-ada");
+        let (id, persona) = crate::api::resolve_session_target_in(&sessions, "grok-ada");
+        assert_eq!(id, "grok-ada");
+        assert_eq!(persona.as_deref(), Some("ada"));
+        let route = VendorRoute::Grok {
+            session_id: String::new(),
+            cwd: None,
+            tmux_target: Some("Ada:grok".into()),
+            tmux_pane: None,
+        };
+        assert!(!crate::api::route_matches_session_id(&route, "grok-ada"));
+        assert!(!crate::api::route_matches_session_id(&route, ""));
+    }
+
+    #[test]
+    fn two_live_grok_placeholders_with_empty_ids_are_both_discovered() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        for (persona, target) in [("felicia", "Felicia:grok"), ("ada", "Ada:grok")] {
+            routes.upsert(
+                persona,
+                VendorRoute::Grok {
+                    session_id: String::new(),
+                    cwd: None,
+                    tmux_target: Some(target.into()),
+                    tmux_pane: None,
+                },
+                fl_core::at::At::from_unix_millis(1),
+            );
+        }
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::new(),
+        };
+        let (sessions, costs) = cost_counters::measure(|| {
+            discover_route_sessions_without_model_info(&snap, Some(home))
+        });
+        let grok: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.adapter == "grok")
+            .collect();
+        assert_eq!(grok.len(), 2, "{sessions:?}");
+        for (persona, id) in [("felicia", "grok-felicia"), ("ada", "grok-ada")] {
+            let session = grok
+                .iter()
+                .find(|session| session.persona.as_deref() == Some(persona))
+                .unwrap_or_else(|| panic!("missing {persona}: {sessions:?}"));
+            assert_eq!(session.id, id);
+            assert_eq!(session.transcript_path, None);
+        }
+        assert_eq!(costs.transcript_finds, 0, "an empty id is not a transcript");
+    }
+
+    #[test]
+    fn muse_default_model_is_flagged_and_a_metadata_model_is_not() {
+        let other = muse_line(
+            "runtime.session",
+            serde_json::json!({"model_id":"muse-spark-1.3"}),
+        );
+        let no_id = muse_line("runtime.session.metadata", serde_json::json!({"record":{}}));
+        // No metadata record, no model_id in it, and no transcript: the default stands in.
+        for lines in [
+            Some(vec![other]),
+            Some(vec![no_id, "not json".to_string()]),
+            None,
+        ] {
+            let session = muse_session_with_transcript(lines.as_deref());
+            assert_eq!(session.model.as_deref(), Some("muse-wonder-full-1.0"));
+            assert!(session.model_is_default);
+        }
+        // A metadata record names the session's own model, even when it equals the default.
+        for model in ["muse-spark-1.3", "muse-wonder-full-1.0"] {
+            let session = muse_session_with_transcript(Some(&[muse_metadata_line(model)]));
+            assert_eq!(session.model.as_deref(), Some(model));
+            assert!(!session.model_is_default, "{model}");
+        }
+    }
+
+    #[test]
+    fn codex_config_model_is_flagged_and_a_rollout_model_is_not() {
+        let tmp = codex_home_with_config();
+        // A rollout with no model (a fresh session), and no rollout at all.
+        let fresh = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"session_meta","payload":{"id":"t-fixture"}}"#],
+        );
+        let no_rollout = codex_model_info(None, Some(tmp.path()));
+        for info in [fresh, no_rollout] {
+            assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+            assert!(info.model_is_default);
+        }
+        // The rollout names the model, even when it equals the config's.
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra"] {
+            let line = format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#);
+            let info = codex_session_info(tmp.path(), &[&line]);
+            assert_eq!(info.model.as_deref(), Some(model));
+            assert!(!info.model_is_default, "{model}");
+        }
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = codex_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn grok_config_default_is_flagged_and_a_summary_model_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let grok = home.join(".grok");
+        let session = grok.join("sessions").join("p").join("s1");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            grok.join("config.toml"),
+            "[models]\ndefault = \"grok-4.7\"\n",
+        )
+        .unwrap();
+        let chat = session.join("chat_history.jsonl");
+        // No summary.json, then a summary without the model id: the config default stands in.
+        for summary in [None, Some(r#"{"num_messages":3}"#)] {
+            let _ = fs::remove_file(session.join("summary.json"));
+            if let Some(summary) = summary {
+                fs::write(session.join("summary.json"), summary).unwrap();
+            }
+            let info = grok_model_info(chat.to_str(), Some(home));
+            assert_eq!(info.model.as_deref(), Some("grok-4.7"), "{summary:?}");
+            assert!(info.model_is_default, "{summary:?}");
+        }
+        // The summary names the session's model, even when it equals the config default.
+        for model in ["grok-4.6", "grok-4.7"] {
+            fs::write(
+                session.join("summary.json"),
+                format!(r#"{{"current_model_id":"{model}"}}"#),
+            )
+            .unwrap();
+            let info = grok_model_info(chat.to_str(), Some(home));
+            assert_eq!(info.model.as_deref(), Some(model));
+            assert!(!info.model_is_default, "{model}");
+        }
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = grok_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn claude_settings_model_is_always_flagged_and_a_transcript_model_never_is() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        let transcript = home.join("t.jsonl");
+        let tp = transcript.to_str().unwrap();
+
+        // No transcript at all: settings.json is the default, not the session's model.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+        // A transcript with no model signal (a new session) is the same.
+        fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // The transcript names the session's model, newer than settings.json.
+        fs::write(&transcript, assistant_line("claude-sonnet-5-5")).unwrap();
+        set_mtime_secs(&settings, 1_000);
+        set_mtime_secs(&transcript, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(!info.model_is_default);
+
+        // settings.json written afterwards still shows, but it is one global file shared by
+        // every session, so it is never a live report about this one: flagged.
+        set_mtime_secs(&settings, 3_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = claude_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn claude_settings_model_stays_flagged_with_a_modelless_transcript_whether_newer_or_older() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        let transcript = home.join("t.jsonl");
+        let tp = transcript.to_str().unwrap();
+
+        // No transcript at all: settings.json is a default.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // A transcript with no model signal, older than settings.json: the model still shows,
+        // but settings.json is a global file, so it is flagged as a default all the same.
+        fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
+        set_mtime_secs(&transcript, 1_000);
+        set_mtime_secs(&settings, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // The same transcript, newer than settings.json: flagged too.
+        set_mtime_secs(&settings, 500);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+    }
+
+    #[test]
     fn attempt_rows_carry_no_model_fields() {
         let tmp = TempDir::new().unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            decommissioned_session_ids: BTreeSet::new(),
             attempts: vec![DiscoveryAttemptRow {
                 id: "attempt-1".into(),
                 adapter: "claude".into(),
@@ -8399,6 +9601,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 47874,
                 max_tokens: 500000,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
             }
         );
     }
@@ -8548,6 +9752,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 65560,
                 max_tokens: 872000,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
             }
         );
     }
@@ -8613,6 +9819,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 125,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             }
         );
 
@@ -8733,6 +9941,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 9,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
     }
@@ -8840,6 +10050,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 15,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
 
@@ -8864,6 +10076,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 4,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
 
@@ -9100,6 +10314,7 @@ mod tests {
                 available_models: vec![],
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             };
             let source = crate::runtime_matrix::QuotaSource::HOST;
             let quota = (source.session)(&session, None).unwrap();
@@ -10132,6 +11347,434 @@ mod tests {
         }
     }
 
+    // --- Context window source (#134) ---------------------------------------------------
+
+    fn context_at(path: &Path) -> Option<SessionContextUsage> {
+        context_usage_for_transcript(&path.display().to_string(), &mut TranscriptReads::default())
+    }
+
+    /// A Grok session under `<home>/.grok/sessions/p/<id>/` with `chat_history.jsonl`, an
+    /// optional `signals.json` and `summary.json`, and an optional `models_cache.json`.
+    fn grok_session_files(
+        home: &Path,
+        signals: Option<serde_json::Value>,
+        summary: Option<serde_json::Value>,
+        cache: Option<serde_json::Value>,
+    ) -> PathBuf {
+        let dir = home.join(".grok/sessions/p/grok-src-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("chat_history.jsonl"), "{}\n").unwrap();
+        if let Some(v) = signals {
+            fs::write(dir.join("signals.json"), v.to_string()).unwrap();
+        }
+        if let Some(v) = summary {
+            fs::write(dir.join("summary.json"), v.to_string()).unwrap();
+        }
+        if let Some(v) = cache {
+            fs::write(home.join(".grok/models_cache.json"), v.to_string()).unwrap();
+        }
+        dir.join("chat_history.jsonl")
+    }
+
+    fn grok_cache() -> serde_json::Value {
+        serde_json::json!({"models": {
+            "grok-x": {"info": {"context_window": 256_000, "context_windows": [500_000, 256_000, 256_000]}},
+            "grok-nowindow": {"info": {"hidden": false}}
+        }})
+    }
+
+    #[test]
+    fn grok_window_from_signals_or_summary_is_reported_and_lists_the_models_sizes() {
+        let home = TempDir::new().unwrap();
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10, "contextWindowTokens": 123_456})),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            Some(grok_cache()),
+        );
+        let usage = context_at(&chat).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (123_456, ContextWindowSource::Reported)
+        );
+        // The sizes come from the cache for the session's model, ascending and deduplicated.
+        assert_eq!(usage.offered_windows, vec![256_000, 500_000]);
+
+        // `summary.json` is the second reported source.
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10})),
+            Some(serde_json::json!({"current_model_id": "grok-x", "context_window": 500_000})),
+            None,
+        );
+        let usage = context_at(&chat).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (500_000, ContextWindowSource::Reported)
+        );
+    }
+
+    #[test]
+    fn grok_without_a_reported_window_takes_the_models_cache_as_catalog() {
+        let home = TempDir::new().unwrap();
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10})),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            Some(grok_cache()),
+        );
+        assert_eq!(
+            context_at(&chat).unwrap(),
+            SessionContextUsage {
+                used_tokens: 10,
+                max_tokens: 256_000,
+                source: ContextWindowSource::Catalog,
+                offered_windows: vec![256_000, 500_000],
+            }
+        );
+        // Without a summary the signals name the model.
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10, "primaryModelId": "grok-x"})),
+            None,
+            Some(grok_cache()),
+        );
+        let usage = context_at(&chat).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (256_000, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn grok_with_no_evidence_is_assumed_at_the_registry_default() {
+        let home = TempDir::new().unwrap();
+        let signals = || Some(serde_json::json!({"contextTokensUsed": 10}));
+        let assumed = SessionContextUsage {
+            used_tokens: 10,
+            max_tokens: fallback_context_window("grok"),
+            source: ContextWindowSource::Assumed,
+            offered_windows: Vec::new(),
+        };
+        // No cache at all.
+        let chat = grok_session_files(
+            home.path(),
+            signals(),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            None,
+        );
+        assert_eq!(context_at(&chat).unwrap(), assumed);
+        // A cache that does not list the session's model, or lists it without a window.
+        for model in ["grok-unlisted", "grok-nowindow"] {
+            let chat = grok_session_files(
+                home.path(),
+                signals(),
+                Some(serde_json::json!({ "current_model_id": model })),
+                Some(grok_cache()),
+            );
+            assert_eq!(context_at(&chat).unwrap(), assumed, "{model}");
+        }
+        // No summary and no model in the signals: the cache cannot be consulted.
+        let chat = grok_session_files(home.path(), signals(), None, Some(grok_cache()));
+        assert_eq!(context_at(&chat).unwrap(), assumed);
+    }
+
+    fn codex_rollout(home: &Path, lines: &[serde_json::Value]) -> PathBuf {
+        let path = home.join(".codex/sessions/2026/11/05/rollout-src-1.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        fs::write(&path, text.join("\n")).unwrap();
+        path
+    }
+
+    fn codex_token_count(info_extra: serde_json::Value) -> serde_json::Value {
+        let mut info = serde_json::json!({"last_token_usage": {"total_tokens": 321}});
+        if let (Some(map), Some(extra)) = (info.as_object_mut(), info_extra.as_object()) {
+            map.extend(extra.clone());
+        }
+        serde_json::json!({"type": "event_msg", "payload": {"type": "token_count", "info": info}})
+    }
+
+    fn codex_cache() -> serde_json::Value {
+        serde_json::json!({"models": [
+            {"slug": "gpt-x", "visibility": "list", "context_window": 272_000, "max_context_window": 872_000},
+            {"slug": "gpt-nowindow", "visibility": "list"}
+        ]})
+    }
+
+    #[test]
+    fn codex_window_from_config_or_rollout_is_reported_with_the_existing_precedence() {
+        let home = TempDir::new().unwrap();
+        let path = codex_rollout(
+            home.path(),
+            &[codex_token_count(
+                serde_json::json!({"model_context_window": 258_400}),
+            )],
+        );
+        // The rollout's own value.
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            usage,
+            SessionContextUsage {
+                used_tokens: 321,
+                max_tokens: 258_400,
+                source: ContextWindowSource::Reported,
+                offered_windows: Vec::new(),
+            }
+        );
+        // `config.toml` still wins over the rollout.
+        fs::write(
+            home.path().join(".codex/config.toml"),
+            "model_context_window = 400000\n",
+        )
+        .unwrap();
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (400_000, ContextWindowSource::Reported)
+        );
+        // With no token_count row yet, the configured value alone is reported at 0 used.
+        let path = codex_rollout(home.path(), &[serde_json::json!({"type": "session_meta"})]);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.used_tokens, usage.max_tokens, usage.source),
+            (0, 400_000, ContextWindowSource::Reported)
+        );
+    }
+
+    #[test]
+    fn codex_window_from_the_models_cache_is_catalog_and_lists_no_sizes() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        fs::write(
+            home.path().join(".codex/models_cache.json"),
+            codex_cache().to_string(),
+        )
+        .unwrap();
+        // The rollout names the model; the row carries no window.
+        let path = codex_rollout(
+            home.path(),
+            &[
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-x"}}),
+                codex_token_count(serde_json::json!({})),
+            ],
+        );
+        // `max_context_window` is a cap, not a selectable size: it is not offered.
+        assert_eq!(
+            context_at(&path).unwrap(),
+            SessionContextUsage {
+                used_tokens: 321,
+                max_tokens: 272_000,
+                source: ContextWindowSource::Catalog,
+                offered_windows: Vec::new(),
+            }
+        );
+        // With no model in the rollout, `config.toml`'s model names it.
+        let path = codex_rollout(home.path(), &[codex_token_count(serde_json::json!({}))]);
+        fs::write(
+            home.path().join(".codex/config.toml"),
+            "model = \"gpt-x\"\n",
+        )
+        .unwrap();
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (272_000, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn codex_with_no_evidence_is_assumed_at_the_fallback() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let assumed = SessionContextUsage {
+            used_tokens: 321,
+            max_tokens: fallback_context_window("codex"),
+            source: ContextWindowSource::Assumed,
+            offered_windows: Vec::new(),
+        };
+        // No cache, no model.
+        let path = codex_rollout(home.path(), &[codex_token_count(serde_json::json!({}))]);
+        assert_eq!(context_at(&path).unwrap(), assumed);
+        // A cache without the rollout's model, and one that lists it without a window.
+        fs::write(
+            home.path().join(".codex/models_cache.json"),
+            codex_cache().to_string(),
+        )
+        .unwrap();
+        for model in ["gpt-unlisted", "gpt-nowindow"] {
+            let path = codex_rollout(
+                home.path(),
+                &[
+                    serde_json::json!({"type": "turn_context", "payload": {"model": model}}),
+                    codex_token_count(serde_json::json!({})),
+                ],
+            );
+            assert_eq!(context_at(&path).unwrap(), assumed, "{model}");
+        }
+    }
+
+    fn muse_session(home: &Path, lines: &[serde_json::Value]) -> PathBuf {
+        let path = home.join(".local/share/muse/sessions/2026/11/05/muse-src-1/session.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        fs::write(&path, text.join("\n")).unwrap();
+        path
+    }
+
+    fn muse_completed(model: Option<&str>) -> serde_json::Value {
+        let mut event = serde_json::json!({
+            "kind": "model_completed",
+            "usage": {"input_tokens": 700, "output_tokens": 30}
+        });
+        if let Some(model) = model {
+            event["model"] = model.into();
+        }
+        serde_json::json!({"payload_type": "runtime.session", "payload": {"event": event}})
+    }
+
+    fn write_muse_catalog(home: &Path) {
+        write_catalog_at(&home.join(".local/share/muse/model-catalog"));
+    }
+
+    fn write_catalog_at(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("a.json"),
+            serde_json::json!({"rows": [
+                {"model_id": "muse-x", "context_limit": 1_007_997},
+                {"model_id": "muse-image", "context_limit": null}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        // A second file the first row search reaches only when the first lacks the model.
+        fs::write(
+            dir.join("b.json"),
+            serde_json::json!({"rows": [{"model_id": "muse-y", "context_limit": 64_000}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn muse_window_is_the_catalog_limit_of_the_sessions_model() {
+        let home = TempDir::new().unwrap();
+        write_muse_catalog(home.path());
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        assert_eq!(
+            context_at(&path).unwrap(),
+            SessionContextUsage {
+                used_tokens: 730,
+                max_tokens: 1_007_997,
+                source: ContextWindowSource::Catalog,
+                offered_windows: Vec::new(),
+            }
+        );
+        // A model that only a later catalog file lists.
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-y"))]);
+        assert_eq!(context_at(&path).unwrap().max_tokens, 64_000);
+        // No `model` on the event: the session metadata record names it.
+        let path = muse_session(
+            home.path(),
+            &[
+                serde_json::json!({
+                    "payload_type": "runtime.session.metadata",
+                    "payload": {"record": {"model_id": "muse-x"}}
+                }),
+                muse_completed(None),
+            ],
+        );
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (1_007_997, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn muse_with_no_catalog_evidence_is_assumed_one_million() {
+        let home = TempDir::new().unwrap();
+        let assumed = SessionContextUsage {
+            used_tokens: 730,
+            max_tokens: 1_000_000,
+            source: ContextWindowSource::Assumed,
+            offered_windows: Vec::new(),
+        };
+        // No catalog directory.
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        assert_eq!(context_at(&path).unwrap(), assumed);
+        write_muse_catalog(home.path());
+        // A model the catalog lacks, one listed without a limit, and no model at all.
+        for model in [Some("muse-unlisted"), Some("muse-image"), None] {
+            let path = muse_session(home.path(), &[muse_completed(model)]);
+            assert_eq!(context_at(&path).unwrap(), assumed, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn muse_catalog_search_stops_at_the_muse_data_directory() {
+        let home = TempDir::new().unwrap();
+        // An unrelated catalog above the Muse data directory, listing the session's model.
+        write_catalog_at(&home.path().join("model-catalog"));
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (1_000_000, ContextWindowSource::Assumed)
+        );
+        // The Muse data directory's own catalog is still found.
+        write_muse_catalog(home.path());
+        assert_eq!(context_at(&path).unwrap().max_tokens, 1_007_997);
+    }
+
+    #[test]
+    fn claude_window_is_assumed_for_both_usage_rows_and_compaction_boundaries() {
+        for rows in [
+            vec![assistant_usage_row(10_000, 500)],
+            vec![boundary_row(Some(21_546))],
+        ] {
+            let usage = claude_context(&rows).unwrap();
+            assert_eq!(usage.max_tokens, 1_000_000);
+            assert_eq!(usage.source, ContextWindowSource::Assumed);
+            assert!(usage.offered_windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn context_usage_json_carries_a_lowercase_source_and_omits_empty_offered_windows() {
+        let mut usage = SessionContextUsage::new(
+            5,
+            256_000,
+            ContextWindowSource::Catalog,
+            vec![500_000, 256_000, 500_000, 0],
+        );
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({
+                "used_tokens": 5,
+                "max_tokens": 256_000,
+                "source": "catalog",
+                "offered_windows": [256_000, 500_000]
+            })
+        );
+        usage.offered_windows.clear();
+        let json = serde_json::to_value(&usage).unwrap();
+        assert!(json.get("offered_windows").is_none(), "{json}");
+        for (source, name) in [
+            (ContextWindowSource::Reported, "reported"),
+            (ContextWindowSource::Catalog, "catalog"),
+            (ContextWindowSource::Assumed, "assumed"),
+        ] {
+            assert_eq!(serde_json::to_value(source).unwrap(), name);
+        }
+        // JSON from before the new fields still reads, as an assumed window.
+        let old: SessionContextUsage =
+            serde_json::from_str(r#"{"used_tokens":7,"max_tokens":1000000}"#).unwrap();
+        assert_eq!(old, SessionContextUsage::assumed(7, 1_000_000));
+        assert_eq!(old.source, ContextWindowSource::Assumed);
+    }
+
     #[test]
     fn a_transcript_that_names_its_window_keeps_it_and_one_that_does_not_gets_the_fallback() {
         let home = TempDir::new().unwrap();
@@ -10155,6 +11798,7 @@ mod tests {
             available_models: Vec::new(),
             context_usage: None,
             execution_mode: None,
+            model_is_default: false,
         };
         let usage = |signals: serde_json::Value| {
             fs::write(session_dir.join("signals.json"), signals.to_string()).unwrap();
@@ -10441,6 +12085,8 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 21_546,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             }
         );
         // Rows after the boundary that carry no usage do not bring the old figure back.
@@ -10558,6 +12204,8 @@ mod tests {
             Some(SessionContextUsage {
                 used_tokens: 21_546,
                 max_tokens: 1_000_000,
+                source: ContextWindowSource::Assumed,
+                offered_windows: Vec::new(),
             })
         );
     }

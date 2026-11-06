@@ -49,7 +49,7 @@ export const HELP_TOPICS: HelpTopicDoc[] = [
     bullets: [
       "Clear: Clears the agent's conversation context window and leaves the session blank without dispatching a startup prompt.",
       "Reforge: Clears the agent's context window and immediately re-primes the session with its registered persona identity, project assignment, and role instructions.",
-      "Prepare & Decommission vs. Tear Down: Prepare & Decommission dispatches a pre-decommission hygiene handshake so the agent checkpoints STATE.md/FerroState and cleans worktrees before exit; Tear Down immediately stops the runtime session and unregisters the route.",
+      "Prepare for Decommission vs. Decommission: Prepare for Decommission dispatches a pre-decommission hygiene handshake so the agent checkpoints STATE.md/FerroState and cleans worktrees before exit; Decommission asks you to confirm, then immediately stops the runtime session and unregisters the route.",
       "New Agent (+ New Agent): Launches a new tmux-backed or hosted agent session for a persona, project, role, vendor adapter, and target node.",
     ],
   },

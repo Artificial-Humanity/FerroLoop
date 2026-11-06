@@ -12,6 +12,7 @@ import {
   type PromptResponse,
   type QueuedOperatorPrompt,
   type QuotaWindowUsage,
+  type ContextWindowSource,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type SetSessionModelResponse,
@@ -646,6 +647,11 @@ export function isAntigravityAdapter(adapter?: string | null): boolean {
   );
 }
 
+/** Lower-cased, trimmed adapter name with the antigravity aliases folded into "antigravity". */
+export function canonicalAdapter(adapter?: string | null): string {
+  return isAntigravityAdapter(adapter) ? "antigravity" : (adapter ?? "").trim().toLowerCase();
+}
+
 export function inferVendorFromModel(modelId?: string | null): string | null {
   const lower = (modelId ?? "").trim().toLowerCase();
   if (!lower) return null;
@@ -657,19 +663,27 @@ export function inferVendorFromModel(modelId?: string | null): string | null {
   return null;
 }
 
+/**
+ * Decide the vendor of a session. A known adapter always wins: Antigravity
+ * hosts `claude-*` and `gpt-oss-*` models too, so the model id only decides
+ * when the adapter is missing or `unknown`.
+ */
+export function resolveSessionVendor(
+  adapter?: string | null,
+  modelId?: string | null,
+): string {
+  const rawAdapter = (adapter ?? "").trim();
+  if (rawAdapter && rawAdapter.toLowerCase() !== "unknown") return rawAdapter;
+  return inferVendorFromModel(modelId) ?? "";
+}
+
 export function getVendorModelOptions(
   adapter?: string | null,
   currentModel?: string | null,
   availableModels?: string[] | null,
 ): string[] {
-  const rawAdapter = (adapter ?? "").trim().toLowerCase();
   const trimmedCurrent = (currentModel ?? "").trim();
-  const inferred =
-    !rawAdapter || rawAdapter === "unknown"
-      ? (inferVendorFromModel(trimmedCurrent) ?? "")
-      : "";
-  const normalized =
-    rawAdapter && rawAdapter !== "unknown" ? rawAdapter : inferred;
+  const normalized = resolveSessionVendor(adapter, trimmedCurrent).toLowerCase();
 
   let base: string[];
   if (Array.isArray(availableModels) && availableModels.length > 0) {
@@ -721,57 +735,51 @@ export function getVendorModelOptions(
 export const BASE_SYSTEM_OVERHEAD_TOKENS = 12_000;
 
 export interface EstimatedContextUsage {
-  usedTokens: number;
-  maxTokens: number;
-  percent: number;
-}
-
-function maxTokensForAdapter(adapter?: string | null): number {
-  const normalized = (adapter ?? "").trim().toLowerCase();
-  if (
-    normalized === "antigravity" ||
-    normalized === "agy" ||
-    normalized === "argon" ||
-    normalized === "gemini" ||
-    normalized === "muse" ||
-    normalized.startsWith("muse-") ||
-    normalized === "claude" ||
-    normalized.startsWith("claude-")
-  ) {
-    return 1_000_000;
-  }
-  if (
-    normalized === "grok" ||
-    normalized.startsWith("grok-") ||
-    normalized === "codex" ||
-    normalized.startsWith("codex-")
-  ) {
-    return 500_000;
-  }
-  return 200_000;
+  /** Tokens in use; `null` when the hub reported nothing and there is no transcript to estimate from. */
+  usedTokens: number | null;
+  /** The window the hub reported; `null` when it named none (this code never invents one). */
+  maxTokens: number | null;
+  /** `usedTokens / maxTokens` in percent; `null` whenever there is no maximum. */
+  percent: number | null;
+  /** How the hub found `maxTokens`; `null` when unknown (no usage, or an older hub). */
+  source?: ContextWindowSource | null;
+  /** Sizes the model offers, ascending; empty or absent when the hub listed none. */
+  offeredWindows?: number[];
+  /** True when `usedTokens` is a local estimate from the loaded transcript, not a hub report. */
+  estimated?: boolean;
 }
 
 /**
- * Estimate active context usage from loaded transcript turns. The hub
- * returns a sliding transcript window, so this is an approximation:
- * server-reported usage, when present, always wins.
+ * Context usage for the meter. The maximum comes only from the hub's `context_usage`; with none,
+ * this returns what the loaded transcript allows (a rough used-tokens estimate) and no maximum
+ * and no percent. The hub returns a sliding transcript window, so that estimate is approximate.
  */
 export function estimateSessionContextUsage(
   turns: TranscriptTurn[],
-  adapter?: string | null,
   serverUsage?: SessionContextUsage | null,
 ): EstimatedContextUsage {
-  if (serverUsage && serverUsage.max_tokens > 0) {
+  if (serverUsage) {
     const usedTokens = Math.max(0, serverUsage.used_tokens);
+    const hasMax = serverUsage.max_tokens > 0;
     return {
       usedTokens,
-      maxTokens: serverUsage.max_tokens,
-      percent: Math.min(100, Math.round((usedTokens / serverUsage.max_tokens) * 100)),
+      maxTokens: hasMax ? serverUsage.max_tokens : null,
+      percent: hasMax
+        ? Math.min(100, Math.round((usedTokens / serverUsage.max_tokens) * 100))
+        : null,
+      source: hasMax ? (serverUsage.source ?? null) : null,
+      offeredWindows: hasMax ? (serverUsage.offered_windows ?? []) : [],
+      estimated: false,
     };
   }
-  const maxTokens = maxTokensForAdapter(adapter);
+  const none = {
+    maxTokens: null,
+    percent: null,
+    source: null,
+    offeredWindows: [],
+  };
   if (!turns || turns.length === 0) {
-    return { usedTokens: 0, maxTokens, percent: 0 };
+    return { ...none, usedTokens: null, estimated: false };
   }
   let boundaryIndex = -1;
   for (let i = turns.length - 1; i >= 0; i -= 1) {
@@ -790,21 +798,61 @@ export function estimateSessionContextUsage(
       JSON.stringify(turn.tool_calls ?? []).length;
     usedTokens += Math.ceil(chars / 4);
   }
-  return {
-    usedTokens,
-    maxTokens,
-    percent: Math.min(100, Math.round((usedTokens / maxTokens) * 100)),
-  };
+  return { ...none, usedTokens, estimated: true };
 }
 
+/**
+ * Compact token count rounded to three significant digits, trailing zeros trimmed ("1m", "262k",
+ * "828k", "12.3k", "1.01m"). Three digits keep 1,007,997 ("1.01m") apart from 1,000,000 ("1m"); a
+ * value that rounds up to 1000k reads "1m".
+ */
 export function formatTokenCount(value: number): string {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
-  }
+  const round3 = (n: number) => Number(n.toPrecision(3));
   if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+    const thousands = round3(value / 1_000);
+    if (thousands < 1_000) {
+      return `${thousands}k`;
+    }
+    return `${round3(value / 1_000_000)}m`;
   }
   return String(value);
+}
+
+/**
+ * True when the window is known and at least half used. Compares tokens, not the rounded percent,
+ * so 499,999 of 1,000,000 stays below the threshold.
+ */
+export function contextAtCompactThreshold(estimate: EstimatedContextUsage): boolean {
+  return (
+    estimate.maxTokens !== null &&
+    estimate.maxTokens > 0 &&
+    (estimate.usedTokens ?? 0) * 2 >= estimate.maxTokens
+  );
+}
+
+/** Tooltip for a context window's source; an unknown source (older hub) makes no claim. */
+export function contextWindowSourceTitle(
+  source: ContextWindowSource | null | undefined,
+): string | undefined {
+  switch (source) {
+    case "assumed":
+      return "No vendor file or setting names this session's window; this is a default";
+    case "reported":
+      return "Window reported by the session";
+    case "catalog":
+      return "Window from the vendor's model catalog";
+    default:
+      return undefined;
+  }
+}
+
+/** The maximum as shown to the operator: an assumed window reads "about 1m, assumed". */
+export function formatContextMax(
+  maxTokens: number,
+  source: ContextWindowSource | null | undefined,
+): string {
+  const text = formatTokenCount(maxTokens);
+  return source === "assumed" ? `about ${text}, assumed` : text;
 }
 
 export function hasQuotaUsageData(quota?: SessionQuotaUsage | null): boolean {
@@ -1176,6 +1224,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const clearHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [decommissionModalOpen, setDecommissionModalOpen] = React.useState<boolean>(false);
   const [decommissionHelpVisible, setDecommissionHelpVisible] = React.useState<boolean>(false);
+  // Second step of "Decommission" (teardown): the operator confirms before the session stops.
+  const [decommissionConfirmOpen, setDecommissionConfirmOpen] = React.useState<boolean>(false);
   const [decommissioning, setDecommissioning] = React.useState<boolean>(false);
   const decommissionHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [interruptArmed, setInterruptArmed] = React.useState<boolean>(false);
@@ -1331,10 +1381,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     () =>
       estimateSessionContextUsage(
         effectiveTurns,
-        adapter,
         contextUsage ?? internalContextUsage,
       ),
-    [effectiveTurns, adapter, contextUsage, internalContextUsage],
+    [effectiveTurns, contextUsage, internalContextUsage],
   );
   const effectiveQuotaUsage = quotaUsage ?? internalQuotaUsage;
   const showQuotaBadge = hasQuotaUsageData(effectiveQuotaUsage);
@@ -1345,8 +1394,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         (effectiveQuotaUsage.primary_window?.used_percent ?? 0) >= 100 ||
         (effectiveQuotaUsage.secondary_window?.used_percent ?? 0) >= 100),
   );
+  // With no known window there is no percent to compare, so the 50% rule does not gate Compact.
   const canCompact =
-    contextEstimate.percent >= 50 &&
+    (contextEstimate.percent === null || contextAtCompactThreshold(contextEstimate)) &&
     Boolean(targetSessionOrAgent) &&
     !compacting &&
     !clearing &&
@@ -1731,6 +1781,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       decommissionHelpTimerRef.current = null;
     }
     setDecommissionHelpVisible(false);
+    setDecommissionConfirmOpen(false);
     setDecommissionModalOpen(true);
   };
 
@@ -1740,6 +1791,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       decommissionHelpTimerRef.current = null;
     }
     setDecommissionHelpVisible(false);
+    setDecommissionConfirmOpen(false);
     setDecommissionModalOpen(false);
   }, []);
 
@@ -1751,12 +1803,22 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!decommissionModalOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !decommissioning) {
-        handleCloseDecommissionModal();
+        // From the confirmation step Escape goes back one step; from the choices it closes.
+        if (decommissionConfirmOpen) {
+          setDecommissionConfirmOpen(false);
+        } else {
+          handleCloseDecommissionModal();
+        }
       }
     };
     window.addEventListener("keydown", handleKeyDownEscape);
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
-  }, [decommissionModalOpen, decommissioning, handleCloseDecommissionModal]);
+  }, [
+    decommissionModalOpen,
+    decommissionConfirmOpen,
+    decommissioning,
+    handleCloseDecommissionModal,
+  ]);
 
   const handleShowDecommissionHelp = () => {
     if (decommissionHelpTimerRef.current !== null) {
@@ -1800,7 +1862,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       handleCloseDecommissionModal();
       if (currentTargetRef.current === submittedTarget) {
         setCompactFeedback(
-          mode === "prepare" ? "Prepared decommission" : "Tore down session",
+          mode === "prepare" ? "Prepared for decommission" : "Decommissioned session",
         );
       }
     } catch (err) {
@@ -4172,7 +4234,82 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </div>
       )}
 
-      {decommissionModalOpen && (
+      {decommissionModalOpen && decommissionConfirmOpen && (
+        <div
+          className="fd-modal-backdrop"
+          onClick={() => {
+            if (!decommissioning) setDecommissionConfirmOpen(false);
+          }}
+        >
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="decommission-confirm-title"
+            aria-describedby="decommission-confirm-description"
+            data-testid="decommission-confirm-dialog"
+            className="fd-modal"
+            onClick={(e) => e.stopPropagation()}
+            style={{ position: "relative", maxWidth: "460px" }}
+          >
+            <h3
+              id="decommission-confirm-title"
+              style={{
+                margin: "0 0 10px 0",
+                fontSize: "15px",
+                fontWeight: 600,
+                color: "var(--text-primary)",
+              }}
+            >
+              Confirm Decommission
+            </h3>
+            <p
+              id="decommission-confirm-description"
+              style={{
+                margin: "0 0 16px 0",
+                fontSize: "13px",
+                color: "var(--text-secondary)",
+                lineHeight: 1.5,
+              }}
+            >
+              Are you sure you want to decommission{" "}
+              <strong style={{ color: "var(--text-primary)" }}>{displayTarget}</strong>? This
+              immediately stops the runtime session, clears queues and routes, and unregisters
+              the persona.
+            </p>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="decommission-confirm-cancel-btn"
+                autoFocus
+                disabled={decommissioning}
+                onClick={() => setDecommissionConfirmOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="fd-btn fd-btn-danger"
+                data-testid="decommission-confirm-submit-btn"
+                disabled={decommissioning}
+                onClick={() => void handleDecommission("teardown")}
+              >
+                Yes, Decommission
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {decommissionModalOpen && !decommissionConfirmOpen && (
         <div
           className="fd-modal-backdrop"
           onClick={handleCloseDecommissionModal}
@@ -4214,7 +4351,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   type="button"
                   data-testid="decommission-help-btn"
                   aria-label="Help"
-                  title="Explain Prepare & Decommission vs. Tear Down"
+                  title="Explain Prepare for Decommission vs. Decommission"
                   className="fd-btn fd-help-icon-btn"
                   onClick={handleShowDecommissionHelp}
                 >
@@ -4242,13 +4379,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               >
                 <div style={{ marginBottom: "6px" }}>
                   <strong style={{ color: "var(--accent-hover)" }}>
-                    Prepare &amp; Decommission:
+                    Prepare for Decommission:
                   </strong>{" "}
                   Sends a pre-decommission state and worktree hygiene handshake prompt so the
                   agent saves STATE.md/FerroState, cleans up worktrees, and messages its Lead.
                 </div>
                 <div>
-                  <strong style={{ color: "var(--text-primary)" }}>Tear Down:</strong>{" "}
+                  <strong style={{ color: "var(--text-primary)" }}>Decommission:</strong>{" "}
                   Immediately stops the runtime session, clears queues and routes, and
                   unregisters the persona.
                 </div>
@@ -4280,6 +4417,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 type="button"
                 className="fd-btn"
                 data-testid="decommission-cancel-btn"
+                autoFocus
                 disabled={decommissioning}
                 onClick={handleCloseDecommissionModal}
               >
@@ -4290,9 +4428,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 className="fd-btn fd-btn-danger"
                 data-testid="decommission-teardown-btn"
                 disabled={decommissioning}
-                onClick={() => void handleDecommission("teardown")}
+                onClick={() => setDecommissionConfirmOpen(true)}
               >
-                Tear Down
+                Decommission
               </button>
               <button
                 type="button"
@@ -4301,7 +4439,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 disabled={decommissioning}
                 onClick={() => void handleDecommission("prepare")}
               >
-                Prepare &amp; Decommission
+                Prepare for Decommission
               </button>
             </div>
           </div>

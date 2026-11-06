@@ -606,9 +606,20 @@ export interface TranscriptTurn {
   created_at?: string | null;
 }
 
+/**
+ * How the hub found a context window: `reported` (the session or the vendor said it for this
+ * session), `catalog` (the vendor's model catalog lists it) or `assumed` (a default: nothing says
+ * it).
+ */
+export type ContextWindowSource = "reported" | "catalog" | "assumed";
+
 export interface SessionContextUsage {
   used_tokens: number;
   max_tokens: number;
+  /** How `max_tokens` was found. Absent from an older hub: treat as unknown. */
+  source?: ContextWindowSource;
+  /** Window sizes the model offers, ascending; absent when no vendor file lists them. */
+  offered_windows?: number[];
 }
 
 export interface SessionTranscriptResponse {
@@ -732,6 +743,11 @@ export interface SetSessionModelResponse {
   thinking_level?: string | null;
   switched: boolean;
   method: string;
+  /**
+   * Set only for Antigravity: the effort-suffixed model id stored for the next launch. A
+   * running Antigravity session keeps its model; nothing is sent to it.
+   */
+  cli_model?: string;
 }
 
 export type BulkSessionAction =

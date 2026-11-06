@@ -1573,3 +1573,141 @@ fn a_remodel_onto_a_muse_window_that_exists_adopts_it() {
     assert_eq!(*fake.calls.borrow(), ["kill Ada", "spawn muse:ada"],);
     assert!(fake.is_live("muse:ada"));
 }
+
+#[test]
+fn a_failed_remodel_keeps_antigravity_conversation_files() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    spin(&store, &env, "ada", "assistant", "antigravity");
+    let id = "11111111-1111-1111-1111-111111111111";
+    let brain = home.path().join(".gemini/antigravity-cli/brain").join(id);
+    let pb = home
+        .path()
+        .join(".gemini/antigravity/conversations")
+        .join(format!("{id}.pb"));
+    std::fs::create_dir_all(brain.join("logs")).unwrap();
+    std::fs::write(brain.join("logs/transcript.jsonl"), "kept").unwrap();
+    std::fs::create_dir_all(pb.parent().unwrap()).unwrap();
+    std::fs::write(&pb, "pb").unwrap();
+
+    let (err, _) = remodel_failing(
+        &store,
+        &env,
+        "antigravity:ada",
+        &remodel_req("grok"),
+        &["grok"],
+    );
+    assert!(err.is_err(), "{err:?}");
+    assert!(
+        brain.join("logs/transcript.jsonl").is_file(),
+        "a failed spin-up leaves the brain directory"
+    );
+    assert!(
+        pb.is_file(),
+        "a failed spin-up leaves the conversation file"
+    );
+    assert_eq!(
+        record(&store, "antigravity:ada").status,
+        STATUS_RUNNING,
+        "the old session is restored"
+    );
+}
+
+#[test]
+fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
+    let store = FaultyStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    let grok = HostedSessionRecord {
+        session_id: "grok:ada".into(),
+        persona: "ada".into(),
+        project: "FerroLoop".into(),
+        role: "assistant".into(),
+        vendor: "grok".into(),
+        model: None,
+        node_id: DEFAULT_NODE_ID.into(),
+        hosted: true,
+        status: STATUS_DECOMMISSIONED.into(),
+        restart_policy: "never".into(),
+        restart_count: 0,
+        tmux_target: None,
+        cwd: None,
+        hydration_dispatched: false,
+        runtime_spawned: false,
+        tombstone_ids: vec!["gs-old".into()],
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        decommission_prepared_at_ms: None,
+    };
+    persist_hosted_session(&store, &grok, "owner").unwrap();
+    spin_up(
+        &store,
+        &env,
+        &SpinUpRequest {
+            persona: "ada".into(),
+            project: "FerroLoop".into(),
+            role: "assistant".into(),
+            vendor: "claude".into(),
+            ..SpinUpRequest::default()
+        },
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    let mut routes = RouteTable::default();
+    routes.upsert(
+        "ada",
+        VendorRoute::Claude {
+            pid: 4_000_000_001,
+            session_id: "sess-claude".into(),
+            socket_path: home.path().join("claude.sock"),
+            key_path: None,
+        },
+        At::from_unix_millis(1),
+    );
+    let path = home
+        .path()
+        .join(".cache")
+        .join("agent-bus")
+        .join("routes.json");
+    routes.save(Some(&path)).unwrap();
+    *store.fail_state_write.borrow_mut() = Some((hosted_session_slug("grok:ada"), 2));
+
+    let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+    let err = remodel_with(
+        &store,
+        &env,
+        &target,
+        &remodel_req("grok"),
+        "owner",
+        Caller::Owner,
+        |_| {},
+        &mut |store, env, req, by, caller| {
+            if req.vendor == "grok" {
+                return spin_up(store, env, req, by, caller);
+            }
+            Err(LifecycleError::Store(
+                "restore refused before spin-up".into(),
+            ))
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("spin-up on grok failed"), "{err}");
+    let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+    assert_eq!(
+        banned,
+        std::collections::BTreeSet::from(["gs-old".to_string(), "sess-claude".to_string()]),
+        "{banned:?}"
+    );
+    assert!(!banned.contains("grok:ada"));
+    assert!(!banned.contains("claude:ada"));
+    assert_eq!(
+        record(&store.inner, "grok:ada").status,
+        STATUS_DECOMMISSIONED
+    );
+    assert_eq!(
+        record(&store.inner, "claude:ada").status,
+        STATUS_DECOMMISSIONED
+    );
+}

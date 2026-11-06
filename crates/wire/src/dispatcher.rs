@@ -857,6 +857,11 @@ fn deliver_to_grok_route(
             }
         }
     }
+    // A live-window placeholder has no session file yet. Headless `grok -r` with an empty id
+    // would create or resume the wrong session, so it runs only after tmux delivery did not.
+    if session_id.trim().is_empty() {
+        return Err("grok route has no session id and tmux delivery did not run".to_string());
+    }
 
     let bin = std::env::var_os("FL_WIRE_GROK_BIN")
         .map(PathBuf::from)
@@ -1747,7 +1752,7 @@ pub(crate) fn tmux_bin() -> PathBuf {
 /// `=session:=window` (a trailing `.pane` index or `.%id` is kept), which resolves only to a
 /// window of exactly that name or not at all. A pane id (`%3`), a window id (`@2`), a numeric
 /// window index, a bare session name and a target that already carries `=` are returned as given.
-pub(crate) fn tmux_exact_target(target: &str) -> String {
+pub fn tmux_exact_target(target: &str) -> String {
     let Some((session, rest)) = target.split_once(':') else {
         return target.to_string();
     };
@@ -1886,25 +1891,55 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
         return Err(format!("tmux send-keys exited with {enter_status}"));
     }
 
+    // A large paste on a busy pane shows "[Pasted Content" a moment after the first Enter.
+    // Poll for up to 300ms and submit as soon as the marker appears. `FL_WIRE_TMUX_BIN` (tests)
+    // skips the wait entirely.
     if !skip_sleep {
-        std::thread::sleep(TMUX_ENTER_SETTLE_DELAY);
+        let tmux_cap = tmux.clone();
+        let target_cap = target.to_string();
+        let saw_paste = poll_for_pasted_content(
+            6,
+            || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
+            || capture_pane_tail(&tmux_cap, &target_cap),
+        );
+        if saw_paste {
+            let _ = Command::new(&tmux)
+                .args(["send-keys", "-t", target, "Enter"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
-    if let Ok(cap) = Command::new(&tmux)
+
+    Ok(())
+}
+
+/// `true` when a capture shows tmux's bracketed-paste placeholder. `wait` runs before each of
+/// `attempts` captures. The first hit returns immediately.
+fn poll_for_pasted_content(
+    attempts: u32,
+    mut wait: impl FnMut(),
+    mut capture: impl FnMut() -> Option<String>,
+) -> bool {
+    for _ in 0..attempts {
+        wait();
+        if capture().is_some_and(|text| text.contains("[Pasted Content")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn capture_pane_tail(tmux: &Path, target: &str) -> Option<String> {
+    let cap = Command::new(tmux)
         .args(["capture-pane", "-p", "-t", target, "-S", "-8"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
-        && cap.status.success()
-        && String::from_utf8_lossy(&cap.stdout).contains("[Pasted Content")
-    {
-        let _ = Command::new(&tmux)
-            .args(["send-keys", "-t", target, "Enter"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
-    Ok(())
+        .ok()?;
+    cap.status
+        .success()
+        .then(|| String::from_utf8_lossy(&cap.stdout).into_owned())
 }
 
 /// `true` when `sender_name` names the owner (`owner`, or the owner's login `lmcfarlin`).
@@ -2125,9 +2160,35 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     msg: &WireMessage,
     now: At,
 ) -> Vec<DeliveryReceipt> {
-    let Ok(receipts) = store.list_wire_receipts(&msg.id) else {
-        return Vec::new();
+    dispatch_message_selected(store, routes, home_override, msg, now, None).0
+}
+
+/// Dispatch only one recipient; the daemon schedules each recipient independently.
+pub(crate) fn dispatch_message_for_recipient<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: &str,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    dispatch_message_selected(store, routes, home_override, msg, now, Some(recipient))
+}
+
+fn dispatch_message_selected<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: Option<&str>,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
+        return (Vec::new(), None);
     };
+    if let Some(recipient) = recipient {
+        receipts.retain(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
+    }
     let deliverable = |rcpt: &DeliveryReceipt| {
         !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             && rcpt.attempts < MAX_DELIVER
@@ -2149,6 +2210,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         routes.discover_routes(home_override, now.clone());
     }
     let mut updated = Vec::new();
+    let mut attempted = false;
     for rcpt in receipts {
         if !deliverable(&rcpt) {
             continue;
@@ -2156,6 +2218,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
             continue;
         };
+        attempted = true;
         let mut pushed = dispatch_to_route(&entry.route, msg);
         if pushed.is_err() {
             // The session may have restarted since this route was learned (a new pid, socket or
@@ -2180,7 +2243,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
             updated.push(new_rcpt);
         }
     }
-    updated
+    (updated, Some(attempted))
 }
 
 /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it
@@ -2215,6 +2278,55 @@ mod tests {
     fn validate_agy_conversation_id_rejects_dot_and_nul() {
         assert!(validate_agy_conversation_id(".").is_err());
         assert!(validate_agy_conversation_id("a\0b").is_err());
+    }
+
+    #[test]
+    fn pasted_content_poll_submits_on_the_first_hit_and_stops_after_six_misses() {
+        let mut waits = 0u32;
+        let saw = poll_for_pasted_content(
+            6,
+            || waits += 1,
+            || Some("[Pasted Content 1400 chars]".into()),
+        );
+        assert!(saw);
+        assert_eq!(waits, 1);
+
+        let mut waits = 0u32;
+        let mut captures = 0u32;
+        let saw = poll_for_pasted_content(
+            6,
+            || waits += 1,
+            || {
+                captures += 1;
+                Some("still typing".into())
+            },
+        );
+        assert!(!saw);
+        assert_eq!(waits, 6);
+        assert_eq!(captures, 6);
+    }
+
+    #[test]
+    fn grok_placeholder_without_a_live_tmux_target_refuses_an_empty_session_id() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
+        let prev_grok = std::env::var_os("FL_WIRE_GROK_BIN");
+        unsafe {
+            std::env::remove_var("FL_WIRE_TMUX_BIN");
+            std::env::set_var("FL_WIRE_GROK_BIN", "grok-not-invoked");
+        }
+        let err = deliver_to_grok_route("", None, Some("Felicia:grok"), None, "hello").unwrap_err();
+        unsafe {
+            match prev_tmux {
+                Some(v) => std::env::set_var("FL_WIRE_TMUX_BIN", v),
+                None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
+            }
+            match prev_grok {
+                Some(v) => std::env::set_var("FL_WIRE_GROK_BIN", v),
+                None => std::env::remove_var("FL_WIRE_GROK_BIN"),
+            }
+        }
+        assert!(err.contains("no session id"), "{err}");
     }
 
     #[test]
