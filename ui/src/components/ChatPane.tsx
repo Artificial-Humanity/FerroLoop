@@ -2258,6 +2258,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     const submittedTarget = targetSessionOrAgent;
     try {
       setSubmitError(null);
+      sessionSendErrors.delete(submittedTarget);
+      setSendErrorsByTarget((prev) => {
+        const next = { ...prev };
+        delete next[submittedTarget];
+        return next;
+      });
       if (onSendQueuedNow) {
         const res = (await onSendQueuedNow(promptId)) as PromptResponse | undefined;
         if (isPromptDeliveryFailure(res)) {
@@ -2266,10 +2272,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         recordPromptDelivery(submittedTarget, res);
       } else if (apiClient) {
         const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
-        if (isPromptDeliveryFailure(res)) {
-          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
-        }
-        recordPromptDelivery(submittedTarget, res);
         if (mountedRef.current && currentTargetRef.current === submittedTarget) {
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
@@ -2277,6 +2279,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           if (typeof res.is_busy === "boolean") {
             setInternalIsBusy(res.is_busy);
           }
+        }
+        if (isPromptDeliveryFailure(res)) {
+          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        }
+        recordPromptDelivery(submittedTarget, res);
+        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
           const content = res.effective_body || res.prompt;
           if (content && res.delivery_stage !== "unconfirmed") {
             setInternalTurns((prev) => [
@@ -2297,11 +2305,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         scrollToBottom("smooth");
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
-        setSubmitError(
-          err instanceof Error ? err.message : "Failed to send queued message",
-        );
-      }
+      const message = err instanceof Error ? err.message : "Failed to send queued message";
+      sessionSendErrors.set(submittedTarget, message);
+      notifyDraft(submittedTarget, null, message);
     }
   };
 
