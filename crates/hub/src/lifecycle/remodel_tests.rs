@@ -1639,6 +1639,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         created_at_ms: 1,
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,
+        context_window: None,
     };
     persist_hosted_session(&store, &grok, "owner").unwrap();
     spin_up(
