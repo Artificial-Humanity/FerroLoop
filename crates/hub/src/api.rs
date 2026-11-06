@@ -5305,6 +5305,8 @@ fn dispatch_to_session_route<T>(
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_PROMPT_DISPATCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
     static AFTER_PROMPT_DISPATCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static AFTER_QUEUE_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -5335,6 +5337,11 @@ pub(crate) fn stub_queued_delivery_success() -> StubQueuedDelivery {
 }
 
 #[cfg(test)]
+pub(crate) fn before_next_prompt_dispatch(f: impl FnOnce() + 'static) {
+    BEFORE_PROMPT_DISPATCH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
 pub(crate) fn after_next_prompt_dispatch(f: impl FnOnce() + 'static) {
     AFTER_PROMPT_DISPATCH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
 }
@@ -5355,7 +5362,14 @@ fn dispatch_operator_prompt_with_intent_for_session(
     sender_name: &str,
     body: &str,
     intent: OperatorPromptIntent,
+    intended_codex_thread_id: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
+    #[cfg(test)]
+    BEFORE_PROMPT_DISPATCH.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
     // Preserve typed steering failures across the ordinary transport's rediscovery boundary.
     // Every steering failure is final: mapping it to Failed prevents a second route attempt.
     let mut steering_error = None;
@@ -5364,8 +5378,12 @@ fn dispatch_operator_prompt_with_intent_for_session(
         session_route_query(persona, session_id),
         |route| {
             let delivery = if intent == OperatorPromptIntent::OwnerSendNow
-                && matches!(route, fl_wire::identity::VendorRoute::Codex { .. })
-                && !route_matches_session_id(route, session_id)
+                && match intended_codex_thread_id {
+                    Some(intended) => !matches!(route,
+                        fl_wire::identity::VendorRoute::Codex { thread_id, .. } if thread_id == intended),
+                    None => matches!(route, fl_wire::identity::VendorRoute::Codex { .. })
+                        && !route_matches_session_id(route, session_id),
+                }
             {
                 Err(OperatorPromptError::Steer(CodexSteerError::Refused {
                     stage: fl_wire::dispatcher::CodexSteerStage::Route,
@@ -5407,6 +5425,7 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     sender_name: &str,
     body: &str,
     intent: OperatorPromptIntent,
+    intended_codex_thread_id: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
     if QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
@@ -5424,6 +5443,7 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         sender_name,
         body,
         intent,
+        intended_codex_thread_id,
     )
 }
 
@@ -5477,6 +5497,7 @@ fn dispatch_operator_prompt_for_session_typed(
         sender_name,
         body,
         OperatorPromptIntent::Ordinary,
+        None,
     )
     .map_err(|e| match e {
         OperatorPromptError::Push(e) => e,
@@ -5617,13 +5638,20 @@ fn handle_post_queued_prompt_send_now(
         );
     };
     let queue_key = item.session_id.clone();
+    let intended_codex_thread_id = item.intended_codex_thread_id.as_deref();
+    let dispatch_session_id = if authority.is_owner() && intended_codex_thread_id.is_some() {
+        item.session_id.as_str()
+    } else {
+        canonical_id.as_str()
+    };
     let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
         state,
         item.persona.as_deref().or(target_persona.as_deref()),
-        &canonical_id,
+        dispatch_session_id,
         &item.by,
         &item.effective_body,
         operator_prompt_intent(authority, true),
+        intended_codex_thread_id,
     );
     let refused = matches!(
         delivery_res,
@@ -5941,6 +5969,14 @@ fn handle_post_session_prompt(
         (snap, sessions)
     };
     let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
+    let intended_codex_thread_id = match sessions
+        .iter()
+        .find(|session| session.id == canonical_session_id)
+    {
+        Some(session) if session.adapter == "codex" => Some(session.id.clone()),
+        Some(_) => None,
+        None => session_id.trim().strip_prefix("codex-").map(str::to_string),
+    };
     let mut files = TranscriptReads::default();
     // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
     // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
@@ -5961,6 +5997,7 @@ fn handle_post_session_prompt(
         payload.send_now,
         busy,
         crate::DirectPromptInput {
+            intended_codex_thread_id: intended_codex_thread_id.clone(),
             persona: target_persona.clone(),
             prompt: prompt_text.clone(),
             effective_body: effective_body.clone(),
@@ -6009,6 +6046,7 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
         operator_prompt_intent(authority, payload.send_now),
+        intended_codex_thread_id.as_deref(),
     );
     match &delivery_res {
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}

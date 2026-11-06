@@ -108,6 +108,9 @@ pub struct SavedPromptAttachment {
 pub struct QueuedOperatorPrompt {
     pub id: String,
     pub session_id: String,
+    /// Captured at admission; persona rediscovery must never retarget an explicit Codex send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_codex_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     pub prompt: String,
@@ -210,6 +213,7 @@ impl Drop for SessionDispatchGuard<'_> {
 }
 
 pub(crate) struct DirectPromptInput {
+    pub intended_codex_thread_id: Option<String>,
     pub persona: Option<String>,
     pub prompt: String,
     pub effective_body: String,
@@ -234,6 +238,7 @@ impl PromptQueueState {
         let item = QueuedOperatorPrompt {
             id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
             session_id: session_key.to_string(),
+            intended_codex_thread_id: input.intended_codex_thread_id,
             persona: input.persona,
             prompt: input.prompt,
             effective_body: input.effective_body,
@@ -633,10 +638,21 @@ impl HubState {
         by: String,
         attachments: Vec<SavedPromptAttachment>,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let observed = discovery::lookup_one_route_session(
+            &discovery::DiscoveryStoreSnapshot::default(),
+            self.config.home_override.as_deref(),
+            session_key,
+        );
+        let intended_codex_thread_id = match observed {
+            Some(session) if session.adapter == "codex" => Some(session.id),
+            Some(_) => None,
+            None => session_key.strip_prefix("codex-").map(str::to_string),
+        };
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.enqueue(
             session_key,
             DirectPromptInput {
+                intended_codex_thread_id,
                 persona,
                 prompt,
                 effective_body,
@@ -1276,6 +1292,7 @@ mod tests {
                 false,
                 false,
                 DirectPromptInput {
+                    intended_codex_thread_id: None,
                     persona: None,
                     prompt: "one".into(),
                     effective_body: "one".into(),
@@ -1296,6 +1313,7 @@ mod tests {
             false,
             false,
             DirectPromptInput {
+                intended_codex_thread_id: None,
                 persona: None,
                 prompt: "two".into(),
                 effective_body: "two".into(),
@@ -7754,6 +7772,218 @@ mod tests {
             }
             methods
         })
+    }
+
+    #[test]
+    fn send_now_preserves_non_codex_personas_with_a_codex_prefix() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        for queued in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let state = test_hub_state(&tmp);
+            let socket = tmp.path().join("webhook.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            install_route(tmp.path(), "codex-persona", webhook_route(&socket));
+            let response = if queued {
+                let (item, _) = state.enqueue_session_prompt(
+                    "codex-persona",
+                    Some("codex-persona".into()),
+                    "non-Codex".into(),
+                    "non-Codex".into(),
+                    "ferris".into(),
+                    vec![],
+                );
+                call(
+                    &state,
+                    "POST",
+                    &format!("/api/v1/sessions/codex-persona/queue/{}/send-now", item.id),
+                    OWNER,
+                    &json!({}),
+                )
+                .json_value()
+                .unwrap()
+            } else {
+                post_prompt(
+                    &state,
+                    "codex-persona",
+                    OWNER,
+                    None,
+                    &json!({"prompt":"non-Codex", "send_now":true}),
+                )
+            };
+            assert_eq!(
+                response["delivery_stage"], "transport_accepted",
+                "{response}"
+            );
+            assert_eq!(response["delivered"], true);
+            let (stream, _) = listener
+                .accept()
+                .expect("original non-Codex endpoint should receive the prompt");
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            assert!(line.contains("non-Codex"));
+        }
+    }
+
+    #[test]
+    fn codex_send_now_refuses_replacement_routes_for_direct_and_queued_targets() {
+        use std::os::unix::net::UnixListener;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect());
+        for original in ["thread-original", "codex-thread-fixture"] {
+            for mode in ["direct", "queued-thread", "queued-persona"] {
+                for replacement in ["webhook", "claude", "codex"] {
+                    let tmp = TempDir::new().unwrap();
+                    let state = test_hub_state(&tmp);
+                    let tmux = FakeTmux::install(tmp.path());
+                    install_route(
+                        tmp.path(),
+                        "freya",
+                        fl_wire::identity::VendorRoute::Codex {
+                            thread_id: original.into(),
+                            cwd: None,
+                        },
+                    );
+                    let socket = tmp.path().join("replacement.sock");
+                    let listener = UnixListener::bind(&socket).unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    // Even a broken guard may only reach these temporary mock endpoints.
+                    let bin = tmp.path().join("no-codex");
+                    fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+                    unsafe {
+                        std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+                        std::env::set_var("FL_WIRE_CODEX_CONTROL_SOCK", &socket);
+                    }
+                    let route = match replacement {
+                        "claude" => {
+                            let key = tmp.path().join("replacement.key");
+                            fs::write(
+                                &key,
+                                json!({"peerToken":"fake", "tmux":"Fake:@12.%12"}).to_string(),
+                            )
+                            .unwrap();
+                            fl_wire::identity::VendorRoute::Claude {
+                                pid: 0,
+                                session_id: "replacement".into(),
+                                socket_path: socket,
+                                key_path: Some(key),
+                            }
+                        }
+                        "codex" => fl_wire::identity::VendorRoute::Codex {
+                            thread_id: "thread-fixture".into(),
+                            cwd: None,
+                        },
+                        _ => webhook_route(&socket),
+                    };
+                    let queued = mode != "direct";
+                    let response = if queued {
+                        // Capture the original native Codex thread through normal admission.
+                        state.mark_session_in_flight_from_turns(original, &[]);
+                        let (target, id) = if mode == "queued-persona" {
+                            let (item, _) = state.enqueue_session_prompt(
+                                "freya",
+                                Some("freya".into()),
+                                "queued original".into(),
+                                "queued original".into(),
+                                "ferris".into(),
+                                vec![],
+                            );
+                            ("freya", item.id)
+                        } else {
+                            let admitted = post_prompt(
+                                &state,
+                                "freya",
+                                OWNER,
+                                None,
+                                &json!({"prompt":"queued original"}),
+                            );
+                            assert_eq!(
+                                admitted["queued_prompt"]["intended_codex_thread_id"],
+                                original
+                            );
+                            (
+                                original,
+                                admitted["queued_prompt"]["id"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_string(),
+                            )
+                        };
+                        install_route(tmp.path(), "freya", route);
+                        call(
+                            &state,
+                            "POST",
+                            &format!("/api/v1/sessions/{target}/queue/{id}/send-now"),
+                            OWNER,
+                            &json!({}),
+                        )
+                        .json_value()
+                        .unwrap()
+                    } else {
+                        // Move the persona only after this request has observed the original thread.
+                        let home = tmp.path().to_path_buf();
+                        crate::api::before_next_prompt_dispatch(move || {
+                            install_route(&home, "freya", route)
+                        });
+                        post_prompt(
+                            &state,
+                            original,
+                            OWNER,
+                            None,
+                            &json!({"prompt":"direct original", "send_now":true}),
+                        )
+                    };
+                    assert_eq!(
+                        response["delivery_stage"], "refused",
+                        "mode={mode}, replacement={replacement}: {response}"
+                    );
+                    assert_eq!(response["delivered"], false);
+                    assert_eq!(response["failure_stage"], "Route");
+                    assert!(
+                        listener.accept().is_err(),
+                        "a replacement endpoint received a connection"
+                    );
+                    assert!(
+                        !tmux.log().contains("paste-buffer"),
+                        "replacement Claude pane received input"
+                    );
+                    if queued {
+                        assert_eq!(
+                            response["queue"][0]["session_id"],
+                            if mode == "queued-persona" {
+                                "freya"
+                            } else {
+                                original
+                            }
+                        );
+                        assert_eq!(response["queue"][0]["delivery_state"], "refused");
+                        crate::api::drain_ready_session_queues(&state);
+                        assert!(
+                            listener.accept().is_err(),
+                            "background drain retried a refusal"
+                        );
+                        assert!(!tmux.log().contains("paste-buffer"));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

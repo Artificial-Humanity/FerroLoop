@@ -966,6 +966,19 @@ function notifyPendingPrompts() {
 /** In-progress composer drafts survive tab switches and agent switches. */
 export const sessionDraftMemory = new Map<string, SessionDraft>();
 export const sessionSendErrors = new Map<string, string>();
+// Receipts can arrive after selection changes or the submitting pane unmounts.
+// Retain their stage with the submitted target, just like drafts and pending sends.
+export const sessionDeliveryReceipts = new Map<string, {
+  stage: PromptResponse["delivery_stage"];
+  text: string;
+}>();
+const deliveryReceiptListeners = new Set<() => void>();
+function recordPromptDelivery(target: string, response?: PromptResponse) {
+  const text = promptDeliveryStatus(response);
+  if (text) sessionDeliveryReceipts.set(target, { stage: response?.delivery_stage, text });
+  else sessionDeliveryReceipts.delete(target);
+  for (const listener of deliveryReceiptListeners) listener();
+}
 const pendingAttachmentReads = new Map<string, number>();
 const draftListeners = new Set<
   (target: string, draft: SessionDraft | null, error?: string) => void
@@ -1313,12 +1326,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
     pendingPromptListeners.add(refreshPendingPrompts);
+    deliveryReceiptListeners.add(refreshPendingPrompts);
     // A send could have begun between render and subscription.
     refreshPendingPrompts();
-    return () => { pendingPromptListeners.delete(refreshPendingPrompts); };
+    return () => {
+      pendingPromptListeners.delete(refreshPendingPrompts);
+      deliveryReceiptListeners.delete(refreshPendingPrompts);
+    };
   }, []);
   const submitting = Boolean(targetSessionOrAgent && pendingPrompts.has(targetSessionOrAgent));
-  const [deliveryStatus, setDeliveryStatus] = React.useState<{ target: string; text: string } | null>(null);
+  const deliveryStatus = sessionDeliveryReceipts.get(targetSessionOrAgent)?.text;
   const [submitError, setSubmitError] = React.useState<string | null>(null);
   const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>(
     () => Object.fromEntries(sessionSendErrors),
@@ -2246,22 +2263,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         if (isPromptDeliveryFailure(res)) {
           throw new Error(res?.delivery_error || "Queued message delivery could not be confirmed");
         }
-        const status = promptDeliveryStatus(res);
-        if (status && currentTargetRef.current === submittedTarget) setDeliveryStatus({ target: submittedTarget, text: status });
+        recordPromptDelivery(submittedTarget, res);
       } else if (apiClient) {
         const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
-        if (currentTargetRef.current === submittedTarget) {
+        if (isPromptDeliveryFailure(res)) {
+          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        }
+        recordPromptDelivery(submittedTarget, res);
+        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
           if (typeof res.is_busy === "boolean") {
             setInternalIsBusy(res.is_busy);
           }
-          if (isPromptDeliveryFailure(res)) {
-            throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
-          }
-          const status = promptDeliveryStatus(res);
-          if (status) setDeliveryStatus({ target: submittedTarget, text: status });
           const content = res.effective_body || res.prompt;
           if (content && res.delivery_stage !== "unconfirmed") {
             setInternalTurns((prev) => [
@@ -2430,10 +2445,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (!wasQueued && isPromptDeliveryFailure(res)) {
         throw new Error(res?.delivery_error || "Message delivery failed");
       }
-      const status = promptDeliveryStatus(res);
-      if (mountedRef.current && currentTargetRef.current === submittedTarget) {
-        setDeliveryStatus(status ? { target: submittedTarget, text: status } : null);
-      }
+      recordPromptDelivery(submittedTarget, res);
       if (
         mountedRef.current && !onSendPrompt && apiClient && res &&
         currentTargetRef.current === submittedTarget
@@ -3626,7 +3638,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             }}
           />
         </div>
-        {deliveryStatus?.target === targetSessionOrAgent && <div role="status">{deliveryStatus.text}</div>}
+        {deliveryStatus && <div role="status">{deliveryStatus}</div>}
         {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
