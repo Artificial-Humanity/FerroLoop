@@ -277,7 +277,8 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
     let dir = unsafe { std::os::fd::OwnedFd::from_raw_fd(dirfd) };
     let st = fstat(dir.as_raw_fd())?;
     let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-    private_parent_ok(st.st_uid, unix_euid(), st.st_mode, is_dir)?;
+    // mode_t is u16 on macOS; the shared permission validator accepts u32.
+    private_parent_ok(st.st_uid, unix_euid(), st.st_mode as _, is_dir)?;
     let temp = temp_name()?;
     // SAFETY: `temp` is a relative name. O_EXCL|O_NOFOLLOW creates a new file and refuses a symlink.
     let fd = unsafe {

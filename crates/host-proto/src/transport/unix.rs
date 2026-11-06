@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnix;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -311,7 +311,8 @@ fn open_private_dir(path: &Path, euid: u32) -> Result<OwnedFd, HostError> {
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let st = fstat(owned.as_raw_fd())?;
     let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-    crate::private_parent_ok(st.st_uid, euid, st.st_mode & 0o777, is_dir)?;
+    // mode_t is u16 on macOS; the shared permission validator accepts u32.
+    crate::private_parent_ok(st.st_uid, euid, (st.st_mode & 0o777) as _, is_dir)?;
     Ok(owned)
 }
 
@@ -456,7 +457,7 @@ fn bind_private(path: &Path) -> Result<(tokio::net::UnixListener, u64, u64), Hos
         let _ = std::fs::remove_file(path);
         HostError::Io(err.to_string())
     })?;
-    if meta.mode() & libc::S_IFMT != libc::S_IFSOCK {
+    if !meta.file_type().is_socket() {
         let _ = std::fs::remove_file(path);
         return Err(HostError::NotASocket);
     }

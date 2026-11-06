@@ -1440,6 +1440,52 @@ mod deadline_tests {
         assert!(!host.inner.sessions.lock().unwrap().contains_key("late"));
     }
 
+    #[test]
+    fn windows_deadline_endpoints_are_distinct_across_threads() {
+        let endpoints = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        unresolved_windows_endpoint("S-1-5-21-123")
+                            .socket_path()
+                            .to_owned()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(endpoints.len(), 16);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn distinct_deadline_hosts_keep_per_endpoint_singleton() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = unresolved_endpoint(first_dir.path());
+        let second = unresolved_endpoint(second_dir.path());
+        let _first_host = Host::open(OpenOptions::new(HostConfig::new(first.clone()))).unwrap();
+        let _second_host = Host::open(OpenOptions::new(HostConfig::new(second))).unwrap();
+        assert!(matches!(
+            Host::open(OpenOptions::new(HostConfig::new(first))),
+            Err(fl_host_proto::HostError::AlreadyRunning)
+        ));
+    }
+
+    fn unresolved_windows_endpoint(sid: &str) -> HostEndpoint {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let suffix = format!(
+            "unres-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        HostEndpoint::windows(&suffix, sid).expect("endpoint")
+    }
+
     fn unresolved_endpoint(dir: &std::path::Path) -> HostEndpoint {
         #[cfg(unix)]
         {
@@ -1450,9 +1496,7 @@ mod deadline_tests {
         #[cfg(windows)]
         {
             let _ = dir;
-            let suffix = format!("unres-{}", std::process::id());
-            HostEndpoint::windows(&suffix, &super::current_user_sid().expect("sid"))
-                .expect("endpoint")
+            unresolved_windows_endpoint(&super::current_user_sid().expect("sid"))
         }
         #[cfg(not(any(unix, windows)))]
         {
