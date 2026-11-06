@@ -1169,15 +1169,37 @@ pub fn transition(
                 return Ok(refused(HoldReason::Corrupt));
             }
             if attempt.evidence.is_some() {
+                // A contradictory old response fences the whole key. Its newer
+                // unarmed owner can no longer Arm, so release that exact slot;
+                // an armed owner may still emit and must retain capacity.
+                if let Some(current) = record.attempts.len().checked_sub(1)
+                    && record.attempts[current].armed_at.is_none()
+                {
+                    capacity_changed = release_capacity(
+                        &mut record,
+                        current,
+                        &mut recipient,
+                        &mut global,
+                        CapacityState::Released,
+                    )?;
+                    recipient_changed = capacity_changed;
+                }
                 record.eligibility = Eligibility::Held;
                 record.held = Some(HoldReason::Unconfirmed);
                 if recipient.barrier.as_ref() != Some(&record.key) {
                     recipient.barrier = Some(record.key.clone());
-                    bump(&mut recipient.revision)?;
+                    if !recipient_changed {
+                        bump(&mut recipient.revision)?;
+                    }
                     recipient_changed = true;
                 }
             } else {
                 let retired = attempt.capacity == CapacityState::Retired;
+                let uncertainty_fenced = record.eligibility == Eligibility::Held
+                    && matches!(
+                        record.held,
+                        Some(HoldReason::Unconfirmed | HoldReason::EvidenceOverflow)
+                    );
                 let frozen = attempt.frozen.as_ref();
                 let valid = match (&input.evidence, frozen) {
                     (DeliveryEvidence::VendorQueued, Some(f)) => f.transport == Transport::Queue,
@@ -1216,9 +1238,10 @@ pub fn transition(
                     CapacityState::Released,
                 )?;
                 recipient_changed = capacity_changed;
-                if retired {
-                    // A retired scope keeps its eligibility and ordering fence permanently.
-                    // A late, still-authorized response records only evidence/receipt.
+                if retired || uncertainty_fenced {
+                    // Later evidence cannot erase historical uncertainty or a
+                    // retired scope's eligibility/ordering fence. Record only
+                    // evidence, receipt and any exactly-owned capacity release.
                 } else if input.evidence == DeliveryEvidence::MutationUnconfirmed || overflow {
                     record.eligibility = Eligibility::Held;
                     record.held = Some(if overflow {
@@ -1342,7 +1365,9 @@ pub fn transition(
                 }
             };
             if overflow {
-                record.held = Some(HoldReason::EvidenceOverflow);
+                if record.held != Some(HoldReason::Unconfirmed) {
+                    record.held = Some(HoldReason::EvidenceOverflow);
+                }
                 if record.eligibility == Eligibility::Prepared {
                     let Some(index) = record.attempts.len().checked_sub(1) else {
                         return Ok(refused(HoldReason::Corrupt));
@@ -1421,13 +1446,14 @@ pub fn transition_capacity_retirement(
             view: record.view(&ctx.recipient),
         }));
     }
+    // Capacity ownership and uncertainty ordering are independent: another key
+    // may have installed the recipient barrier after this owner was armed.
     if record.attempts[index].armed_at.is_none()
         || record.revision != target.record_revision
         || ctx.recipient.revision != target.recipient_revision
         || ctx.global.revision != target.global_revision
         || ctx.recipient.active.as_ref() != Some(&target.owner)
         || !ctx.global.active_index.contains(&target.owner)
-        || ctx.recipient.barrier.as_ref() != Some(&record.key)
     {
         return Ok(unchanged(CapacityRetirementResult::Stale));
     }

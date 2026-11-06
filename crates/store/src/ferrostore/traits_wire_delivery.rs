@@ -1017,6 +1017,136 @@ mod tests {
             })
             .unwrap()
     }
+
+    fn contradiction_case(case: conformance::ContradictionCase) {
+        struct Model<'a>(&'a FerroStore);
+        impl WireDeliveryStore for Model<'_> {
+            fn apply_delivery(&self, c: DeliveryCommand) -> Result<DeliveryResult, StoreError> {
+                Ok(model(self.0, c))
+            }
+            fn inspect_delivery(
+                &self,
+                k: &DeliveryKey,
+            ) -> Result<Option<DeliveryView>, StoreError> {
+                self.0.inspect_delivery(k)
+            }
+            fn active_delivery_owners(&self) -> Result<Vec<CapacityRetirementTarget>, StoreError> {
+                self.0.active_delivery_owners()
+            }
+            fn retire_orphan_capacity(
+                &self,
+                _: CapacityRetirementTarget,
+            ) -> Result<CapacityRetirementResult, StoreError> {
+                panic!("private ended-scope observation required")
+            }
+        }
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("contradiction.fls");
+            let store = if disk {
+                FerroStore::open(&path).unwrap()
+            } else {
+                FerroStore::in_memory()
+            };
+            let views = conformance::contradiction_conformance(
+                &Model(&store),
+                |p, m| install(&store, p, m),
+                |t| {
+                    close_fixture(&store, t);
+                    let before = snapshot(&store);
+                    let result = retire(&store, t);
+                    let after = snapshot(&store);
+                    for (name, rows) in before["collections"].as_object().unwrap() {
+                        if name != LEDGER && name != CONTROLS {
+                            assert_eq!(&after["collections"][name], rows);
+                        }
+                    }
+                    if !matches!(result, CapacityRetirementResult::Retired { .. }) {
+                        assert_eq!(after, before);
+                    }
+                    result
+                },
+                case,
+            );
+            public_refusals(&store);
+            let before = snapshot(&store);
+            let mut first = Some(store);
+            for _ in 0..if disk { 2 } else { 1 } {
+                let store = first
+                    .take()
+                    .unwrap_or_else(|| FerroStore::open(&path).unwrap());
+                assert_eq!(snapshot(&store), before);
+                store
+                    .with_read(|tx| {
+                        let global: GlobalControl = row(tx, CONTROLS, "global")?.unwrap();
+                        assert_eq!(global.revision, Revision(4));
+                        assert_eq!(global.active_attempts, 0);
+                        assert!(global.active_index.is_empty());
+                        for view in &views {
+                            let recipient: RecipientControl =
+                                row(tx, CONTROLS, &recipient_key(&view.key))?.unwrap();
+                            assert!(recipient.active.is_none());
+                            assert_eq!(recipient.barrier, view.barrier);
+                            assert_eq!(
+                                recipient.revision,
+                                Revision(match case {
+                                    conformance::ContradictionCase::Unarmed => 6,
+                                    conformance::ContradictionCase::CrossKey => 8,
+                                    _ => 7,
+                                })
+                            );
+                            let reservation: IdReservation =
+                                row(tx, RESERVATIONS, &hex(&lp(view.key.original_id.as_str())))?
+                                    .unwrap();
+                            assert_eq!(
+                                reservation,
+                                IdReservation {
+                                    original_id: view.key.original_id.clone(),
+                                    generation: view.generation
+                                }
+                            );
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                public_refusals(&store);
+                let any = AnyStore::from(store);
+                refusals(&any, false);
+                #[cfg(target_os = "linux")]
+                admissions(&any, false);
+                for view in &views {
+                    assert_eq!(
+                        zero(|| any.inspect_delivery(&view.key)).unwrap().as_ref(),
+                        Some(view)
+                    );
+                }
+                assert!(zero(|| any.active_delivery_owners()).unwrap().is_empty());
+                drop(any);
+            }
+            if disk {
+                assert_eq!(snapshot(&FerroStore::open(&path).unwrap()), before);
+            }
+        }
+    }
+    #[test]
+    fn managed_ferro_preparatory_contradiction_unarmed() {
+        contradiction_case(conformance::ContradictionCase::Unarmed);
+    }
+    #[test]
+    fn managed_ferro_preparatory_contradiction_armed() {
+        for case in [
+            conformance::ContradictionCase::ArmedQueued,
+            conformance::ContradictionCase::ArmedAccepted,
+            conformance::ContradictionCase::ArmedNoMutation,
+            conformance::ContradictionCase::RetiredNoMutation,
+        ] {
+            contradiction_case(case);
+        }
+    }
+    #[test]
+    fn managed_ferro_preparatory_contradiction_cross_key() {
+        contradiction_case(conformance::ContradictionCase::CrossKey);
+    }
     #[test]
     fn managed_ferro_preparatory_write_probe() {
         let dir = tempfile::tempdir().unwrap();

@@ -1381,6 +1381,130 @@ mod tests {
             canonical_payload(p.generation, &arm.frozen.renderer, &arm.frozen.bytes).unwrap();
         DeliveryCommand::Arm(arm)
     }
+
+    fn contradiction_case(case: conformance::ContradictionCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contradiction.redb");
+        let store = Arc::new(RedbStore::open(&path).unwrap());
+        let views = conformance::contradiction_conformance(
+            &ModelHandle(store.clone()),
+            |p, m| install(&store, p, m),
+            |t| {
+                close_fixture(&store, t);
+                let before = snapshot(&store);
+                let result = retire(&store, t);
+                let after = snapshot(&store);
+                for field in ["tables", "receipts", "log", "meta"] {
+                    assert_eq!(after[field], before[field]);
+                }
+                for def in [RESERVATIONS, WIRE_MESSAGES, AGENTS] {
+                    assert_eq!(after["rows"][def.name()], before["rows"][def.name()]);
+                }
+                if !matches!(result, CapacityRetirementResult::Retired { .. }) {
+                    assert_eq!(after, before);
+                }
+                result
+            },
+            case,
+        );
+        public_refusals(&store);
+        let before = snapshot(&store);
+        let mut first = Some(Arc::try_unwrap(store).ok().unwrap());
+        for _ in 0..2 {
+            let store = first
+                .take()
+                .unwrap_or_else(|| RedbStore::open(&path).unwrap());
+            assert_eq!(snapshot(&store), before);
+            let tx = store.db.begin_read().unwrap();
+            let global: GlobalControl = row(&tx, CONTROLS, "global").unwrap().unwrap();
+            assert_eq!(global.revision, Revision(4));
+            assert_eq!(global.active_attempts, 0);
+            assert!(global.active_index.is_empty());
+            for view in &views {
+                let recipient: RecipientControl = row(&tx, CONTROLS, &recipient_key(&view.key))
+                    .unwrap()
+                    .unwrap();
+                assert!(recipient.active.is_none());
+                assert_eq!(recipient.barrier, view.barrier);
+                assert_eq!(
+                    recipient.revision,
+                    Revision(match case {
+                        conformance::ContradictionCase::Unarmed => 6,
+                        conformance::ContradictionCase::CrossKey => 8,
+                        _ => 7,
+                    })
+                );
+                let reservation: IdReservation =
+                    row(&tx, RESERVATIONS, &hex(&lp(view.key.original_id.as_str())))
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    reservation,
+                    IdReservation {
+                        original_id: view.key.original_id.clone(),
+                        generation: view.generation
+                    }
+                );
+            }
+            drop(tx);
+            public_refusals(&store);
+            let any = crate::AnyStore::from(store);
+            for view in &views {
+                assert_eq!(
+                    zero(|| any.inspect_delivery(&view.key)).unwrap().as_ref(),
+                    Some(view)
+                );
+                assert_eq!(
+                    zero(|| any.apply_delivery(DeliveryCommand::Close {
+                        key: view.key.clone()
+                    }))
+                    .unwrap(),
+                    DeliveryResult::Refused {
+                        reason: HoldReason::Disabled
+                    }
+                );
+            }
+            assert!(zero(|| any.active_delivery_owners()).unwrap().is_empty());
+            let p = prepare();
+            let target = CapacityRetirementTarget {
+                owner: ActiveOwner {
+                    key: p.key,
+                    attempt: p.attempt,
+                },
+                record_revision: Revision(1),
+                recipient_revision: Revision(1),
+                global_revision: Revision(1),
+            };
+            assert_eq!(
+                zero(|| any.retire_orphan_capacity(target)).unwrap(),
+                CapacityRetirementResult::Unproven
+            );
+            #[cfg(target_os = "linux")]
+            crate::wire_delivery_lifetime::assert_preparatory_admit_refusal(&any, false);
+            drop(any);
+        }
+        assert_eq!(snapshot(&RedbStore::open(&path).unwrap()), before);
+    }
+
+    #[test]
+    fn managed_redb_preparatory_contradiction_unarmed() {
+        contradiction_case(conformance::ContradictionCase::Unarmed);
+    }
+    #[test]
+    fn managed_redb_preparatory_contradiction_armed() {
+        for case in [
+            conformance::ContradictionCase::ArmedQueued,
+            conformance::ContradictionCase::ArmedAccepted,
+            conformance::ContradictionCase::ArmedNoMutation,
+            conformance::ContradictionCase::RetiredNoMutation,
+        ] {
+            contradiction_case(case);
+        }
+    }
+    #[test]
+    fn managed_redb_preparatory_contradiction_cross_key() {
+        contradiction_case(conformance::ContradictionCase::CrossKey);
+    }
     fn race(store: Arc<RedbStore>, commands: [DeliveryCommand; 2]) -> Vec<DeliveryResult> {
         let barrier = Arc::new(Barrier::new(2));
         let handles: Vec<_> = commands

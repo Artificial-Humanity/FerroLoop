@@ -3036,6 +3036,76 @@ mod managed_tests {
     use crate::wire_delivery::conformance::{fixture_commands, fixture_message};
     use crate::wire_delivery::*;
 
+    fn contradiction(case: conformance::ContradictionCase) {
+        let s = MemStore::default();
+        let views = conformance::contradiction_conformance(
+            &s,
+            |p, m| install_input(&s, p, m.clone()),
+            |t| {
+                s.inner.borrow_mut().delivery.ended_scopes.insert(
+                    t.owner.attempt.lifetime.id,
+                    t.owner.attempt.lifetime.clone(),
+                );
+                s.retire_orphan_capacity(t.clone()).unwrap()
+            },
+            case,
+        );
+        let inner = s.inner.borrow();
+        let global = inner.delivery.global.as_ref().unwrap();
+        assert_eq!(global.revision, Revision(4)); // two reservations, exactly two releases
+        assert_eq!(global.active_attempts, 0);
+        assert!(global.active_index.is_empty());
+        for view in views {
+            assert_eq!(
+                inner.delivery.reservations.get(&view.key.original_id),
+                Some(&IdReservation {
+                    original_id: view.key.original_id.clone(),
+                    generation: view.generation
+                })
+            );
+            assert_eq!(
+                inner.delivery.recipients[&view.key.recipient_id].revision,
+                Revision(match case {
+                    conformance::ContradictionCase::Unarmed => 6,
+                    conformance::ContradictionCase::CrossKey => 8,
+                    _ => 7,
+                })
+            );
+        }
+        assert!(
+            inner
+                .delivery
+                .recipients
+                .values()
+                .all(|r| r.active.is_none())
+        );
+    }
+
+    #[test]
+    fn managed_contradiction_unarmed_capacity() {
+        contradiction(conformance::ContradictionCase::Unarmed);
+    }
+    #[test]
+    fn managed_contradiction_armed_queued_fence() {
+        contradiction(conformance::ContradictionCase::ArmedQueued);
+    }
+    #[test]
+    fn managed_contradiction_armed_accepted_fence() {
+        contradiction(conformance::ContradictionCase::ArmedAccepted);
+    }
+    #[test]
+    fn managed_contradiction_armed_no_mutation_fence() {
+        contradiction(conformance::ContradictionCase::ArmedNoMutation);
+    }
+    #[test]
+    fn managed_contradiction_retired_fence() {
+        contradiction(conformance::ContradictionCase::RetiredNoMutation);
+    }
+    #[test]
+    fn managed_contradiction_cross_key_retirement() {
+        contradiction(conformance::ContradictionCase::CrossKey);
+    }
+
     fn install(s: &MemStore) {
         let DeliveryCommand::Prepare(input) = fixture_commands().remove(0) else {
             unreachable!()
