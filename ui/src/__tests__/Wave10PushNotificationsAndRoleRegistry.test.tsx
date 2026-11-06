@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { HubApiClient } from "../api/client";
 import {
   BUILTIN_ROLE_REGISTRY as ReExportedRoles,
   DEFAULT_OPERATOR_PUSH_STATE as ReExportedPushState,
@@ -77,7 +78,7 @@ describe("Wave 10 Item 1 (Record #67): FerroDeck+ Operator Push Notifications UI
 });
 
 describe("Wave 10 Item 2 (Record #74): User-Configurable Agent Role Registry UI", () => {
-  it("renders all 11 built-in roles and supports editing existing roles and creating custom RoleRecord definitions", () => {
+  it("renders all 11 built-in roles and supports editing existing roles and creating custom RoleRecord definitions", async () => {
     expect(ReExportedRoles).toEqual(BUILTIN_ROLE_REGISTRY);
     expect(BUILTIN_ROLE_REGISTRY.map((r) => r.slug)).toEqual([
       "lead",
@@ -93,24 +94,29 @@ describe("Wave 10 Item 2 (Record #74): User-Configurable Agent Role Registry UI"
       "journalist",
     ]);
 
+    const apiClient = new HubApiClient({
+      fetchImpl: vi.fn(async (input, init) => new Response(JSON.stringify(
+        String(input).endsWith("/api/v1/roles")
+          ? init?.method === "POST" ? JSON.parse(String(init.body)) : BUILTIN_ROLE_REGISTRY
+          : {},
+      ), { status: 200, headers: { "Content-Type": "application/json" } })),
+    });
     render(
-      <SettingsModal isOpen={true} onClose={() => {}} initialTab="agents" />,
+      <SettingsModal isOpen={true} onClose={() => {}} initialTab="agents" apiClient={apiClient} />,
     );
+    await screen.findByTestId("role-registry-row-ui-developer");
 
     expect(
       screen.getByTestId("configurable-role-registry-card"),
     ).toBeTruthy();
     expect(
       screen.getByTestId("role-registry-count-badge").textContent,
-    ).toContain("11 Roles (11 Built-in · 0 Custom)");
+    ).toContain("11 Roles");
 
     for (const roleRec of BUILTIN_ROLE_REGISTRY) {
       expect(
         screen.getByTestId(`role-registry-row-${roleRec.slug}`),
       ).toBeTruthy();
-      expect(
-        screen.getByTestId(`role-registry-kind-${roleRec.slug}`).textContent,
-      ).toBe("built-in");
     }
 
     // Load an existing role into the editor
@@ -135,15 +141,12 @@ describe("Wave 10 Item 2 (Record #74): User-Configurable Agent Role Registry UI"
     });
     fireEvent.click(screen.getByTestId("role-registry-save-btn"));
 
-    expect(
+    await waitFor(() => expect(
       screen.getByTestId("role-registry-count-badge").textContent,
-    ).toContain("12 Roles (11 Built-in · 1 Custom)");
+    ).toContain("12 Roles"));
     expect(
       screen.getByTestId("role-registry-row-benchmark-auditor"),
     ).toBeTruthy();
-    expect(
-      screen.getByTestId("role-registry-kind-benchmark-auditor").textContent,
-    ).toBe("custom");
     expect(
       screen.getByTestId("role-registry-status-banner").textContent,
     ).toContain("Saved RoleRecord 'benchmark-auditor'");

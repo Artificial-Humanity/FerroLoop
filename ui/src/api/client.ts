@@ -47,6 +47,7 @@ import {
   type ProjectsListResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
+  type RoleRecord,
   type RecastAgentRequest,
   type RecastAgentResponse,
   type SessionQueueResponse,
@@ -927,6 +928,21 @@ export class HubApiClient {
 
   public async getAgentsLiveness(staleAfterMs?: number): Promise<LivenessResponse> {
     return this.getLiveness(staleAfterMs);
+  }
+
+  public async getRoles(): Promise<RoleRecord[]> {
+    return this.request<RoleRecord[]>("/api/v1/roles");
+  }
+
+  public async upsertRole(role: RoleRecord): Promise<RoleRecord> {
+    return this.request<RoleRecord>("/api/v1/roles", {
+      method: "POST",
+      body: JSON.stringify(role),
+    });
+  }
+
+  public async deleteRole(slug: string): Promise<{ deleted: boolean; slug: string }> {
+    return this.request(`/api/v1/roles/${encodeURIComponent(slug)}`, { method: "DELETE" });
   }
 
   public async recastAgent(

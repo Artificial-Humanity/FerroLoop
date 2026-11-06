@@ -75,8 +75,8 @@ impl AreaRecord {
     }
 }
 
-/// A registered agent's role. The eleven default roles are first-class
-/// variants; `Custom` is only for genuinely custom roles (`custom:<slug>`).
+/// A registered agent's runtime role. Editable catalog defaults can also use
+/// `Custom` (`custom:<slug>`); catalog metadata does not confer structural authority.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AgentRole {
     Lead,
@@ -528,7 +528,7 @@ impl RoleRecord {
     }
 }
 
-/// The 11 built-in roles, verbatim from the UI `BUILTIN_ROLE_REGISTRY`.
+/// Editable, deletion-protected defaults, independent of runtime role variants.
 pub fn builtin_role_records() -> Vec<RoleRecord> {
     let raw: [(&str, &str, &str, RoleReviewPolicy, &str); 11] = [
         (
@@ -623,6 +623,18 @@ pub fn builtin_role_records() -> Vec<RoleRecord> {
         .collect()
 }
 
+/// Optional starter guidance uses ordinary custom-role override and deletion rules.
+fn starter_role_records() -> Vec<RoleRecord> {
+    vec![RoleRecord {
+        slug: "council-chair".into(),
+        label: "Council Chair".into(),
+        description: "Preferred contact for council advice; synthesizes evidence and guides bounded discussion to actionable recommendations.".into(),
+        builtin: false,
+        review_policy: RoleReviewPolicy::LeadReview,
+        prompt_template: "Read .agents/roles/strategist.md and inherit its research synthesis, empirical rigor, project data boundaries, and constructive independent advice. Ground recommendations in source files, measured metrics, or cited literature, distinguishing measured results, estimates, and hypotheses. As Council Chair, be the preferred contact for the Owner, users, and Project Leads seeking council advice. Frame each request and its decision criteria; synthesize evidence, findings, and disagreements across the council. Adjudicate bounded discussion to a concrete recommendation or action, or name the unresolved decision and who must resolve it; prevent endless debate. Council advice cannot override the Owner or Project Lead and grants no additional authority or review tier.".into(),
+    }]
+}
+
 fn role_store_slug(slug: &str) -> String {
     format!("role-{slug}")
 }
@@ -672,14 +684,28 @@ fn stored_roles(store: &impl StateStore) -> Result<BTreeMap<String, RoleRecord>,
     Ok(out)
 }
 
-/// All roles: builtins in registry order with stored overrides applied,
-/// then custom roles sorted by slug. An empty store yields the 11 builtins.
+/// All roles: builtins and optional starters with stored overrides applied,
+/// then other custom roles sorted by slug. Starter tombstones stay deleted.
 /// Corrupt stored role entries are skipped.
 pub fn list_roles(store: &impl StateStore) -> Result<Vec<RoleRecord>, StoreError> {
-    let stored = stored_roles(store)?;
+    let mut stored = stored_roles(store)?;
     let mut out = Vec::new();
     for builtin in builtin_role_records() {
-        out.push(stored.get(&builtin.slug).cloned().unwrap_or(builtin));
+        out.push(stored.remove(&builtin.slug).unwrap_or(builtin));
+    }
+    for starter in starter_role_records() {
+        if let Some(record) = stored.remove(&starter.slug) {
+            out.push(record);
+        } else if store
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &role_store_slug(&starter.slug),
+            )?
+            .is_none()
+        {
+            out.push(starter);
+        }
     }
     let mut customs: Vec<RoleRecord> = stored
         .into_values()
@@ -706,7 +732,10 @@ pub fn get_role(store: &impl StateStore, slug: &str) -> Result<Option<RoleRecord
         }
         return Ok(None);
     }
-    Ok(builtin_role_records().into_iter().find(|r| r.slug == slug))
+    Ok(builtin_role_records()
+        .into_iter()
+        .chain(starter_role_records())
+        .find(|r| r.slug == slug))
 }
 
 /// Validate, normalize and persist a role (custom or builtin override).
@@ -1016,11 +1045,128 @@ mod tests {
     }
 
     #[test]
+    fn council_chair_default_is_available_through_the_catalog() {
+        let store = crate::MemStore::default();
+        let chair = get_role(&store, "council-chair")
+            .unwrap()
+            .expect("Council Chair must be available without a stored override");
+        assert_eq!(chair.label, "Council Chair");
+        assert_eq!(chair.review_policy, RoleReviewPolicy::LeadReview);
+        assert!(!chair.builtin);
+        assert!(!chair.description.is_empty());
+        assert!(!chair.prompt_template.is_empty());
+        assert_eq!(
+            list_roles(&store)
+                .unwrap()
+                .into_iter()
+                .filter(|role| role.slug == "council-chair")
+                .collect::<Vec<_>>(),
+            vec![chair]
+        );
+    }
+
+    #[test]
+    fn council_chair_stored_guidance_overrides_the_default() {
+        let store = crate::MemStore::default();
+        let mut chair = get_role(&store, "council-chair").unwrap().unwrap();
+        chair.label = "Council Facilitator".into();
+        chair.prompt_template = "Compare the measured latency evidence before advising.".into();
+        chair.builtin = false;
+        let saved = upsert_role(&store, chair).unwrap();
+        assert!(!saved.builtin);
+
+        let stored = get_role(&store, "council-chair").unwrap().unwrap();
+        assert_eq!(stored.label, "Council Facilitator");
+        assert_eq!(
+            stored.prompt_template,
+            "Compare the measured latency evidence before advising."
+        );
+        assert_eq!(stored.review_policy, RoleReviewPolicy::LeadReview);
+        assert_eq!(
+            list_roles(&store)
+                .unwrap()
+                .into_iter()
+                .filter(|role| role.slug == "council-chair")
+                .collect::<Vec<_>>(),
+            vec![stored]
+        );
+    }
+
+    #[test]
+    fn council_chair_and_structural_custom_shadows_keep_runtime_identity() {
+        let store = crate::MemStore::default();
+        let lead = agent(1, "ProjectLead", AgentRole::Lead, "ferroloop");
+        for (wire, slug, catalog_slug) in [
+            ("custom:council-chair", "council-chair", "council-chair"),
+            ("custom:lead", "lead", "lead"),
+            ("custom:assistant", "assistant", "assistant"),
+            ("custom:lab_manager", "lab_manager", "lab-manager"),
+            ("custom:lab-manager", "lab-manager", "lab-manager"),
+        ] {
+            // Catalog labels and default metadata carry no structural authority.
+            let mut catalog = get_role(&store, catalog_slug).unwrap().unwrap();
+            catalog.label = "Project Lead".into();
+            catalog.review_policy = RoleReviewPolicy::LabManagerReview;
+            let saved = upsert_role(&store, catalog).unwrap();
+            assert_eq!(saved.builtin, catalog_slug != "council-chair");
+            let role = AgentRole::from_wire(wire).unwrap();
+            assert_eq!(role, AgentRole::Custom(slug.into()), "{wire}");
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{wire}\""));
+            let registered = agent(2, "Advisor", role, "ferroloop");
+            assert_eq!(
+                reports_to(&registered, std::slice::from_ref(&lead)),
+                "ProjectLead"
+            );
+        }
+        assert!(AgentRole::from_wire("council-chair").is_err());
+    }
+
+    #[test]
+    fn council_chair_deletion_stays_missing_until_explicitly_revived() {
+        let store = crate::MemStore::default();
+        delete_role(&store, "council-chair").unwrap();
+        assert!(get_role(&store, "council-chair").unwrap().is_none());
+        assert!(
+            list_roles(&store)
+                .unwrap()
+                .iter()
+                .all(|role| role.slug != "council-chair")
+        );
+        assert!(matches!(
+            delete_role(&store, "council-chair"),
+            Err(RoleError::NotFound(_))
+        ));
+
+        let revived = RoleRecord::new(
+            "council-chair",
+            "Restored Chair",
+            "Restored council guidance",
+            RoleReviewPolicy::LeadReview,
+            "Bound discussion and report unresolved decisions.",
+        )
+        .unwrap();
+        upsert_role(&store, revived.clone()).unwrap();
+        assert!(!revived.builtin);
+        assert_eq!(
+            get_role(&store, "council-chair").unwrap(),
+            Some(revived.clone())
+        );
+        assert_eq!(
+            list_roles(&store)
+                .unwrap()
+                .into_iter()
+                .filter(|role| role.slug == "council-chair")
+                .collect::<Vec<_>>(),
+            vec![revived]
+        );
+    }
+
+    #[test]
     fn role_registry_empty_store_and_persistence() {
         use crate::MemStore;
         let store = MemStore::default();
         let roles = list_roles(&store).unwrap();
-        assert_eq!(roles.len(), 11);
+        assert_eq!(roles.len(), 12);
         let slugs: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
         assert_eq!(
             slugs,
@@ -1035,10 +1181,11 @@ mod tests {
                 "devops-release",
                 "data-ml-engineer",
                 "technical-writer",
-                "journalist"
+                "journalist",
+                "council-chair"
             ]
         );
-        assert!(roles.iter().all(|r| r.builtin));
+        assert_eq!(roles.iter().filter(|r| r.builtin).count(), 11);
         // Custom upsert appears and persists on re-read (same store = reopen).
         let custom = RoleRecord::new(
             "reviewer",
@@ -1053,7 +1200,7 @@ mod tests {
             get_role(&store, "reviewer").unwrap().unwrap().label,
             "Reviewer"
         );
-        assert_eq!(list_roles(&store).unwrap().len(), 12);
+        assert_eq!(list_roles(&store).unwrap().len(), 13);
         // Lab-manager alias lookup finds the builtin.
         assert_eq!(
             get_role(&store, "lab_manager").unwrap().unwrap().slug,
@@ -1068,7 +1215,7 @@ mod tests {
         let lead2 = get_role(&store, "lead").unwrap().unwrap();
         assert_eq!(lead2.label, "Boss");
         assert!(lead2.builtin);
-        assert_eq!(list_roles(&store).unwrap().len(), 12);
+        assert_eq!(list_roles(&store).unwrap().len(), 13);
         // Delete builtin refused; delete custom gone.
         assert!(matches!(
             delete_role(&store, "lead"),
@@ -1076,7 +1223,7 @@ mod tests {
         ));
         delete_role(&store, "reviewer").unwrap();
         assert!(get_role(&store, "reviewer").unwrap().is_none());
-        assert_eq!(list_roles(&store).unwrap().len(), 11);
+        assert_eq!(list_roles(&store).unwrap().len(), 12);
         assert!(matches!(
             delete_role(&store, "reviewer"),
             Err(RoleError::NotFound(_))
@@ -1115,7 +1262,7 @@ mod tests {
         // Value tries to hijack the builtin `lead` from a custom key.
         insert_raw_role(&store, "role-ghost", role_value("lead", "Hijacked"));
         let roles = list_roles(&store).unwrap();
-        assert_eq!(roles.len(), 11);
+        assert_eq!(roles.len(), 12);
         assert!(
             roles
                 .iter()
@@ -1140,7 +1287,7 @@ mod tests {
         insert_raw_role(&store, "role-broken", serde_json::json!({"not": "a role"}));
         insert_raw_role(&store, "role-lead", serde_json::json!("garbage"));
         let roles = list_roles(&store).unwrap();
-        assert_eq!(roles.len(), 11);
+        assert_eq!(roles.len(), 12);
         assert_eq!(
             roles.iter().find(|r| r.slug == "lead").unwrap().label,
             "Project Lead"

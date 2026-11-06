@@ -312,19 +312,8 @@ export const DEFAULT_OPERATOR_PUSH_STATE: OperatorPushSubscriptionState = {
 /**
  * Record #74: User-Configurable Agent Role Registry (11 built-in roles + custom RoleRecord).
  */
-export type RoleReviewPolicy =
-  | "lead-review"
-  | "lab-manager-review"
-  | "peer-review";
-
-export interface ConfigurableRoleRecord {
-  slug: string;
-  label: string;
-  description: string;
-  builtin: boolean;
-  review_policy: RoleReviewPolicy;
-  prompt_template: string;
-}
+export type { RoleReviewPolicy } from "../types/api";
+export type ConfigurableRoleRecord = RoleRecord;
 
 export const BUILTIN_ROLE_REGISTRY: ConfigurableRoleRecord[] = [
   {
@@ -723,6 +712,8 @@ import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
   DEFAULT_WORKSPACE_AGENTS,
+  type RoleRecord,
+  type RoleReviewPolicy,
   type AgentRecord,
   type BulkSessionAction,
   type BulkSessionActionResponse,
@@ -737,6 +728,7 @@ import {
   type ProjectSummary,
   type TotpEnrollmentResponse,
 } from "../types/api";
+import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import {
   FALLBACK_PROJECTS,
   findProject,
@@ -939,6 +931,10 @@ export function canonicalizeDefaultRole(rawRole: string): string {
     ? trimmed.slice(7).trim()
     : trimmed;
   const lower = stripped.toLowerCase();
+  if (
+    /^custom:/i.test(trimmed) &&
+    ["lead", "assistant", "lab-manager", "lab_manager"].includes(lower)
+  ) return trimmed;
   if (lower === "scribe") return "journalist";
   if (lower === "lab-manager" || lower === "lab_manager") return "lab_manager";
   if (RECAST_ROLE_OPTIONS.some((opt) => opt.value === lower)) {
@@ -954,6 +950,9 @@ export function normalizeRecastRole(
   if (selectedRole === CREATE_CUSTOM_ROLE_VALUE) {
     const clean = customRoleInput.trim();
     if (!clean) return "assistant";
+    if (["lead", "assistant", "lab-manager", "lab_manager"].includes(clean.toLowerCase())) {
+      return `custom:${clean.toLowerCase()}`;
+    }
     const canonical = canonicalizeDefaultRole(clean);
     if (RECAST_ROLE_OPTIONS.some((opt) => opt.value === canonical)) {
       return canonical;
@@ -2078,18 +2077,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [operatorPushState, setOperatorPushState] =
     useState<OperatorPushSubscriptionState>(() => DEFAULT_OPERATOR_PUSH_STATE);
   const [pushActionBanner, setPushActionBanner] = useState<string | null>(null);
-  const [roleRegistry, setRoleRegistry] = useState<ConfigurableRoleRecord[]>(
-    () => BUILTIN_ROLE_REGISTRY,
-  );
+  const roleCatalog = useRoles(isOpen, apiClient);
+  const roleRegistry = roleCatalog.roles;
+  const recastRoleOptions = roleOptions(RECAST_ROLE_OPTIONS, roleRegistry);
   const [roleDraftSlug, setRoleDraftSlug] = useState("");
   const [roleDraftLabel, setRoleDraftLabel] = useState("");
   const [roleDraftDescription, setRoleDraftDescription] = useState("");
   const [roleDraftReviewPolicy, setRoleDraftReviewPolicy] =
     useState<RoleReviewPolicy>("lead-review");
   const [roleDraftPromptTemplate, setRoleDraftPromptTemplate] = useState("");
-  const [roleRegistryBanner, setRoleRegistryBanner] = useState<string | null>(
-    null,
-  );
   const [cloudSessions, setCloudSessions] = useState<VendorCloudSessionEntry[]>(
     () => DEFAULT_VENDOR_CLOUD_SESSIONS,
   );
@@ -2211,7 +2207,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       });
       setRecastModalAgentKey(null);
       setRecastStatusBanner(
-        `Re-cast ${ag.display_name} to ${updatedAgent.project} as ${updatedAgent.role}.`,
+        `Re-cast ${ag.display_name} to ${updatedAgent.project} as ${roleLabel(updatedAgent.role, roleRegistry)}.${res?.guidance_requires_reforge ? " Run an explicit Reforge to apply current role guidance." : ""}`,
       );
       onAgentsUpdated?.();
     } catch (err) {
@@ -3843,7 +3839,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           className="fd-badge fd-mono"
                           style={{ fontSize: "10.5px" }}
                         >
-                          {canonicalizeDefaultRole(ag.role)}
+                          {roleLabel(canonicalizeDefaultRole(ag.role), roleRegistry)}
                         </span>
                         {(() => {
                           const rawPosture = postureInputsByAgent?.[key] ?? {};
@@ -4266,7 +4262,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  Inspect the 11 built-in workspace roles and define or edit custom{" "}
+                  Inspect, define, or edit saved{" "}
                   <code className="fd-mono">RoleRecord</code> templates synced via{" "}
                   <code className="fd-mono">/api/v1/roles</code>.
                 </p>
@@ -4276,13 +4272,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 data-testid="role-registry-count-badge"
                 style={{ fontSize: "10.5px" }}
               >
-                {roleRegistry.length} Roles (
-                {roleRegistry.filter((r) => r.builtin).length} Built-in ·{" "}
-                {roleRegistry.filter((r) => !r.builtin).length} Custom)
+                {roleRegistry.length} Roles
               </span>
             </div>
 
-            {roleRegistryBanner && (
+            {roleCatalog.loading && <div role="status">Loading roles…</div>}
+            {roleCatalog.error && (
+              <div role="alert" data-testid="role-registry-error">{roleCatalog.error}</div>
+            )}
+            {roleCatalog.status && (
               <div
                 role="status"
                 data-testid="role-registry-status-banner"
@@ -4295,7 +4293,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   backgroundColor: "rgba(16, 185, 129, 0.12)",
                 }}
               >
-                {roleRegistryBanner}
+                {roleCatalog.status}
               </div>
             )}
 
@@ -4341,13 +4339,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         gap: "4px",
                       }}
                     >
-                      <span
-                        className="fd-badge fd-mono"
-                        data-testid={`role-registry-kind-${roleRec.slug}`}
-                        style={{ fontSize: "9.5px" }}
-                      >
-                        {roleRec.builtin ? "built-in" : "custom"}
-                      </span>
                       <button
                         type="button"
                         className="fd-btn"
@@ -4363,6 +4354,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       >
                         Edit
                       </button>
+                      {!roleRec.builtin && (
+                        <button
+                          type="button"
+                          className="fd-btn"
+                          disabled={roleCatalog.saving}
+                          data-testid={`role-registry-delete-btn-${roleRec.slug}`}
+                          onClick={() => void roleCatalog.remove(roleRec.slug)}
+                        >
+                          Remove
+                        </button>
+                      )}
                     </div>
                   </div>
                   <div style={{ fontWeight: 600 }}>{roleRec.label}</div>
@@ -4464,6 +4466,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   type="button"
                   className="fd-btn fd-btn-primary"
                   data-testid="role-registry-save-btn"
+                  disabled={roleCatalog.saving || !roleDraftSlug.trim()}
                   style={{ fontSize: "11px", padding: "4px 10px" }}
                   onClick={() => {
                     const cleanSlug = roleDraftSlug
@@ -4476,39 +4479,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       label: roleDraftLabel.trim() || cleanSlug,
                       description:
                         roleDraftDescription.trim() ||
-                        `Custom role ${cleanSlug}`,
-                      builtin: BUILTIN_ROLE_REGISTRY.some(
-                        (b) => b.slug === cleanSlug,
-                      ),
+                        `Role ${cleanSlug}`,
+                      builtin: roleRegistry.find((r) => r.slug === cleanSlug)?.builtin ?? false,
                       review_policy: roleDraftReviewPolicy,
                       prompt_template:
                         roleDraftPromptTemplate.trim() ||
                         `Read .agents/roles/${cleanSlug}.md and execute assigned tasks.`,
                     };
-                    setRoleRegistry((prev) => {
-                      const exists = prev.some((r) => r.slug === cleanSlug);
-                      if (exists) {
-                        return prev.map((r) =>
-                          r.slug === cleanSlug ? nextRec : r,
-                        );
-                      }
-                      return [...prev, nextRec];
-                    });
-                    setRoleRegistryBanner(
-                      `Saved RoleRecord '${cleanSlug}' (${nextRec.review_policy}) to registry.`,
-                    );
-                    if (typeof globalThis.fetch === "function") {
-                      void globalThis
-                        .fetch("/api/v1/roles", {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify(nextRec),
-                        })
-                        .catch(() => {});
-                    }
+                    void roleCatalog.save(nextRec);
                   }}
                 >
-                  Save Role Record
+                  {roleCatalog.saving ? "Saving…" : "Save Role Record"}
                 </button>
               </div>
             </div>
@@ -10177,7 +10158,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             ]);
           const hasRoleOption =
             draft.role === CREATE_CUSTOM_ROLE_VALUE ||
-            RECAST_ROLE_OPTIONS.some((opt) => opt.value === draft.role);
+            recastRoleOptions.some((opt) => opt.value === draft.role);
 
           return (
             <div
@@ -10324,15 +10305,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       }}
                     >
                       {!hasRoleOption && (
-                        <option value={draft.role}>{draft.role}</option>
+                        <option value={draft.role}>{roleLabel(draft.role, roleRegistry)}</option>
                       )}
-                      {RECAST_ROLE_OPTIONS.map((opt) => (
+                      {recastRoleOptions.map((opt) => (
                         <option key={opt.value} value={opt.value}>
                           {opt.label}
                         </option>
                       ))}
                       <option value={CREATE_CUSTOM_ROLE_VALUE}>
-                        + Create custom role...
+                        + Create User Role...
                       </option>
                     </select>
                   </div>
@@ -10350,12 +10331,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           textTransform: "uppercase",
                         }}
                       >
-                        Custom Role Name
+                        User Role Name
                       </label>
                       <input
                         id={`recast-custom-role-input-${key}`}
                         type="text"
-                        aria-label={`Custom role for ${modalAgent.display_name}`}
+                        aria-label={`User role for ${modalAgent.display_name}`}
                         data-testid={`recast-custom-role-input-${key}`}
                         className="fd-input fd-mono"
                         placeholder="e.g. reviewer or custom:reviewer"

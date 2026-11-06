@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
+import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import {
   formatModelOptionLabel,
   getVendorModelOptions,
@@ -825,6 +826,8 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   onSpunUp,
   apiClient,
 }) => {
+  const catalog = useRoles(isOpen, apiClient);
+  const roles = roleOptions(SPIN_UP_ROLES, catalog.roles);
   const [persona, setPersona] = useState("");
   const [project, setProject] = useState<string>(() =>
     resolveSpinUpProject(initialProject, projects),
@@ -1121,12 +1124,15 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 disabled={submitting}
                 style={{ width: "100%" }}
               >
-                {SPIN_UP_ROLES.map((r) => (
+                {!roles.some((r) => r.value === role) && <option value={role}>{roleLabel(role, catalog.roles)}</option>}
+                {roles.map((r) => (
                   <option key={r.value} value={r.value}>
                     {r.label}
                   </option>
                 ))}
               </select>
+              {catalog.loading && <div role="status">Loading roles…</div>}
+              {catalog.error && <div role="status">Role catalog: {catalog.error}. Existing roles remain available.</div>}
             </div>
           </div>
 

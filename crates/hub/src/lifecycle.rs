@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use fl_core::agent::{AgentRecord, AgentRole, AgentStatus, RegisterAgentArgs};
+use fl_core::agent::{
+    AgentRecord, AgentRole, AgentStatus, RegisterAgentArgs, get_role, normalize_role_slug,
+};
 use fl_core::state::{
     HandoffEntry, MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload,
     StateScope, UpsertStateArgs, validate_slug,
@@ -31,7 +33,7 @@ use crate::api::{
     synthesize_decommission_prompt,
 };
 
-/// Roles `spin-up` accepts (the FerroDeck role list).
+/// Legacy executable role choices; spin-up also accepts roles in the current catalog.
 pub const SPIN_UP_ROLES: [&str; 11] = [
     "lead",
     "assistant",
@@ -1280,12 +1282,9 @@ impl SpinUpRequest {
         validate_slug(&project)
             .map_err(|_| invalid_field("project", "must be a valid area slug"))?;
         let role = self.role.trim().to_ascii_lowercase();
-        if !SPIN_UP_ROLES.contains(&role.as_str()) {
-            return Err(LifecycleError::Invalid(format!(
-                "role must be one of: {}",
-                SPIN_UP_ROLES.join(", ")
-            )));
-        }
+        let slug = role.strip_prefix("custom:").unwrap_or(&role);
+        validate_slug(slug)
+            .map_err(|_| invalid_field("role", "must be an executable role or catalog slug"))?;
         let vendor = self.vendor.trim().to_ascii_lowercase();
         if lookup_vendor(&vendor).is_none() {
             return Err(LifecycleError::Invalid(format!(
@@ -1562,6 +1561,192 @@ fn prompt_for(display: &str, project: &str, role: &str) -> String {
         project,
         &reforge_role_label(&agent_role_from_label(role)),
     )
+}
+
+/// Resolve the executable/catalog union before registration or runtime effects. Keep the
+/// runtime identity separate from catalog slug normalization (especially structural shadows).
+fn validate_catalog_role<S: StateStore>(store: &S, label: &str) -> Result<(), LifecycleError> {
+    let role = agent_role_from_label(label);
+    if !matches!(role, AgentRole::Custom(_)) {
+        return Ok(());
+    }
+    let slug = label.strip_prefix("custom:").unwrap_or(label);
+    if get_role(store, slug)
+        .map_err(|e| LifecycleError::Store(e.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(invalid_field(
+        "role",
+        &format!("`{label}` is not an executable role or available catalog role"),
+    ))
+}
+
+/// A current catalog record or persisted catalog tombstone/corruption. Unknown legacy roles
+/// have neither, and keep the legacy external/file hydration path.
+pub(crate) fn has_catalog_guidance<S: StateStore>(
+    store: &S,
+    slug: &str,
+) -> Result<bool, LifecycleError> {
+    let normalized = normalize_role_slug(slug).map_err(|e| LifecycleError::Store(e.to_string()))?;
+    Ok(get_role(store, slug)
+        .map_err(|e| LifecycleError::Store(e.to_string()))?
+        .is_some()
+        || store
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &format!("role-{normalized}"),
+            )?
+            .is_some())
+}
+
+/// Catalog guidance for custom roles. Structural custom shadows may share a catalog slug,
+/// but must never inherit the builtin structural template or file.
+pub(crate) fn registered_role_prompt<S: StateStore>(
+    store: &S,
+    display: &str,
+    project: &str,
+    role: &AgentRole,
+) -> Result<String, LifecycleError> {
+    let AgentRole::Custom(slug) = role else {
+        return Ok(canonical_reforge_prompt(
+            display,
+            project,
+            &reforge_role_label(role),
+        ));
+    };
+    let label = role.as_wire();
+    let base = canonical_reforge_prompt(display, project, &label);
+    let file_step = format!("Read your role file(s): `.agents/roles/{label}.md`.");
+    if matches!(
+        slug.as_str(),
+        "lead" | "assistant" | "lab_manager" | "lab-manager"
+    ) {
+        return Ok(base.replace(
+            &file_step,
+            "Retain your custom role identity; it grants no structural authority.",
+        ));
+    }
+    match get_role(store, slug).map_err(|e| LifecycleError::Store(e.to_string()))? {
+        Some(record) => Ok(base.replace(
+            &file_step,
+            &format!(
+                "Apply your current catalog role guidance: {}",
+                record.prompt_template
+            ),
+        )),
+        None => {
+            let normalized =
+                normalize_role_slug(slug).map_err(|e| LifecycleError::Store(e.to_string()))?;
+            if store
+                .get_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &format!("role-{normalized}"),
+                )?
+                .is_some()
+            {
+                return Err(LifecycleError::Invalid(format!(
+                    "catalog guidance for `{label}` is missing or deleted; restore the role before hydration"
+                )));
+            }
+            // Pre-catalog legacy registrations remain usable with their original file guidance.
+            Ok(prompt_for(display, project, &reforge_role_label(role)))
+        }
+    }
+}
+
+/// Each staged binding has its own key, preserving earlier required guidance if a later
+/// registry write fails. A binding is effective only for the same stable ID and assignment.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RecastGuidanceBinding {
+    agent_id: fl_core::ids::AgentId,
+    project: String,
+    role: AgentRole,
+}
+
+fn guidance_binding(agent: &AgentRecord, project: &str, role: &AgentRole) -> RecastGuidanceBinding {
+    RecastGuidanceBinding {
+        agent_id: agent.id.clone(),
+        project: project.into(),
+        role: role.clone(),
+    }
+}
+
+fn guidance_binding_slug(binding: &RecastGuidanceBinding) -> String {
+    let encoded = serde_json::to_string(binding).expect("binding serializes");
+    format!(
+        "recast-guidance-{}",
+        &crate::auth::sha256_hex(&encoded)[..48]
+    )
+}
+
+pub(crate) fn recast_guidance_required<S: StateStore>(
+    store: &S,
+    agent: &AgentRecord,
+) -> Result<bool, StoreError> {
+    let binding = guidance_binding(agent, &agent.project, &agent.role);
+    let Some(entry) = store.get_state_by_key(
+        &StateScope::Workspace,
+        StateConcern::Runtime,
+        &guidance_binding_slug(&binding),
+    )?
+    else {
+        return Ok(false);
+    };
+    let StatePayload::Runtime(rt) = entry.payload else {
+        return Err(StoreError::Backend(
+            "invalid recast guidance metadata".into(),
+        ));
+    };
+    let stored: RecastGuidanceBinding = serde_json::from_value(rt.value)
+        .map_err(|e| StoreError::Backend(format!("invalid recast guidance metadata: {e}")))?;
+    if stored != binding {
+        return Err(StoreError::Backend(
+            "recast guidance binding mismatch".into(),
+        ));
+    }
+    Ok(true)
+}
+
+fn current_recast_assignment<S: AgentRegistry + StateStore>(
+    store: &S,
+    persona: &str,
+) -> Result<Option<AgentRecord>, LifecycleError> {
+    let Some(agent) = store.agent_by_name(persona)? else {
+        return Ok(None);
+    };
+    // Retirement ends the current assignment. A later spin-up may reuse this stable identity
+    // in a new project or role; only an active recast overrides stale hosted/request fields.
+    if agent.status != AgentStatus::Active {
+        return Ok(None);
+    }
+    Ok(recast_guidance_required(store, &agent)?.then_some(agent))
+}
+
+pub(crate) fn stage_recast_guidance<S: StateStore>(
+    store: &S,
+    agent: &AgentRecord,
+    project: &str,
+    role: &AgentRole,
+    by: &str,
+) -> Result<(), StoreError> {
+    let binding = guidance_binding(agent, project, role);
+    store.upsert_state(UpsertStateArgs {
+        scope: StateScope::Workspace,
+        slug: guidance_binding_slug(&binding),
+        sensitivity: SensitivityPatch::Inherit,
+        payload: StatePayload::Runtime(RuntimeEntry {
+            value: serde_json::to_value(&binding)
+                .map_err(|e| StoreError::Backend(e.to_string()))?,
+            merge_mode: MergeMode::LastWriter,
+        }),
+        at: stamp::now(),
+        by: by.into(),
+    })?;
+    Ok(())
 }
 
 /// How [`check_registration`] treats the persona's own agent record.
@@ -2577,6 +2762,14 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let mut v = req.validate()?;
+    if let Some(agent) = current_recast_assignment(store, &v.persona)? {
+        v.project = agent.project;
+        v.role = role_label_of(&agent.role);
+    }
+    validate_catalog_role(store, &v.role)?;
+    let display = capitalize(&v.persona);
+    let prompt =
+        registered_role_prompt(store, &display, &v.project, &agent_role_from_label(&v.role))?;
     // Before any side effect: a window the vendor does not offer registers nothing. It is only
     // recorded here; the launch below does not apply it.
     if let Some(tokens) = v.context_window {
@@ -2615,10 +2808,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     )?;
     register_spun_up_agent(store, &v, by)?;
 
-    let display = capitalize(&v.persona);
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
     let unit = tmux_target.as_deref().map_or("", runtime_unit).to_string();
-    let prompt = prompt_for(&display, &v.project, &v.role);
 
     let now = now_ms();
     let mut record = HostedSessionRecord {
@@ -3549,7 +3740,7 @@ pub struct RestartResponse {
 
 /// Count a restart: reopen a missing tmux session, redeliver the reforge prompt, mark running.
 /// A `decommissioned` session is refused (409); spin it up again instead.
-pub fn restart_hosted_session<S: StateStore>(
+pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
     store: &S,
     env: &LifecycleEnv<'_>,
     id: &str,
@@ -3561,8 +3752,17 @@ pub fn restart_hosted_session<S: StateStore>(
         // Its agent is retired; restarting would mark it running with no agent behind it.
         return Err(decommissioned_conflict(&record.session_id));
     }
+    if let Some(agent) = current_recast_assignment(store, &record.persona)? {
+        record.project = agent.project;
+        record.role = role_label_of(&agent.role);
+    }
     let display = capitalize(&record.persona);
-    let prompt = prompt_for(&display, &record.project, &record.role);
+    let prompt = registered_role_prompt(
+        store,
+        &display,
+        &record.project,
+        &agent_role_from_label(&record.role),
+    )?;
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = runtime_unit(&want_target).to_string();
@@ -3873,7 +4073,11 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
     if target.hosted.as_ref().is_some_and(is_decommissioned) {
         return Err(decommissioned_conflict(&target.session_id));
     }
-    let Some((project, role)) = project_and_role(store, target)? else {
+    let assignment = match current_recast_assignment(store, &target.persona)? {
+        Some(agent) => Some((agent.project, role_label_of(&agent.role))),
+        None => project_and_role(store, target)?,
+    };
+    let Some((project, role)) = assignment else {
         return Err(LifecycleError::NotFound(format!(
             "no hosted session or agent record for `{}`",
             target.raw_id
@@ -3900,6 +4104,13 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         context_window: None,
     }
     .validate()?;
+    validate_catalog_role(store, &to.role)?;
+    registered_role_prompt(
+        store,
+        &capitalize(&to.persona),
+        &to.project,
+        &agent_role_from_label(&to.role),
+    )?;
     // Before the teardown: a remodel onto an API vendor with no key would retire the old
     // session for nothing.
     check_api_key(env, &to.vendor)?;
@@ -4612,14 +4823,9 @@ mod tests {
         r.project = "no spaces".into();
         assert_eq!(r.validate().unwrap_err().status(), 400);
 
-        let all_roles = format!("role must be one of: {}", SPIN_UP_ROLES.join(", "));
-        assert_eq!(SPIN_UP_ROLES.len(), 11);
         for role in [
             "",
-            "owner",
-            "lab_manager",
-            "custom:x",
-            "custom:web-developer",
+            "custom:",
             "web developer",
             "web-developer\u{0}",
             "web/developer",
@@ -4629,9 +4835,18 @@ mod tests {
             let e = req("felicity", role, "claude").validate().unwrap_err();
             assert_eq!(e.status(), 400, "{role}");
             assert!(
-                matches!(&e, LifecycleError::Invalid(m) if *m == all_roles),
+                matches!(&e, LifecycleError::Invalid(m) if m.starts_with("role")),
                 "{role}"
             );
+        }
+        // Catalog existence is checked by spin-up/remodel against the store.
+        for role in [
+            "council-chair",
+            "custom:council-chair",
+            "custom:lead",
+            "missing-role",
+        ] {
+            assert!(req("felicity", role, "claude").validate().is_ok(), "{role}");
         }
         for vendor in ["", "gemini", "Claude2"] {
             let e = req("felicity", "lead", vendor).validate().unwrap_err();
@@ -4771,6 +4986,230 @@ mod tests {
             "claude:bob"
         );
         assert!(find_hosted_session(&store, &["nobody"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn recast_startup_and_restart_use_current_registration_over_stale_hosted_assignment() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut test_env = env(&home);
+        test_env.runtime = &runtime;
+        test_env.spawn_runtime = true;
+        spin_up(
+            &store,
+            &test_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let old = store.agent_by_name("ada").unwrap().unwrap();
+        let target_role = AgentRole::Custom("council-chair".into());
+        crate::agents::register_recast(
+            &store,
+            &old,
+            RegisterAgentArgs {
+                display_name: old.display_name.clone(),
+                email: Some(old.email.clone()),
+                project: "sonora".into(),
+                role: target_role.clone(),
+                extra_areas: vec![],
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "owner".into(),
+            },
+        )
+        .unwrap();
+        let restarted = restart_hosted_session(&store, &test_env, "claude:ada", "owner").unwrap();
+        assert_eq!(restarted.record.project, "sonora");
+        assert!(
+            restarted
+                .prompt
+                .contains("--role custom:council-chair --replace")
+        );
+        let spun = spin_up(
+            &store,
+            &test_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(spun.prompt.unwrap().contains("sonora/"));
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().role,
+            target_role
+        );
+    }
+
+    #[test]
+    fn retired_recast_persona_reuses_id_with_requested_assignment_and_hydration() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut test_env = env(&home);
+        test_env.runtime = &runtime;
+        test_env.spawn_runtime = true;
+        spin_up(
+            &store,
+            &test_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let old = store.agent_by_name("ada").unwrap().unwrap();
+        crate::agents::register_recast(
+            &store,
+            &old,
+            RegisterAgentArgs {
+                display_name: old.display_name.clone(),
+                email: Some(old.email.clone()),
+                project: "sonora".into(),
+                role: AgentRole::Custom("council-chair".into()),
+                extra_areas: vec![],
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "owner".into(),
+            },
+        )
+        .unwrap();
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        teardown_session(&store, &test_env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+        let mut request = req("ada", "tester", "claude");
+        request.project = "new-project".into();
+        let spun = spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+        let agent = store.agent_by_name("ada").unwrap().unwrap();
+        assert_eq!(agent.id, old.id);
+        assert_eq!(agent.project, "new-project");
+        assert_eq!(agent.role, AgentRole::Tester);
+        assert_eq!(agent.status, AgentStatus::Active);
+        let prompt = spun.prompt.unwrap();
+        assert!(prompt.contains("new-project/"), "{prompt}");
+        assert!(prompt.contains("--role tester --replace"), "{prompt}");
+        assert!(spun.hydration_dispatched);
+        let launches = runtime.launches.borrow();
+        let launch = launches.last().unwrap().1.as_ref().unwrap();
+        assert!(launch.argv.contains(&prompt), "{launch:?}");
+    }
+
+    #[test]
+    fn legacy_unknown_role_hydration_preserves_file_fallback() {
+        let store = MemStore::default();
+        let role = AgentRole::Custom("legacy-reviewer".into());
+        assert!(!has_catalog_guidance(&store, "legacy-reviewer").unwrap());
+        let prompt = registered_role_prompt(&store, "Ada", "ferroloop", &role).unwrap();
+        assert!(prompt.contains("roles/legacy-reviewer.md"));
+        assert!(prompt.contains("--role legacy-reviewer --replace"));
+    }
+
+    #[test]
+    fn catalog_chair_spin_up_uses_current_template_without_inventing_role_file() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut test_env = env(&home);
+        test_env.runtime = &runtime;
+        test_env.spawn_runtime = true;
+        let mut chair = fl_core::agent::get_role(&store, "council-chair")
+            .unwrap()
+            .unwrap();
+        chair.prompt_template =
+            "Read .agents/roles/strategist.md; chair edited evidence review.".into();
+        fl_core::agent::upsert_role(&store, chair).unwrap();
+        let out = spin_up(
+            &store,
+            &test_env,
+            &req("ada", "custom:council-chair", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().role,
+            AgentRole::Custom("council-chair".into())
+        );
+        let prompt = out.prompt.unwrap();
+        assert!(prompt.contains("chair edited evidence review"), "{prompt}");
+        assert!(!prompt.contains("roles/council-chair.md"), "{prompt}");
+    }
+
+    #[test]
+    fn catalog_invalid_unknown_and_deleted_roles_have_no_registration_or_runtime_effects() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut test_env = env(&home);
+        test_env.runtime = &runtime;
+        test_env.spawn_runtime = true;
+        fl_core::agent::delete_role(&store, "council-chair").unwrap();
+        for role in [
+            "custom:council-chair",
+            "missing-adviser",
+            "custom:missing-adviser",
+            "custom:bad role",
+        ] {
+            assert_eq!(
+                spin_up(
+                    &store,
+                    &test_env,
+                    &req("ada", role, "claude"),
+                    "owner",
+                    Caller::Owner
+                )
+                .unwrap_err()
+                .status(),
+                400,
+                "{role}"
+            );
+            assert!(store.agent_by_name("ada").unwrap().is_none());
+            assert!(list_hosted_sessions(&store).unwrap().is_empty());
+            assert!(store.get_area("ferroloop").unwrap().is_none());
+            assert!(runtime.calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_custom_structural_shadows_keep_identity_without_builtin_guidance() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut test_env = env(&home);
+        test_env.runtime = &runtime;
+        test_env.spawn_runtime = true;
+        for (i, slug) in ["lead", "assistant", "lab_manager", "lab-manager"]
+            .into_iter()
+            .enumerate()
+        {
+            let role = format!("custom:{slug}");
+            let persona = format!("agent-{i}");
+            let out = spin_up(
+                &store,
+                &test_env,
+                &req(&persona, &role, "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            assert_eq!(
+                store.agent_by_name(&persona).unwrap().unwrap().role,
+                AgentRole::Custom(slug.into())
+            );
+            let prompt = out.prompt.unwrap();
+            assert!(!prompt.contains(&format!("roles/{slug}.md")), "{prompt}");
+            assert!(!prompt.contains("lead project architecture"), "{prompt}");
+            assert!(
+                prompt.contains(&format!("--role {role} --replace")),
+                "{prompt}"
+            );
+        }
     }
 
     #[test]
