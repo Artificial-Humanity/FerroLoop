@@ -1149,6 +1149,24 @@ fn the_workspace_store_is_refused_when_named_in_either_form() {
 }
 
 #[test]
+fn a_workspace_store_with_another_extension_is_still_refused_at_its_fls() {
+    // FerroStore keeps a workspace store named `state.db` (or `fl`, with no extension) at
+    // `state.fls` (`fl.fls`); a project whose store is that file is the workspace store.
+    for ws_name in ["state.db", "fl"] {
+        let mut fx = Fx::new();
+        fx.paths.workspace_store = fx.paths.store_dir.join(ws_name);
+        let fls = fx.paths.workspace_store.with_extension("fls");
+        fs::write(&fls, "x").unwrap();
+        let listed = [summary("alpha", &fls)];
+        let why = crate::project_delete::check_store("alpha", &fls, &[], &listed, &fx.paths)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("is the workspace store"), "{ws_name}: {why}");
+        assert!(fls.is_file(), "{ws_name}: nothing is deleted");
+    }
+}
+
+#[test]
 fn a_legacy_redb_beside_the_workspace_store_is_refused_as_the_workspace_store() {
     let fx = Fx::new();
     fx.project("alpha");

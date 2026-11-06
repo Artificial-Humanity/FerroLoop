@@ -524,7 +524,14 @@ pub(crate) fn check_store(
     let store_dir = resolve_loose(&paths.store_dir);
     let files = store_files(store);
     let ws = resolve_loose(&paths.workspace_store);
-    let ws_main: Vec<PathBuf> = std::iter::once(ws.clone()).chain(both_forms(&ws)).collect();
+    // The workspace store as named, its `.fls` (where FerroStore keeps a store whose name has
+    // another extension or none, `state.db` -> `state.fls`), and both forms of a store name.
+    let mut ws_main: Vec<PathBuf> = vec![ws.clone(), ws.with_extension(FLS)];
+    for form in both_forms(&ws) {
+        if !ws_main.contains(&form) {
+            ws_main.push(form);
+        }
+    }
     let others: Vec<PathBuf> = entries
         .iter()
         .filter(|e| e.slug().as_deref() != Some(slug))

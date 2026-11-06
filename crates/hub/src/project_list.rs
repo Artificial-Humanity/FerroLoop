@@ -127,9 +127,9 @@ pub(crate) fn effective_store_path(configured: &Path) -> PathBuf {
 ///   `.redb` nor `.fls`; the delete flow refuses such a name, and it must keep seeing it): the
 ///   path as configured;
 /// - redb (an explicit override, for a path that is not `.fls`): the path as configured;
-/// - FerroStore: the sibling `.fls`, except that a lone legacy file (no `.fls`, and the
-///   configured path is a regular file) is what is on disk, so that is reported until it is
-///   migrated. Nothing at all: the `.fls` it would be created at.
+/// - FerroStore: the sibling `.fls`, except that a lone legacy file (nothing at the `.fls`, a
+///   dangling link included, and the configured path is a regular file) is what is on disk, so
+///   that is reported until it is migrated. Nothing at all: the `.fls` it would be created at.
 ///
 /// It looks at the file system and changes nothing: no store is opened, migrated or made.
 pub(crate) fn effective_store_path_with(configured: &Path, env: Option<&str>) -> PathBuf {
@@ -146,7 +146,7 @@ pub(crate) fn effective_store_path_with(configured: &Path, env: Option<&str>) ->
         Ok(BackendKind::Ferro) => {
             let fls = physical_path(configured, BackendKind::Ferro);
             let legacy_only = fls != configured
-                && !fls.exists()
+                && std::fs::symlink_metadata(&fls).is_err()
                 && std::fs::metadata(configured).is_ok_and(|m| m.is_file());
             if legacy_only {
                 configured.to_path_buf()

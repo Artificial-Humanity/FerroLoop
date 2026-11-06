@@ -1514,8 +1514,39 @@ fn file_names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Holds the lock that serialises tests that touch process environment variables and removes
+/// `FL_STORE_BACKEND` until dropped, then puts it back: the list reads it, and a developer's own
+/// selection must not decide what these tests see.
+struct NoBackendEnv {
+    saved: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn no_backend_env() -> NoBackendEnv {
+    let lock = crate::SECRET_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let saved = std::env::var_os(fl_store::BACKEND_ENV);
+    // SAFETY: every test that reads or sets this variable holds SECRET_ENV_LOCK.
+    unsafe { std::env::remove_var(fl_store::BACKEND_ENV) };
+    NoBackendEnv { saved, _lock: lock }
+}
+
+impl Drop for NoBackendEnv {
+    fn drop(&mut self) {
+        // SAFETY: still holding SECRET_ENV_LOCK.
+        unsafe {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(fl_store::BACKEND_ENV, v),
+                None => std::env::remove_var(fl_store::BACKEND_ENV),
+            }
+        }
+    }
+}
+
 #[test]
 fn a_redb_alias_in_the_config_is_listed_as_the_fls_that_exists_on_disk() {
+    let _env = no_backend_env();
     let sb = Sandbox::new();
     let dir = sb.base.join("stores");
     fs::create_dir_all(&dir).unwrap();
@@ -1530,6 +1561,7 @@ fn a_redb_alias_in_the_config_is_listed_as_the_fls_that_exists_on_disk() {
 
 #[test]
 fn a_redb_alias_with_both_files_beside_it_is_listed_as_the_fls() {
+    let _env = no_backend_env();
     let sb = Sandbox::new();
     let dir = sb.base.join("stores");
     fs::create_dir_all(&dir).unwrap();
@@ -1544,6 +1576,7 @@ fn a_redb_alias_with_both_files_beside_it_is_listed_as_the_fls() {
 
 #[test]
 fn a_lone_unmigrated_redb_is_listed_as_the_redb_and_listing_touches_nothing() {
+    let _env = no_backend_env();
     let sb = Sandbox::new();
     let dir = sb.base.join("stores");
     fs::create_dir_all(&dir).unwrap();
@@ -1571,6 +1604,7 @@ fn a_lone_unmigrated_redb_is_listed_as_the_redb_and_listing_touches_nothing() {
 
 #[test]
 fn a_redb_alias_with_nothing_on_disk_is_listed_as_the_fls_it_would_be_created_at() {
+    let _env = no_backend_env();
     let sb = Sandbox::new();
     let dir = sb.base.join("stores");
     fs::create_dir_all(&dir).unwrap();
@@ -1585,6 +1619,7 @@ fn a_redb_alias_with_nothing_on_disk_is_listed_as_the_fls_it_would_be_created_at
 
 #[test]
 fn a_scanned_hint_and_a_stores_only_project_are_listed_by_their_physical_file() {
+    let _env = no_backend_env();
     let sb = Sandbox::new();
     let dir = sb.base.join("stores");
     fs::create_dir_all(&dir).unwrap();
@@ -1678,6 +1713,21 @@ fn effective_store_path_keeps_a_lone_legacy_file_and_is_idempotent() {
         let once = eff(p, None);
         assert_eq!(eff(&once, None), once, "{}", p.display());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_fls_link_beside_a_redb_is_the_fls_not_a_lone_legacy_file() {
+    use crate::project_list::effective_store_path_with as eff;
+    let tmp = TempDir::new().unwrap();
+    let dir = fs::canonicalize(tmp.path()).unwrap();
+    let redb = dir.join("x.redb");
+    let fls = dir.join("x.fls");
+    make_redb(&redb);
+    std::os::unix::fs::symlink(dir.join("nowhere"), &fls).unwrap();
+    assert!(!fls.exists() && fs::symlink_metadata(&fls).is_ok());
+    // Something is at the `.fls` (open_ferro sees it too), so it is the physical store.
+    assert_eq!(eff(&redb, None), fls);
 }
 
 #[test]
