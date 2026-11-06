@@ -380,6 +380,68 @@ describe("authenticated editable role catalog", () => {
   });
 
   it.each(["before", "after"])(
+    "shows initial catalog failure %s save acknowledgement while retaining feedback and drafts",
+    async (order) => {
+      const read = deferred<Response>();
+      const save = deferred<Response>();
+      const { client } = server({ get: () => read.promise, save: () => save.promise });
+      render(<SettingsModal isOpen onClose={vi.fn()} apiClient={client} />);
+      fillDraft();
+      fireEvent.click(screen.getByTestId("role-registry-save-btn"));
+      fireEvent.change(screen.getByTestId("role-registry-label-input"), {
+        target: { value: "Newer unsaved draft" },
+      });
+      const failLoad = () => act(async () => read.resolve(json({ error: "Catalog unavailable" }, 503)));
+      if (order === "before") await failLoad();
+      await act(async () => save.resolve(json({ ...chair, label: "Server acknowledged" })));
+      if (order === "after") {
+        expect(screen.getByText("Loading roles…")).toBeInTheDocument();
+        await failLoad();
+      }
+      expect(screen.getByTestId("role-registry-error")).toHaveTextContent("Catalog unavailable");
+      expect(screen.getByTestId("role-registry-status-banner")).toHaveTextContent("Saved");
+      expect(screen.getByTestId("role-registry-row-council-chair")).toHaveTextContent("Server acknowledged");
+      expect(screen.getByTestId("role-registry-label-input")).toHaveValue("Newer unsaved draft");
+      expect(screen.getByTestId("role-registry-prompt-input")).toHaveValue("My draft guidance");
+      expect(screen.queryByText("Loading roles…")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["before", "after"])(
+    "retains both catalog failure and mutation refusal when load fails %s save",
+    async (order) => {
+      const read = deferred<Response>();
+      const save = deferred<Response>();
+      const { client } = server({ get: () => read.promise, save: () => save.promise });
+      render(<SettingsModal isOpen onClose={vi.fn()} apiClient={client} />);
+      fillDraft();
+      const failLoad = () => act(async () => read.resolve(json({ error: "Catalog unavailable" }, 503)));
+      if (order === "before") await failLoad();
+      fireEvent.click(screen.getByTestId("role-registry-save-btn"));
+      await act(async () => save.resolve(json({ error: "Owner required" }, 403)));
+      if (order === "after") await failLoad();
+      expect(screen.getByTestId("role-registry-error")).toHaveTextContent("Catalog unavailable");
+      expect(screen.getByTestId("role-registry-error")).toHaveTextContent("Owner required");
+      expect(screen.queryByTestId("role-registry-status-banner")).not.toBeInTheDocument();
+      expect(screen.getByTestId("role-registry-label-input")).toHaveValue("Draft Chair");
+    },
+  );
+
+  it("ignores an initial catalog failure from a closed editor session", async () => {
+    const read = deferred<Response>();
+    let reads = 0;
+    const { client } = server({ get: () => ++reads === 1 ? read.promise : Promise.resolve(json([chair])) });
+    const onClose = vi.fn();
+    const { rerender } = render(<SettingsModal isOpen onClose={onClose} apiClient={client} />);
+    rerender(<SettingsModal isOpen={false} onClose={onClose} apiClient={client} />);
+    rerender(<SettingsModal isOpen onClose={onClose} apiClient={client} />);
+    await screen.findByTestId("role-registry-row-council-chair");
+    await act(async () => read.resolve(json({ error: "Old catalog failure" }, 503)));
+    expect(screen.queryByTestId("role-registry-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("role-registry-row-council-chair")).toHaveTextContent("Council Chair");
+  });
+
+  it.each(["before", "after"])(
     "retains unrelated catalog rows when the initial read resolves %s a save acknowledgement",
     async (order) => {
       const read = deferred<Response>();

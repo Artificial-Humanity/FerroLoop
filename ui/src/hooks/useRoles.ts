@@ -42,23 +42,23 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
   const [roles, setRoles] = useState<RoleRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const session = useRef(0);
-  const revision = useRef(0);
   const busy = useRef(false);
   // Only retain overlays while this session's initial catalog is pending.
   const pendingCatalog = useRef<Map<string, RoleRecord | null> | null>(null);
 
   useEffect(() => {
     const currentSession = ++session.current;
-    const currentRevision = ++revision.current;
     const overlays = new Map<string, RoleRecord | null>();
     pendingCatalog.current = enabled ? overlays : null;
     busy.current = false;
     setSaving(false);
     setStatus(null);
-    setError(null);
+    setLoadError(null);
+    setMutationError(null);
     setRoles([]);
     setLoading(enabled);
     if (enabled) {
@@ -76,11 +76,8 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
             setRoles(Array.from(reconciled.values()));
           }
         } catch (err) {
-          if (
-            session.current === currentSession &&
-            revision.current === currentRevision
-          ) {
-            setError(
+          if (session.current === currentSession) {
+            setLoadError(
               err instanceof Error ? err.message : "Unable to load roles",
             );
           }
@@ -107,10 +104,8 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
     if (!enabled || busy.current) return;
     busy.current = true;
     const currentSession = session.current;
-    ++revision.current;
-    setLoading(false);
     setSaving(true);
-    setError(null);
+    setMutationError(null);
     setStatus(null);
     try {
       const result = await operation();
@@ -124,7 +119,9 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
       }
     } catch (err) {
       if (session.current === currentSession) {
-        setError(err instanceof Error ? err.message : "Unable to save roles");
+        setMutationError(
+          err instanceof Error ? err.message : "Unable to save roles",
+        );
       }
     } finally {
       if (session.current === currentSession) {
@@ -152,5 +149,7 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
         message: `Removed RoleRecord '${slug}' from registry.`,
       };
     });
+  // A saved row does not mean the initial catalog loaded. Keep both failure sources visible.
+  const error = [loadError, mutationError].filter(Boolean).join("\n") || null;
   return { roles, loading, saving, error, status, save, remove };
 }

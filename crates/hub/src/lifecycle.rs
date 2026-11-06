@@ -1718,6 +1718,11 @@ fn current_recast_assignment<S: AgentRegistry + StateStore>(
     let Some(agent) = store.agent_by_name(persona)? else {
         return Ok(None);
     };
+    // Retirement ends the current assignment. A later spin-up may reuse this stable identity
+    // in a new project or role; only an active recast overrides stale hosted/request fields.
+    if agent.status != AgentStatus::Active {
+        return Ok(None);
+    }
     Ok(recast_guidance_required(store, &agent)?.then_some(agent))
 }
 
@@ -5037,6 +5042,62 @@ mod tests {
             store.agent_by_name("ada").unwrap().unwrap().role,
             target_role
         );
+    }
+
+    #[test]
+    fn retired_recast_persona_reuses_id_with_requested_assignment_and_hydration() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut test_env = env(&home);
+        test_env.runtime = &runtime;
+        test_env.spawn_runtime = true;
+        spin_up(
+            &store,
+            &test_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let old = store.agent_by_name("ada").unwrap().unwrap();
+        crate::agents::register_recast(
+            &store,
+            &old,
+            RegisterAgentArgs {
+                display_name: old.display_name.clone(),
+                email: Some(old.email.clone()),
+                project: "sonora".into(),
+                role: AgentRole::Custom("council-chair".into()),
+                extra_areas: vec![],
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "owner".into(),
+            },
+        )
+        .unwrap();
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        teardown_session(&store, &test_env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+        let mut request = req("ada", "tester", "claude");
+        request.project = "new-project".into();
+        let spun = spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+        let agent = store.agent_by_name("ada").unwrap().unwrap();
+        assert_eq!(agent.id, old.id);
+        assert_eq!(agent.project, "new-project");
+        assert_eq!(agent.role, AgentRole::Tester);
+        assert_eq!(agent.status, AgentStatus::Active);
+        let prompt = spun.prompt.unwrap();
+        assert!(prompt.contains("new-project/"), "{prompt}");
+        assert!(prompt.contains("--role tester --replace"), "{prompt}");
+        assert!(spun.hydration_dispatched);
+        let launches = runtime.launches.borrow();
+        let launch = launches.last().unwrap().1.as_ref().unwrap();
+        assert!(launch.argv.contains(&prompt), "{launch:?}");
     }
 
     #[test]

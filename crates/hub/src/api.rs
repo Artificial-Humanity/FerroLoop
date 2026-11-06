@@ -6213,9 +6213,9 @@ fn handle_post_session_clear(
     }
 }
 
-/// Clear or reforge one session: drop its queued prompts, build the reforge prompt, and reset
-/// the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id` is the id the
-/// caller used (its queue is dropped too); `canonical_id` and `persona` come from
+/// Clear or reforge one session: prepare the reforge prompt, then drop queued prompts and model
+/// overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
+/// is the id the caller used (its queue is dropped too); `canonical_id` and `persona` come from
 /// [`resolve_session_target`]. Returns the response body, or `(status, error)`: 404 when there
 /// is no agent record (reforge) or no live route, 502 when the dispatch itself fails.
 /// Shared by the single-session clear handler and the bulk action.
@@ -6227,6 +6227,17 @@ fn reset_session(
     persona: Option<&str>,
     mode: &str,
 ) -> Result<Value, (u16, String)> {
+    // Fallible guidance preparation must not erase queues or model choices on refusal.
+    let prompt = if mode == "reforge" {
+        let lookup = persona.unwrap_or(canonical_id);
+        match build_reforge_prompt(state, lookup) {
+            Ok(prompt) => Some(prompt),
+            Err(error) => return Err((error.status(), error.to_string())),
+        }
+    } else {
+        None
+    };
+
     state.clear_session_prompt_queue(canonical_id);
     if raw_session_id != canonical_id {
         state.clear_session_prompt_queue(raw_session_id);
@@ -6244,16 +6255,6 @@ fn reset_session(
     {
         state.clear_session_model_override(key);
     }
-
-    let prompt = if mode == "reforge" {
-        let lookup = persona.unwrap_or(canonical_id);
-        match build_reforge_prompt(state, lookup) {
-            Ok(prompt) => Some(prompt),
-            Err(error) => return Err((error.status(), error.to_string())),
-        }
-    } else {
-        None
-    };
 
     let reset_mode = if mode == "reforge" {
         SessionResetMode::Reforge
@@ -9622,6 +9623,108 @@ mod council_guidance_tests {
         let error = build_reforge_prompt(&state, "ada").unwrap_err();
         assert_eq!(error.status(), 400);
         assert!(error.to_string().contains("missing or deleted"));
+    }
+
+    #[test]
+    fn refused_reforge_preflight_preserves_alias_queues_and_model_overrides() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        for corruption in ["deleted", "corrupt"] {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Ada".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Custom("council-chair".into()),
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+            if corruption == "deleted" {
+                fl_core::agent::delete_role(&*store, "council-chair").unwrap();
+            } else {
+                store
+                    .upsert_state(UpsertStateArgs {
+                        scope: StateScope::Workspace,
+                        slug: "role-council-chair".into(),
+                        sensitivity: SensitivityPatch::Inherit,
+                        payload: StatePayload::Runtime(RuntimeEntry {
+                            value: json!({"invalid": "guidance"}),
+                            merge_mode: fl_core::state::MergeMode::LastWriter,
+                        }),
+                        at: stamp::now(),
+                        by: "owner".into(),
+                    })
+                    .unwrap();
+            }
+            drop(store);
+            let socket = tmp.path().join("reset.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Webhook {
+                    socket_path: socket,
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let keys = ["webhook-ada", "raw-alias", "ada"];
+            for key in keys {
+                // Seed the queues directly: this fixture must not run discovery or route probes.
+                state.prompt_queues.lock().unwrap().enqueue(
+                    key,
+                    crate::DirectPromptInput {
+                        intended_codex_thread_id: None,
+                        persona: Some("ada".into()),
+                        prompt: format!("prompt-{key}"),
+                        effective_body: format!("body-{key}"),
+                        by: "owner".into(),
+                        attachments: vec![],
+                    },
+                );
+                state.set_session_model_override(
+                    key,
+                    session_actions::ModelOverride::new(
+                        format!("model-{key}"),
+                        Some(format!("thinking-{key}")),
+                    ),
+                );
+            }
+            let before: Vec<_> = keys
+                .iter()
+                .map(|key| (state.session_queue(key), state.session_model_override(key)))
+                .collect();
+            let error = reset_session(&state, "owner", keys[1], keys[0], Some(keys[2]), "reforge")
+                .unwrap_err();
+            assert_eq!(error.0, 400, "{corruption}: {error:?}");
+            assert!(error.1.contains("missing or deleted"), "{error:?}");
+            for (key, expected) in keys.iter().zip(before) {
+                assert_eq!(
+                    (state.session_queue(key), state.session_model_override(key)),
+                    expected,
+                    "{corruption}: {key}"
+                );
+            }
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "preflight refusal must dispatch no reset"
+            );
+        }
     }
 
     #[test]
