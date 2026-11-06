@@ -4,6 +4,7 @@ import { HubApiClient } from "../api/client";
 import {
   ALWAYS_SEND_NOW_STORAGE_KEY,
   ChatPane,
+  sessionDeliveryReceipts,
   sessionDraftMemory,
   sessionScrollMemory,
 } from "../components/ChatPane";
@@ -17,6 +18,7 @@ describe("ChatPane", () => {
   beforeEach(() => {
     sessionScrollMemory.clear();
     sessionDraftMemory.clear();
+    sessionDeliveryReceipts.clear();
     window.localStorage.removeItem(ALWAYS_SEND_NOW_STORAGE_KEY);
     for (const key of Object.keys(window.localStorage)) {
       if (key.startsWith("ferrodeck.draft.")) window.localStorage.removeItem(key);
@@ -48,6 +50,271 @@ describe("ChatPane", () => {
       created_at: "2026-10-27T04:10:05Z",
     },
   ];
+
+  it.each([
+    ["fetch", false, false], ["body", false, false],
+    ["fetch", false, true], ["body", false, true],
+    ["fetch", true, false], ["body", true, false],
+    ["fetch", true, true], ["body", true, true],
+    ["empty", false, true], ["malformed", false, false],
+    ["empty", true, false], ["malformed", true, true],
+    ["callback", false, true], ["callback", true, true],
+    ["legacy", false, true], ["http500", true, false], ["transport", false, false],
+  ] as const)("retains an unconfirmed Codex Send Now receipt after lost %s (queued=%s, callback=%s)", async (failure, queued, callback) => {
+    const target = `lost-${failure}-${queued}-${callback}`;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    let sends = 0;
+    const apiClient = new HubApiClient({ fetchImpl: async (_input, init) => {
+      if (init?.method !== "POST") return new Response(JSON.stringify({ turns: [], queue: [] }));
+      sends++;
+      await pending;
+      if (failure === "fetch") throw new TypeError("fixture transport interruption");
+      const body = failure === "malformed" ? "broken json" : failure === "legacy" ? JSON.stringify({ delivered: true }) : failure === "transport" ? JSON.stringify({ delivered: true, delivery_stage: "transport_accepted" }) : "";
+      const response = new Response(body, { status: failure === "http500" ? 500 : 200 });
+      if (failure === "body") vi.spyOn(response, "text").mockRejectedValue(new TypeError("fixture transport interruption"));
+      return response;
+    } });
+    const rejectCallback = async () => { sends++; await pending; throw new Error("fixture refusal"); };
+    window.localStorage.setItem(ALWAYS_SEND_NOW_STORAGE_KEY, "true");
+    const pane = (sessionId: string) => <ChatPane agentName="freya" adapter="codex" sessionId={sessionId} turns={[]}
+      queue={queued && sessionId === target ? [{ id: "lost-queued", session_id: target, prompt: "submitted once", by: "ferris", created_at: "2026-11-06T00:00:00Z" }] : []}
+      {...(callback ? {
+        onSendPrompt: failure === "callback" ? rejectCallback : (id, payload) => apiClient.sendSessionPrompt(id, payload),
+        onSendQueuedNow: failure === "callback" ? rejectCallback : (id) => apiClient.sendQueuedPromptNow(target, id),
+      } : { apiClient })} />;
+    const view = render(pane(target));
+    if (queued) fireEvent.click(screen.getByTestId("queued-send-now-lost-queued"));
+    else {
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "submitted once" } });
+      fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    }
+    view.rerender(pane("lost-other"));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "other draft" } });
+    await act(async () => { release(); });
+    expect(screen.queryByText(/Delivery unconfirmed/)).toBeNull();
+    expect(screen.getByLabelText("Message")).toHaveValue("other draft");
+    view.rerender(pane(target));
+    expect(await screen.findAllByText(/Delivery unconfirmed/)).not.toHaveLength(0);
+    expect(screen.getByLabelText("Message")).toHaveValue("");
+    expect(window.localStorage.getItem(`ferrodeck.draft.${target}`)).toBeNull();
+    if (queued) expect(screen.getByTestId("queued-send-now-lost-queued")).toBeDisabled();
+    view.unmount();
+    const remounted = render(pane(target));
+    expect(screen.getAllByText(/Delivery unconfirmed/)).not.toHaveLength(0);
+    expect(screen.getByLabelText("Message")).toHaveValue("");
+    if (queued) {
+      expect(screen.getByTestId("queued-send-now-lost-queued")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("queued-send-now-lost-queued"));
+    }
+    expect(sends).toBe(1);
+    remounted.unmount();
+  });
+
+  it.each([
+    ["refusal", "codex", true, "owner"], ["refusal-body", "codex", true, "owner"], ["refusal-stage", "codex", true, "owner"],
+    ["fetch", "codex", false, "owner"], ["body", "codex", false, "owner"],
+    ["fetch", "claude", true, "owner"], ["fetch", "codex", true, "peer"],
+  ] as const)("restores drafts for %s with adapter=%s, Send Now=%s, authority=%s", async (failure, adapter, sendNow, tier) => {
+    const target = `restore-${failure}-${adapter}-${sendNow}-${tier}`;
+    const apiClient = new HubApiClient({ fetchImpl: async (_input, init) => {
+      if (init?.method !== "POST") return new Response(JSON.stringify({ turns: [], queue: [] }));
+      if (failure === "fetch") throw new TypeError("fixture transport interruption");
+      const response = new Response(JSON.stringify(failure === "refusal-stage" ? { delivery_stage: "refused", delivery_error: "fixture refusal" } : { error: "fixture refusal" }), { status: failure === "refusal" || failure === "refusal-body" ? 403 : 200 });
+      if (failure === "body" || failure === "refusal-body") vi.spyOn(response, "text").mockRejectedValue(new TypeError("fixture transport interruption"));
+      return response;
+    } });
+    window.localStorage.setItem(ALWAYS_SEND_NOW_STORAGE_KEY, String(sendNow));
+    render(<ChatPane agentName="freya" adapter={adapter} sessionId={target} turns={[]} apiClient={apiClient}
+      authority={tier === "owner" ? { tier, login: "fixture" } : { tier, agent: "fixture" }} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "safe draft" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(screen.getByLabelText("Message")).toHaveValue("safe draft"));
+    expect(window.localStorage.getItem(`ferrodeck.draft.${target}`)).toBe("safe draft");
+    expect(screen.queryByText(/Delivery unconfirmed/)).toBeNull();
+  });
+
+  describe.each(["app_server_accepted", "unconfirmed"] as const)("after a prior %s delivery", (previousStage) => {
+    it.each([
+      ["refused", false, false], ["refused", false, true],
+      ["refused", true, false], ["refused", true, true],
+      ["not_connected", false, false], ["not_connected", false, true],
+      ["not_connected", true, false], ["not_connected", true, true],
+      ["http403", false, false], ["http403", false, true],
+      ["http403", true, false], ["http403", true, true],
+    ] as const)("clears stale acceptance and preserves uncertainty after %s (queued=%s, callback=%s)", async (refusal, queued, callback) => {
+      const target = `prior-${previousStage}-${refusal}-${queued}-${callback}`;
+      let sends = 0;
+      const apiClient = new HubApiClient({ fetchImpl: async (_input, init) => {
+        if (init?.method !== "POST") return new Response(JSON.stringify({ turns: [], queue: [] }));
+        sends++;
+        if (sends === 1) return new Response(JSON.stringify({ session_id: target, queued: false,
+          delivered: previousStage !== "unconfirmed", delivery_stage: previousStage }));
+        return new Response(JSON.stringify(refusal === "http403" ? { error: "second input refused" } : {
+          session_id: target, queued: false, delivered: false, delivery_stage: refusal, delivery_error: "second input refused",
+        }), { status: refusal === "http403" ? 403 : 200 });
+      } });
+      window.localStorage.setItem(ALWAYS_SEND_NOW_STORAGE_KEY, "true");
+      const pane = <ChatPane agentName="freya" adapter="codex" sessionId={target} turns={[]}
+        queue={queued ? ["first", "second"].map((id) => ({ id, session_id: target, prompt: `${id} input`,
+          by: "ferris", created_at: "2026-11-06T00:00:00Z" })) : []}
+        {...(callback ? {
+          onSendPrompt: (id, payload) => apiClient.sendSessionPrompt(id, payload),
+          onSendQueuedNow: (id) => apiClient.sendQueuedPromptNow(target, id),
+        } : { apiClient })} />;
+      const view = render(pane);
+      if (queued) fireEvent.click(screen.getByTestId("queued-send-now-first"));
+      else {
+        fireEvent.change(screen.getByLabelText("Message"), { target: { value: "first input" } });
+        fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+      }
+      const previousStatus = previousStage === "unconfirmed" ? /Delivery unconfirmed/ : /Accepted by the active Codex turn/;
+      expect(await screen.findByText(previousStatus)).toBeInTheDocument();
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "second input" } });
+      if (queued) fireEvent.click(screen.getByTestId("queued-send-now-second"));
+      else fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("second input refused");
+      expect(screen.queryByText(/Accepted by the active Codex turn/)).toBeNull();
+      expect(screen.getByLabelText("Message")).toHaveValue("second input");
+      expect(window.localStorage.getItem(`ferrodeck.draft.${target}`)).toBe("second input");
+      if (previousStage === "unconfirmed") {
+        expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument();
+        if (queued) {
+          expect(screen.getByTestId("queued-send-now-first")).toBeDisabled();
+          fireEvent.click(screen.getByTestId("queued-send-now-first"));
+        }
+      } else expect(screen.queryByText(/Delivery unconfirmed/)).toBeNull();
+      expect(sends).toBe(2);
+      view.unmount();
+      const remounted = render(pane);
+      expect(screen.queryByText(/Accepted by the active Codex turn/)).toBeNull();
+      expect(screen.getByLabelText("Message")).toHaveValue("second input");
+      if (previousStage === "unconfirmed") {
+        expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument();
+        if (queued) expect(screen.getByTestId("queued-send-now-first")).toBeDisabled();
+      }
+      remounted.unmount();
+    });
+  });
+
+  it.each([
+    ["vendor_queued", "Queued in Codex"],
+    ["app_server_accepted", "Accepted by the active Codex turn"],
+    ["unconfirmed", "Delivery unconfirmed"],
+  ])("keeps the submitted draft cleared for explicit %s outcomes", async (delivery_stage, status) => {
+    const onSendPrompt = vi.fn().mockResolvedValue({
+      session_id: "codex-fixture", queued: false, delivered: false,
+      delivery_stage, delivery_error: delivery_stage === "unconfirmed" ? "ack lost" : null,
+    });
+    render(<ChatPane agentName="freya" adapter="codex" sessionId="codex-fixture"
+      turns={[]} onSendPrompt={onSendPrompt} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "steering fixture" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(screen.getByText(new RegExp(status))).toBeInTheDocument());
+    expect(screen.getByLabelText("Message")).toHaveValue("");
+    expect(onSendPrompt).toHaveBeenCalledTimes(1);
+    expect(window.localStorage.getItem("ferrodeck.draft.codex-fixture")).toBeNull();
+  });
+
+  it.each([
+    ["vendor_queued", "Queued in Codex"],
+    ["app_server_accepted", "Accepted by the active Codex turn"],
+    ["unconfirmed", "Delivery unconfirmed"],
+  ])("retains deferred %s receipts for their submitted target across switches and remounts", async (delivery_stage, status) => {
+    for (const queued of [false, true]) {
+      for (const useApi of [false, true]) {
+        const target = `receipt-${delivery_stage}-${queued}-${useApi}`;
+        let resolveSend!: (value: unknown) => void;
+        const response = new Promise<unknown>((resolve) => { resolveSend = resolve; });
+        const onSendPrompt = vi.fn((id: string) => id === target ? response : Promise.resolve({ delivered: true, delivery_stage: "transport_accepted" }));
+        const onSendQueuedNow = vi.fn(() => response);
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          const body = url.includes(`/sessions/${target}/`) ? await response : { delivered: true, delivery_stage: "transport_accepted" };
+          return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+        });
+        const apiClient = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
+        const pane = (sessionId: string) => <ChatPane agentName="freya" adapter="codex" sessionId={sessionId} turns={[]}
+          queue={queued && sessionId === target ? [{ id: "pending-receipt", session_id: target, prompt: "queued fixture", by: "ferris", created_at: "2026-11-06T00:00:00Z" }] : []}
+          {...(useApi ? { apiClient } : { onSendPrompt, onSendQueuedNow })} />;
+        const view = render(pane(target));
+        if (queued) fireEvent.click(screen.getByTestId("queued-send-now-pending-receipt"));
+        else {
+          fireEvent.change(screen.getByLabelText("Message"), { target: { value: "submitted once" } });
+          fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+        }
+        view.rerender(pane("receipt-other"));
+        fireEvent.change(screen.getByLabelText("Message"), { target: { value: "other target draft" } });
+        await act(async () => { resolveSend({ session_id: target, queued: queued && delivery_stage === "unconfirmed", delivered: delivery_stage !== "unconfirmed", delivery_stage }); });
+        expect(screen.queryByText(new RegExp(status))).toBeNull();
+        expect(screen.getByLabelText("Message")).toHaveValue("other target draft");
+        view.rerender(pane(target));
+        expect(await screen.findByText(new RegExp(status))).toBeInTheDocument();
+        expect(screen.getByLabelText("Message")).toHaveValue("");
+        // A successful send to another target must not overwrite this receipt.
+        view.rerender(pane("receipt-other"));
+        fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+        await act(async () => {});
+        view.rerender(pane(target));
+        expect(screen.getByText(new RegExp(status))).toBeInTheDocument();
+        view.unmount();
+        const remounted = render(pane(target));
+        expect(screen.getByText(new RegExp(status))).toBeInTheDocument();
+        expect(screen.getByLabelText("Message")).toHaveValue("");
+        if (useApi) expect(fetchImpl.mock.calls.filter(([input]) => String(input).includes(`/sessions/${target}/`))).toHaveLength(1);
+        else expect(queued ? onSendQueuedNow.mock.calls : onSendPrompt.mock.calls.filter(([id]) => id === target)).toHaveLength(1);
+        remounted.unmount();
+      }
+    }
+  });
+
+  it.each([false, true])("retains a receipt that completes after its originating pane unmounts (queued=%s)", async (queued) => {
+    const target = `receipt-unmounted-${queued}`;
+    let resolveSend!: (value: unknown) => void;
+    const response = new Promise<unknown>((resolve) => { resolveSend = resolve; });
+    const onSendPrompt = vi.fn(() => response);
+    const onSendQueuedNow = vi.fn(() => response);
+    const pane = <ChatPane agentName="freya" adapter="codex" sessionId={target} turns={[]} onSendPrompt={onSendPrompt} onSendQueuedNow={onSendQueuedNow}
+      queue={queued ? [{ id: "unmounted-receipt", session_id: target, prompt: "queued fixture", by: "ferris", created_at: "2026-11-06T00:00:00Z" }] : []} />;
+    const view = render(pane);
+    if (queued) fireEvent.click(screen.getByTestId("queued-send-now-unmounted-receipt"));
+    else {
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "submitted once" } });
+      fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    }
+    view.unmount();
+    const remounted = render(pane);
+    await act(async () => { resolveSend({ session_id: target, queued: false, delivered: false, delivery_stage: "unconfirmed" }); });
+    expect(await screen.findByText(/Delivery unconfirmed/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toHaveValue("");
+    expect(queued ? onSendQueuedNow : onSendPrompt).toHaveBeenCalledTimes(1);
+    remounted.unmount();
+  });
+
+  it.each([undefined, "refused"])("restores drafts for known failure with legacy or %s stage", async (delivery_stage) => {
+    const onSendPrompt = vi.fn().mockResolvedValue({ session_id: "codex-refused", queued: false,
+      delivered: false, delivery_stage, delivery_error: "input was refused" });
+    render(<ChatPane agentName="freya" adapter="codex" sessionId="codex-refused" turns={[]} onSendPrompt={onSendPrompt} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "safe draft" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(screen.getByLabelText("Message")).toHaveValue("safe draft"));
+    expect(screen.getByText("input was refused")).toBeInTheDocument();
+    expect(onSendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["vendor_queued", "app_server_accepted", "unconfirmed"])("shows explicit queued Send now %s outcome without retry", async (delivery_stage) => {
+    const onSendQueuedNow = vi.fn().mockResolvedValue({ session_id: "codex-queued", queued: delivery_stage === "unconfirmed",
+      delivered: delivery_stage !== "unconfirmed", delivery_stage });
+    render(<ChatPane agentName="freya" adapter="codex" sessionId="codex-queued" turns={[]}
+      queue={[{ id: "fixture-queue", session_id: "codex-queued", prompt: "queued fixture", by: "ferris", created_at: "2026-11-06T00:00:00Z" }]}
+      onSendQueuedNow={onSendQueuedNow} />);
+    fireEvent.click(screen.getByTestId("queued-send-now-fixture-queue"));
+    const expected = delivery_stage === "vendor_queued" ? /Queued in Codex/ : delivery_stage === "app_server_accepted" ? /Accepted by the active Codex turn/ : /Delivery unconfirmed/;
+    await waitFor(() => expect(screen.getByText(expected)).toBeInTheDocument());
+    expect(onSendQueuedNow).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/delivery could not be confirmed/i)).toBeNull();
+  });
 
   it("renders user and assistant TranscriptTurn items with prose and code blocks", () => {
     render(

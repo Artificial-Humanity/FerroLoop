@@ -177,6 +177,90 @@ pub fn push_operator_prompt_to_route(
     }
 }
 
+/// Caller-authorized operator intent. Sender labels never grant Send now authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorPromptIntent {
+    Ordinary,
+    /// Only an authenticated Owner's explicit Send now action may select this intent.
+    OwnerSendNow,
+}
+
+/// What accepted the input. None of these outcomes proves model consumption.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "delivery_stage", rename_all = "snake_case")]
+pub enum OperatorPromptOutcome {
+    TransportAccepted,
+    VendorQueued,
+    AppServerAccepted { turn_id: String },
+    CompactionAccepted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorPromptError {
+    Push(PushError),
+    Steer(CodexSteerError),
+}
+
+impl std::fmt::Display for OperatorPromptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Push(e) => e.fmt(f),
+            Self::Steer(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for OperatorPromptError {}
+
+/// Dispatch once on the caller's pinned route. Only a proven, nonmutating idle preflight
+/// permits Send now to use Codex's legacy vendor queue. Every other steering error is final.
+/// Existing wrappers and all ordinary operator/Wire delivery retain their queue behavior.
+pub fn push_operator_prompt_with_intent(
+    route: &VendorRoute,
+    sender_name: &str,
+    body: &str,
+    intent: OperatorPromptIntent,
+) -> Result<OperatorPromptOutcome, OperatorPromptError> {
+    if matches!(route, VendorRoute::Codex { .. }) {
+        if body.trim().eq_ignore_ascii_case("/compact") {
+            let socket = crate::codex_control::resolve_control_socket(
+                std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+                std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+                std::env::var_os("CODEX_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )
+            .map_err(|e| OperatorPromptError::Push(PushError::Failed(e)))?;
+            push_operator_prompt_to_route(route, sender_name, body)
+                .map_err(OperatorPromptError::Push)?;
+            return Ok(if socket.is_some() {
+                OperatorPromptOutcome::CompactionAccepted
+            } else {
+                OperatorPromptOutcome::VendorQueued
+            });
+        }
+        if intent == OperatorPromptIntent::OwnerSendNow {
+            match steer_codex_active_turn(route, body) {
+                Ok(ack) => {
+                    return Ok(OperatorPromptOutcome::AppServerAccepted {
+                        turn_id: ack.turn_id,
+                    });
+                }
+                Err(CodexSteerError::Refused {
+                    stage: CodexSteerStage::ThreadRead,
+                    reason: CodexSteerRefusalReason::Idle,
+                    ..
+                }) => {}
+                Err(e) => return Err(OperatorPromptError::Steer(e)),
+            }
+        }
+        push_operator_prompt_to_route(route, sender_name, body)
+            .map_err(OperatorPromptError::Push)?;
+        return Ok(OperatorPromptOutcome::VendorQueued);
+    }
+    push_operator_prompt_to_route(route, sender_name, body).map_err(OperatorPromptError::Push)?;
+    Ok(OperatorPromptOutcome::TransportAccepted)
+}
+
 fn push_webhook_message(socket_path: &Path, msg: &WireMessage) -> Result<(), PushError> {
     let line = serde_json::to_string(msg)
         .map_err(|e| PushError::Failed(format!("serialize message: {e}")))?;
@@ -684,6 +768,56 @@ fn failure_with_output(what: &str, run: &CapturedRun) -> String {
     }
 }
 
+pub use crate::codex_control::{
+    CodexSteerAck, CodexSteerError, CodexSteerRefusalReason, CodexSteerStage,
+};
+
+/// Submit explicit owner input to a Codex route's currently active turn, returning the server's
+/// acknowledged turn ID. The caller MUST authenticate the owner and obtain explicit intent to
+/// steer this session; a sender name or route alone is not authorization. This helper performs
+/// no authorization and is separate from ordinary queued delivery.
+///
+/// No queue, resume, turn start, or retry fallback is attempted. `Unconfirmed` means the input
+/// may already have been accepted; callers must not automatically retry or enqueue it.
+pub fn steer_codex_active_turn(
+    route: &VendorRoute,
+    body: &str,
+) -> Result<CodexSteerAck, CodexSteerError> {
+    let VendorRoute::Codex { thread_id, .. } = route else {
+        return Err(CodexSteerError::refused(
+            CodexSteerStage::Route,
+            CodexSteerRefusalReason::Unsupported,
+            "active-turn steering requires a Codex route",
+        ));
+    };
+    let sock = crate::codex_control::resolve_control_socket(
+        std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+        std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .map_err(|message| {
+        CodexSteerError::refused(
+            CodexSteerStage::Connect,
+            CodexSteerRefusalReason::Transport,
+            message,
+        )
+    })?
+    .ok_or_else(|| {
+        CodexSteerError::refused(
+            CodexSteerStage::Connect,
+            CodexSteerRefusalReason::Unsupported,
+            "active-turn steering requires a Codex control socket; queue fallback is disabled",
+        )
+    })?;
+    crate::codex_control::steer_active_turn(
+        &sock,
+        thread_id,
+        body,
+        crate::codex_control::STEER_TIMEOUT,
+    )
+}
+
 fn deliver_to_codex_route(
     thread_id: &str,
     cwd: Option<&PathBuf>,
@@ -731,8 +865,8 @@ fn deliver_to_codex_route(
     Err(last_err)
 }
 
-/// Why one `codex queue` attempt failed: a spawn or timeout failure lets the caller try the
-/// next candidate binary; a non-zero exit is final.
+/// Why one `codex queue` attempt failed. Only a proven pre-spawn failure permits another
+/// candidate binary; nonzero exits and post-spawn errors (including timeout) are final.
 enum CodexQueueError {
     Spawn(String),
     Exit(String),
@@ -753,13 +887,19 @@ fn run_codex_queue(
     {
         cmd.current_dir(dir);
     }
-    match run_vendor_cli(&mut cmd, AdapterKind::Codex, &[], CliKind::Enqueue) {
+    // Keep the same vendor environment policy, but preserve the mutation boundary: once a
+    // child exists it may have queued input, even if waiting times out or otherwise fails.
+    cmd.env_clear()
+        .envs(vendor_child_env(AdapterKind::Codex, &[]));
+    let mut child = spawn_retrying_text_busy(&mut cmd)
+        .map_err(|e| CodexQueueError::Spawn(format!("failed to spawn codex queue: {e}")))?;
+    match wait_with_deadline(&mut child, cli_timeout(CliKind::Enqueue)) {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(CodexQueueError::Exit(format!(
             "codex queue exited with {status}"
         ))),
-        Err(e) => Err(CodexQueueError::Spawn(format!(
-            "failed to spawn codex queue: {e}"
+        Err(e) => Err(CodexQueueError::Exit(format!(
+            "codex queue outcome unconfirmed after spawn: {e}"
         ))),
     }
 }
@@ -3847,6 +3987,206 @@ mod tests {
     }
 
     #[test]
+    fn owner_send_now_steers_active_codex_and_only_proven_idle_queues() {
+        use crate::codex_control::fake_server;
+        let _lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (status, turns, reply, expected) in [
+            (
+                "active",
+                true,
+                r#"{"id":4,"result":{"turnId":"turn-7"}}"#,
+                "app_server_accepted",
+            ),
+            ("idle", false, "", "vendor_queued"),
+            ("notLoaded", false, "", "refused"),
+            ("unknown", false, "", "refused"),
+            ("active", false, "", "refused"),
+            (
+                "active",
+                true,
+                r#"{"id":4,"error":{"code":-32602,"message":"stale expectedTurnId"}}"#,
+                "refused",
+            ),
+            (
+                "active",
+                true,
+                r#"{"id":4,"result":{"turnId":"other-turn"}}"#,
+                "unconfirmed",
+            ),
+            ("active", true, "", "unconfirmed"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let (bin, out) = fake_codex_queue_bin(tmp.path());
+            let (sock, server) = fake_server::spawn(tmp.path(), move |c| {
+                c.handshake();
+                c.expect_json();
+                c.send_text(r#"{"id":1,"result":{}}"#);
+                c.expect_json();
+                c.expect_json();
+                c.send_text(&serde_json::json!({"id":2,"result":{"thread":{
+                    "id":"thread-9", "sessionId":"session-9", "cliVersion":"0.166.0", "createdAt":1,
+                    "updatedAt":2, "cwd":"/tmp/mock-project", "ephemeral":false, "modelProvider":"openai",
+                    "preview":"fixture", "projectId":null, "source":"cli", "status":{"type":status,"activeFlags":[]},
+                    "canAcceptDirectInput":true,"turns":[]}}}).to_string());
+                if status == "active" {
+                    c.expect_json();
+                    c.send_text(&serde_json::json!({"id":3,"result":{"data":if turns {serde_json::json!([{"id":"turn-7","status":"inProgress","items":[],"itemsView":"notLoaded"}])} else {serde_json::json!([])},"nextCursor":null,"backwardsCursor":null}}).to_string());
+                    if turns {
+                        let steer = c.expect_json();
+                        assert_eq!(steer["params"]["threadId"], "thread-9");
+                        assert_eq!(steer["params"]["expectedTurnId"], "turn-7");
+                        if !reply.is_empty() {
+                            c.send_text(reply);
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                c.drain_until_eof();
+            });
+            let _bin = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+            let _sock = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+            let result = push_operator_prompt_with_intent(
+                &codex_route("thread-9"),
+                "ferris",
+                "owner input",
+                OperatorPromptIntent::OwnerSendNow,
+            );
+            let stage = match result {
+                Ok(OperatorPromptOutcome::AppServerAccepted { turn_id }) => {
+                    assert_eq!(turn_id, "turn-7");
+                    "app_server_accepted"
+                }
+                Ok(OperatorPromptOutcome::VendorQueued) => "vendor_queued",
+                Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => "refused",
+                Err(OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. })) => {
+                    "unconfirmed"
+                }
+                other => panic!("unexpected: {other:?}"),
+            };
+            assert_eq!(stage, expected, "{status} {reply}");
+            assert_eq!(out.exists(), expected == "vendor_queued");
+            let frames = server.join().unwrap();
+            let methods: Vec<_> = frames
+                .iter()
+                .filter(|f| f.opcode == 1)
+                .map(|f| f.json()["method"].as_str().unwrap().to_owned())
+                .collect();
+            assert!(
+                !methods
+                    .iter()
+                    .any(|m| matches!(m.as_str(), "thread/resume" | "turn/start"))
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_typed_codex_delivery_keeps_vendor_queue_even_with_owner_label() {
+        let _lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let _bin = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _sock = EnvGuard::set(
+            "FL_WIRE_CODEX_CONTROL_SOCK",
+            &tmp.path().join("absent.sock"),
+        );
+        assert_eq!(
+            push_operator_prompt_with_intent(
+                &codex_route("thread-9"),
+                "owner",
+                "ordinary",
+                OperatorPromptIntent::Ordinary
+            )
+            .unwrap(),
+            OperatorPromptOutcome::VendorQueued
+        );
+        assert!(fs::read_to_string(out).unwrap().contains("ordinary"));
+    }
+
+    #[test]
+    fn active_turn_steering_returns_ack_and_never_runs_the_queue_binary() {
+        use crate::codex_control::fake_server;
+
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let (sock, server) = fake_server::spawn(tmp.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(r#"{"id":1,"result":{}}"#);
+            c.expect_json();
+            c.expect_json();
+            c.send_text(r#"{"id":2,"result":{"thread":{"id":"thread-9","sessionId":"session-9","cliVersion":"0.166.0","createdAt":1,"updatedAt":2,"cwd":"/tmp/mock-project","ephemeral":false,"modelProvider":"openai","preview":"fixture","projectId":null,"source":"cli","status":{"type":"active","activeFlags":[]},"canAcceptDirectInput":true,"turns":[]}}}"#);
+            c.expect_json();
+            c.send_text(r#"{"id":3,"result":{"data":[{"id":"turn-7","status":"inProgress","items":[],"itemsView":"notLoaded"}],"nextCursor":null,"backwardsCursor":null}}"#);
+            c.expect_json();
+            c.send_text(r#"{"id":4,"result":{"turnId":"turn-7"}}"#);
+            c.drain_until_eof();
+        });
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+        assert_eq!(
+            steer_codex_active_turn(&codex_route("thread-9"), "owner input")
+                .unwrap()
+                .turn_id,
+            "turn-7"
+        );
+        let log = server.join().unwrap();
+        let methods: Vec<String> = log
+            .iter()
+            .filter(|frame| frame.opcode == 1)
+            .map(|frame| frame.json()["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "initialized",
+                "thread/read",
+                "thread/turns/list",
+                "turn/steer"
+            ]
+        );
+        assert!(!out.exists(), "steering must never run codex queue");
+    }
+
+    #[test]
+    fn active_turn_steering_refuses_missing_control_socket_without_queue_fallback() {
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _no_sock = EnvGuard::remove("FL_WIRE_CODEX_CONTROL_SOCK");
+        assert!(matches!(
+            steer_codex_active_turn(&codex_route("thread-9"), "hello"),
+            Err(CodexSteerError::Refused { .. })
+        ));
+        let _sock_env = EnvGuard::set(
+            "FL_WIRE_CODEX_CONTROL_SOCK",
+            &tmp.path().join("missing.sock"),
+        );
+        assert!(matches!(
+            steer_codex_active_turn(&codex_route("thread-9"), "hello"),
+            Err(CodexSteerError::Refused { .. })
+        ));
+        assert!(
+            !out.exists(),
+            "missing control socket must never fall back to queue"
+        );
+    }
+
+    #[test]
+    fn active_turn_steering_refuses_non_codex_routes() {
+        let route = VendorRoute::Webhook {
+            socket_path: PathBuf::from("/not-a-real-socket"),
+        };
+        assert!(matches!(
+            steer_codex_active_turn(&route, "hello"),
+            Err(CodexSteerError::Refused { .. })
+        ));
+    }
+
+    #[test]
     fn operator_compact_for_codex_uses_the_app_server_rpc_not_codex_queue() {
         use crate::codex_control::fake_server;
 
@@ -3866,8 +4206,16 @@ mod tests {
         let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
 
         // Case and surrounding whitespace do not matter.
-        dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", " /Compact\n")
-            .expect("compact succeeds over the control socket");
+        assert_eq!(
+            push_operator_prompt_with_intent(
+                &codex_route("thread-9"),
+                "owner",
+                " /Compact\n",
+                OperatorPromptIntent::OwnerSendNow
+            )
+            .expect("compact succeeds over the control socket"),
+            OperatorPromptOutcome::CompactionAccepted
+        );
 
         let log = server.join().unwrap();
         assert!(log.iter().all(|f| f.masked));
@@ -4624,10 +4972,14 @@ mod tests {
         let result = run_codex_queue(&hung, "thread", None, "hello");
         CLI_TIMEOUT_OVERRIDE.with(|c| c.set(None));
         match result {
-            Err(CodexQueueError::Spawn(e)) => assert!(e.contains("did not finish"), "{e}"),
+            Err(CodexQueueError::Exit(e)) => assert!(e.contains("did not finish"), "{e}"),
             _ => panic!("expected a timeout from the hung enqueue CLI"),
         }
         assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(
+            run_codex_queue(&tmp.path().join("absent"), "thread", None, "hello"),
+            Err(CodexQueueError::Spawn(_))
+        ));
     }
 
     #[test]

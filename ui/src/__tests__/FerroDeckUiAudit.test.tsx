@@ -8,7 +8,7 @@ import { HubApiClient } from "../api/client";
 import { HubWsClient, MAX_PENDING_FRAMES } from "../api/ws";
 import { App } from "../App";
 import { ArtifactPreviewPane } from "../components/ArtifactPreviewPane";
-import { ChatPane, sessionDraftMemory } from "../components/ChatPane";
+import { ALWAYS_SEND_NOW_STORAGE_KEY, ChatPane, sessionDraftMemory } from "../components/ChatPane";
 import { parseUnifiedDiff } from "../components/DiffViewer";
 import { FerroStatePane } from "../components/FerroStatePane";
 import { GitPrPane, parsePrNumber } from "../components/GitPrPane";
@@ -281,6 +281,36 @@ function wsStub() {
 }
 
 describe("App", () => {
+  it.each([[false, false], [true, false], [false, true], [true, true]])("preserves Codex Send Now receipt evidence without optimistic turns (queued=%s, refused=%s)", async (queued, refused) => {
+    const target = `app-receipt-${queued}-${refused}`;
+    const item = { id: "missing-stage-q", session_id: target, prompt: "uncertain steering", by: "owner", created_at: "now" };
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+    const fetchImpl = appFetch((url) => {
+      if (url.endsWith("/api/v1/sessions")) return json({ sessions: [{ id: target, persona: "ferris", adapter: "codex", status: "idle" }] });
+      if (url.endsWith("/transcript")) return json({ turns: [turn("Codex receipt fixture ready")], queue: queued ? [item] : [], is_busy: false });
+      if (url.endsWith("/prompt") || url.endsWith("/send-now")) return json(refused
+        ? { session_id: target, delivered: false, delivery_stage: "refused", delivery_error: "fixture Codex refusal", queue: queued ? [{ ...item, delivery_state: "refused" }] : [] }
+        : { session_id: target, delivered: true, effective_body: "uncertain steering" });
+      return undefined;
+    });
+    window.localStorage.setItem(ALWAYS_SEND_NOW_STORAGE_KEY, "true");
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
+    render(<App apiClient={apiClient} wsClient={wsStub() as unknown as HubWsClient} />);
+    await screen.findByText("Codex receipt fixture ready");
+    if (queued) fireEvent.click(screen.getByTestId("queued-send-now-missing-stage-q"));
+    else {
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "uncertain steering" } });
+      fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    }
+    if (refused) {
+      expect(await screen.findByRole("alert")).toHaveTextContent("fixture Codex refusal");
+      expect(screen.queryByText(/Delivery unconfirmed/)).toBeNull();
+    } else expect(await screen.findAllByText(/Delivery unconfirmed/)).not.toHaveLength(0);
+    expect(screen.queryByTestId("turn-card-1")).toBeNull();
+    expect(screen.getByLabelText("Message")).toHaveValue(refused && !queued ? "uncertain steering" : "");
+    if (queued) expect(screen.getByTestId("queued-send-now-missing-stage-q")).toBeDisabled();
+  });
+
   it("keeps the WebSocket connected across agent switches", async () => {
     const fetchImpl = appFetch();
     const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });

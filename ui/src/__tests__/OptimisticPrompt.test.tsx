@@ -61,6 +61,52 @@ describe("optimistic prompt submission", () => {
     expect(screen.getByTestId("queued-prompt-item-q1")).toBeInTheDocument();
     expect(screen.queryByTestId("turn-card-0")).toBeNull();
   });
+  it("holds a refused queued item from the standalone API response without resending or replacing the draft", async () => {
+    const item = { id: "held-q", session_id: "held-session", prompt: "held queued prompt", by: "owner", created_at: "now" };
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const sent = init?.method === "POST";
+      return new Response(JSON.stringify(sent
+        ? { delivered: false, delivery_stage: "refused", delivery_error: "receiver refused", effective_body: item.prompt,
+            queue: [{ ...item, delivery_state: "refused", delivery_error: "receiver refused" }], is_busy: false }
+        : { turns: [], queue: [item], is_busy: true }), { status: 200 });
+    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
+    render(<ChatPane agentName="alpha" sessionId="held-session" apiClient={apiClient} />);
+    fireEvent.click(await screen.findByTestId("queued-send-now-held-q"));
+    fireEvent.change(input(), { target: { value: "keep my draft" } });
+    expect(await screen.findByText(/Send now refused/)).toBeInTheDocument();
+    expect(screen.getByText("Idle")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-send-now-held-q")).toBeDisabled();
+    expect(screen.getByTestId("queued-edit-held-q")).toBeDisabled();
+    expect(screen.getByTestId("queued-cancel-held-q")).toBeEnabled();
+    expect(screen.getByTestId("queued-cancel-held-q")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("receiver refused");
+    expect(screen.queryByTestId("turn-card-0")).toBeNull();
+    expect(input()).toHaveValue("keep my draft");
+    fireEvent.click(screen.getByTestId("queued-send-now-held-q"));
+    expect(fetchImpl.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+  });
+  it.each([false, true])("keeps a deferred queued refusal error on its submitted target (API=%s)", async (useApi) => {
+    const pending = deferred<unknown>();
+    const item = { id: "target-q", session_id: "submitted", prompt: "queued prompt", by: "owner", created_at: "now" };
+    const apiClient = new HubApiClient({ fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Response(JSON.stringify(init?.method === "POST" ? await pending.promise : { turns: [], queue: [item], is_busy: false }), { status: 200 })) as typeof fetch });
+    const pane = (target: string) => <ChatPane agentName="alpha" sessionId={target}
+      {...(useApi ? { apiClient } : { turns: [], queue: [item], onSendQueuedNow: () => pending.promise })} />;
+    const view = render(pane("submitted"));
+    fireEvent.click(await screen.findByTestId("queued-send-now-target-q"));
+    view.rerender(pane("selected-other"));
+    await act(async () => {});
+    fireEvent.change(input(), { target: { value: "other draft" } });
+    await act(async () => { pending.resolve({ delivered: false, delivery_stage: "refused", delivery_error: "submitted target refused",
+      queue: [{ id: "wrong-q", session_id: "submitted", prompt: "wrong queue", by: "owner", created_at: "now", delivery_state: "refused" }], is_busy: true }); });
+    expect(screen.queryByText("submitted target refused")).toBeNull();
+    expect(screen.queryByText("wrong queue")).toBeNull();
+    expect(screen.getByText("Idle")).toBeInTheDocument();
+    expect(input()).toHaveValue("other draft");
+    view.rerender(pane("submitted"));
+    expect(screen.getByRole("alert")).toHaveTextContent("submitted target refused");
+  });
   it("keeps unconfirmed queue evidence visible and blocks another send", () => {
     const handler = vi.fn();
     render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now", delivery_state: "unconfirmed", delivery_error: "partial write" }]} onSendQueuedNow={handler} />);

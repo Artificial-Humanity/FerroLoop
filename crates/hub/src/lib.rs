@@ -108,6 +108,9 @@ pub struct SavedPromptAttachment {
 pub struct QueuedOperatorPrompt {
     pub id: String,
     pub session_id: String,
+    /// Captured at admission; persona rediscovery must never retarget an explicit Codex send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_codex_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     pub prompt: String,
@@ -130,6 +133,8 @@ pub enum QueuedDeliveryState {
     Pending,
     Sending,
     Unconfirmed,
+    /// A known nonmutating explicit Send now refusal; held until the owner removes it.
+    Refused,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +213,7 @@ impl Drop for SessionDispatchGuard<'_> {
 }
 
 pub(crate) struct DirectPromptInput {
+    pub intended_codex_thread_id: Option<String>,
     pub persona: Option<String>,
     pub prompt: String,
     pub effective_body: String,
@@ -232,6 +238,7 @@ impl PromptQueueState {
         let item = QueuedOperatorPrompt {
             id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
             session_id: session_key.to_string(),
+            intended_codex_thread_id: input.intended_codex_thread_id,
             persona: input.persona,
             prompt: input.prompt,
             effective_body: input.effective_body,
@@ -631,10 +638,21 @@ impl HubState {
         by: String,
         attachments: Vec<SavedPromptAttachment>,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let observed = discovery::lookup_one_route_session(
+            &discovery::DiscoveryStoreSnapshot::default(),
+            self.config.home_override.as_deref(),
+            session_key,
+        );
+        let intended_codex_thread_id = match observed {
+            Some(session) if session.adapter == "codex" => Some(session.id),
+            Some(_) => None,
+            None => session_key.strip_prefix("codex-").map(str::to_string),
+        };
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.enqueue(
             session_key,
             DirectPromptInput {
+                intended_codex_thread_id,
                 persona,
                 prompt,
                 effective_body,
@@ -793,6 +811,27 @@ impl HubState {
                     queue[pos].delivery_error = Some(error);
                 }
             }
+        }
+        queue.clone()
+    }
+
+    /// Hold a known refusal without allowing a later automatic drain to change its intent.
+    pub(crate) fn hold_refused_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        error: String,
+    ) -> Vec<QueuedOperatorPrompt> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return Vec::new();
+        };
+        if let Some(item) = queue
+            .iter_mut()
+            .find(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
+        {
+            item.delivery_state = QueuedDeliveryState::Refused;
+            item.delivery_error = Some(error);
         }
         queue.clone()
     }
@@ -1253,6 +1292,7 @@ mod tests {
                 false,
                 false,
                 DirectPromptInput {
+                    intended_codex_thread_id: None,
                     persona: None,
                     prompt: "one".into(),
                     effective_body: "one".into(),
@@ -1273,6 +1313,7 @@ mod tests {
             false,
             false,
             DirectPromptInput {
+                intended_codex_thread_id: None,
                 persona: None,
                 prompt: "two".into(),
                 effective_body: "two".into(),
@@ -7646,6 +7687,657 @@ mod tests {
         let resp = handle_http_request(state, &req);
         assert_eq!(resp.status, 200, "{}", error_text(&resp));
         resp.json_value().unwrap()
+    }
+
+    /// Scripted Codex control transport on a temporary Unix socket, with no vendor process.
+    fn mock_codex_control(
+        socket: &std::path::Path,
+        outcome: &'static str,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{Read, Write};
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let key = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", crate::ws::compute_accept_key(key)).unwrap();
+            let mut buffered = Vec::new();
+            let mut methods = Vec::new();
+            loop {
+                if let Some(frame) = crate::ws::try_parse_ws_frame(&mut buffered).unwrap() {
+                    if frame.opcode == fl_wire::ws::WsOpcode::Close {
+                        break;
+                    }
+                    let request: Value = serde_json::from_slice(&frame.payload).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    methods.push(method.to_string());
+                    let result = match method {
+                        "initialize" => json!({}),
+                        "initialized" => continue,
+                        "thread/read" => {
+                            assert_eq!(request["params"]["threadId"], "thread-fixture");
+                            json!({"thread":{"id":"thread-fixture", "sessionId":"session-fixture", "cliVersion":"0.166.0",
+                                "createdAt":1,"updatedAt":2,"cwd":"/tmp/mock-project","ephemeral":false,"modelProvider":"openai",
+                                "preview":"fixture","projectId":null,"source":"cli", "status":{"type":if outcome=="idle" {"idle"} else {"active"},"activeFlags":[]},
+                                "canAcceptDirectInput":true,"turns":[]}})
+                        }
+                        "thread/turns/list" => {
+                            json!({"data":[{"id":"turn-fixture","status":"inProgress","items":[],"itemsView":"notLoaded"}],"nextCursor":null,"backwardsCursor":null})
+                        }
+                        "turn/steer" => {
+                            assert_eq!(request["params"]["threadId"], "thread-fixture");
+                            assert_eq!(request["params"]["expectedTurnId"], "turn-fixture");
+                            if outcome == "unconfirmed" {
+                                break;
+                            }
+                            json!({"turnId":"turn-fixture"})
+                        }
+                        other => panic!("forbidden Codex method {other}"),
+                    };
+                    let bytes =
+                        serde_json::to_vec(&json!({"id":request["id"],"result":result})).unwrap();
+                    let mut encoded = vec![0x81];
+                    if bytes.len() < 126 {
+                        encoded.push(bytes.len() as u8);
+                    } else {
+                        encoded.push(126);
+                        encoded.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    }
+                    encoded.extend_from_slice(&bytes);
+                    stream.write_all(&encoded).unwrap();
+                } else {
+                    let mut chunk = [0; 4096];
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+            }
+            methods
+        })
+    }
+
+    #[test]
+    fn send_now_preserves_non_codex_personas_with_a_codex_prefix() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        for queued in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let state = test_hub_state(&tmp);
+            let socket = tmp.path().join("webhook.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            install_route(tmp.path(), "codex-persona", webhook_route(&socket));
+            let response = if queued {
+                let (item, _) = state.enqueue_session_prompt(
+                    "codex-persona",
+                    Some("codex-persona".into()),
+                    "non-Codex".into(),
+                    "non-Codex".into(),
+                    "ferris".into(),
+                    vec![],
+                );
+                call(
+                    &state,
+                    "POST",
+                    &format!("/api/v1/sessions/codex-persona/queue/{}/send-now", item.id),
+                    OWNER,
+                    &json!({}),
+                )
+                .json_value()
+                .unwrap()
+            } else {
+                post_prompt(
+                    &state,
+                    "codex-persona",
+                    OWNER,
+                    None,
+                    &json!({"prompt":"non-Codex", "send_now":true}),
+                )
+            };
+            assert_eq!(
+                response["delivery_stage"], "transport_accepted",
+                "{response}"
+            );
+            assert_eq!(response["delivered"], true);
+            let (stream, _) = listener
+                .accept()
+                .expect("original non-Codex endpoint should receive the prompt");
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            assert!(line.contains("non-Codex"));
+        }
+    }
+
+    #[test]
+    fn codex_send_now_refuses_replacement_routes_for_direct_and_queued_targets() {
+        use std::os::unix::net::UnixListener;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect());
+        for original in ["thread-original", "codex-thread-fixture"] {
+            for mode in ["direct", "queued-thread", "queued-persona"] {
+                for replacement in ["webhook", "claude", "codex"] {
+                    let tmp = TempDir::new().unwrap();
+                    let state = test_hub_state(&tmp);
+                    let tmux = FakeTmux::install(tmp.path());
+                    install_route(
+                        tmp.path(),
+                        "freya",
+                        fl_wire::identity::VendorRoute::Codex {
+                            thread_id: original.into(),
+                            cwd: None,
+                        },
+                    );
+                    let socket = tmp.path().join("replacement.sock");
+                    let listener = UnixListener::bind(&socket).unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    // Even a broken guard may only reach these temporary mock endpoints.
+                    let bin = tmp.path().join("no-codex");
+                    fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+                    unsafe {
+                        std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+                        std::env::set_var("FL_WIRE_CODEX_CONTROL_SOCK", &socket);
+                    }
+                    let route = match replacement {
+                        "claude" => {
+                            let key = tmp.path().join("replacement.key");
+                            fs::write(
+                                &key,
+                                json!({"peerToken":"fake", "tmux":"Fake:@12.%12"}).to_string(),
+                            )
+                            .unwrap();
+                            fl_wire::identity::VendorRoute::Claude {
+                                pid: 0,
+                                session_id: "replacement".into(),
+                                socket_path: socket,
+                                key_path: Some(key),
+                            }
+                        }
+                        "codex" => fl_wire::identity::VendorRoute::Codex {
+                            thread_id: "thread-fixture".into(),
+                            cwd: None,
+                        },
+                        _ => webhook_route(&socket),
+                    };
+                    let queued = mode != "direct";
+                    let response = if queued {
+                        // Capture the original native Codex thread through normal admission.
+                        state.mark_session_in_flight_from_turns(original, &[]);
+                        let (target, id) = if mode == "queued-persona" {
+                            let (item, _) = state.enqueue_session_prompt(
+                                "freya",
+                                Some("freya".into()),
+                                "queued original".into(),
+                                "queued original".into(),
+                                "ferris".into(),
+                                vec![],
+                            );
+                            ("freya", item.id)
+                        } else {
+                            let admitted = post_prompt(
+                                &state,
+                                "freya",
+                                OWNER,
+                                None,
+                                &json!({"prompt":"queued original"}),
+                            );
+                            assert_eq!(
+                                admitted["queued_prompt"]["intended_codex_thread_id"],
+                                original
+                            );
+                            (
+                                original,
+                                admitted["queued_prompt"]["id"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_string(),
+                            )
+                        };
+                        install_route(tmp.path(), "freya", route);
+                        call(
+                            &state,
+                            "POST",
+                            &format!("/api/v1/sessions/{target}/queue/{id}/send-now"),
+                            OWNER,
+                            &json!({}),
+                        )
+                        .json_value()
+                        .unwrap()
+                    } else {
+                        // Move the persona only after this request has observed the original thread.
+                        let home = tmp.path().to_path_buf();
+                        crate::api::before_next_prompt_dispatch(move || {
+                            install_route(&home, "freya", route)
+                        });
+                        post_prompt(
+                            &state,
+                            original,
+                            OWNER,
+                            None,
+                            &json!({"prompt":"direct original", "send_now":true}),
+                        )
+                    };
+                    assert_eq!(
+                        response["delivery_stage"], "refused",
+                        "mode={mode}, replacement={replacement}: {response}"
+                    );
+                    assert_eq!(response["delivered"], false);
+                    assert_eq!(response["failure_stage"], "Route");
+                    assert!(
+                        listener.accept().is_err(),
+                        "a replacement endpoint received a connection"
+                    );
+                    assert!(
+                        !tmux.log().contains("paste-buffer"),
+                        "replacement Claude pane received input"
+                    );
+                    if queued {
+                        assert_eq!(
+                            response["queue"][0]["session_id"],
+                            if mode == "queued-persona" {
+                                "freya"
+                            } else {
+                                original
+                            }
+                        );
+                        assert_eq!(response["queue"][0]["delivery_state"], "refused");
+                        crate::api::drain_ready_session_queues(&state);
+                        assert!(
+                            listener.accept().is_err(),
+                            "background drain retried a refusal"
+                        );
+                        assert!(!tmux.log().contains("paste-buffer"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn codex_send_now_holds_pinned_queued_intent_when_route_disappears() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect());
+        for target in ["thread-fixture", "freya"] {
+            let tmp = TempDir::new().unwrap();
+            let state = test_hub_state(&tmp);
+            let bin = tmp.path().join("fake-codex");
+            let log = tmp.path().join("codex.log");
+            fs::write(
+                &bin,
+                format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let socket = tmp.path().join("control.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            unsafe {
+                std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+                std::env::set_var("FL_WIRE_CODEX_CONTROL_SOCK", &socket);
+            }
+            let route = fl_wire::identity::VendorRoute::Codex {
+                thread_id: "thread-fixture".into(),
+                cwd: Some(tmp.path().into()),
+            };
+            install_route(tmp.path(), "freya", route.clone());
+            let (item, _) = state.enqueue_session_prompt(
+                target,
+                Some("freya".into()),
+                "held original".into(),
+                "held original".into(),
+                "owner".into(),
+                vec![],
+            );
+            assert_eq!(
+                item.intended_codex_thread_id.as_deref(),
+                Some("thread-fixture")
+            );
+            fs::remove_file(tmp.path().join(".cache/agent-bus/routes.json")).unwrap();
+            let response = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{target}/queue/{}/send-now", item.id),
+                OWNER,
+                &json!({}),
+            )
+            .json_value()
+            .unwrap();
+            assert_eq!(response["delivery_stage"], "refused", "{response}");
+            assert_eq!(response["failure_stage"], "Route");
+            assert_eq!(response["delivered"], false);
+            assert_eq!(response["queue"][0]["delivery_state"], "refused");
+
+            // A restored route with a reliable idle transcript must not reinterpret Send now.
+            install_route(tmp.path(), "freya", route);
+            let sessions = tmp.path().join(".codex/sessions/2026/11/06");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(
+                sessions.join("rollout-2026-11-06T01-02-03-thread-fixture.jsonl"),
+                [
+                    json!({"type":"session_meta","payload":{"id":"thread-fixture","cwd":tmp.path()}}),
+                    json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Completed."}]}}),
+                ]
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            )
+            .unwrap();
+            {
+                let store = state.open_store().unwrap();
+                assert!(!state.is_session_busy(&store, "thread-fixture"));
+            }
+            crate::api::drain_ready_session_queues(&state);
+            let held = state.session_queue(target);
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].delivery_state, QueuedDeliveryState::Refused);
+            assert!(
+                !log.exists(),
+                "background drain queued the held prompt in Codex"
+            );
+            assert!(
+                listener.accept().is_err(),
+                "held prompt reached Codex control"
+            );
+            let cancelled = call(
+                &state,
+                "DELETE",
+                &format!("/api/v1/sessions/{target}/queue/{}", item.id),
+                OWNER,
+                &json!({}),
+            );
+            assert_eq!(cancelled.status, 200);
+            assert!(state.session_queue(target).is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_send_now_direct_and_queued_report_ack_idle_and_unknown_without_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect());
+        for queued in [false, true] {
+            for outcome in ["accepted", "idle", "unconfirmed"] {
+                let tmp = TempDir::new().unwrap();
+                let state = test_hub_state(&tmp);
+                let bin = tmp.path().join("fake-codex");
+                let log = tmp.path().join("queue.log");
+                fs::write(
+                    &bin,
+                    format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+                )
+                .unwrap();
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+                let socket = tmp.path().join("control.sock");
+                let server = mock_codex_control(&socket, outcome);
+                unsafe {
+                    std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+                    std::env::set_var("FL_WIRE_CODEX_CONTROL_SOCK", &socket);
+                }
+                install_route(
+                    tmp.path(),
+                    "freya",
+                    fl_wire::identity::VendorRoute::Codex {
+                        thread_id: "thread-fixture".into(),
+                        cwd: Some(tmp.path().into()),
+                    },
+                );
+                let body = if queued {
+                    let (item, _) = state.enqueue_session_prompt(
+                        "codex-thread-fixture",
+                        Some("freya".into()),
+                        "fixture".into(),
+                        "fixture".into(),
+                        "ferris".into(),
+                        vec![],
+                    );
+                    call(
+                        &state,
+                        "POST",
+                        &format!(
+                            "/api/v1/sessions/codex-thread-fixture/queue/{}/send-now",
+                            item.id
+                        ),
+                        OWNER,
+                        &json!({}),
+                    )
+                    .json_value()
+                    .unwrap()
+                } else {
+                    post_prompt(
+                        &state,
+                        "codex-thread-fixture",
+                        OWNER,
+                        None,
+                        &json!({"prompt":"fixture","send_now":true,"by":"ferris"}),
+                    )
+                };
+                assert_eq!(
+                    body["delivery_stage"],
+                    match outcome {
+                        "accepted" => "app_server_accepted",
+                        "idle" => "vendor_queued",
+                        _ => "unconfirmed",
+                    },
+                    "{body}"
+                );
+                assert_eq!(body["delivered"], outcome != "unconfirmed");
+                assert_eq!(log.exists(), outcome == "idle");
+                if outcome == "accepted" {
+                    assert_eq!(body["turn_id"], "turn-fixture");
+                }
+                if queued {
+                    if outcome == "unconfirmed" {
+                        assert_eq!(body["queue"][0]["delivery_state"], "unconfirmed");
+                        assert!(state.session_in_flight_unconfirmed("codex-thread-fixture"));
+                        crate::api::drain_ready_session_queues(&state);
+                        assert!(!log.exists());
+                    } else {
+                        assert!(body["queue"].as_array().unwrap().is_empty());
+                    }
+                }
+                let methods = server.join().unwrap();
+                assert_eq!(
+                    methods.iter().filter(|m| *m == "turn/steer").count(),
+                    usize::from(outcome != "idle")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_send_now_requires_owner_authority_and_holds_failed_queued_intent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let bin = tmp.path().join("fake-codex");
+        let log = tmp.path().join("codex.log");
+        fs::write(
+            &bin,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect());
+        unsafe {
+            std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+            std::env::set_var(
+                "FL_WIRE_CODEX_CONTROL_SOCK",
+                tmp.path().join("missing.sock"),
+            );
+        }
+        install_route(
+            tmp.path(),
+            "freya",
+            fl_wire::identity::VendorRoute::Codex {
+                thread_id: "thread-fixture".into(),
+                cwd: Some(tmp.path().into()),
+            },
+        );
+        // The authenticated Owner's arbitrary label must not disable explicit steering.
+        let sent = post_prompt(
+            &state,
+            "codex-thread-fixture",
+            OWNER,
+            None,
+            &json!({"prompt":"direct", "send_now":true, "by":"ferris"}),
+        );
+        assert_eq!(sent["delivery_stage"], "refused", "{sent}");
+        assert_eq!(sent["delivered"], false);
+        assert!(
+            !log.exists(),
+            "failed steering must never fall back to queue"
+        );
+        // A peer claiming Owner only gets ordinary vendor queue behavior.
+        let peer = post_prompt(
+            &state,
+            "codex-thread-fixture",
+            PEER,
+            Some("owner"),
+            &json!({"prompt":"peer", "send_now":true, "by":"owner"}),
+        );
+        assert_eq!(peer["delivery_stage"], "vendor_queued", "{peer}");
+        assert_eq!(peer["delivered"], true);
+        assert!(fs::read_to_string(&log).unwrap().contains("peer"));
+        fs::remove_file(&log).unwrap();
+        let (item, _) = state.enqueue_session_prompt(
+            "codex-thread-fixture",
+            Some("freya".into()),
+            "queued".into(),
+            "queued".into(),
+            "ferris".into(),
+            vec![],
+        );
+        let response = call(
+            &state,
+            "POST",
+            &format!(
+                "/api/v1/sessions/codex-thread-fixture/queue/{}/send-now",
+                item.id
+            ),
+            OWNER,
+            &json!({}),
+        );
+        let body = response.json_value().unwrap();
+        assert_eq!(body["delivery_stage"], "refused", "{body}");
+        assert_eq!(body["queue"][0]["delivery_state"], "refused");
+        assert!(!log.exists());
+        // Held failed explicit intent cannot be silently retried by the background queue drain.
+        crate::api::drain_ready_session_queues(&state);
+        assert!(!log.exists());
+        assert!(
+            state
+                .remove_queued_prompt("codex-thread-fixture", &item.id)
+                .is_some()
+        );
+        let (peer_item, _) = state.enqueue_session_prompt(
+            "codex-thread-fixture",
+            Some("freya".into()),
+            "peer queued".into(),
+            "peer queued".into(),
+            "owner".into(),
+            vec![],
+        );
+        let peer_queued = call(
+            &state,
+            "POST",
+            &format!(
+                "/api/v1/sessions/codex-thread-fixture/queue/{}/send-now",
+                peer_item.id
+            ),
+            PEER,
+            &json!({}),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(
+            peer_queued["delivery_stage"], "vendor_queued",
+            "{peer_queued}"
+        );
+        assert!(fs::read_to_string(&log).unwrap().contains("peer queued"));
     }
 
     #[test]
