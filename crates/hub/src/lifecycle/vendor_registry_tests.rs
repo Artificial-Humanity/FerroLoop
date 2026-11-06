@@ -689,6 +689,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         restart_count: 0,
         tmux_target: None,
         cwd: None,
+        context_window: None,
         hydration_dispatched: false,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),

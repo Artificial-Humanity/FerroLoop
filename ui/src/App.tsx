@@ -2865,6 +2865,7 @@ export const App: React.FC<AppProps> = ({
       onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
       returnToSettingsLabel={returnToSettingsLabel}
       onReturnToSettings={handleReturnToOriginSettings}
+      authority={authority}
       splitView={splitView}
       onToggleSplitView={handleToggleSplitView}
       onOpenMobileRoster={

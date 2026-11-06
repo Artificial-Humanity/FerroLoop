@@ -13,6 +13,7 @@ mod balance_api;
 mod boot_reconcile;
 pub mod cloud_adapters;
 pub mod commands;
+mod context_window;
 mod direct_quota;
 pub mod discovery;
 mod doctor_api;
@@ -1164,6 +1165,9 @@ mod artifact_consolidate_tests;
 
 #[cfg(test)]
 mod remodel_api_tests;
+
+#[cfg(test)]
+mod context_window_api_tests;
 
 #[cfg(test)]
 mod conn_and_auth_cache_tests;

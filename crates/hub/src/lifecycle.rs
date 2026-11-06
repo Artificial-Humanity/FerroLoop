@@ -505,15 +505,40 @@ pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
     }
 }
 
-/// A plain model id cannot be interpreted as a command-line option.
-fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
-    let id = requested?.trim();
-    (id.len() <= 64
+/// Split a trailing context-window tag (`[1m]`, `[200k]`: one to four digits, then lower-case
+/// `k` or `m`) off a model id. `None` for an id with no such tag.
+pub(crate) fn split_window_tag(id: &str) -> Option<(&str, &str)> {
+    let open = id.rfind('[')?;
+    let (base, tag) = id.split_at(open);
+    let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
+    // Work on bytes: the last char of the tag may be multi-byte, so slicing the `str` at
+    // `len - 1` could land inside it. A valid tag is all ASCII, and any non-ASCII byte fails
+    // the checks below.
+    let bytes = inner.as_bytes();
+    let (&unit, digits) = bytes.split_last()?;
+    let valid = matches!(unit, b'k' | b'm')
+        && (1..=4).contains(&digits.len())
+        && digits.iter().all(u8::is_ascii_digit);
+    valid.then_some((base, tag))
+}
+
+/// `true` for `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
+fn is_plain_model_id(id: &str) -> bool {
+    id.len() <= 64
         && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
-    .then(|| id.to_string())
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A plain model id cannot be interpreted as a command-line option. It may end in ONE
+/// context-window tag (`opus[1m]`, `sonnet[1m]`: [`split_window_tag`]); no other bracket is
+/// accepted. The launch passes each argument to the process as is (never through a shell), so
+/// the tag is not glob-expanded.
+fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
+    let id = requested?.trim();
+    let base = split_window_tag(id).map_or(id, |(base, _)| base);
+    is_plain_model_id(base).then(|| id.to_string())
 }
 
 /// The `agy --model` id for `model`. `agy models` lists every id with an effort suffix
@@ -580,7 +605,11 @@ fn launch_spec_for(
         } else {
             model
         };
-        if let Some(model) = normalize_plain_model(model) {
+        // Only Claude names its window in the model id (`opus[1m]`); another vendor's id never
+        // carries a tag, so a tagged one is dropped as it always was.
+        if let Some(model) = normalize_plain_model(model)
+            .filter(|m| vendor == "claude" || split_window_tag(m).is_none())
+        {
             args.extend(["--model".into(), model]);
         }
         if vendor == "antigravity" {
@@ -1033,6 +1062,30 @@ pub struct SpinUpRequest {
     pub hosted: Option<bool>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The context window to give the session, in tokens. Validated against the vendor and model
+    /// ([`crate::context_window::validate_context_window`]) and recorded; Grok only. It is not
+    /// applied at launch yet.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_context_window",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window: Option<u64>,
+}
+
+/// `context_window` from JSON: absent or `null` is none; anything but a non-negative integer is
+/// refused with a message that says what is wanted.
+fn deserialize_context_window<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value>>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            serde::de::Error::custom("context_window must be a positive integer number of tokens")
+        }),
+    }
 }
 
 impl SpinUpRequest {
@@ -1071,6 +1124,7 @@ struct ValidSpinUp {
     node_id: String,
     hosted: bool,
     cwd: Option<String>,
+    context_window: Option<u64>,
 }
 
 fn trimmed_opt(raw: &Option<String>) -> Option<String> {
@@ -1276,6 +1330,7 @@ impl SpinUpRequest {
             node_id,
             hosted: self.hosted.unwrap_or(true),
             cwd,
+            context_window: self.context_window,
         })
     }
 }
@@ -1295,6 +1350,9 @@ pub struct SpinUpResponse {
     pub tmux_target: Option<String>,
     pub hydration_dispatched: bool,
     pub prompt: Option<String>,
+    /// The context window recorded for the session, in tokens, when one was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Whether this spin-up started the session's `tmux` runtime. `false` when the session is
     /// not hosted, runtime calls are off, or the start failed (tmux failed, or a session of the
     /// name already runs).
@@ -1320,6 +1378,10 @@ pub struct HostedSessionRecord {
     pub restart_count: u32,
     pub tmux_target: Option<String>,
     pub cwd: Option<String>,
+    /// The context window chosen for the session, in tokens. Validated and recorded; whether and
+    /// how a launch applies it is separate. Absent when none was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     pub hydration_dispatched: bool,
     /// Whether this lifecycle created the tmux session. Teardown of a runtime it created
     /// uses [`SessionRuntime::kill`]. An owner teardown of one it did not create still
@@ -1439,6 +1501,24 @@ pub fn set_hosted_session_model<S: StateStore>(
         return Ok(None);
     };
     record.model = Some(model.to_string());
+    record.updated_at_ms = now_ms();
+    persist_hosted_session(store, &record, by)?;
+    Ok(Some(record))
+}
+
+/// Set (`Some`) or clear (`None`) the context window on the hosted-session record that `keys`
+/// name (same lookup as [`find_hosted_session`]). The caller has validated the value. Returns
+/// the updated record, or `None` when no record matches.
+pub fn set_hosted_session_context_window<S: StateStore>(
+    store: &S,
+    keys: &[&str],
+    context_window: Option<u64>,
+    by: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let Some(mut record) = find_hosted_session(store, keys)? else {
+        return Ok(None);
+    };
+    record.context_window = context_window;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
     Ok(Some(record))
@@ -2497,6 +2577,17 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let mut v = req.validate()?;
+    // Before any side effect: a window the vendor does not offer registers nothing. It is only
+    // recorded here; the launch below does not apply it.
+    if let Some(tokens) = v.context_window {
+        crate::context_window::validate_context_window(
+            &v.vendor,
+            v.model.as_deref(),
+            tokens,
+            env.home_override,
+        )
+        .map_err(LifecycleError::Invalid)?;
+    }
     if v.cwd.is_none() {
         v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root);
     }
@@ -2544,6 +2635,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         restart_count: previous.as_ref().map_or(0, |r| r.restart_count),
         tmux_target: tmux_target.clone(),
         cwd: v.cwd.clone(),
+        context_window: v.context_window,
         hydration_dispatched: false,
         tombstone_ids: Vec::new(),
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
@@ -2625,6 +2717,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         tmux_target,
         hydration_dispatched,
         prompt: Some(prompt),
+        context_window: v.context_window,
     })
 }
 
@@ -2804,6 +2897,7 @@ fn record_for_target<S: AgentRegistry>(
         restart_count: 0,
         tmux_target: None,
         cwd: None,
+        context_window: None,
         hydration_dispatched: false,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
@@ -3658,6 +3752,8 @@ impl RemodelPlan {
             node_id: Some(self.to.node_id.clone()),
             hosted: Some(self.to.hosted),
             cwd: self.to.cwd.clone(),
+            // A window is chosen for one vendor and model: a remodel starts without one.
+            context_window: None,
         }
     }
 }
@@ -3801,6 +3897,7 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         // The new session keeps the old one's `hosted`; with no record, spin-up's default.
         hosted: req.hosted.or(old.map(|r| r.hosted)),
         cwd: req.cwd.clone().or_else(|| old_cwd.clone()),
+        context_window: None,
     }
     .validate()?;
     // Before the teardown: a remodel onto an API vendor with no key would retire the old
@@ -3822,6 +3919,8 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
             node_id: Some(old_node),
             hosted: Some(old.is_some_and(|r| r.hosted)),
             cwd: old_cwd,
+            // A restore must not fail on a window: it puts the session back as it can start.
+            context_window: None,
         });
     // With no restore, a failed spin-up leaves the persona down; only the Owner may take that
     // risk (the remodel then warns that no restore is possible).
@@ -6888,6 +6987,7 @@ mod tests {
             restart_count: 0,
             tmux_target: Some(format!("{}:{vendor}", capitalize(persona))),
             cwd: None,
+            context_window: None,
             hydration_dispatched: false,
             runtime_spawned: spawned,
             tombstone_ids: Vec::new(),
