@@ -44,7 +44,7 @@ Files: `crates/hub/src/lifecycle.rs`, `crates/hub/src/api.rs`, `crates/hub/src/a
 
 Consumes Task 1 catalog APIs. Produces store-aware role validation before side effects, current catalog-guided startup/reforge, and truthful metadata-only recast feedback. Preserve existing response fields; any additive status must be explicit, not model consumption.
 
-- [ ] Inspect exact validation, saved hydrate, current registration, hosted metadata and recast paths; report material ambiguity before broad changes.
+- [ ] Inspect exact validation, external opaque `agent-hydrate` output, current registration, hosted metadata and recast paths. Use approved narrow Runtime recast metadata bound to agent identity/current assignment; unchanged legacy/default agents retain external hydration. Failure to persist required metadata must be truthful, never silent successful completion; no transport-based clearing.
 - [ ] Add meaningful RED tests for catalog Chair spin-up, edited template hydration, recast followed by explicit Reforge with stale hydration, legacy/default fallback, unknown-role refusal before side effects and structural custom-shadow safety.
 - [ ] Implement the smallest catalog/current-role integration. No blind overwrite of unrelated hydration content or broad lifecycle precedence refactor; no automatic recast injection/restart.
 - [ ] Run focused regressions and hub tests GREEN; commit with Freya trailer; independent review/fix before advancing.

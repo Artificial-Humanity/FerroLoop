@@ -10,6 +10,8 @@ UI choices use authenticated catalog reads and persisted saves, retaining existi
 
 Creation resolves supported catalog roles before side effects and puts current stored guidance into hydration. Recast remains registry-only and tells the user guidance requires explicit Reforge. Explicit current-role hydration must not restore stale registered role/project from cached hydration or hosted metadata. Preserve default/legacy role behavior; resolve opaque legacy hydration compatibility narrowly rather than introducing a general hydration framework. No automatic injection, restart or runtime rollout.
 
+Lead clarification `01a1b1a5-e671-70ba-97f2-df94602c1faa` permits narrow persisted per-agent recast-guidance-required Runtime metadata on actual project/role reassignment. Bind it to stable agent identity and intended current assignment; it selects current registry/catalog guidance at explicit hydration, not automatic dispatch. An unchanged legacy/default agent retains the external `agent-hydrate` behavior. Do not edit that command or its files, infer role from arbitrary prompt text, clear precedence on transport acceptance, or report a fully completed recast if required metadata persistence failed.
+
 Alternatives: a new enum/file would duplicate role data and was rejected by the request; a label-only addition would leave validation and guidance disconnected; automatic recast dispatch would introduce a new delivery contract and is explicitly excluded. The accepted path connects the existing catalog and explicit hydration boundary.
 
 No live agent/session changes, installation, shared instructions, Host work, or held peer production work are included. Felix cleared UI overlap; JARVIS confirmed no shared role file is necessary.
