@@ -119,7 +119,7 @@ impl Session {
             .unwrap_or_else(|err| err.into_inner()) = Some(child);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn cleanup_requested(&self) -> bool {
         self.cleanup_requested.load(Ordering::SeqCst)
     }

@@ -249,7 +249,7 @@ struct Spawned {
 
 struct Worker {
     child: Child,
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
     stdout: BufReader<std::process::ChildStdout>,
 }
 
@@ -268,7 +268,7 @@ impl Worker {
         let mut child = cmd.spawn().expect("worker");
         let mut worker = Self {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
-            stdin: child.stdin.take().expect("stdin"),
+            stdin: Some(child.stdin.take().expect("stdin")),
             child,
         };
         let ready = worker.line().expect("worker ready");
@@ -287,9 +287,15 @@ impl Worker {
     }
 
     fn cmd(&mut self, command: &str) -> String {
-        writeln!(self.stdin, "{command}").expect("write");
-        self.stdin.flush().expect("flush");
+        let stdin = self.stdin.as_mut().expect("stdin");
+        writeln!(stdin, "{command}").expect("write");
+        stdin.flush().expect("flush");
         self.line().unwrap_or_default()
+    }
+
+    #[cfg(windows)]
+    fn close_stdin(&mut self) {
+        self.stdin.take();
     }
 
     fn spawn_spec(&mut self, spec: &SpawnSpec) -> Spawned {
@@ -1746,7 +1752,7 @@ fn failed_handshake_pidfd_kills_known_vendor() {
 fn windows_cleanup_deadline_starts_when_cleanup_is_requested() {
     let hold = tempfile::NamedTempFile::new().expect("hold");
     let suffix = format!("clk-{}", std::process::id());
-    let (_endpoint, mut worker) = win_worker(
+    let (endpoint, mut worker) = win_worker(
         &suffix,
         &[("FL_HOST_JOB_HOLD", &hold.path().display().to_string())],
     );
@@ -1766,16 +1772,33 @@ fn windows_cleanup_deadline_starts_when_cleanup_is_requested() {
     ));
     assert_eq!(later, "ok false", "{later}");
     assert_ne!(worker.cmd("phase held"), "ok absent");
-    drop(hold);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The hold stays for shutdown. Dropping it would let accounting look quiet and hide a wedged join.
+    worker.close_stdin();
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let phase = worker.cmd("phase held");
-        if phase == "ok absent" {
+        if worker.child.try_wait().expect("wait").is_some() {
             break;
         }
-        assert!(Instant::now() < deadline, "{phase}");
-        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            Instant::now() < deadline,
+            "shutdown joined unresolved windows cleanup forever"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
+    let registry = read_registry(&endpoint).expect("registry");
+    assert!(
+        registry
+            .alerts
+            .iter()
+            .any(|alert| alert == "cleanup unresolved")
+    );
+    assert!(
+        registry
+            .sessions
+            .iter()
+            .any(|record| record.session == "held"),
+        "unresolved cleanup retired the session"
+    );
 }
 
 #[test]

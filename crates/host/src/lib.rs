@@ -760,30 +760,46 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
 
 #[cfg(windows)]
 fn windows_watch(session: Arc<Session>, host: Arc<HostInner>) {
+    // The observation drops its guards before the sleep, so TerminateJobObject can lock the Job.
+    windows_watch_until(session, host, observe_windows_job);
+}
+
+#[cfg(windows)]
+fn observe_windows_job(session: &Session) -> WatchTick {
+    let process = session
+        .process
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let job = session.job.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(process) = process.as_ref() else {
+        return WatchTick::Stop;
+    };
+    let Some(job) = job.as_ref() else {
+        return WatchTick::Stop;
+    };
+    if session.leader_exit().is_none() && child::windows::leader_signaled(process) {
+        return WatchTick::Leader(child::windows::leader_exit_code(process));
+    }
+    let requested = session.cleanup_requested();
+    // Hold forces accounting to look live. A non-zero Job is not cleanup.
+    let quiet = !job_hold_active() && child::windows::stable_job_quiescent(job);
+    WatchTick::Poll { requested, quiet }
+}
+
+/// Poll until cleanup is resolved or the post-request deadline expires.
+///
+/// Unresolved cleanup leaves this loop so `shutdown` can join the thread. The
+/// `Session` keeps the Job until the host drops that session; this loop does not.
+#[cfg(any(windows, test))]
+fn windows_watch_until(
+    session: Arc<Session>,
+    host: Arc<HostInner>,
+    mut observe: impl FnMut(&Session) -> WatchTick,
+) {
     let mut cleanup_started: Option<Instant> = None;
-    let mut reported_unresolved = false;
     loop {
-        // The guards end with this block so TerminateJobObject can lock the Job during the sleep.
-        let observed = {
-            let process = session
-                .process
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
-            let job = session.job.lock().unwrap_or_else(|err| err.into_inner());
-            let Some(process) = process.as_ref() else {
-                break;
-            };
-            let Some(job) = job.as_ref() else { break };
-            if session.leader_exit().is_none() && child::windows::leader_signaled(process) {
-                WatchTick::Leader(child::windows::leader_exit_code(process))
-            } else {
-                let requested = session.cleanup_requested();
-                // Hold forces accounting to look live so the Job handle stays open past the deadline.
-                let quiet = !job_hold_active() && child::windows::stable_job_quiescent(job);
-                WatchTick::Poll { requested, quiet }
-            }
-        };
-        match observed {
+        match observe(&session) {
+            WatchTick::Stop => break,
             WatchTick::Leader(code) => {
                 let exit = ChildExit { code, signal: None };
                 host.mark_leader(session.session.as_str(), &exit);
@@ -799,14 +815,11 @@ fn windows_watch(session: Arc<Session>, host: Arc<HostInner>) {
                     session.note_cleanup(CleanupReport { complete: true });
                     break;
                 }
-                if requested
-                    && cleanup_deadline_expired(cleanup_started, Instant::now())
-                    && !quiet
-                    && !reported_unresolved
+                if requested && !quiet && cleanup_deadline_expired(cleanup_started, Instant::now())
                 {
                     host.alert("cleanup unresolved");
                     session.note_cleanup(CleanupReport { complete: false });
-                    reported_unresolved = true;
+                    break;
                 }
             }
         }
@@ -814,10 +827,16 @@ fn windows_watch(session: Arc<Session>, host: Arc<HostInner>) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 enum WatchTick {
+    #[cfg_attr(not(windows), allow(dead_code))]
     Leader(Option<i32>),
-    Poll { requested: bool, quiet: bool },
+    Poll {
+        requested: bool,
+        quiet: bool,
+    },
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Stop,
 }
 
 #[cfg(windows)]
@@ -917,7 +936,14 @@ fn wait_for_stop() -> Result<(), HostError> {
 
 #[cfg(test)]
 mod deadline_tests {
-    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        CLEANUP_DEADLINE, CleanupReport, Host, OpenOptions, Session, SessionParts, SessionPhase,
+        SurvivorRecord, WatchTick, cleanup_deadline_expired, load_registry, windows_watch_until,
+    };
+    use fl_host_proto::{HostConfig, HostEndpoint, SessionId};
 
     #[test]
     fn cleanup_deadline_starts_only_when_requested() {
@@ -928,5 +954,113 @@ mod deadline_tests {
         assert!(!cleanup_deadline_expired(None, now));
         assert!(!cleanup_deadline_expired(Some(now), now));
         assert!(cleanup_deadline_expired(Some(running_since), now));
+    }
+
+    #[test]
+    fn shutdown_returns_after_unresolved_windows_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = unresolved_endpoint(dir.path());
+        let host = Host::open(OpenOptions::new(HostConfig::new(endpoint.clone()))).expect("open");
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("held").expect("session"),
+            epoch: 1,
+            vendor_pid: 1,
+            vendor_start: 1,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 1,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        {
+            let mut registry = host
+                .inner
+                .registry
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            registry.high_water = 1;
+            registry.sessions.push(SurvivorRecord {
+                session: "held".to_owned(),
+                epoch: 1,
+                phase: SessionPhase::Running,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                vendor_pid: 1,
+                vendor_start: 1,
+                pgid: 1,
+                group_leader_pid: 1,
+                group_leader_start: 1,
+                group_leader_reaped: false,
+                leader_code: None,
+                leader_signal: None,
+            });
+        }
+        host.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert("held".to_owned(), Arc::clone(&session));
+        let watched = Arc::clone(&session);
+        let inner = Arc::clone(&host.inner);
+        host.spawn_thread(move || {
+            // Never quiet: accounting stays non-zero, so this must not become cleanup.
+            windows_watch_until(watched, inner, |session| WatchTick::Poll {
+                requested: session.cleanup_requested(),
+                quiet: false,
+            });
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = host.shutdown();
+            let _ = tx.send((started.elapsed(), result.is_ok()));
+        });
+        let (elapsed, ok) = rx
+            .recv_timeout(CLEANUP_DEADLINE + Duration::from_secs(3))
+            .expect("shutdown joined unresolved windows cleanup forever");
+        assert!(ok);
+        assert!(
+            elapsed >= CLEANUP_DEADLINE,
+            "cleanup clock was already running"
+        );
+        assert_eq!(
+            session.cleanup_report(),
+            Some(CleanupReport { complete: false })
+        );
+        assert_eq!(Arc::strong_count(&session), 1);
+        let registry = load_registry(&endpoint).expect("registry");
+        assert!(
+            registry
+                .alerts
+                .iter()
+                .any(|alert| alert == "cleanup unresolved")
+        );
+        assert!(
+            registry
+                .sessions
+                .iter()
+                .any(|record| record.session == "held")
+        );
+    }
+
+    fn unresolved_endpoint(dir: &std::path::Path) -> HostEndpoint {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+            HostEndpoint::unix(dir.join("h.sock")).expect("endpoint")
+        }
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            let suffix = format!("unres-{}", std::process::id());
+            HostEndpoint::windows(&suffix, &super::current_user_sid().expect("sid"))
+                .expect("endpoint")
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            HostEndpoint::unix(dir.join("h.sock")).expect("endpoint")
+        }
     }
 }
