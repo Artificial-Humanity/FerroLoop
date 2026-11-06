@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { HubApiClient } from "../api/client";
+import { HubApiClient, HubApiError } from "../api/client";
 import {
   ALWAYS_SEND_NOW_STORAGE_KEY,
   ChatPane,
@@ -2111,5 +2111,212 @@ describe("Resizable chat composer (Record 57 & Record 112)", () => {
       behavior: "smooth",
       block: "center",
     });
+  });
+});
+
+describe("standalone transcript ownership and availability", () => {
+  const history = [{ index: 0, role: "assistant", content: "Owned history", thinking: null, tool_calls: [] }];
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+  function setup() {
+    const reads: ReturnType<typeof deferred<import("../types/api").SessionTranscriptResponse>>[] = [];
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockImplementation(() => {
+      const read = deferred<import("../types/api").SessionTranscriptResponse>();
+      reads.push(read);
+      return read.promise;
+    });
+    const body = (content = history, extra = {}) => ({ session_id: "session-a", turns: content, ...extra });
+    const pane = (sessionId: string | null = "session-a", agentName = "freya", authority: import("../types/api").HubAuthority | null = null) =>
+      <ChatPane apiClient={client} agentName={agentName} adapter="claude" sessionId={sessionId} authority={authority} agentSettingsOpen />;
+    return { reads, client, body, pane };
+  }
+  const unavailable = () => new HubApiError(503, "temporarily unavailable", undefined, undefined, { code: "transcript_unavailable" });
+  const staleNotice = "History refresh unavailable; showing last loaded history";
+  it.each(["503", "network", "malformed", "malformed turn"])("retains exact-session history after %s and recovers, while observed empty clears", async (failure) => {
+    const { pane, reads, body } = setup();
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "protected draft" } });
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => {
+      if (failure === "malformed") reads[1].resolve({ session_id: "session-a" } as never);
+      else if (failure === "malformed turn") reads[1].resolve(body([{ ...history[0], tool_calls: "invalid" }] as never));
+      else reads[1].reject(failure === "503" ? unavailable() : new TypeError("network failed"));
+    });
+    expect(screen.getByText(staleNotice)).toBeInTheDocument();
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toHaveValue("protected draft");
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[2].resolve(body()));
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[3].resolve(body([])));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it("shows initial unavailable separately from observed empty history", async () => {
+    const { pane, reads } = setup();
+    render(pane());
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    await act(async () => reads[0].reject(unavailable()));
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+  });
+  it.each([401, 403, 404])("hides last-good history on HTTP %s instead of stale success", async (status) => {
+    const { pane, reads, body } = setup();
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[1].reject(new HubApiError(status, "access refused")));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("access refused");
+  });
+  it.each(["session", "agent", "principal", "token", "client"])("masks history immediately on %s change and rejects the old read's metadata and finally", async (change) => {
+    const { pane, reads, body, client } = setup();
+    const view = render(pane("session-a", "freya", { tier: "owner", login: "first" }));
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    const replacement = setup();
+    if (change === "token") client.setToken("fixture-new-token");
+    view.rerender(change === "client" ? replacement.pane() : pane(
+      change === "session" ? "session-b" : "session-a",
+      change === "agent" ? "felix" : "freya",
+      { tier: "owner", login: change === "principal" ? "second" : "first" },
+    ));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    await act(async () => reads[1].resolve(body(history, { is_busy: true, queue: [{ id: "old", prompt: "Old queue", session_id: "session-a", by: "owner", created_at: "" }] })));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.queryByText("Old queue")).toBeNull();
+    expect(screen.getByTestId("chat-refresh-btn")).toBeDisabled();
+    const latest = change === "client" ? replacement.reads[0] : reads[2];
+    await act(async () => latest.resolve(body([])));
+    expect(screen.getByTestId("chat-refresh-btn")).not.toBeDisabled();
+  });
+  it("rejects a same-session response from the first A after A to B to A", async () => {
+    const { pane, reads, body } = setup();
+    const view = render(pane());
+    view.rerender(pane("session-b"));
+    view.rerender(pane());
+    await act(async () => reads[2].reject(unavailable()));
+    await act(async () => reads[0].resolve(body()));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    await act(async () => reads[1].reject(new Error("old failure")));
+    expect(screen.queryByText("old failure")).toBeNull();
+  });
+  it.each([false, true])("requires positive alias resolution for reusable last-good (resolved=%s)", async (resolved) => {
+    const { pane, reads, body } = setup();
+    render(pane(null));
+    await act(async () => reads[0].resolve(body(history, resolved ? { resolved_session_id: "session-a" } : {})));
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[1].reject(unavailable()));
+    expect(Boolean(screen.queryByText("Owned history"))).toBe(resolved);
+    expect(Boolean(screen.queryByText(staleNotice))).toBe(resolved);
+  });
+  it("does not reuse a concrete snapshot after switching to an unknown alias or accept contradictory resolution", async () => {
+    const { pane, reads, body } = setup();
+    const view = render(pane());
+    await act(async () => reads[0].resolve(body()));
+    view.rerender(pane(null));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    await act(async () => reads[1].reject(unavailable()));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    view.rerender(pane());
+    await act(async () => reads[2].resolve(body(history, { resolved_session_id: "session-b" })));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+  });
+  it.each(["clear", "reforge"] as const)("fences a pending read during %s, preserves history on reset failure, discards on success", async (mode) => {
+    const { pane, reads, body, client } = setup();
+    const reset = deferred<never>();
+    vi.spyOn(client, "clearSession").mockReturnValueOnce(reset.promise).mockResolvedValue({} as never);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "pre-reset late result" }])));
+    expect(screen.queryByText("pre-reset late result")).toBeNull();
+    await act(async () => reset.reject(new Error("reset failed")));
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("reset failed");
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    await waitFor(() => expect(client.clearSession).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    await act(async () => reads[reads.length - 1].resolve(body([])));
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it.each(["newer success", "newer failure", "newer still loading"])("rejects overlapping old results after %s, including metadata and finally", async (outcome) => {
+    const { pane, reads, body, client } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: true } as never);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "queued exactly once" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(reads).toHaveLength(3));
+    if (outcome === "newer success") await act(async () => reads[2].resolve(body([{ ...history[0], content: "New observation" }])));
+    if (outcome === "newer failure") await act(async () => reads[2].reject(unavailable()));
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "Old observation" }], { is_busy: true, queue: [{ id: "old", prompt: "Old queue", session_id: "session-a", by: "owner", created_at: "" }] })));
+    expect(screen.queryByText("Old observation")).toBeNull();
+    expect(screen.queryByText("Old queue")).toBeNull();
+    if (outcome === "newer success") expect(screen.getByText("New observation")).toBeInTheDocument();
+    if (outcome === "newer failure") expect(screen.getByText(staleNotice)).toBeInTheDocument();
+    expect(screen.getByTestId("chat-refresh-btn").hasAttribute("disabled")).toBe(outcome === "newer still loading");
+    expect(client.sendSessionPrompt).toHaveBeenCalledTimes(1);
+  });
+  it.each(["success", "failure"])("fences pending reads on teardown %s and allows recovery after refusal", async (outcome) => {
+    const { pane, reads, body, client } = setup();
+    const reset = deferred<never>();
+    vi.spyOn(client, "decommissionSession").mockReturnValue(reset.promise);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "Pre-teardown result" }])));
+    expect(screen.queryByText("Pre-teardown result")).toBeNull();
+    await act(async () => outcome === "success" ? reset.resolve({} as never) : reset.reject(new Error("teardown refused")));
+    expect(Boolean(screen.queryByText("Owned history"))).toBe(outcome === "failure");
+    if (outcome === "failure") expect(screen.getByRole("alert")).toHaveTextContent("teardown refused");
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[2].resolve(body([])));
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it("does not resurrect successful reset history when the post-reset read is unavailable", async () => {
+    const { pane, reads, body, client } = setup();
+    vi.spyOn(client, "clearSession").mockResolvedValue({} as never);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
+    await waitFor(() => expect(reads).toHaveLength(2));
+    await act(async () => reads[1].reject(unavailable()));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+  });
+  it("delegates controlled reset once without issuing the direct reset", async () => {
+    const { client } = setup();
+    const reset = vi.fn(async () => undefined);
+    const direct = vi.spyOn(client, "clearSession");
+    render(<ChatPane agentName="freya" sessionId="session-a" turns={history} apiClient={client} onResetSession={reset} transcriptRefreshState="stale" agentSettingsOpen />);
+    expect(screen.getByText(staleNotice)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
+    await waitFor(() => expect(reset).toHaveBeenCalledWith("session-a", "clear"));
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(direct).not.toHaveBeenCalled();
   });
 });
