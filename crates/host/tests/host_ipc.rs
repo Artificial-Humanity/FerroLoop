@@ -1748,3 +1748,65 @@ fn epoch_guard_serializes_signal_kill_and_respawn() {
         new_epoch
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn terminate_signal_reaches_child_from_real_daemon() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("term", &["stall"]);
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("term", epoch).expect("lease");
+    rpc.signal("term", epoch, lease, SignalKind::Terminate)
+        .expect("signal");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let children = rpc.list();
+        let row = record(&find(&children, "term").state);
+        if let Some(exit) = &row.exit {
+            assert_eq!(exit.signal, Some(libc::SIGTERM));
+            break;
+        }
+        assert!(Instant::now() < deadline, "child did not exit from SIGTERM");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn respawned_session_allows_bounded_daemon_shutdown() {
+    let mut daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("respawn-shutdown", &["stall"]);
+    let epoch = epoch_of(&child);
+    rpc.kill("respawn-shutdown", epoch, None).expect("kill");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let children = rpc.list();
+        if matches!(
+            find(&children, "respawn-shutdown").state,
+            ChildState::CleanupComplete(_)
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "cleanup did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let replacement = rpc.spawn("respawn-shutdown", &["stall"]);
+    assert!(epoch_of(&replacement) > epoch);
+    drop(rpc);
+    let rc = unsafe { libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+    let deadline = Instant::now() + fl_host::CLEANUP_DEADLINE + Duration::from_secs(3);
+    loop {
+        if let Some(status) = daemon.child.try_wait().expect("wait") {
+            assert!(status.success(), "daemon exit: {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon shutdown exceeded deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}

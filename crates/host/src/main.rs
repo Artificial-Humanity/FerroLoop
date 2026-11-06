@@ -5,7 +5,7 @@ fn main() {
         Some("--containment-worker") => fl_host::containment_worker(),
         Some("--socket") => {
             let path = args.next().unwrap_or_default();
-            match fl_host_proto::HostEndpoint::unix(&path) {
+            match fl_host::socket_endpoint(&path) {
                 Ok(endpoint) => fl_host::serve(fl_host_proto::HostConfig::new(endpoint)),
                 Err(err) => Err(err),
             }

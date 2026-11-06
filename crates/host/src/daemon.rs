@@ -30,10 +30,14 @@ pub(crate) fn attach(host: &Arc<HostInner>, session: &Arc<Session>) {
     let stop = Arc::clone(host);
     let running = Arc::clone(&writer);
     host.spawn_thread(move || running.run(move || stop.stop.load(Ordering::SeqCst)));
-    host.writers
+    let previous = host
+        .writers
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .insert(session.session.as_str().to_owned(), writer);
+    if let Some(previous) = previous {
+        previous.shutdown();
+    }
     output.emit_spawned(HostedChild {
         state: session.state(),
     });

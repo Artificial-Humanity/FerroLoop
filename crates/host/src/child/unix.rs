@@ -73,6 +73,14 @@ pub fn spawn_supervised(
     // daemon lock, token, listener, and client sockets.
     unsafe {
         cmd.pre_exec(move || {
+            let mut signals: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut signals);
+            libc::sigaddset(&mut signals, libc::SIGINT);
+            libc::sigaddset(&mut signals, libc::SIGTERM);
+            let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
             dup_fd(fds[0], 3)?;
             dup_fd(fds[1], 4)?;
             dup_fd(fds[2], 5)?;

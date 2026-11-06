@@ -140,17 +140,7 @@ pub fn containment_worker() -> Result<(), HostError> {
     try_backstop();
     let path =
         std::env::var("FL_HOST_SOCK").map_err(|_| HostError::Protocol("FL_HOST_SOCK".into()))?;
-    #[cfg(unix)]
-    let endpoint = HostEndpoint::unix(path)?;
-    #[cfg(windows)]
-    let endpoint = worker_endpoint(&path)?;
-    #[cfg(not(any(unix, windows)))]
-    let endpoint = {
-        let _ = path;
-        return Err(HostError::Unsupported {
-            subject: "containment worker",
-        });
-    };
+    let endpoint = socket_endpoint(&path)?;
     let mut opts = OpenOptions::new(HostConfig::new(endpoint));
     if let Some(bin) = std::env::var_os("FL_HOST_SUPERVISOR") {
         opts.supervisor_bin = PathBuf::from(bin);
@@ -183,12 +173,22 @@ pub fn containment_worker() -> Result<(), HostError> {
     host.shutdown()
 }
 
-#[cfg(windows)]
-fn worker_endpoint(path: &str) -> Result<HostEndpoint, HostError> {
-    let sid = survivor_registry::current_sid_string()?;
+/// Parse the same endpoint syntax for daemon and containment worker.
+pub fn socket_endpoint(path: &str) -> Result<HostEndpoint, HostError> {
+    #[cfg(windows)]
+    {
+        windows_socket_endpoint(path, &survivor_registry::current_sid_string()?)
+    }
+    #[cfg(not(windows))]
+    {
+        HostEndpoint::unix(path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_socket_endpoint(path: &str, sid: &str) -> Result<HostEndpoint, HostError> {
     let prefix = format!(r"\\.\pipe\fl-host-{sid}-");
-    let suffix = path.strip_prefix(&prefix).unwrap_or(path);
-    HostEndpoint::windows(suffix, &sid)
+    HostEndpoint::windows(path.strip_prefix(&prefix).unwrap_or(path), sid)
 }
 
 fn writeln_out(text: &str) -> Result<(), HostError> {
@@ -1155,6 +1155,41 @@ mod deadline_tests {
         );
     }
 
+    #[test]
+    fn replacement_releases_old_writer_before_host_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = unresolved_endpoint(dir.path());
+        let host = Host::open(OpenOptions::new(HostConfig::new(endpoint))).unwrap();
+        let make = |epoch| {
+            Arc::new(Session::new(SessionParts {
+                session: SessionId::new("same").unwrap(),
+                epoch,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            }))
+        };
+        let old = make(1);
+        super::daemon::attach(&host.inner, &old);
+        let weak = Arc::downgrade(host.inner.writers.lock().unwrap().get("same").unwrap());
+        drop(old);
+        super::daemon::attach(&host.inner, &make(2));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "old writer remains alive after replacement"
+        );
+        host.shutdown().unwrap();
+    }
+
     fn unresolved_endpoint(dir: &std::path::Path) -> HostEndpoint {
         #[cfg(unix)]
         {
@@ -1173,5 +1208,31 @@ mod deadline_tests {
         {
             HostEndpoint::unix(dir.join("h.sock")).expect("endpoint")
         }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    #[test]
+    fn windows_full_pipe_name_and_suffix_resolve_identically() {
+        let sid = "S-1-5-21-123";
+        let full = format!(r"\\.\pipe\fl-host-{sid}-example");
+        let endpoint = super::windows_socket_endpoint(&full, sid).unwrap();
+        assert_eq!(
+            endpoint.socket_path(),
+            super::windows_socket_endpoint("example", sid)
+                .unwrap()
+                .socket_path()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_socket_path_is_unix_endpoint() {
+        let endpoint = super::socket_endpoint("/tmp/host-test.sock").unwrap();
+        assert_eq!(
+            endpoint.socket_path(),
+            std::path::Path::new("/tmp/host-test.sock")
+        );
     }
 }

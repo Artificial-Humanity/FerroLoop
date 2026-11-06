@@ -49,6 +49,7 @@ enum Body {
 struct Track {
     holders: usize,
     completes: usize,
+    retired: bool,
     delivered: HashSet<u64>,
 }
 
@@ -252,7 +253,7 @@ fn assign(sub: &mut Sub, event: &Arc<Logical>, preexisting: bool) -> Assign {
         return Assign::Skip;
     }
     let mut track = event.track.lock().unwrap_or_else(|err| err.into_inner());
-    if !track.delivered.insert(sub.id) {
+    if track.retired || !track.delivered.insert(sub.id) {
         return Assign::Skip;
     }
     let bytes = event.raw_len.saturating_add(event.envelope);
@@ -303,7 +304,7 @@ fn prime_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
             continue;
         }
         let track = event.track.lock().unwrap_or_else(|err| err.into_inner());
-        if track.completes == 0 && !track.delivered.contains(&sub.id) {
+        if !track.retired && track.completes == 0 && !track.delivered.contains(&sub.id) {
             start = event.seq;
         }
     }
@@ -370,8 +371,12 @@ fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> b
     let preexisting = event.index < sub.subscribed_at;
     match assign(sub, event, preexisting) {
         Assign::Queued => {
-            if let Some(parked) = sub.ahead.get_mut(key) {
-                parked.remove(&cursor);
+            if let Some(event) = sub
+                .ahead
+                .get_mut(key)
+                .and_then(|parked| parked.remove(&cursor))
+            {
+                settle_locked(&event, false);
             }
             let Some(next) = cursor.checked_add(1) else {
                 return false;
@@ -391,8 +396,12 @@ fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> b
                 .delivered
                 .contains(&sub.id);
             if already {
-                if let Some(parked) = sub.ahead.get_mut(key) {
-                    parked.remove(&cursor);
+                if let Some(event) = sub
+                    .ahead
+                    .get_mut(key)
+                    .and_then(|parked| parked.remove(&cursor))
+                {
+                    settle_locked(&event, false);
                 }
                 let Some(next) = cursor.checked_add(1) else {
                     return false;
@@ -415,11 +424,15 @@ fn park_ahead(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>]) {
         if event.session != key.0 || event.epoch != key.1 || event.seq < cursor {
             continue;
         }
-        sub.ahead
-            .entry(key.clone())
-            .or_default()
-            .entry(event.seq)
-            .or_insert_with(|| Arc::clone(event));
+        if let std::collections::btree_map::Entry::Vacant(slot) =
+            sub.ahead.entry(key.clone()).or_default().entry(event.seq)
+        {
+            let mut track = event.track.lock().unwrap_or_else(|err| err.into_inner());
+            if !track.retired {
+                track.holders = track.holders.saturating_add(1);
+                slot.insert(Arc::clone(event));
+            }
+        }
     }
 }
 
@@ -432,11 +445,15 @@ fn take_sub(fanout: &mut Fanout, id: u64) -> Vec<Arc<Logical>> {
     }
     sub.dropped = true;
     sub.slow = true;
-    sub.ahead.clear();
+    let parked = std::mem::take(&mut sub.ahead);
     if let Some(kill) = sub.kill.take() {
         kill.trip();
     }
-    let mut events: Vec<_> = sub.queue.drain(..).collect();
+    let mut events: Vec<_> = parked
+        .into_values()
+        .flat_map(|events| events.into_values())
+        .collect();
+    events.extend(sub.queue.drain(..));
     sub.queued_bytes = 0;
     events.extend(sub.terminals.drain().map(|(_, event)| event));
     sub.wake.notify_all();
@@ -444,13 +461,28 @@ fn take_sub(fanout: &mut Fanout, id: u64) -> Vec<Arc<Logical>> {
 }
 
 fn settle(event: &Logical, wrote: bool) {
+    // Serialize retirement with admission, which can park references from a
+    // snapshot. Otherwise a completed event can be reaped just as that snapshot
+    // adds a new parked holder.
+    if let Some(hub) = event.hub.upgrade() {
+        let _fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        settle_locked(event, wrote);
+    }
+}
+
+// The caller holds the fanout lock.
+fn settle_locked(event: &Logical, wrote: bool) {
     let release = {
         let mut track = event.track.lock().unwrap_or_else(|err| err.into_inner());
         if wrote {
             track.completes = track.completes.saturating_add(1);
         }
         track.holders = track.holders.saturating_sub(1);
-        track.holders == 0 && track.completes > 0
+        let release = track.holders == 0 && track.completes > 0;
+        if release {
+            track.retired = true;
+        }
+        release
     };
     if release && let Some(hub) = event.hub.upgrade() {
         for output in hub.live_sessions() {
@@ -552,6 +584,7 @@ impl OutputSession {
             track: Mutex::new(Track {
                 holders: 0,
                 completes: 0,
+                retired: false,
                 delivered: HashSet::new(),
             }),
             hub: Arc::downgrade(&self.hub),
@@ -1085,5 +1118,90 @@ fn wait_hold(dir: &std::path::Path, phase: &str, mut dropped: impl FnMut() -> bo
 impl Sub {
     fn wants_key(&self, key: &StreamKey) -> bool {
         self.filter.as_ref().is_none_or(|filter| filter == &key.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionParts;
+
+    #[test]
+    fn parked_events_remain_charged_until_subscriber_drops() {
+        let hub = Arc::new(Hub::new());
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("parked").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        let output = OutputSession::open(session, Arc::clone(&hub));
+        let slow = hub.subscribe(None, None).ok().unwrap();
+        let fast = hub.subscribe(None, None).ok().unwrap();
+        let key = ("parked".to_owned(), 1);
+        let mut snapshot = Vec::new();
+        for seq in 2..10 {
+            let size = MAX_STDOUT_BACKLOG / 8 - 64;
+            let event = Arc::new(Logical {
+                index: seq,
+                seq,
+                epoch: 1,
+                raw_len: size,
+                envelope: 64,
+                session: key.0.clone(),
+                exited: false,
+                body: Body::Line(vec![0; size]),
+                track: Mutex::new(Track {
+                    holders: 0,
+                    completes: 0,
+                    retired: false,
+                    delivered: HashSet::new(),
+                }),
+                hub: Arc::downgrade(&hub),
+            });
+            output.inner.lock().unwrap().events.push(Arc::clone(&event));
+            snapshot.push(Arc::clone(&event));
+            {
+                let mut fanout = hub.fanout.lock().unwrap();
+                let s = fanout.subs.iter_mut().find(|s| s.id == slow.id).unwrap();
+                s.cursors.insert(key.clone(), 1);
+                park_ahead(s, &key, &[Arc::clone(&event)]);
+                let f = fanout.subs.iter_mut().find(|s| s.id == fast.id).unwrap();
+                assert!(matches!(assign(f, &event, false), Assign::Queued));
+                f.queue.pop_front();
+                f.queued_bytes = 0;
+            }
+            settle(&event, true);
+        }
+        assert_eq!(
+            OutputSession::charge(&output.inner.lock().unwrap()).charge,
+            MAX_STDOUT_BACKLOG
+        );
+        assert_eq!(output.space(), 0, "parked bytes must stop further reads");
+        slow.abandon(&hub);
+        assert_eq!(
+            OutputSession::charge(&output.inner.lock().unwrap()).charge,
+            0
+        );
+        {
+            let mut fanout = hub.fanout.lock().unwrap();
+            let fast_sub = fanout.subs.iter_mut().find(|s| s.id == fast.id).unwrap();
+            fast_sub.cursors.insert(key.clone(), 1);
+            park_ahead(fast_sub, &key, &snapshot);
+            assert!(
+                fast_sub
+                    .ahead
+                    .get(&key)
+                    .is_none_or(|parked| parked.is_empty()),
+                "a stale snapshot must not re-park retired events"
+            );
+        }
+        fast.abandon(&hub);
     }
 }
