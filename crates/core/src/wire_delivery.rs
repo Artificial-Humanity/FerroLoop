@@ -592,6 +592,13 @@ fn valid_record(record: &DeliveryRecord, key: &DeliveryKey) -> bool {
         && record.binding.recipient_id == key.recipient_id
         && record.attempts.len() <= 3
         && usize::from(record.prepares) == record.attempts.len()
+        && (record.eligibility != Eligibility::Prepared
+            || record.attempts.last().is_some_and(|attempt| {
+                attempt.armed_at.is_none()
+                    && attempt.frozen.is_none()
+                    && attempt.evidence.is_none()
+                    && attempt.capacity == CapacityState::Held
+            }))
         && record
             .attempts
             .iter()
@@ -764,18 +771,17 @@ fn bounded_summary(attempt: &AttemptSummary) -> Result<bool, StoreError> {
             .is_none_or(|s| s.len() <= 4096))
 }
 
-// Leave fixed room for the full annotation and safety flags. Frozen bytes are
-// separately bounded; their metadata is part of the compact row limit.
+// Count the real annotation, including JSON escaping, and reserve future evidence,
+// detail and safety flags. Frozen bytes have a separate bound; their metadata counts.
 fn bounded_record(record: &DeliveryRecord) -> Result<bool, StoreError> {
     let mut compact = record.clone();
-    compact.annotation.clear();
     for attempt in &mut compact.attempts {
         *attempt = summary_reservation(attempt);
     }
     Ok(serde_json::to_vec(&compact)
         .map_err(|e| StoreError::Backend(e.to_string()))?
         .len()
-        <= 32_768 - 4096 - 1024)
+        <= 32_768 - 1024)
 }
 
 fn release_capacity(
@@ -1278,7 +1284,9 @@ pub fn transition(
             }
             record.acknowledgment.manual_at = Some(input.at.clone());
             if record.eligibility == Eligibility::Prepared {
-                let index = record.attempts.len() - 1;
+                let Some(index) = record.attempts.len().checked_sub(1) else {
+                    return Ok(refused(HoldReason::Corrupt));
+                };
                 capacity_changed = release_capacity(
                     &mut record,
                     index,
@@ -1300,7 +1308,9 @@ pub fn transition(
             if record.revision != revision || record.eligibility != Eligibility::Prepared {
                 return Ok(refused(HoldReason::Corrupt));
             }
-            let index = record.attempts.len() - 1;
+            let Some(index) = record.attempts.len().checked_sub(1) else {
+                return Ok(refused(HoldReason::Corrupt));
+            };
             // The trusted store may invalidate a disconnected unarmed worker before expiry too.
             let _ = now;
             capacity_changed = release_capacity(
@@ -1319,10 +1329,24 @@ pub fn transition(
             record.held = (record.prepares >= 3).then_some(HoldReason::BudgetExhausted);
         }
         DeliveryCommand::Annotate { text, .. } => {
-            if record.annotation.len().saturating_add(text.len()) > 4096 {
+            let annotation_len = record.annotation.len();
+            let overflow = if annotation_len.saturating_add(text.len()) > 4096 {
+                true
+            } else {
+                record.annotation.push_str(&text);
+                if bounded_record(&record)? {
+                    false
+                } else {
+                    record.annotation.truncate(annotation_len);
+                    true
+                }
+            };
+            if overflow {
                 record.held = Some(HoldReason::EvidenceOverflow);
                 if record.eligibility == Eligibility::Prepared {
-                    let index = record.attempts.len() - 1;
+                    let Some(index) = record.attempts.len().checked_sub(1) else {
+                        return Ok(refused(HoldReason::Corrupt));
+                    };
                     capacity_changed = release_capacity(
                         &mut record,
                         index,
@@ -1333,13 +1357,13 @@ pub fn transition(
                     recipient_changed = capacity_changed;
                 }
                 record.eligibility = Eligibility::Held;
-            } else {
-                record.annotation.push_str(&text);
             }
         }
         DeliveryCommand::Close { .. } => {
             if record.eligibility == Eligibility::Prepared {
-                let index = record.attempts.len() - 1;
+                let Some(index) = record.attempts.len().checked_sub(1) else {
+                    return Ok(refused(HoldReason::Corrupt));
+                };
                 capacity_changed = release_capacity(
                     &mut record,
                     index,

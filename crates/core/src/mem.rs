@@ -4109,6 +4109,284 @@ mod managed_tests {
         assert_eq!(s.active_delivery_owners().unwrap(), vec![new_owner]);
     }
 
+    fn compact_delivery_bytes(record: &DeliveryRecord) -> usize {
+        let mut compact = record.clone();
+        for attempt in &mut compact.attempts {
+            if let Some(frozen) = &mut attempt.frozen {
+                frozen.bytes.clear();
+            }
+        }
+        serde_json::to_vec(&compact).unwrap().len()
+    }
+
+    #[test]
+    fn managed_annotation_accounts_for_json_expansion() {
+        for (text, accepted) in [
+            ("\0".repeat(4091), false),
+            ("\u{1}".repeat(4091), false),
+            ("x".repeat(4091), true),
+            ("\"".repeat(4091), true),
+            ("\\".repeat(4091), true),
+            ("😀".repeat(1022), true),
+        ] {
+            let s = MemStore::default();
+            install(&s);
+            let mut input = base_input();
+            input.route.thread_id = "t".repeat(2000);
+            input.route.executable = Some("e".repeat(2000));
+            for token in 0..3 {
+                input.attempt.token = PhaseToken([token; 32]);
+                let p = prepare(&s, &input);
+                assert!(matches!(
+                    s.apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                        key: input.key.clone(),
+                        revision: p.revision,
+                        attempt: input.attempt.clone(),
+                        proof: DeliveryEvidence::PreMutationRefused,
+                        now: At::from_unix_millis(2100),
+                    }))
+                    .unwrap(),
+                    DeliveryResult::Applied { .. }
+                ));
+            }
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: "prior".into(),
+            })
+            .unwrap();
+            ack(&s, &input, 4000);
+            let before = view(&s, &input);
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: text.clone(),
+            })
+            .unwrap();
+            let after = view(&s, &input);
+            let row = s.inner.borrow().delivery.records[&input.key].clone();
+            assert!(compact_delivery_bytes(&row) <= 32_768);
+            assert_eq!(
+                after.annotation,
+                if accepted {
+                    format!("prior{text}")
+                } else {
+                    "prior".into()
+                }
+            );
+            assert_eq!(after.attempts, before.attempts);
+            assert_eq!(after.prepares, before.prepares);
+            assert_eq!(after.acknowledgment, before.acknowledgment);
+            assert_eq!(after.barrier, before.barrier);
+            if !accepted {
+                assert_eq!(after.eligibility, Eligibility::Held);
+                assert_eq!(after.held, Some(HoldReason::EvidenceOverflow));
+            }
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn managed_escaped_annotation_uses_remaining_row_capacity() {
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        prepare(&s, &input);
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "\0".repeat(4096),
+        })
+        .unwrap();
+        assert_eq!(view(&s, &input).annotation.len(), 4096);
+        assert_eq!(view(&s, &input).eligibility, Eligibility::Prepared);
+        assert!(compact_delivery_bytes(&s.inner.borrow().delivery.records[&input.key]) <= 32_768);
+        // Raw UTF-8 bytes remain independently bounded even with row space left.
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "é".into(),
+        })
+        .unwrap();
+        let v = view(&s, &input);
+        assert_eq!(v.annotation, "\0".repeat(4096));
+        assert_eq!(v.held, Some(HoldReason::EvidenceOverflow));
+        assert_eq!(v.eligibility, Eligibility::Held);
+        assert!(s.active_delivery_owners().unwrap().is_empty());
+        ack(&s, &input, 4000);
+        assert!(view(&s, &input).acknowledgment.manual_at.is_some());
+        assert!(s.active_delivery_owners().unwrap().is_empty());
+    }
+
+    #[test]
+    fn managed_annotation_overflow_preserves_armed_safety_operations() {
+        for retire in [false, true] {
+            let s = MemStore::default();
+            install(&s);
+            let mut input = base_input();
+            input.route.thread_id = "t".repeat(2000);
+            input.route.executable = Some("e".repeat(2000));
+            for token in 0..2 {
+                input.attempt.token = PhaseToken([token; 32]);
+                let p = prepare(&s, &input);
+                s.apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                    key: input.key.clone(),
+                    revision: p.revision,
+                    attempt: input.attempt.clone(),
+                    proof: DeliveryEvidence::PreMutationRefused,
+                    now: At::from_unix_millis(2100),
+                }))
+                .unwrap();
+            }
+            input.attempt.token = PhaseToken([2; 32]);
+            armed(&s, &input);
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: "prior".into(),
+            })
+            .unwrap();
+            let before = view(&s, &input);
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: "\0".repeat(4091),
+            })
+            .unwrap();
+            let overflow = view(&s, &input);
+            assert_eq!(overflow.held, Some(HoldReason::EvidenceOverflow));
+            assert_eq!(overflow.eligibility, Eligibility::Held);
+            assert_eq!(overflow.annotation, before.annotation);
+            assert_eq!(overflow.attempts, before.attempts);
+            assert_eq!(overflow.acknowledgment, before.acknowledgment);
+            assert_eq!(overflow.prepares, before.prepares);
+            assert_eq!(overflow.barrier, before.barrier);
+            assert_eq!(s.active_delivery_owners().unwrap().len(), 1);
+            ack(&s, &input, 4000);
+            assert_eq!(s.active_delivery_owners().unwrap().len(), 1);
+            let retirement = target(&s, &input);
+            if retire {
+                end_scope(&s, &input);
+                assert!(matches!(
+                    s.retire_orphan_capacity(retirement.clone()).unwrap(),
+                    CapacityRetirementResult::Retired { .. }
+                ));
+            }
+            settle(&s, &input, DeliveryEvidence::VendorQueued);
+            let settled = view(&s, &input);
+            assert_eq!(
+                settled.attempts[2].evidence,
+                Some(DeliveryEvidence::VendorQueued)
+            );
+            assert_eq!(
+                settled.attempts[2].capacity,
+                if retire {
+                    CapacityState::Retired
+                } else {
+                    CapacityState::Released
+                }
+            );
+            assert!(settled.acknowledgment.manual_at.is_some());
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+            assert!(
+                compact_delivery_bytes(&s.inner.borrow().delivery.records[&input.key]) <= 32_768
+            );
+            settle(&s, &input, DeliveryEvidence::VendorQueued);
+            assert_eq!(view(&s, &input), settled);
+            end_scope(&s, &input);
+            assert!(matches!(
+                s.retire_orphan_capacity(retirement).unwrap(),
+                CapacityRetirementResult::AlreadyReleased { .. }
+            ));
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+            if retire {
+                assert_eq!(settled.eligibility, overflow.eligibility);
+                assert_eq!(settled.held, overflow.held);
+                assert_eq!(settled.barrier, overflow.barrier);
+            }
+            assert!(matches!(
+                s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                    .unwrap(),
+                DeliveryResult::Refused { .. }
+            ));
+        }
+    }
+
+    fn malformed_prepared_command(case: usize) {
+        for corruption in 0..5 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            let p = prepare(&s, &input);
+            {
+                let mut inner = s.inner.borrow_mut();
+                let record = inner.delivery.records.get_mut(&input.key).unwrap();
+                match corruption {
+                    0 => {
+                        record.attempts.clear();
+                        record.prepares = 0;
+                    }
+                    1 => record.attempts[0].armed_at = Some(At::from_unix_millis(2001)),
+                    2 => record.attempts[0].frozen = Some(arm_input(&input, p.revision).frozen),
+                    3 => record.attempts[0].evidence = Some(DeliveryEvidence::PreMutationRefused),
+                    4 => record.attempts[0].capacity = CapacityState::Released,
+                    _ => unreachable!(),
+                }
+            }
+            let command = match case {
+                0 => DeliveryCommand::ManualAck(ManualAckInput {
+                    key: input.key.clone(),
+                    at: At::from_unix_millis(4000),
+                }),
+                1 => DeliveryCommand::InvalidatePrepared {
+                    key: input.key.clone(),
+                    revision: p.revision,
+                    now: At::from_unix_millis(4000),
+                },
+                2 => DeliveryCommand::Annotate {
+                    key: input.key.clone(),
+                    text: "x".repeat(4097),
+                },
+                3 => DeliveryCommand::Close {
+                    key: input.key.clone(),
+                },
+                _ => unreachable!(),
+            };
+            let before = s
+                .inner
+                .borrow_mut()
+                .delivery_context(&command)
+                .unwrap()
+                .unwrap();
+            s.inner.borrow_mut().delivery.access = DeliveryAccess::default();
+            assert_eq!(
+                s.apply_delivery(command.clone()).unwrap(),
+                DeliveryResult::Refused {
+                    reason: HoldReason::Corrupt
+                }
+            );
+            assert!(s.inner.borrow().delivery.access.writes.is_empty());
+            let after = s
+                .inner
+                .borrow_mut()
+                .delivery_context(&command)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn managed_malformed_prepared_ack_refuses_without_writes() {
+        malformed_prepared_command(0);
+    }
+    #[test]
+    fn managed_malformed_prepared_invalidation_refuses_without_writes() {
+        malformed_prepared_command(1);
+    }
+    #[test]
+    fn managed_malformed_prepared_annotation_refuses_without_writes() {
+        malformed_prepared_command(2);
+    }
+    #[test]
+    fn managed_malformed_prepared_close_refuses_without_writes() {
+        malformed_prepared_command(3);
+    }
+
     #[test]
     fn managed_bounds_and_overflow_do_not_reopen_or_block_safety_flags() {
         for bytes in [1_048_576 + 15, 1_048_576 + 14] {
