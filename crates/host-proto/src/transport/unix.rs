@@ -683,6 +683,7 @@ pub fn peer_uid_fd(fd: RawFd) -> Result<u32, HostError> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn interpret_ucred(bytes: &[u8]) -> Result<u32, HostError> {
     let size = std::mem::size_of::<libc::ucred>();
     if bytes.len() != size {

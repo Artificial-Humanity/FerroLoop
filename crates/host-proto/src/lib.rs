@@ -22,7 +22,7 @@ pub use frame::{
     checked_unauth_len, decode_request, encode_request, fragment_line, frame_total_len,
     line_fragment, read_frame, write_frame,
 };
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use transport::interpret_ucred;
 pub use transport::{HostConn, HostListener, ShutdownSwitch, TokenControl};
 pub use types::{

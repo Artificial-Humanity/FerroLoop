@@ -111,7 +111,7 @@ fn client_refuses_foreign_uid_server() {
         validate_unix_peer(PeerQuery::Unsupported, 0),
         Err(HostError::PeerIdentityUnavailable)
     ));
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         assert!(fl_host_proto::interpret_ucred(&[0, 1, 2, 3]).is_err());
         let mut cred = vec![0u8; std::mem::size_of::<libc::ucred>()];

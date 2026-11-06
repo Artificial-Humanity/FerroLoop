@@ -111,14 +111,12 @@ fn truncated_event_never_becomes_a_line() {
     assert!(big.len() > 1);
     let mut reassembler = LineReassembler::new();
     assert!(reassembler.push_frame(&big[0]).unwrap().is_none());
-    assert!(reassembler.completed().is_none());
     // The unfinished bytes are not a Line, even if a later control frame arrives.
     let partial = Frame {
         kind: FrameKind::Request,
         payload: br#"{"op":"list","id":1}"#.to_vec(),
     };
     assert!(reassembler.push_frame(&partial).is_err());
-    assert!(reassembler.completed().is_none());
 }
 
 #[test]
@@ -152,10 +150,8 @@ fn interleaved_fragment_chains_refused() {
     let err = reassembler.push_frame(&other[0]).unwrap_err();
     assert!(matches!(err, HostError::Protocol(_)), "{err}");
     assert_eq!(reassembler.allocated(), before);
-    assert!(reassembler.completed().is_none());
     let different_seq = fragment_line(&session("alpha"), SessionEpoch(1), 2, b"x").unwrap();
     assert!(reassembler.push_frame(&different_seq[0]).is_err());
-    assert!(reassembler.completed().is_none());
 }
 
 #[test]
@@ -182,7 +178,6 @@ fn reassembly_cap_checked_before_append() {
         "{err}"
     );
     assert_eq!(reassembler.allocated(), before);
-    assert!(reassembler.completed().is_none());
 }
 
 #[test]
@@ -216,7 +211,6 @@ fn fragment_count_and_connection_allocation_are_bounded() {
     ));
     assert_eq!(reassembler.allocated(), before);
     assert_eq!(reassembler.fragment_count(), fit);
-    assert!(reassembler.completed().is_none());
 }
 
 #[test]
@@ -241,7 +235,7 @@ fn event_envelope_one_over_is_refused_before_append() {
     assert_eq!(
         before,
         fit + fit * LINE_HEADER_LEN,
-        "one raw byte per fragment plus its header"
+        "exact raw capacity plus fragment headers"
     );
     let one_over =
         fl_host_proto::line_fragment(&session("env"), SessionEpoch(1), 1, false, b"X").unwrap();
@@ -249,7 +243,6 @@ fn event_envelope_one_over_is_refused_before_append() {
     assert!(matches!(err, HostError::EventTooLarge), "{err}");
     assert_eq!(reassembler.allocated(), before);
     assert_eq!(reassembler.fragment_count(), fit);
-    assert!(reassembler.completed().is_none());
 }
 
 #[test]
@@ -277,7 +270,6 @@ fn control_fragmentation_refused() {
     let before = reassembler.allocated();
     assert!(reassembler.push_frame(&partial).is_err());
     assert_eq!(reassembler.allocated(), before);
-    assert!(reassembler.completed().is_none());
 }
 
 #[test]
@@ -624,4 +616,38 @@ fn cwd_len(len: usize) -> SpawnSpec {
     let mut spec = base_spec(1, 1, 0, 1, 0);
     spec.cwd = PathBuf::from("c".repeat(len));
     spec
+}
+
+#[test]
+fn wire_session_ids_are_validated_before_request_admission() {
+    let original = HostRequest::Spawn {
+        id: RequestId(1),
+        spec: base_spec(1, 1, 1, 1, 1),
+    };
+    let value = serde_json::to_value(&original).unwrap();
+    for name in [
+        String::new(),
+        "a".repeat(65),
+        "bad/name".into(),
+        "é".into(),
+        "é".repeat(33),
+    ] {
+        let mut bad = value.clone();
+        bad["spec"]["session"] = serde_json::Value::String(name.clone());
+        let frame = Frame {
+            kind: FrameKind::Request,
+            payload: serde_json::to_vec(&bad).unwrap(),
+        };
+        assert!(
+            decode_request(&frame).is_err(),
+            "wire accepted {name:?}: {bad}"
+        );
+    }
+    for name in ["x".into(), "A.-_9".into(), "a".repeat(64)] {
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionId>(&json).unwrap().as_str(),
+            name
+        );
+    }
 }

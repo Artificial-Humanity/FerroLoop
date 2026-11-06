@@ -100,9 +100,16 @@ impl From<std::io::Error> for HostError {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::new(&name).map_err(serde::de::Error::custom)
+    }
+}
 
 impl SessionId {
     pub fn new(name: &str) -> Result<Self, HostError> {

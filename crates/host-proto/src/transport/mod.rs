@@ -17,7 +17,7 @@ use crate::types::{AuthToken, HostError, HostRequest, HostResponse};
 
 #[cfg(unix)]
 pub(crate) mod unix;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use unix::interpret_ucred;
 
 pub mod windows;
@@ -184,7 +184,7 @@ impl HostConn {
             let fd = match &self.io {
                 ConnIo::Unix(stream) => stream.as_raw_fd(),
             };
-            let duped = unsafe { libc::dup(fd) };
+            let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if duped < 0 {
                 return None;
             }
@@ -271,10 +271,23 @@ fn peer_half_closed(io: &ConnIo) -> bool {
         }
         false
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = io;
-        false
+        use std::os::windows::io::AsRawHandle;
+        let ConnIo::Server(pipe) = io;
+        // Peek does not consume pending bytes and does not wait for input on
+        // our byte-mode pipe. Broken/disconnected handles and query failures
+        // all close admission fail-closed, even on an otherwise idle stream.
+        unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                pipe.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+        }
     }
 }
 
@@ -640,5 +653,60 @@ async fn write_frame(
         ConnIo::Unix(stream) => auth::write_frame_async(stream, frame, deadline).await,
         #[cfg(windows)]
         ConnIo::Server(stream) => auth::write_frame_async(stream, frame, deadline).await,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod descriptor_tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_wire_session_never_counts_as_an_admitted_request() {
+        let (stream, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut conn = HostConn {
+            io: ConnIo::Unix(stream),
+            frame_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            requests: Arc::new(AtomicUsize::new(0)),
+            stream_only: false,
+            pending: Vec::new(),
+            frame_started: None,
+        };
+        let frame = crate::Frame {
+            kind: crate::FrameKind::Request,
+            payload:
+                br#"{"op":"kill","id":1,"session":"bad/name","expected_epoch":1,"lease":null}"#
+                    .to_vec(),
+        };
+        crate::auth::write_frame_async(
+            &mut peer,
+            &frame,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(conn.recv().await.is_err());
+        assert_eq!(conn.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_duplicate_is_close_on_exec() {
+        let (stream, _peer) = tokio::net::UnixStream::pair().unwrap();
+        let conn = HostConn {
+            io: ConnIo::Unix(stream),
+            frame_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            requests: Arc::new(AtomicUsize::new(0)),
+            stream_only: false,
+            pending: Vec::new(),
+            frame_started: None,
+        };
+        let switch = conn.dup_shutdown().unwrap();
+        let flags = unsafe { libc::fcntl(switch.fd.load(Ordering::SeqCst), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "shutdown duplicate leaked across exec"
+        );
     }
 }

@@ -293,7 +293,6 @@ pub struct LineReassembler {
     open: Option<OpenLine>,
     raw: Vec<u8>,
     fragments: usize,
-    completed: Option<HostEvent>,
 }
 
 impl LineReassembler {
@@ -302,7 +301,6 @@ impl LineReassembler {
             open: None,
             raw: Vec::new(),
             fragments: 0,
-            completed: None,
         }
     }
 
@@ -312,7 +310,7 @@ impl LineReassembler {
 
     pub fn allocated(&self) -> usize {
         self.raw
-            .len()
+            .capacity()
             .saturating_add(self.fragments.saturating_mul(LINE_HEADER_LEN))
     }
 
@@ -327,10 +325,9 @@ impl LineReassembler {
         self.fragments = 0;
     }
 
-    pub fn completed(&self) -> Option<&HostEvent> {
-        self.completed.as_ref()
-    }
-
+    /// Returns `Ok(None)` for an incomplete chain and transfers the sole owned
+    /// completed event with `Ok(Some(event))`. Errors produce no event; callers
+    /// discard the chain on errors or disconnect to release its storage.
     pub fn push_frame(&mut self, frame: &Frame) -> Result<Option<HostEvent>, HostError> {
         if frame.kind != FrameKind::Line {
             if self.fragments > 0 {
@@ -381,6 +378,13 @@ impl LineReassembler {
         if new_alloc > MAX_REASSEMBLY_BYTES {
             return Err(HostError::EventTooLarge);
         }
+        // Reserve only the needed payload, without Vec's amortized growth.
+        // The requested owned capacity and envelope are bounded before growth.
+        if new_raw > self.raw.capacity() {
+            self.raw
+                .try_reserve_exact(new_raw - self.raw.len())
+                .map_err(|_| HostError::EventTooLarge)?;
+        }
         if self.open.is_none() {
             self.open = Some(OpenLine {
                 session: header.session.clone(),
@@ -404,7 +408,6 @@ impl LineReassembler {
             bytes: std::mem::take(&mut self.raw),
         };
         self.fragments = 0;
-        self.completed = Some(event.clone());
         Ok(Some(event))
     }
 }
@@ -471,5 +474,56 @@ impl EventSeq {
             .checked_add(1)
             .ok_or_else(|| HostError::Protocol("event seq exhausted".into()))?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_maximum_lines_bound_owned_buffer_capacity() {
+        let session = SessionId::new("capacity").unwrap();
+        let raw = vec![b'x'; MAX_LINE_BYTES];
+        let mut lines = LineReassembler::new();
+        for seq in 1..=2 {
+            let frames = fragment_line(&session, SessionEpoch(1), seq, &raw).unwrap();
+            for (i, frame) in frames.iter().enumerate() {
+                let event = lines.push_frame(frame).unwrap();
+                let owned = lines.raw.capacity();
+                assert_eq!(lines.allocated(), owned + lines.fragments * LINE_HEADER_LEN);
+                assert!(
+                    owned + lines.fragments * LINE_HEADER_LEN <= MAX_REASSEMBLY_BYTES,
+                    "real allocation {owned} exceeds cap at fragment {i}"
+                );
+                if i + 1 == frames.len() {
+                    match event.unwrap() {
+                        HostEvent::Line {
+                            seq: got_seq,
+                            bytes,
+                            ..
+                        } => {
+                            assert_eq!(got_seq, seq);
+                            assert_eq!(bytes, raw);
+                            assert!(bytes.capacity() <= MAX_LINE_BYTES);
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                    assert_eq!(owned, 0, "completed bytes must transfer to caller");
+                } else {
+                    assert!(event.is_none());
+                }
+            }
+        }
+        let open = line_fragment(&session, SessionEpoch(1), 3, true, b"pending").unwrap();
+        lines.push_frame(&open).unwrap();
+        let wrong = line_fragment(&session, SessionEpoch(1), 4, false, b"bad").unwrap();
+        assert!(lines.push_frame(&wrong).is_err());
+        lines.discard_chain();
+        assert_eq!(lines.raw.capacity(), 0);
+        assert_eq!(lines.allocated(), 0);
+        lines.push_frame(&open).unwrap();
+        lines.discard_chain();
+        assert_eq!(lines.raw.capacity(), 0, "disconnect discards owned storage");
     }
 }

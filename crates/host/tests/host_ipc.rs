@@ -1810,3 +1810,47 @@ fn respawned_session_allows_bounded_daemon_shutdown() {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// No child is spawned and no output events are produced in this scenario.
+#[cfg(windows)]
+#[test]
+fn disconnected_idle_subscribers_release_all_windows_slots() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let endpoint = &daemon.paths.endpoint;
+    let mut subscribers = Vec::new();
+    for _ in 0..fl_host_proto::MAX_SUBSCRIBERS {
+        let mut rpc = Rpc::connect(endpoint);
+        assert!(matches!(
+            rpc.call(|id| HostRequest::Events { id, session: None })
+                .unwrap(),
+            HostResponse::Subscribed { .. }
+        ));
+        subscribers.push(rpc);
+    }
+    let mut probe = Rpc::connect(endpoint);
+    assert!(matches!(
+        probe
+            .call(|id| HostRequest::Events { id, session: None })
+            .unwrap(),
+        HostResponse::Failed { .. }
+    ));
+    subscribers.clear();
+    // Reclaim every slot, not only the first one. Refused probes stay RPC.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for _ in 0..fl_host_proto::MAX_SUBSCRIBERS {
+        loop {
+            match probe
+                .call(|id| HostRequest::Events { id, session: None })
+                .unwrap()
+            {
+                HostResponse::Subscribed { .. } => break,
+                HostResponse::Failed { .. } if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                other => panic!("idle disconnect failed to reclaim subscriber slot: {other:?}"),
+            }
+        }
+        subscribers.push(probe);
+        probe = Rpc::connect(endpoint);
+    }
+}
