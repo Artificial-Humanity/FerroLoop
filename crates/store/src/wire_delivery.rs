@@ -1919,4 +1919,76 @@ mod tests {
         ));
         assert_eq!(snapshot(&raced), snapshot_before);
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_any_store_preparatory_redb_fixture_refusal() {
+        use crate::AnyStore;
+        use crate::wire_delivery_lifetime::{
+            LocalAdmissionError, LocalLifetimeAdmissionStore, assert_preparatory_admit_refusal,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("any-fixture.redb");
+        let store = RedbStore::open(&path).unwrap();
+        install(&store, &prepare(), &fixture_message());
+        model(&store, fixture_commands().remove(0));
+        let before = snapshot(&store);
+        let view = store.inspect_delivery(&prepare().key).unwrap();
+        let owners = store.active_delivery_owners().unwrap();
+        let mut first = Some(store);
+        for _ in 0..2 {
+            let store = first
+                .take()
+                .unwrap_or_else(|| RedbStore::open(&path).unwrap());
+            assert_eq!(snapshot(&store), before);
+            let any = AnyStore::from(store);
+            let p = prepare();
+            let mut commands = fixture_commands();
+            commands.extend([
+                DeliveryCommand::Release(ReleaseInput {
+                    key: p.key.clone(),
+                    revision: Revision(1),
+                    attempt: p.attempt,
+                    proof: DeliveryEvidence::PreMutationRefused,
+                    now: p.now.clone(),
+                }),
+                DeliveryCommand::InvalidatePrepared {
+                    key: p.key.clone(),
+                    revision: Revision(1),
+                    now: p.now,
+                },
+                DeliveryCommand::Annotate {
+                    key: p.key.clone(),
+                    text: "not authority".into(),
+                },
+                DeliveryCommand::Close { key: p.key },
+            ]);
+            for command in commands {
+                let expected = if matches!(
+                    command,
+                    DeliveryCommand::Prepare(_) | DeliveryCommand::Arm(_)
+                ) {
+                    HoldReason::UnsupportedBackend
+                } else {
+                    HoldReason::Disabled
+                };
+                assert_eq!(
+                    zero(|| any.apply_delivery(command)).unwrap(),
+                    DeliveryResult::Refused { reason: expected }
+                );
+            }
+            assert_eq!(zero(|| any.inspect_delivery(&prepare().key)).unwrap(), view);
+            assert_eq!(zero(|| any.active_delivery_owners()).unwrap(), owners);
+            assert_eq!(
+                zero(|| any.retire_orphan_capacity(owners[0].clone())).unwrap(),
+                CapacityRetirementResult::Unproven
+            );
+            assert_preparatory_admit_refusal(&any, false);
+            assert!(matches!(
+                zero(|| any.close_local_lifetime(&prepare().attempt.lifetime)),
+                Err(LocalAdmissionError::Unproven)
+            ));
+            drop(any);
+            assert_eq!(snapshot(&RedbStore::open(&path).unwrap()), before);
+        }
+    }
 }

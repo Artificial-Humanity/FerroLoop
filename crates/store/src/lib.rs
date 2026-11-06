@@ -3739,3 +3739,33 @@ pub(crate) fn note_preparatory_write_attempt() {
         ));
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    static PREPARATORY_RPC: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe outbound request attempts on this thread, including failed and disconnected sends.
+#[cfg(test)]
+pub(crate) fn observe_preparatory_rpc<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PREPARATORY_RPC.set(None);
+        }
+    }
+    assert!(PREPARATORY_RPC.get().is_none(), "nested RPC observation");
+    PREPARATORY_RPC.set(Some(0));
+    let _reset = Reset;
+    let result = f();
+    (result, PREPARATORY_RPC.get().unwrap())
+}
+
+#[cfg(test)]
+pub(crate) fn note_preparatory_rpc_attempt() {
+    if let Some(count) = PREPARATORY_RPC.get() {
+        PREPARATORY_RPC.set(Some(
+            count.checked_add(1).expect("RPC observation overflow"),
+        ));
+    }
+}

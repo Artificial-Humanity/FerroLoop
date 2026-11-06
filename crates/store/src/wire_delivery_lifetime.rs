@@ -110,9 +110,12 @@ mod tests {
         store: &S,
         remote: bool,
     ) {
-        let (result, attempts) = observe_preparatory_writes(|| {
-            store.admit_local_lifetime(LocalAdmissionInput { _private: () })
+        let ((result, rpc), attempts) = observe_preparatory_writes(|| {
+            crate::observe_preparatory_rpc(|| {
+                store.admit_local_lifetime(LocalAdmissionInput { _private: () })
+            })
         });
+        assert_eq!(rpc, 0);
         assert_eq!(attempts, 0);
         assert!(if remote {
             matches!(result, Err(LocalAdmissionError::UnsupportedBackend))
@@ -169,5 +172,69 @@ mod tests {
         drop(store);
         let store = RedbStore::open(&dir.path().join("test.redb")).unwrap();
         assert_preparatory_admit_refusal(&store, false);
+    }
+    #[test]
+    fn managed_local_admission_preparatory_ferro_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facade.fls");
+        assert_preparatory_admit_refusal(&crate::FerroStore::in_memory(), false);
+        assert_preparatory_admit_refusal(&crate::FerroStore::open(&path).unwrap(), false);
+        assert_preparatory_admit_refusal(&crate::FerroStore::open(&path).unwrap(), false);
+    }
+    #[test]
+    fn managed_local_admission_preparatory_any_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_preparatory_admit_refusal(
+            &crate::AnyStore::from(crate::FerroStore::in_memory()),
+            false,
+        );
+        assert_preparatory_admit_refusal(
+            &crate::AnyStore::from(crate::FerroStore::open(dir.path().join("facade.fls")).unwrap()),
+            false,
+        );
+        assert_preparatory_admit_refusal(
+            &crate::AnyStore::from(RedbStore::open(&dir.path().join("facade.redb")).unwrap()),
+            false,
+        );
+    }
+    #[test]
+    fn managed_local_admission_preparatory_remote_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        for tcp in [false, true] {
+            let mut server = if tcp {
+                crate::FerroStoreServer::bind_tcp(
+                    "127.0.0.1:0",
+                    crate::FerroStore::in_memory(),
+                    crate::ServerAuth::new()
+                        .with_psk("fixture", &[71; 32])
+                        .unwrap(),
+                )
+                .unwrap()
+            } else {
+                crate::FerroStoreServer::bind_unix(
+                    dir.path().join("facade.sock"),
+                    crate::FerroStore::in_memory(),
+                )
+                .unwrap()
+            };
+            let client = if tcp {
+                crate::FerroStore::connect_with(
+                    &format!("ws://{}", server.local_addr()),
+                    &crate::ConnectOptions::psk("fixture", vec![71; 32]),
+                )
+                .unwrap()
+            } else {
+                crate::FerroStore::connect_uri(&format!(
+                    "unix://{}",
+                    dir.path().join("facade.sock").display()
+                ))
+                .unwrap()
+            };
+            assert_preparatory_admit_refusal(&client, true);
+            let any = crate::AnyStore::from(client);
+            assert_preparatory_admit_refusal(&any, true);
+            server.shutdown().unwrap();
+            assert_preparatory_admit_refusal(&any, true);
+        }
     }
 }

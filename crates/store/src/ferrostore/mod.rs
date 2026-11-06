@@ -25,6 +25,7 @@ mod tls;
 mod traits_catalog;
 mod traits_state;
 mod traits_wire;
+mod traits_wire_delivery;
 mod traits_workflow;
 mod transaction;
 mod vector;
@@ -3549,6 +3550,8 @@ impl FerroStore {
         self.refuse_reentry()?;
         match &self.inner {
             Inner::Memory(slot) => {
+                #[cfg(test)]
+                crate::note_preparatory_write_attempt();
                 let registered = {
                     let _gate = lock_mutex(&self.commit_gate);
                     let committed = {
@@ -3572,6 +3575,8 @@ impl FerroStore {
                 Ok(true)
             }
             Inner::Disk(disk) => {
+                #[cfg(test)]
+                crate::note_preparatory_write_attempt();
                 // The expected sequence is checked against the group's
                 // running state at this member's turn (spec §4.3).
                 let (outcome, _) = self.group_write(disk, silent, |state| {
@@ -3660,6 +3665,8 @@ impl FerroStore {
         silent: bool,
         mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
     ) -> Result<(T, Option<u64>), StoreError> {
+        #[cfg(test)]
+        crate::note_preparatory_write_attempt();
         match &self.inner {
             Inner::Remote(_) => Err(backend(
                 "a remote FerroStore cannot run a write body in this process",
@@ -3882,6 +3889,8 @@ impl FerroStore {
                 Err(self.remote_conflict())
             }
             Inner::Memory(slot) => {
+                #[cfg(test)]
+                crate::note_preparatory_write_attempt();
                 let (extra, registered) = {
                     let _gate = lock_mutex(&self.commit_gate);
                     let (extra, committed) = {
@@ -3902,6 +3911,8 @@ impl FerroStore {
                 Ok(extra)
             }
             Inner::Disk(disk) => {
+                #[cfg(test)]
+                crate::note_preparatory_write_attempt();
                 let (extra, _) = self.group_write(disk, silent, |state| {
                     let (op, extra) = build()?;
                     let (overlay, _) = stage_ops(&state, std::slice::from_ref(&op))?;
