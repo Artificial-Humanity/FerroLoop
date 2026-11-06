@@ -201,6 +201,51 @@ fn controls(reader: &impl Reader) -> Result<GlobalControl, StoreError> {
     }
     global(reader)
 }
+// Validate persisted sizes, not the writer's larger reservation for future evidence.
+// Frozen bytes have their own limit; their metadata still counts in compact JSON.
+fn validate_record_bounds(record: &DeliveryRecord) -> Result<(), StoreError> {
+    if record.annotation.len() > 4096
+        || record.key.original_id.as_str().len() > 4096
+        || record.key.recipient_id.as_str().len() > 4096
+        || record.binding.authority_id.len() > 4096
+    {
+        return Err(decode("oversized managed record field"));
+    }
+    let mut compact = record.clone();
+    for attempt in &mut compact.attempts {
+        if attempt.detail.chars().count() > 300
+            || attempt.route.thread_id.len() > 4096
+            || attempt
+                .route
+                .executable
+                .as_ref()
+                .is_some_and(|s| s.len() > 4096)
+            || matches!(&attempt.evidence, Some(DeliveryEvidence::AppServerAccepted { thread, turn })
+                if thread.len() > 4096 || turn.len() > 4096)
+        {
+            return Err(decode("oversized managed evidence field"));
+        }
+        if let Some(frozen) = &mut attempt.frozen {
+            if frozen.bytes.len() > 1_048_576 + 14
+                || frozen.renderer.len() > 4096
+                || frozen
+                    .expected_turn
+                    .as_ref()
+                    .is_some_and(|s| s.len() > 4096)
+            {
+                return Err(decode("oversized managed frozen payload"));
+            }
+            frozen.bytes.clear();
+        }
+        if serde_json::to_vec(attempt).map_err(decode)?.len() > 8192 {
+            return Err(decode("oversized managed evidence summary"));
+        }
+    }
+    if serde_json::to_vec(&compact).map_err(decode)?.len() > 32_768 {
+        return Err(decode("oversized managed compact record"));
+    }
+    Ok(())
+}
 fn read_record(
     reader: &impl Reader,
     key: &DeliveryKey,
@@ -212,7 +257,6 @@ fn read_record(
             || r.binding.recipient_id != key.recipient_id
             || r.attempts.len() > 3
             || usize::from(r.prepares) != r.attempts.len()
-            || r.annotation.len() > 4096
             || r.attempts
                 .iter()
                 .filter(|a| a.capacity == CapacityState::Held)
@@ -228,6 +272,9 @@ fn read_record(
                 }))
     }) {
         return Err(decode("invalid managed record"));
+    }
+    if let Some(record) = &record {
+        validate_record_bounds(record)?;
     }
     Ok(record)
 }
@@ -867,6 +914,188 @@ mod tests {
     fn managed_preparatory_fixture_boundary() {
         managed_redb_preparatory_public_refusal();
     }
+    #[test]
+    fn managed_redb_preparatory_inspection_evidence_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounds.redb");
+        let mut store = RedbStore::open(&path).unwrap();
+        install(&store, &prepare(), &fixture_message());
+        model(&store, fixture_commands().remove(0));
+        model(&store, fixture_commands().remove(1));
+        let key = prepare().key;
+        let tx = store.db.begin_read().unwrap();
+        let good: DeliveryRecord = get(&tx, LEDGER, &ledger_key(&key)).unwrap().unwrap();
+        drop(tx);
+        let compact = |record: &DeliveryRecord| {
+            let mut record = record.clone();
+            for attempt in &mut record.attempts {
+                if let Some(frozen) = &mut attempt.frozen {
+                    frozen.bytes.clear();
+                }
+            }
+            record
+        };
+        let mut corruptions = Vec::new();
+        let mut add = |name, corrupt: fn(&mut DeliveryRecord)| {
+            let mut record = good.clone();
+            corrupt(&mut record);
+            corruptions.push((name, record));
+        };
+        add("oversized detail", |r| {
+            r.attempts[0].detail = "d".repeat(9 * 1024)
+        });
+        add("detail character count", |r| {
+            r.attempts[0].detail = "🦀".repeat(301)
+        });
+        add("frozen bytes", |r| {
+            r.attempts[0].frozen.as_mut().unwrap().bytes = vec![0; 1_048_576 + 15];
+        });
+        add("route thread", |r| {
+            r.attempts[0].route.thread_id = "t".repeat(4097)
+        });
+        add("route executable", |r| {
+            r.attempts[0].route.executable = Some("e".repeat(4097))
+        });
+        add("expected turn", |r| {
+            r.attempts[0].frozen.as_mut().unwrap().expected_turn = Some("t".repeat(4097));
+        });
+        add("acceptance thread", |r| {
+            r.attempts[0].evidence = Some(DeliveryEvidence::AppServerAccepted {
+                thread: "t".repeat(4097),
+                turn: "turn".into(),
+            });
+        });
+        add("acceptance turn", |r| {
+            r.attempts[0].evidence = Some(DeliveryEvidence::AppServerAccepted {
+                thread: "thread".into(),
+                turn: "t".repeat(4097),
+            });
+        });
+        add("annotation bytes", |r| r.annotation = "a".repeat(4097));
+        add("escaped summary", |r| {
+            r.attempts[0].route.thread_id = "\0".repeat(4096)
+        });
+        add("escaped compact row", |r| {
+            r.annotation = "\0".repeat(4096);
+            r.attempts[0].route.executable = Some("e".repeat(4000));
+            let mut released = r.attempts[0].clone();
+            released.capacity = CapacityState::Released;
+            released.frozen = None;
+            r.attempts.extend([released.clone(), released]);
+            r.prepares = 3;
+        });
+        for (name, record) in corruptions {
+            if name == "escaped summary" {
+                let compact = compact(&record);
+                assert!(serde_json::to_vec(&compact.attempts[0]).unwrap().len() > 8192);
+                assert!(serde_json::to_vec(&compact).unwrap().len() <= 32_768);
+                assert_eq!(compact.attempts[0].route.thread_id.len(), 4096);
+            }
+            if name == "escaped compact row" {
+                let compact = compact(&record);
+                assert!(
+                    compact
+                        .attempts
+                        .iter()
+                        .all(|a| serde_json::to_vec(a).unwrap().len() <= 8192)
+                );
+                assert!(serde_json::to_vec(&compact).unwrap().len() > 32_768);
+                assert_eq!(compact.annotation.len(), 4096);
+            }
+            let tx = store.db.begin_write().unwrap();
+            put(&tx, LEDGER, &ledger_key(&key), &record);
+            tx.commit().unwrap();
+            let before = snapshot(&store);
+            for reopen in [false, true] {
+                if reopen {
+                    drop(store);
+                    store = RedbStore::open(&path).unwrap();
+                }
+                assert!(
+                    matches!(
+                        zero(|| store.inspect_delivery(&key)),
+                        Err(StoreError::Decode(_))
+                    ),
+                    "{name}: inspection accepted corrupt evidence (reopen={reopen})"
+                );
+                assert!(
+                    matches!(
+                        zero(|| store.active_delivery_owners()),
+                        Err(StoreError::Decode(_))
+                    ),
+                    "{name}: owner discovery accepted corrupt evidence (reopen={reopen})"
+                );
+                public_refusals(&store);
+                assert_eq!(snapshot(&store), before, "{name}: inspection changed rows");
+            }
+        }
+    }
+
+    #[test]
+    fn managed_redb_preparatory_inspection_valid_evidence_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid-bounds.redb");
+        let store = RedbStore::open(&path).unwrap();
+        install(&store, &prepare(), &fixture_message());
+        model(&store, fixture_commands().remove(0));
+        let key = prepare().key;
+        let annotation = "\0".repeat(4096);
+        model(
+            &store,
+            DeliveryCommand::Annotate {
+                key: key.clone(),
+                text: annotation.clone(),
+            },
+        );
+        let DeliveryCommand::Arm(mut arm) = fixture_commands().remove(1) else {
+            unreachable!()
+        };
+        arm.revision = store.inspect_delivery(&key).unwrap().unwrap().revision;
+        arm.frozen.bytes = vec![0; 1_048_576 + 14];
+        arm.frozen.digest = canonical_payload(
+            prepare().generation,
+            &arm.frozen.renderer,
+            &arm.frozen.bytes,
+        )
+        .unwrap();
+        assert!(matches!(
+            model(&store, DeliveryCommand::Arm(arm)),
+            DeliveryResult::Armed { .. }
+        ));
+        let before = snapshot(&store);
+        let view = zero(|| store.inspect_delivery(&key)).unwrap().unwrap();
+        assert_eq!(view.annotation, annotation);
+        assert_eq!(zero(|| store.active_delivery_owners()).unwrap().len(), 1);
+        assert_eq!(snapshot(&store), before);
+        drop(store);
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(
+            zero(|| store.inspect_delivery(&key)).unwrap(),
+            Some(view.clone())
+        );
+        assert_eq!(zero(|| store.active_delivery_owners()).unwrap().len(), 1);
+        assert_eq!(snapshot(&store), before);
+        let DeliveryCommand::Settle(mut settle) = fixture_commands().remove(2) else {
+            unreachable!()
+        };
+        settle.revision = view.revision;
+        settle.detail = "🦀".repeat(300);
+        assert!(matches!(
+            model(&store, DeliveryCommand::Settle(settle.clone())),
+            DeliveryResult::Applied { .. }
+        ));
+        let before = snapshot(&store);
+        let view = zero(|| store.inspect_delivery(&key)).unwrap().unwrap();
+        assert_eq!(view.attempts[0].detail, settle.detail);
+        assert!(zero(|| store.active_delivery_owners()).unwrap().is_empty());
+        assert_eq!(snapshot(&store), before);
+        drop(store);
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(zero(|| store.inspect_delivery(&key)).unwrap(), Some(view));
+        assert!(zero(|| store.active_delivery_owners()).unwrap().is_empty());
+        assert_eq!(snapshot(&store), before);
+    }
+
     #[test]
     fn managed_redb_preparatory_inspection() {
         let dir = tempfile::tempdir().unwrap();
