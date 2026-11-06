@@ -389,6 +389,7 @@ impl Worker {
         self.line().unwrap_or_default()
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     fn close_stdin(&mut self) {
         self.stdin.take();
     }
