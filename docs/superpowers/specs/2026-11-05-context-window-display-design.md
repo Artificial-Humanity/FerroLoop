@@ -1,8 +1,8 @@
 # Context window display, Phase 1 (Local Record #134)
 
 Phase 1 of the per-agent context window work. It adds no controls. It makes the window the hub
-reports correct and honest, and shows it. Phase 2 (selection for Grok and Claude) and Phase 3
-(Codex and Muse launch flags) are separate records and PRs.
+reports correct and honest, and shows it. Phase 2 (selection for Grok; Claude selection could not be
+verified on this account) and Phase 3 (Codex and Muse launch flags) are separate records and PRs.
 
 ## Problem
 

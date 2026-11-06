@@ -916,7 +916,8 @@ pub struct SpinUpRequest {
     #[serde(default)]
     pub cwd: Option<String>,
     /// The context window to give the session, in tokens. Validated against the vendor and model
-    /// ([`crate::context_window::validate_context_window`]) and recorded; Grok and Claude only.
+    /// ([`crate::context_window::validate_context_window`]) and recorded; Grok only. It is not
+    /// applied at launch yet.
     #[serde(
         default,
         deserialize_with = "deserialize_context_window",

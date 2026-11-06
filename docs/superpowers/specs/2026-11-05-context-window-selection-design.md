@@ -86,6 +86,9 @@ Antigravity: no selector exists. These vendors answer a window request with
   (the hub dispatches the text the same way as `/model`; the response says what the hub did).
 * How Grok behaves when a window smaller than the current usage is chosen (the docs say it starts
   an auto-compact).
+* Pasting `/context-window N` while Grok is mid-turn or has an autocomplete popup open (a
+  `/model <name> <N>` typed by hand needed a second Enter when the popup was open). The UI's
+  25-second wait, with its "may not have been applied" message, covers it at runtime.
 * Anything about Claude window selection, Codex and Muse flags, and Antigravity.
 
 ## Non-goals
