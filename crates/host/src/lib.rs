@@ -37,7 +37,8 @@ use survivor_registry::{load_registry, publish, registry_path};
 
 pub use child::{CleanupReport, DescendantExit};
 pub use identity::{
-    LeaderAnchor, ProcessIdentity, check_pidfd_support, process_identity, signal_anchored_group,
+    LeaderAnchor, ProcessIdentity, check_pidfd_support, process_identity,
+    set_pidfd_kill_unavailable, set_pidfd_probe_unavailable, signal_anchored_group,
 };
 pub use limits::{CLEANUP_DEADLINE, HANDOFF_TIMEOUT, STARTUP_CLEANUP_DEADLINE, TERM_GRACE};
 pub use refusal::refusal;
@@ -51,7 +52,8 @@ pub struct OpenOptions {
     pub supervisor_bin: PathBuf,
     pub crash_at: Option<CrashPoint>,
     pub recover_hold: Option<PathBuf>,
-    pub assume_no_pidfd: bool,
+    /// Test seam. Publish succeeds, then the handshake fails so abort runs at once.
+    pub fail_handshake_after_publish: bool,
     pub before_signal: Option<SignalHook>,
 }
 
@@ -62,7 +64,7 @@ impl OpenOptions {
             supervisor_bin: std::env::current_exe().unwrap_or_default(),
             crash_at: None,
             recover_hold: None,
-            assume_no_pidfd: false,
+            fail_handshake_after_publish: false,
             before_signal: None,
         }
     }
@@ -89,7 +91,7 @@ struct HostInner {
     /// Keeps the listener task polling after `bind` returns.
     runtime: tokio::runtime::Runtime,
     supervisor_bin: PathBuf,
-    assume_no_pidfd: bool,
+    fail_handshake_after_publish: bool,
     crash: Mutex<Option<CrashPoint>>,
 }
 
@@ -125,7 +127,7 @@ pub fn containment_worker() -> Result<(), HostError> {
     #[cfg(unix)]
     let endpoint = HostEndpoint::unix(path)?;
     #[cfg(windows)]
-    let endpoint = HostEndpoint::windows(&path, &survivor_registry::current_sid_string()?)?;
+    let endpoint = worker_endpoint(&path)?;
     #[cfg(not(any(unix, windows)))]
     let endpoint = {
         let _ = path;
@@ -142,9 +144,6 @@ pub fn containment_worker() -> Result<(), HostError> {
     }
     if let Some(dir) = std::env::var_os("FL_HOST_RECOVER_HOLD") {
         opts.recover_hold = Some(PathBuf::from(dir));
-    }
-    if std::env::var("FL_HOST_ASSUME_NO_PIDFD").ok().as_deref() == Some("1") {
-        opts.assume_no_pidfd = true;
     }
     let host = Host::open(opts)?;
     writeln_out("ready")?;
@@ -166,6 +165,14 @@ pub fn containment_worker() -> Result<(), HostError> {
         }
     }
     host.shutdown()
+}
+
+#[cfg(windows)]
+fn worker_endpoint(path: &str) -> Result<HostEndpoint, HostError> {
+    let sid = survivor_registry::current_sid_string()?;
+    let prefix = format!(r"\\.\pipe\fl-host-{sid}-");
+    let suffix = path.strip_prefix(&prefix).unwrap_or(path);
+    HostEndpoint::windows(suffix, &sid)
 }
 
 fn writeln_out(text: &str) -> Result<(), HostError> {
@@ -276,7 +283,7 @@ impl Host {
             .map_err(|err| HostError::Io(err.to_string()))?;
         let listener = runtime.block_on(HostListener::bind(opts.config))?;
         let endpoint = listener.endpoint().clone();
-        let path = registry_path(&endpoint);
+        let path = registry_path(&endpoint)?;
         let mut registry = load_registry(&endpoint)?;
         let deadline = Instant::now() + STARTUP_CLEANUP_DEADLINE;
         if let Err(err) = recover(
@@ -300,7 +307,7 @@ impl Host {
                 listener: Mutex::new(Some(listener)),
                 runtime,
                 supervisor_bin: opts.supervisor_bin,
-                assume_no_pidfd: opts.assume_no_pidfd,
+                fail_handshake_after_publish: opts.fail_handshake_after_publish,
                 crash: Mutex::new(opts.crash_at),
             }),
         })
@@ -452,19 +459,12 @@ impl Host {
     }
 
     fn require_pidfd(&self) -> Result<(), HostError> {
+        let _ = self.inner.endpoint.pipe_name();
         #[cfg(target_os = "linux")]
         {
-            if self.inner.assume_no_pidfd {
-                return Err(ContainmentRefusal::PidfdUnavailable.into());
-            }
             check_pidfd_support()?;
-            Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = self.inner.assume_no_pidfd;
-            Ok(())
-        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -481,6 +481,7 @@ impl Host {
             .unwrap_or_else(|err| err.into_inner())
             .take();
         let path = host.path.clone();
+        let fail_after_publish = host.fail_handshake_after_publish;
         let supervised = child::unix::spawn_supervised(
             &host.supervisor_bin,
             spec.argv.clone(),
@@ -509,11 +510,15 @@ impl Host {
                 registry.sessions.push(record);
                 publish(&path, &registry, crash)
             },
+            fail_after_publish,
         );
         let supervised = match supervised {
             Ok(spawned) => spawned,
             Err(err) => {
-                self.retire_epoch_keep(spec.session.as_str(), epoch);
+                // Pidfd abort could not prove both processes. Keep the durable record.
+                if refusal(&err) != Some(ContainmentRefusal::CleanupUnresolved) {
+                    self.retire_epoch_keep(spec.session.as_str(), epoch);
+                }
                 return Err(err);
             }
         };
@@ -755,42 +760,77 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
 
 #[cfg(windows)]
 fn windows_watch(session: Arc<Session>, host: Arc<HostInner>) {
-    let started = Instant::now();
+    let mut cleanup_started: Option<Instant> = None;
+    let mut reported_unresolved = false;
     loop {
-        let process = session
-            .process
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let job = session.job.lock().unwrap_or_else(|err| err.into_inner());
-        let Some(process) = process.as_ref() else {
-            break;
+        // The guards end with this block so TerminateJobObject can lock the Job during the sleep.
+        let observed = {
+            let process = session
+                .process
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let job = session.job.lock().unwrap_or_else(|err| err.into_inner());
+            let Some(process) = process.as_ref() else {
+                break;
+            };
+            let Some(job) = job.as_ref() else { break };
+            if session.leader_exit().is_none() && child::windows::leader_signaled(process) {
+                WatchTick::Leader(child::windows::leader_exit_code(process))
+            } else {
+                let requested = session.cleanup_requested();
+                // Hold forces accounting to look live so the Job handle stays open past the deadline.
+                let quiet = !job_hold_active() && child::windows::stable_job_quiescent(job);
+                WatchTick::Poll { requested, quiet }
+            }
         };
-        let Some(job) = job.as_ref() else { break };
-        if session.leader_exit().is_none() && child::windows::leader_signaled(process) {
-            let code = child::windows::leader_exit_code(process);
-            let exit = ChildExit { code, signal: None };
-            drop(process);
-            drop(job);
-            host.mark_leader(session.session.as_str(), &exit);
-            session.note_leader(exit);
-            continue;
-        }
-        let requested = session.cleanup_requested();
-        let quiet = child::windows::stable_job_quiescent(job);
-        drop(process);
-        drop(job);
-        if quiet && (requested || session.leader_exit().is_some()) {
-            host.retire(session.session.as_str());
-            session.note_cleanup(CleanupReport { complete: true });
-            break;
-        }
-        if requested && started.elapsed() > CLEANUP_DEADLINE && !quiet {
-            host.alert("cleanup unresolved");
-            session.note_cleanup(CleanupReport { complete: false });
-            break;
+        match observed {
+            WatchTick::Leader(code) => {
+                let exit = ChildExit { code, signal: None };
+                host.mark_leader(session.session.as_str(), &exit);
+                session.note_leader(exit);
+                continue;
+            }
+            WatchTick::Poll { requested, quiet } => {
+                if requested && cleanup_started.is_none() {
+                    cleanup_started = Some(Instant::now());
+                }
+                if quiet && (requested || session.leader_exit().is_some()) {
+                    host.retire(session.session.as_str());
+                    session.note_cleanup(CleanupReport { complete: true });
+                    break;
+                }
+                if requested
+                    && cleanup_deadline_expired(cleanup_started, Instant::now())
+                    && !quiet
+                    && !reported_unresolved
+                {
+                    host.alert("cleanup unresolved");
+                    session.note_cleanup(CleanupReport { complete: false });
+                    reported_unresolved = true;
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(windows)]
+enum WatchTick {
+    Leader(Option<i32>),
+    Poll { requested: bool, quiet: bool },
+}
+
+#[cfg(windows)]
+fn job_hold_active() -> bool {
+    std::env::var_os("FL_HOST_JOB_HOLD")
+        .is_some_and(|path| !path.is_empty() && std::path::Path::new(&path).exists())
+}
+
+/// The cleanup clock is absent until cleanup is requested. A process that has already
+/// run longer than [`CLEANUP_DEADLINE`] has not used up that budget.
+#[cfg(any(windows, test))]
+fn cleanup_deadline_expired(started: Option<Instant>, now: Instant) -> bool {
+    started.is_some_and(|started| now.saturating_duration_since(started) > CLEANUP_DEADLINE)
 }
 
 fn recover(
@@ -872,5 +912,21 @@ fn wait_for_stop() -> Result<(), HostError> {
     {
         std::thread::park();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_deadline_starts_only_when_requested() {
+        let now = Instant::now();
+        let running_since = now
+            .checked_sub(CLEANUP_DEADLINE + Duration::from_secs(30))
+            .expect("instant");
+        assert!(!cleanup_deadline_expired(None, now));
+        assert!(!cleanup_deadline_expired(Some(now), now));
+        assert!(cleanup_deadline_expired(Some(running_since), now));
     }
 }

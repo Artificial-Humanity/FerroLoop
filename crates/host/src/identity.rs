@@ -10,10 +10,26 @@
 //! an unreaped leader. A `setsid` descendant reparented to launchd is a residual, including
 //! after daemon SIGKILL. This module does not claim macOS adoption.
 
+use std::cell::Cell;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static PROBE_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+    static KILL_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test seam. The next [`check_pidfd_support`] call returns [`ContainmentRefusal::PidfdUnavailable`].
+pub fn set_pidfd_probe_unavailable(unavailable: bool) {
+    PROBE_UNAVAILABLE.with(|cell| cell.set(unavailable));
+}
+
+/// Test seam. Pidfd cleanup returns [`ContainmentRefusal::CleanupUnresolved`] and does not signal.
+pub fn set_pidfd_kill_unavailable(unavailable: bool) {
+    KILL_UNAVAILABLE.with(|cell| cell.set(unavailable));
+}
 
 use fl_host_proto::HostError;
 
@@ -70,6 +86,9 @@ pub fn process_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
 pub fn check_pidfd_support() -> Result<(), ContainmentRefusal> {
     #[cfg(target_os = "linux")]
     {
+        if probe_forced_unavailable() {
+            return Err(ContainmentRefusal::PidfdUnavailable);
+        }
         let fd = pidfd_open(std::process::id()).map_err(classify_pidfd)?;
         pidfd_send(fd.as_raw_fd(), 0).map_err(classify_pidfd)?;
         Ok(())
@@ -78,6 +97,58 @@ pub fn check_pidfd_support() -> Result<(), ContainmentRefusal> {
     {
         Err(ContainmentRefusal::PidfdUnavailable)
     }
+}
+
+fn probe_forced_unavailable() -> bool {
+    PROBE_UNAVAILABLE.with(|cell| cell.get())
+        || std::env::var_os("FL_HOST_ASSUME_NO_PIDFD").is_some_and(|value| value == "1")
+}
+
+/// SIGKILL each proven target through a pidfd, vendor before supervisor.
+/// A pin or send failure signals nothing further and returns [`ContainmentRefusal::CleanupUnresolved`].
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_kill_pidfd(targets: &[(u32, u64)]) -> Result<(), ContainmentRefusal> {
+    if KILL_UNAVAILABLE.with(|cell| cell.get()) {
+        return Err(ContainmentRefusal::CleanupUnresolved);
+    }
+    let mut pins = Vec::new();
+    for &(pid, start) in targets {
+        if pid == 0 {
+            continue;
+        }
+        match prove(pid, start) {
+            Ok(Proof::Gone) => {}
+            Ok(Proof::Pinned(pin)) => pins.push(pin),
+            Ok(Proof::Unproven) | Err(_) => return Err(ContainmentRefusal::CleanupUnresolved),
+        }
+    }
+    for pin in &pins {
+        if let Err(err) = pidfd_send(pin.as_raw(), libc::SIGKILL)
+            && err.raw_os_error() != Some(libc::ESRCH)
+        {
+            return Err(ContainmentRefusal::CleanupUnresolved);
+        }
+    }
+    Ok(())
+}
+
+/// True while `pid` is still the process that started at `start` and is not a zombie.
+#[cfg(target_os = "linux")]
+pub(crate) fn still_executing(pid: u32, start: u64) -> bool {
+    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(ident) = parse_stat(&text) else {
+        return false;
+    };
+    if ident.pid != pid || ident.start != start {
+        return false;
+    }
+    let Some(close) = text.rfind(')') else {
+        return false;
+    };
+    let state = text[close + 1..].trim_start().chars().next();
+    !matches!(state, None | Some('Z'))
 }
 
 /// Signal `anchor.pgid` only while that unreaped leader still anchors the group.

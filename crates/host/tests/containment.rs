@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,10 +31,21 @@ fn host_bin() -> PathBuf {
 fn harness() -> (tempfile::TempDir, HostEndpoint) {
     let dir = tempfile::tempdir().expect("tempdir");
     #[cfg(unix)]
-    {
+    let endpoint = {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("mode");
-    }
+        HostEndpoint::unix(dir.path().join("h.sock")).expect("endpoint")
+    };
+    #[cfg(windows)]
+    let endpoint = {
+        use std::sync::atomic::AtomicU64;
+        static SUFFIX: AtomicU64 = AtomicU64::new(0);
+        let n = SUFFIX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let suffix = format!("h-{}-{n}", std::process::id());
+        HostEndpoint::windows(&suffix, &fl_host::current_user_sid().expect("sid"))
+            .expect("endpoint")
+    };
+    #[cfg(not(any(unix, windows)))]
     let endpoint = HostEndpoint::unix(dir.path().join("h.sock")).expect("endpoint");
     (dir, endpoint)
 }
@@ -97,6 +110,17 @@ fn read_until(mut file: impl Read + Send + 'static, needle: &str, timeout: Durat
     });
     let buf = rx.recv_timeout(timeout).expect("readiness");
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn home_var() -> &'static str {
+    #[cfg(windows)]
+    {
+        "USERPROFILE"
+    }
+    #[cfg(not(windows))]
+    {
+        "HOME"
+    }
 }
 
 fn child_pid(text: &str) -> u32 {
@@ -378,7 +402,7 @@ fn env_is_explicit_and_scrubbed() {
     let value = report_value(&stdout_text(&session));
     assert_eq!(value["isatty"], false);
     assert!(value["env"]["PATH"].is_string());
-    assert!(value["env"]["HOME"].is_string());
+    assert!(value["env"][home_var()].is_string());
     assert!(value["env"].get("CARGO_MANIFEST_DIR").is_none());
     let mut allowed = spec("env-allow", &["report"]);
     allowed.env.insert("PATH".into(), "/only-sentinel".into());
@@ -389,7 +413,7 @@ fn env_is_explicit_and_scrubbed() {
     let value = report_value(&stdout_text(&session));
     assert_eq!(value["env"]["PATH"], "/only-sentinel");
     assert_eq!(value["env"]["FL_HOST_SENTINEL"], "kept");
-    assert!(value["env"]["HOME"].is_string());
+    assert!(value["env"][home_var()].is_string());
     assert!(value["env"].get("CARGO_MANIFEST_DIR").is_none());
     let mut denied = spec("env-denied", &["stall"]);
     denied.env.insert("FL_HOST_SENTINEL".into(), "nope".into());
@@ -510,6 +534,7 @@ fn leader_exit_keeps_cleanup_owner() {
     assert!(registry.sessions.iter().any(|record| {
         record.session == session.session().as_str() && record.phase == SessionPhase::LeaderExited
     }));
+    #[cfg(unix)]
     let supervisor_start = process_identity(session.supervisor_pid())
         .expect("supervisor")
         .start;
@@ -519,6 +544,7 @@ fn leader_exit_keeps_cleanup_owner() {
         .wait_cleanup(CLEANUP_DEADLINE + Duration::from_secs(2))
         .expect("report");
     assert!(report.complete);
+    #[cfg(unix)]
     assert!(wait_gone(
         session.supervisor_pid(),
         supervisor_start,
@@ -554,6 +580,7 @@ fn daemon_death_obeys_platform_contract() {
         "stdin-EOF survivor outlived daemon death"
     );
     assert!(started.elapsed() < CLEANUP_DEADLINE + Duration::from_secs(2));
+    #[cfg(unix)]
     assert!(wait_gone(
         spawned.supervisor_pid,
         spawned.supervisor_start,
@@ -816,11 +843,14 @@ fn lock_listener_client_fds_not_inherited_by_child() {
 #[test]
 fn pidfd_unavailable_refuses_spawn() {
     check_pidfd_support().expect("this kernel has pidfds");
+    let _probe = PidfdSeam::probe_unavailable();
+    assert_eq!(
+        check_pidfd_support(),
+        Err(ContainmentRefusal::PidfdUnavailable)
+    );
     let (_dir, endpoint) = harness();
     let (canary, _) = Tracked::spawn("survive-eof");
-    let mut opts = base_opts(&endpoint);
-    opts.assume_no_pidfd = true;
-    let host = Host::open(opts).expect("open");
+    let host = Host::open(base_opts(&endpoint)).expect("open");
     let err = host.spawn(&spec("refused", &["stall"])).expect_err("pidfd");
     assert_eq!(refusal(&err), Some(ContainmentRefusal::PidfdUnavailable));
     assert!(canary.alive());
@@ -951,6 +981,15 @@ fn leader_exit_preserves_durable_cleanup_owner() {
         spawned.supervisor_start,
         Duration::from_secs(2)
     ));
+    #[cfg(target_os = "linux")]
+    {
+        let _reap = ReapIfAlive::new(grandchild, grandchild_start);
+        assert!(
+            wait_gone(grandchild, grandchild_start, Duration::from_secs(2)),
+            "adopted orphan was still running after restart"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
     kill_if_same(grandchild, grandchild_start);
 }
 
@@ -1105,6 +1144,7 @@ fn spawn_record_publication_survives_crash() {
             .sessions
             .is_empty()
     );
+    assert!(!publication_temp(dir.path()));
     assert!(canary.alive());
     let host = open_host(&endpoint);
     assert!(canary.alive());
@@ -1117,7 +1157,7 @@ fn spawn_record_publication_survives_crash() {
             .sessions
             .is_empty()
     );
-    assert!(dir_has_temp(dir.path()));
+    assert!(publication_temp(dir.path()));
     assert!(canary.alive());
     let host = open_host(&endpoint);
     assert!(canary.alive());
@@ -1163,20 +1203,53 @@ fn plant_temp(dir: &Path, record: &SurvivorRecord) {
     .expect("plant");
 }
 
-fn dir_has_temp(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .expect("dir")
-        .flatten()
-        .any(|entry| entry.file_name().to_string_lossy().starts_with(".flh-"))
+fn publication_temp(dir: &Path) -> bool {
+    std::fs::read_dir(dir).expect("dir").flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".flh-") && name != ".flh-planted"
+    })
 }
 
 fn crash_spawn(endpoint: &HostEndpoint, point: &str) {
-    let mut worker = Worker::start(endpoint, &[("FL_HOST_CRASH_AT", point)]);
+    let mut worker = Worker::start(
+        endpoint,
+        &[
+            ("FL_HOST_CRASH_AT", point),
+            ("FL_HOST_CRASH_HOLD_MS", "100"),
+        ],
+    );
+    #[cfg(target_os = "linux")]
+    let watch = GateWatch::start(worker.child.id());
     let _ = worker.cmd(&format!(
         "spawn {}",
         serde_json::to_string(&spec("crash", &["survive-eof"])).unwrap()
     ));
     wait_worker_exit(&mut worker, Duration::from_secs(5));
+    #[cfg(target_os = "linux")]
+    {
+        let observed = watch.finish().expect("gated vendor was not observed");
+        let vendor = ReapIfAlive::new(observed.vendor_pid, observed.vendor_start);
+        let supervisor = ReapIfAlive::new(observed.supervisor_pid, observed.supervisor_start);
+        assert!(
+            wait_gone(
+                observed.vendor_pid,
+                observed.vendor_start,
+                Duration::from_secs(2)
+            ),
+            "gated vendor leaked without a test-side kill"
+        );
+        assert!(
+            wait_gone(
+                observed.supervisor_pid,
+                observed.supervisor_start,
+                Duration::from_secs(2)
+            ),
+            "supervisor leaked without a test-side kill"
+        );
+        vendor.disarm();
+        supervisor.disarm();
+    }
     let _ = CrashPoint::parse(point);
 }
 
@@ -1384,6 +1457,325 @@ fn windows_grandchild_exits_on_job_kill_and_daemon_death() {
         CLEANUP_DEADLINE
     ));
     assert!(wait_gone(child, child_start, CLEANUP_DEADLINE));
+}
+
+#[cfg(target_os = "linux")]
+struct PidfdSeam {
+    probe: bool,
+    kill: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PidfdSeam {
+    fn probe_unavailable() -> Self {
+        fl_host::set_pidfd_probe_unavailable(true);
+        Self {
+            probe: true,
+            kill: false,
+        }
+    }
+
+    fn kill_unavailable() -> Self {
+        fl_host::set_pidfd_kill_unavailable(true);
+        Self {
+            probe: false,
+            kill: true,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PidfdSeam {
+    fn drop(&mut self) {
+        if self.probe {
+            fl_host::set_pidfd_probe_unavailable(false);
+        }
+        if self.kill {
+            fl_host::set_pidfd_kill_unavailable(false);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReapIfAlive {
+    pid: u32,
+    start: u64,
+    armed: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl ReapIfAlive {
+    fn new(pid: u32, start: u64) -> Self {
+        Self {
+            pid,
+            start,
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    fn disarm(&self) {
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReapIfAlive {
+    fn drop(&mut self) {
+        if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+            kill_if_same(self.pid, self.start);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ObservedGate {
+    vendor_pid: u32,
+    vendor_start: u64,
+    supervisor_pid: u32,
+    supervisor_start: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct GateWatch {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<Option<ObservedGate>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl GateWatch {
+    fn start(worker: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let ready_flag = Arc::clone(&ready);
+        let join = std::thread::spawn(move || {
+            ready_flag.store(true, std::sync::atomic::Ordering::Release);
+            watch_children(worker, &flag)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "gate watcher did not start");
+            std::thread::yield_now();
+        }
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn finish(mut self) -> Option<ObservedGate> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.join.take()?.join().ok()?
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn watch_children(worker: u32, stop: &AtomicBool) -> Option<ObservedGate> {
+    let mut stopped_at = None;
+    loop {
+        if let Some(found) = gated_children(worker) {
+            return Some(found);
+        }
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            let started = stopped_at.get_or_insert_with(Instant::now);
+            if started.elapsed() > Duration::from_millis(200) {
+                return None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Child tids of every task. A fork is listed on the thread that created it.
+#[cfg(target_os = "linux")]
+fn task_children(pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return out;
+    };
+    for task in tasks.flatten() {
+        let Ok(text) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        for field in text.split_whitespace() {
+            let Ok(child) = field.parse::<u32>() else {
+                continue;
+            };
+            if child != 0 && !out.contains(&child) {
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn gated_children(worker: u32) -> Option<ObservedGate> {
+    for supervisor in task_children(worker) {
+        let Ok(supervisor_ident) = process_identity(supervisor) else {
+            continue;
+        };
+        if supervisor_ident.pid != supervisor || supervisor_ident.start == 0 {
+            continue;
+        }
+        for vendor in task_children(supervisor) {
+            let Ok(ident) = process_identity(vendor) else {
+                continue;
+            };
+            if ident.pid != vendor || ident.pgid != ident.pid || ident.ppid != supervisor {
+                continue;
+            }
+            return Some(ObservedGate {
+                vendor_pid: ident.pid,
+                vendor_start: ident.start,
+                supervisor_pid: supervisor,
+                supervisor_start: supervisor_ident.start,
+            });
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn executing(pid: u32, start: u64) -> bool {
+    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Ok(ident) = process_identity(pid) else {
+        return false;
+    };
+    if ident.pid != pid || ident.start != start {
+        return false;
+    }
+    let Some(close) = text.rfind(')') else {
+        return false;
+    };
+    !matches!(
+        text[close + 1..].trim_start().chars().next(),
+        None | Some('Z')
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn read_gated(dir: &Path) -> (u32, u64, u32, u64) {
+    let text = std::fs::read_to_string(dir.join("gated.pids")).expect("gated vendor identity");
+    let mut fields = text.split_whitespace();
+    let vendor = fields.next().expect("vendor").parse().expect("vendor");
+    let vendor_start = fields.next().expect("start").parse().expect("start");
+    let supervisor = fields.next().expect("supervisor").parse().expect("pid");
+    let supervisor_start = fields.next().expect("start").parse().expect("start");
+    (vendor, vendor_start, supervisor, supervisor_start)
+}
+
+#[cfg(target_os = "linux")]
+fn stuck_opts(endpoint: &HostEndpoint) -> OpenOptions {
+    let mut opts = base_opts(endpoint);
+    opts.supervisor_bin = PathBuf::from(child_bin());
+    opts.fail_handshake_after_publish = true;
+    opts
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_handshake_does_not_numeric_kill() {
+    let (dir, endpoint) = harness();
+    let (canary, _) = Tracked::spawn("survive-eof");
+    let host = Host::open(stuck_opts(&endpoint)).expect("open");
+    let mut spec = spec("stuck", &["stall"]);
+    spec.cwd = dir.path().to_path_buf();
+    let _seam = PidfdSeam::kill_unavailable();
+    let err = host.spawn(&spec).expect_err("abort");
+    assert_eq!(refusal(&err), Some(ContainmentRefusal::CleanupUnresolved));
+    assert!(
+        read_registry(&endpoint)
+            .expect("registry")
+            .sessions
+            .iter()
+            .any(|record| record.session == "stuck")
+    );
+    let (vendor, vendor_start, supervisor, supervisor_start) = read_gated(dir.path());
+    let _vendor = ReapIfAlive::new(vendor, vendor_start);
+    let _supervisor = ReapIfAlive::new(supervisor, supervisor_start);
+    assert!(
+        executing(supervisor, supervisor_start),
+        "supervisor was numeric-killed"
+    );
+    assert!(
+        executing(vendor, vendor_start),
+        "gated vendor was numeric-killed"
+    );
+    assert_eq!(process_identity(vendor).expect("vendor").ppid, supervisor);
+    assert!(canary.alive());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_handshake_pidfd_kills_known_vendor() {
+    let (dir, endpoint) = harness();
+    let (canary, _) = Tracked::spawn("survive-eof");
+    let host = Host::open(stuck_opts(&endpoint)).expect("open");
+    let mut spec = spec("stuck-kill", &["stall"]);
+    spec.cwd = dir.path().to_path_buf();
+    let err = host.spawn(&spec).expect_err("handshake");
+    assert!(err.to_string().contains("handshake"), "{err}");
+    assert_eq!(refusal(&err), None);
+    let (vendor, vendor_start, supervisor, supervisor_start) = read_gated(dir.path());
+    let vendor_reap = ReapIfAlive::new(vendor, vendor_start);
+    let supervisor_reap = ReapIfAlive::new(supervisor, supervisor_start);
+    assert!(wait_gone(vendor, vendor_start, Duration::from_secs(2)));
+    assert!(wait_gone(
+        supervisor,
+        supervisor_start,
+        Duration::from_secs(2)
+    ));
+    vendor_reap.disarm();
+    supervisor_reap.disarm();
+    assert!(
+        read_registry(&endpoint)
+            .expect("registry")
+            .sessions
+            .iter()
+            .all(|record| record.session != "stuck-kill")
+    );
+    assert!(canary.alive());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cleanup_deadline_starts_when_cleanup_is_requested() {
+    let hold = tempfile::NamedTempFile::new().expect("hold");
+    let suffix = format!("clk-{}", std::process::id());
+    let (_endpoint, mut worker) = win_worker(
+        &suffix,
+        &[("FL_HOST_JOB_HOLD", &hold.path().display().to_string())],
+    );
+    let spawned = worker.spawn_spec(&spec("held", &["stall"]));
+    let _ = worker.cmd("stdout held 5000 READY");
+    std::thread::sleep(CLEANUP_DEADLINE + Duration::from_millis(300));
+    let killed = worker.cmd(&format!("kill held {}", spawned.epoch));
+    assert_eq!(killed, "ok", "{killed}");
+    let early = worker.cmd("cleanup held 800");
+    assert!(
+        early.starts_with("err "),
+        "cleanup clock was already expired at kill: {early}"
+    );
+    let later = worker.cmd(&format!(
+        "cleanup held {}",
+        CLEANUP_DEADLINE.as_millis() + 1500
+    ));
+    assert_eq!(later, "ok false", "{later}");
+    assert_ne!(worker.cmd("phase held"), "ok absent");
+    drop(hold);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let phase = worker.cmd("phase held");
+        if phase == "ok absent" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{phase}");
+        std::thread::sleep(Duration::from_millis(40));
+    }
 }
 
 #[test]

@@ -41,6 +41,7 @@ fn main() {
             park();
         }
         "fds" => fds(),
+        "--session-supervisor" => stuck_supervisor(),
         "marker" => {
             ready();
             if let Some(path) = rest.first() {
@@ -61,7 +62,7 @@ fn ready() {
     let _ = out.flush();
 }
 
-fn park() {
+fn park() -> ! {
     loop {
         std::thread::park();
     }
@@ -311,3 +312,100 @@ fn fds() {
 
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
+
+/// Supervisor stand-in that publishes a gated vendor and then ignores control EOF.
+/// The vendor calls `setsid` and parks. It does not wait on the release pipe, so a
+/// numeric kill of this process would reparent it.
+#[cfg(unix)]
+fn stuck_supervisor() -> ! {
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::{Duration, Instant};
+
+    if unsafe { libc::setsid() } < 0 {
+        exit(2);
+    }
+    let vendor = unsafe { libc::fork() };
+    if vendor < 0 {
+        exit(2);
+    }
+    if vendor == 0 {
+        if unsafe { libc::setsid() } < 0 {
+            unsafe { libc::_exit(2) };
+        }
+        for fd in 0..64 {
+            unsafe { libc::close(fd) };
+        }
+        park();
+    }
+    let mut control = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match control.read(&mut byte) {
+            Ok(0) => exit(2),
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                buf.push(byte[0]);
+                if buf.len() > 1024 * 1024 {
+                    exit(2);
+                }
+            }
+            Err(_) => exit(2),
+        }
+    }
+    drop(control);
+    let value: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
+    let cwd_bytes: Vec<u8> = value["cwd"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if cwd_bytes.is_empty() {
+        exit(2);
+    }
+    let cwd = std::path::PathBuf::from(std::ffi::OsString::from_vec(cwd_bytes));
+    let vendor_pid = u32::try_from(vendor).unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (vendor_start, pgid) = loop {
+        if let Ok(ident) = fl_host::process_identity(vendor_pid)
+            && ident.pid == vendor_pid
+            && ident.pgid == vendor_pid
+        {
+            break (ident.start, ident.pgid);
+        }
+        if Instant::now() >= deadline {
+            exit(2);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let supervisor_pid = std::process::id();
+    let Ok(supervisor) = fl_host::process_identity(supervisor_pid) else {
+        exit(2);
+    };
+    let note = format!(
+        "{vendor_pid} {vendor_start} {supervisor_pid} {}\n",
+        supervisor.start
+    );
+    if std::fs::write(cwd.join("gated.pids"), note).is_err() {
+        exit(2);
+    }
+    let line = format!(
+        "{{\"op\":\"identity\",\"vendor_pid\":{vendor_pid},\"vendor_start\":{vendor_start},\"pgid\":{pgid},\"supervisor_pid\":{supervisor_pid},\"supervisor_start\":{}}}\n",
+        supervisor.start
+    );
+    let mut status = unsafe { std::fs::File::from_raw_fd(4) };
+    if status.write_all(line.as_bytes()).is_err() || status.flush().is_err() {
+        exit(2);
+    }
+    drop(status);
+    park();
+}
+
+#[cfg(not(unix))]
+fn stuck_supervisor() -> ! {
+    exit(2);
+}

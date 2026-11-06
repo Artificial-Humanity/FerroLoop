@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fl_host_proto::{HostEndpoint, HostError, private_parent_ok};
 use serde::{Deserialize, Serialize};
@@ -103,27 +103,33 @@ impl CrashPoint {
     }
 }
 
-pub fn registry_path(endpoint: &HostEndpoint) -> PathBuf {
+pub fn registry_path(endpoint: &HostEndpoint) -> Result<PathBuf, HostError> {
     #[cfg(windows)]
     {
-        let local = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
-        PathBuf::from(local)
-            .join("FerroLoop")
-            .join("host")
-            .join(endpoint.state_file_name())
+        let local = std::env::var_os("LOCALAPPDATA");
+        Ok(host_dir_from_local(local.as_deref())?.join(endpoint.state_file_name()))
     }
     #[cfg(not(windows))]
     {
-        endpoint.state_path()
+        Ok(endpoint.state_path())
+    }
+}
+
+/// `LOCALAPPDATA` is required. An empty value is not a relative path.
+#[cfg(any(windows, test))]
+fn host_dir_from_local(local: Option<&std::ffi::OsStr>) -> Result<PathBuf, HostError> {
+    match local {
+        Some(local) if !local.is_empty() => Ok(PathBuf::from(local).join("FerroLoop").join("host")),
+        _ => Err(HostError::ParentDenied),
     }
 }
 
 pub fn load_registry(endpoint: &HostEndpoint) -> Result<Registry, HostError> {
-    load_path(&registry_path(endpoint))
+    load_path(&registry_path(endpoint)?)
 }
 
 pub fn write_raw_state(endpoint: &HostEndpoint, bytes: &[u8]) -> Result<(), HostError> {
-    replace_atomic(&registry_path(endpoint), bytes, None)
+    replace_atomic(&registry_path(endpoint)?, bytes, None)
 }
 
 pub fn write_registry_fixture(
@@ -137,7 +143,7 @@ pub fn write_registry_fixture(
         alerts: Vec::new(),
     };
     validate_registry(&registry).map_err(HostError::from)?;
-    publish(&registry_path(endpoint), &registry, None)
+    publish(&registry_path(endpoint)?, &registry, None)
 }
 
 fn load_path(path: &Path) -> Result<Registry, HostError> {
@@ -217,6 +223,13 @@ fn file_name_is_temp(path: &Path) -> bool {
 }
 
 fn die_for_crash() -> ! {
+    // The gated vendor lives only until this process dies. Tests that must sample it
+    // set FL_HOST_CRASH_HOLD_MS so the sample happens before the signal.
+    if let Ok(text) = std::env::var("FL_HOST_CRASH_HOLD_MS")
+        && let Ok(ms) = text.parse::<u64>()
+    {
+        std::thread::sleep(Duration::from_millis(ms.min(500)));
+    }
     #[cfg(unix)]
     unsafe {
         libc::raise(libc::SIGKILL);
@@ -411,15 +424,18 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    ensure_registry_dirs(path)?;
+    let owner = current_sid()?;
+    if let Some(existing) = open_reparse_file(path)? {
+        require_private_file(&existing, &owner)?;
     }
-    let sid = current_sid_string()?;
+    let sid = sid_string(&owner)?;
     let sddl = fl_host_proto::pipe_dacl_sddl(&sid);
     let wide_sddl = wide_str(&sddl);
     let mut raw_sd = std::ptr::null_mut();
@@ -455,7 +471,7 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
             0,
             &attrs,
             CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             std::ptr::null_mut(),
         )
     };
@@ -494,10 +510,19 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
 
 #[cfg(windows)]
 fn read_private(path: &Path) -> Result<Option<Vec<u8>>, HostError> {
-    if !path.exists() {
+    let parent = path.parent().ok_or(HostError::ParentDenied)?;
+    let Some(dir) = open_directory(parent)? else {
         return Ok(None);
-    }
-    let bytes = std::fs::read(path)?;
+    };
+    require_directory(&dir)?;
+    drop(dir);
+    let Some(handle) = open_reparse_file(path)? else {
+        return Ok(None);
+    };
+    require_private_file(&handle, &current_sid()?)?;
+    let mut file = handle.into_file();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     if bytes.len() > MAX_BYTES {
         return Err(ContainmentRefusal::CorruptRegistry.into());
     }
@@ -582,6 +607,429 @@ pub(crate) fn current_sid_string() -> Result<String, HostError> {
     }
 }
 
+#[cfg(windows)]
+fn ensure_registry_dirs(file: &Path) -> Result<(), HostError> {
+    let host = file.parent().ok_or(HostError::ParentDenied)?;
+    let ferro = host.parent().ok_or(HostError::ParentDenied)?;
+    ensure_private_dir(ferro)?;
+    ensure_private_dir(host)
+}
+
+#[cfg(windows)]
+fn ensure_private_dir(path: &Path) -> Result<(), HostError> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let sid = current_sid()?;
+    let text = sid_string(&sid)?;
+    let descriptor = security_descriptor(&fl_host_proto::pipe_dacl_sddl(&text))?;
+    let wide = wide_os(path.as_os_str());
+    let attrs = security_attributes(descriptor.as_ptr());
+    // SAFETY: `wide` is NUL-terminated. The DACL is applied at creation and is not inherited.
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), &attrs) };
+    if ok == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        return Err(HostError::ParentDenied);
+    }
+    let handle = open_directory(path)?.ok_or(HostError::ParentDenied)?;
+    require_directory(&handle)
+}
+
+#[cfg(windows)]
+fn require_directory(handle: &OwnedWinHandle) -> Result<(), HostError> {
+    use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let info = file_info(handle.as_raw()).map_err(|_| HostError::ParentDenied)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(HostError::ParentDenied);
+    }
+    require_dacl(handle.as_raw(), SE_FILE_OBJECT, &current_sid()?, false)
+        .map_err(|_| HostError::ParentDenied)
+}
+
+#[cfg(windows)]
+fn require_private_file(handle: &OwnedWinHandle, sid: &OwnedSid) -> Result<(), HostError> {
+    use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let info = file_info(handle.as_raw())?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        || info.nNumberOfLinks != 1
+    {
+        return Err(HostError::EndpointStateDenied);
+    }
+    require_dacl(handle.as_raw(), SE_FILE_OBJECT, sid, true)
+}
+
+#[cfg(windows)]
+fn open_reparse_file(path: &Path) -> Result<Option<OwnedWinHandle>, HostError> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
+    let wide = wide_os(path.as_os_str());
+    // SAFETY: OPEN_REPARSE_POINT opens the last component itself and does not follow it.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        return if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(HostError::EndpointStateDenied)
+        };
+    }
+    OwnedWinHandle::new(handle).map(Some)
+}
+
+#[cfg(windows)]
+fn open_directory(path: &Path) -> Result<Option<OwnedWinHandle>, HostError> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide = wide_os(path.as_os_str());
+    // SAFETY: BACKUP_SEMANTICS opens a directory. OPEN_REPARSE_POINT does not follow it.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        return if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(HostError::ParentDenied)
+        };
+    }
+    OwnedWinHandle::new(handle).map(Some)
+}
+
+#[cfg(windows)]
+fn file_info(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION, HostError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    // SAFETY: `info` is plain data. GetFileInformationByHandle writes it for this handle.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    if ok == 0 {
+        Err(HostError::EndpointStateDenied)
+    } else {
+        Ok(info)
+    }
+}
+
+#[cfg(windows)]
+fn require_dacl(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    object: i32,
+    sid: &OwnedSid,
+    check_owner: bool,
+) -> Result<(), HostError> {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PRESENT, SE_DACL_PROTECTED,
+    };
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the pointers are ours. On success `sd` owns the returned buffers.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            object,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != ERROR_SUCCESS || sd.is_null() {
+        return Err(HostError::EndpointStateDenied);
+    }
+    let result = (|| {
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        let ok = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) };
+        if ok == 0
+            || control & SE_DACL_PRESENT == 0
+            || control & SE_DACL_PROTECTED == 0
+            || dacl.is_null()
+        {
+            return Err(HostError::EndpointStateDenied);
+        }
+        if check_owner && (owner.is_null() || unsafe { EqualSid(owner, sid.as_psid()) } == 0) {
+            return Err(HostError::EndpointStateDenied);
+        }
+        let acl = unsafe { &*dacl };
+        if acl.AceCount != 1 {
+            return Err(HostError::EndpointStateDenied);
+        }
+        let mut ace = std::ptr::null_mut();
+        let ok = unsafe { GetAce(dacl, 0, &mut ace) };
+        if ok == 0 || ace.is_null() {
+            return Err(HostError::EndpointStateDenied);
+        }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != 0 {
+            return Err(HostError::EndpointStateDenied);
+        }
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let ace_sid = (&raw const allowed.SidStart)
+            .cast_mut()
+            .cast::<core::ffi::c_void>();
+        if unsafe { EqualSid(ace_sid, sid.as_psid()) } == 0 {
+            Err(HostError::EndpointStateDenied)
+        } else {
+            Ok(())
+        }
+    })();
+    unsafe { LocalFree(sd) };
+    result
+}
+
+#[cfg(windows)]
+fn current_sid() -> Result<OwnedSid, HostError> {
+    use windows_sys::Win32::Security::{
+        CopySid, GetLengthSid, GetTokenInformation, IsValidSid, SECURITY_MAX_SID_SIZE, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the process handle is this process. A non-zero result owns `token`.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let token = OwnedWinHandle::new(token)?;
+    let mut needed = 0u32;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 || needed > 65_536 {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let words = usize::try_from(needed)
+        .map_err(|_| HostError::PeerIdentityUnavailable)?
+        .div_ceil(std::mem::size_of::<u64>())
+        .max(1);
+    let mut buf = vec![0u64; words];
+    let capacity = u32::try_from(buf.len() * std::mem::size_of::<u64>())
+        .map_err(|_| HostError::PeerIdentityUnavailable)?;
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw(),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            capacity,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+    if user.User.Sid.is_null() || unsafe { IsValidSid(user.User.Sid) } == 0 {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let len = unsafe { GetLengthSid(user.User.Sid) };
+    if len == 0 || len > SECURITY_MAX_SID_SIZE {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let mut owned = OwnedSid {
+        bytes: [0u8; SECURITY_MAX_SID_SIZE as usize],
+    };
+    // SAFETY: the destination is 8-aligned and SECURITY_MAX_SID_SIZE bytes. `buf` stays alive.
+    let copied = unsafe { CopySid(SECURITY_MAX_SID_SIZE, owned.as_psid_mut(), user.User.Sid) };
+    if copied == 0 || unsafe { IsValidSid(owned.as_psid()) } == 0 {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    Ok(owned)
+}
+
+#[cfg(windows)]
+fn sid_string(sid: &OwnedSid) -> Result<String, HostError> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    let mut raw = std::ptr::null_mut();
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_psid(), &mut raw) };
+    if ok == 0 || raw.is_null() {
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let mut len = 0usize;
+    unsafe {
+        while len <= 256 && *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    if len == 0 || len > 256 {
+        unsafe { LocalFree(raw.cast()) };
+        return Err(HostError::PeerIdentityUnavailable);
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
+    unsafe { LocalFree(raw.cast()) };
+    if text.is_empty() {
+        Err(HostError::PeerIdentityUnavailable)
+    } else {
+        Ok(text)
+    }
+}
+
+#[cfg(windows)]
+fn security_descriptor(sddl: &str) -> Result<SecurityDescriptor, HostError> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+
+    let wide = wide_str(sddl);
+    let mut raw = std::ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            1,
+            &mut raw,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || raw.is_null() {
+        Err(HostError::EndpointStateDenied)
+    } else {
+        Ok(SecurityDescriptor(raw))
+    }
+}
+
+#[cfg(windows)]
+fn security_attributes(
+    descriptor: *mut core::ffi::c_void,
+) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+    windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    }
+}
+
+#[cfg(windows)]
+struct SecurityDescriptor(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SecurityDescriptor {
+    fn as_ptr(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+struct OwnedWinHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for OwnedWinHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+        self.0 = std::ptr::null_mut();
+    }
+}
+
+#[cfg(windows)]
+impl OwnedWinHandle {
+    fn new(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Self, HostError> {
+        if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            Err(HostError::PeerIdentityUnavailable)
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn as_raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+
+    fn into_file(self) -> File {
+        use std::os::windows::io::FromRawHandle;
+        let handle = self.0;
+        std::mem::forget(self);
+        // SAFETY: `handle` is open and exclusively owned. The file closes it.
+        unsafe { File::from_raw_handle(handle) }
+    }
+}
+
+#[cfg(windows)]
+#[repr(C, align(8))]
+struct OwnedSid {
+    bytes: [u8; windows_sys::Win32::Security::SECURITY_MAX_SID_SIZE as usize],
+}
+
+#[cfg(windows)]
+impl OwnedSid {
+    fn as_psid(&self) -> windows_sys::Win32::Security::PSID {
+        self.bytes.as_ptr() as windows_sys::Win32::Security::PSID
+    }
+
+    fn as_psid_mut(&mut self) -> windows_sys::Win32::Security::PSID {
+        self.bytes.as_mut_ptr() as windows_sys::Win32::Security::PSID
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +1069,66 @@ mod tests {
             alerts: Vec::new(),
         };
         assert!(validate_registry(&registry).is_err());
+    }
+
+    #[test]
+    fn missing_or_empty_localappdata_is_refused() {
+        use std::ffi::OsStr;
+
+        use fl_host_proto::HostError;
+
+        assert!(matches!(
+            host_dir_from_local(None),
+            Err(HostError::ParentDenied)
+        ));
+        assert!(matches!(
+            host_dir_from_local(Some(OsStr::new(""))),
+            Err(HostError::ParentDenied)
+        ));
+        let local = OsStr::new(r"C:\Users\me\AppData\Local");
+        let path = host_dir_from_local(Some(local)).expect("local");
+        assert_eq!(path, PathBuf::from(local).join("FerroLoop").join("host"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_registry_round_trip_rejects_reparse() {
+        use fl_host_proto::HostEndpoint;
+
+        let suffix = format!("reg-{}-{}", std::process::id(), std::process::id());
+        let endpoint =
+            HostEndpoint::windows(&suffix, &current_sid_string().expect("sid")).expect("endpoint");
+        let record = SurvivorRecord {
+            session: "kept".into(),
+            epoch: 1,
+            phase: SessionPhase::Running,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            vendor_pid: 4,
+            vendor_start: 4,
+            pgid: 4,
+            group_leader_pid: 4,
+            group_leader_start: 4,
+            group_leader_reaped: false,
+            leader_code: None,
+            leader_signal: None,
+        };
+        write_registry_fixture(&endpoint, 1, &[record.clone()]).expect("write");
+        let loaded = load_registry(&endpoint).expect("load");
+        assert_eq!(loaded.high_water, 1);
+        assert_eq!(loaded.sessions, vec![record]);
+        let path = registry_path(&endpoint).expect("path");
+        let bytes = std::fs::read(&path).expect("bytes");
+        let target = std::env::temp_dir().join(format!("flh-reparse-{}", std::process::id()));
+        std::fs::write(&target, &bytes).expect("target");
+        std::fs::remove_file(&path).expect("remove");
+        if std::os::windows::fs::symlink_file(&target, &path).is_ok() {
+            assert!(
+                load_registry(&endpoint).is_err(),
+                "state open followed a reparse point"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+        let _ = std::fs::remove_file(&target);
     }
 }

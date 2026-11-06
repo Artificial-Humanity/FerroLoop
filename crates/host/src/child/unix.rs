@@ -16,6 +16,7 @@ use fl_host_proto::HostError;
 use crate::identity::process_identity;
 use crate::limits::{CLEANUP_DEADLINE, HANDOFF_TIMEOUT};
 use crate::protocol::{DaemonMsg, SupervisorMsg, from_line, to_line};
+use crate::refusal::ContainmentRefusal;
 
 pub struct Supervised {
     pub vendor_pid: u32,
@@ -32,6 +33,7 @@ pub struct Supervised {
     pub child: Child,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_supervised(
     bin: &Path,
     argv: Vec<String>,
@@ -40,6 +42,7 @@ pub fn spawn_supervised(
     session: &str,
     epoch: u64,
     publish: impl FnOnce(u32, u64, u32, u64, u32) -> Result<(), HostError>,
+    fail_after_publish: bool,
 ) -> Result<Supervised, HostError> {
     block_sigpipe();
     let (control_r, control_w) = pipe_cloexec()?;
@@ -91,6 +94,7 @@ pub fn spawn_supervised(
         .unwrap_or(0);
     let mut status = File::from(status_r);
     let mut control = File::from(control_w);
+    let mut proven = None;
     let outcome = handshake(
         &mut child,
         &mut control,
@@ -103,6 +107,8 @@ pub fn spawn_supervised(
             epoch,
         },
         publish,
+        fail_after_publish,
+        &mut proven,
     );
     match outcome {
         Ok((vendor_pid, vendor_start, supervisor_start, pgid)) => Ok(Supervised {
@@ -121,8 +127,12 @@ pub fn spawn_supervised(
         }),
         Err(err) => {
             drop(control);
-            stop_child(&mut child);
-            Err(err)
+            // Dropping the control pipe asks a live supervisor to abort its own vendor.
+            // A numeric kill here would also drop the subreaper and reparent a gated vendor.
+            match abort_supervised(&mut child, proven) {
+                Ok(()) => Err(err),
+                Err(refusal) => Err(HostError::from(refusal)),
+            }
         }
     }
 }
@@ -141,6 +151,8 @@ fn handshake(
     status: &mut File,
     launch: VendorLaunch<'_>,
     publish: impl FnOnce(u32, u64, u32, u64, u32) -> Result<(), HostError>,
+    fail_after_publish: bool,
+    proven: &mut Option<(u32, u64)>,
 ) -> Result<(u32, u64, u64, u32), HostError> {
     let VendorLaunch {
         argv,
@@ -189,6 +201,7 @@ fn handshake(
     {
         return Err(HostError::Protocol("unproven ownership".into()));
     }
+    *proven = Some((vendor_pid, vendor_start));
     publish(
         vendor_pid,
         vendor_start,
@@ -196,6 +209,9 @@ fn handshake(
         supervisor_start,
         pgid,
     )?;
+    if fail_after_publish {
+        return Err(HostError::Protocol("handshake".into()));
+    }
     let go = to_line(&DaemonMsg::Go).map_err(HostError::Protocol)?;
     control.write_all(&go)?;
     match read_supervisor(status, HANDOFF_TIMEOUT)? {
@@ -207,19 +223,63 @@ fn handshake(
     }
 }
 
-fn stop_child(child: &mut Child) {
-    let deadline = Instant::now() + CLEANUP_DEADLINE;
-    loop {
+fn abort_supervised(
+    child: &mut Child,
+    vendor: Option<(u32, u64)>,
+) -> Result<(), ContainmentRefusal> {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        // Both pidfds are pinned before either signal. A missing supervisor is unresolved:
+        // signalling only the vendor would leave the subreaper, and the reverse reparents it.
+        let supervisor =
+            process_identity(child.id()).map_err(|_| ContainmentRefusal::CleanupUnresolved)?;
+        let mut targets = Vec::new();
+        if let Some(vendor) = vendor {
+            targets.push(vendor);
+        }
+        targets.push((supervisor.pid, supervisor.start));
+        crate::identity::signal_kill_pidfd(&targets)?;
+        wait_stopped(child, &targets, deadline)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = vendor;
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         if child.try_wait().ok().flatten().is_some() {
-            return;
+            Ok(())
+        } else {
+            Err(ContainmentRefusal::CleanupUnresolved)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_stopped(
+    child: &mut Child,
+    targets: &[(u32, u64)],
+    deadline: Instant,
+) -> Result<(), ContainmentRefusal> {
+    loop {
+        let _ = child.try_wait();
+        let live = targets
+            .iter()
+            .any(|(pid, start)| crate::identity::still_executing(*pid, *start));
+        if !live {
+            let _ = child.try_wait();
+            return Ok(());
         }
         if Instant::now() >= deadline {
-            break;
+            return Err(ContainmentRefusal::CleanupUnresolved);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn read_supervisor(file: &mut File, timeout: Duration) -> Result<Option<SupervisorMsg>, HostError> {
