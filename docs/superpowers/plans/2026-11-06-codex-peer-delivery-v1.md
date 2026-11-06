@@ -152,12 +152,19 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
   unbounded event list, caller-supplied provenance or model-consumption assertion is accepted. Both fields may be present: a later explicit
   ACK never erases the fact that an earlier imported ACK had unknown provenance.
 - `AttemptSummary { binding: AttemptBinding, route: RoutePin, frozen: Option<FrozenPayload>, prepared_at: At, armed_at: Option<At>,
-  evidence: Option<DeliveryEvidence>, detail: String }`.
+  evidence: Option<DeliveryEvidence>, detail: String, capacity:CapacityState }`.
 - `DeliveryRecord { schema:u16, key:DeliveryKey, generation:Digest, binding:Binding, revision:Revision, eligibility:Eligibility,
   prepares:u8, attempts:Vec<AttemptSummary>, acknowledgment:AcknowledgmentState, held:Option<HoldReason>, annotation:String }`;
   row schema starts at 1.
-- `RecipientControl { binding:Binding, revision:Revision, active:Option<DeliveryKey>, barrier:Option<DeliveryKey>, identity_conflict:bool }`;
-  `GlobalControl { revision:Revision, active_attempts:u8 }`; `Continuity { schema:u16, cutover:At, policy_hash:Digest, local_epoch:u64,
+- `CapacityState::{Held,Released,Retired}` is a fixed-size persisted per-attempt flag; `Retired` is a permanent capacity-only tombstone.
+  `LifetimeRegistration { id:Digest, revision:Revision, home:Digest, boot:Digest, emitter_scope:Digest }` identifies the trusted registered local worker
+  and its complete possible-emitter scope, not a numeric PID. Add `lifetime:LifetimeRegistration` to `AttemptBinding` before prepare/arm.
+  `ActiveOwner { key:DeliveryKey, attempt:AttemptBinding }` includes the exact token/instance/worker/connection and lifetime registration;
+  `CapacityRetirementTarget { owner:ActiveOwner, record_revision:Revision, recipient_revision:Revision, global_revision:Revision }`.
+- `RecipientControl { binding:Binding, revision:Revision, active:Option<ActiveOwner>, barrier:Option<DeliveryKey>, identity_conflict:bool }`;
+  `GlobalControl { revision:Revision, active_attempts:u8, active_index:Vec<ActiveOwner> }` has at most16 entries; count equals index length.
+  `CapacityRetirementResult::{Retired{view:DeliveryView},AlreadyReleased{view:DeliveryView},Unproven,Stale}` grants no delivery authority.
+  `Continuity { schema:u16, cutover:At, policy_hash:Digest, local_epoch:u64,
   enabled:bool, intact:bool }`; `IdReservation { original_id:MessageId, generation:Digest }`.
 - `IdentityResolution::{Unresolved,Unique{recipient_id:AgentId,binding_revision:Revision},Conflict}`;
   `IdentityIndexRow { key:String, resolution:IdentityResolution }`; `IdentityContext { registry:Option<AgentRecord>,
@@ -166,7 +173,7 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
 - `DeliverySnapshot { records:Vec<DeliveryRecord>, ids:Vec<IdReservation>, recipients:Vec<RecipientControl>,
   identities:Vec<IdentityIndexRow>, global:GlobalControl, continuity:Continuity }` exists only for local continuity boundaries (Task 6);
   `EvidenceView { lane:Lane, route:RoutePin, prepared_at:At, armed_at:Option<At>, evidence:Option<DeliveryEvidence>, detail:String,
-  payload_digest:Option<Digest> }`; `DeliveryView { key:DeliveryKey, generation:Digest, binding:Binding, revision:Revision,
+  payload_digest:Option<Digest>, capacity:CapacityState }`; `DeliveryView { key:DeliveryKey, generation:Digest, binding:Binding, revision:Revision,
   eligibility:Eligibility, prepares:u8, attempts:Vec<EvidenceView>, acknowledgment:AcknowledgmentState, held:Option<HoldReason>,
   annotation:String, barrier:Option<DeliveryKey> }` is the redacted inspection form without tokens/frozen bytes.
 - `PrepareInput { key:DeliveryKey, generation:Digest, binding:Binding, attempt:AttemptBinding, route:RoutePin, now:At }`; `ArmInput {
@@ -179,7 +186,11 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
   - `DeliveryResult::{Prepared{record:DeliveryRecord},Armed{record:DeliveryRecord},Applied{view:DeliveryView},Refused{reason:HoldReason}}`;
   `Armed` is durable state, **not** an emission permit.
 - `WireDeliveryStore::apply_delivery(&self, command:DeliveryCommand)->Result<DeliveryResult,StoreError>`;
-  `inspect_delivery(&self,key:&DeliveryKey)->Result<Option<DeliveryView>,StoreError>`. Neither method materializes a full snapshot.
+  `inspect_delivery(&self,key:&DeliveryKey)->Result<Option<DeliveryView>,StoreError>`;
+  `active_delivery_owners(&self)->Result<Vec<CapacityRetirementTarget>,StoreError>` reads only the bounded active index and at most16
+  corresponding point-read records/controls; `retire_orphan_capacity(&self,target:CapacityRetirementTarget)->Result<CapacityRetirementResult,StoreError>`.
+  Retirement obtains proof from the store-owned trusted verifier defined in Task 3, never from the caller. No proof/retirement variant is
+  added to public `DeliveryCommand` or RPC. None of these methods materializes a full snapshot.
 - `TransitionContext { key:DeliveryKey, record:Option<DeliveryRecord>, reservation:Option<IdReservation>,
   recipient:RecipientControl, global:GlobalControl, continuity:Continuity, message:Option<WireMessage>,
   receipt:Option<DeliveryReceipt>, identity:IdentityContext }` contains only the target key and its indexed predicates.
@@ -192,20 +203,43 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
   selector/receipt-alias indexes. No table/recipient/history scan or receipt-alias enumeration is permitted on this path; missing/corrupt
   required metadata refuses rather than rebuilding from history. Independent inspection uses the same bounded key/recipient reads.
 - Prepare atomically requires `global.active_attempts < 16`, `recipient.active.is_none()`, no barrier/conflict and all target predicates;
-  committing Prepared increments the counter and sets the recipient slot together with the lifetime prepare counter. Arm keeps that slot;
-  safe release, Prepared invalidation or terminal settlement clears it/decrements exactly once. Settlement of uncertainty retains the
-  recipient barrier even after freeing active capacity. Duplicate/refused commands change neither capacity nor prepares. Serializable
-  transactions (Mem's single borrow) protect the global/recipient predicates against concurrent keys, not a separate read/count/write.
-  Indefinite retained suppression never counts as active capacity. No aggregate snapshot-size cap may block Arm rejection, settlement,
-  ACK, invalidation or safe suppression. Existing per-row bounds remain binding; reserve fixed space for ACK/hold flags so evidence
-  overflow preserves prior mutation evidence and still records suppression.
+  committing Prepared increments the count, inserts the exact `ActiveOwner` into the bounded index, sets the recipient slot and marks
+  capacity Held together with the lifetime prepare counter. Arm keeps that ownership; safe release, Prepared invalidation or terminal
+  settlement changes Held to Released, removes only that exact indexed/recipient owner and decrements once. Retirement changes Held to
+  Retired with the same exact-owner removal/decrement; it preserves eligibility, mutation uncertainty, original attempt outcome/ACK,
+  lifetime prepares, ID suppression and the affected recipient barrier. It grants no replay/output/new eligibility. A still-live or unproven
+  worker keeps capacity Held and inspectable. Settlement of uncertainty retains the recipient barrier even after freeing active capacity.
+  Only Armed attempts with Held capacity use retirement; unarmed Prepared attempts use existing CAS invalidation. Disconnect alone never
+  retires Armed capacity. Duplicate/refused commands change neither prepares nor capacity.
+- Retirement CAS compares the exact key/attempt token/instance/worker/connection/lifetime registration and record/recipient/global revisions
+  in one native transaction; proof must cover that exact registration revision. A stale target/observation refuses, never clears another
+  attempt's slot, and requires a fresh bounded read and fresh verifier observation rather than blind retries. Released/Retired is durable
+  independently of outcome/ACK, so duplicate retirement or late settlement never decrements twice. An exact historical attempt already
+  Released/Retired returns AlreadyReleased without writes, even if a newer owner exists; stale ownership may never mutate that newer slot.
+  If settlement wins first, retirement
+  observes Released and is idempotent; if retirement wins first, a still-authorized settlement may update only evidence/receipt under the
+  ordinary exact-attempt CAS rules, preserving Retired and the barrier. Stale settlement must re-read/revalidate, never acquire a new
+  connection grant. Lost connection-bound settlement authority stays lost: reconciliation cannot reconstruct it or forge an outcome.
+- Worker exit racing verification either leaves proof Unproven/capacity Held or yields positive proof of complete scope termination;
+  client disconnect, elapsed time, new epoch, missing numeric PID, receipt/ACK or administrative annotation are never such proof. Crash
+  before retirement commit retains capacity; crash after commit/lost reply preserves Retired and exact-once capacity removal on reopen.
+  Late evidence/worker exit cannot create output authority, reset counters or clear the uncertainty barrier. Serializable transactions
+  (Mem's single borrow) protect global/recipient predicates across keys. Indefinite retained suppression and Retired tombstones do not
+  consume active slots. No aggregate snapshot-size cap may block Arm rejection, settlement, ACK, invalidation, retirement or suppression.
+  Existing per-row bounds remain binding; reserve fixed space for capacity/ACK/hold flags, preserving mutation evidence on overflow.
+- `CapacityRetirementDelta { record:Option<DeliveryRecord>, recipient:Option<RecipientControl>, global:Option<GlobalControl>,
+  result:CapacityRetirementResult }` follows the same bounded point-update/None-means-no-write rules as `DeliveryDelta`, with no receipt,
+  reservation or eligibility change. Define
+  `transition_capacity_retirement(ctx:TransitionContext,target:CapacityRetirementTarget)->Result<CapacityRetirementDelta,StoreError>` as a
+  pure exact-owner/revision predicate/delta function, not a store mutation or proof API. Only a store's internally verified retirement path may
+  commit its delta. Mem uses a module-local lifetime-verifier fixture for conformance; ordinary production Mem retirement returns Unproven.
 - `canonical_generation(msg:&WireMessage)->Result<Digest,StoreError>`;
   `canonical_payload(generation:Digest,renderer:&str,bytes:&[u8])->Result<Digest,StoreError>` in `c14n.rs`.
 
 - [ ] **Step 1: Write failing unit tests.** Local test fixture `golden_message()` uses
   id=thread_id=`urn:uuid:00000000-0000-7000-8000-000000000001`, all options None, sender_name=`alice`, to=AgentName(`bob`), kind=Mail,
   urgency=Normal, durable=false, subject=`Hello`, body=`Body`, created_at=`2026-11-06T00:00:00.000Z`.
-  `managed_c14n_golden_fields_and_selectors` compares literal LP byte vectors and independent SHA-256 constants for all 16 fields in spec
+  `managed_c14n_golden_fields_and_selectors` compares literal LP byte vectors and independent SHA-256 constants for all 15 fields in spec
   §4; cover absent/present options, false/true, Unicode without normalization, each selector tag and custom role. Assert changing
   reply/correlation/selector kind changes generation, stored whitespace is preserved, At encodes exactly 24 bytes, payload includes raw
   32-byte digest and count `u64be(1)`. Assertion anchors for the named tests (each variable is the observed result of the fixture operation
@@ -268,6 +302,11 @@ assert!(matches!(fourth_prepare, DeliveryResult::Refused { reason: HoldReason::B
   `managed_capacity_predicates_are_atomic` races the last global slot across recipients and two keys of one recipient; exactly one wins,
   refused keys keep their own prepare counters, and unrelated retained history cannot consume a target's budget. Mem uses sequential
   competing-command/interleaving cases; Tasks 3–4 run actual concurrent durable writer races without sharing non-Sync MemStore.
+  `managed_capacity_retirement_preserves_uncertainty` fills16 slots, retires one exactly owned Armed attempt with verified ended-scope
+  fixture evidence and admits one unrelated recipient; original ID and later IDs for the affected recipient remain barred, with unchanged
+  outcomes/ACK/prepares. `managed_capacity_retirement_race_orders` exercises settlement→retirement and retirement→still-authorized
+  settlement, duplicate retirement and worker exit before/during/after verification: one decrement total, permanent Retired where applicable,
+  no other/newer attempt's slot cleared and no new output or barrier clearance.
 - [ ] **Step 5: Commit gate.** Fresh reviewer checks full transition table, empty post-write rejection allow-list and no model-action
   guarantee; commit `feat(core): add atomic peer delivery reference semantics` with the Freya trailer.
 
@@ -279,6 +318,35 @@ assert!(matches!(fourth_prepare, DeliveryResult::Refused { reason: HoldReason::B
 `apply_delivery_in(tx:&redb::WriteTransaction,command:DeliveryCommand)->Result<DeliveryResult,StoreError>`. Table names exactly
 `__wire_delivery_v1`, `__wire_delivery_ids_v1`, `__wire_delivery_control_v1`; strict versioned JSON values, collision-free key encoding
 (length-prefixed original ID and registry ID, hex key).
+
+**Internal lifetime/fence interfaces:** Add `crates/store/src/wire_delivery_lifetime.rs` (and its module declaration) for the trusted local
+verifier shared by redb/ferro. Internal verifier/observation visibility is crate-private for the two owning backend modules, never a
+public construction/serialization interface. `LocalLifetimeVerifier::observe(&self,target:&CapacityRetirementTarget)->Result<Option<CapacityOnlyObservation>,StoreError>`
+returns an opaque, non-serializable observation with private constructors. It binds the exact `ActiveOwner` and registered
+scope revision; it is not a `DeliveryEvidence` or no-mutation proof. Production stores own this verifier and accept neither caller booleans,
+proof structs nor caller-selected verifier implementations. Test-only injection stays owning-module/conformance fixtures. An internal
+`retire_capacity_in(tx:&redb::WriteTransaction,target:&CapacityRetirementTarget,observation:CapacityOnlyObservation)->Result<CapacityRetirementResult,StoreError>`
+validates the exact observation/target and runs the pure capacity delta. The ferro equivalent uses `&mut super::Txn` in Task 4. Obtain the
+observation outside the transaction and all store/global locks; its positive proof must be irreversible for the registered lifetime, then
+CAS current exact ownership and all three revisions inside the native transaction. Changed registration/coverage refuses stale proof.
+
+At trusted admission, pin authority/physical-home identity, a trusted kernel boot identity and a unique immutable lifetime registration for
+the exact instance/worker and all possible local emitters (including hook client and vendor descendants) before granting any permit.
+The stable scope identity covers future descendants through owned creation rights/containment, not a one-time process list; it cannot
+silently acquire a new emitter after verification. Broker/verifier admission closes the scope against unregistered emission: if complete
+coverage cannot be established, no managed Arm is allowed. Use owned kernel lifetime handles and a closed emitter-registration scope, never numeric PID absence/reuse inference. The concrete
+same-boot route requires the owned worker joined, its output/child-creation rights irreversibly closed, and positive termination or an
+irreversible trusted kernel fence of **every** registered potentially emitting process/descendant/endpoint. Main-child exit or join alone is
+insufficient; missing descendants/handles/coverage returns Unproven. No new Host component or external authority/service is assumed.
+
+A second concrete recovery route after a full kernel reboot reads a validated local procfs kernel boot identity, checks the same pinned
+trusted physical home/authority and admission boot identity, and positively establishes that every registered old local emitter belonged to
+the previous boot. A verified different boot on that same home proves old local processes/descendants ended, even after broker/store reopen;
+a hostname, daemon epoch, caller boot string, moved/copied store or restored snapshot cannot supply this proof. Missing/unsupported home or
+kernel provenance returns Unproven. Mutation already submitted to a vendor may persist; retirement still grants no nonmutation/consumption
+claim. Same-boot daemon restart that lost all usable lifetime handles retains capacity unless a complete trusted irreversible fence can be
+verified; no liveness promise bypasses that boundary. Registration/boot provenance and active ownership survive ordinary reopen/migration;
+restore remains disabled and cannot manufacture lifetime proof.
 
 - [ ] **Step 1: Write failing unit tests.** `managed_redb_transaction_conformance` invokes the shared assertions; `managed_redb_cas_reopen`:
   competing writer handles serialize, one prepare wins, counters/barrier survive close/reopen. Inject failure before commit and after
@@ -302,6 +370,13 @@ assert_eq!(reopened_barrier, committed_barrier);
   refuse managed operations without silently creating replacements; pre-enrollment ordinary stores retain their old format. Run the shared
   ACK/evidence and growing-history lookup assertions; competing keys must atomically enforce global16/recipient1 without a scan. Reopen
   must preserve independent acknowledgment fields and original attempt evidence, including an ACK after Armed before settlement.
+  Add `managed_redb_orphan_capacity_reopen`: persist16 Armed orphans, reopen, and assert unrelated prepare refuses until valid internally
+  verified retirement; Unproven retains16, valid retirement yields15 and permits one unrelated prepare. Original/later affected-recipient
+  IDs stay suppressed. `managed_redb_retirement_commit_faults` injects before-commit, after-commit/before-reply and reopen: Retired flag,
+  index removal, recipient owner and count commit together; repeat/late authorized settlement cannot double-decrement. Reuse the shared
+  race-order assertions. `managed_lifetime_proof_scope_and_boot` rejects wrong key/token/instance/worker/connection/registration/revision,
+  incomplete emitter coverage, live descendant, stale observations and reused process identities; tests joined-complete-scope and pinned
+  same-home prior-boot proof positively, and rejects new epoch/caller boot/snapshot/moved-home claims. These are fixtures, not runtime proof.
 - [ ] **Step 5: Commit gate.** Fresh review checks durable commit boundaries and no policy activation; commit `feat(store): persist redb
   peer delivery transitions` with the Freya trailer.
 
@@ -311,8 +386,10 @@ assert_eq!(reopened_barrier, committed_barrier);
 `crates/store/src/any.rs`. Unit tests in the owning modules.
 
 **Interfaces:** Consume Tasks 1–3; produce `impl WireDeliveryStore for FerroStore`, forwarding `impl WireDeliveryStore for AnyStore`,
-internal `apply_delivery_in(tx:&mut super::Txn,command:DeliveryCommand)->Result<DeliveryResult,StoreError>` in the ferro module. Use the
-same logical collection names/schema/key encoding as redb, within existing `with_write` transaction machinery.
+internal `apply_delivery_in(tx:&mut super::Txn,command:DeliveryCommand)->Result<DeliveryResult,StoreError>` in the ferro module, plus
+`retire_capacity_in(tx:&mut super::Txn,target:&CapacityRetirementTarget,observation:CapacityOnlyObservation)->Result<CapacityRetirementResult,StoreError>`
+using Task 3's private shared verifier. Use the same logical collection names/schema/key encoding as redb, within existing `with_write`
+transaction machinery.
 
 - [ ] **Step 1: Write failing unit tests.** `managed_ferro_transaction_conformance` runs shared assertions;
   `managed_any_store_forwards_delivery` covers both variants; `managed_ferro_atomic_reopen` injects append/sync errors and validates no
@@ -330,14 +407,19 @@ assert_eq!(reopened_barrier, committed_barrier);
 - [ ] **Step 3: Implement native context/delta application and forwarding.** Use one durable `with_write` per transition, including
   reservations, binding revision, indexed point reads, global/recipient capacity predicates and receipt log. Apply only `DeliveryDelta`;
   retained history must not affect hot-operation decoding/work. Raw remote authentication conveys no permit authority.
-  **Plan proposal requiring Lead acceptance:** implement native delivery transactions for embedded FerroStore; an `Inner::Remote` handle
-  returns `UnsupportedBackend` for the new delivery trait while preserving unrelated remote APIs. This is a persistence-support limitation,
-  separate from remote permit authority, and an activation blocker for deployments requiring that backend until a compatible persistence
-  path is separately reviewed. No managed prepare/arm/settle verbs are added to remote RPC. Enforce both schema step and required
-  collection validation on reopen; never synthesize a missing managed history.
+  **Lead-accepted disabled-v1 limitation** (`urn:uuid:01a1aef6-fede-73a1-a562-68d49f21594c`): implement native delivery transactions for
+  embedded FerroStore; every `Inner::Remote` handle, including a same-host Unix daemon-backed store, returns `UnsupportedBackend` for the
+  new delivery trait while preserving unrelated remote APIs. Installation/activation for deployments requiring that backend remains
+  BLOCKED until a compatible persistence path is separately reviewed. No embedded fallback or new ledger is implied; this acceptance is
+  neither Owner approval nor implementation/activation GO. No managed prepare/arm/settle verbs are added to remote RPC. Enforce both
+  schema step and required collection validation on reopen; never synthesize a missing managed history.
 - [ ] **Step 4: Run the Step 2 commands**; expect PASS including two local handles racing CAS, reopen counters, recipient ordering barrier
   and unknown-format refusal. Mem/redb/ferro must yield identical conformance outcomes, including growing-history point-read/work counts,
   global16/recipient1 atomic refusal with unchanged losing-key prepares, and independent ACK/evidence persistence across reopen.
+  `managed_ferro_orphan_capacity_reopen` and `managed_ferro_retirement_commit_faults` repeat Task 3's 16-orphan, proof refusal, race, atomic
+  fault/lost-reply and exact-once retirement assertions with native ferro transactions and reopened handles; AnyStore forwards both
+  retirement and bounded active discovery. `managed_any_store_remote_delivery_unsupported` covers TCP and same-host Unix daemon-backed
+  `Inner::Remote`: no retirement/prepare fallback, new ledger or external handoff; unrelated remote APIs retain their behavior.
 - [ ] **Step 5: Commit gate.** Fresh review checks native serialization rather than read-then-write emulation; commit `feat(store): add
   ferro peer delivery transactions` with the Freya trailer.
 
@@ -359,7 +441,7 @@ old/new selector or alias keys when changed; reject ambiguous public mutations w
 constructed call paths, never caller-provided strings/remote fields. Core applies equivalent identity/receipt/prune invariants under its
 own borrow without depending on fl-store. Before enrollment, preserve existing ordinary mutation behavior; required managed metadata is
 validated only on the enrolled path. Add internal
-`project_delivery_sync(batch:&SyncBatch)->Result<SyncBatch,StoreError>` for the proposal below; never infer permit authority from projection.
+`project_delivery_sync(batch:&SyncBatch)->Result<SyncBatch,StoreError>` for the accepted limitation below; never infer permit authority from projection.
 
 - [ ] **Step 1: Write failing tests.** `managed_all_mutation_surfaces_fenced` enumerates ordinary put/delete, batch/raw op, Transaction,
   session commit, remote raw commit, inbound sync, compact/reopen, typed send/import/update/prune, registry update/import/delete and
@@ -384,7 +466,8 @@ assert_eq!(reimported_view.prepares, pruned_view.prepares);
   them to grant permission. Imported receipts may suppress/display but never enroll, relocate, grant or clear uncertainty; an unproven ACK
   updates `acknowledgment.legacy_unknown`, not `AttemptSummary.evidence`. Atomic ACK projection preserves any original mutation outcome.
   Fence inbound ordinary dependent records, remote cache-fill (`fill_doc_miss`/`install_fetched_doc`) and lazy fetch as well as writes.
-- [ ] **Step 3a: Implement the sequence-preserving projection only after Lead acceptance of this plan proposal.** Source basis:
+- [ ] **Step 3a: Implement the Lead-accepted sequence-preserving projection.** Lead acceptance
+  `urn:uuid:01a1aef6-fede-73a1-a562-68d49f21594c` accepts this disabled-v1 limitation, not Owner approval or implementation/activation GO. Source basis:
   `sync.rs:SyncOp:14` already supports `DeleteDoc`; `mod.rs:prepare_sync_batches:4509` requires the exact next sequence and nonempty input;
   `:admit_inbound:4551` drops non-schema reserved deletes while the containing sequence still advances, even when all applied ops drop.
   `:register_committed_for:4266` currently clones local ops, and `:apply_sync_batches:4216` forwards the original inbound batch. Neither is
@@ -398,12 +481,13 @@ assert_eq!(reimported_view.prepares, pruned_view.prepares);
   adapter retries, remote sync serialization and any replay path. Inbound marker handling must bypass ordinary protected-mutation rejection
   only for this exact constant and leave all delivery records unchanged. Projection failures use bounded generic diagnostics without raw
   input/private fields; error/log paths and retry buffers may not retain or emit the unprojected batch. Do not weaken reserved/data fences.
-  **Bounded fail-closed reopen proposal:** current `sync.rs` documents process-local pending/cursors; `write_through_disk_commit_survives_reopen_without_an_adapter`
+  **Lead-accepted bounded fail-closed reopen limitation:** current `sync.rs` documents process-local pending/cursors; `write_through_disk_commit_survives_reopen_without_an_adapter`
   shows reopen has no adapter and `synced_seq=0`. Projection does not make pending retries durable. Keep a failed projected batch queued
   unchanged for in-process retry; after reopen of a nonempty managed store, refuse adapter reattachment/replay under this v1 plan rather
   than guess a cursor or resend earlier sequences. No automatic sync resume or recovery protocol is proposed. A deployment requiring sync
-  across reopen remains disabled until separately reviewed durable egress/cursor continuity exists; this limitation is a Lead-review and
-  activation blocker, distinct from remote permit authority. Scope this refusal to the managed-store path; preserve unmanaged sync behavior.
+  across reopen has installation/activation BLOCKED until separately reviewed durable egress/cursor continuity exists; no embedded fallback,
+  new ledger or implied readiness follows acceptance. This limitation is distinct from remote permit authority. Scope this refusal to the
+  managed-store path; preserve unmanaged sync behavior.
   Local continuity export is never peer-sync recovery permission.
 - [ ] **Step 4: Add** `managed_identity_alias_conflict_holds`: unresolved name later uniquely bound works only without prior conflict;
   distinct armed aliases retain both histories and hold. Add `managed_prune_identical_reimport_stays_suppressed`: prune eligible retained
@@ -475,7 +559,10 @@ assert_eq!(legacy_handoffs, 0);
 - [ ] **Step 5: Run Step 2 commands**; expect PASS; additionally require reopened archive/migration preserves three prepares and recipient
   barrier. Add `managed_ack_and_outcome_survive_continuity`: Armed/no-outcome, settled accepted and unconfirmed fixtures each receive
   explicit ACK; legacy imported ACK then explicit ACK retains both provenance flags. Reopen/export/restore/migration preserve ACK and original
-  outcomes independently, without new attempts, counter reset, barrier clearance or model-consumption claim. No managed integration proceeds
+  outcomes independently, without new attempts, counter reset, barrier clearance or model-consumption claim.
+  `managed_capacity_tombstones_survive_continuity` verifies Held/Released/Retired exact-attempt flags, bounded active index/count consistency
+  and lifetime admission provenance through reopen/export/disabled restore/migration; duplicate retirement or late settlement after reopen
+  changes no capacity twice and cannot clear a different attempt. Disabled restore itself supplies no fence proof. No managed integration proceeds
   until Tasks 5–6 reviews pass.
 - [ ] **Step 6: Commit gate.** Fresh review checks absence of automatic resume and distinction between local continuity export and peer
   synchronization; commit `feat(store): preserve disabled peer delivery continuity` with the Freya trailer.
@@ -494,6 +581,13 @@ transcript_root:PathBuf, policy_hash:Digest }` in policy module; default is disa
 `ManagedBroker::prepare(&self,worker:&WorkerContext,input:PrepareInput)->Result<PreparedAttempt,StoreError>`;
 `arm(&self,worker:&WorkerContext,prepared:PreparedAttempt,frozen:FrozenPayload,now:At)->Result<EmissionPermit,StoreError>`;
 `settle(&self,worker:&WorkerContext,input:SettleInput)->Result<DeliveryView,StoreError>`. Store Armed alone never creates a permit.
+The broker obtains each `AttemptBinding.lifetime` from Task 3's trusted local admission registry for the verified worker/instance and complete
+emitter scope before prepare; caller fields cannot construct or revise registrations. Define internal
+`ManagedBroker::reconcile_orphan_capacity(&self)->Result<Vec<CapacityRetirementResult>,StoreError>`: inspect only
+`store.active_delivery_owners()` (at most16), invoke `store.retire_orphan_capacity(target)` once per candidate, and leave stale/unproven
+entries held/inspectable. Startup/observed worker exit may request this bounded capacity reconciliation; it performs no prepare, model
+probe or replay and has no public RPC/CLI verb. Broker restart alone grants no proof. The verifier performs local lifetime checks outside
+native transactions; it never inherits lost settlement or emission authority.
 `render_peer_envelope(msg:&WireMessage)->Result<Vec<u8>,StoreError>` in render module pins the existing envelope exactly.
 
 Protocol module defines negotiated capability `peer_delivery_v1`, version=1; `HookClaim { session_id:String, transcript_path:PathBuf,
@@ -529,6 +623,11 @@ assert!(foreign_uid_prepare.is_err());
   read-only preflight/final serialization. Durable arm commit precedes first possible mutation; only first confirmed Arm reply on bound live
   connection grants permit. Arm timeout/error/lost reply forbids sending, even if Inspect shows Armed. Disconnect invalidates only Prepared
   via CAS, never Armed. Reject arbitrary caller frozen bytes; renderer uses stored fields. No lock/transaction spans vendor I/O.
+  Complete Task 3's trusted lifetime admission/closed-scope tracking for direct hook output, steering endpoints and queue child descendants;
+  a disconnected hook client or surviving vendor child is potentially emitting until positive ended/fenced proof. Worker exit may trigger
+  capacity-only reconciliation; it never creates a mutation outcome. Retired remains independent of ACK/evidence and permanent on later
+  settlement. `managed_broker_orphan_reconciliation_is_capacity_only` proves copied/forged claims, disconnect, timeout, daemon replacement,
+  PID absence and new epoch keep slots held; complete verified scope termination retires once, with zero permits/replays/settlement transfers.
 - [ ] **Step 5: Run Step 2 commands**; expect PASS plus max-connections/attempt-capacity/20s lifetime tests, handshake mismatch, redacted
   Inspect, malformed/oversize frames and remote prepare rejection. Existing daemon worker/queue caps remain unchanged; capacity never loops.
 - [ ] **Step 6: Commit gate.** Fresh review checks local authority and one-use permit construction; commit `feat(wire): broker disabled
@@ -701,6 +800,15 @@ assert_eq!(handoffs_after_restart, handoffs_before_restart);
   JSON1MiB/frame+14, summaries3×8KiB/row32KiB, error300 chars/annotation4KiB, connections64/active16/recipient1; existing128/512/1024/128
   caps stay fixed. Fake-clock deadline tests cover RPC5s, prepared20s, steer10s, queue60s, push85s, hook20s/stdin2s/stdout2s. Exhaustion
   holds or refuses without legacy fallback, spin or inference probe.
+  Add black-box `managed_sixteen_orphans_restart_capacity_retirement`: fill16 Armed attempts on distinct recipients, lose their
+  connection-bound settlement paths and restart the broker; a 17th unrelated recipient cannot prepare. An unproven/live old emitter keeps
+  the refusal. After valid trusted exact-scope retirement, one unrelated prepare succeeds; the retired original and later IDs at its
+  affected recipient remain suppressed. Assert zero new output, unchanged original outcome/ACK/prepares/barrier and no forged settlement.
+  `managed_retirement_settlement_restart_races` covers both settlement/retirement orders, worker-exit races, duplicate/restarted retirement,
+  stale/wrong scope or revision, reused process identity, crash before/after commit/lost reply and late authorized settlement: exactly one
+  count decrement, no different/newer attempt owner cleared and tombstone persists. Fixtures positively close/join every registered emitter;
+  test-only lifetime providers in isolated conformance binaries exercise pinned boot transitions where a real reboot is unavailable. No
+  production flag/proof endpoint selects synthetic observations, and fixture boot evidence grants no installed-runtime approval.
 - [ ] **Step 5: Run Step 2 command and store continuity subprocess tests**; expect PASS. Run existing focused operator, other-vendor,
   route-replacement and state-sync regression modules; require their existing assertions pass. Never equate accepted input/stdout completion
   with model consumption or exactly-once effects.
@@ -751,11 +859,13 @@ fallback or grant constructor.
 
 Remaining gaps are activation evidence, not delegated implementation assumptions: exact installed transcript schema and hook host behavior;
 installed Codex build/method contracts; all resolved executable/wrapper/daemon/store writer paths and digests; compatible old/open-process
-fencing and continuity attestation. The evidence template records these as unverified. Two additional plan proposals require explicit Lead
-acceptance: Task 4's remote-backed persistence support limitation, and Task 5's constant reserved-delete sync projection with fail-closed
-adapter reattachment after managed-store reopen. Deployments depending on either unsupported path remain disabled until separately reviewed
-persistence/egress continuity resolves that blocker. Neither proposal grants remote permit authority or forbids all remote persistence; the
-marker carries no distributed delivery evidence/authority. Public docs include no private notes or operational configuration.
+fencing and continuity attestation. The evidence template records these as unverified. Lead message
+`urn:uuid:01a1aef6-fede-73a1-a562-68d49f21594c` accepts Task 4's `Inner::Remote` persistence limitation (including same-host Unix
+daemon-backed stores) and Task 5's constant reserved-delete projection plus managed reopen/reattachment refusal as disabled-v1 limitations.
+Installation/activation for deployments depending on either unsupported path remains BLOCKED pending separately reviewed persistence/egress
+continuity; no embedded fallback, new ledger, implied readiness, Owner approval or implementation/activation GO follows acceptance. Ordinary/
+unmanaged behavior remains unchanged. These limitations grant no remote permit authority; the marker carries no distributed delivery
+evidence/authority. Public docs include no private notes or operational configuration.
 
 This plan and the unchanged snapshot are ready for review as documentation. Implementation commands, tests and commits above have not been
 executed by this planning work. The next decision is plan acceptance and a separate explicit implementation GO; activation remains a later
