@@ -1,0 +1,456 @@
+//! Length-prefixed frames. Control messages are one UTF-8 JSON frame.
+//! Line fragments carry raw bytes behind a fixed header.
+
+use std::io::{Read, Write};
+
+use crate::types::{
+    HostError, HostEvent, HostRequest, HostResponse, LINE_HEADER_LEN, MAX_EVENT_ENVELOPE,
+    MAX_FRAGMENTS, MAX_FRAME_PAYLOAD, MAX_LINE_BYTES, MAX_REASSEMBLY_BYTES, MAX_UNAUTH_PAYLOAD,
+    SessionEpoch, SessionId,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameKind {
+    Challenge = 1,
+    Hello = 2,
+    Proof = 3,
+    Welcome = 4,
+    Request = 5,
+    Response = 6,
+    Line = 7,
+    Event = 8,
+}
+
+impl FrameKind {
+    pub fn from_u8(byte: u8) -> Result<Self, HostError> {
+        Ok(match byte {
+            1 => Self::Challenge,
+            2 => Self::Hello,
+            3 => Self::Proof,
+            4 => Self::Welcome,
+            5 => Self::Request,
+            6 => Self::Response,
+            7 => Self::Line,
+            8 => Self::Event,
+            _ => {
+                return Err(HostError::Protocol(format!("unknown frame type {byte}")));
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub kind: FrameKind,
+    pub payload: Vec<u8>,
+}
+
+/// `len` is the on-wire length field: 1 type byte plus the payload.
+/// Checked in `u64` before any `usize` cast or allocation.
+pub fn checked_frame_len(len: u32) -> Result<usize, HostError> {
+    checked_len(len, MAX_FRAME_PAYLOAD)
+}
+
+pub fn checked_unauth_len(len: u32) -> Result<usize, HostError> {
+    checked_len(len, MAX_UNAUTH_PAYLOAD)
+}
+
+fn checked_len(len: u32, max_payload: usize) -> Result<usize, HostError> {
+    let len64 = u64::from(len);
+    let max = 1u64
+        .checked_add(max_payload as u64)
+        .ok_or(HostError::FrameLength)?;
+    if len64 == 0 || len64 > max {
+        return Err(HostError::FrameLength);
+    }
+    let total = 4u64.checked_add(len64).ok_or(HostError::FrameLength)?;
+    let _ = usize::try_from(total).map_err(|_| HostError::FrameLength)?;
+    usize::try_from(len64).map_err(|_| HostError::FrameLength)
+}
+
+/// Total bytes on the wire for a payload of `payload_len` (the type byte is extra).
+pub fn frame_total_len(payload_len: u64) -> Result<u64, HostError> {
+    if payload_len > MAX_FRAME_PAYLOAD as u64 {
+        return Err(HostError::FrameLength);
+    }
+    4u64.checked_add(1)
+        .and_then(|n| n.checked_add(payload_len))
+        .ok_or(HostError::FrameLength)
+}
+
+pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), HostError> {
+    let body = 1usize
+        .checked_add(frame.payload.len())
+        .ok_or(HostError::FrameLength)?;
+    let len = u32::try_from(body).map_err(|_| HostError::FrameLength)?;
+    let _ = checked_frame_len(len)?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(&[frame.kind as u8])?;
+    writer.write_all(&frame.payload)?;
+    Ok(())
+}
+
+pub fn read_frame(reader: &mut impl Read) -> Result<Frame, HostError> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf);
+    let body_len = checked_frame_len(len)?;
+    let mut body = vec![0u8; body_len];
+    reader.read_exact(&mut body)?;
+    decode_body(body)
+}
+
+pub(crate) fn decode_body(mut body: Vec<u8>) -> Result<Frame, HostError> {
+    if body.is_empty() {
+        return Err(HostError::FrameLength);
+    }
+    let kind = FrameKind::from_u8(body[0])?;
+    body.remove(0);
+    Ok(Frame {
+        kind,
+        payload: body,
+    })
+}
+
+pub fn encode_request(request: &HostRequest) -> Result<Frame, HostError> {
+    if let HostRequest::Spawn { spec, .. } = request {
+        spec.validate()?;
+    }
+    if !crate::supports_message(0, request.op_name()) && request.op_name() != "resize" {
+        return Err(HostError::Protocol("unknown request".into()));
+    }
+    let payload =
+        serde_json::to_vec(request).map_err(|err| HostError::Protocol(err.to_string()))?;
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    Ok(Frame {
+        kind: FrameKind::Request,
+        payload,
+    })
+}
+
+pub fn decode_request(frame: &Frame) -> Result<HostRequest, HostError> {
+    if frame.kind != FrameKind::Request {
+        return Err(HostError::Protocol("expected a request frame".into()));
+    }
+    if frame.payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    let request: HostRequest = serde_json::from_slice(&frame.payload)
+        .map_err(|err| HostError::Protocol(err.to_string()))?;
+    if let HostRequest::Spawn { spec, .. } = &request {
+        spec.validate()?;
+    }
+    Ok(request)
+}
+
+pub fn encode_response(response: &HostResponse) -> Result<Frame, HostError> {
+    let payload =
+        serde_json::to_vec(response).map_err(|err| HostError::Protocol(err.to_string()))?;
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    Ok(Frame {
+        kind: FrameKind::Response,
+        payload,
+    })
+}
+
+pub fn decode_response(frame: &Frame) -> Result<HostResponse, HostError> {
+    if frame.kind != FrameKind::Response {
+        return Err(HostError::Protocol("expected a response frame".into()));
+    }
+    serde_json::from_slice(&frame.payload).map_err(|err| HostError::Protocol(err.to_string()))
+}
+
+pub fn line_fragment(
+    session: &SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+    more: bool,
+    raw: &[u8],
+) -> Result<Frame, HostError> {
+    if raw.is_empty() && more {
+        return Err(HostError::Protocol(
+            "an empty raw fragment must be the sole final frame".into(),
+        ));
+    }
+    let payload = encode_line_payload(session, epoch, seq, more, raw)?;
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    Ok(Frame {
+        kind: FrameKind::Line,
+        payload,
+    })
+}
+
+pub fn fragment_line(
+    session: &SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+    raw: &[u8],
+) -> Result<Vec<Frame>, HostError> {
+    if raw.len() > MAX_LINE_BYTES {
+        return Err(HostError::EventTooLarge);
+    }
+    if raw.is_empty() {
+        return Ok(vec![line_fragment(session, epoch, seq, false, raw)?]);
+    }
+    let chunk = MAX_FRAME_PAYLOAD - LINE_HEADER_LEN;
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        if frames.len() >= MAX_FRAGMENTS {
+            return Err(HostError::EventTooLarge);
+        }
+        let end = (offset + chunk).min(raw.len());
+        let more = end < raw.len();
+        frames.push(line_fragment(session, epoch, seq, more, &raw[offset..end])?);
+        offset = end;
+    }
+    Ok(frames)
+}
+
+fn encode_line_payload(
+    session: &SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+    more: bool,
+    raw: &[u8],
+) -> Result<Vec<u8>, HostError> {
+    let name = session.as_str().as_bytes();
+    if name.len() > 64 {
+        return Err(HostError::Protocol(
+            "session id does not fit the line header".into(),
+        ));
+    }
+    let total = LINE_HEADER_LEN
+        .checked_add(raw.len())
+        .ok_or(HostError::FrameLength)?;
+    if total > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    let mut payload = vec![0u8; LINE_HEADER_LEN + raw.len()];
+    payload[0] = u8::try_from(name.len()).unwrap_or(0);
+    payload[1..1 + name.len()].copy_from_slice(name);
+    payload[65..73].copy_from_slice(&epoch.0.to_be_bytes());
+    payload[73..81].copy_from_slice(&seq.to_be_bytes());
+    payload[81] = u8::from(more);
+    payload[LINE_HEADER_LEN..].copy_from_slice(raw);
+    Ok(payload)
+}
+
+struct LineHeader<'a> {
+    session: SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+    more: bool,
+    raw: &'a [u8],
+}
+
+fn decode_line_header(payload: &[u8]) -> Result<LineHeader<'_>, HostError> {
+    if payload.len() < LINE_HEADER_LEN || payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    let session_len = usize::from(payload[0]);
+    if session_len == 0 || session_len > 64 {
+        return Err(HostError::Protocol("line session length".into()));
+    }
+    if payload[1 + session_len..65].iter().any(|byte| *byte != 0) {
+        return Err(HostError::Protocol("line session padding".into()));
+    }
+    let name = std::str::from_utf8(&payload[1..1 + session_len])
+        .map_err(|_| HostError::Protocol("line session is not utf-8".into()))?;
+    let session = SessionId::new(name)?;
+    let epoch = SessionEpoch(u64::from_be_bytes(payload[65..73].try_into().unwrap()));
+    let seq = u64::from_be_bytes(payload[73..81].try_into().unwrap());
+    let more = match payload[81] {
+        0 => false,
+        1 => true,
+        _ => return Err(HostError::Protocol("line more flag".into())),
+    };
+    Ok(LineHeader {
+        session,
+        epoch,
+        seq,
+        more,
+        raw: &payload[LINE_HEADER_LEN..],
+    })
+}
+
+#[derive(Debug)]
+struct OpenLine {
+    session: SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+}
+
+#[derive(Debug)]
+pub struct LineReassembler {
+    open: Option<OpenLine>,
+    raw: Vec<u8>,
+    fragments: usize,
+    completed: Option<HostEvent>,
+}
+
+impl LineReassembler {
+    pub fn new() -> Self {
+        Self {
+            open: None,
+            raw: Vec::new(),
+            fragments: 0,
+            completed: None,
+        }
+    }
+
+    pub fn fragment_count(&self) -> usize {
+        self.fragments
+    }
+
+    pub fn allocated(&self) -> usize {
+        self.raw
+            .len()
+            .saturating_add(self.fragments.saturating_mul(LINE_HEADER_LEN))
+    }
+
+    pub fn completed(&self) -> Option<&HostEvent> {
+        self.completed.as_ref()
+    }
+
+    pub fn push_frame(&mut self, frame: &Frame) -> Result<Option<HostEvent>, HostError> {
+        if frame.kind != FrameKind::Line {
+            if self.fragments > 0 {
+                return Err(HostError::Protocol(
+                    "control frame interleaved with a line chain".into(),
+                ));
+            }
+            return Err(HostError::Protocol(
+                "line reassembler received a control frame".into(),
+            ));
+        }
+        let header = decode_line_header(&frame.payload)?;
+        if header.raw.is_empty() && (header.more || self.fragments > 0) {
+            return Err(HostError::Protocol(
+                "empty raw fragments are only a single final empty line".into(),
+            ));
+        }
+        if let Some(open) = &self.open
+            && (open.session != header.session
+                || open.epoch != header.epoch
+                || open.seq != header.seq)
+        {
+            return Err(HostError::Protocol(
+                "line fragment identity does not match the open chain".into(),
+            ));
+        }
+        let new_fragments = self.fragments.saturating_add(1);
+        if new_fragments > MAX_FRAGMENTS {
+            return Err(HostError::EventTooLarge);
+        }
+        let new_raw = self
+            .raw
+            .len()
+            .checked_add(header.raw.len())
+            .ok_or(HostError::EventTooLarge)?;
+        if new_raw > MAX_LINE_BYTES {
+            return Err(HostError::EventTooLarge);
+        }
+        let new_alloc = new_raw.saturating_add(new_fragments.saturating_mul(LINE_HEADER_LEN));
+        if new_alloc > MAX_REASSEMBLY_BYTES || LINE_HEADER_LEN > MAX_EVENT_ENVELOPE {
+            return Err(HostError::EventTooLarge);
+        }
+        if self.open.is_none() {
+            self.open = Some(OpenLine {
+                session: header.session.clone(),
+                epoch: header.epoch,
+                seq: header.seq,
+            });
+        }
+        self.raw.extend_from_slice(header.raw);
+        self.fragments = new_fragments;
+        if header.more {
+            return Ok(None);
+        }
+        let open = self
+            .open
+            .take()
+            .ok_or_else(|| HostError::Protocol("finished a line with no identity".into()))?;
+        let event = HostEvent::Line {
+            session: open.session,
+            session_epoch: open.epoch,
+            seq: open.seq,
+            bytes: std::mem::take(&mut self.raw),
+        };
+        self.fragments = 0;
+        self.completed = Some(event.clone());
+        Ok(Some(event))
+    }
+}
+
+impl Default for LineReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub struct ResponseCorrelator {
+    last: u64,
+    outstanding: Option<u64>,
+}
+
+impl ResponseCorrelator {
+    pub fn new() -> Self {
+        Self {
+            last: 0,
+            outstanding: None,
+        }
+    }
+
+    pub fn submit(&mut self, id: u64) -> Result<(), HostError> {
+        if id == 0 || self.outstanding.is_some() || id <= self.last {
+            return Err(HostError::Protocol("request id refused".into()));
+        }
+        self.outstanding = Some(id);
+        self.last = id;
+        Ok(())
+    }
+
+    pub fn complete(&mut self, id: u64) -> Result<(), HostError> {
+        if self.outstanding != Some(id) {
+            return Err(HostError::Protocol("response id refused".into()));
+        }
+        self.outstanding = None;
+        Ok(())
+    }
+}
+
+impl Default for ResponseCorrelator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub struct EventSeq {
+    next: u64,
+}
+
+impl EventSeq {
+    pub fn at(next: u64) -> Self {
+        Self { next }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<u64, HostError> {
+        let value = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| HostError::Protocol("event seq exhausted".into()))?;
+        Ok(value)
+    }
+}

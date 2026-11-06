@@ -91,6 +91,14 @@ package = "fl-install"
 paths = ["crates/install/**"]
 
 [[components]]
+id = "fl_host_proto"
+title = "Host Protocol"
+kind = "crate"
+description = "Typed host IPC messages, bounded framing, and authenticated platform transport"
+package = "fl-host-proto"
+paths = ["crates/host-proto/**"]
+
+[[components]]
 id = "fl_cli"
 title = "FerroLoop CLI"
 kind = "crate"
