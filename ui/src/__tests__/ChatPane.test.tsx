@@ -2307,6 +2307,23 @@ describe("standalone transcript ownership and availability", () => {
     expect(screen.queryByText(staleNotice)).toBeNull();
     expect(screen.getByText("History unavailable")).toBeInTheDocument();
   });
+  it.each([false, true])("shows independently observed send queue/busy before transcript success (controlled=%s)", async (controlled) => {
+    const { client, reads } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: true, is_busy: true,
+      queue: [{ id: "independent", session_id: "session-a", prompt: "Independently observed queue", by: "owner", created_at: "" }],
+    } as never);
+    render(<ChatPane agentName="freya" sessionId="session-a" apiClient={client} adapter="claude" {...(controlled ? { turns: [] } : {})} />);
+    if (!controlled) await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "queued submission" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    expect(await screen.findByText("Independently observed queue")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy · Working");
+    if (!controlled) {
+      await act(async () => reads[1].reject(unavailable()));
+      expect(screen.getByText("Independently observed queue")).toBeInTheDocument();
+      expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy · Working");
+    }
+  });
   it("delegates controlled reset once without issuing the direct reset", async () => {
     const { client } = setup();
     const reset = vi.fn(async () => undefined);

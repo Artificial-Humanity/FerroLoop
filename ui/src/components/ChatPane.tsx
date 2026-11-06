@@ -1245,7 +1245,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     snapshotRef.current = next;
     setSnapshotState(next);
   };
-  const [metadataOwner, setMetadataOwner] = React.useState<TranscriptReadOwner | null>(null);
+  const [metadataOwner, setMetadataOwnerState] = React.useState<TranscriptReadOwner | null>(null);
+  const metadataOwnerRef = React.useRef(metadataOwner);
+  const setMetadataOwner = (next: TranscriptReadOwner | null) => {
+    metadataOwnerRef.current = next;
+    setMetadataOwnerState(next);
+  };
   const [readState, setReadState] = React.useState<{ owner: TranscriptReadOwner; status: TranscriptRefreshState } | null>(null);
   const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
   const [permPromptOverrides, setPermPromptOverrides] = React.useState<
@@ -1419,6 +1424,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   );
   const effectiveLoading = loading || (turns === undefined && (!readStateMatches || internalLoading));
   const effectiveError = error ?? (readStateMatches ? internalError : null);
+
+  // Prompt/queue replies are independent observations, even before a transcript is readable.
+  const adoptPromptMetadata = (response: { queue?: unknown; is_busy?: unknown }) => {
+    if (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean") return;
+    if (!sameTranscriptOwner(metadataOwnerRef.current, ownerRef.current)) {
+      // Hidden values belonging to a previous owner must not reappear with this reply.
+      setInternalQueue([]);
+      setInternalIsBusy(false);
+      setInternalInFlightUnconfirmed(false);
+      setInternalContextUsage(null);
+      setInternalQuotaUsage(null);
+    }
+    setMetadataOwner({ ...ownerRef.current });
+  };
 
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
 
@@ -2007,6 +2026,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else if (apiClient) {
         const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
         if (currentTargetRef.current === submittedTarget) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2383,6 +2403,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         response = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
         const res = codexSendNow ? codexSendNowReceipt(submittedTarget, response) : response;
         if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2444,6 +2465,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else if (apiClient) {
         const res = await apiClient.cancelQueuedPrompt(submittedTarget, promptId);
         if (currentTargetRef.current === submittedTarget) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2476,6 +2498,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           trimmed,
         );
         if (currentTargetRef.current === submittedTarget) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2578,6 +2601,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         mountedRef.current && !onSendPrompt && apiClient && res &&
         currentTargetRef.current === submittedTarget
       ) {
+        adoptPromptMetadata(res);
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
         if (!wasQueued && res.delivery_stage !== "unconfirmed") {
