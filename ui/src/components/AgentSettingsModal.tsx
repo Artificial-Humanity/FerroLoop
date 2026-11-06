@@ -389,7 +389,8 @@ export interface AgentSettingsModalProps {
 /** What the last context window request answered; shown in the status line or the alert. */
 type ContextWindowNotice =
   | { kind: "ok"; requested: number; method: "operator-prompt" | "stored"; persisted: boolean }
-  | { kind: "error"; text: string };
+  | { kind: "error"; text: string }
+  | { kind: "timed-out" };
 
 /** An operator's pick, kept over the reported window until the hub reports a different one. */
 interface ContextWindowPick {
@@ -398,6 +399,8 @@ interface ContextWindowPick {
   reportedAtPick: number | null;
 }
 
+/** How long a prompt sent to the session may go without a changed `max_tokens` report. */
+const CONTEXT_WINDOW_PICK_TIMEOUT_MS = 25_000;
 const CONTEXT_WINDOW_STATUS_ID = "fd-agent-settings-context-window-status";
 const CONTEXT_WINDOW_ERROR_ID = "fd-agent-settings-context-window-error";
 
@@ -535,12 +538,32 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setContextWindowPick((prev) =>
       prev && reportedMaxTokens !== prev.reportedAtPick ? null : prev,
     );
+    // A "still reports X" message is about the old window.
+    setContextWindowNotice((prev) => (prev?.kind === "timed-out" ? null : prev));
   }, [reportedMaxTokens]);
+  const contextWindowAwaitingReport =
+    contextWindowPick !== null &&
+    contextWindowNotice?.kind === "ok" &&
+    contextWindowNotice.method === "operator-prompt";
   useEffect(() => {
-    // A disabled select loses focus; give it back once the call is over.
+    // Bound the wait: if Grok refuses silently or the paste is lost, `max_tokens` never changes.
+    if (!contextWindowAwaitingReport) return;
+    const timer = setTimeout(() => {
+      setContextWindowPick(null);
+      setContextWindowNotice({ kind: "timed-out" });
+    }, CONTEXT_WINDOW_PICK_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [contextWindowAwaitingReport, contextWindowPick]);
+  useEffect(() => {
+    // A disabled select loses focus; give it back once the call is over, unless the operator
+    // has moved to another field meanwhile.
     if (!contextWindowSending && contextWindowRefocusRef.current) {
       contextWindowRefocusRef.current = false;
-      contextWindowSelectRef.current?.focus();
+      const select = contextWindowSelectRef.current;
+      const active = document.activeElement;
+      if (select && (active === null || active === document.body || active === select)) {
+        select.focus();
+      }
     }
   }, [contextWindowSending]);
 
@@ -742,10 +765,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     activeContextWindowPick !== null &&
     activeContextWindowPick.value !== reportedMaxTokens;
   const contextWindowStatusText =
-    contextWindowNotice?.kind !== "ok"
+    contextWindowNotice?.kind === "timed-out"
+      ? reportedMaxTokens === null
+        ? "The session has not reported a window. The change may not have been applied."
+        : `The session still reports ${contextWindowSizeText}. The change may not have been applied.`
+      : contextWindowNotice?.kind !== "ok"
       ? ""
       : contextWindowNotice.method === "stored"
-        ? "Saved for this agent. The session's terminal was not reachable, so it was not applied now."
+        ? "Saved for this agent. It is not applied to the running session (its terminal is not open)."
         : `Requested ${formatTokenCount(contextWindowNotice.requested)}. Sent to the session; it reports the window it actually uses.${
             contextWindowNotice.persisted ? "" : " Not saved: it will not survive a restart."
           }`;
@@ -810,6 +837,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       const client = apiClient ?? new HubApiClient();
       const res = await client.setSessionContextWindow(sessionId, next);
       if (token !== contextWindowRequestRef.current) return;
+      // A stored window is not applied to the running session: show what it really uses.
+      if (res.method === "stored") setContextWindowPick(null);
       setContextWindowNotice({
         kind: "ok",
         requested: next,
@@ -1407,7 +1436,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   >
                     {contextVendor === "grok"
                       ? offeredContextWindows.length >= 2
-                        ? `Context window: ${contextWindowSizeText}. Only an owner can change it.`
+                        ? authority?.tier !== "owner"
+                          ? `Context window: ${contextWindowSizeText}. Only an owner can change it.`
+                          : `Context window: ${contextWindowSizeText}.`
                         : `Context window: ${contextWindowSizeText} (no other sizes offered)`
                       : contextVendor
                         ? `Context window: ${contextWindowSizeText}. ${vendorDisplayName(contextVendor)}'s window cannot be selected from FerroDeck.`

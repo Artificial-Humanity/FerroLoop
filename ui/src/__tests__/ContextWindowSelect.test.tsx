@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import {
   AgentSettingsModal,
@@ -232,16 +232,34 @@ describe("Agent Settings context window selector: the control", () => {
     );
   });
 
-  it("says a stored size was saved but not applied now", async () => {
+  it("says a stored size was saved but not applied to the running session", async () => {
     const send = vi.fn().mockResolvedValue(response({ method: "stored" }));
     render(<AgentSettingsModal {...modalProps(USAGE, { apiClient: clientWith(send) })} />);
     pick(500_000);
     await waitFor(() =>
       expect(status()).toHaveTextContent(
-        "Saved for this agent. The session's terminal was not reachable, so it was not applied now.",
+        "Saved for this agent. It is not applied to the running session (its terminal is not open).",
       ),
     );
     expect(screen.queryByTestId("context-window-waiting")).not.toBeInTheDocument();
+  });
+
+  it("shows the effective window again after a stored answer and ignores later reports", async () => {
+    const send = vi.fn().mockResolvedValue(response({ method: "stored" }));
+    const props = modalProps(USAGE, { apiClient: clientWith(send) });
+    const { rerender } = render(<AgentSettingsModal {...props} />);
+    pick(500_000);
+    await waitFor(() => expect(status()).toHaveTextContent("Saved for this agent"));
+    expect(select()).toHaveValue("256000");
+    expect(screen.queryByTestId("context-window-waiting")).not.toBeInTheDocument();
+    rerender(
+      <AgentSettingsModal
+        {...props}
+        contextEstimate={estimateSessionContextUsage([], { ...USAGE, used_tokens: 20_000 })}
+      />,
+    );
+    expect(select()).toHaveValue("256000");
+    expect(status()).toHaveTextContent("Saved for this agent");
   });
 
   it.each([
@@ -450,8 +468,217 @@ describe("Agent Settings context window: read-only lines", () => {
     expect(readonly()).not.toHaveTextContent("no other sizes");
   });
 
+  it("does not claim the owner can change it when the owner has no usable session id", () => {
+    render(<AgentSettingsModal {...modalProps(USAGE, { sessionId: null })} />);
+    expect(queryControl()).not.toBeInTheDocument();
+    expect(readonly()).toHaveTextContent("Context window: 256k.");
+    expect(readonly()).not.toHaveTextContent("Only an owner");
+  });
+
+  it("does not claim an owner role to an unknown authority beyond the owner-only line", () => {
+    render(<AgentSettingsModal {...modalProps(USAGE, { authority: null })} />);
+    expect(readonly()).toHaveTextContent("Only an owner can change it.");
+  });
+
   it("says so when no window is reported", () => {
     render(<AgentSettingsModal {...modalProps(null, { adapter: "claude", selectedModel: "" })} />);
     expect(readonly()).toHaveTextContent("Context window: not reported.");
+  });
+});
+
+describe("Agent Settings context window selector: the wait is bounded", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  // The 25 s wait timers the component started, and whether each one was cleared since.
+  function waitTimers() {
+    const started: unknown[] = [];
+    const cleared = new Set<unknown>();
+    const realSet = globalThis.setTimeout;
+    const realClear = globalThis.clearTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      const id = realSet(fn, ms);
+      if (ms === 25_000) started.push(id);
+      return id;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(((id: never) => {
+      cleared.add(id);
+      return realClear(id);
+    }) as typeof clearTimeout);
+    return {
+      started,
+      live: () => started.filter((id) => !cleared.has(id)),
+    };
+  }
+
+  async function sendAndWait(timersFirst = true) {
+    if (timersFirst) vi.useFakeTimers();
+    const timers = waitTimers();
+    const send = vi.fn().mockResolvedValue(response());
+    const props = modalProps(USAGE, { apiClient: clientWith(send) });
+    const view = render(<AgentSettingsModal {...props} />);
+    pick(500_000);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    return { props, timers, ...view };
+  }
+
+  it("keeps waiting for 24 seconds, then returns to the effective window after 25 with a message", async () => {
+    const { props, rerender } = await sendAndWait();
+    expect(select()).toHaveValue("500000");
+    // A lagging report with changing usage is normal and does not end the wait.
+    rerender(
+      <AgentSettingsModal
+        {...props}
+        contextEstimate={estimateSessionContextUsage([], { ...USAGE, used_tokens: 20_000 })}
+      />,
+    );
+    act(() => {
+      vi.advanceTimersByTime(24_000);
+    });
+    expect(select()).toHaveValue("500000");
+    expect(screen.getByTestId("context-window-waiting")).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1_100);
+    });
+    expect(select()).toHaveValue("256000");
+    expect(screen.queryByTestId("context-window-waiting")).not.toBeInTheDocument();
+    expect(status()).toHaveTextContent(
+      "The session still reports 256k. The change may not have been applied.",
+    );
+    expect(select()).toBeEnabled();
+  });
+
+  it("shows the effective window for a matching report that arrives after the expiry", async () => {
+    const { props, rerender } = await sendAndWait();
+    act(() => {
+      vi.advanceTimersByTime(26_000);
+    });
+    expect(select()).toHaveValue("256000");
+    rerender(
+      <AgentSettingsModal
+        {...props}
+        contextEstimate={estimateSessionContextUsage([], { ...USAGE, max_tokens: 500_000 })}
+      />,
+    );
+    expect(select()).toHaveValue("500000");
+    expect(screen.getByTestId("context-window-effective")).toHaveTextContent("500k");
+    expect(status()).not.toHaveTextContent("still reports");
+  });
+
+  it("gives no timeout message when the window changes before the expiry", async () => {
+    const { props, rerender } = await sendAndWait();
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    rerender(
+      <AgentSettingsModal
+        {...props}
+        contextEstimate={estimateSessionContextUsage([], { ...USAGE, max_tokens: 500_000 })}
+      />,
+    );
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(select()).toHaveValue("500000");
+    expect(status()).not.toHaveTextContent("still reports");
+    expect(status()).toHaveTextContent("Requested 500k");
+  });
+
+  it("starts no timer for a stored answer or an error", async () => {
+    vi.useFakeTimers();
+    const timers = waitTimers();
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce(response({ method: "stored" }))
+      .mockRejectedValueOnce(new HubApiError(409, "not applied"));
+    render(<AgentSettingsModal {...modalProps(USAGE, { apiClient: clientWith(send) })} />);
+    pick(500_000);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(timers.started).toHaveLength(0);
+    pick(500_000);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("context-window-error")).toBeInTheDocument();
+    expect(timers.started).toHaveLength(0);
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(status()).not.toHaveTextContent("still reports");
+  });
+
+  it("clears the timer on unmount", async () => {
+    const { unmount, timers } = await sendAndWait();
+    expect(timers.live()).toHaveLength(1);
+    unmount();
+    expect(timers.live()).toHaveLength(0);
+  });
+
+  it("cancels the timer when the modal is reopened or moves to another session", async () => {
+    const { props, rerender, timers } = await sendAndWait();
+    expect(timers.live()).toHaveLength(1);
+    rerender(<AgentSettingsModal {...props} isOpen={false} />);
+    expect(timers.live()).toHaveLength(0);
+    rerender(<AgentSettingsModal {...props} />);
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(select()).toHaveValue("256000");
+    expect(status()).toHaveTextContent("");
+
+    pick(500_000);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(timers.live()).toHaveLength(1);
+    rerender(<AgentSettingsModal {...props} sessionId="sess-2" agentName="other" />);
+    expect(timers.live()).toHaveLength(0);
+  });
+});
+
+describe("Agent Settings context window selector: focus after the request", () => {
+  it("does not take focus back when the operator moved to another field during the request", async () => {
+    const d = deferred<SetSessionContextWindowResponse>();
+    const send = vi.fn(() => d.promise);
+    render(
+      <>
+        <input data-testid="other-field" />
+        <AgentSettingsModal {...modalProps(USAGE, { apiClient: clientWith(send) })} />
+      </>,
+    );
+    select().focus();
+    pick(500_000);
+    const other = screen.getByTestId("other-field");
+    other.focus();
+    expect(other).toHaveFocus();
+    await act(async () => {
+      d.resolve(response());
+    });
+    expect(select()).toBeEnabled();
+    expect(other).toHaveFocus();
+  });
+
+  it("returns focus when the browser dropped it to the body", async () => {
+    const d = deferred<SetSessionContextWindowResponse>();
+    const send = vi.fn(() => d.promise);
+    render(<AgentSettingsModal {...modalProps(USAGE, { apiClient: clientWith(send) })} />);
+    select().focus();
+    pick(500_000);
+    // jsdom keeps focus on a disabled control; browsers drop it to the body. Imitate that.
+    const stray = document.createElement("button");
+    document.body.appendChild(stray);
+    stray.focus();
+    stray.remove();
+    expect(document.body).toHaveFocus();
+    await act(async () => {
+      d.resolve(response());
+    });
+    expect(select()).toHaveFocus();
   });
 });
