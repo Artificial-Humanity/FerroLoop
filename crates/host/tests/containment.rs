@@ -145,8 +145,85 @@ fn child_pid(text: &str) -> u32 {
     digits.parse().expect("pid")
 }
 
+#[cfg(not(windows))]
 fn same_process(pid: u32, start: u64) -> bool {
     matches!(process_identity(pid), Ok(ident) if ident.pid == pid && ident.start == start)
+}
+
+// A terminated Windows process object can still answer identity queries while a
+// Session or Child holds its handle. Test execution through the process signal,
+// not through object disappearance or the numeric STILL_ACTIVE exit code.
+#[cfg(windows)]
+struct WindowsProcessProbe {
+    handle: std::os::windows::io::OwnedHandle,
+    start: u64,
+}
+
+#[cfg(windows)]
+impl WindowsProcessProbe {
+    fn open(pid: u32) -> Option<Self> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+        // SAFETY: OpenProcess returns a new owned handle or null.
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if raw.is_null() {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(ERROR_INVALID_PARAMETER as i32),
+                "OpenProcess({pid}) failed without proving absence: {err}"
+            );
+            return None;
+        }
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+        let mut created: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+        let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+        let mut user: FILETIME = unsafe { std::mem::zeroed() };
+        // SAFETY: the query handle is owned and all FILETIME pointers are writable.
+        assert_ne!(
+            unsafe { GetProcessTimes(raw, &mut created, &mut exit, &mut kernel, &mut user) },
+            0,
+            "GetProcessTimes({pid}): {}",
+            std::io::Error::last_os_error()
+        );
+        let start = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        Some(Self { handle, start })
+    }
+
+    fn running(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: the retained handle has SYNCHRONIZE access; timeout zero polls.
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle() as _, 0) } {
+            WAIT_TIMEOUT => true,
+            WAIT_OBJECT_0 => false,
+            other => panic!(
+                "process wait failed ({other}): {}",
+                std::io::Error::last_os_error()
+            ),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_running(pid: u32) -> bool {
+    WindowsProcessProbe::open(pid).is_some_and(|probe| probe.running())
+}
+
+#[cfg(windows)]
+fn same_process(pid: u32, start: u64) -> bool {
+    WindowsProcessProbe::open(pid).is_some_and(|probe| probe.start == start && probe.running())
 }
 
 fn wait_gone(pid: u32, start: u64, timeout: Duration) -> bool {
@@ -1315,6 +1392,63 @@ fn invalid_registry_refuses_startup_within_deadline() {
 }
 
 #[cfg(windows)]
+fn assert_windows_dead_handle_is_not_running(exit_code: u32) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess};
+    let mut child = Command::new(child_bin())
+        .arg("stall")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("child");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("read readiness");
+    assert_eq!(line.trim(), "READY");
+    let pid = child.id();
+    let probe = WindowsProcessProbe::open(pid).expect("live process");
+    assert!(probe.running());
+    assert!(same_process(pid, probe.start));
+    assert!(!same_process(pid, probe.start.wrapping_add(1)));
+    // SAFETY: Child owns this live process handle with termination access.
+    assert_ne!(
+        unsafe { TerminateProcess(child.as_raw_handle() as _, exit_code) },
+        0
+    );
+    let status = child.wait().expect("wait");
+    assert_eq!(status.code(), Some(exit_code as i32));
+    // The probe pins the exited object, so an identity query still succeeds.
+    assert_eq!(
+        process_identity(pid).expect("retained identity").start,
+        probe.start
+    );
+    assert!(!probe.running(), "exit {exit_code} is signalled");
+    let mut observed_code = 0;
+    // SAFETY: the same retained query handle has already been proved signalled.
+    assert_ne!(
+        unsafe { GetExitCodeProcess(probe.handle.as_raw_handle() as _, &mut observed_code) },
+        0
+    );
+    assert_eq!(observed_code, exit_code);
+    assert!(!same_process(pid, probe.start), "identity is not liveness");
+    assert!(wait_gone(pid, probe.start, Duration::from_secs(1)));
+    let current = WindowsProcessProbe::open(std::process::id()).expect("current process");
+    assert!(current.running());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_terminated_process_with_retained_handle_is_not_running() {
+    assert_windows_dead_handle_is_not_running(0);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_exit_259_with_retained_handle_is_not_running() {
+    assert_windows_dead_handle_is_not_running(259);
+}
+
+#[cfg(windows)]
 fn win_endpoint(suffix: &str) -> HostEndpoint {
     HostEndpoint::windows(suffix, &fl_host::current_user_sid().expect("sid")).expect("endpoint")
 }
@@ -1353,19 +1487,13 @@ fn windows_fault_barriers_leave_no_job_member() {
             .parse()
             .expect("pid");
         assert!(
-            !same_process(pid, process_start_or_zero(pid)),
-            "{point} left a job member"
+            !windows_process_running(pid),
+            "{point} left a running child"
         );
-        assert!(wait_gone(pid, 0, Duration::from_secs(2)) || process_identity(pid).is_err());
         if point != "windows_running" {
             assert!(!marker.exists(), "{point} resumed the child");
         }
     }
-}
-
-#[cfg(windows)]
-fn process_start_or_zero(pid: u32) -> u64 {
-    process_identity(pid).map(|ident| ident.start).unwrap_or(0)
 }
 
 #[cfg(windows)]
@@ -1398,7 +1526,7 @@ fn windows_spawn_failures_kill_and_wait() {
                 .trim()
                 .parse()
                 .expect("pid");
-            assert!(process_identity(pid).is_err(), "{inject} left the child");
+            assert!(!windows_process_running(pid), "{inject} left the child");
         }
         if inject == "resume" {
             assert!(
@@ -1425,7 +1553,7 @@ fn windows_siblings_do_not_share_jobs() {
     assert!(reply.starts_with("ok"), "{reply}");
     let cleanup = worker.cmd("cleanup win-one 8000");
     assert_eq!(cleanup, "ok true");
-    assert!(process_identity(first.vendor_pid).is_err());
+    assert!(!same_process(first.vendor_pid, first.vendor_start));
     assert!(same_process(second.vendor_pid, second.vendor_start));
     let _ = endpoint;
 }
@@ -1457,7 +1585,7 @@ fn windows_leader_exit_keeps_job_until_accounting() {
     assert!(reply.starts_with("ok"), "{reply}");
     let cleanup = worker.cmd("cleanup win-orphan 8000");
     assert_eq!(cleanup, "ok true", "CleanupComplete before job accounting");
-    assert!(process_identity(child).is_err());
+    assert!(!same_process(child, child_start));
     assert_eq!(worker.cmd("phase win-orphan"), "ok absent");
 }
 
