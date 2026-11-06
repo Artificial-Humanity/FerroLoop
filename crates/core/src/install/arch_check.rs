@@ -8,9 +8,17 @@ use crate::arch::ArchitectureModel;
 use std::collections::BTreeSet;
 
 /// Components that belong to no product: the ones that serve every product (the binary's entry
-/// point, the MCP catalog writer and the installer's I/O) and FerroBrowse, which ships inside
-/// the `fl` binary and has no product of its own.
-pub const SHARED_COMPONENTS: &[&str] = &["fl_cli", "fl_mcp", "fl_install", "fl_browse"];
+/// point, the MCP catalog writer and the installer's I/O), FerroBrowse, which ships inside
+/// the `fl` binary and has no product of its own, and the standalone host crates, which are
+/// not an install product in this release.
+pub const SHARED_COMPONENTS: &[&str] = &[
+    "fl_cli",
+    "fl_mcp",
+    "fl_install",
+    "fl_browse",
+    "fl_host",
+    "fl_host_proto",
+];
 
 /// Dependencies that are real at run time but have no edge in the model: the
 /// dependant reaches the store through its caller (the CLI or the hub), not

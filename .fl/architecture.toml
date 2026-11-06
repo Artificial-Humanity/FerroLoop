@@ -91,6 +91,22 @@ package = "fl-install"
 paths = ["crates/install/**"]
 
 [[components]]
+id = "fl_host_proto"
+title = "Host Protocol"
+kind = "crate"
+description = "Typed host IPC messages, bounded framing, and authenticated platform transport"
+package = "fl-host-proto"
+paths = ["crates/host-proto/**"]
+
+[[components]]
+id = "fl_host"
+title = "Native Agent Host"
+kind = "service"
+description = "Standalone pipe-child daemon: per-session supervision, survivor registry, and platform containment"
+package = "fl-host"
+paths = ["crates/host/**"]
+
+[[components]]
 id = "fl_cli"
 title = "FerroLoop CLI"
 kind = "crate"
@@ -254,3 +270,8 @@ label = "serves GET /api/v1/doctor and the UI build-info reader"
 from = "fl_hub"
 to = "fl_mcp"
 label = "serves GET /api/v1/mcp/catalog and POST /api/v1/mcp/sync over the committed MCP catalog"
+
+[[edges]]
+from = "fl_host"
+to = "fl_host_proto"
+label = "speaks the authenticated host protocol and reuses its endpoint identity"
