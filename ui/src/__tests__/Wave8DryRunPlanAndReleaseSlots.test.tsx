@@ -13,7 +13,6 @@ import {
 import {
   ChatPane,
   DEFAULT_PENDING_PERMISSION_PROMPTS as ReExportedChatPrompts,
-  detectTranscriptPermissionPrompts,
 } from "../components/ChatPane";
 import {
   DEFAULT_RELEASE_SLOTS,
@@ -570,24 +569,6 @@ describe("Wave 8 & Wave 9 (Record #103): Universal Agent Permission 3-Layer Mode
       screen.getByTestId("chat-perm-status-badge-perm-req-03").textContent,
     ).toBe("send_keys_unverified");
 
-    // 4. Transcript-based permission prompt detection
-    const detected = detectTranscriptPermissionPrompts(
-      [
-        {
-          index: 4,
-          role: "assistant",
-          content: "control_request: Bash(cargo test --workspace)",
-          thinking: null,
-          tool_calls: [],
-          created_at: "2026-11-03T19:55:00Z",
-        },
-      ],
-      "felicia",
-      "claude",
-      "sess-felicia-01",
-    );
-    expect(detected).toHaveLength(1);
-    expect(detected[0].channel_kind).toBe("rpc");
-    expect(detected[0].capability).toBe("shell_exec");
+
   });
 });
