@@ -1,7 +1,10 @@
 import React from "react";
-import type { HubApiClient } from "../api/client";
+import { HubApiError, type HubApiClient } from "../api/client";
 import {
   DEFAULT_SLASH_COMMANDS,
+  codexSendNowReceipt,
+  isPromptDeliveryFailure,
+  promptDeliveryStatus,
   type ClearSessionMode,
   type DecommissionMode,
   type HubAuthority,
@@ -964,6 +967,42 @@ function notifyPendingPrompts() {
 /** In-progress composer drafts survive tab switches and agent switches. */
 export const sessionDraftMemory = new Map<string, SessionDraft>();
 export const sessionSendErrors = new Map<string, string>();
+// Receipts can arrive after selection changes or the submitting pane unmounts.
+// Retain their stage with the submitted target, just like drafts and pending sends.
+export const sessionDeliveryReceipts = new Map<string, {
+  stage: PromptResponse["delivery_stage"];
+  text: string;
+}>();
+// A lost Send Now reply must also hold its queue item against another click.
+const unconfirmedQueuedPrompts = new Map<string, Set<string>>();
+const deliveryReceiptListeners = new Set<() => void>();
+function recordUnconfirmedDelivery(target: string, promptId?: string) {
+  if (promptId) {
+    const ids = unconfirmedQueuedPrompts.get(target) ?? new Set<string>();
+    ids.add(promptId);
+    unconfirmedQueuedPrompts.set(target, ids);
+  }
+  recordPromptDelivery(target, { session_id: target, delivery_stage: "unconfirmed" });
+}
+
+function isKnownPromptRefusal(error: unknown): boolean {
+  // These endpoint statuses reject before dispatch. Other errors (including 5xx
+  // and plain callback exceptions) cannot establish whether steering occurred.
+  return error instanceof HubApiError &&
+    [400, 401, 403, 404, 409, 413, 415].includes(error.status);
+}
+function recordPromptDelivery(target: string, response?: PromptResponse) {
+  const text = promptDeliveryStatus(response);
+  if (text) sessionDeliveryReceipts.set(target, { stage: response?.delivery_stage, text });
+  else sessionDeliveryReceipts.delete(target);
+  for (const listener of deliveryReceiptListeners) listener();
+}
+function recordPromptRefusal(target: string) {
+  // A later refusal supersedes acceptance, but cannot resolve an earlier lost reply.
+  if (sessionDeliveryReceipts.get(target)?.stage !== "unconfirmed") {
+    recordPromptDelivery(target);
+  }
+}
 const pendingAttachmentReads = new Map<string, number>();
 const draftListeners = new Set<
   (target: string, draft: SessionDraft | null, error?: string) => void
@@ -1074,61 +1113,6 @@ export interface ChatPaneProps {
     decision: PermissionResponseDecision,
   ) => Promise<void> | void;
   apiClient?: HubApiClient;
-}
-
-export function detectTranscriptPermissionPrompts(
-  turns: TranscriptTurn[],
-  agentName?: string | null,
-  adapter?: string | null,
-  sessionId?: string | null,
-): PendingPermissionPromptItem[] {
-  if (!Array.isArray(turns) || turns.length === 0) {
-    return [];
-  }
-  const vendor = (adapter ?? "claude").trim().toLowerCase() || "claude";
-  const isRpcChannel =
-    vendor.includes("claude") ||
-    vendor.includes("codex") ||
-    vendor.includes("muse");
-  const channelKind: PermissionChannelKind = isRpcChannel
-    ? "rpc"
-    : "pty-snapshot";
-  const transport = vendor.includes("claude")
-    ? "stdio-control_request"
-    : vendor.includes("codex")
-      ? "app-server-rpc"
-      : vendor.includes("muse")
-        ? "msp-socket"
-        : "tmux-pty-snapshot";
-
-  const results: PendingPermissionPromptItem[] = [];
-  for (const turn of turns) {
-    const content = turn.content ?? "";
-    if (
-      content.includes("control_request") ||
-      content.includes("requestApproval") ||
-      content.includes("[PERMISSION PROMPT]")
-    ) {
-      results.push({
-        id: `turn-perm-${turn.index}`,
-        session_id: sessionId || `sess-${agentName || "agent"}`,
-        agent: agentName || "agent",
-        vendor,
-        transport,
-        channel_kind: channelKind,
-        request_kind: content.includes("fileChange")
-          ? "item/fileChange/requestApproval"
-          : "canUseTool",
-        capability: content.includes("fileChange")
-          ? "fs_write_workspace"
-          : "shell_exec",
-        command_or_target: content.trim().slice(0, 160),
-        always_allow_supported: isRpcChannel,
-        status: "pending",
-      });
-    }
-  }
-  return results;
 }
 
 function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
@@ -1311,11 +1295,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
     pendingPromptListeners.add(refreshPendingPrompts);
+    deliveryReceiptListeners.add(refreshPendingPrompts);
     // A send could have begun between render and subscription.
     refreshPendingPrompts();
-    return () => { pendingPromptListeners.delete(refreshPendingPrompts); };
+    return () => {
+      pendingPromptListeners.delete(refreshPendingPrompts);
+      deliveryReceiptListeners.delete(refreshPendingPrompts);
+    };
   }, []);
   const submitting = Boolean(targetSessionOrAgent && pendingPrompts.has(targetSessionOrAgent));
+  const deliveryReceipt = sessionDeliveryReceipts.get(targetSessionOrAgent);
+  const deliveryStatus = deliveryReceipt?.text;
   const [submitError, setSubmitError] = React.useState<string | null>(null);
   const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>(
     () => Object.fromEntries(sessionSendErrors),
@@ -1354,7 +1344,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const effectiveTurns = turns ?? internalTurns;
   const effectiveIsBusy = isBusy ?? internalIsBusy;
-  const effectiveQueue = queue ?? internalQueue;
+  const effectiveQueue = (queue ?? internalQueue).map((item) =>
+    unconfirmedQueuedPrompts.get(targetSessionOrAgent)?.has(item.id)
+      ? { ...item, delivery_state: "unconfirmed" as const } : item,
+  );
   const effectiveLoading = loading || internalLoading;
   const effectiveError = error ?? internalError;
 
@@ -2236,27 +2229,47 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const handleSendQueuedNow = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
     const submittedTarget = targetSessionOrAgent;
+    if (unconfirmedQueuedPrompts.get(submittedTarget)?.has(promptId)) return;
+    const codexSendNow = adapter === "codex" && authority?.tier !== "peer";
+    let response: PromptResponse | undefined;
+    let attempted = false;
     try {
       setSubmitError(null);
+      sessionSendErrors.delete(submittedTarget);
+      setSendErrorsByTarget((prev) => {
+        const next = { ...prev };
+        delete next[submittedTarget];
+        return next;
+      });
       if (onSendQueuedNow) {
-        const res = (await onSendQueuedNow(promptId)) as PromptResponse | undefined;
-        if (res?.delivered === false) {
-          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        attempted = true;
+        response = (await onSendQueuedNow(promptId)) as PromptResponse | undefined;
+        const res = codexSendNow ? codexSendNowReceipt(submittedTarget, response) : response;
+        if (isPromptDeliveryFailure(res)) {
+          throw new Error(res?.delivery_error || "Queued message delivery could not be confirmed");
         }
+        if (codexSendNow && res?.delivery_stage === "unconfirmed") recordUnconfirmedDelivery(submittedTarget, promptId);
+        else recordPromptDelivery(submittedTarget, res);
       } else if (apiClient) {
-        const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
-        if (currentTargetRef.current === submittedTarget) {
+        attempted = true;
+        response = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
+        const res = codexSendNow ? codexSendNowReceipt(submittedTarget, response) : response;
+        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
           if (typeof res.is_busy === "boolean") {
             setInternalIsBusy(res.is_busy);
           }
-          if (res.delivered === false) {
-            throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
-          }
+        }
+        if (isPromptDeliveryFailure(res)) {
+          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        }
+        if (codexSendNow && res.delivery_stage === "unconfirmed") recordUnconfirmedDelivery(submittedTarget, promptId);
+        else recordPromptDelivery(submittedTarget, res);
+        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
           const content = res.effective_body || res.prompt;
-          if (content) {
+          if (content && res.delivery_stage !== "unconfirmed") {
             setInternalTurns((prev) => [
               ...prev,
               {
@@ -2275,11 +2288,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         scrollToBottom("smooth");
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
-        setSubmitError(
-          err instanceof Error ? err.message : "Failed to send queued message",
-        );
+      if (codexSendNow && attempted && !isPromptDeliveryFailure(response) && !isKnownPromptRefusal(err)) {
+        recordUnconfirmedDelivery(submittedTarget, promptId);
+        return;
       }
+      if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
+      const message = err instanceof Error ? err.message : "Failed to send queued message";
+      sessionSendErrors.set(submittedTarget, message);
+      notifyDraft(submittedTarget, null, message);
     }
   };
 
@@ -2308,6 +2324,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }
         }
       }
+      unconfirmedQueuedPrompts.get(submittedTarget)?.delete(promptId);
     } catch (err) {
       if (currentTargetRef.current === submittedTarget) {
         setSubmitError(
@@ -2408,28 +2425,34 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setPromptText("");
     setAttachments([]);
     scrollToBottom("smooth");
+    const codexSendNow = adapter === "codex" && authority?.tier !== "peer" && payload.send_now === true;
+    let res: PromptResponse | undefined;
+    let attempted = false;
     try {
-      let res: PromptResponse | undefined;
       if (onSendPrompt) {
+        attempted = true;
         res = (await onSendPrompt(submittedTarget, payload)) as
           | PromptResponse
           | undefined;
       } else if (apiClient) {
+        attempted = true;
         res = await apiClient.sendSessionPrompt(submittedTarget, payload);
       } else {
         throw new Error("No prompt connection is available");
       }
+      if (codexSendNow) res = codexSendNowReceipt(submittedTarget, res);
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
-      if (!wasQueued && res?.delivered === false) {
-        throw new Error(res.delivery_error || "Message delivery failed");
+      if (!wasQueued && isPromptDeliveryFailure(res)) {
+        throw new Error(res?.delivery_error || "Message delivery failed");
       }
+      recordPromptDelivery(submittedTarget, res);
       if (
         mountedRef.current && !onSendPrompt && apiClient && res &&
         currentTargetRef.current === submittedTarget
       ) {
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
-        if (!wasQueued) {
+        if (!wasQueued && res.delivery_stage !== "unconfirmed") {
           const body = res.effective_body || payload.prompt;
           setInternalTurns((prev) => {
             const matches = prev.filter((turn) =>
@@ -2455,6 +2478,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
+      if (codexSendNow && attempted && !isPromptDeliveryFailure(res) && !isKnownPromptRefusal(err)) {
+        recordUnconfirmedDelivery(submittedTarget);
+        return;
+      }
+      if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
       const message = err instanceof Error ? err.message : "Failed to send message";
       sessionSendErrors.set(submittedTarget, message);
       const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget
@@ -3114,15 +3142,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
       {/* Record #103: Live Permission-Prompt Interception & Remote Approval Banner */}
       {(() => {
-        const basePrompts =
-          pendingPermissionPrompts !== undefined
-            ? pendingPermissionPrompts
-            : detectTranscriptPermissionPrompts(
-                effectiveTurns,
-                agentName,
-                adapter,
-                sessionId,
-              );
+        // Transcript text is not a permission channel. Only explicit structured
+        // requests supplied by the caller can populate the approval panel.
+        const basePrompts = pendingPermissionPrompts ?? [];
         const resolvedPrompts = basePrompts.map((p) =>
           permPromptOverrides[p.id]
             ? { ...p, status: permPromptOverrides[p.id] }
@@ -3615,6 +3637,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             }}
           />
         </div>
+        {deliveryStatus && <div role="status">{deliveryStatus}</div>}
         {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
@@ -3746,7 +3769,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         >
                           {item.prompt}
                         </span>
-                        {item.delivery_state === "unconfirmed" && (
+                        {item.delivery_state === "refused" && <span role="status">Send now refused. Remove this item before submitting a new prompt.</span>}
+                        {item.delivery_state === "unconfirmed" && deliveryReceipt?.stage !== "unconfirmed" && (
                           <span role="status">Delivery unconfirmed. Check the session before removing this item.</span>
                         )}
                         {item.delivery_error && <span role="status">{item.delivery_error}</span>}

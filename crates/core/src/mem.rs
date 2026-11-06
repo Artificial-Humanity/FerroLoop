@@ -113,6 +113,8 @@ struct Inner {
     wire_threads: BTreeSet<(ThreadId, MessageId)>,
     wire_replies: BTreeSet<(MessageId, MessageId)>,
 
+    delivery: ManagedMemory,
+
     workflow_defs: BTreeMap<WorkflowId, WorkflowDef>,
     workflow_by_slug: BTreeMap<(ProjectId, String), WorkflowId>,
     workflow_runs: BTreeMap<WorkflowRunId, WorkflowRun>,
@@ -2722,5 +2724,2044 @@ mod tests {
         assert_eq!(s.routes(&q).unwrap(), None, "per project");
         let err = s.routes(&ProjectId(seq_iri(99))).unwrap_err();
         assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+    }
+}
+
+#[derive(Default)]
+struct ManagedMemory {
+    records: BTreeMap<crate::wire_delivery::DeliveryKey, crate::wire_delivery::DeliveryRecord>,
+    reservations: BTreeMap<MessageId, crate::wire_delivery::IdReservation>,
+    recipients: BTreeMap<AgentId, crate::wire_delivery::RecipientControl>,
+    identities: BTreeMap<String, crate::wire_delivery::IdentityResolution>,
+    receipt_keys: BTreeMap<crate::wire_delivery::DeliveryKey, Iri>,
+    global: Option<crate::wire_delivery::GlobalControl>,
+    continuity: Option<crate::wire_delivery::Continuity>,
+    access: DeliveryAccess,
+    // Deliberately unavailable in production, including feature=conformance.
+    #[cfg(test)]
+    admissions: BTreeMap<crate::wire_delivery::Digest, crate::wire_delivery::LifetimeRegistration>,
+    #[cfg(test)]
+    ended_scopes:
+        BTreeMap<crate::wire_delivery::Digest, crate::wire_delivery::LifetimeRegistration>,
+}
+
+#[derive(Default)]
+struct DeliveryAccess {
+    #[cfg(test)]
+    reads: Vec<(&'static str, bool)>,
+    #[cfg(test)]
+    writes: Vec<&'static str>,
+}
+impl DeliveryAccess {
+    fn read<T>(&mut self, name: &'static str, value: Option<T>) -> Option<T> {
+        #[cfg(test)]
+        self.reads.push((name, value.is_some()));
+        #[cfg(not(test))]
+        let _ = name;
+        value
+    }
+    fn write(&mut self, name: &'static str) {
+        #[cfg(test)]
+        self.writes.push(name);
+        #[cfg(not(test))]
+        let _ = name;
+    }
+}
+
+impl Inner {
+    fn delivery_context(
+        &mut self,
+        command: &crate::wire_delivery::DeliveryCommand,
+    ) -> Result<Option<crate::wire_delivery::TransitionContext>, StoreError> {
+        use crate::wire_delivery::*;
+        let key = command.key();
+        let d = &mut self.delivery;
+        let record = d.access.read("record", d.records.get(key).cloned());
+        let reservation = d
+            .access
+            .read("reservation", d.reservations.get(&key.original_id).cloned());
+        let recipient = d
+            .access
+            .read("recipient", d.recipients.get(&key.recipient_id).cloned());
+        let global = d.access.read("global", d.global.clone());
+        let continuity = d.access.read("continuity", d.continuity.clone());
+        let message = d
+            .access
+            .read("message", self.wire_messages.get(&key.original_id).cloned());
+        let receipt_key = d
+            .access
+            .read("receipt_index", d.receipt_keys.get(key).cloned());
+        let receipt = d.access.read(
+            "receipt",
+            receipt_key
+                .as_ref()
+                .and_then(|id| self.wire_inbox.get(&(id.clone(), key.original_id.clone())))
+                .cloned(),
+        );
+        let registry = d
+            .access
+            .read("registry", self.agents.get(&key.recipient_id).cloned());
+        let selector_key = message
+            .as_ref()
+            .map(|m| serde_json::to_string(&m.to))
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let selector = d.access.read(
+            "selector_index",
+            selector_key
+                .as_ref()
+                .and_then(|k| d.identities.get(k))
+                .cloned(),
+        );
+        let receipt_alias = d.access.read(
+            "receipt_alias_index",
+            receipt
+                .as_ref()
+                .and_then(|r| d.identities.get(&format!("name:{}", r.recipient_name)))
+                .cloned(),
+        );
+        #[cfg(test)]
+        let lifetime = match command {
+            DeliveryCommand::Prepare(input) => d.access.read(
+                "admission",
+                d.admissions.get(&input.attempt.lifetime.id).cloned(),
+            ),
+            DeliveryCommand::Arm(input) => d.access.read(
+                "admission",
+                d.admissions.get(&input.attempt.lifetime.id).cloned(),
+            ),
+            _ => None,
+        };
+        #[cfg(not(test))]
+        let lifetime = None;
+        let (Some(recipient), Some(global), Some(continuity), Some(selector), Some(receipt_alias)) =
+            (recipient, global, continuity, selector, receipt_alias)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TransitionContext {
+            key: key.clone(),
+            record,
+            reservation,
+            recipient,
+            global,
+            continuity,
+            message,
+            receipt,
+            identity: IdentityContext {
+                registry,
+                selector,
+                receipt_alias,
+            },
+            lifetime,
+        }))
+    }
+
+    fn commit_delivery(
+        &mut self,
+        delta: crate::wire_delivery::DeliveryDelta,
+    ) -> crate::wire_delivery::DeliveryResult {
+        let d = &mut self.delivery;
+        if let Some(record) = delta.record {
+            d.access.write("record");
+            d.records.insert(record.key.clone(), record);
+        }
+        if let Some(reservation) = delta.reservation {
+            d.access.write("reservation");
+            d.reservations
+                .insert(reservation.original_id.clone(), reservation);
+        }
+        if let Some(recipient) = delta.recipient {
+            d.access.write("recipient");
+            d.recipients
+                .insert(recipient.binding.recipient_id.clone(), recipient);
+        }
+        if let Some(global) = delta.global {
+            d.access.write("global");
+            d.global = Some(global);
+        }
+        if let Some(receipt) = delta.receipt {
+            d.access.write("receipt");
+            self.wire_inbox.insert(
+                (receipt.recipient_id.clone(), receipt.message_id.clone()),
+                receipt.clone(),
+            );
+            self.append_wire_receipt(receipt);
+            self.delivery.access.write("receipt_log");
+            self.delivery.access.write("receipt_sequence");
+        }
+        delta.result
+    }
+}
+
+impl crate::wire_delivery::WireDeliveryStore for MemStore {
+    fn apply_delivery(
+        &self,
+        command: crate::wire_delivery::DeliveryCommand,
+    ) -> Result<crate::wire_delivery::DeliveryResult, StoreError> {
+        use crate::wire_delivery::*;
+        // Ordinary MemStore has no trusted lifetime-admission producer.
+        #[cfg(not(test))]
+        if matches!(
+            command,
+            DeliveryCommand::Prepare(_) | DeliveryCommand::Arm(_)
+        ) {
+            return Ok(DeliveryResult::Refused {
+                reason: HoldReason::UnsupportedBackend,
+            });
+        }
+        let mut inner = self.inner.borrow_mut();
+        let Some(context) = inner.delivery_context(&command)? else {
+            return Ok(DeliveryResult::Refused {
+                reason: HoldReason::ContinuityLost,
+            });
+        };
+        let delta = transition(context, command)?;
+        Ok(inner.commit_delivery(delta))
+    }
+
+    fn inspect_delivery(
+        &self,
+        key: &crate::wire_delivery::DeliveryKey,
+    ) -> Result<Option<crate::wire_delivery::DeliveryView>, StoreError> {
+        let mut inner = self.inner.borrow_mut();
+        let d = &mut inner.delivery;
+        let record = d.access.read("record", d.records.get(key).cloned());
+        let recipient = d
+            .access
+            .read("recipient", d.recipients.get(&key.recipient_id).cloned());
+        match (record, recipient) {
+            (Some(record), Some(recipient)) => Ok(Some(record.view(&recipient))),
+            (None, _) => Ok(None),
+            _ => Err(StoreError::Backend(
+                "missing delivery recipient control".into(),
+            )),
+        }
+    }
+
+    fn active_delivery_owners(
+        &self,
+    ) -> Result<Vec<crate::wire_delivery::CapacityRetirementTarget>, StoreError> {
+        use crate::wire_delivery::*;
+        let mut inner = self.inner.borrow_mut();
+        let d = &mut inner.delivery;
+        let Some(global) = d.access.read("global", d.global.clone()) else {
+            return Err(StoreError::Backend(
+                "missing delivery global control".into(),
+            ));
+        };
+        if !crate::wire_delivery::valid_global(&global) {
+            return Err(StoreError::Backend("corrupt delivery active index".into()));
+        }
+        let mut out = Vec::with_capacity(global.active_index.len());
+        for owner in &global.active_index {
+            let record = d.access.read("record", d.records.get(&owner.key).cloned());
+            let recipient = d.access.read(
+                "recipient",
+                d.recipients.get(&owner.key.recipient_id).cloned(),
+            );
+            let (Some(record), Some(recipient)) = (record, recipient) else {
+                return Err(StoreError::Backend("missing active delivery owner".into()));
+            };
+            if recipient.active.as_ref() != Some(owner)
+                || !record
+                    .attempts
+                    .iter()
+                    .any(|a| a.binding == owner.attempt && a.capacity == CapacityState::Held)
+            {
+                return Err(StoreError::Backend("corrupt active delivery owner".into()));
+            }
+            out.push(CapacityRetirementTarget {
+                owner: owner.clone(),
+                record_revision: record.revision,
+                recipient_revision: recipient.revision,
+                global_revision: global.revision,
+            });
+        }
+        Ok(out)
+    }
+
+    fn retire_orphan_capacity(
+        &self,
+        target: crate::wire_delivery::CapacityRetirementTarget,
+    ) -> Result<crate::wire_delivery::CapacityRetirementResult, StoreError> {
+        #[cfg(not(test))]
+        {
+            let _ = target;
+            Ok(crate::wire_delivery::CapacityRetirementResult::Unproven)
+        }
+        #[cfg(test)]
+        {
+            use crate::wire_delivery::*;
+            let mut inner = self.inner.borrow_mut();
+            // This module-local fixture is not a real producer or an API for proof submission.
+            if inner
+                .delivery
+                .ended_scopes
+                .get(&target.owner.attempt.lifetime.id)
+                != Some(&target.owner.attempt.lifetime)
+            {
+                return Ok(CapacityRetirementResult::Unproven);
+            }
+            let command = DeliveryCommand::Close {
+                key: target.owner.key.clone(),
+            };
+            let Some(context) = inner.delivery_context(&command)? else {
+                return Ok(CapacityRetirementResult::Stale);
+            };
+            let delta = transition_capacity_retirement(context, target)?;
+            if let Some(record) = delta.record {
+                inner.delivery.access.write("record");
+                inner.delivery.records.insert(record.key.clone(), record);
+            }
+            if let Some(recipient) = delta.recipient {
+                inner.delivery.access.write("recipient");
+                inner
+                    .delivery
+                    .recipients
+                    .insert(recipient.binding.recipient_id.clone(), recipient);
+            }
+            if let Some(global) = delta.global {
+                inner.delivery.access.write("global");
+                inner.delivery.global = Some(global);
+            }
+            Ok(delta.result)
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    use crate::wire_delivery::conformance::{fixture_commands, fixture_message};
+    use crate::wire_delivery::*;
+
+    fn contradiction(case: conformance::ContradictionCase) {
+        let s = MemStore::default();
+        let views = conformance::contradiction_conformance(
+            &s,
+            |p, m| install_input(&s, p, m.clone()),
+            |t| {
+                s.inner.borrow_mut().delivery.ended_scopes.insert(
+                    t.owner.attempt.lifetime.id,
+                    t.owner.attempt.lifetime.clone(),
+                );
+                s.retire_orphan_capacity(t.clone()).unwrap()
+            },
+            case,
+        );
+        let inner = s.inner.borrow();
+        let global = inner.delivery.global.as_ref().unwrap();
+        assert_eq!(global.revision, Revision(4)); // two reservations, exactly two releases
+        assert_eq!(global.active_attempts, 0);
+        assert!(global.active_index.is_empty());
+        for view in views {
+            assert_eq!(
+                inner.delivery.reservations.get(&view.key.original_id),
+                Some(&IdReservation {
+                    original_id: view.key.original_id.clone(),
+                    generation: view.generation
+                })
+            );
+            assert_eq!(
+                inner.delivery.recipients[&view.key.recipient_id].revision,
+                Revision(match case {
+                    conformance::ContradictionCase::Unarmed => 6,
+                    conformance::ContradictionCase::CrossKey => 8,
+                    _ => 7,
+                })
+            );
+        }
+        assert!(
+            inner
+                .delivery
+                .recipients
+                .values()
+                .all(|r| r.active.is_none())
+        );
+    }
+
+    #[test]
+    fn managed_contradiction_unarmed_capacity() {
+        contradiction(conformance::ContradictionCase::Unarmed);
+    }
+    #[test]
+    fn managed_contradiction_armed_queued_fence() {
+        contradiction(conformance::ContradictionCase::ArmedQueued);
+    }
+    #[test]
+    fn managed_contradiction_armed_accepted_fence() {
+        contradiction(conformance::ContradictionCase::ArmedAccepted);
+    }
+    #[test]
+    fn managed_contradiction_armed_no_mutation_fence() {
+        contradiction(conformance::ContradictionCase::ArmedNoMutation);
+    }
+    #[test]
+    fn managed_contradiction_retired_fence() {
+        contradiction(conformance::ContradictionCase::RetiredNoMutation);
+    }
+    #[test]
+    fn managed_contradiction_cross_key_retirement() {
+        contradiction(conformance::ContradictionCase::CrossKey);
+    }
+
+    fn install(s: &MemStore) {
+        let DeliveryCommand::Prepare(input) = fixture_commands().remove(0) else {
+            unreachable!()
+        };
+        install_input(s, &input, fixture_message());
+    }
+
+    fn install_input(s: &MemStore, input: &PrepareInput, message: WireMessage) {
+        let mut inner = s.inner.borrow_mut();
+        let recipient_id = input.key.recipient_id.clone();
+        let name = match &message.to {
+            crate::ferrowire::WireAddress::AgentName(name) => name.clone(),
+            _ => "bob".into(),
+        };
+        let resolution = IdentityResolution::Unique {
+            recipient_id: recipient_id.clone(),
+            binding_revision: input.binding.binding_revision,
+        };
+        inner.agents.insert(
+            recipient_id.clone(),
+            AgentRecord {
+                id: recipient_id.clone(),
+                name_key: name.clone(),
+                display_name: "Bob".into(),
+                email: "bob@example.test".into(),
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                status: AgentStatus::Active,
+                updated_at: At::from_unix_millis(1),
+                by: "fixture".into(),
+            },
+        );
+        inner.wire_inbox.insert(
+            (recipient_id.iri().clone(), message.id.clone()),
+            DeliveryReceipt {
+                message_id: message.id.clone(),
+                recipient_id: recipient_id.iri().clone(),
+                recipient_name: name.clone(),
+                status: DeliveryStatus::Pending,
+                attempts: 0,
+                updated_at: message.created_at.clone(),
+                acked_at: None,
+            },
+        );
+        inner.delivery.identities.insert(
+            serde_json::to_string(&message.to).unwrap(),
+            resolution.clone(),
+        );
+        inner
+            .delivery
+            .identities
+            .insert(format!("name:{name}"), resolution);
+        inner
+            .delivery
+            .receipt_keys
+            .insert(input.key.clone(), recipient_id.iri().clone());
+        inner.append_wire_message(message);
+        inner
+            .delivery
+            .recipients
+            .entry(recipient_id)
+            .or_insert(RecipientControl {
+                binding: input.binding.clone(),
+                revision: Revision(1),
+                active: None,
+                barrier: None,
+                identity_conflict: false,
+            });
+        inner
+            .delivery
+            .global
+            .get_or_insert_with(GlobalControl::default);
+        inner.delivery.continuity.get_or_insert(Continuity {
+            schema: DELIVERY_SCHEMA_VERSION,
+            cutover: At::from_unix_millis(0),
+            policy_hash: input.binding.policy_hash,
+            local_epoch: input.binding.local_epoch,
+            enabled: true,
+            intact: true,
+        });
+        inner
+            .delivery
+            .admissions
+            .insert(input.attempt.lifetime.id, input.attempt.lifetime.clone());
+    }
+
+    #[test]
+    fn managed_mem_first_prepare_wins() {
+        let s = MemStore::default();
+        install(&s);
+        let command = fixture_commands().remove(0);
+        let mut other = command.clone();
+        if let DeliveryCommand::Prepare(input) = &mut other {
+            input.attempt.token = PhaseToken([42; 32]);
+        }
+        let results = [
+            s.apply_delivery(command.clone()).unwrap(),
+            s.apply_delivery(other).unwrap(),
+        ];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, DeliveryResult::Prepared { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.inspect_delivery(command.key()).unwrap().unwrap().prepares,
+            1
+        );
+    }
+
+    #[test]
+    fn managed_transition_crash_matrix() {
+        // One fixture per spec §7 crash row; copying committed Inner below models
+        // process restart, without generating a new attempt or connection grant.
+        for crash in 0..8 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            match crash {
+                0 => {
+                    assert!(s.inspect_delivery(&input.key).unwrap().is_none());
+                    prepare(&s, &input);
+                }
+                1 => {
+                    let p = prepare(&s, &input);
+                    let stale_arm = arm_input(&input, p.revision);
+                    s.apply_delivery(DeliveryCommand::InvalidatePrepared {
+                        key: input.key.clone(),
+                        revision: p.revision,
+                        now: At::from_unix_millis(22000),
+                    })
+                    .unwrap();
+                    assert_eq!(view(&s, &input).prepares, 1);
+                    assert_eq!(view(&s, &input).eligibility, Eligibility::Eligible);
+                    assert!(matches!(
+                        s.apply_delivery(DeliveryCommand::Arm(stale_arm)).unwrap(),
+                        DeliveryResult::Refused { .. }
+                    ));
+                }
+                2..=4 => {
+                    // Unknown arm reply, armed-before-output/partial output, and
+                    // vendor acceptance with failed settlement all retain fences.
+                    armed(&s, &input);
+                    let committed = view(&s, &input);
+                    assert_eq!(committed.eligibility, Eligibility::MutationArmed);
+                    assert!(matches!(
+                        s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                            .unwrap(),
+                        DeliveryResult::Refused { .. }
+                    ));
+                    s.apply_delivery(DeliveryCommand::Close {
+                        key: input.key.clone(),
+                    })
+                    .unwrap();
+                    assert_ne!(view(&s, &input).eligibility, Eligibility::Eligible);
+                    assert_eq!(view(&s, &input).barrier, Some(input.key.clone()));
+                    settle(&s, &input, DeliveryEvidence::MutationUnconfirmed);
+                    assert_eq!(view(&s, &input).eligibility, Eligibility::Held);
+                }
+                5 => {
+                    armed(&s, &input);
+                    settle(&s, &input, DeliveryEvidence::VendorQueued);
+                    let before = view(&s, &input);
+                    settle(&s, &input, DeliveryEvidence::VendorQueued);
+                    assert_eq!(view(&s, &input), before);
+                    assert!(matches!(
+                        s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                            .unwrap(),
+                        DeliveryResult::Refused { .. }
+                    ));
+                }
+                6 => {
+                    let p = prepare(&s, &input);
+                    ack(&s, &input, 2100);
+                    assert!(matches!(
+                        s.apply_delivery(DeliveryCommand::Arm(arm_input(&input, p.revision)))
+                            .unwrap(),
+                        DeliveryResult::Refused { .. }
+                    ));
+                    assert_ne!(view(&s, &input).eligibility, Eligibility::Eligible);
+                }
+                7 => {
+                    s.inner
+                        .borrow_mut()
+                        .delivery
+                        .continuity
+                        .as_mut()
+                        .unwrap()
+                        .intact = false;
+                    assert!(matches!(
+                        s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                            .unwrap(),
+                        DeliveryResult::Refused {
+                            reason: HoldReason::ContinuityLost
+                        }
+                    ));
+                    assert!(s.inspect_delivery(&input.key).unwrap().is_none());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn managed_three_prepares_lifetime() {
+        let s = MemStore::default();
+        install(&s);
+        let DeliveryCommand::Prepare(mut input) = fixture_commands().remove(0) else {
+            unreachable!()
+        };
+        for n in 0..3 {
+            input.attempt.token = PhaseToken([n; 32]);
+            let DeliveryResult::Prepared { record } = s
+                .apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                .unwrap()
+            else {
+                panic!("prepare")
+            };
+            s.apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                key: input.key.clone(),
+                revision: record.revision,
+                attempt: input.attempt.clone(),
+                proof: DeliveryEvidence::PreMutationRefused,
+                now: input.now.clone(),
+            }))
+            .unwrap();
+        }
+        ack(&s, &input, 5000);
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "restart simulation".into(),
+        })
+        .unwrap();
+        let restarted = MemStore::default();
+        {
+            let mut from = s.inner.borrow_mut();
+            let mut to = restarted.inner.borrow_mut();
+            to.delivery = std::mem::take(&mut from.delivery);
+            to.delivery.admissions.clear(); // Restart cannot reconstruct connection authority.
+            to.wire_messages = std::mem::take(&mut from.wire_messages);
+            to.wire_inbox = std::mem::take(&mut from.wire_inbox);
+            to.agents = std::mem::take(&mut from.agents);
+        }
+        assert_eq!(
+            restarted
+                .inspect_delivery(&input.key)
+                .unwrap()
+                .unwrap()
+                .prepares,
+            3
+        );
+        assert!(matches!(
+            restarted
+                .apply_delivery(DeliveryCommand::Prepare(input))
+                .unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::BudgetExhausted
+            }
+        ));
+    }
+
+    fn base_input() -> PrepareInput {
+        let DeliveryCommand::Prepare(input) = fixture_commands().remove(0) else {
+            unreachable!()
+        };
+        input
+    }
+    fn prepare(s: &MemStore, input: &PrepareInput) -> DeliveryRecord {
+        match s
+            .apply_delivery(DeliveryCommand::Prepare(input.clone()))
+            .unwrap()
+        {
+            DeliveryResult::Prepared { record } => record,
+            result => panic!("expected Prepared, got {result:?}"),
+        }
+    }
+    fn arm_input(input: &PrepareInput, revision: Revision) -> ArmInput {
+        let DeliveryCommand::Arm(mut arm) = fixture_commands().remove(1) else {
+            unreachable!()
+        };
+        arm.key = input.key.clone();
+        arm.attempt = input.attempt.clone();
+        arm.route = input.route.clone();
+        arm.revision = revision;
+        arm.now = At::from_unix_millis(input.now.unix_millis() + 1);
+        arm.frozen.digest =
+            canonical_payload(input.generation, &arm.frozen.renderer, &arm.frozen.bytes).unwrap();
+        arm
+    }
+    fn armed(s: &MemStore, input: &PrepareInput) -> DeliveryRecord {
+        let prepared = prepare(s, input);
+        match s
+            .apply_delivery(DeliveryCommand::Arm(arm_input(input, prepared.revision)))
+            .unwrap()
+        {
+            DeliveryResult::Armed { record } => record,
+            result => panic!("expected Armed, got {result:?}"),
+        }
+    }
+    fn settle(s: &MemStore, input: &PrepareInput, evidence: DeliveryEvidence) -> DeliveryResult {
+        let revision = s.inspect_delivery(&input.key).unwrap().unwrap().revision;
+        s.apply_delivery(DeliveryCommand::Settle(SettleInput {
+            key: input.key.clone(),
+            revision,
+            attempt: input.attempt.clone(),
+            evidence,
+            detail: String::new(),
+            now: At::from_unix_millis(3000),
+        }))
+        .unwrap()
+    }
+    fn view(s: &MemStore, input: &PrepareInput) -> DeliveryView {
+        s.inspect_delivery(&input.key).unwrap().unwrap()
+    }
+    fn ack(s: &MemStore, input: &PrepareInput, at: u64) {
+        s.apply_delivery(DeliveryCommand::ManualAck(ManualAckInput {
+            key: input.key.clone(),
+            at: At::from_unix_millis(at),
+        }))
+        .unwrap();
+    }
+    fn next_input(n: u64) -> (PrepareInput, WireMessage) {
+        let mut input = base_input();
+        let mut message = fixture_message();
+        message.id = MessageId(seq_iri(10_000 + n));
+        message.thread_id = message.id.clone();
+        message.to = crate::ferrowire::WireAddress::AgentName(format!("bob-{n}"));
+        input.key = DeliveryKey {
+            original_id: message.id.clone(),
+            recipient_id: AgentId(seq_iri(20_000 + n)),
+        };
+        input.binding.recipient_id = input.key.recipient_id.clone();
+        input.attempt.token = PhaseToken([n as u8; 32]);
+        input.generation = canonical_generation(&message).unwrap();
+        (input, message)
+    }
+
+    #[test]
+    fn managed_mem_shared_conformance() {
+        let s = MemStore::default();
+        install(&s);
+        let agent = s
+            .inner
+            .borrow()
+            .agents
+            .get(&base_input().key.recipient_id)
+            .unwrap()
+            .clone();
+        {
+            let mut inner = s.inner.borrow_mut();
+            inner.agents.clear();
+            inner.wire_messages.clear();
+            inner.wire_inbox.clear();
+        }
+        crate::wire_delivery::conformance::delivery_conformance(&s, |message| {
+            s.import_registry_events(&[RegistryEvent {
+                event_id: seq_iri(9003),
+                at: At::from_unix_millis(1),
+                by: "fixture".into(),
+                kind: RegistryEventKind::AgentUpsert(agent.clone()),
+            }])
+            .unwrap();
+            let report = s
+                .import_wire_batch(std::slice::from_ref(message), &[])
+                .unwrap();
+            assert_eq!(report.imported_messages, 1);
+        });
+    }
+
+    #[test]
+    fn managed_stale_wrong_worker_and_digest_fail_closed() {
+        for case in 0..7 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            if case == 0 {
+                let mut bad = input.clone();
+                bad.generation = Digest([0; 32]);
+                assert!(matches!(
+                    s.apply_delivery(DeliveryCommand::Prepare(bad)).unwrap(),
+                    DeliveryResult::Refused {
+                        reason: HoldReason::GenerationConflict
+                    }
+                ));
+                assert!(s.inspect_delivery(&input.key).unwrap().is_none());
+                continue;
+            }
+            let prepared = prepare(&s, &input);
+            let mut arm = arm_input(&input, prepared.revision);
+            match case {
+                1 => arm.revision = Revision(0),
+                2 => arm.attempt.worker = WorkerId([0; 32]),
+                3 => {
+                    s.inner
+                        .borrow_mut()
+                        .wire_messages
+                        .get_mut(&input.key.original_id)
+                        .unwrap()
+                        .body
+                        .push('!');
+                }
+                4 => arm.frozen.digest = Digest([0; 32]),
+                5 => {
+                    s.inner.borrow_mut().delivery.admissions.clear();
+                }
+                6 => arm.route.thread_id = "other".into(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                s.apply_delivery(DeliveryCommand::Arm(arm)).unwrap(),
+                DeliveryResult::Refused { .. }
+            ));
+            assert_eq!(view(&s, &input).eligibility, Eligibility::Prepared);
+            assert_eq!(
+                s.inner
+                    .borrow()
+                    .delivery
+                    .global
+                    .as_ref()
+                    .unwrap()
+                    .active_attempts,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn managed_expiry_ack_and_invalidation_race_arm() {
+        for case in 0..4 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            let p = prepare(&s, &input);
+            let mut arm = arm_input(&input, p.revision);
+            match case {
+                0 => {
+                    arm.now = At::from_unix_millis(input.now.unix_millis() + 20_000);
+                }
+                1 => ack(&s, &input, 2100),
+                2 => {
+                    s.apply_delivery(DeliveryCommand::InvalidatePrepared {
+                        key: input.key.clone(),
+                        revision: p.revision,
+                        now: At::from_unix_millis(22_000),
+                    })
+                    .unwrap();
+                }
+                3 => {
+                    s.inner
+                        .borrow_mut()
+                        .wire_messages
+                        .get_mut(&input.key.original_id)
+                        .unwrap()
+                        .deadline_at = Some(At::from_unix_millis(2001));
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                s.apply_delivery(DeliveryCommand::Arm(arm)).unwrap(),
+                DeliveryResult::Refused { .. }
+            ));
+            assert_eq!(view(&s, &input).prepares, 1);
+        }
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        armed(&s, &input);
+        let before = view(&s, &input);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::InvalidatePrepared {
+                key: input.key.clone(),
+                revision: before.revision,
+                now: At::from_unix_millis(u64::MAX)
+            })
+            .unwrap(),
+            DeliveryResult::Refused { .. }
+        ));
+        assert_eq!(view(&s, &input), before);
+    }
+
+    #[test]
+    fn managed_ack_preserves_independent_evidence() {
+        for evidence in [
+            None,
+            Some(DeliveryEvidence::VendorQueued),
+            Some(DeliveryEvidence::MutationUnconfirmed),
+        ] {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            armed(&s, &input);
+            if let Some(evidence) = evidence {
+                settle(&s, &input, evidence);
+            }
+            let before = view(&s, &input);
+            ack(&s, &input, 4000);
+            let after = view(&s, &input);
+            assert_eq!(before.attempts, after.attempts);
+            assert_eq!(before.prepares, after.prepares);
+            assert_eq!(before.barrier, after.barrier);
+            assert_eq!(before.eligibility, after.eligibility);
+            assert_eq!(
+                after.acknowledgment.manual_at,
+                Some(At::from_unix_millis(4000))
+            );
+            ack(&s, &input, 5000);
+            assert_eq!(view(&s, &input), after);
+            let inner = s.inner.borrow();
+            let receipt = inner
+                .wire_inbox
+                .get(&(
+                    input.key.recipient_id.iri().clone(),
+                    input.key.original_id.clone(),
+                ))
+                .unwrap();
+            assert_eq!(receipt.status, DeliveryStatus::Acked);
+        }
+        // Enrollment's legacy provenance has no invented attempt/evidence.
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        let mut ctx = s
+            .inner
+            .borrow_mut()
+            .delivery_context(&DeliveryCommand::Prepare(input.clone()))
+            .unwrap()
+            .unwrap();
+        ctx.record = Some(DeliveryRecord {
+            schema: DELIVERY_SCHEMA_VERSION,
+            key: input.key.clone(),
+            generation: input.generation,
+            binding: input.binding.clone(),
+            revision: Revision(1),
+            eligibility: Eligibility::Held,
+            prepares: 0,
+            attempts: vec![],
+            acknowledgment: AcknowledgmentState {
+                manual_at: None,
+                legacy_unknown: true,
+            },
+            held: Some(HoldReason::LegacyUncertain),
+            annotation: String::new(),
+        });
+        ctx.reservation = Some(IdReservation {
+            original_id: input.key.original_id.clone(),
+            generation: input.generation,
+        });
+        {
+            let mut inner = s.inner.borrow_mut();
+            inner
+                .delivery
+                .records
+                .insert(input.key.clone(), ctx.record.unwrap());
+            inner
+                .delivery
+                .reservations
+                .insert(input.key.original_id.clone(), ctx.reservation.unwrap());
+        }
+        ack(&s, &input, 4000);
+        let v = view(&s, &input);
+        assert!(v.acknowledgment.legacy_unknown);
+        assert!(v.acknowledgment.manual_at.is_some());
+        assert!(v.attempts.is_empty());
+        assert_eq!(v.prepares, 0);
+    }
+
+    #[test]
+    fn managed_settlement_projection_contradiction_and_bounds() {
+        for transport in [Transport::Queue, Transport::Steer, Transport::Stdout] {
+            let s = MemStore::default();
+            install(&s);
+            let mut input = base_input();
+            if transport == Transport::Stdout {
+                input.attempt.lane = Lane::Hook;
+            }
+            let p = prepare(&s, &input);
+            let mut arm = arm_input(&input, p.revision);
+            arm.frozen.transport = transport;
+            arm.frozen.expected_turn = (transport == Transport::Steer).then(|| "turn".into());
+            s.apply_delivery(DeliveryCommand::Arm(arm)).unwrap();
+            let evidence = match transport {
+                Transport::Queue => DeliveryEvidence::VendorQueued,
+                Transport::Steer => DeliveryEvidence::AppServerAccepted {
+                    thread: "thread".into(),
+                    turn: "turn".into(),
+                },
+                Transport::Stdout => DeliveryEvidence::HookEmissionCompleted,
+            };
+            settle(&s, &input, evidence.clone());
+            let before = view(&s, &input);
+            settle(&s, &input, evidence);
+            assert_eq!(view(&s, &input), before);
+            assert_eq!(
+                s.inner
+                    .borrow()
+                    .wire_inbox
+                    .get(&(
+                        input.key.recipient_id.iri().clone(),
+                        input.key.original_id.clone()
+                    ))
+                    .unwrap()
+                    .status,
+                DeliveryStatus::Delivered
+            );
+            settle(&s, &input, DeliveryEvidence::MutationUnconfirmed);
+            let after = view(&s, &input);
+            assert_eq!(after.eligibility, Eligibility::Held);
+            assert_eq!(after.attempts, before.attempts);
+            assert_eq!(after.barrier, Some(input.key.clone()));
+        }
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        let a = armed(&s, &input);
+        let before = s
+            .inner
+            .borrow()
+            .wire_inbox
+            .get(&(
+                input.key.recipient_id.iri().clone(),
+                input.key.original_id.clone(),
+            ))
+            .unwrap()
+            .clone();
+        s.apply_delivery(DeliveryCommand::Settle(SettleInput {
+            key: input.key.clone(),
+            revision: a.revision,
+            attempt: input.attempt.clone(),
+            evidence: DeliveryEvidence::MutationUnconfirmed,
+            detail: "é".repeat(400),
+            now: At::from_unix_millis(3000),
+        }))
+        .unwrap();
+        let v = view(&s, &input);
+        assert_eq!(v.held, Some(HoldReason::EvidenceOverflow));
+        assert_eq!(v.attempts[0].detail.chars().count(), 300);
+        assert_eq!(
+            *s.inner
+                .borrow()
+                .wire_inbox
+                .get(&(
+                    input.key.recipient_id.iri().clone(),
+                    input.key.original_id.clone()
+                ))
+                .unwrap(),
+            before
+        );
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "x".repeat(4097),
+        })
+        .unwrap();
+        assert!(view(&s, &input).annotation.is_empty());
+    }
+
+    #[test]
+    fn managed_uncertainty_barrier_new_ids_and_one_frozen_copy() {
+        let s = MemStore::default();
+        install(&s);
+        let mut input = base_input();
+        for n in 0..3 {
+            input.attempt.token = PhaseToken([n; 32]);
+            armed(&s, &input);
+            assert_eq!(
+                s.inner
+                    .borrow()
+                    .delivery
+                    .records
+                    .get(&input.key)
+                    .unwrap()
+                    .attempts
+                    .iter()
+                    .filter(|a| a.frozen.is_some())
+                    .count(),
+                1
+            );
+            settle(&s, &input, DeliveryEvidence::DefinitiveNoMutation);
+        }
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        armed(&s, &input);
+        settle(&s, &input, DeliveryEvidence::MutationUnconfirmed);
+        ack(&s, &input, 4000);
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "reviewed".into(),
+        })
+        .unwrap();
+        s.apply_delivery(DeliveryCommand::Close {
+            key: input.key.clone(),
+        })
+        .unwrap();
+        let mut new_input = input.clone();
+        let mut message = fixture_message();
+        message.id = MessageId(seq_iri(9999));
+        new_input.key.original_id = message.id.clone();
+        new_input.generation = canonical_generation(&message).unwrap();
+        install_input(&s, &new_input, message);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Prepare(new_input))
+                .unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::Unconfirmed
+            }
+        ));
+        assert_eq!(view(&s, &input).barrier, Some(input.key.clone()));
+    }
+
+    #[test]
+    fn managed_capacity_predicates_are_atomic() {
+        let s = MemStore::default();
+        for n in 0..15 {
+            let (input, message) = next_input(n);
+            install_input(&s, &input, message);
+            armed(&s, &input);
+        }
+        let (a, ma) = next_input(15);
+        let (b, mb) = next_input(16);
+        install_input(&s, &a, ma);
+        install_input(&s, &b, mb);
+        prepare(&s, &a);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Prepare(b.clone()))
+                .unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::Capacity
+            }
+        ));
+        assert!(s.inspect_delivery(&b.key).unwrap().is_none());
+        assert_eq!(s.active_delivery_owners().unwrap().len(), 16);
+        let s = MemStore::default();
+        install(&s);
+        let first = base_input();
+        let mut second = first.clone();
+        let mut message = fixture_message();
+        message.id = MessageId(seq_iri(999));
+        second.key.original_id = message.id.clone();
+        second.generation = canonical_generation(&message).unwrap();
+        install_input(&s, &second, message);
+        prepare(&s, &second);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Prepare(first.clone()))
+                .unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::Capacity
+            }
+        ));
+        assert!(s.inspect_delivery(&first.key).unwrap().is_none());
+    }
+
+    fn end_scope(s: &MemStore, input: &PrepareInput) {
+        s.inner
+            .borrow_mut()
+            .delivery
+            .ended_scopes
+            .insert(input.attempt.lifetime.id, input.attempt.lifetime.clone());
+    }
+    fn target(s: &MemStore, input: &PrepareInput) -> CapacityRetirementTarget {
+        s.active_delivery_owners()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.owner.key == input.key)
+            .unwrap()
+    }
+
+    #[test]
+    fn managed_capacity_retirement_preserves_uncertainty() {
+        let s = MemStore::default();
+        let mut inputs = vec![];
+        for n in 0..16 {
+            let (input, message) = next_input(n);
+            install_input(&s, &input, message);
+            armed(&s, &input);
+            inputs.push(input);
+        }
+        let input = &inputs[0];
+        let before = view(&s, input);
+        let t = target(&s, input);
+        assert!(matches!(
+            s.retire_orphan_capacity(t.clone()).unwrap(),
+            CapacityRetirementResult::Unproven
+        ));
+        end_scope(&s, input);
+        assert!(matches!(
+            s.retire_orphan_capacity(t.clone()).unwrap(),
+            CapacityRetirementResult::Retired { .. }
+        ));
+        let after = view(&s, input);
+        assert_eq!(after.eligibility, before.eligibility);
+        assert_eq!(after.acknowledgment, before.acknowledgment);
+        assert_eq!(after.prepares, before.prepares);
+        assert_eq!(after.attempts[0].evidence, before.attempts[0].evidence);
+        assert_eq!(after.barrier, before.barrier);
+        assert_eq!(after.attempts[0].capacity, CapacityState::Retired);
+        assert!(matches!(
+            s.retire_orphan_capacity(t).unwrap(),
+            CapacityRetirementResult::AlreadyReleased { .. }
+        ));
+        let (fresh, message) = next_input(17);
+        install_input(&s, &fresh, message);
+        prepare(&s, &fresh);
+        assert_eq!(s.active_delivery_owners().unwrap().len(), 16);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                .unwrap(),
+            DeliveryResult::Refused { .. }
+        ));
+        let mut later = input.clone();
+        let mut message = fixture_message();
+        message.id = MessageId(seq_iri(999));
+        message.to = crate::ferrowire::WireAddress::AgentName("bob-0".into());
+        later.key.original_id = message.id.clone();
+        later.generation = canonical_generation(&message).unwrap();
+        install_input(&s, &later, message);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Prepare(later)).unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::Unconfirmed
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_capacity_retirement_race_orders() {
+        for retirement_first in [false, true] {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            armed(&s, &input);
+            let t = target(&s, &input);
+            end_scope(&s, &input);
+            if retirement_first {
+                s.retire_orphan_capacity(t.clone()).unwrap();
+                let before = view(&s, &input);
+                settle(&s, &input, DeliveryEvidence::VendorQueued);
+                let after = view(&s, &input);
+                assert_eq!(after.attempts[0].capacity, CapacityState::Retired);
+                assert_eq!(after.barrier, before.barrier);
+                assert_ne!(after.eligibility, Eligibility::Eligible);
+            } else {
+                settle(&s, &input, DeliveryEvidence::VendorQueued);
+            }
+            assert!(matches!(
+                s.retire_orphan_capacity(t).unwrap(),
+                CapacityRetirementResult::AlreadyReleased { .. }
+            ));
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+        }
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        armed(&s, &input);
+        let stale = target(&s, &input);
+        end_scope(&s, &input);
+        ack(&s, &input, 4000);
+        assert!(matches!(
+            s.retire_orphan_capacity(stale).unwrap(),
+            CapacityRetirementResult::Stale
+        ));
+        assert_eq!(s.active_delivery_owners().unwrap().len(), 1);
+        let fresh = target(&s, &input);
+        s.inner
+            .borrow_mut()
+            .delivery
+            .ended_scopes
+            .get_mut(&input.attempt.lifetime.id)
+            .unwrap()
+            .revision = Revision(2);
+        assert!(matches!(
+            s.retire_orphan_capacity(fresh.clone()).unwrap(),
+            CapacityRetirementResult::Unproven
+        ));
+        end_scope(&s, &input);
+        s.retire_orphan_capacity(fresh).unwrap();
+        assert!(s.active_delivery_owners().unwrap().is_empty());
+    }
+
+    #[test]
+    fn managed_missing_metadata_never_rebuilds_from_history() {
+        for case in 0..6 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            prepare(&s, &input);
+            {
+                let mut inner = s.inner.borrow_mut();
+                match case {
+                    0 => inner.delivery.global = None,
+                    1 => inner.delivery.continuity = None,
+                    2 => {
+                        inner.delivery.recipients.clear();
+                    }
+                    3 => {
+                        inner.delivery.reservations.clear();
+                    }
+                    4 => {
+                        inner.delivery.identities.clear();
+                    }
+                    5 => {
+                        inner.delivery.receipt_keys.clear();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(matches!(
+                s.apply_delivery(DeliveryCommand::Arm(arm_input(&input, Revision(1))))
+                    .unwrap(),
+                DeliveryResult::Refused { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_hot_context_independent_of_retained_history() {
+        type AccessTrace = (Vec<(&'static str, bool)>, Vec<&'static str>);
+        fn run(history: usize) -> Vec<AccessTrace> {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            // Direct module-local historical fixtures, absent from the bounded active index.
+            let donor = armed(&s, &input);
+            settle(&s, &input, DeliveryEvidence::VendorQueued);
+            {
+                let mut inner = s.inner.borrow_mut();
+                inner.delivery.records.clear();
+                inner.delivery.reservations.clear();
+                inner
+                    .delivery
+                    .recipients
+                    .get_mut(&input.key.recipient_id)
+                    .unwrap()
+                    .revision = Revision(1);
+                inner
+                    .wire_inbox
+                    .get_mut(&(
+                        input.key.recipient_id.iri().clone(),
+                        input.key.original_id.clone(),
+                    ))
+                    .unwrap()
+                    .status = DeliveryStatus::Pending;
+                for n in 0..history {
+                    let (other, message) = next_input(n as u64);
+                    let mut row = donor.clone();
+                    row.key = other.key.clone();
+                    row.binding = other.binding.clone();
+                    row.eligibility = if n % 2 == 0 {
+                        Eligibility::Held
+                    } else {
+                        Eligibility::Settled
+                    };
+                    row.attempts[0].capacity = CapacityState::Released;
+                    inner.delivery.records.insert(other.key.clone(), row);
+                    inner.delivery.reservations.insert(
+                        message.id.clone(),
+                        IdReservation {
+                            original_id: message.id,
+                            generation: other.generation,
+                        },
+                    );
+                    inner.delivery.recipients.insert(
+                        other.key.recipient_id.clone(),
+                        RecipientControl {
+                            binding: other.binding,
+                            revision: Revision(1),
+                            active: None,
+                            barrier: None,
+                            identity_conflict: false,
+                        },
+                    );
+                    inner
+                        .delivery
+                        .identities
+                        .insert(format!("old-alias-{n}"), IdentityResolution::Conflict);
+                }
+                inner.delivery.access = DeliveryAccess::default();
+            }
+            let mut out = vec![];
+            let capture = |out: &mut Vec<_>| {
+                let access = std::mem::take(&mut s.inner.borrow_mut().delivery.access);
+                out.push((access.reads, access.writes));
+            };
+            s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                .unwrap();
+            capture(&mut out);
+            s.apply_delivery(DeliveryCommand::Arm(arm_input(&input, Revision(1))))
+                .unwrap();
+            capture(&mut out);
+            s.apply_delivery(DeliveryCommand::Settle(SettleInput {
+                key: input.key.clone(),
+                revision: Revision(2),
+                attempt: input.attempt.clone(),
+                evidence: DeliveryEvidence::VendorQueued,
+                detail: String::new(),
+                now: At::from_unix_millis(3000),
+            }))
+            .unwrap();
+            capture(&mut out);
+            ack(&s, &input, 4000);
+            capture(&mut out);
+            view(&s, &input);
+            capture(&mut out);
+            out
+        }
+        let empty = run(0);
+        let retained = run(512);
+        assert_eq!(empty, retained);
+        assert_eq!(
+            empty[0].0.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                "record",
+                "reservation",
+                "recipient",
+                "global",
+                "continuity",
+                "message",
+                "receipt_index",
+                "receipt",
+                "registry",
+                "selector_index",
+                "receipt_alias_index",
+                "admission"
+            ]
+        );
+        assert_eq!(empty[4].0.len(), 2);
+        assert!(!empty[0].1.is_empty());
+    }
+
+    #[test]
+    fn managed_retired_late_nonmutation_and_historical_release_cannot_reopen() {
+        let s = MemStore::default();
+        install(&s);
+        let mut input = base_input();
+        armed(&s, &input);
+        end_scope(&s, &input);
+        s.retire_orphan_capacity(target(&s, &input)).unwrap();
+        let before = view(&s, &input);
+        let result = s
+            .apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                key: input.key.clone(),
+                revision: before.revision,
+                attempt: input.attempt.clone(),
+                proof: DeliveryEvidence::DefinitiveNoMutation,
+                now: At::from_unix_millis(4000),
+            }))
+            .unwrap();
+        assert!(matches!(result, DeliveryResult::Refused { .. }));
+        assert_eq!(view(&s, &input), before);
+        settle(&s, &input, DeliveryEvidence::DefinitiveNoMutation);
+        let after = view(&s, &input);
+        assert_eq!(after.eligibility, before.eligibility);
+        assert_eq!(after.barrier, before.barrier);
+        assert_eq!(after.attempts[0].capacity, CapacityState::Retired);
+        // Exact historical retirement must never clear a later prepared owner.
+        let s = MemStore::default();
+        install(&s);
+        armed(&s, &input);
+        let old = target(&s, &input);
+        end_scope(&s, &input);
+        settle(&s, &input, DeliveryEvidence::DefinitiveNoMutation);
+        input.attempt.token = PhaseToken([44; 32]);
+        prepare(&s, &input);
+        let new_owner = target(&s, &input);
+        assert!(matches!(
+            s.retire_orphan_capacity(old).unwrap(),
+            CapacityRetirementResult::AlreadyReleased { .. }
+        ));
+        assert_eq!(s.active_delivery_owners().unwrap(), vec![new_owner]);
+    }
+
+    fn compact_delivery_bytes(record: &DeliveryRecord) -> usize {
+        let mut compact = record.clone();
+        for attempt in &mut compact.attempts {
+            if let Some(frozen) = &mut attempt.frozen {
+                frozen.bytes.clear();
+            }
+        }
+        serde_json::to_vec(&compact).unwrap().len()
+    }
+
+    #[test]
+    fn managed_annotation_accounts_for_json_expansion() {
+        for (text, accepted) in [
+            ("\0".repeat(4091), false),
+            ("\u{1}".repeat(4091), false),
+            ("x".repeat(4091), true),
+            ("\"".repeat(4091), true),
+            ("\\".repeat(4091), true),
+            ("😀".repeat(1022), true),
+        ] {
+            let s = MemStore::default();
+            install(&s);
+            let mut input = base_input();
+            input.route.thread_id = "t".repeat(2000);
+            input.route.executable = Some("e".repeat(2000));
+            for token in 0..3 {
+                input.attempt.token = PhaseToken([token; 32]);
+                let p = prepare(&s, &input);
+                assert!(matches!(
+                    s.apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                        key: input.key.clone(),
+                        revision: p.revision,
+                        attempt: input.attempt.clone(),
+                        proof: DeliveryEvidence::PreMutationRefused,
+                        now: At::from_unix_millis(2100),
+                    }))
+                    .unwrap(),
+                    DeliveryResult::Applied { .. }
+                ));
+            }
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: "prior".into(),
+            })
+            .unwrap();
+            ack(&s, &input, 4000);
+            let before = view(&s, &input);
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: text.clone(),
+            })
+            .unwrap();
+            let after = view(&s, &input);
+            let row = s.inner.borrow().delivery.records[&input.key].clone();
+            assert!(compact_delivery_bytes(&row) <= 32_768);
+            assert_eq!(
+                after.annotation,
+                if accepted {
+                    format!("prior{text}")
+                } else {
+                    "prior".into()
+                }
+            );
+            assert_eq!(after.attempts, before.attempts);
+            assert_eq!(after.prepares, before.prepares);
+            assert_eq!(after.acknowledgment, before.acknowledgment);
+            assert_eq!(after.barrier, before.barrier);
+            if !accepted {
+                assert_eq!(after.eligibility, Eligibility::Held);
+                assert_eq!(after.held, Some(HoldReason::EvidenceOverflow));
+            }
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn managed_escaped_annotation_uses_remaining_row_capacity() {
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        prepare(&s, &input);
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "\0".repeat(4096),
+        })
+        .unwrap();
+        assert_eq!(view(&s, &input).annotation.len(), 4096);
+        assert_eq!(view(&s, &input).eligibility, Eligibility::Prepared);
+        assert!(compact_delivery_bytes(&s.inner.borrow().delivery.records[&input.key]) <= 32_768);
+        // Raw UTF-8 bytes remain independently bounded even with row space left.
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "é".into(),
+        })
+        .unwrap();
+        let v = view(&s, &input);
+        assert_eq!(v.annotation, "\0".repeat(4096));
+        assert_eq!(v.held, Some(HoldReason::EvidenceOverflow));
+        assert_eq!(v.eligibility, Eligibility::Held);
+        assert!(s.active_delivery_owners().unwrap().is_empty());
+        ack(&s, &input, 4000);
+        assert!(view(&s, &input).acknowledgment.manual_at.is_some());
+        assert!(s.active_delivery_owners().unwrap().is_empty());
+    }
+
+    #[test]
+    fn managed_annotation_overflow_preserves_armed_safety_operations() {
+        for retire in [false, true] {
+            let s = MemStore::default();
+            install(&s);
+            let mut input = base_input();
+            input.route.thread_id = "t".repeat(2000);
+            input.route.executable = Some("e".repeat(2000));
+            for token in 0..2 {
+                input.attempt.token = PhaseToken([token; 32]);
+                let p = prepare(&s, &input);
+                s.apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                    key: input.key.clone(),
+                    revision: p.revision,
+                    attempt: input.attempt.clone(),
+                    proof: DeliveryEvidence::PreMutationRefused,
+                    now: At::from_unix_millis(2100),
+                }))
+                .unwrap();
+            }
+            input.attempt.token = PhaseToken([2; 32]);
+            armed(&s, &input);
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: "prior".into(),
+            })
+            .unwrap();
+            let before = view(&s, &input);
+            s.apply_delivery(DeliveryCommand::Annotate {
+                key: input.key.clone(),
+                text: "\0".repeat(4091),
+            })
+            .unwrap();
+            let overflow = view(&s, &input);
+            assert_eq!(overflow.held, Some(HoldReason::EvidenceOverflow));
+            assert_eq!(overflow.eligibility, Eligibility::Held);
+            assert_eq!(overflow.annotation, before.annotation);
+            assert_eq!(overflow.attempts, before.attempts);
+            assert_eq!(overflow.acknowledgment, before.acknowledgment);
+            assert_eq!(overflow.prepares, before.prepares);
+            assert_eq!(overflow.barrier, before.barrier);
+            assert_eq!(s.active_delivery_owners().unwrap().len(), 1);
+            ack(&s, &input, 4000);
+            assert_eq!(s.active_delivery_owners().unwrap().len(), 1);
+            let retirement = target(&s, &input);
+            if retire {
+                end_scope(&s, &input);
+                assert!(matches!(
+                    s.retire_orphan_capacity(retirement.clone()).unwrap(),
+                    CapacityRetirementResult::Retired { .. }
+                ));
+            }
+            settle(&s, &input, DeliveryEvidence::VendorQueued);
+            let settled = view(&s, &input);
+            assert_eq!(
+                settled.attempts[2].evidence,
+                Some(DeliveryEvidence::VendorQueued)
+            );
+            assert_eq!(
+                settled.attempts[2].capacity,
+                if retire {
+                    CapacityState::Retired
+                } else {
+                    CapacityState::Released
+                }
+            );
+            assert!(settled.acknowledgment.manual_at.is_some());
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+            assert!(
+                compact_delivery_bytes(&s.inner.borrow().delivery.records[&input.key]) <= 32_768
+            );
+            settle(&s, &input, DeliveryEvidence::VendorQueued);
+            assert_eq!(view(&s, &input), settled);
+            end_scope(&s, &input);
+            assert!(matches!(
+                s.retire_orphan_capacity(retirement).unwrap(),
+                CapacityRetirementResult::AlreadyReleased { .. }
+            ));
+            assert!(s.active_delivery_owners().unwrap().is_empty());
+            if retire {
+                assert_eq!(settled.eligibility, overflow.eligibility);
+                assert_eq!(settled.held, overflow.held);
+                assert_eq!(settled.barrier, overflow.barrier);
+            }
+            assert!(matches!(
+                s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                    .unwrap(),
+                DeliveryResult::Refused { .. }
+            ));
+        }
+    }
+
+    fn malformed_prepared_command(case: usize) {
+        for corruption in 0..5 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            let p = prepare(&s, &input);
+            {
+                let mut inner = s.inner.borrow_mut();
+                let record = inner.delivery.records.get_mut(&input.key).unwrap();
+                match corruption {
+                    0 => {
+                        record.attempts.clear();
+                        record.prepares = 0;
+                    }
+                    1 => record.attempts[0].armed_at = Some(At::from_unix_millis(2001)),
+                    2 => record.attempts[0].frozen = Some(arm_input(&input, p.revision).frozen),
+                    3 => record.attempts[0].evidence = Some(DeliveryEvidence::PreMutationRefused),
+                    4 => record.attempts[0].capacity = CapacityState::Released,
+                    _ => unreachable!(),
+                }
+            }
+            let command = match case {
+                0 => DeliveryCommand::ManualAck(ManualAckInput {
+                    key: input.key.clone(),
+                    at: At::from_unix_millis(4000),
+                }),
+                1 => DeliveryCommand::InvalidatePrepared {
+                    key: input.key.clone(),
+                    revision: p.revision,
+                    now: At::from_unix_millis(4000),
+                },
+                2 => DeliveryCommand::Annotate {
+                    key: input.key.clone(),
+                    text: "x".repeat(4097),
+                },
+                3 => DeliveryCommand::Close {
+                    key: input.key.clone(),
+                },
+                _ => unreachable!(),
+            };
+            let before = s
+                .inner
+                .borrow_mut()
+                .delivery_context(&command)
+                .unwrap()
+                .unwrap();
+            s.inner.borrow_mut().delivery.access = DeliveryAccess::default();
+            assert_eq!(
+                s.apply_delivery(command.clone()).unwrap(),
+                DeliveryResult::Refused {
+                    reason: HoldReason::Corrupt
+                }
+            );
+            assert!(s.inner.borrow().delivery.access.writes.is_empty());
+            let after = s
+                .inner
+                .borrow_mut()
+                .delivery_context(&command)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn managed_malformed_prepared_ack_refuses_without_writes() {
+        malformed_prepared_command(0);
+    }
+    #[test]
+    fn managed_malformed_prepared_invalidation_refuses_without_writes() {
+        malformed_prepared_command(1);
+    }
+    #[test]
+    fn managed_malformed_prepared_annotation_refuses_without_writes() {
+        malformed_prepared_command(2);
+    }
+    #[test]
+    fn managed_malformed_prepared_close_refuses_without_writes() {
+        malformed_prepared_command(3);
+    }
+
+    #[test]
+    fn managed_bounds_and_overflow_do_not_reopen_or_block_safety_flags() {
+        for bytes in [1_048_576 + 15, 1_048_576 + 14] {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            let p = prepare(&s, &input);
+            let mut arm = arm_input(&input, p.revision);
+            arm.frozen.bytes = vec![b'x'; bytes];
+            arm.frozen.digest =
+                canonical_payload(input.generation, &arm.frozen.renderer, &arm.frozen.bytes)
+                    .unwrap();
+            let result = s.apply_delivery(DeliveryCommand::Arm(arm)).unwrap();
+            assert_eq!(
+                matches!(result, DeliveryResult::Armed { .. }),
+                bytes == 1_048_576 + 14
+            );
+        }
+        let s = MemStore::default();
+        install(&s);
+        let input = base_input();
+        let p = prepare(&s, &input);
+        s.apply_delivery(DeliveryCommand::Annotate {
+            key: input.key.clone(),
+            text: "x".repeat(4097),
+        })
+        .unwrap();
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Arm(arm_input(&input, p.revision)))
+                .unwrap(),
+            DeliveryResult::Refused { .. }
+        ));
+        assert_eq!(view(&s, &input).eligibility, Eligibility::Held);
+        assert!(s.active_delivery_owners().unwrap().is_empty());
+        ack(&s, &input, 5000);
+        assert!(view(&s, &input).acknowledgment.manual_at.is_some());
+        let s = MemStore::default();
+        install(&s);
+        let mut input = base_input();
+        input.route.thread_id = "x".repeat(4097);
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Prepare(input)).unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::EvidenceOverflow
+            }
+        ));
+        let s = MemStore::default();
+        install(&s);
+        let mut input = base_input();
+        input.route.thread_id = "x".repeat(2000);
+        let p = prepare(&s, &input);
+        let mut arm = arm_input(&input, p.revision);
+        arm.frozen.transport = Transport::Steer;
+        arm.frozen.expected_turn = Some("y".repeat(2000));
+        assert!(matches!(
+            s.apply_delivery(DeliveryCommand::Arm(arm)).unwrap(),
+            DeliveryResult::Refused {
+                reason: HoldReason::EvidenceOverflow
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_corrupt_capacity_and_missing_reservation_refuse_prepare() {
+        for case in 0..5 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            let p = prepare(&s, &input);
+            s.apply_delivery(DeliveryCommand::Release(ReleaseInput {
+                key: input.key.clone(),
+                revision: p.revision,
+                attempt: input.attempt.clone(),
+                proof: DeliveryEvidence::PreMutationRefused,
+                now: At::from_unix_millis(2100),
+            }))
+            .unwrap();
+            {
+                let mut inner = s.inner.borrow_mut();
+                match case {
+                    0 => inner.delivery.reservations.clear(),
+                    1 => inner.delivery.global.as_mut().unwrap().active_attempts = 1,
+                    2 => {
+                        let owner = ActiveOwner {
+                            key: input.key.clone(),
+                            attempt: input.attempt.clone(),
+                        };
+                        let global = inner.delivery.global.as_mut().unwrap();
+                        global.active_index = vec![owner.clone(), owner];
+                        global.active_attempts = 2;
+                    }
+                    3 => {
+                        let owner = ActiveOwner {
+                            key: input.key.clone(),
+                            attempt: input.attempt.clone(),
+                        };
+                        let global = inner.delivery.global.as_mut().unwrap();
+                        global.active_index = vec![owner];
+                        global.active_attempts = 1;
+                    }
+                    4 => {
+                        inner
+                            .delivery
+                            .recipients
+                            .get_mut(&input.key.recipient_id)
+                            .unwrap()
+                            .active = Some(ActiveOwner {
+                            key: input.key.clone(),
+                            attempt: input.attempt.clone(),
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(matches!(
+                s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                    .unwrap(),
+                DeliveryResult::Refused {
+                    reason: HoldReason::Corrupt
+                }
+            ));
+            assert_eq!(view(&s, &input).prepares, 1);
+        }
+    }
+
+    #[test]
+    fn managed_corrupt_receipt_and_prepared_phase_cannot_mutate() {
+        for case in 0..3 {
+            let s = MemStore::default();
+            install(&s);
+            let input = base_input();
+            let p = prepare(&s, &input);
+            match case {
+                0 => {
+                    let mut inner = s.inner.borrow_mut();
+                    inner
+                        .wire_inbox
+                        .get_mut(&(
+                            input.key.recipient_id.iri().clone(),
+                            input.key.original_id.clone(),
+                        ))
+                        .unwrap()
+                        .recipient_id = seq_iri(42);
+                }
+                1 => {
+                    let mut inner = s.inner.borrow_mut();
+                    inner.delivery.records.get_mut(&input.key).unwrap().attempts[0].armed_at =
+                        Some(At::from_unix_millis(2001));
+                }
+                2 => {
+                    let mut inner = s.inner.borrow_mut();
+                    inner.delivery.records.get_mut(&input.key).unwrap().attempts[0].evidence =
+                        Some(DeliveryEvidence::PreMutationRefused);
+                }
+                _ => unreachable!(),
+            }
+            let command = if case == 0 {
+                DeliveryCommand::ManualAck(ManualAckInput {
+                    key: input.key.clone(),
+                    at: At::from_unix_millis(4000),
+                })
+            } else {
+                DeliveryCommand::Arm(arm_input(&input, p.revision))
+            };
+            assert!(matches!(
+                s.apply_delivery(command).unwrap(),
+                DeliveryResult::Refused {
+                    reason: HoldReason::Corrupt
+                }
+            ));
+            assert!(view(&s, &input).acknowledgment.manual_at.is_none());
+        }
+    }
+
+    #[test]
+    fn managed_initial_refusals_preserve_all_counters_and_slots() {
+        let cases = [
+            HoldReason::Disabled,
+            HoldReason::ContinuityLost,
+            HoldReason::UnsupportedVersion,
+            HoldReason::WrongHome,
+            HoldReason::UnknownIdentity,
+            HoldReason::AliasConflict,
+            HoldReason::GenerationConflict,
+            HoldReason::UnsupportedBackend,
+            HoldReason::UnsupportedBackend,
+            HoldReason::Unconfirmed,
+            HoldReason::LegacyUncertain,
+            HoldReason::Expired,
+        ];
+        for (case, expected) in cases.into_iter().enumerate() {
+            let s = MemStore::default();
+            install(&s);
+            let mut input = base_input();
+            {
+                let mut inner = s.inner.borrow_mut();
+                match case {
+                    0 => inner.delivery.continuity.as_mut().unwrap().enabled = false,
+                    1 => inner.delivery.continuity.as_mut().unwrap().intact = false,
+                    2 => inner.delivery.continuity.as_mut().unwrap().schema = 2,
+                    3 => inner.delivery.continuity.as_mut().unwrap().local_epoch = 2,
+                    4 => {
+                        inner
+                            .agents
+                            .get_mut(&input.key.recipient_id)
+                            .unwrap()
+                            .status = AgentStatus::Retired
+                    }
+                    5 => {
+                        inner
+                            .delivery
+                            .identities
+                            .insert("name:bob".into(), IdentityResolution::Conflict);
+                    }
+                    6 => input.binding.binding_revision = Revision(2),
+                    7 => inner.delivery.admissions.clear(),
+                    8 => input.attempt.lifetime.revision = Revision(2),
+                    9 => {
+                        inner
+                            .delivery
+                            .recipients
+                            .get_mut(&input.key.recipient_id)
+                            .unwrap()
+                            .barrier = Some(input.key.clone())
+                    }
+                    10 => {
+                        inner.delivery.continuity.as_mut().unwrap().cutover =
+                            At::from_unix_millis(1000)
+                    }
+                    11 => {
+                        inner
+                            .wire_messages
+                            .get_mut(&input.key.original_id)
+                            .unwrap()
+                            .deadline_at = Some(input.now.clone())
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // The expiry fixture mutates immutable fields, so bind its new digest.
+            if case == 11 {
+                input.generation = canonical_generation(
+                    s.inner
+                        .borrow()
+                        .wire_messages
+                        .get(&input.key.original_id)
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            s.inner.borrow_mut().delivery.access = DeliveryAccess::default();
+            assert_eq!(
+                s.apply_delivery(DeliveryCommand::Prepare(input.clone()))
+                    .unwrap(),
+                DeliveryResult::Refused { reason: expected }
+            );
+            let inner = s.inner.borrow();
+            assert!(inner.delivery.records.is_empty());
+            assert!(inner.delivery.reservations.is_empty());
+            assert_eq!(inner.delivery.global.as_ref().unwrap().active_attempts, 0);
+            assert!(
+                inner
+                    .delivery
+                    .recipients
+                    .get(&input.key.recipient_id)
+                    .unwrap()
+                    .active
+                    .is_none()
+            );
+            assert!(inner.delivery.access.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn managed_immutable_identity_field_bounds() {
+        for case in 0..7 {
+            let s = MemStore::default();
+            let mut input = base_input();
+            let mut message = fixture_message();
+            let large = "x".repeat(4097);
+            let large_id = Iri::parse(&format!("urn:fixture:{large}")).unwrap();
+            match case {
+                0 => message.sender_host = Some(large),
+                1 => {
+                    message.id = MessageId(large_id);
+                    input.key.original_id = message.id.clone();
+                }
+                2 => message.thread_id = MessageId(large_id),
+                3 => message.reply_to = Some(MessageId(large_id)),
+                4 => message.correlation_id = Some(MessageId(large_id)),
+                5 => message.sender_id = Some(AgentId(large_id)),
+                6 => message.to = crate::ferrowire::WireAddress::AgentName(large),
+                _ => unreachable!(),
+            }
+            input.generation = canonical_generation(&message).unwrap();
+            install_input(&s, &input, message);
+            assert!(
+                matches!(
+                    s.apply_delivery(DeliveryCommand::Prepare(input)).unwrap(),
+                    DeliveryResult::Refused {
+                        reason: HoldReason::EvidenceOverflow
+                    }
+                ),
+                "field {case}"
+            );
+        }
     }
 }

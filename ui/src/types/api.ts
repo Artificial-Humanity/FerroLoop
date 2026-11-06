@@ -654,7 +654,7 @@ export interface SavedPromptAttachment {
 }
 
 export interface QueuedOperatorPrompt {
-  delivery_state?: "pending" | "sending" | "unconfirmed";
+  delivery_state?: "pending" | "sending" | "unconfirmed" | "refused";
   delivery_error?: string | null;
   id: string;
   session_id: string;
@@ -854,10 +854,15 @@ export interface PromptResponse {
   session_id: string;
   in_flight_unconfirmed?: boolean;
   persona?: string | null;
-  status?: "sent" | "queued";
+  status?: "sent" | "queued" | "delivery_failed";
   queued?: boolean;
   is_busy?: boolean;
+  /** Transport compatibility only; never proof of model consumption. */
   delivered?: boolean;
+  delivery_stage?: "transport_accepted" | "vendor_queued" | "app_server_accepted" | "compaction_accepted" | "refused" | "unconfirmed" | "not_connected";
+  turn_id?: string;
+  failure_stage?: string;
+  refusal_reason?: string | null;
   delivery_error?: string | null;
   prompt_id?: string;
   prompt?: string;
@@ -868,6 +873,30 @@ export interface PromptResponse {
   message?: WireMessage;
   receipts?: WireReceipt[];
   attachments?: SavedPromptAttachment[];
+}
+
+/** Explicit uncertainty is handled without restoring a draft that might deliver twice. */
+export function isPromptDeliveryFailure(response?: PromptResponse): boolean {
+  if (!response) return false;
+  if (["vendor_queued", "app_server_accepted", "compaction_accepted", "unconfirmed"].includes(response.delivery_stage ?? "")) return false;
+  return response.delivery_stage === "refused" || response.delivery_stage === "not_connected" || response.delivered === false;
+}
+
+/** Explicit steering needs a receipt stage; legacy/malformed replies prove no acceptance. */
+export function codexSendNowReceipt(sessionId: string, response?: PromptResponse): PromptResponse {
+  if (response && ["vendor_queued", "app_server_accepted", "compaction_accepted", "refused", "unconfirmed", "not_connected"].includes(response.delivery_stage ?? "")) {
+    return response;
+  }
+  return { ...response, session_id: sessionId, delivered: false, delivery_stage: "unconfirmed" };
+}
+
+export function promptDeliveryStatus(response?: PromptResponse): string | null {
+  switch (response?.delivery_stage) {
+    case "vendor_queued": return "Queued in Codex. Waiting for Codex to consume it.";
+    case "app_server_accepted": return "Accepted by the active Codex turn. Model consumption is not confirmed.";
+    case "unconfirmed": return "Delivery unconfirmed. Check the session before resending; no automatic retry was made.";
+    default: return null;
+  }
 }
 
 export type SessionPromptResponse = PromptResponse;

@@ -1273,6 +1273,100 @@ delegate! {
     }
 }
 
+impl fl_core::wire_delivery::WireDeliveryStore for AnyStore {
+    fn apply_delivery(
+        &self,
+        command: fl_core::wire_delivery::DeliveryCommand,
+    ) -> Result<fl_core::wire_delivery::DeliveryResult, StoreError> {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::apply_delivery(&**s, command)
+            }
+            Backend::Redb(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::apply_delivery(s, command)
+            }
+        }
+    }
+    fn inspect_delivery(
+        &self,
+        key: &fl_core::wire_delivery::DeliveryKey,
+    ) -> Result<Option<fl_core::wire_delivery::DeliveryView>, StoreError> {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::inspect_delivery(&**s, key)
+            }
+            Backend::Redb(s) => fl_core::wire_delivery::WireDeliveryStore::inspect_delivery(s, key),
+        }
+    }
+    fn active_delivery_owners(
+        &self,
+    ) -> Result<Vec<fl_core::wire_delivery::CapacityRetirementTarget>, StoreError> {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::active_delivery_owners(&**s)
+            }
+            Backend::Redb(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::active_delivery_owners(s)
+            }
+        }
+    }
+    fn retire_orphan_capacity(
+        &self,
+        target: fl_core::wire_delivery::CapacityRetirementTarget,
+    ) -> Result<fl_core::wire_delivery::CapacityRetirementResult, StoreError> {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::retire_orphan_capacity(&**s, target)
+            }
+            Backend::Redb(s) => {
+                fl_core::wire_delivery::WireDeliveryStore::retire_orphan_capacity(s, target)
+            }
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl crate::wire_delivery_lifetime::LocalLifetimeAdmissionStore for AnyStore {
+    fn admit_local_lifetime(
+        &self,
+        input: crate::wire_delivery_lifetime::LocalAdmissionInput,
+    ) -> Result<
+        fl_core::wire_delivery::LifetimeRegistration,
+        crate::wire_delivery_lifetime::LocalAdmissionError,
+    > {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                crate::wire_delivery_lifetime::LocalLifetimeAdmissionStore::admit_local_lifetime(
+                    &**s, input,
+                )
+            }
+            Backend::Redb(s) => {
+                crate::wire_delivery_lifetime::LocalLifetimeAdmissionStore::admit_local_lifetime(
+                    s, input,
+                )
+            }
+        }
+    }
+    fn close_local_lifetime(
+        &self,
+        registration: &fl_core::wire_delivery::LifetimeRegistration,
+    ) -> Result<(), crate::wire_delivery_lifetime::LocalAdmissionError> {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                crate::wire_delivery_lifetime::LocalLifetimeAdmissionStore::close_local_lifetime(
+                    &**s,
+                    registration,
+                )
+            }
+            Backend::Redb(s) => {
+                crate::wire_delivery_lifetime::LocalLifetimeAdmissionStore::close_local_lifetime(
+                    s,
+                    registration,
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

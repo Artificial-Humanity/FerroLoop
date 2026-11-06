@@ -1133,6 +1133,39 @@ describe("Agent switch transcript isolation", () => {
     unmount();
   });
 
+  it("applies a refused queued response through the App callback before surfacing its error", async () => {
+    const item = { id: "refused-app-q", session_id: "refused-app-session", prompt: "held App prompt", by: "owner", created_at: "now" };
+    let refused = false;
+    const heldItem = { ...item, delivery_state: "refused", delivery_error: "App receiver refused" };
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+      if (url.includes("/auth/session")) return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
+      if (url.includes("/queue/refused-app-q/send") && init?.method === "POST") {
+        refused = true;
+        return json({ delivered: false, delivery_stage: "refused", delivery_error: "App receiver refused", effective_body: item.prompt,
+          queue: [heldItem], is_busy: false });
+      }
+      if (url.includes("/sessions") && !url.includes("/transcript")) return json({ sessions: [{
+        id: item.session_id, source: "route", adapter: "codex", persona: "ferris", status: "active", updated_at: "t1",
+      }] });
+      if (url.includes("/transcript")) return json({ session_id: item.session_id, turns: [], queue: [refused ? heldItem : item], is_busy: !refused });
+      return json({});
+    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
+    const wsClient = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: () => () => {} } as unknown as HubWsClient;
+    const view = render(<App apiClient={apiClient} wsClient={wsClient} />);
+    fireEvent.click(await screen.findByTestId("queued-send-now-refused-app-q"));
+    expect(await screen.findByText(/Send now refused/)).toBeInTheDocument();
+    expect(screen.getByTestId("queued-send-now-refused-app-q")).toBeDisabled();
+    expect(screen.getByTestId("queued-edit-refused-app-q")).toBeDisabled();
+    expect(screen.getByTestId("queued-cancel-refused-app-q")).toBeEnabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("App receiver refused");
+    expect(screen.getByText("Idle")).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-card-0")).toBeNull();
+    view.unmount();
+  });
+
   it("preserves multiple outbound prompts across polls and keeps prompt_sent WebSocket / queued prompts visible while in FerroWire transit", async () => {
     const now = Date.now();
     const baseTurns: TranscriptTurn[] = [

@@ -836,7 +836,14 @@ export class HubApiClient {
       credentials: init.credentials ?? "same-origin",
     });
 
-    const rawText = await response.text();
+    let rawText: string;
+    try {
+      rawText = await response.text();
+    } catch (error) {
+      // A received refusal remains a refusal even if its explanatory body was lost.
+      if (!response.ok) throw new HubApiError(response.status, `HTTP ${response.status}`);
+      throw error;
+    }
     let parsed: Record<string, unknown> | null = null;
     if (rawText.trim().length > 0) {
       try {

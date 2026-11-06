@@ -241,6 +241,10 @@ const NOT_SCANNED: &[(&str, &str)] = &[
         "its one write call is in its own #[cfg(test)] module, on an in-memory store",
     ),
     ("tests.rs", "test code, as every tests_*.rs file is"),
+    (
+        "traits_wire_delivery.rs",
+        "all write call sites are in its owning #[cfg(test)] module; production preparatory methods refuse before writes",
+    ),
 ];
 
 /// A line that starts a write: a call of `with_write`, `with_write_outcome`
@@ -288,6 +292,14 @@ fn write_sites() -> BTreeSet<(&'static str, u32)> {
 /// go unscanned.
 #[test]
 fn every_source_file_with_a_write_call_site_is_scanned() {
+    // Keep the preparatory exemption valid only while production has no write entry point.
+    let (preparatory_production, _) = include_str!("traits_wire_delivery.rs")
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .expect("preparatory delivery keeps its fixtures in one inline test module");
+    assert!(
+        !preparatory_production.lines().any(starts_a_write),
+        "production preparatory write call sites must join SOURCES instead of the test-only exemption"
+    );
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ferrostore");
     let mut with_writes = BTreeSet::new();
     let mut files = 0;

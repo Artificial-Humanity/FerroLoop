@@ -32,6 +32,30 @@ pub(crate) const WIRE_REPLIES: TableDefinition<(&str, &str), ()> =
 const NEXT_WIRE_MSG_SEQ: &str = "next_wire_msg_seq";
 const NEXT_WIRE_RCPT_SEQ: &str = "next_wire_rcpt_seq";
 
+/// Shared atomic receipt-log projection; callers own the native transaction.
+pub(crate) fn append_wire_receipt_in(
+    tx: &redb::WriteTransaction,
+    rcpt: &DeliveryReceipt,
+) -> Result<(), StoreError> {
+    let seq = {
+        let mut meta = tx.open_table(META).map_err(backend)?;
+        let next = meta
+            .get(NEXT_WIRE_RCPT_SEQ)
+            .map_err(backend)?
+            .map(|g| g.value())
+            .unwrap_or(0)
+            + 1;
+        meta.insert(NEXT_WIRE_RCPT_SEQ, next).map_err(backend)?;
+        next
+    };
+    let json = serde_json::to_string(rcpt).map_err(backend)?;
+    tx.open_table(WIRE_RCPT_LOG)
+        .map_err(backend)?
+        .insert(seq, json.as_str())
+        .map_err(backend)?;
+    Ok(())
+}
+
 impl RedbStore {
     fn wtx_has_table(tx: &redb::WriteTransaction, name: &str) -> Result<bool, StoreError> {
         Ok(tx.list_tables().map_err(backend)?.any(|h| h.name() == name))
@@ -125,23 +149,7 @@ impl RedbStore {
         tx: &redb::WriteTransaction,
         rcpt: &DeliveryReceipt,
     ) -> Result<(), StoreError> {
-        let seq = {
-            let mut meta = tx.open_table(META).map_err(backend)?;
-            let next = meta
-                .get(NEXT_WIRE_RCPT_SEQ)
-                .map_err(backend)?
-                .map(|g| g.value())
-                .unwrap_or(0)
-                + 1;
-            meta.insert(NEXT_WIRE_RCPT_SEQ, next).map_err(backend)?;
-            next
-        };
-        let json = serde_json::to_string(rcpt).map_err(backend)?;
-        tx.open_table(WIRE_RCPT_LOG)
-            .map_err(backend)?
-            .insert(seq, json.as_str())
-            .map_err(backend)?;
-        Ok(())
+        append_wire_receipt_in(tx, rcpt)
     }
 
     fn all_agents_in_wtx(
