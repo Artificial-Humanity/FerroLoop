@@ -56,6 +56,7 @@ pub mod ui_bundle;
 pub mod vendor;
 pub mod verdict;
 pub mod wire_delivery;
+pub use wire_delivery::WireDeliveryStore;
 pub mod workflow;
 pub mod workspace;
 
