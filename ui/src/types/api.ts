@@ -879,7 +879,15 @@ export interface PromptResponse {
 export function isPromptDeliveryFailure(response?: PromptResponse): boolean {
   if (!response) return false;
   if (["vendor_queued", "app_server_accepted", "compaction_accepted", "unconfirmed"].includes(response.delivery_stage ?? "")) return false;
-  return response.delivered === false;
+  return response.delivery_stage === "refused" || response.delivery_stage === "not_connected" || response.delivered === false;
+}
+
+/** Explicit steering needs a receipt stage; legacy/malformed replies prove no acceptance. */
+export function codexSendNowReceipt(sessionId: string, response?: PromptResponse): PromptResponse {
+  if (response && ["vendor_queued", "app_server_accepted", "compaction_accepted", "refused", "unconfirmed", "not_connected"].includes(response.delivery_stage ?? "")) {
+    return response;
+  }
+  return { ...response, session_id: sessionId, delivered: false, delivery_stage: "unconfirmed" };
 }
 
 export function promptDeliveryStatus(response?: PromptResponse): string | null {

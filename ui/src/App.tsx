@@ -1,4 +1,4 @@
-import { isPromptDeliveryFailure } from "./types/api";
+import { codexSendNowReceipt, isPromptDeliveryFailure } from "./types/api";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError } from "./api/client";
@@ -2054,7 +2054,9 @@ export const App: React.FC<AppProps> = ({
     const submittedAgent = selectedAgentNameRef.current;
     const submittedSession = selectedSessionIdRef.current;
     const submittedActiveSession = activeSessionIdRef.current;
-    const res = await apiClient.sendSessionPrompt(targetId, payload);
+    const response = await apiClient.sendSessionPrompt(targetId, payload);
+    const res = activeAdapter === "codex" && authority?.tier !== "peer" && payload.send_now
+      ? codexSendNowReceipt(targetId, response) : response;
     if (
       (!res.queued && res.status !== "queued" && isPromptDeliveryFailure(res)) ||
       selectedAgentNameRef.current !== submittedAgent ||
@@ -2099,9 +2101,9 @@ export const App: React.FC<AppProps> = ({
     if (!targetId) return;
     const submittedSession = activeSessionIdRef.current;
     const submittedAgent = selectedAgentNameRef.current;
-    const res = await apiClient.sendQueuedPromptNow(targetId, promptId);
+    const response = await apiClient.sendQueuedPromptNow(targetId, promptId);
+    const res = activeAdapter === "codex" && authority?.tier !== "peer" ? codexSendNowReceipt(targetId, response) : response;
     if (activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
-      if (isPromptDeliveryFailure(res)) throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
       return res;
     }
     if (Array.isArray(res.queue)) {
@@ -2111,7 +2113,7 @@ export const App: React.FC<AppProps> = ({
       setIsSessionBusy(res.is_busy);
     }
     if (isPromptDeliveryFailure(res)) {
-      throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+      return res;
     }
     const content = res.effective_body || res.prompt;
     if (content && res.delivery_stage !== "unconfirmed") {
