@@ -312,6 +312,75 @@ impl Drop for Tracked {
     }
 }
 
+// Unlike a saved identity, this fixture retains ownership of its child. EOF
+// requests a normal exit; the owned Child also bounds failure-path cleanup.
+#[cfg(target_os = "macos")]
+struct EofChild {
+    child: Child,
+    input: Option<std::process::ChildStdin>,
+    pid: u32,
+    start: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl EofChild {
+    fn spawn() -> Self {
+        let mut child = Command::new(child_bin())
+            .arg("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("owned echo child");
+        let input = child.stdin.take();
+        let output = child.stdout.take().expect("stdout");
+        let pid = child.id();
+        let mut owned = Self {
+            child,
+            input,
+            pid,
+            start: 0,
+        };
+        read_until(output, "READY", Duration::from_secs(3));
+        owned.start = process_identity(pid).expect("identity").start;
+        owned
+    }
+
+    fn alive(&mut self) -> bool {
+        self.child.try_wait().expect("child status").is_none() && same_process(self.pid, self.start)
+    }
+
+    fn release(&mut self) {
+        self.input.take();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("child status") {
+                assert!(status.success(), "owned child did not exit normally");
+                return;
+            }
+            assert!(Instant::now() < deadline, "owned child ignored stdin EOF");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for EofChild {
+    fn drop(&mut self) {
+        self.input.take();
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                if !matches!(self.child.try_wait(), Ok(None)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn survivor(session: &str, epoch: u64, pid: u32, start: u64) -> SurvivorRecord {
     SurvivorRecord {
@@ -1138,19 +1207,31 @@ fn stale_pid_or_identity_mismatch_never_signals() {
     let err = Host::open(opts).expect_err("unproven");
     assert!(started.elapsed() < STARTUP_CLEANUP_DEADLINE + Duration::from_secs(2));
     assert_eq!(refusal(&err), Some(ContainmentRefusal::IdentityUnproven));
+    #[cfg(target_os = "linux")]
     assert!(
         !leader.alive(),
         "proven leader was not signalled through its pidfd"
     );
+    #[cfg(target_os = "macos")]
+    {
+        assert!(started.elapsed() >= STARTUP_CLEANUP_DEADLINE);
+        assert!(leader.alive(), "saved matching PID was signalled");
+    }
     assert!(grandchild.alive(), "saved process group was signalled");
     assert!(stale.alive(), "start mismatch was signalled");
     assert!(bystander.alive());
     let seen = seen.lock().expect("seen");
+    #[cfg(target_os = "linux")]
     assert!(seen.contains(&leader.pid));
+    #[cfg(target_os = "macos")]
+    assert!(seen.is_empty(), "macOS recovery invoked a signal hook");
     assert!(!seen.contains(&stale.pid));
     assert!(!seen.contains(&grandchild.pid));
     let spawned = extra.lock().expect("extra");
+    #[cfg(target_os = "linux")]
     assert!(spawned.as_ref().expect("hook spawn").alive());
+    #[cfg(target_os = "macos")]
+    assert!(spawned.is_none(), "signal hook spawned an extra process");
     assert_eq!(
         signal_anchored_group(None, 15),
         Err(ContainmentRefusal::UnanchoredGroup)
@@ -1179,15 +1260,32 @@ fn stale_pid_or_identity_mismatch_never_signals() {
             .iter()
             .any(|record| record.session == "stale")
     );
+    #[cfg(target_os = "linux")]
     assert!(
         registry
             .sessions
             .iter()
             .all(|record| record.session != "proven")
     );
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            registry
+                .sessions
+                .iter()
+                .any(|record| record.session == "proven")
+        );
+        assert_eq!(registry.sessions.len(), 2);
+        assert!(
+            registry
+                .alerts
+                .iter()
+                .any(|alert| alert.contains("cleanup unresolved"))
+        );
+    }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn restart_cleanup_isolates_sibling_sessions() {
     let (dir, endpoint) = harness();
@@ -1225,6 +1323,66 @@ fn restart_cleanup_isolates_sibling_sessions() {
     let high_water = opened.join().expect("thread").expect("recover");
     assert_eq!(high_water, 2);
     assert!(!beta.alive());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn restart_cleanup_isolates_sibling_sessions() {
+    let (dir, endpoint) = harness();
+    let mut alpha = EofChild::spawn();
+    let mut beta = EofChild::spawn();
+    write_registry_fixture(
+        &endpoint,
+        2,
+        &[
+            survivor("alpha", 1, alpha.pid, alpha.start),
+            survivor("beta", 2, beta.pid, beta.start),
+        ],
+    )
+    .expect("fixture");
+    let hold = dir.path().join("hold");
+    std::fs::create_dir(&hold).expect("hold");
+    let endpoint_for_open = endpoint.clone();
+    let hold_for_open = hold.clone();
+    let signals = Arc::new(Mutex::new(Vec::new()));
+    let signals_for_open = Arc::clone(&signals);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let opened = std::thread::spawn(move || {
+        let mut opts = base_opts(&endpoint_for_open);
+        opts.recover_hold = Some(hold_for_open);
+        opts.before_signal = Some(Arc::new(move |pid| {
+            signals_for_open.lock().expect("signals").push(pid);
+        }));
+        let result = Host::open(opts).map(|host| host.epoch_high_water());
+        let _ = tx.send(result);
+    });
+    wait_path(&hold.join("hold-alpha"), Duration::from_secs(4));
+    assert!(alpha.alive());
+    assert!(beta.alive());
+    // Recovery cannot signal these recorded PIDs. The owning harness requests
+    // each normal exit, one at a time, before releasing that record's hold.
+    alpha.release();
+    std::fs::write(hold.join("go-alpha"), b"1").expect("go");
+    wait_path(&hold.join("hold-beta"), Duration::from_secs(4));
+    assert!(!alpha.alive());
+    assert!(beta.alive(), "alpha's release reached the sibling");
+    assert!(rx.try_recv().is_err(), "recovery skipped beta's ownership");
+    assert!(signals.lock().expect("signals").is_empty());
+    beta.release();
+    std::fs::write(hold.join("go-beta"), b"1").expect("go");
+    let high_water = rx
+        .recv_timeout(STARTUP_CLEANUP_DEADLINE + Duration::from_secs(2))
+        .expect("startup did not finish")
+        .expect("recover");
+    opened.join().expect("thread");
+    assert!(started.elapsed() < STARTUP_CLEANUP_DEADLINE);
+    assert_eq!(high_water, 2);
+    assert!(!beta.alive());
+    assert!(signals.lock().expect("signals").is_empty());
+    let registry = read_registry(&endpoint).expect("retired registry");
+    assert!(registry.sessions.is_empty());
+    assert_eq!(registry.high_water, 2);
 }
 
 #[cfg(unix)]
