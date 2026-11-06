@@ -973,6 +973,16 @@ fn windows_watch(session: Arc<Session>, host: Arc<HostInner>) {
 
 #[cfg(windows)]
 fn observe_windows_job(session: &Session) -> WatchTick {
+    observe_windows_job_after_poll(session, || {})
+}
+
+// The callback permits a native test to complete a real process exit precisely
+// between the retained-handle poll and Job accounting. Production has no barrier.
+#[cfg(windows)]
+fn observe_windows_job_after_poll(
+    session: &Session,
+    after_initial_poll: impl FnOnce(),
+) -> WatchTick {
     let process = session
         .process
         .lock()
@@ -987,6 +997,7 @@ fn observe_windows_job(session: &Session) -> WatchTick {
     if session.leader_exit().is_none() && child::windows::leader_signaled(process) {
         return WatchTick::Leader(child::windows::leader_exit_code(process));
     }
+    after_initial_poll();
     let requested = session.cleanup_requested();
     // Hold forces accounting to look live. A non-zero Job is not cleanup.
     let quiet = !job_hold_active() && child::windows::stable_job_quiescent(job);
@@ -1017,13 +1028,14 @@ fn windows_watch_until(
                 if requested && cleanup_started.is_none() {
                     cleanup_started = Some(Instant::now());
                 }
-                if quiet && (requested || session.leader_exit().is_some()) {
+                // Stable Job accounting proves containment cleanup, not that the
+                // leader's retained handle has been observed and Exited published.
+                if quiet && session.leader_exit().is_some() {
                     host.retire(session.session.as_str());
                     session.note_cleanup(CleanupReport { complete: true });
                     break;
                 }
-                if requested && !quiet && cleanup_deadline_expired(cleanup_started, Instant::now())
-                {
+                if requested && cleanup_deadline_expired(cleanup_started, Instant::now()) {
                     host.alert("cleanup unresolved");
                     session.note_cleanup(CleanupReport { complete: false });
                     break;
@@ -1162,6 +1174,262 @@ mod deadline_tests {
         SurvivorRecord, WatchTick, cleanup_deadline_expired, load_registry, windows_watch_until,
     };
     use fl_host_proto::{HostConfig, HostEndpoint, SessionId};
+
+    #[derive(Default)]
+    struct WatchEvents(std::sync::Mutex<Vec<String>>);
+
+    impl super::session::StdoutSink for WatchEvents {
+        fn room(&self) -> usize {
+            usize::MAX
+        }
+        fn push(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn eof(&self) {}
+        fn wait(&self, _: Duration) {}
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn on_leader(&self, exit: fl_host_proto::ChildExit) {
+            self.0.lock().unwrap().push(format!("exit:{:?}", exit.code));
+        }
+        fn on_cleanup(&self, complete: bool) {
+            self.0.lock().unwrap().push(format!("cleanup:{complete}"));
+        }
+    }
+
+    fn watch_fixture() -> (tempfile::TempDir, Host, Arc<Session>, Arc<WatchEvents>) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("race").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        host.inner
+            .registry
+            .lock()
+            .unwrap()
+            .sessions
+            .push(SurvivorRecord {
+                session: "race".into(),
+                epoch: 1,
+                phase: SessionPhase::Running,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                vendor_pid: 0,
+                vendor_start: 0,
+                pgid: 0,
+                group_leader_pid: 0,
+                group_leader_start: 0,
+                group_leader_reaped: false,
+                leader_code: None,
+                leader_signal: None,
+            });
+        let events = Arc::new(WatchEvents::default());
+        let sink: Arc<dyn super::session::StdoutSink> = events.clone();
+        session.set_sink(Arc::downgrade(&sink));
+        (dir, host, session, events)
+    }
+
+    #[test]
+    fn windows_cleanup_records_exit_before_retiring_quiet_job() {
+        for code in [0, 259] {
+            let (_dir, host, session, events) = watch_fixture();
+            let mut tick = 0;
+            windows_watch_until(Arc::clone(&session), Arc::clone(&host.inner), |_| {
+                tick += 1;
+                match tick {
+                    1 => WatchTick::Poll {
+                        requested: true,
+                        quiet: true,
+                    },
+                    2 => {
+                        assert_eq!(host.inner.registry.lock().unwrap().sessions.len(), 1);
+                        assert!(events.0.lock().unwrap().is_empty());
+                        WatchTick::Leader(Some(code))
+                    }
+                    3 => {
+                        let registry = host.inner.registry.lock().unwrap();
+                        let record = &registry.sessions[0];
+                        assert!(record.group_leader_reaped);
+                        assert_eq!(record.leader_code, Some(code));
+                        WatchTick::Poll {
+                            requested: true,
+                            quiet: false,
+                        }
+                    }
+                    4 => {
+                        assert_eq!(host.inner.registry.lock().unwrap().sessions.len(), 1);
+                        assert!(session.cleanup_report().is_none());
+                        WatchTick::Poll {
+                            requested: true,
+                            quiet: true,
+                        }
+                    }
+                    _ => panic!("watcher failed to finish"),
+                }
+            });
+            assert_eq!(tick, 4, "retired before observing leader exit");
+            assert_eq!(
+                *events.0.lock().unwrap(),
+                [format!("exit:Some({code})"), "cleanup:true".into()]
+            );
+            assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
+            host.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_quiet_without_leader_evidence_has_bounded_unresolved_cleanup() {
+        let (_dir, host, session, events) = watch_fixture();
+        let watched = Arc::clone(&session);
+        let inner = Arc::clone(&host.inner);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let watcher = std::thread::spawn(move || {
+            windows_watch_until(watched, inner, |_| {
+                // A regressed driver must fail this test without leaving a
+                // permanently running watcher behind in the test process.
+                if started.elapsed() > CLEANUP_DEADLINE + Duration::from_secs(1) {
+                    WatchTick::Stop
+                } else {
+                    WatchTick::Poll {
+                        requested: true,
+                        quiet: true,
+                    }
+                }
+            });
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(CLEANUP_DEADLINE + Duration::from_secs(3))
+            .expect("quiet without exit evidence hung cleanup");
+        watcher.join().unwrap();
+        assert!(started.elapsed() >= CLEANUP_DEADLINE);
+        assert!(session.leader_exit().is_none());
+        assert_eq!(
+            session.cleanup_report(),
+            Some(CleanupReport { complete: false })
+        );
+        assert_eq!(*events.0.lock().unwrap(), ["cleanup:false"]);
+        assert_eq!(host.inner.registry.lock().unwrap().sessions.len(), 1);
+        host.shutdown().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_real_leader_exit_between_handle_poll_and_job_accounting() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        for code in [0, 259] {
+            let (dir, host, session, events) = watch_fixture();
+            // Request before installing the test handles: the worker below supplies
+            // the asynchronous termination, independently of the observer's locks.
+            session.request_cleanup().unwrap();
+            let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("cmd.exe");
+            let child = super::child::windows::spawn_in_job(
+                &[
+                    cmd.to_string_lossy().into_owned(),
+                    "/D".into(),
+                    "/Q".into(),
+                    "/C".into(),
+                    "for /L %i in (1,0,2) do @rem".into(),
+                ],
+                dir.path(),
+                &[],
+                None,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            let retained = child.process.try_clone().unwrap();
+            let retained_job = child.job.try_clone().unwrap();
+            *session.process.lock().unwrap() = Some(child.process);
+            *session.job.lock().unwrap() = Some(child.job);
+            assert!(
+                matches!(
+                    super::observe_windows_job(&session),
+                    WatchTick::Poll {
+                        requested: true,
+                        quiet: false
+                    }
+                ),
+                "live Job member must not be cleanup proof"
+            );
+            let (release, hold) = std::sync::mpsc::channel();
+            let (done, completed) = std::sync::mpsc::channel();
+            let terminator = std::thread::spawn(move || {
+                hold.recv_timeout(Duration::from_secs(3)).unwrap();
+                // SAFETY: this independently owned process handle stays live across
+                // both calls; only the fixture child is terminated.
+                let exited = unsafe {
+                    TerminateProcess(retained.as_raw_handle() as _, code) != 0
+                        && WaitForSingleObject(retained.as_raw_handle() as _, 3000) == WAIT_OBJECT_0
+                };
+                // Process signaling need not coincide with the Job accounting
+                // update. Establish that state before releasing the observer,
+                // rather than assuming the kernel updates both atomically.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut quiet = false;
+                while exited && Instant::now() < deadline {
+                    if super::child::windows::stable_job_quiescent(&retained_job) {
+                        quiet = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                done.send(exited && quiet).unwrap();
+            });
+            let first = super::observe_windows_job_after_poll(&session, || {
+                release.send(()).unwrap();
+                assert!(completed.recv_timeout(Duration::from_secs(7)).unwrap());
+            });
+            terminator.join().unwrap();
+            assert!(
+                matches!(
+                    first,
+                    WatchTick::Poll {
+                        requested: true,
+                        quiet: true
+                    }
+                ),
+                "real exit must occur after unsignaled poll and before stable zero accounting"
+            );
+            let mut first = Some(first);
+            let mut ticks = 0;
+            windows_watch_until(Arc::clone(&session), Arc::clone(&host.inner), |session| {
+                ticks += 1;
+                assert!(ticks <= 4, "real exit not observed");
+                first
+                    .take()
+                    .unwrap_or_else(|| super::observe_windows_job(session))
+            });
+            assert!(
+                ticks >= 3,
+                "cleanup skipped the retained-handle exit observation"
+            );
+            assert_eq!(
+                *events.0.lock().unwrap(),
+                [format!("exit:Some({code})"), "cleanup:true".into()]
+            );
+            assert_eq!(session.leader_exit().unwrap().code, Some(code as i32));
+            assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
+            host.shutdown().unwrap();
+        }
+    }
 
     #[test]
     fn cleanup_deadline_starts_only_when_requested() {
