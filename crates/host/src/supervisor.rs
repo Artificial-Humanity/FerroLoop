@@ -176,13 +176,20 @@ fn supervise(vendor_pid: u32, vendor_start: u64, pgid: u32) -> Result<(), HostEr
     let mut reported: BTreeSet<u32> = BTreeSet::new();
     reported.insert(vendor_pid);
     let mut cleanup_started: Option<Instant> = None;
+    let mut control_buf = Vec::new();
+    let mut control_eof = false;
     let mut saw_child = true;
     // One empty wait is not adoption. A child can be between the exiting leader and
     // this subreaper. Two empty passes, with the poll below between them, are the
     // stable observation that no owned child remains.
     let mut empty_streak = 0u8;
     loop {
-        if (CLEANUP.load(Ordering::Relaxed) || control_closed()) && cleanup_started.is_none() {
+        // This loop alone owns both group signals and waitpid. No reap can occur
+        // between validating the unreaped anchor and delivering a numeric group signal.
+        if !control_eof {
+            control_eof = control_commands(&mut control_buf, &anchor, cleanup_started.is_some());
+        }
+        if (CLEANUP.load(Ordering::Relaxed) || control_eof) && cleanup_started.is_none() {
             cleanup_started = Some(Instant::now());
         }
         if let Some(started) = cleanup_started {
@@ -307,25 +314,80 @@ fn wait_one() -> Wait {
     }
 }
 
-fn control_closed() -> bool {
+fn control_commands(buf: &mut Vec<u8>, anchor: &LeaderAnchor, cleaning: bool) -> bool {
     let mut pfd = libc::pollfd {
         fd: CONTROL_R,
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: poll on the control reader. POLLHUP without data is EOF.
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
     if rc <= 0 {
         return false;
     }
-    if pfd.revents & libc::POLLIN != 0 {
-        let mut buf = [0u8; 64];
-        // SAFETY: `buf` is writable. A zero read is EOF. Extra bytes are discarded;
-        // cleanup is requested by EOF, not by a payload.
-        let n = unsafe { libc::read(CONTROL_R, buf.as_mut_ptr().cast(), buf.len()) };
-        return n == 0;
+    if pfd.revents & libc::POLLIN == 0 {
+        return pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
     }
-    pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    // Only this thread reads control. Poll established data/EOF, so this bounded
+    // read cannot wait for a newline or a partially sent command.
+    let mut bytes = [0u8; 4096];
+    let n = unsafe { libc::read(CONTROL_R, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if n == 0 {
+        return true;
+    }
+    if n < 0 {
+        return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+    }
+    buf.extend_from_slice(&bytes[..n as usize]);
+    while let Some(end) = buf.iter().position(|&byte| byte == b'\n') {
+        let command = from_line::<DaemonMsg>(&buf[..end]);
+        buf.drain(..=end);
+        if let Ok(DaemonMsg::Signal {
+            id,
+            signal,
+            deadline_ms,
+        }) = command
+        {
+            let result = if cleaning {
+                Err("cleanup in progress".to_owned())
+            } else if !matches!(
+                signal,
+                libc::SIGINT | libc::SIGTERM | libc::SIGKILL | libc::SIGHUP
+            ) {
+                Err("unsupported signal".to_owned())
+            } else {
+                signal_command(anchor, signal, deadline_ms)
+            };
+            let _ = write_msg(&SupervisorMsg::SignalResult {
+                id,
+                error: result.err(),
+            });
+        } else {
+            return true;
+        }
+    }
+    buf.len() > 4096
+}
+
+fn signal_command(anchor: &LeaderAnchor, signal: i32, deadline_ms: u64) -> Result<(), String> {
+    if anchor.reaped {
+        return Err("unanchored group".into());
+    }
+    // This anchor was established while our own child was gated before exec.
+    // Only this loop can reap it; until then its PID cannot be reused and its
+    // session-leader PGID cannot change. Unlike a daemon-side pidfd, this owned,
+    // unreaped child reserves the numeric group throughout this syscall.
+    let now = crate::protocol::signal_clock_ms()?;
+    if now >= deadline_ms {
+        return Err("signal expired".into());
+    }
+    let rc = unsafe { libc::kill(-(anchor.pgid as i32), signal) };
+    if rc == 0 {
+        Ok(())
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Err("unanchored group".into())
+    } else {
+        Err("signal failed".into())
+    }
 }
 
 fn signal_children(vendor_pid: u32, signal: i32) {

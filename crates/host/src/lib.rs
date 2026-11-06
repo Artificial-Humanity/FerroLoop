@@ -451,6 +451,9 @@ impl Host {
         for session in &sessions {
             let _ = session.wait_cleanup(deadline.saturating_duration_since(Instant::now()));
         }
+        for session in &sessions {
+            session.stop_pumps();
+        }
         let joins = std::mem::take(
             &mut *self
                 .inner
@@ -827,6 +830,7 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
             continue;
         };
         match message {
+            protocol::SupervisorMsg::SignalResult { id, error } => session.note_signal(id, error),
             protocol::SupervisorMsg::Leader { code, signal } => {
                 let exit = ChildExit { code, signal };
                 host.mark_leader(session.session.as_str(), &exit);

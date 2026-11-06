@@ -34,6 +34,11 @@ pub struct Session {
     stdout_cv: Condvar,
     stderr: Mutex<Vec<u8>>,
     cleanup_requested: AtomicBool,
+    io_stop: AtomicBool,
+    #[cfg(unix)]
+    signal_reply: Mutex<(u64, Option<Result<(), String>>)>,
+    #[cfg(unix)]
+    signal_cv: Condvar,
     input: Mutex<InputState>,
     stalled: AtomicBool,
     sink: Mutex<Option<Weak<dyn StdoutSink>>>,
@@ -105,6 +110,11 @@ impl Session {
             stdout_cv: Condvar::new(),
             stderr: Mutex::new(Vec::new()),
             cleanup_requested: AtomicBool::new(false),
+            io_stop: AtomicBool::new(false),
+            #[cfg(unix)]
+            signal_reply: Mutex::new((0, None)),
+            #[cfg(unix)]
+            signal_cv: Condvar::new(),
             input: Mutex::new(InputState::Writable),
             stalled: AtomicBool::new(false),
             sink: Mutex::new(None),
@@ -139,6 +149,73 @@ impl Session {
             self.terminate_job()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn stop_pumps(&self) {
+        self.io_stop.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn signal(&self, signal: i32) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let timeout = Duration::from_secs(1);
+        let deadline = Instant::now() + timeout;
+        let deadline_ms = crate::protocol::signal_clock_ms()? + timeout.as_millis() as u64;
+        let mut reply = self
+            .signal_reply
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        reply.0 = reply.0.checked_add(1).ok_or("signal id exhausted")?;
+        reply.1 = None;
+        let id = reply.0;
+        let bytes = crate::protocol::to_line(&crate::protocol::DaemonMsg::Signal {
+            id,
+            signal,
+            deadline_ms,
+        })?;
+        {
+            let control = self.control.lock().unwrap_or_else(|err| err.into_inner());
+            let file = control.as_ref().ok_or("supervisor unavailable")?;
+            // Atomic, nonblocking pipe write: no partial command and no stalled supervisor
+            // can hold this authority worker past the response deadline.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0
+                || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                    < 0
+            {
+                return Err("supervisor control unavailable".into());
+            }
+            let n = unsafe { libc::write(file.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            if n != bytes.len() as isize {
+                return Err("supervisor control unavailable".into());
+            }
+        }
+        loop {
+            if let Some(result) = reply.1.take() {
+                return result;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("signal outcome unknown".into());
+            }
+            reply = self
+                .signal_cv
+                .wait_timeout(reply, left)
+                .unwrap_or_else(|err| err.into_inner())
+                .0;
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn note_signal(&self, id: u64, error: Option<String>) {
+        let mut reply = self
+            .signal_reply
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if reply.0 == id {
+            reply.1 = Some(error.map_or(Ok(()), Err));
+            self.signal_cv.notify_all();
+        }
     }
 
     #[cfg(windows)]
@@ -428,7 +505,7 @@ pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
     if session.sink().is_none() {
         let mut buf = [0u8; 8192];
         loop {
-            match file.read(&mut buf) {
+            match pump_read(&mut file, &mut buf, &session) {
                 Ok(0) => {
                     session.stdout_eof();
                     break;
@@ -444,6 +521,13 @@ pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
     }
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        if session.io_stop.load(Ordering::SeqCst) {
+            if let Some(sink) = session.sink() {
+                sink.eof();
+            }
+            session.stdout_eof();
+            break;
+        }
         let Some(sink) = session.sink() else {
             session.stdout_eof();
             break;
@@ -461,7 +545,7 @@ pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
         }
         session.set_stalled(false);
         let n = room.min(buf.len());
-        match file.read(&mut buf[..n]) {
+        match pump_read(&mut file, &mut buf[..n], &session) {
             Ok(0) => {
                 sink.eof();
                 session.stdout_eof();
@@ -487,9 +571,88 @@ pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
 pub fn pump_stderr(mut file: File, session: std::sync::Arc<Session>) {
     let mut buf = [0u8; 8192];
     loop {
-        match file.read(&mut buf) {
+        match pump_read(&mut file, &mut buf, &session) {
             Ok(0) | Err(_) => break,
             Ok(n) => session.push_stderr(&buf[..n]),
         }
+    }
+}
+
+// One reader owns each pipe. Unix reads are nonblocking; Windows reads never ask
+// for more than PeekNamedPipe observed, so a surviving writer cannot hold a read.
+fn pump_read(file: &mut File, buf: &mut [u8], session: &Session) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        loop {
+            if session.io_stop.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+            if rc == 0 {
+                continue;
+            }
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            match file.read(buf) {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        loop {
+            if session.io_stop.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            let mut available = 0;
+            let ok = unsafe {
+                windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                    file.as_raw_handle() as _,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if available != 0 {
+                let n = buf.len().min(available as usize);
+                return file.read(&mut buf[..n]);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = session;
+        file.read(buf)
     }
 }

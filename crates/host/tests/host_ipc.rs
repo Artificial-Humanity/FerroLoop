@@ -797,8 +797,21 @@ fn stdin_queue_refuses_over_capacity() {
         }
     }
     wait_depth(&daemon.paths.barrier, 63);
-    let refused = rpc.send("cap", epoch, lease, "NO");
-    assert_eq!(not_written(&refused), &SendBlock::QueueFull);
+    // Keep using the split API while earlier correlated sends are outstanding.
+    let overflow_id = rpc.push(|id| HostRequest::Send {
+        id,
+        session: sid("cap"),
+        expected_epoch: SessionEpoch(epoch),
+        lease,
+        line: "NO".into(),
+    });
+    match rpc.pull() {
+        HostResponse::Sent { id, outcome } => {
+            assert_eq!(id, overflow_id);
+            assert_eq!(not_written(&outcome), &SendBlock::QueueFull);
+        }
+        other => panic!("overflow response: {other:?}"),
+    }
     release(&daemon.paths.barrier, "before-first");
     for _ in 0..64 {
         match rpc.pull() {
@@ -841,8 +854,20 @@ fn stdin_queue_refuses_over_capacity() {
     }
     wait_depth(&daemon.paths.barrier, 3);
     let overflow = format!("BYTECAP{}", "B".repeat(30_000));
-    let refused = rpc.send("bytes", epoch, lease, &overflow);
-    assert_eq!(not_written(&refused), &SendBlock::QueueFull);
+    let overflow_id = rpc.push(|id| HostRequest::Send {
+        id,
+        session: sid("bytes"),
+        expected_epoch: SessionEpoch(epoch),
+        lease,
+        line: overflow,
+    });
+    match rpc.pull() {
+        HostResponse::Sent { id, outcome } => {
+            assert_eq!(id, overflow_id);
+            assert_eq!(not_written(&outcome), &SendBlock::QueueFull);
+        }
+        other => panic!("byte overflow response: {other:?}"),
+    }
     release(&daemon.paths.barrier, "before-first");
     for _ in 0..4 {
         match rpc.pull() {
@@ -1248,7 +1273,7 @@ fn fenced_session_allows_epoch_guarded_signal_and_kill() {
     let mut next = Rpc::connect(&daemon.paths.endpoint);
     let renewed = next.claim("fence", epoch).expect("lease");
     let _ = send.join();
-    next.signal("fence", epoch, renewed, SignalKind::Interrupt)
+    next.signal("fence", epoch, renewed, SignalKind::Terminate)
         .expect("signal");
     next.kill("fence", epoch, Some(renewed)).expect("kill");
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("fence"));
@@ -1674,7 +1699,7 @@ fn stale_lease_signal_refused() {
     assert!(failed_reason(err).contains("stale lease"));
     let listed = rpc.list();
     assert!(matches!(find(&listed, "sig").state, ChildState::Running(_)));
-    rpc.signal("sig", epoch, lease, SignalKind::Interrupt)
+    rpc.signal("sig", epoch, lease, SignalKind::Terminate)
         .expect("signal");
 }
 
@@ -1694,7 +1719,7 @@ fn epoch_guard_serializes_signal_kill_and_respawn() {
             session: sid("guard"),
             expected_epoch: SessionEpoch(epoch),
             lease,
-            signal: SignalKind::Hangup,
+            signal: SignalKind::Terminate,
         });
         wait_at(&barrier, "before-signal");
         let _ = rpc.push(|id| HostRequest::Kill {
@@ -1853,4 +1878,327 @@ fn disconnected_idle_subscribers_release_all_windows_slots() {
         subscribers.push(probe);
         probe = Rpc::connect(endpoint);
     }
+}
+
+#[cfg(target_os = "linux")]
+struct SignalFixturePin(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl SignalFixturePin {
+    fn new(pid: u32) -> Self {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+        assert!(fd >= 0, "pin fixture");
+        Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+    }
+    fn send(&self, signal: i32) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SignalFixturePin {
+    fn drop(&mut self) {
+        self.send(libc::SIGCONT);
+        self.send(libc::SIGKILL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signal_waits_for_sole_reaper_and_expired_command_cannot_signal() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("serialized"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("serialized", &["stall"]);
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("serialized", epoch).expect("lease");
+    log.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "serialized")
+            .iter()
+            .any(|line| line == b"READY")
+    });
+    let registry = fl_host::read_registry(&daemon.paths.endpoint).expect("registry");
+    let row = registry
+        .sessions
+        .iter()
+        .find(|row| row.session == "serialized")
+        .expect("row");
+    let supervisor = SignalFixturePin::new(row.supervisor_pid);
+    let vendor = SignalFixturePin::new(row.vendor_pid);
+    supervisor.send(libc::SIGSTOP);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stat =
+            std::fs::read_to_string(format!("/proc/{}/stat", row.supervisor_pid)).expect("stat");
+        if stat
+            .rsplit_once(')')
+            .expect("stat fields")
+            .1
+            .trim_start()
+            .starts_with('T')
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "supervisor did not stop");
+        thread::yield_now();
+    }
+    let started = Instant::now();
+    let error = rpc
+        .signal("serialized", epoch, lease, SignalKind::Kill)
+        .expect_err("no acknowledgement while sole reaper is stopped");
+    assert!(failed_reason(error).contains("signal outcome unknown"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    supervisor.send(libc::SIGCONT);
+    // A subsequent RPC on the same FIFO proves the expired command was consumed.
+    rpc.signal("serialized", epoch, lease, SignalKind::Hangup)
+        .expect("next signal");
+    log.wait_until(Duration::from_secs(3), |events| {
+        controls(events).iter().any(|event| {
+            matches!(
+                event,
+                ControlEvent::Exited {
+                    exit: ChildExit {
+                        signal: Some(libc::SIGHUP),
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+    });
+    let error = rpc
+        .signal("serialized", epoch, lease, SignalKind::Kill)
+        .expect_err("reaped leader cannot anchor a signal");
+    assert!(failed_reason(error).contains("unanchored group"));
+    drop(vendor);
+}
+
+#[cfg(windows)]
+#[test]
+fn signalled_windows_handle_preserves_exit_259_in_event_inventory_and_registry() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("exit259"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("exit259", &["exit-with-survivor", "259"]);
+    log.wait_until(Duration::from_secs(3), |events| {
+        controls(events).iter().any(|event| {
+            matches!(
+                event,
+                ControlEvent::Exited {
+                    exit: ChildExit {
+                        code: Some(259),
+                        signal: None
+                    },
+                    ..
+                }
+            )
+        })
+    });
+    let snapshot = log.snapshot();
+    let exits: Vec<_> = controls(&snapshot)
+        .into_iter()
+        .filter(|event| matches!(event, ControlEvent::Exited { .. }))
+        .collect();
+    assert_eq!(exits.len(), 1);
+    let children = rpc.list();
+    assert!(
+        matches!(&find(&children, "exit259").state, ChildState::LeaderExited(row) if row.exit.as_ref().is_some_and(|exit| exit.code == Some(259)))
+    );
+    let registry = fl_host::read_registry(&daemon.paths.endpoint).expect("registry");
+    let row = registry
+        .sessions
+        .iter()
+        .find(|row| row.session == "exit259")
+        .expect("durable leader");
+    assert_eq!(row.leader_code, Some(259));
+    assert!(row.group_leader_reaped);
+    rpc.kill("exit259", epoch_of(&child), None)
+        .expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn unsupported_windows_signals_refuse_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("unsupported"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("unsupported", &["echo"]);
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("unsupported", epoch).expect("lease");
+    log.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "unsupported")
+            .iter()
+            .any(|line| line == b"READY")
+    });
+    for signal in [SignalKind::Interrupt, SignalKind::Hangup] {
+        let error = rpc
+            .signal("unsupported", epoch, lease, signal)
+            .expect_err("unsupported signal");
+        assert!(failed_reason(error).contains("unsupported Windows signal"));
+        assert!(matches!(
+            find(&rpc.list(), "unsupported").state,
+            ChildState::Running(_)
+        ));
+        let text = format!("survived-{signal:?}");
+        assert_eq!(
+            rpc.send("unsupported", epoch, lease, &text),
+            SendOutcome::Written
+        );
+        log.wait_until(Duration::from_secs(3), |events| {
+            line_bytes(events, "unsupported")
+                .iter()
+                .any(|line| line == text.as_bytes())
+        });
+    }
+    rpc.signal("unsupported", epoch, lease, SignalKind::Kill)
+        .expect("supported kill");
+    log.wait_until(Duration::from_secs(3), |events| {
+        controls(events)
+            .iter()
+            .any(|event| matches!(event, ControlEvent::Exited { .. }))
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_disconnect_never_reports_signal_success() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("disconnect"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("disconnect", &["stall"]);
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("disconnect", epoch).expect("lease");
+    log.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "disconnect")
+            .iter()
+            .any(|line| line == b"READY")
+    });
+    let registry = fl_host::read_registry(&daemon.paths.endpoint).expect("registry");
+    let row = registry
+        .sessions
+        .iter()
+        .find(|row| row.session == "disconnect")
+        .expect("row");
+    let vendor = SignalFixturePin::new(row.vendor_pid);
+    let supervisor = SignalFixturePin::new(row.supervisor_pid);
+    supervisor.send(libc::SIGKILL);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if fl_host::read_registry(&daemon.paths.endpoint)
+            .expect("registry")
+            .alerts
+            .iter()
+            .any(|alert| alert == "cleanup unresolved")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "supervisor EOF was not observed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let started = Instant::now();
+    assert!(
+        rpc.signal("disconnect", epoch, lease, SignalKind::Kill)
+            .is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(matches!(
+        find(&rpc.list(), "disconnect").state,
+        ChildState::Running(_)
+    ));
+    drop(vendor);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signal_with_unreported_leader_exit_is_serialized_with_reaping() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("exit-race"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let child = rpc.spawn("exit-race", &["stall"]);
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("exit-race", epoch).expect("lease");
+    log.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "exit-race")
+            .iter()
+            .any(|line| line == b"READY")
+    });
+    let registry = fl_host::read_registry(&daemon.paths.endpoint).expect("registry");
+    let row = registry
+        .sessions
+        .iter()
+        .find(|row| row.session == "exit-race")
+        .expect("row");
+    let supervisor = SignalFixturePin::new(row.supervisor_pid);
+    let vendor = SignalFixturePin::new(row.vendor_pid);
+    supervisor.send(libc::SIGSTOP);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stat =
+            std::fs::read_to_string(format!("/proc/{}/stat", row.supervisor_pid)).expect("stat");
+        if stat
+            .rsplit_once(')')
+            .expect("stat fields")
+            .1
+            .trim_start()
+            .starts_with('T')
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "supervisor did not stop");
+        thread::yield_now();
+    }
+    vendor.send(libc::SIGTERM);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", row.vendor_pid))
+            .expect("unreaped fixture");
+        if stat
+            .rsplit_once(')')
+            .expect("stat fields")
+            .1
+            .trim_start()
+            .starts_with('Z')
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "leader did not exit");
+        thread::yield_now();
+    }
+    assert!(
+        matches!(find(&rpc.list(), "exit-race").state, ChildState::Running(_)),
+        "leader exit must still be unreported"
+    );
+    let error = rpc
+        .signal("exit-race", epoch, lease, SignalKind::Kill)
+        .expect_err("sole reaper must decide");
+    assert!(failed_reason(error).contains("signal outcome unknown"));
+    supervisor.send(libc::SIGCONT);
+    log.wait_until(Duration::from_secs(3), |events| {
+        controls(events).iter().any(|event| {
+            matches!(
+                event,
+                ControlEvent::Exited {
+                    exit: ChildExit {
+                        signal: Some(libc::SIGTERM),
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+    });
+    let error = rpc
+        .signal("exit-race", epoch, lease, SignalKind::Kill)
+        .expect_err("reaped anchor");
+    assert!(failed_reason(error).contains("unanchored group"));
 }

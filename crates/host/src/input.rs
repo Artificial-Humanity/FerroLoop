@@ -994,23 +994,20 @@ fn write_some_windows(file: &mut File, buf: &[u8], deadline: Instant) -> WriteSt
 fn signal_session(session: &Session, signal: SignalKind) -> Result<(), String> {
     #[cfg(unix)]
     {
-        let anchor = crate::LeaderAnchor {
-            pid: session.vendor_pid,
-            start: session.vendor_start,
-            pgid: session.pgid,
-            reaped: session.leader_exit().is_some(),
-        };
         let mapped = match signal {
             SignalKind::Interrupt => libc::SIGINT,
             SignalKind::Terminate => libc::SIGTERM,
             SignalKind::Kill => libc::SIGKILL,
             SignalKind::Hangup => libc::SIGHUP,
         };
-        crate::signal_anchored_group(Some(&anchor), mapped).map_err(|err| err.as_str().to_owned())
+        session.signal(mapped)
     }
     #[cfg(windows)]
     {
-        let _ = signal;
+        if matches!(signal, SignalKind::Interrupt | SignalKind::Hangup) {
+            return Err("unsupported Windows signal".into());
+        }
+        // Windows Terminate and Kill both use TerminateProcess on the retained handle.
         session.terminate_leader().map_err(|err| err.to_string())
     }
     #[cfg(not(any(unix, windows)))]

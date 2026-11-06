@@ -238,6 +238,9 @@ fn env_name_ok(name: &str) -> bool {
         && !bytes.contains(&b'=')
 }
 
+/// Unix maps these to SIGINT, SIGTERM, SIGKILL, and SIGHUP for the anchored group.
+/// Windows supports Terminate and Kill through TerminateProcess on the retained
+/// leader handle. Interrupt and Hangup are refused without changing the child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalKind {

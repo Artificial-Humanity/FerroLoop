@@ -312,7 +312,6 @@ impl Worker {
         self.line().unwrap_or_default()
     }
 
-    #[cfg(windows)]
     fn close_stdin(&mut self) {
         self.stdin.take();
     }
@@ -1849,4 +1848,83 @@ fn containment_types_stay_public() {
             start: 1,
         },
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dead_supervisor_with_live_pipe_survivor_does_not_block_shutdown() {
+    let (_dir, endpoint) = harness();
+    let mut worker = Worker::start(&endpoint, &[]);
+    let spawned = worker.spawn_spec(&spec("pipe-survivor", &["stall"]));
+    assert!(
+        worker
+            .cmd("stdout pipe-survivor 5000 READY")
+            .starts_with("ok ")
+    );
+    // Retained pidfds keep fixture cleanup from retargeting a reused numeric pid.
+    let vendor = PinFixture::new(spawned.vendor_pid);
+    let supervisor = PinFixture::new(spawned.supervisor_pid);
+    supervisor.kill();
+    assert_eq!(worker.cmd("cleanup pipe-survivor 3000"), "ok false");
+    assert!(executing(spawned.vendor_pid, spawned.vendor_start));
+    worker.close_stdin();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if worker.child.try_wait().expect("wait").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shutdown blocked on surviving stdout/stderr pipe"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        executing(spawned.vendor_pid, spawned.vendor_start),
+        "shutdown must not claim or force unresolved cleanup"
+    );
+    let registry = read_registry(&endpoint).expect("registry");
+    assert!(
+        registry
+            .sessions
+            .iter()
+            .any(|row| row.session == "pipe-survivor" && row.vendor_start == spawned.vendor_start)
+    );
+    assert!(
+        registry
+            .alerts
+            .iter()
+            .any(|alert| alert == "cleanup unresolved")
+    );
+    drop(vendor);
+}
+
+#[cfg(target_os = "linux")]
+struct PinFixture(std::os::fd::OwnedFd);
+#[cfg(target_os = "linux")]
+impl PinFixture {
+    fn new(pid: u32) -> Self {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+        assert!(fd >= 0, "pin fixture");
+        Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+    }
+    fn kill(&self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for PinFixture {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }

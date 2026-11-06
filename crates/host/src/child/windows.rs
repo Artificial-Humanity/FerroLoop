@@ -212,13 +212,10 @@ pub fn backstop() {
 
 pub fn leader_exit_code(process: &OwnedHandle) -> Option<i32> {
     let mut code = 0u32;
-    // SAFETY: `process` is the leader handle retained since CreateProcessW.
+    // SAFETY: the caller proved this retained process handle is signalled.
+    // Every queried code, including STILL_ACTIVE (259), is now an exit code.
     let ok = unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut code) };
-    if ok == 0 || code == 259 {
-        None
-    } else {
-        Some(code as i32)
-    }
+    if ok == 0 { None } else { Some(code as i32) }
 }
 
 pub fn leader_signaled(process: &OwnedHandle) -> bool {

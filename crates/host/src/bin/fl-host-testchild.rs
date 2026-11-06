@@ -17,6 +17,17 @@ fn main() {
             let code = rest.first().and_then(|text| text.parse().ok()).unwrap_or(0);
             exit(code);
         }
+        "exit-with-survivor" => {
+            // The inherited Job contains this child too; its open stdio and live
+            // membership keep the leader's exit inspectable until explicit cleanup.
+            let _child = std::process::Command::new(std::env::current_exe().expect("exe"))
+                .arg("stall")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("survivor");
+            ready();
+            exit(rest.first().and_then(|text| text.parse().ok()).unwrap_or(0));
+        }
         "stall" => {
             ready();
             park();
