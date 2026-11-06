@@ -30,10 +30,10 @@
 
 Files: `crates/core/src/agent.rs`; only catalog-count assertions in existing core/hub API tests when needed.
 
-Consumes existing `RoleRecord`, `builtin_role_records`, `list_roles`, `get_role`, `upsert_role`.
-Produces default `council-chair` record through unchanged catalog APIs. No new public enum or endpoint.
+Consumes existing `RoleRecord`, `list_roles`, `get_role`, `upsert_role`, `delete_role` and existing builtin defaults.
+Produces optional starter `council-chair` record through unchanged catalog APIs. It is **not** a builtin/protected slug; explicit deletion must suppress the starter until re-added. No new public enum or endpoint.
 
-- [ ] Add tests proving Chair default guidance/label/review policy, stored template override, unchanged `custom:council-chair` and structural custom-shadow identity.
+- [ ] Add tests proving Chair starter guidance/label/review policy, stored template override, removal without resurrection/duplication and revival, unchanged `custom:council-chair` and structural custom-shadow identity.
 - [ ] Run focused tests RED before implementation; preserve logs under `/tmp`, not the product diff.
 - [ ] Add the minimal default catalog data; update exact default counts only as required.
 - [ ] Run focused/core tests GREEN; commit with machine author and Freya co-author; independent review before advancing.
