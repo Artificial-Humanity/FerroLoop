@@ -2202,3 +2202,95 @@ fn signal_with_unreported_leader_exit_is_serialized_with_reaping() {
         .expect_err("reaped anchor");
     assert!(failed_reason(error).contains("unanchored group"));
 }
+
+fn wait_complete(rpc: &mut Rpc, name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(
+            find(&rpc.list(), name).state,
+            ChildState::CleanupComplete(_)
+        ) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cleanup never completed for {name}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn unread_previous_epoch_survives_respawn() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let endpoint = &daemon.paths.endpoint;
+    let mut rpc = Rpc::connect(endpoint);
+    let marker = daemon.paths.barrier.join("lines-flushed");
+    let old = epoch_of(&rpc.spawn("retained", &["lines", "3", marker.to_str().unwrap()]));
+    wait_file(&marker, |bytes| bytes == b"flushed");
+    arm(&daemon.paths.subscriber, "before-send");
+    let held = EventLog::subscribe(endpoint, Some("retained"));
+    wait_at(&daemon.paths.subscriber, "before-send");
+    rpc.kill("retained", old, None).unwrap();
+    wait_complete(&mut rpc, "retained");
+    drop(held);
+    // Old output is still unwritten when the same name is replaced.
+    let new = epoch_of(&rpc.spawn("retained", &["stall"]));
+    assert!(new > old);
+    release(&daemon.paths.subscriber, "before-send");
+    let log = EventLog::subscribe(endpoint, Some("retained"));
+    let events = log.wait_until(Duration::from_secs(3), |events| {
+        events.iter().any(|event| matches!(event, HostEvent::Control(ControlEvent::CleanupComplete {session_epoch, ..}) if session_epoch.0 == old))
+        && events.iter().any(|event| matches!(event, HostEvent::Line {session_epoch, bytes, ..} if session_epoch.0 == new && bytes == b"READY"))
+        && events.iter().any(|event| matches!(event, HostEvent::Line {session_epoch, bytes, ..} if session_epoch.0 == old && bytes == b"L2"))
+    });
+    assert!(events.iter().any(|event| matches!(event, HostEvent::Control(ControlEvent::Spawned {session_epoch, ..}) if session_epoch.0 == old)));
+    assert!(events.iter().any(|event| matches!(event, HostEvent::Control(ControlEvent::Exited {session_epoch, ..}) if session_epoch.0 == old)));
+    for expected in [b"READY".as_slice(), b"L0", b"L1", b"L2"] {
+        assert!(events.iter().any(|event| matches!(event, HostEvent::Line {session_epoch, bytes, ..} if session_epoch.0 == old && bytes == expected)));
+    }
+}
+
+#[test]
+fn unread_epochs_refuse_admission_at_retained_capacity() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    for index in 0..fl_host_proto::DEFAULT_MAX_SESSIONS {
+        let name = format!("retained-{index}");
+        let epoch = epoch_of(&rpc.spawn(&name, &["stall"]));
+        rpc.kill(&name, epoch, None).unwrap();
+        wait_complete(&mut rpc, &name);
+    }
+    for index in 64..70 {
+        let spec = spec(&format!("overflow-{index}"), &["stall"]);
+        let response = rpc.call(|id| HostRequest::Spawn { id, spec }).unwrap();
+        assert!(
+            matches!(response, HostResponse::Failed { .. }),
+            "unread output must consume admission capacity: {response:?}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let threads = std::fs::read_dir(format!("/proc/{}/task", daemon.child.id()))
+                .unwrap()
+                .count();
+            if threads <= 12 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completed epochs retained {threads} daemon threads"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert!(rpc.list().len() <= fl_host_proto::DEFAULT_MAX_SESSIONS);
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("retained-0"));
+    log.wait_until(Duration::from_secs(3), |events| {
+        controls(events)
+            .iter()
+            .any(|event| matches!(event, ControlEvent::CleanupComplete { .. }))
+    });
+}

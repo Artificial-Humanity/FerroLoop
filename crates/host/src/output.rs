@@ -4,7 +4,7 @@
 //! application consumption, and a dropped subscriber does not discard bytes that
 //! nobody has fully written.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -90,9 +90,8 @@ struct Sub {
     slow: bool,
     wake: Arc<Condvar>,
     kill: Option<Arc<ShutdownSwitch>>,
-    /// Next `seq` to enqueue for each session epoch. Newer events stay in `ahead`.
+    /// Next `seq` to enqueue. Excess catchup stays in shared pending storage.
     cursors: HashMap<StreamKey, u64>,
-    ahead: HashMap<StreamKey, BTreeMap<u64, Arc<Logical>>>,
 }
 
 pub struct OutputSession {
@@ -142,7 +141,8 @@ impl Hub {
         kill: Option<Arc<ShutdownSwitch>>,
     ) -> Result<Subscriber, (Option<Arc<ShutdownSwitch>>, &'static str)> {
         let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        let alive = fanout.subs.iter().filter(|sub| !sub.dropped).count();
+        fanout.subs.retain(|sub| !sub.dropped);
+        let alive = fanout.subs.len();
         if alive >= MAX_SUBSCRIBERS {
             return Err((kill, "subscriber limit"));
         }
@@ -163,7 +163,6 @@ impl Hub {
             wake: Arc::clone(&wake),
             kill,
             cursors: HashMap::new(),
-            ahead: HashMap::new(),
         });
         drop(fanout);
         self.pull_preexisting();
@@ -191,10 +190,16 @@ impl Hub {
             }
             prime_cursor(sub, key, pending, next_seq);
             drive_cursor(sub, key, pending, next_seq);
-            park_ahead(sub, key, pending);
         }
         for sub in &fanout.subs {
             sub.wake.notify_all();
+        }
+    }
+
+    pub(crate) fn forget_epoch(&self, key: &StreamKey) {
+        let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        for sub in &mut fanout.subs {
+            sub.cursors.remove(key);
         }
     }
 
@@ -308,9 +313,6 @@ fn prime_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
             start = event.seq;
         }
     }
-    if let Some(min) = sub.ahead.get(key).and_then(|parked| parked.keys().next()) {
-        start = start.min(*min);
-    }
     sub.cursors.insert(key.clone(), start);
 }
 
@@ -323,16 +325,10 @@ fn drive_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
         let Some(cursor) = sub.cursors.get(key).copied() else {
             return;
         };
-        let parked = sub
-            .ahead
-            .get(key)
-            .and_then(|parked| parked.get(&cursor).cloned());
-        let event = parked.or_else(|| {
-            pending
-                .iter()
-                .find(|event| event.session == key.0 && event.epoch == key.1 && event.seq == cursor)
-                .cloned()
-        });
+        let event = pending
+            .iter()
+            .find(|event| event.session == key.0 && event.epoch == key.1 && event.seq == cursor)
+            .cloned();
         let Some(event) = event else {
             if cursor < next_seq {
                 let Some(next) = cursor.checked_add(1) else {
@@ -343,23 +339,6 @@ fn drive_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
             }
             return;
         };
-        let done = event
-            .track
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .completes
-            > 0
-            && sub
-                .ahead
-                .get(key)
-                .is_none_or(|parked| !parked.contains_key(&cursor));
-        if done {
-            let Some(next) = cursor.checked_add(1) else {
-                return;
-            };
-            sub.cursors.insert(key.clone(), next);
-            continue;
-        }
         if !offer(sub, key, cursor, &event) {
             return;
         }
@@ -371,13 +350,6 @@ fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> b
     let preexisting = event.index < sub.subscribed_at;
     match assign(sub, event, preexisting) {
         Assign::Queued => {
-            if let Some(event) = sub
-                .ahead
-                .get_mut(key)
-                .and_then(|parked| parked.remove(&cursor))
-            {
-                settle_locked(&event, false);
-            }
             let Some(next) = cursor.checked_add(1) else {
                 return false;
             };
@@ -396,13 +368,6 @@ fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> b
                 .delivered
                 .contains(&sub.id);
             if already {
-                if let Some(event) = sub
-                    .ahead
-                    .get_mut(key)
-                    .and_then(|parked| parked.remove(&cursor))
-                {
-                    settle_locked(&event, false);
-                }
                 let Some(next) = cursor.checked_add(1) else {
                     return false;
                 };
@@ -410,27 +375,6 @@ fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> b
                 true
             } else {
                 false
-            }
-        }
-    }
-}
-
-/// Keep a newer `seq` out of the queue until `cursor` reaches it, including after reap.
-fn park_ahead(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>]) {
-    let Some(cursor) = sub.cursors.get(key).copied() else {
-        return;
-    };
-    for event in pending {
-        if event.session != key.0 || event.epoch != key.1 || event.seq < cursor {
-            continue;
-        }
-        if let std::collections::btree_map::Entry::Vacant(slot) =
-            sub.ahead.entry(key.clone()).or_default().entry(event.seq)
-        {
-            let mut track = event.track.lock().unwrap_or_else(|err| err.into_inner());
-            if !track.retired {
-                track.holders = track.holders.saturating_add(1);
-                slot.insert(Arc::clone(event));
             }
         }
     }
@@ -445,15 +389,11 @@ fn take_sub(fanout: &mut Fanout, id: u64) -> Vec<Arc<Logical>> {
     }
     sub.dropped = true;
     sub.slow = true;
-    let parked = std::mem::take(&mut sub.ahead);
+    sub.cursors.clear();
     if let Some(kill) = sub.kill.take() {
         kill.trip();
     }
-    let mut events: Vec<_> = parked
-        .into_values()
-        .flat_map(|events| events.into_values())
-        .collect();
-    events.extend(sub.queue.drain(..));
+    let mut events: Vec<_> = sub.queue.drain(..).collect();
     sub.queued_bytes = 0;
     events.extend(sub.terminals.drain().map(|(_, event)| event));
     sub.wake.notify_all();
@@ -461,24 +401,33 @@ fn take_sub(fanout: &mut Fanout, id: u64) -> Vec<Arc<Logical>> {
 }
 
 fn settle(event: &Logical, wrote: bool) {
-    // Serialize retirement with admission, which can park references from a
-    // snapshot. Otherwise a completed event can be reaped just as that snapshot
-    // adds a new parked holder.
+    // Serialize retirement with admission so catchup cursor obligations cannot
+    // race retirement of the shared pending event.
     if let Some(hub) = event.hub.upgrade() {
-        let _fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        settle_locked(event, wrote);
+        let fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        settle_locked(event, wrote, &fanout);
     }
 }
 
 // The caller holds the fanout lock.
-fn settle_locked(event: &Logical, wrote: bool) {
+fn settle_locked(event: &Logical, wrote: bool, fanout: &Fanout) {
     let release = {
         let mut track = event.track.lock().unwrap_or_else(|err| err.into_inner());
         if wrote {
             track.completes = track.completes.saturating_add(1);
         }
         track.holders = track.holders.saturating_sub(1);
-        let release = track.holders == 0 && track.completes > 0;
+        // An admitted catchup cursor is an obligation, not an event reference.
+        // A healthy subscriber can finish while another drains bounded batches.
+        let waiting = fanout.subs.iter().any(|sub| {
+            !sub.dropped
+                && sub.wants_key(&(event.session.clone(), event.epoch))
+                && sub
+                    .cursors
+                    .get(&(event.session.clone(), event.epoch))
+                    .is_some_and(|cursor| *cursor <= event.seq)
+        });
+        let release = track.holders == 0 && track.completes > 0 && !waiting;
         if release {
             track.retired = true;
         }
@@ -490,6 +439,18 @@ fn settle_locked(event: &Logical, wrote: bool) {
                 output.reap(event.index);
             }
         }
+    }
+}
+
+fn retire_unheld(event: &Logical, fanout: &Fanout) {
+    let unheld = event
+        .track
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .holders
+        == 0;
+    if unheld {
+        settle_locked(event, false, fanout);
     }
 }
 
@@ -609,6 +570,33 @@ impl OutputSession {
             (inner.events.clone(), self.seq.load(Ordering::SeqCst))
         };
         self.hub.admit(&pending, &key, next_seq);
+        let fanout = self
+            .hub
+            .fanout
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for event in &pending {
+            event
+                .track
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .delivered
+                .retain(|id| fanout.subs.iter().any(|sub| !sub.dropped && sub.id == *id));
+            // No holder is removed here; retry only deferred retirement.
+            retire_unheld(event, &fanout);
+        }
+    }
+
+    pub(crate) fn can_retire(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        inner.eof
+            && inner.events.is_empty()
+            && inner.partial.is_empty()
+            && inner.staging.is_empty()
+            && self
+                .session
+                .cleanup_report()
+                .is_some_and(|report| report.complete)
     }
 
     fn charge(inner: &OutInner) -> Charge {
@@ -820,6 +808,10 @@ impl StdoutSink for OutputSession {
         if !complete {
             return;
         }
+        self.fence
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
         let session = self.session.session.clone();
         let epoch = self.session.epoch;
         self.publish_with(0, false, move |seq| {
@@ -1126,8 +1118,103 @@ mod tests {
     use super::*;
     use crate::session::SessionParts;
 
+    fn fixture(epoch: u64, hub: &Arc<Hub>) -> Arc<OutputSession> {
+        OutputSession::open(
+            Arc::new(Session::new(SessionParts {
+                session: SessionId::new("same").unwrap(),
+                epoch,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            })),
+            Arc::clone(hub),
+        )
+    }
+
     #[test]
-    fn parked_events_remain_charged_until_subscriber_drops() {
+    fn cursor_disconnect_releases_completed_shared_backlog() {
+        let hub = Arc::new(Hub::new());
+        let output = fixture(1, &hub);
+        for _ in 0..100 {
+            output.emit_line(vec![1; 64 * 1024]);
+        }
+        let slow = hub.subscribe(None, None).ok().unwrap();
+        let fast = hub.subscribe(None, None).ok().unwrap();
+        for _ in 0..100 {
+            let event = fast.next_event(&hub).expect("catchup");
+            fast.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+        }
+        assert!(OutputSession::charge(&output.inner.lock().unwrap()).charge > SUB_BYTES);
+        slow.abandon(&hub);
+        assert_eq!(
+            OutputSession::charge(&output.inner.lock().unwrap()).charge,
+            0
+        );
+        fast.abandon(&hub);
+    }
+
+    #[test]
+    fn occupied_same_name_exit_slot_drops_slow_subscriber_without_overwrite() {
+        let hub = Arc::new(Hub::new());
+        let first = fixture(1, &hub);
+        let second = fixture(2, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        first.on_leader(ChildExit {
+            code: Some(1),
+            signal: None,
+        });
+        second.on_leader(ChildExit {
+            code: Some(2),
+            signal: None,
+        });
+        assert_eq!(hub.fanout.lock().unwrap().subs[0].terminals.len(), 1);
+        assert!(sub.want_slow(&hub));
+        assert_eq!(sub.next_event(&hub).unwrap().epoch, 1);
+        sub.abandon(&hub);
+        let next = hub.subscribe(None, None).ok().unwrap();
+        let event = next.next_event(&hub).unwrap();
+        assert_eq!(event.epoch, 1);
+        next.pop_sent(&hub, &event);
+        settle(&event, true);
+        hub.pull_preexisting();
+        assert_eq!(next.next_event(&hub).unwrap().epoch, 2);
+        next.abandon(&hub);
+    }
+
+    #[test]
+    fn small_event_catchup_stays_within_64_references() {
+        let hub = Arc::new(Hub::new());
+        let output = fixture(1, &hub);
+        for _ in 0..128 {
+            output.emit_line(Vec::new());
+        }
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert_eq!(hub.fanout.lock().unwrap().subs[0].queue.len(), SUB_QUEUE);
+        for expected in 1..=128 {
+            let event = sub.next_event(&hub).expect("small event catchup");
+            assert_eq!(event.seq, expected);
+            sub.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+            let fanout = hub.fanout.lock().unwrap();
+            assert!(fanout.subs[0].queue.len() <= SUB_QUEUE);
+        }
+        assert_eq!(
+            OutputSession::charge(&output.inner.lock().unwrap()).charge,
+            0
+        );
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn catchup_references_stay_bounded_and_drain_in_order() {
         let hub = Arc::new(Hub::new());
         let session = Arc::new(Session::new(SessionParts {
             session: SessionId::new("parked").unwrap(),
@@ -1142,66 +1229,44 @@ mod tests {
             stdin: None,
         }));
         let output = OutputSession::open(session, Arc::clone(&hub));
+        for _ in 0..100 {
+            output.emit_line(vec![1; 64 * 1024]);
+        }
         let slow = hub.subscribe(None, None).ok().unwrap();
         let fast = hub.subscribe(None, None).ok().unwrap();
-        let key = ("parked".to_owned(), 1);
-        let mut snapshot = Vec::new();
-        for seq in 2..10 {
-            let size = MAX_STDOUT_BACKLOG / 8 - 64;
-            let event = Arc::new(Logical {
-                index: seq,
-                seq,
-                epoch: 1,
-                raw_len: size,
-                envelope: 64,
-                session: key.0.clone(),
-                exited: false,
-                body: Body::Line(vec![0; size]),
-                track: Mutex::new(Track {
-                    holders: 0,
-                    completes: 0,
-                    retired: false,
-                    delivered: HashSet::new(),
-                }),
-                hub: Arc::downgrade(&hub),
-            });
-            output.inner.lock().unwrap().events.push(Arc::clone(&event));
-            snapshot.push(Arc::clone(&event));
-            {
-                let mut fanout = hub.fanout.lock().unwrap();
-                let s = fanout.subs.iter_mut().find(|s| s.id == slow.id).unwrap();
-                s.cursors.insert(key.clone(), 1);
-                park_ahead(s, &key, &[Arc::clone(&event)]);
-                let f = fanout.subs.iter_mut().find(|s| s.id == fast.id).unwrap();
-                assert!(matches!(assign(f, &event, false), Assign::Queued));
-                f.queue.pop_front();
-                f.queued_bytes = 0;
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            for sub in &fanout.subs {
+                assert!(sub.queue.len() <= SUB_QUEUE);
+                assert!(sub.queued_bytes <= SUB_BYTES);
             }
-            settle(&event, true);
         }
-        assert_eq!(
-            OutputSession::charge(&output.inner.lock().unwrap()).charge,
-            MAX_STDOUT_BACKLOG
+        for expected in 1..=100 {
+            let event = fast.next_event(&hub).expect("fast catchup gap");
+            assert_eq!(event.seq, expected);
+            fast.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+        }
+        let newcomer = hub.subscribe(None, None).ok().unwrap();
+        assert!(
+            newcomer.next_event(&hub).is_none(),
+            "completed output was replayed to a new subscriber"
         );
-        assert_eq!(output.space(), 0, "parked bytes must stop further reads");
-        slow.abandon(&hub);
+        newcomer.abandon(&hub);
+        // A completed fast write must not erase a slow subscriber's catchup.
+        for expected in 1..=100 {
+            let event = slow.next_event(&hub).expect("slow catchup gap");
+            assert_eq!(event.seq, expected);
+            slow.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+        }
         assert_eq!(
             OutputSession::charge(&output.inner.lock().unwrap()).charge,
             0
         );
-        {
-            let mut fanout = hub.fanout.lock().unwrap();
-            let fast_sub = fanout.subs.iter_mut().find(|s| s.id == fast.id).unwrap();
-            fast_sub.cursors.insert(key.clone(), 1);
-            park_ahead(fast_sub, &key, &snapshot);
-            assert!(
-                fast_sub
-                    .ahead
-                    .get(&key)
-                    .is_none_or(|parked| parked.is_empty()),
-                "a stale snapshot must not re-park retired events"
-            );
-        }
+        slow.abandon(&hub);
         fast.abandon(&hub);
     }
 }

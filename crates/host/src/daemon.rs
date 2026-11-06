@@ -19,17 +19,26 @@ pub(crate) fn attach(host: &Arc<HostInner>, session: &Arc<Session>) {
     let stdin = session.take_stdin();
     let output = OutputSession::open(Arc::clone(session), Arc::clone(&host.hub));
     let writer = WriterHandle::start(Arc::clone(session), stdin);
-    let fence = Arc::clone(&writer);
-    output.set_fence(Arc::new(move || fence.fence()));
+    let fence = Arc::downgrade(&writer);
+    output.set_fence(Arc::new(move || {
+        if let Some(writer) = fence.upgrade() {
+            writer.fence();
+        }
+    }));
     let sink: Arc<dyn StdoutSink> = output.clone();
     session.set_sink(Arc::downgrade(&sink));
     host.outputs
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .insert(session.session.as_str().to_owned(), Arc::clone(&output));
+        .insert(
+            (session.session.as_str().to_owned(), session.epoch),
+            Arc::clone(&output),
+        );
     let stop = Arc::clone(host);
     let running = Arc::clone(&writer);
-    host.spawn_thread(move || running.run(move || stop.stop.load(Ordering::SeqCst)));
+    host.spawn_epoch_thread(session, move || {
+        running.run(move || stop.stop.load(Ordering::SeqCst))
+    });
     let previous = host
         .writers
         .lock()

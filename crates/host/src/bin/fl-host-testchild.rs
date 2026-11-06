@@ -61,7 +61,10 @@ fn main() {
             park();
         }
         "record" => record(rest.first().map(String::as_str)),
-        "lines" => lines(rest.first().and_then(|text| text.parse().ok()).unwrap_or(1)),
+        "lines" => lines(
+            rest.first().and_then(|text| text.parse().ok()).unwrap_or(1),
+            rest.get(1).map(String::as_str),
+        ),
         "flood-stdout" => flood_stdout(),
         "flood-empty" => flood_empty(),
         "overflow" => overflow_line(),
@@ -106,13 +109,16 @@ fn record(path: Option<&str>) {
     }
 }
 
-fn lines(count: usize) {
+fn lines(count: usize, flushed: Option<&str>) {
     ready();
     let mut out = io::stdout();
     for index in 0..count {
         let _ = writeln!(out, "L{index}");
     }
     let _ = out.flush();
+    if let Some(path) = flushed {
+        std::fs::write(path, b"flushed").expect("flush marker");
+    }
     park();
 }
 

@@ -86,12 +86,14 @@ impl std::fmt::Debug for Host {
     }
 }
 
+type ThreadJoin = (Option<(String, u64)>, JoinHandle<()>);
+
 pub(crate) struct HostInner {
     endpoint: HostEndpoint,
     path: PathBuf,
     registry: Mutex<Registry>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<Session>>>,
-    joins: Mutex<Vec<JoinHandle<()>>>,
+    joins: Mutex<Vec<ThreadJoin>>,
     spawn_gate: Mutex<()>,
     pub(crate) listener: Mutex<Option<HostListener>>,
     pub(crate) handle: tokio::runtime::Handle,
@@ -99,7 +101,7 @@ pub(crate) struct HostInner {
     pub(crate) wake: tokio::sync::Notify,
     pub(crate) hub: Arc<output::Hub>,
     pub(crate) writers: Mutex<HashMap<String, Arc<input::WriterHandle>>>,
-    pub(crate) outputs: Mutex<HashMap<String, Arc<output::OutputSession>>>,
+    pub(crate) outputs: Mutex<HashMap<(String, u64), Arc<output::OutputSession>>>,
     pub(crate) next_conn: AtomicU64,
     shutdown_started: AtomicBool,
     #[cfg(unix)]
@@ -411,7 +413,15 @@ impl Host {
         if self.inner.shutdown_started.swap(true, Ordering::SeqCst) {
             return;
         }
+        // A spawn holds this gate through publication and thread registration.
+        // Shutdown cannot snapshot until every admitted spawn has settled.
+        let gate = self
+            .inner
+            .spawn_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         self.inner.stop.store(true, Ordering::SeqCst);
+        drop(gate);
         self.inner.wake.notify_one();
         self.inner.hub.shutdown();
         let writers: Vec<_> = self
@@ -461,7 +471,7 @@ impl Host {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner()),
         );
-        for join in joins {
+        for (_, join) in joins {
             let _ = join.join();
         }
         self.inner
@@ -485,10 +495,24 @@ impl Host {
         this: &Arc<HostInner>,
         spec: &SpawnSpec,
     ) -> Result<SessionHandle, HostError> {
+        Self::admit_spawn(this, || Self::spawn_admitted(this, spec))
+    }
+
+    fn admit_spawn<T>(
+        this: &HostInner,
+        spawn: impl FnOnce() -> Result<T, HostError>,
+    ) -> Result<T, HostError> {
         let _gate = this
             .spawn_gate
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        if this.shutdown_started.load(Ordering::SeqCst) || this.stop.load(Ordering::SeqCst) {
+            return Err(HostError::Protocol("host shutting down".into()));
+        }
+        spawn()
+    }
+
+    fn spawn_admitted(this: &Arc<HostInner>, spec: &SpawnSpec) -> Result<SessionHandle, HostError> {
         spec.validate()?;
         if spec.kind == fl_host_proto::SpawnKind::Pty {
             return Err(HostError::Unsupported { subject: "pty" });
@@ -498,19 +522,29 @@ impl Host {
         {
             check_pidfd_support()?;
         }
-        let occupied = this
-            .sessions
+        this.reclaim_completed();
+        // Every retained epoch consumes capacity, including unread completed
+        // output and unresolved containment. Never evict either to admit a spawn.
+        let retained = this
+            .outputs
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .values()
-            .filter(|session| {
-                !matches!(
-                    session.state(),
-                    fl_host_proto::ChildState::CleanupComplete(_)
-                )
+            .len();
+        let unresolved = this
+            .registry
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .sessions
+            .iter()
+            .filter(|record| {
+                !this
+                    .outputs
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains_key(&(record.session.clone(), record.epoch))
             })
             .count();
-        if occupied >= fl_host_proto::DEFAULT_MAX_SESSIONS {
+        if retained.saturating_add(unresolved) >= fl_host_proto::DEFAULT_MAX_SESSIONS {
             return Err(HostError::Protocol("session limit".into()));
         }
         {
@@ -656,14 +690,14 @@ impl Host {
     ) {
         let host = Arc::clone(this);
         let watched = Arc::clone(&session);
-        this.spawn_thread(move || unix_status(status, watched, host));
+        this.spawn_epoch_thread(&session, move || unix_status(status, watched, host));
         let pumped = Arc::clone(&session);
-        this.spawn_thread(move || session::pump_stdout(stdout, pumped));
+        this.spawn_epoch_thread(&session, move || session::pump_stdout(stdout, pumped));
         let pumped = Arc::clone(&session);
-        this.spawn_thread(move || session::pump_stderr(stderr, pumped));
+        this.spawn_epoch_thread(&session, move || session::pump_stderr(stderr, pumped));
         let waited = Arc::clone(&session);
         // The status thread owns cleanup reports. This thread only reaps the supervisor.
-        this.spawn_thread(move || {
+        this.spawn_epoch_thread(&session, move || {
             if let Some(mut child) = waited.take_supervisor() {
                 let _ = child.wait();
             }
@@ -748,11 +782,11 @@ impl Host {
     fn arm_windows(this: &Arc<HostInner>, session: Arc<Session>, stdout: File, stderr: File) {
         let host = Arc::clone(this);
         let watched = Arc::clone(&session);
-        this.spawn_thread(move || windows_watch(watched, host));
+        this.spawn_epoch_thread(&session, move || windows_watch(watched, host));
         let pumped = Arc::clone(&session);
-        this.spawn_thread(move || session::pump_stdout(stdout, pumped));
+        this.spawn_epoch_thread(&session, move || session::pump_stdout(stdout, pumped));
         let pumped = Arc::clone(&session);
-        this.spawn_thread(move || session::pump_stderr(stderr, pumped));
+        this.spawn_epoch_thread(&session, move || session::pump_stderr(stderr, pumped));
     }
 
     #[cfg(test)]
@@ -777,11 +811,73 @@ impl Host {
 }
 
 impl HostInner {
+    fn reap_threads(&self) {
+        let mut joins = self.joins.lock().unwrap_or_else(|err| err.into_inner());
+        let mut running = Vec::new();
+        for (key, join) in joins.drain(..) {
+            if join.is_finished() {
+                let _ = join.join();
+            } else {
+                running.push((key, join));
+            }
+        }
+        *joins = running;
+    }
+
     pub(crate) fn spawn_thread(&self, work: impl FnOnce() + Send + 'static) {
+        self.reap_threads();
         self.joins
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .push(std::thread::spawn(work));
+            .push((None, std::thread::spawn(work)));
+    }
+
+    pub(crate) fn spawn_epoch_thread(
+        &self,
+        session: &Session,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        self.reap_threads();
+        self.joins
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push((
+                Some((session.session.as_str().to_owned(), session.epoch)),
+                std::thread::spawn(work),
+            ));
+    }
+
+    // Called under spawn_gate. Output is reclaimable only after EOF, successful
+    // cleanup, all pending/assigned output and all epoch threads have retired.
+    fn reclaim_completed(&self) {
+        self.reap_threads();
+        let joins = self.joins.lock().unwrap_or_else(|err| err.into_inner());
+        let mut outputs = self.outputs.lock().unwrap_or_else(|err| err.into_inner());
+        let retired: Vec<_> = outputs
+            .iter()
+            .filter(|(key, output)| {
+                output.can_retire()
+                    && !joins
+                        .iter()
+                        .any(|(running, _)| running.as_ref() == Some(*key))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in retired {
+            outputs.remove(&key);
+            let mut sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
+            if sessions
+                .get(&key.0)
+                .is_some_and(|session| session.epoch == key.1)
+            {
+                sessions.remove(&key.0);
+                self.writers
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .remove(&key.0);
+            }
+            self.hub.forget_epoch(&key);
+        }
     }
 }
 
@@ -1197,6 +1293,149 @@ mod deadline_tests {
             "old writer remains alive after replacement"
         );
         host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn completed_output_waits_for_epoch_thread_retirement_before_reclamation() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("retire").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        let output =
+            super::output::OutputSession::open(Arc::clone(&session), Arc::clone(&host.inner.hub));
+        super::session::StdoutSink::eof(output.as_ref());
+        session.note_cleanup(CleanupReport { complete: true });
+        let key = ("retire".to_owned(), 1);
+        host.inner
+            .outputs
+            .lock()
+            .unwrap()
+            .insert(key.clone(), output);
+        host.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(key.0.clone(), Arc::clone(&session));
+        let (release, hold) = std::sync::mpsc::channel();
+        host.inner.spawn_epoch_thread(&session, move || {
+            hold.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        host.inner.reclaim_completed();
+        assert!(host.inner.outputs.lock().unwrap().contains_key(&key));
+        assert!(host.inner.sessions.lock().unwrap().contains_key(&key.0));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !host.inner.outputs.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "retired epoch was not reclaimed");
+            host.inner.reclaim_completed();
+            std::thread::yield_now();
+        }
+        assert!(host.inner.sessions.lock().unwrap().is_empty());
+        assert!(host.inner.joins.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_waits_for_admitted_spawn_gate_and_rejects_late_spawn() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = unresolved_endpoint(dir.path());
+        let host = Arc::new(Host::open(OpenOptions::new(HostConfig::new(endpoint))).unwrap());
+        let admitted = Arc::new(std::sync::Barrier::new(2));
+        let publish = Arc::new(std::sync::Barrier::new(2));
+        let spawning = Arc::clone(&host);
+        let at = Arc::clone(&admitted);
+        let go = Arc::clone(&publish);
+        let spawn = std::thread::spawn(move || {
+            Host::admit_spawn(&spawning.inner, || {
+                at.wait();
+                go.wait();
+                let session = Arc::new(Session::new(SessionParts {
+                    session: SessionId::new("admitted").unwrap(),
+                    epoch: 1,
+                    vendor_pid: 0,
+                    vendor_start: 0,
+                    supervisor_pid: 0,
+                    supervisor_start: 0,
+                    pgid: 0,
+                    control_inode: 0,
+                    control: None,
+                    stdin: None,
+                }));
+                spawning
+                    .inner
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .insert("admitted".into(), Arc::clone(&session));
+                let watched = Arc::clone(&session);
+                spawning.inner.spawn_epoch_thread(&session, move || {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !watched.cleanup_requested() {
+                        assert!(Instant::now() < deadline, "admitted session missed cleanup");
+                        std::thread::yield_now();
+                    }
+                    watched.note_cleanup(CleanupReport { complete: true });
+                });
+                Ok(session)
+            })
+        });
+        admitted.wait();
+        let other = Arc::clone(&host);
+        let (finished, completion) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            other.shutdown_inner();
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !host.inner.shutdown_started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        // The admitted spawn is held at a publication barrier. Shutdown must
+        // remain blocked until that admission publishes its session and joins.
+        let finished_early = completion.recv_timeout(Duration::from_millis(100)).is_ok();
+        let stopped_early = host.inner.stop.load(Ordering::SeqCst);
+        publish.wait();
+        let session = spawn.join().unwrap().unwrap();
+        shutdown.join().unwrap();
+        assert!(
+            !stopped_early && !finished_early,
+            "shutdown published stop or finished before settling admitted spawn"
+        );
+        assert!(
+            session.cleanup_requested(),
+            "admitted publication missed cleanup snapshot"
+        );
+        assert_eq!(
+            session.cleanup_report(),
+            Some(CleanupReport { complete: true })
+        );
+        assert!(host.inner.joins.lock().unwrap().is_empty());
+        let spec = fl_host_proto::SpawnSpec {
+            session: SessionId::new("late").unwrap(),
+            kind: fl_host_proto::SpawnKind::Pty,
+            argv: vec!["unused".into()],
+            cwd: dir.path().to_owned(),
+            env: Default::default(),
+            env_allow: Default::default(),
+        };
+        assert!(
+            matches!(host.spawn(&spec), Err(fl_host_proto::HostError::Protocol(reason)) if reason == "host shutting down")
+        );
+        assert!(!host.inner.sessions.lock().unwrap().contains_key("late"));
     }
 
     fn unresolved_endpoint(dir: &std::path::Path) -> HostEndpoint {

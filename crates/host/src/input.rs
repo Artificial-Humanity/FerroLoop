@@ -164,7 +164,18 @@ impl WriterHandle {
     pub fn shutdown(&self) {
         let mut state = self.lock();
         state.stop = true;
+        self.invalidate_queued(&mut state, SendBlock::SessionFenced);
+        for job in state.control.drain(..) {
+            let _ = job.reply.send(Err("writer stopped".into()));
+        }
+        state.claim_conns.clear();
         self.cv.notify_all();
+    }
+
+    fn completed(&self) -> bool {
+        self.session
+            .cleanup_report()
+            .is_some_and(|report| report.complete)
     }
 
     pub fn fence(&self) {
@@ -251,6 +262,9 @@ impl WriterHandle {
         if epoch != self.session.epoch {
             return Err("stale epoch".into());
         }
+        if state.stop || self.completed() {
+            return Err("writer stopped".into());
+        }
         if let Some(lease) = lease {
             if state.fenced {
                 // An administrative lease is optional. A supplied one still has to match.
@@ -327,6 +341,9 @@ impl WriterHandle {
         if epoch != self.session.epoch {
             return Err("stale epoch".into());
         }
+        if state.stop || self.completed() {
+            return Err("writer stopped".into());
+        }
         if state.control.len() >= CONTROL_LIMIT {
             return Err("busy".into());
         }
@@ -359,6 +376,11 @@ impl WriterHandle {
                 reason: SendBlock::StaleEpoch,
             });
         }
+        if state.stop || self.completed() {
+            return Some(SendOutcome::NotWritten {
+                reason: SendBlock::SessionFenced,
+            });
+        }
         if state.fenced {
             return Some(SendOutcome::NotWritten {
                 reason: SendBlock::SessionFenced,
@@ -388,6 +410,9 @@ impl WriterHandle {
         if epoch != self.session.epoch {
             return Some("stale epoch".into());
         }
+        if state.stop || self.completed() {
+            return Some("writer stopped".into());
+        }
         if lease == 0 || lease != state.lease {
             return Some("stale lease".into());
         }
@@ -398,12 +423,13 @@ impl WriterHandle {
     }
 
     pub(crate) fn run(self: Arc<Self>, host_stop: impl Fn() -> bool) {
-        while !host_stop() {
+        loop {
             let next = {
                 let mut state = self.lock();
                 loop {
-                    if state.stop || host_stop() {
-                        state.stop = true;
+                    if state.stop || host_stop() || self.completed() {
+                        drop(state);
+                        self.shutdown();
                         return;
                     }
                     if let Some(job) = state.control.pop_front() {
@@ -1014,5 +1040,59 @@ fn signal_session(session: &Session, signal: SignalKind) -> Result<(), String> {
     {
         let _ = (session, signal);
         Err("unanchored group".into())
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use crate::session::SessionParts;
+    use fl_host_proto::SessionId;
+
+    #[test]
+    fn retiring_writer_settles_queued_requests_and_refuses_new_work() {
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("done").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        let writer = WriterHandle::start(session, None);
+        {
+            let mut state = writer.lock();
+            state.lease = 1;
+            state.owner = 7;
+        }
+        let mut queued = writer
+            .send(7, 1, ControllerLease(1), "queued".into())
+            .unwrap();
+        let mut claim = writer.claim(8, 1).unwrap();
+        writer.shutdown();
+        assert!(
+            matches!(queued.try_recv(), Ok(SendOutcome::NotWritten { .. })),
+            "retirement left data reply pending"
+        );
+        assert!(
+            matches!(claim.try_recv(), Ok(Err(_))),
+            "retirement left authority reply pending"
+        );
+        assert!(writer.claim(9, 1).is_err());
+        assert!(
+            writer
+                .signal(7, 1, ControllerLease(1), SignalKind::Kill)
+                .is_err()
+        );
+        assert!(writer.kill(7, 1, None).is_err());
+        assert!(
+            writer
+                .send(7, 1, ControllerLease(1), "late".into())
+                .is_err()
+        );
     }
 }
