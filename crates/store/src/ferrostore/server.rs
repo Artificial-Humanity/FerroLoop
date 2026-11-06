@@ -1977,6 +1977,8 @@ impl RemoteShared {
         method: &str,
         params: &Value,
     ) -> Result<Result<Value, StoreError>, TimedOut> {
+        #[cfg(test)]
+        crate::note_preparatory_rpc_attempt();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         lock_mutex(&self.pending).insert(id, tx);
@@ -2044,6 +2046,8 @@ impl RemoteShared {
 
     /// Send `method` and do not wait: its reply is dropped when it comes.
     pub(super) fn send_only(&self, method: &str, params: Value) {
+        #[cfg(test)]
+        crate::note_preparatory_rpc_attempt();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({
             "id": id,

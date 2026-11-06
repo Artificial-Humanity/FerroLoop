@@ -28,6 +28,9 @@ pub mod migrate;
 pub mod private;
 pub mod rollup;
 pub mod state;
+mod wire_delivery;
+#[cfg(target_os = "linux")]
+pub mod wire_delivery_lifetime;
 pub mod workflow;
 
 #[cfg(test)]
@@ -261,6 +264,8 @@ impl Db {
     }
 
     pub(crate) fn begin_write(&self) -> Result<redb::WriteTransaction, BeginWriteError> {
+        #[cfg(test)]
+        note_preparatory_write_attempt();
         match self {
             Self::Write(db) => db.begin_write().map_err(BeginWriteError::Redb),
             Self::Read(_) => Err(BeginWriteError::ReadOnly),
@@ -3699,5 +3704,68 @@ mod tests {
         std::fs::write(&empty, b"").unwrap();
         assert!(RedbStore::open_read_only(&empty, 0).is_err());
         assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARATORY_WRITES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe native transaction attempts on this thread, including empty and aborted writes.
+#[cfg(test)]
+pub(crate) fn observe_preparatory_writes<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PREPARATORY_WRITES.set(None);
+        }
+    }
+    assert!(
+        PREPARATORY_WRITES.get().is_none(),
+        "nested write observation"
+    );
+    PREPARATORY_WRITES.set(Some(0));
+    let _reset = Reset;
+    let result = f();
+    (result, PREPARATORY_WRITES.get().unwrap())
+}
+
+#[cfg(test)]
+pub(crate) fn note_preparatory_write_attempt() {
+    if let Some(count) = PREPARATORY_WRITES.get() {
+        PREPARATORY_WRITES.set(Some(
+            count.checked_add(1).expect("write observation overflow"),
+        ));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARATORY_RPC: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe outbound request attempts on this thread, including failed and disconnected sends.
+#[cfg(test)]
+pub(crate) fn observe_preparatory_rpc<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PREPARATORY_RPC.set(None);
+        }
+    }
+    assert!(PREPARATORY_RPC.get().is_none(), "nested RPC observation");
+    PREPARATORY_RPC.set(Some(0));
+    let _reset = Reset;
+    let result = f();
+    (result, PREPARATORY_RPC.get().unwrap())
+}
+
+#[cfg(test)]
+pub(crate) fn note_preparatory_rpc_attempt() {
+    if let Some(count) = PREPARATORY_RPC.get() {
+        PREPARATORY_RPC.set(Some(
+            count.checked_add(1).expect("RPC observation overflow"),
+        ));
     }
 }
