@@ -107,7 +107,7 @@ impl HostEndpoint {
         }
         #[cfg(target_os = "macos")]
         {
-            return Self::unix(std::env::temp_dir().join("ferroloop/fl-host.sock"));
+            Self::unix(std::env::temp_dir().join("ferroloop/fl-host.sock"))
         }
         #[cfg(windows)]
         {
