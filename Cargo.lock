@@ -511,6 +511,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fl-host"
+version = "0.1.0"
+dependencies = [
+ "fl-host-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "fl-host-proto"
 version = "0.1.0"
 dependencies = [
