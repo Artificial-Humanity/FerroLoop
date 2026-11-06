@@ -149,6 +149,24 @@ fn spin_up_registers_the_agent_and_persists_a_hosted_record() {
 }
 
 #[test]
+fn spin_up_accepts_catalog_chair_and_persists_its_custom_identity() {
+    for role in ["council-chair", "custom:council-chair"] {
+        let env = Env::new();
+        let out = Env::json_of(env.spin_up("ada", role, "claude"));
+        assert_eq!(out["role"], role);
+
+        let roster = env.roster(false);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0]["role"], "custom:council-chair");
+
+        let records = env.hosted_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["role"], role);
+        assert_eq!(records[0]["runtime_spawned"], false);
+    }
+}
+
+#[test]
 fn spin_up_rejects_each_invalid_field_without_touching_the_store() {
     let env = Env::new();
     env.spin_up("Felicity", "assistant", "claude")
@@ -162,8 +180,7 @@ fn spin_up_rejects_each_invalid_field_without_touching_the_store() {
         .assert()
         .code(1)
         .stderr(contains(
-            "role must be one of: lead, assistant, ui-developer, web-developer, mobile-developer, \
-system-developer, data-engineer, tester, strategist, journalist, lab-manager",
+            "role `owner` is not an executable role or available catalog role",
         ));
     env.spin_up("felicity", "assistant", "gemini")
         .assert()
