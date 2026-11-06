@@ -60,8 +60,10 @@ use fl_gate::{
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
-    MAX_DELIVER, PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
-    dispatch_operator_prompt_to_route, push_operator_prompt_to_route, push_to_route,
+    CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
+    PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
+    dispatch_operator_prompt_to_route, push_operator_prompt_to_route,
+    push_operator_prompt_with_intent, push_to_route,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -4949,7 +4951,7 @@ fn handle_dynamic_api_routes(
         let session_id = percent_decode(segments[3]);
         let prompt_id = percent_decode(segments[5]);
         if segments.len() == 7 && segments[6] == "send-now" && method == "POST" {
-            return handle_post_queued_prompt_send_now(state, &session_id, &prompt_id);
+            return handle_post_queued_prompt_send_now(state, authority, &session_id, &prompt_id);
         }
         if segments.len() == 6 && (method == "PATCH" || method == "PUT") {
             return handle_patch_queued_prompt(state, &session_id, &prompt_id, req);
@@ -5337,13 +5339,75 @@ pub(crate) fn after_next_prompt_dispatch(f: impl FnOnce() + 'static) {
     AFTER_PROMPT_DISPATCH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
 }
 
-fn dispatch_operator_prompt_for_session_typed(
+/// Select capability from authenticated authority, never a display label or the queued author.
+fn operator_prompt_intent(authority: &HubAuthority, send_now: bool) -> OperatorPromptIntent {
+    if authority.is_owner() && send_now {
+        OperatorPromptIntent::OwnerSendNow
+    } else {
+        OperatorPromptIntent::Ordinary
+    }
+}
+
+fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
     session_id: &str,
     sender_name: &str,
     body: &str,
-) -> Result<(), PushError> {
+    intent: OperatorPromptIntent,
+) -> Result<OperatorPromptOutcome, OperatorPromptError> {
+    // Preserve typed steering failures across the ordinary transport's rediscovery boundary.
+    // Every steering failure is final: mapping it to Failed prevents a second route attempt.
+    let mut steering_error = None;
+    let result = crate::lifecycle::dispatch_with_rediscovery_typed(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, session_id),
+        |route| {
+            let delivery = if intent == OperatorPromptIntent::OwnerSendNow
+                && matches!(route, fl_wire::identity::VendorRoute::Codex { .. })
+                && !route_matches_session_id(route, session_id)
+            {
+                Err(OperatorPromptError::Steer(CodexSteerError::Refused {
+                    stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                    reason: fl_wire::dispatcher::CodexSteerRefusalReason::InvalidResponse,
+                    message: "resolved route does not serve the intended Codex thread".into(),
+                }))
+            } else {
+                push_operator_prompt_with_intent(route, sender_name, body, intent)
+            };
+            delivery.map_err(|e| match e {
+                OperatorPromptError::Push(e) => e,
+                OperatorPromptError::Steer(e) => {
+                    let message = e.to_string();
+                    steering_error = Some(e);
+                    PushError::Failed(message)
+                }
+            })
+        },
+    )
+    .ok_or_else(|| {
+        OperatorPromptError::Push(PushError::NotConnected(no_route_error(persona, session_id)))
+    })?;
+    #[cfg(test)]
+    AFTER_PROMPT_DISPATCH.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    match steering_error {
+        Some(error) => Err(OperatorPromptError::Steer(error)),
+        None => result.map_err(OperatorPromptError::Push),
+    }
+}
+
+fn dispatch_queued_operator_prompt_with_intent_for_session(
+    state: &HubState,
+    persona: Option<&str>,
+    session_id: &str,
+    sender_name: &str,
+    body: &str,
+    intent: OperatorPromptIntent,
+) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
     if QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
         AFTER_PROMPT_DISPATCH.with(|hook| {
@@ -5351,21 +5415,73 @@ fn dispatch_operator_prompt_for_session_typed(
                 f();
             }
         });
-        return Ok(());
+        return Ok(OperatorPromptOutcome::TransportAccepted);
     }
-    let result = crate::lifecycle::dispatch_with_rediscovery_typed(
-        state.config.home_override.as_deref(),
-        session_route_query(persona, session_id),
-        |route| push_operator_prompt_to_route(route, sender_name, body),
+    dispatch_operator_prompt_with_intent_for_session(
+        state,
+        persona,
+        session_id,
+        sender_name,
+        body,
+        intent,
     )
-    .unwrap_or_else(|| Err(PushError::NotConnected(no_route_error(persona, session_id))));
-    #[cfg(test)]
-    AFTER_PROMPT_DISPATCH.with(|hook| {
-        if let Some(f) = hook.borrow_mut().take() {
-            f();
+}
+
+/// `delivered` remains transport compatibility only. The explicit stage identifies what
+/// accepted input; even an app-server acknowledgment does not prove model consumption.
+fn with_operator_delivery(
+    mut data: Value,
+    result: &Result<OperatorPromptOutcome, OperatorPromptError>,
+) -> Value {
+    let fields = match result {
+        Ok(outcome) => {
+            let mut fields = serde_json::to_value(outcome).unwrap();
+            fields["delivered"] = json!(true);
+            fields["delivery_error"] = Value::Null;
+            fields
         }
-    });
-    result
+        Err(error) => {
+            let stage = match error {
+                OperatorPromptError::Steer(CodexSteerError::Refused { .. }) => "refused",
+                OperatorPromptError::Push(PushError::NotConnected(_)) => "not_connected",
+                _ => "unconfirmed",
+            };
+            let mut fields = json!({"delivery_stage":stage, "delivered":false, "delivery_error":error.to_string()});
+            if let OperatorPromptError::Steer(error) = error {
+                fields["failure_stage"] = json!(format!("{:?}", error.stage()));
+                fields["refusal_reason"] = error
+                    .refusal_reason()
+                    .map(|r| json!(format!("{r:?}")))
+                    .unwrap_or(Value::Null);
+            }
+            fields
+        }
+    };
+    data.as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    data
+}
+
+fn dispatch_operator_prompt_for_session_typed(
+    state: &HubState,
+    persona: Option<&str>,
+    session_id: &str,
+    sender_name: &str,
+    body: &str,
+) -> Result<OperatorPromptOutcome, PushError> {
+    dispatch_queued_operator_prompt_with_intent_for_session(
+        state,
+        persona,
+        session_id,
+        sender_name,
+        body,
+        OperatorPromptIntent::Ordinary,
+    )
+    .map_err(|e| match e {
+        OperatorPromptError::Push(e) => e,
+        OperatorPromptError::Steer(e) => PushError::Failed(e.to_string()),
+    })
 }
 
 fn dispatch_operator_prompt_for_session(
@@ -5425,7 +5541,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 &item.by,
                 &item.effective_body,
             );
-            let queue = state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone());
+            let queue =
+                state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone().map(|_| ()));
             #[cfg(test)]
             AFTER_QUEUE_FINISH.with(|hook| {
                 if let Some(f) = hook.borrow_mut().take() {
@@ -5446,21 +5563,22 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 }
             }
             claim.finish();
-            let sent_data = json!({
-                "session_id": item.session_id,
-                "persona": item.persona,
-                "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
-                "queued": delivery_res.is_err(),
-                "is_busy": true,
-                "delivered": delivery_res.is_ok(),
-                "delivery_error": delivery_res.as_ref().err().map(ToString::to_string),
-                "prompt_id": item.id,
-                "prompt": item.prompt,
-                "effective_body": item.effective_body,
-                "by": item.by,
-                "queue": queue,
-                "attachments": item.attachments,
-            });
+            let sent_data = with_operator_delivery(
+                json!({
+                    "session_id": item.session_id,
+                    "persona": item.persona,
+                    "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
+                    "queued": delivery_res.is_err(),
+                    "is_busy": true,
+                    "prompt_id": item.id,
+                    "prompt": item.prompt,
+                    "effective_body": item.effective_body,
+                    "by": item.by,
+                    "queue": queue,
+                    "attachments": item.attachments,
+                }),
+                &delivery_res.map_err(OperatorPromptError::Push),
+            );
             state.broadcast("session", "prompt_sent", sent_data);
             state.broadcast(
                 "session",
@@ -5478,6 +5596,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
 
 fn handle_post_queued_prompt_send_now(
     state: &HubState,
+    authority: &HubAuthority,
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
@@ -5498,37 +5617,69 @@ fn handle_post_queued_prompt_send_now(
         );
     };
     let queue_key = item.session_id.clone();
-    let delivery_res = dispatch_operator_prompt_for_session_typed(
+    let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
         state,
         item.persona.as_deref().or(target_persona.as_deref()),
         &canonical_id,
         &item.by,
         &item.effective_body,
+        operator_prompt_intent(authority, true),
     );
-    let queue = state.finish_queued_prompt(&queue_key, prompt_id, delivery_res.clone());
-    if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
-        state.mark_session_in_flight_released(&canonical_id);
-        if matches!(delivery_res, Err(PushError::Failed(_))) {
+    let refused = matches!(
+        delivery_res,
+        Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. }))
+    );
+    let queue = if refused {
+        state.hold_refused_queued_prompt(
+            &queue_key,
+            prompt_id,
+            delivery_res.as_ref().unwrap_err().to_string(),
+        )
+    } else {
+        let legacy = delivery_res.clone().map(|_| ()).map_err(|e| match e {
+            OperatorPromptError::Push(e) => e,
+            OperatorPromptError::Steer(e) => PushError::Failed(e.to_string()),
+        });
+        state.finish_queued_prompt(&queue_key, prompt_id, legacy)
+    };
+    if !refused
+        && !matches!(
+            delivery_res,
+            Err(OperatorPromptError::Push(PushError::NotConnected(_)))
+        )
+    {
+        if matches!(
+            delivery_res,
+            Err(OperatorPromptError::Steer(
+                CodexSteerError::Unconfirmed { .. }
+            ))
+        ) {
+            state.mark_session_in_flight_from_observation(&canonical_id, None);
+        } else {
+            state.mark_session_in_flight_released(&canonical_id);
+        }
+        if delivery_res.is_err() {
             state.associate_unconfirmed_queue(&canonical_id, &queue_key, prompt_id);
         }
     }
     claim.finish();
 
-    let data = json!({
-        "session_id": canonical_id,
-        "persona": item.persona.clone().or(target_persona.clone()),
-        "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
-        "queued": delivery_res.is_err(),
-        "is_busy": true,
-        "delivered": delivery_res.is_ok(),
-        "delivery_error": delivery_res.as_ref().err().map(ToString::to_string),
-        "prompt_id": prompt_id,
-        "prompt": item.prompt,
-        "effective_body": item.effective_body,
-        "by": item.by,
-        "queue": queue,
-        "attachments": item.attachments,
-    });
+    let data = with_operator_delivery(
+        json!({
+            "session_id": canonical_id,
+            "persona": item.persona.clone().or(target_persona.clone()),
+            "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
+            "queued": delivery_res.is_err(),
+            "is_busy": true,
+            "prompt_id": prompt_id,
+            "prompt": item.prompt,
+            "effective_body": item.effective_body,
+            "by": item.by,
+            "queue": queue,
+            "attachments": item.attachments,
+        }),
+        &delivery_res,
+    );
     state.broadcast("session", "prompt_sent", data.clone());
     state.broadcast(
         "session",
@@ -5851,40 +6002,51 @@ fn handle_post_session_prompt(
         }
     };
 
-    let delivery_res = dispatch_operator_prompt_for_session(
+    let delivery_res = dispatch_operator_prompt_with_intent_for_session(
         state,
         target_persona.as_deref(),
         &canonical_session_id,
         &sender_name,
         &effective_body,
+        operator_prompt_intent(authority, payload.send_now),
     );
-    // A changed transcript is refreshed; an unchanged one reuses the busy check's parse.
-    let after = transcript_observation_from_sessions(
-        &canonical_session_id,
-        &sessions,
-        &snap,
-        home,
-        &mut files,
-    );
-    state.mark_session_in_flight_from_observation(&canonical_session_id, after.as_deref());
+    match &delivery_res {
+        Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}
+        Ok(OperatorPromptOutcome::AppServerAccepted { .. })
+        | Err(OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. })) => {
+            // Steering uses app-server truth; never infer its active turn from a rollout.
+            state.mark_session_in_flight_from_observation(&canonical_session_id, None);
+        }
+        _ => {
+            let after = transcript_observation_from_sessions(
+                &canonical_session_id,
+                &sessions,
+                &snap,
+                home,
+                &mut files,
+            );
+            state.mark_session_in_flight_from_observation(&canonical_session_id, after.as_deref());
+        }
+    }
     claim.finish();
     let queue = state.session_queue(&canonical_session_id);
 
-    let data = json!({
-        "session_id": canonical_session_id,
-        "persona": target_persona,
-        "status": "sent",
-        "queued": false,
-        "is_busy": true,
-        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_session_id),
-        "delivered": delivery_res.is_ok(),
-        "delivery_error": delivery_res.as_ref().err(),
-        "prompt": prompt_text,
-        "effective_body": effective_body,
-        "by": sender_name,
-        "queue": queue,
-        "attachments": saved_attachments,
-    });
+    let data = with_operator_delivery(
+        json!({
+            "session_id": canonical_session_id,
+            "persona": target_persona,
+            "status": if matches!(delivery_res, Err(OperatorPromptError::Steer(_))) { "delivery_failed" } else { "sent" },
+            "queued": false,
+            "is_busy": true,
+            "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_session_id),
+            "prompt": prompt_text,
+            "effective_body": effective_body,
+            "by": sender_name,
+            "queue": queue,
+            "attachments": saved_attachments,
+        }),
+        &delivery_res,
+    );
     state.broadcast("session", "prompt_sent", data.clone());
     HttpResponse::json(200, data)
 }

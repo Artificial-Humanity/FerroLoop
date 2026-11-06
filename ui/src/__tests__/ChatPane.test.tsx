@@ -49,6 +49,49 @@ describe("ChatPane", () => {
     },
   ];
 
+  it.each([
+    ["vendor_queued", "Queued in Codex"],
+    ["app_server_accepted", "Accepted by the active Codex turn"],
+    ["unconfirmed", "Delivery unconfirmed"],
+  ])("keeps the submitted draft cleared for explicit %s outcomes", async (delivery_stage, status) => {
+    const onSendPrompt = vi.fn().mockResolvedValue({
+      session_id: "codex-fixture", queued: false, delivered: false,
+      delivery_stage, delivery_error: delivery_stage === "unconfirmed" ? "ack lost" : null,
+    });
+    render(<ChatPane agentName="freya" adapter="codex" sessionId="codex-fixture"
+      turns={[]} onSendPrompt={onSendPrompt} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "steering fixture" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(screen.getByText(new RegExp(status))).toBeInTheDocument());
+    expect(screen.getByLabelText("Message")).toHaveValue("");
+    expect(onSendPrompt).toHaveBeenCalledTimes(1);
+    expect(window.localStorage.getItem("ferrodeck.draft.codex-fixture")).toBeNull();
+  });
+
+  it.each([undefined, "refused"])("restores drafts for known failure with legacy or %s stage", async (delivery_stage) => {
+    const onSendPrompt = vi.fn().mockResolvedValue({ session_id: "codex-refused", queued: false,
+      delivered: false, delivery_stage, delivery_error: "input was refused" });
+    render(<ChatPane agentName="freya" adapter="codex" sessionId="codex-refused" turns={[]} onSendPrompt={onSendPrompt} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "safe draft" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(screen.getByLabelText("Message")).toHaveValue("safe draft"));
+    expect(screen.getByText("input was refused")).toBeInTheDocument();
+    expect(onSendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["vendor_queued", "app_server_accepted", "unconfirmed"])("shows explicit queued Send now %s outcome without retry", async (delivery_stage) => {
+    const onSendQueuedNow = vi.fn().mockResolvedValue({ session_id: "codex-queued", queued: delivery_stage === "unconfirmed",
+      delivered: delivery_stage !== "unconfirmed", delivery_stage });
+    render(<ChatPane agentName="freya" adapter="codex" sessionId="codex-queued" turns={[]}
+      queue={[{ id: "fixture-queue", session_id: "codex-queued", prompt: "queued fixture", by: "ferris", created_at: "2026-11-06T00:00:00Z" }]}
+      onSendQueuedNow={onSendQueuedNow} />);
+    fireEvent.click(screen.getByTestId("queued-send-now-fixture-queue"));
+    const expected = delivery_stage === "vendor_queued" ? /Queued in Codex/ : delivery_stage === "app_server_accepted" ? /Accepted by the active Codex turn/ : /Delivery unconfirmed/;
+    await waitFor(() => expect(screen.getByText(expected)).toBeInTheDocument());
+    expect(onSendQueuedNow).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/delivery could not be confirmed/i)).toBeNull();
+  });
+
   it("renders user and assistant TranscriptTurn items with prose and code blocks", () => {
     render(
       <ChatPane

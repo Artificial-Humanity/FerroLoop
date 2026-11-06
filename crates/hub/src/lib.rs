@@ -130,6 +130,8 @@ pub enum QueuedDeliveryState {
     Pending,
     Sending,
     Unconfirmed,
+    /// A known nonmutating explicit Send now refusal; held until the owner removes it.
+    Refused,
 }
 
 #[derive(Debug, Clone)]
@@ -793,6 +795,27 @@ impl HubState {
                     queue[pos].delivery_error = Some(error);
                 }
             }
+        }
+        queue.clone()
+    }
+
+    /// Hold a known refusal without allowing a later automatic drain to change its intent.
+    pub(crate) fn hold_refused_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        error: String,
+    ) -> Vec<QueuedOperatorPrompt> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return Vec::new();
+        };
+        if let Some(item) = queue
+            .iter_mut()
+            .find(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
+        {
+            item.delivery_state = QueuedDeliveryState::Refused;
+            item.delivery_error = Some(error);
         }
         queue.clone()
     }
@@ -7646,6 +7669,330 @@ mod tests {
         let resp = handle_http_request(state, &req);
         assert_eq!(resp.status, 200, "{}", error_text(&resp));
         resp.json_value().unwrap()
+    }
+
+    /// Scripted Codex control transport on a temporary Unix socket, with no vendor process.
+    fn mock_codex_control(
+        socket: &std::path::Path,
+        outcome: &'static str,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{Read, Write};
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let key = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", crate::ws::compute_accept_key(key)).unwrap();
+            let mut buffered = Vec::new();
+            let mut methods = Vec::new();
+            loop {
+                if let Some(frame) = crate::ws::try_parse_ws_frame(&mut buffered).unwrap() {
+                    if frame.opcode == fl_wire::ws::WsOpcode::Close {
+                        break;
+                    }
+                    let request: Value = serde_json::from_slice(&frame.payload).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    methods.push(method.to_string());
+                    let result = match method {
+                        "initialize" => json!({}),
+                        "initialized" => continue,
+                        "thread/read" => {
+                            assert_eq!(request["params"]["threadId"], "thread-fixture");
+                            json!({"thread":{"id":"thread-fixture", "sessionId":"session-fixture", "cliVersion":"0.166.0",
+                                "createdAt":1,"updatedAt":2,"cwd":"/tmp/mock-project","ephemeral":false,"modelProvider":"openai",
+                                "preview":"fixture","projectId":null,"source":"cli", "status":{"type":if outcome=="idle" {"idle"} else {"active"},"activeFlags":[]},
+                                "canAcceptDirectInput":true,"turns":[]}})
+                        }
+                        "thread/turns/list" => {
+                            json!({"data":[{"id":"turn-fixture","status":"inProgress","items":[],"itemsView":"notLoaded"}],"nextCursor":null,"backwardsCursor":null})
+                        }
+                        "turn/steer" => {
+                            assert_eq!(request["params"]["threadId"], "thread-fixture");
+                            assert_eq!(request["params"]["expectedTurnId"], "turn-fixture");
+                            if outcome == "unconfirmed" {
+                                break;
+                            }
+                            json!({"turnId":"turn-fixture"})
+                        }
+                        other => panic!("forbidden Codex method {other}"),
+                    };
+                    let bytes =
+                        serde_json::to_vec(&json!({"id":request["id"],"result":result})).unwrap();
+                    let mut encoded = vec![0x81];
+                    if bytes.len() < 126 {
+                        encoded.push(bytes.len() as u8);
+                    } else {
+                        encoded.push(126);
+                        encoded.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    }
+                    encoded.extend_from_slice(&bytes);
+                    stream.write_all(&encoded).unwrap();
+                } else {
+                    let mut chunk = [0; 4096];
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+            }
+            methods
+        })
+    }
+
+    #[test]
+    fn codex_send_now_direct_and_queued_report_ack_idle_and_unknown_without_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect());
+        for queued in [false, true] {
+            for outcome in ["accepted", "idle", "unconfirmed"] {
+                let tmp = TempDir::new().unwrap();
+                let state = test_hub_state(&tmp);
+                let bin = tmp.path().join("fake-codex");
+                let log = tmp.path().join("queue.log");
+                fs::write(
+                    &bin,
+                    format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+                )
+                .unwrap();
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+                let socket = tmp.path().join("control.sock");
+                let server = mock_codex_control(&socket, outcome);
+                unsafe {
+                    std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+                    std::env::set_var("FL_WIRE_CODEX_CONTROL_SOCK", &socket);
+                }
+                install_route(
+                    tmp.path(),
+                    "freya",
+                    fl_wire::identity::VendorRoute::Codex {
+                        thread_id: "thread-fixture".into(),
+                        cwd: Some(tmp.path().into()),
+                    },
+                );
+                let body = if queued {
+                    let (item, _) = state.enqueue_session_prompt(
+                        "codex-thread-fixture",
+                        Some("freya".into()),
+                        "fixture".into(),
+                        "fixture".into(),
+                        "ferris".into(),
+                        vec![],
+                    );
+                    call(
+                        &state,
+                        "POST",
+                        &format!(
+                            "/api/v1/sessions/codex-thread-fixture/queue/{}/send-now",
+                            item.id
+                        ),
+                        OWNER,
+                        &json!({}),
+                    )
+                    .json_value()
+                    .unwrap()
+                } else {
+                    post_prompt(
+                        &state,
+                        "codex-thread-fixture",
+                        OWNER,
+                        None,
+                        &json!({"prompt":"fixture","send_now":true,"by":"ferris"}),
+                    )
+                };
+                assert_eq!(
+                    body["delivery_stage"],
+                    match outcome {
+                        "accepted" => "app_server_accepted",
+                        "idle" => "vendor_queued",
+                        _ => "unconfirmed",
+                    },
+                    "{body}"
+                );
+                assert_eq!(body["delivered"], outcome != "unconfirmed");
+                assert_eq!(log.exists(), outcome == "idle");
+                if outcome == "accepted" {
+                    assert_eq!(body["turn_id"], "turn-fixture");
+                }
+                if queued {
+                    if outcome == "unconfirmed" {
+                        assert_eq!(body["queue"][0]["delivery_state"], "unconfirmed");
+                        assert!(state.session_in_flight_unconfirmed("codex-thread-fixture"));
+                        crate::api::drain_ready_session_queues(&state);
+                        assert!(!log.exists());
+                    } else {
+                        assert!(body["queue"].as_array().unwrap().is_empty());
+                    }
+                }
+                let methods = server.join().unwrap();
+                assert_eq!(
+                    methods.iter().filter(|m| *m == "turn/steer").count(),
+                    usize::from(outcome != "idle")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_send_now_requires_owner_authority_and_holds_failed_queued_intent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let bin = tmp.path().join("fake-codex");
+        let log = tmp.path().join("codex.log");
+        fs::write(
+            &bin,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, old) in self.0.drain(..) {
+                    unsafe {
+                        match old {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _env = Env(["FL_WIRE_CODEX_BIN", "FL_WIRE_CODEX_CONTROL_SOCK"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect());
+        unsafe {
+            std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+            std::env::set_var(
+                "FL_WIRE_CODEX_CONTROL_SOCK",
+                tmp.path().join("missing.sock"),
+            );
+        }
+        install_route(
+            tmp.path(),
+            "freya",
+            fl_wire::identity::VendorRoute::Codex {
+                thread_id: "thread-fixture".into(),
+                cwd: Some(tmp.path().into()),
+            },
+        );
+        // The authenticated Owner's arbitrary label must not disable explicit steering.
+        let sent = post_prompt(
+            &state,
+            "codex-thread-fixture",
+            OWNER,
+            None,
+            &json!({"prompt":"direct", "send_now":true, "by":"ferris"}),
+        );
+        assert_eq!(sent["delivery_stage"], "refused", "{sent}");
+        assert_eq!(sent["delivered"], false);
+        assert!(
+            !log.exists(),
+            "failed steering must never fall back to queue"
+        );
+        // A peer claiming Owner only gets ordinary vendor queue behavior.
+        let peer = post_prompt(
+            &state,
+            "codex-thread-fixture",
+            PEER,
+            Some("owner"),
+            &json!({"prompt":"peer", "send_now":true, "by":"owner"}),
+        );
+        assert_eq!(peer["delivery_stage"], "vendor_queued", "{peer}");
+        assert_eq!(peer["delivered"], true);
+        assert!(fs::read_to_string(&log).unwrap().contains("peer"));
+        fs::remove_file(&log).unwrap();
+        let (item, _) = state.enqueue_session_prompt(
+            "codex-thread-fixture",
+            Some("freya".into()),
+            "queued".into(),
+            "queued".into(),
+            "ferris".into(),
+            vec![],
+        );
+        let response = call(
+            &state,
+            "POST",
+            &format!(
+                "/api/v1/sessions/codex-thread-fixture/queue/{}/send-now",
+                item.id
+            ),
+            OWNER,
+            &json!({}),
+        );
+        let body = response.json_value().unwrap();
+        assert_eq!(body["delivery_stage"], "refused", "{body}");
+        assert_eq!(body["queue"][0]["delivery_state"], "refused");
+        assert!(!log.exists());
+        // Held failed explicit intent cannot be silently retried by the background queue drain.
+        crate::api::drain_ready_session_queues(&state);
+        assert!(!log.exists());
+        assert!(
+            state
+                .remove_queued_prompt("codex-thread-fixture", &item.id)
+                .is_some()
+        );
+        let (peer_item, _) = state.enqueue_session_prompt(
+            "codex-thread-fixture",
+            Some("freya".into()),
+            "peer queued".into(),
+            "peer queued".into(),
+            "owner".into(),
+            vec![],
+        );
+        let peer_queued = call(
+            &state,
+            "POST",
+            &format!(
+                "/api/v1/sessions/codex-thread-fixture/queue/{}/send-now",
+                peer_item.id
+            ),
+            PEER,
+            &json!({}),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(
+            peer_queued["delivery_stage"], "vendor_queued",
+            "{peer_queued}"
+        );
+        assert!(fs::read_to_string(&log).unwrap().contains("peer queued"));
     }
 
     #[test]

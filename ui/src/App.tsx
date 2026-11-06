@@ -1,3 +1,4 @@
+import { isPromptDeliveryFailure } from "./types/api";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError } from "./api/client";
@@ -2055,7 +2056,7 @@ export const App: React.FC<AppProps> = ({
     const submittedActiveSession = activeSessionIdRef.current;
     const res = await apiClient.sendSessionPrompt(targetId, payload);
     if (
-      (!res.queued && res.status !== "queued" && res.delivered === false) ||
+      (!res.queued && res.status !== "queued" && isPromptDeliveryFailure(res)) ||
       selectedAgentNameRef.current !== submittedAgent ||
       selectedSessionIdRef.current !== submittedSession ||
       activeSessionIdRef.current !== submittedActiveSession ||
@@ -2073,7 +2074,7 @@ export const App: React.FC<AppProps> = ({
     if (typeof res.is_busy === "boolean") {
       setIsSessionBusy(res.is_busy);
     }
-    if (!res.queued && res.status !== "queued") {
+    if (!res.queued && res.status !== "queued" && res.delivery_stage !== "unconfirmed") {
       const content = res.effective_body || payload.prompt;
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
@@ -2100,8 +2101,8 @@ export const App: React.FC<AppProps> = ({
     const submittedAgent = selectedAgentNameRef.current;
     const res = await apiClient.sendQueuedPromptNow(targetId, promptId);
     if (activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
-      if (res.delivered === false) throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
-      return;
+      if (isPromptDeliveryFailure(res)) throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+      return res;
     }
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
@@ -2109,11 +2110,11 @@ export const App: React.FC<AppProps> = ({
     if (typeof res.is_busy === "boolean") {
       setIsSessionBusy(res.is_busy);
     }
-    if (res.delivered === false) {
+    if (isPromptDeliveryFailure(res)) {
       throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
     }
     const content = res.effective_body || res.prompt;
-    if (content) {
+    if (content && res.delivery_stage !== "unconfirmed") {
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
@@ -2129,6 +2130,7 @@ export const App: React.FC<AppProps> = ({
       );
     }
     void refreshSessionsAndTranscript(targetId);
+    return res;
   };
 
   const handleCancelQueued = async (promptId: string) => {

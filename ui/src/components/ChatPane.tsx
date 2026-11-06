@@ -2,6 +2,8 @@ import React from "react";
 import type { HubApiClient } from "../api/client";
 import {
   DEFAULT_SLASH_COMMANDS,
+  isPromptDeliveryFailure,
+  promptDeliveryStatus,
   type ClearSessionMode,
   type DecommissionMode,
   type HubAuthority,
@@ -1316,6 +1318,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     return () => { pendingPromptListeners.delete(refreshPendingPrompts); };
   }, []);
   const submitting = Boolean(targetSessionOrAgent && pendingPrompts.has(targetSessionOrAgent));
+  const [deliveryStatus, setDeliveryStatus] = React.useState<{ target: string; text: string } | null>(null);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
   const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>(
     () => Object.fromEntries(sessionSendErrors),
@@ -2240,9 +2243,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setSubmitError(null);
       if (onSendQueuedNow) {
         const res = (await onSendQueuedNow(promptId)) as PromptResponse | undefined;
-        if (res?.delivered === false) {
-          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        if (isPromptDeliveryFailure(res)) {
+          throw new Error(res?.delivery_error || "Queued message delivery could not be confirmed");
         }
+        const status = promptDeliveryStatus(res);
+        if (status && currentTargetRef.current === submittedTarget) setDeliveryStatus({ target: submittedTarget, text: status });
       } else if (apiClient) {
         const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
         if (currentTargetRef.current === submittedTarget) {
@@ -2252,11 +2257,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           if (typeof res.is_busy === "boolean") {
             setInternalIsBusy(res.is_busy);
           }
-          if (res.delivered === false) {
+          if (isPromptDeliveryFailure(res)) {
             throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
           }
+          const status = promptDeliveryStatus(res);
+          if (status) setDeliveryStatus({ target: submittedTarget, text: status });
           const content = res.effective_body || res.prompt;
-          if (content) {
+          if (content && res.delivery_stage !== "unconfirmed") {
             setInternalTurns((prev) => [
               ...prev,
               {
@@ -2420,8 +2427,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         throw new Error("No prompt connection is available");
       }
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
-      if (!wasQueued && res?.delivered === false) {
-        throw new Error(res.delivery_error || "Message delivery failed");
+      if (!wasQueued && isPromptDeliveryFailure(res)) {
+        throw new Error(res?.delivery_error || "Message delivery failed");
+      }
+      const status = promptDeliveryStatus(res);
+      if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+        setDeliveryStatus(status ? { target: submittedTarget, text: status } : null);
       }
       if (
         mountedRef.current && !onSendPrompt && apiClient && res &&
@@ -2429,7 +2440,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       ) {
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
-        if (!wasQueued) {
+        if (!wasQueued && res.delivery_stage !== "unconfirmed") {
           const body = res.effective_body || payload.prompt;
           setInternalTurns((prev) => {
             const matches = prev.filter((turn) =>
@@ -3615,6 +3626,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             }}
           />
         </div>
+        {deliveryStatus?.target === targetSessionOrAgent && <div role="status">{deliveryStatus.text}</div>}
         {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
@@ -3746,6 +3758,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         >
                           {item.prompt}
                         </span>
+                        {item.delivery_state === "refused" && <span role="status">Send now refused. Remove this item before submitting a new prompt.</span>}
                         {item.delivery_state === "unconfirmed" && (
                           <span role="status">Delivery unconfirmed. Check the session before removing this item.</span>
                         )}
