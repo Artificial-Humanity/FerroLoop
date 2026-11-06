@@ -510,6 +510,10 @@ impl OutputSession {
         self.cv.notify_all();
     }
 
+    pub(crate) fn stop_pumps(&self) {
+        self.session.stop_pumps();
+    }
+
     fn reap(&self, index: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         let before = inner.events.len();

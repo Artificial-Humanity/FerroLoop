@@ -11,6 +11,8 @@ fn main() {
     let rest: Vec<String> = args.collect();
     match mode.as_str() {
         "echo" => echo(),
+        #[cfg(unix)]
+        "export-pipe-writers" => export_pipe_writers(&rest),
         "report" => report(&rest),
         "exit" => {
             ready();
@@ -534,4 +536,47 @@ fn stuck_supervisor() -> ! {
 #[cfg(not(unix))]
 fn stuck_supervisor() -> ! {
     exit(2);
+}
+
+// Transfer writers outside containment, then wait for the receiver's readiness
+// acknowledgement before exiting. The test harness owns the received descriptors.
+#[cfg(unix)]
+fn export_pipe_writers(args: &[String]) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(&args[0]).expect("descriptor receiver");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("timeout");
+    for fd in match args[1].as_str() {
+        "stdout" => vec![libc::STDOUT_FILENO],
+        "stderr" => vec![libc::STDERR_FILENO],
+        "both" => vec![libc::STDOUT_FILENO, libc::STDERR_FILENO],
+        _ => panic!("pipe selection"),
+    } {
+        let mut byte = [1u8];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        // usize storage gives cmsghdr its required alignment.
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fd) as _) } as usize;
+        let mut control = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fd) as _) as _;
+            libc::CMSG_DATA(header).cast::<libc::c_int>().write(fd);
+            assert_eq!(libc::sendmsg(stream.as_raw_fd(), &msg, 0), 1, "send writer");
+        }
+    }
+    let mut ack = [0u8];
+    stream.read_exact(&mut ack).expect("receiver ready");
+    assert_eq!(ack, [1]);
 }

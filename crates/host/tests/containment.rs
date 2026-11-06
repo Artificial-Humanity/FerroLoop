@@ -1928,3 +1928,116 @@ impl Drop for PinFixture {
         self.kill();
     }
 }
+
+// These writers live in the test process, outside the vendor's containment tree.
+// Neither leader exit nor successful cleanup can close them. Worker Drop kills
+// and reaps a stuck shutdown, so a regression cannot hang the test suite.
+#[cfg(target_os = "linux")]
+fn retained_epoch_shutdown(selection: &str) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixListener;
+
+    let (dir, endpoint) = harness();
+    let socket = dir.path().join("writers.sock");
+    let listener = UnixListener::bind(&socket).expect("writer receiver");
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let mut worker = Worker::start(&endpoint, &[]);
+    let old = worker.spawn_spec(&spec(
+        "reused",
+        &[
+            "export-pipe-writers",
+            socket.to_str().expect("path"),
+            selection,
+        ],
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(pair) => break pair,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "descriptor sender readiness");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("accept sender: {err}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("receive deadline");
+    let mut writers = Vec::new();
+    for _ in 0..if selection == "both" { 2 } else { 1 } {
+        let mut byte = [0u8];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
+        let mut control = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        unsafe {
+            assert_eq!(
+                libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC),
+                1,
+                "receive writer"
+            );
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!header.is_null(), "writer descriptor");
+            assert_eq!((*header).cmsg_level, libc::SOL_SOCKET);
+            assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
+            let fd = libc::CMSG_DATA(header).cast::<libc::c_int>().read();
+            writers.push(OwnedFd::from_raw_fd(fd));
+        }
+    }
+    // Sender cannot exit until every external writer is safely owned here.
+    stream.write_all(&[1]).expect("acknowledge writers");
+    assert_eq!(worker.cmd("leader reused 5000"), "ok Some(0) None");
+    assert_eq!(worker.cmd(&format!("kill reused {}", old.epoch)), "ok");
+    assert_eq!(worker.cmd("cleanup reused 5000"), "ok true");
+    let new = worker.spawn_spec(&spec("reused", &["exit", "0"]));
+    assert!(
+        new.epoch > old.epoch,
+        "same name must replace the historical epoch"
+    );
+    assert_eq!(worker.cmd("leader reused 5000"), "ok Some(0) None");
+    assert_eq!(worker.cmd(&format!("kill reused {}", new.epoch)), "ok");
+    assert_eq!(worker.cmd("cleanup reused 5000"), "ok true");
+    worker.close_stdin();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = worker.child.try_wait().expect("worker status") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shutdown hung with historical {selection} writer open"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(status.success(), "shutdown: {status}");
+    // Keep descriptors live until bounded shutdown has demonstrably finished.
+    for writer in &writers {
+        assert!(unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_cancels_retained_epoch_stdout_pump() {
+    retained_epoch_shutdown("stdout");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_cancels_retained_epoch_stderr_pump() {
+    retained_epoch_shutdown("stderr");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_cancels_retained_epoch_both_pumps() {
+    retained_epoch_shutdown("both");
+}

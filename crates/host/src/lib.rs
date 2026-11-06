@@ -461,8 +461,10 @@ impl Host {
         for session in &sessions {
             let _ = session.wait_cleanup(deadline.saturating_duration_since(Instant::now()));
         }
-        for session in &sessions {
-            session.stop_pumps();
+        // Historical epochs can still own blocked pipe readers after same-name
+        // replacement. Cancel every retained epoch before joining its threads.
+        for output in &outputs {
+            output.stop_pumps();
         }
         let joins = std::mem::take(
             &mut *self
