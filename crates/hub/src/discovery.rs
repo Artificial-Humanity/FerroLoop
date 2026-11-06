@@ -4717,13 +4717,23 @@ fn slash_command_text(text: &str) -> Option<String> {
     }
 }
 
-/// The mails of a Codex hook turn: the whole turn is one `<hook_prompt ...>` element holding
-/// the `fl wire hook` text, `Incoming FerroWire message(s) for '<persona>':`, a blank line and
-/// then `[fl-wire ...]` mails joined by `\n\n---\n\n`. `None` unless the opening tag is
-/// complete, the close tag ends the turn, the preamble is exact, and no other wrapper tag sits
-/// inside, so quoted or half-written wrappers keep their text. A mail starts only after the
-/// exact join, so a body line cannot start one.
-fn hook_prompt_wire_mails(text: &str) -> Option<Vec<&str>> {
+/// What a Codex hook turn that carries FerroWire mail holds (see [`hook_prompt_wire_mails`]).
+enum HookWire<'a> {
+    /// The mails, split at the exact join.
+    Mails(Vec<&'a str>),
+    /// The whole mail text, when it quotes a literal `<hook_prompt` or `</hook_prompt>` tag, so
+    /// where one mail ends is unknown.
+    Quoted(&'a str),
+}
+
+/// The mail text of a Codex hook turn: the whole turn is one `<hook_prompt ...>` element
+/// holding the `fl wire hook` text, `Incoming FerroWire message(s) for '<persona>':`, a blank
+/// line and then `[fl-wire ...]` mails joined by `\n\n---\n\n`. `None` unless the opening tag
+/// is complete, the close tag ends the turn, the preamble is exact and no second element
+/// follows another, so half-written or mixed wrappers keep their text. A mail starts only
+/// after the exact join, so a body line cannot start one. A literal wrapper tag inside the
+/// mail text is not split on; it comes back as [`HookWire::Quoted`].
+fn hook_prompt_wire_mails(text: &str) -> Option<HookWire<'_>> {
     const OPEN: &str = "<hook_prompt";
     const CLOSE: &str = "</hook_prompt>";
     const PREAMBLE: &str = "Incoming FerroWire message(s) for '";
@@ -4750,7 +4760,13 @@ fn hook_prompt_wire_mails(text: &str) -> Option<Vec<&str>> {
         }
     }
     let inner = rest[tag_end? + 1..].trim().strip_suffix(CLOSE)?.trim();
-    if inner.contains(OPEN) || inner.contains(CLOSE) {
+    let quoted = inner.contains(OPEN) || inner.contains(CLOSE);
+    // Two elements side by side are not one hook turn.
+    if quoted
+        && inner
+            .match_indices(CLOSE)
+            .any(|(at, _)| inner[at + CLOSE.len()..].trim_start().starts_with(OPEN))
+    {
         return None;
     }
     let after_preamble = inner.strip_prefix(PREAMBLE)?;
@@ -4759,6 +4775,9 @@ fn hook_prompt_wire_mails(text: &str) -> Option<Vec<&str>> {
         return None;
     }
     let mails = &after_preamble[persona_end + "':\n\n".len()..];
+    if quoted {
+        return Some(HookWire::Quoted(mails));
+    }
     let split = format!("{JOIN}{MAIL}");
     let mut out = Vec::new();
     let mut start = 0;
@@ -4767,17 +4786,35 @@ fn hook_prompt_wire_mails(text: &str) -> Option<Vec<&str>> {
         start = at + JOIN.len();
     }
     out.push(&mails[start..]);
-    Some(out)
+    Some(HookWire::Mails(out))
+}
+
+/// The text of one hook-wrapped mail: its subject (after the header's `"): "`), a newline and
+/// the whole body (everything after the header line). `fallback` when both are empty.
+fn hook_mail_content(mail: &str, fallback: String) -> String {
+    let (header, body) = mail.split_once('\n').unwrap_or((mail, ""));
+    let subject = header.split_once("): ").map_or("", |(_, subject)| subject);
+    match (subject.trim(), body.trim()) {
+        ("", "") => fallback,
+        (subject, "") => subject.to_string(),
+        ("", body) => body.to_string(),
+        (subject, body) => format!("{subject}\n{body}"),
+    }
 }
 
 /// Role and text of a Codex hook turn that carries FerroWire mail (see
-/// [`hook_prompt_wire_mails`]). One mail is classified like the same mail without the wrapper.
-/// Several keep all their text; they are one `wire:<sender>` turn only when every mail has the
-/// same sender, otherwise a `system` bundle (no mail inherits another's sender).
+/// [`hook_prompt_wire_mails`]). One mail has the role of the same mail without the wrapper
+/// and shows its subject and whole body. Several keep all their text; they are one
+/// `wire:<sender>` turn only when every mail has the same sender, otherwise a `system` bundle
+/// (no mail inherits another's sender). Text that quotes a wrapper tag is a `system` turn.
 fn normalize_hook_prompt_wire_turn(role: &str, text: &str) -> Option<(String, String)> {
-    let mails = hook_prompt_wire_mails(text)?;
+    let mails = match hook_prompt_wire_mails(text)? {
+        HookWire::Quoted(mails) => return Some(("system".to_string(), mails.to_string())),
+        HookWire::Mails(mails) => mails,
+    };
     if let [mail] = mails.as_slice() {
-        return Some(normalize_system_turn(role, mail));
+        let (role, plain) = normalize_system_turn(role, mail);
+        return Some((role, hook_mail_content(mail, plain)));
     }
     let first = normalize_system_turn(role, mails[0]).0;
     let same_sender = first != "system"
@@ -6068,6 +6105,9 @@ mod tests {
 
     const SCREENSHOT_MAIL: &str = "[fl-wire mail/normal] from jarvis (id: urn:uuid:01a1ae68-745c-77c2-a7b1-c9360e9bc5d7): PR #342 reviewed by jarvis (approved): Plan native agent host foundation and safe migration sequence\nAgent `jarvis` (lab_manager) submitted a `approved` review on PR #342 (https://github.com/x/y/pull/342) at head 25e845c:\n\nReviewed and approved PR #342.";
 
+    /// What the transcript shows for [`SCREENSHOT_MAIL`]: the subject, then the whole body.
+    const SCREENSHOT_CONTENT: &str = "PR #342 reviewed by jarvis (approved): Plan native agent host foundation and safe migration sequence\nAgent `jarvis` (lab_manager) submitted a `approved` review on PR #342 (https://github.com/x/y/pull/342) at head 25e845c:\n\nReviewed and approved PR #342.";
+
     #[test]
     fn hook_prompt_wrapped_wire_mail_is_a_wire_turn_not_an_operator_turn() {
         let opens = [
@@ -6081,7 +6121,7 @@ mod tests {
             let raw = hook_wrap(open, "ferris", &[SCREENSHOT_MAIL]);
             let (role, content) = normalize_system_turn("user", &raw);
             assert_eq!(role, "wire:jarvis", "{open}");
-            assert_eq!(content, "Reviewed and approved PR #342.", "{open}");
+            assert_eq!(content, SCREENSHOT_CONTENT, "{open}");
             let (role, _) = normalize_system_turn("system", &raw);
             assert_eq!(role, "wire:jarvis", "{open}");
         }
@@ -6091,7 +6131,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_prompt_wrapped_wire_mail_matches_the_unwrapped_mail_for_any_persona() {
+    fn hook_prompt_wrapped_wire_mail_keeps_the_role_of_the_unwrapped_mail_for_any_persona() {
         let mail = hook_mail(
             "reply",
             "Jarvis",
@@ -6103,16 +6143,100 @@ mod tests {
         assert_eq!(plain.0, "wire:jarvis");
         for persona in ["ferris", "katie", "a b-c_d.e"] {
             let raw = hook_wrap(HOOK_OPEN, persona, &[&mail]);
-            assert_eq!(normalize_system_turn("user", &raw), plain, "{persona}");
+            let (role, content) = normalize_system_turn("user", &raw);
+            assert_eq!(role, plain.0, "{persona}");
+            assert_eq!(content, "Subject\nBody line one\nline two", "{persona}");
         }
         // The owner mapping of the plain path applies too.
         let owner = hook_mail("mail", "owner", "urn:uuid:2", "S", "from the owner");
         let raw = hook_wrap(HOOK_OPEN, "ferris", &[&owner]);
-        assert_eq!(
-            normalize_system_turn("user", &raw),
-            normalize_system_turn("user", &owner)
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "user");
+        assert_eq!(content, "S\nfrom the owner");
+    }
+
+    #[test]
+    fn hook_prompt_wrapped_single_mail_keeps_the_subject_and_the_whole_body() {
+        let cases = [
+            // paragraphs before and after a blank line
+            (
+                "S",
+                "para one\n\npara two\n\npara three",
+                "S\npara one\n\npara two\n\npara three",
+            ),
+            // empty body: the subject alone
+            ("Only subject", "", "Only subject"),
+            // empty subject: the body alone
+            ("", "just the body\n\nsecond", "just the body\n\nsecond"),
+        ];
+        for (subject, body, expected) in cases {
+            let mail = hook_mail("mail", "jarvis", "urn:uuid:1", subject, body);
+            let raw = hook_wrap(HOOK_OPEN, "ferris", &[&mail]);
+            let (role, content) = normalize_system_turn("user", &raw);
+            assert_eq!(role, "wire:jarvis", "{mail:?}");
+            assert_eq!(content, expected, "{mail:?}");
+        }
+        // No subject and no body: the existing fallback keeps the mail text.
+        let mail = hook_mail("mail", "jarvis", "urn:uuid:1", "", "");
+        let raw = hook_wrap(HOOK_OPEN, "ferris", &[&mail]);
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "wire:jarvis");
+        assert!(!content.is_empty() && !content.contains("hook_prompt"));
+    }
+
+    #[test]
+    fn hook_prompt_wrapped_non_ascii_mails_keep_their_text() {
+        let persona = "Zoë-日本";
+        let a = hook_mail(
+            "mail",
+            "jarvis",
+            "urn:uuid:1",
+            "Ünï — süm",
+            "日本語の本文\n\nÉtape «deux»",
         );
-        assert_eq!(normalize_system_turn("user", &raw).0, "user");
+        let raw = hook_wrap(HOOK_OPEN, persona, &[&a]);
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "wire:jarvis");
+        assert_eq!(content, "Ünï — süm\n日本語の本文\n\nÉtape «deux»");
+        // Several mails, multi-byte text right next to the join and the quote delimiters.
+        let b = hook_mail("reply", "jarvis", "urn:uuid:2", "Ça→va", "fin✓");
+        let raw = hook_wrap(HOOK_OPEN, persona, &[&a, &b]);
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "wire:jarvis");
+        assert_eq!(content, format!("{a}\n\n---\n\n{b}"));
+        // A multi-byte sender and persona are fine too.
+        let c = hook_mail("mail", "Jürgen", "urn:uuid:3", "Hé", "ça");
+        let raw = hook_wrap(HOOK_OPEN, persona, &[&c]);
+        assert_eq!(normalize_system_turn("user", &raw).0, "wire:jürgen");
+    }
+
+    #[test]
+    fn hook_prompt_wrapped_empty_body_mail_in_a_bundle_keeps_every_subject() {
+        let a = hook_mail("mail", "jarvis", "urn:uuid:1", "First subject", "");
+        let b = hook_mail(
+            "mail",
+            "jarvis",
+            "urn:uuid:2",
+            "Second subject",
+            "second body",
+        );
+        let c = hook_mail("mail", "jarvis", "urn:uuid:3", "Third subject", "");
+        let raw = hook_wrap(HOOK_OPEN, "ferris", &[&a, &b, &c]);
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "wire:jarvis");
+        // The wrapper trim drops the last mail's empty body line.
+        assert_eq!(
+            content,
+            format!("{a}\n\n---\n\n{b}\n\n---\n\n{}", c.trim_end())
+        );
+        for part in [
+            "First subject",
+            "Second subject",
+            "second body",
+            "Third subject",
+        ] {
+            assert!(content.contains(part), "{part} missing from {content}");
+        }
     }
 
     #[test]
@@ -6256,6 +6380,11 @@ mod tests {
             format!("<hook_prompt hook_run_id=\"stop:1{preamble}{mail}</hook_prompt>"),
             "<hook_prompt hook_run_id=\"a>Incoming FerroWire message(s) for 'f':\n\n[fl-wire mail/normal] from jarvis (id: 1): s\nb</hook_prompt>".to_string(),
             format!("<hook_prompt {preamble}{mail}</hook_prompt>"),
+            // attribute and tag-name rules, not only the stray `<` rule
+            format!("<hook_prompt a=\"1\"b{preamble}{mail}</hook_prompt>"),
+            format!("<hook_prompt/>{preamble}{mail}</hook_prompt>"),
+            format!("<hook_prompt\u{a0}hook_run_id=\"x\"{preamble}{mail}</hook_prompt>"),
+            format!("<hook_prompt a='x>{preamble}{mail}</hook_prompt>"),
             // opening tag name only a prefix of the real one
             format!("<hook_prompts>{preamble}{mail}</hook_prompt>"),
             // trailing mixed content
@@ -6270,17 +6399,51 @@ mod tests {
             format!("{HOOK_OPEN}{preamble}</hook_prompt>"),
             format!("{HOOK_OPEN}{preamble}just words, no mail</hook_prompt>"),
             format!("{HOOK_OPEN}Incoming FerroWire message(s) for '':\n\n{mail}</hook_prompt>"),
-            // nested or duplicate wrappers
+            // several adjacent wrappers
             format!("{good}{good}"),
-            format!("{HOOK_OPEN}{preamble}{mail}\n{HOOK_OPEN}x</hook_prompt></hook_prompt>"),
+            format!("{good}\n{good}"),
+            // a wrapper opened right after the first opening tag
             format!("{HOOK_OPEN}{HOOK_OPEN}{preamble}{mail}</hook_prompt></hook_prompt>"),
-            format!("{HOOK_OPEN}{preamble}{mail}</hook_prompt>\n</hook_prompt>"),
         ];
         for text in cases {
             let (role, content) = normalize_system_turn("user", &text);
             assert_eq!(role, "user", "{text}");
             assert_eq!(content, text);
         }
+    }
+
+    #[test]
+    fn hook_prompt_tag_quoted_inside_a_complete_wrapper_is_a_system_turn() {
+        let preamble = "Incoming FerroWire message(s) for 'ferris':\n\n";
+        let cases = [
+            "[fl-wire mail/normal] from jarvis (id: 1): s\nsee <hook_prompt> in the log",
+            "[fl-wire mail/normal] from jarvis (id: 1): s\nsee </hook_prompt> in the log",
+            "[fl-wire mail/normal] from owner (id: 1): <hook_prompt x=\"1\">\nbody",
+            "[fl-wire mail/normal] from jarvis (id: 1): s\nfirst\n\n---\n\n[fl-wire mail/normal] from katie (id: 2): <hook_prompt>\nb",
+        ];
+        for mail in cases {
+            let raw = format!("{HOOK_OPEN}{preamble}{mail}</hook_prompt>");
+            let (role, content) = normalize_system_turn("user", &raw);
+            assert_eq!(role, "system", "{mail}");
+            assert_eq!(content, mail, "{mail}");
+            assert_eq!(normalize_system_turn("system", &raw).0, "system", "{mail}");
+        }
+        // A closed element quoted inside the mail, not adjacent to another one.
+        let mail = "[fl-wire mail/normal] from jarvis (id: 1): s\nthe log said <hook_prompt>x</hook_prompt> twice";
+        let raw = format!("{HOOK_OPEN}{preamble}{mail}</hook_prompt>");
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!((role.as_str(), content.as_str()), ("system", mail));
+        // A stray close tag after the mail.
+        let mail = SCREENSHOT_MAIL;
+        let raw = format!("{HOOK_OPEN}{preamble}{mail}</hook_prompt>\n</hook_prompt>");
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "system");
+        assert!(content.contains("Reviewed and approved PR #342."));
+        // A second opening tag after the mail.
+        let raw = format!("{HOOK_OPEN}{preamble}{mail}\n{HOOK_OPEN}x</hook_prompt></hook_prompt>");
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(role, "system");
+        assert!(content.contains(&format!("{HOOK_OPEN}x")));
     }
 
     #[test]
@@ -6360,7 +6523,7 @@ mod tests {
             ["user", "assistant", "wire:jarvis", "user"],
             "{turns:?}"
         );
-        assert_eq!(turns[2].content, "Reviewed and approved PR #342.");
+        assert_eq!(turns[2].content, SCREENSHOT_CONTENT);
         assert_eq!(turns[3].content, quoted);
     }
 
