@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::ws::{WsError, compute_accept_key, read_http_headers};
@@ -30,10 +31,14 @@ use crate::ws::{WsError, compute_accept_key, read_http_headers};
 pub(crate) const COMPACT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Overall budget for active-turn socket connect, preflight, and acknowledgment.
 pub(crate) const STEER_TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest a single socket read or write may block.
+/// Longest a single socket read may block.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest data frame or reassembled message accepted from the server.
 const MAX_MESSAGE: usize = 1024 * 1024;
+/// Raw steering text and thread ID must each fit within this bound before any copying.
+const MAX_STEER_INPUT: usize = 1024 * 1024;
+/// Largest encoded steering JSON payload (WebSocket framing adds at most 14 bytes).
+const MAX_STEER_REQUEST: usize = 1024 * 1024;
 /// Longest RPC error text carried into an `Err`.
 const MAX_ERROR_TEXT: usize = 300;
 /// The control socket, relative to the Codex home directory.
@@ -243,6 +248,12 @@ pub(crate) fn steer_active_turn(
     use CodexSteerRefusalReason as Reason;
     use CodexSteerStage as Stage;
     let deadline = Instant::now() + timeout;
+    // Validate caller-controlled fields before connecting, cloning or masking them. An empty
+    // turn ID lets us bound all known JSON, including escaping; the proven ID is checked below.
+    if thread_id.len() > MAX_STEER_INPUT || text.len() > MAX_STEER_INPUT {
+        return Err(oversized_steering_request());
+    }
+    encode_steering_request(io::sink(), thread_id, "", text)?;
     let stream = connect_for_steering(sock, deadline).map_err(|e| {
         CodexSteerError::refused(
             Stage::Connect,
@@ -323,11 +334,13 @@ pub(crate) fn steer_active_turn(
                 "thread/turns/list did not prove one latest active turn",
             )
         })?;
+    // Encoding is bounded before the first mutating write. A large proven turn ID or the
+    // combined fields can still exceed the cap even though the caller's fields passed above.
+    let mut request = Vec::new();
+    encode_steering_request(&mut request, thread_id, turn_id, text)?;
     // From the first write attempt onward, a transport failure cannot prove non-delivery.
-    conn.send_json(&json!({
-        "id": 4, "method": "turn/steer",
-        "params": {"threadId": thread_id, "expectedTurnId": turn_id, "input": [{"type": "text", "text": text}]},
-    })).map_err(|message| CodexSteerError::failure(Stage::Steer, Reason::Transport, message))?;
+    conn.send(OP_TEXT, &request)
+        .map_err(|message| CodexSteerError::failure(Stage::Steer, Reason::Transport, message))?;
     let outcome = conn
         .await_steering_response(4, "turn/steer", Stage::Steer)
         .and_then(|ack| {
@@ -349,6 +362,80 @@ pub(crate) fn steer_active_turn(
     // A close failure cannot change the acknowledgment's meaning.
     let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
     outcome
+}
+
+fn oversized_steering_request() -> CodexSteerError {
+    CodexSteerError::refused(
+        CodexSteerStage::Steer,
+        CodexSteerRefusalReason::Rejected,
+        format!("Codex steering request exceeds {MAX_STEER_REQUEST} bytes"),
+    )
+}
+
+/// Borrow the potentially large strings and stop serialization at the cap, rather than
+/// allocating a JSON value and an arbitrarily expanded encoded copy. A sink checks the known
+/// fields before transport; a Vec stores the final request only after proving the active turn.
+fn encode_steering_request(
+    writer: impl Write,
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+) -> Result<(), CodexSteerError> {
+    #[derive(Serialize)]
+    struct Request<'a> {
+        id: u8,
+        method: &'static str,
+        params: Params<'a>,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Params<'a> {
+        thread_id: &'a str,
+        expected_turn_id: &'a str,
+        input: [Input<'a>; 1],
+    }
+    #[derive(Serialize)]
+    struct Input<'a> {
+        r#type: &'static str,
+        text: &'a str,
+    }
+    struct BoundedWriter<W> {
+        inner: W,
+        left: usize,
+    }
+    impl<W: Write> Write for BoundedWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() > self.left {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let written = self.inner.write(buf)?;
+            self.left -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    serde_json::to_writer(
+        BoundedWriter {
+            inner: writer,
+            left: MAX_STEER_REQUEST,
+        },
+        &Request {
+            id: 4,
+            method: "turn/steer",
+            params: Params {
+                thread_id,
+                expected_turn_id: turn_id,
+                input: [Input {
+                    r#type: "text",
+                    text,
+                }],
+            },
+        },
+    )
+    .map_err(|_| oversized_steering_request())
 }
 
 /// Nonblocking connect + deadline-bounded poll, with descriptor ownership held by `Socket`
@@ -374,6 +461,58 @@ fn connect_for_steering(sock: &Path, deadline: Instant) -> io::Result<UnixStream
     remaining()?;
     let descriptor: std::os::fd::OwnedFd = socket.into();
     Ok(UnixStream::from(descriptor))
+}
+
+/// SO_SNDTIMEO only bounds each blocking send, so a progressing peer can keep write_all alive
+/// past the operation deadline. Nonblocking sends plus poll bound both partial progress and
+/// readiness waits. This connection is exclusively owned; restore blocking mode on every exit
+/// so its existing deadline readers retain their behavior. No worker thread outlives a call.
+fn write_with_deadline(stream: &UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let socket = socket2::SockRef::from(stream);
+    socket.set_nonblocking(true)?;
+    let result = (|| {
+        let mut writer = stream;
+        while !bytes.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            // Keep std's platform-specific SIGPIPE suppression when writing a closed peer.
+            match writer.write(bytes) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => bytes = &bytes[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    let mut fd = libc::pollfd {
+                        fd: stream.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // Round up to avoid treating a fractional millisecond as no time left.
+                    let wait_ms = left.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+                    // SAFETY: fd is one initialized pollfd, borrowed from the live stream;
+                    // poll neither retains the pointer nor takes descriptor ownership.
+                    let ready = unsafe { libc::poll(&mut fd, 1, wait_ms) };
+                    if ready < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                    // Recheck the absolute deadline after every wake, including EINTR and
+                    // readiness errors. The next nonblocking send reports a closed peer.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+    let restored = socket.set_nonblocking(false);
+    result.and(restored)
 }
 
 /// Reads from a socket under an overall deadline: before every read it re-arms the socket read
@@ -422,11 +561,7 @@ impl Conn {
             "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
              Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        self.stream
-            .set_write_timeout(Some(self.io_budget()?))
-            .map_err(io_err)?;
-        self.stream
-            .write_all(request.as_bytes())
+        write_with_deadline(&self.stream, request.as_bytes(), self.deadline)
             .map_err(|e| io_failure("sending the WebSocket handshake", &e))?;
         // `read_http_headers` reads one byte at a time; the reader re-arms the socket timeout
         // before every read so a slow drip cannot outlast the overall deadline.
@@ -471,12 +606,7 @@ impl Conn {
             .fill(&mut mask)
             .map_err(|_| "random number generator failure".to_string())?;
         let frame = encode_client_frame(opcode, payload, mask);
-        self.stream
-            .set_write_timeout(Some(self.io_budget()?))
-            .map_err(io_err)?;
-        self.stream
-            .write_all(&frame)
-            .and_then(|()| self.stream.flush())
+        write_with_deadline(&self.stream, &frame, self.deadline)
             .map_err(|e| io_failure("writing to the Codex app-server", &e))
     }
 
@@ -1012,6 +1142,169 @@ mod tests {
     use tempfile::TempDir;
 
     const SHORT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn steering_refuses_oversized_input_before_connecting_or_writing_any_bytes() {
+        for (thread_id, text) in [
+            ("thread-9".to_owned(), "x".repeat(MAX_MESSAGE + 1)),
+            ("thread-9".to_owned(), "\0".repeat(MAX_MESSAGE / 6)),
+            ("x".repeat(MAX_MESSAGE + 1), "hello".to_owned()),
+            ("\0".repeat(MAX_MESSAGE / 6), "hello".to_owned()),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let sock = dir.path().join("no-bytes.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let result = steer_active_turn(&sock, &thread_id, &text, Duration::from_millis(50));
+            assert!(
+                matches!(
+                    result,
+                    Err(CodexSteerError::Refused {
+                        stage: CodexSteerStage::Steer,
+                        reason: CodexSteerRefusalReason::Rejected,
+                        ..
+                    })
+                ),
+                "oversized request must be refused before transport: {result:?}"
+            );
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn steering_refuses_combined_encoded_overflow_before_mutating_write() {
+        let mut replies = steer_replies();
+        replies.truncate(3);
+        let mut turns = active_turn_reply();
+        turns["result"]["data"][0]["id"] = json!("t".repeat(1024));
+        replies[2] = turns.to_string();
+        let (result, log) = steer_exchange(
+            replies,
+            &"x".repeat(MAX_MESSAGE - 512),
+            Duration::from_millis(500),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CodexSteerError::Refused {
+                    stage: CodexSteerStage::Steer,
+                    reason: CodexSteerRefusalReason::Rejected,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            methods(&log),
+            [
+                "initialize",
+                "initialized",
+                "thread/read",
+                "thread/turns/list"
+            ]
+        );
+    }
+
+    #[test]
+    fn steering_accepts_a_request_at_the_encoded_limit() {
+        // Independent literal wire fixture, including the proven thread and turn IDs.
+        let empty = r#"{"id":4,"method":"turn/steer","params":{"threadId":"thread-9","expectedTurnId":"turn-7","input":[{"type":"text","text":""}]}}"#;
+        let text = "x".repeat(MAX_MESSAGE - empty.len());
+        let (result, log) = steer_exchange(steer_replies(), &text, SHORT);
+        assert_eq!(result.unwrap().turn_id, "turn-7");
+        let steer = log
+            .iter()
+            .find(|frame| frame.opcode == OP_TEXT && frame.json()["method"] == "turn/steer")
+            .unwrap();
+        assert_eq!(steer.payload.len(), MAX_MESSAGE);
+        assert_eq!(steer.json()["params"]["input"][0]["text"], text);
+    }
+
+    fn assert_blocking(stream: &UnixStream) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: F_GETFL reads flags from the live descriptor without altering it.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "blocking mode must be restored"
+        );
+    }
+
+    #[test]
+    fn socket_writes_restore_blocking_mode_on_success_and_failures() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        write_with_deadline(&stream, b"hello", Instant::now() + SHORT).unwrap();
+        assert_blocking(&stream);
+        let mut received = [0; 5];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"hello");
+
+        let error = write_with_deadline(&stream, b"expired", Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_blocking(&stream);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut received).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        drop(peer);
+        assert!(write_with_deadline(&stream, b"closed", Instant::now() + SHORT).is_err());
+        assert_blocking(&stream);
+    }
+
+    #[test]
+    fn socket_write_deadline_bounds_a_slow_reader_despite_continuous_progress() {
+        use std::sync::mpsc;
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(4096)
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let mut total = 0;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match peer.read(&mut chunk) {
+                    Ok(0) | Err(_) => return total,
+                    Ok(n) => total += n,
+                }
+                // Pace actual socket reads, while allowing prompt deterministic cleanup.
+                if stop_rx.recv_timeout(Duration::from_millis(20))
+                    != Err(mpsc::RecvTimeoutError::Timeout)
+                {
+                    return total;
+                }
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let mut conn = Conn {
+            stream,
+            rbuf: Vec::new(),
+            rng: SystemRandom::new(),
+            deadline: started + Duration::from_millis(100),
+        };
+        let result = conn.send(OP_TEXT, &vec![b'x'; 128 * 1024]);
+        let elapsed = started.elapsed();
+        stop_tx.send(()).ok();
+        let read = reader.join().unwrap();
+        assert_blocking(&conn.stream);
+        assert!(read > 0, "the reader must make real progress");
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "write took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn steering_connect_refuses_an_expired_deadline_without_connecting() {
