@@ -2019,6 +2019,17 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
     }
 }
 
+/// The model one Grok session itself reports (its `summary.json` beside `transcript_path`), read
+/// without discovery, quota probes or any other session. `None` when the session reports none:
+/// the config default stands in for a session without a summary, but it is no live report.
+pub(crate) fn grok_live_model(
+    transcript_path: Option<&str>,
+    home: Option<&Path>,
+) -> Option<String> {
+    let info = grok_model_info(transcript_path, home);
+    info.model.filter(|_| !info.model_is_default)
+}
+
 fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String> {
     #[cfg(test)]
     cost_counters::bump(&cost_counters::TRANSCRIPT_FINDS);

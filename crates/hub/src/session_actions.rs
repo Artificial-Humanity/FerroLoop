@@ -18,9 +18,10 @@ pub const METHOD_NOOP_TEST: &str = "noop-test";
 pub const METHOD_OPERATOR_PROMPT: &str = "operator-prompt";
 /// `method` reported when the model was recorded but nothing reached a CLI.
 pub const METHOD_OVERRIDE_ONLY: &str = "override-only";
-/// `method` reported when a context window was recorded and applies at the session's next
-/// launch (nothing was sent to the running CLI).
-pub const METHOD_NEXT_LAUNCH: &str = "next-launch";
+/// `method` reported when a context window was saved on the session's hosted record and nothing
+/// was sent to the running CLI. Applying a stored window at launch is separate work, so this
+/// value says "saved", not "will apply".
+pub const METHOD_STORED: &str = "stored";
 
 /// A live (model, thinking level) pair as discovery reported it for a session.
 type LivePair = (Option<String>, Option<String>);

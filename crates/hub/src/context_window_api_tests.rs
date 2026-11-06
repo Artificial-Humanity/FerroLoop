@@ -337,7 +337,8 @@ fn a_default_applies_only_when_it_suits_the_model_and_never_fails_a_spin_up() {
 
 // ---- POST /api/v1/sessions/:id/context-window -------------------------------------------
 
-/// Points `FL_WIRE_TMUX_BIN` at a fake tmux that reports every pane alive, logs its arguments in
+/// Points `FL_WIRE_TMUX_BIN` at a fake tmux that reports every pane alive (or, with
+/// [`FakeTmux::install_dead`], none), logs its arguments in
 /// `<dir>/tmux.out` and appends what is loaded into a paste buffer to `<dir>/pasted.out`. The
 /// variable is restored on drop. Hold `crate::TMUX_ENV_LOCK` while it lives.
 struct FakeTmux {
@@ -347,13 +348,23 @@ struct FakeTmux {
 
 impl FakeTmux {
     fn install(dir: &std::path::Path) -> Self {
+        Self::install_with(dir, true)
+    }
+
+    /// A tmux whose panes and windows are all gone: every liveness check fails.
+    fn install_dead(dir: &std::path::Path) -> Self {
+        Self::install_with(dir, false)
+    }
+
+    fn install_with(dir: &std::path::Path, alive: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
         let bin = dir.join("fake-tmux.sh");
+        let probe = if alive { "echo \"%12\"" } else { "exit 1" };
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> \"{log}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat >> \"{pasted}\"\nfi\n",
+                "#!/bin/sh\necho \"$*\" >> \"{log}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  {probe}\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat >> \"{pasted}\"\nfi\n",
                 log = dir.join("tmux.out").display(),
                 pasted = dir.join("pasted.out").display(),
             ),
@@ -613,7 +624,7 @@ fn a_grok_window_is_validated_stored_sent_live_and_cleared_with_null() {
             "vendor": "grok",
             "context_window": null,
             "persisted": true,
-            "method": "next-launch",
+            "method": "stored",
         })
     );
     assert!(record(&state, "grok:ada").get("context_window").is_none());
@@ -701,18 +712,56 @@ fn without_a_hosted_record_nothing_is_persisted_and_the_live_apply_is_all_there_
     let cleared = set_window(&state, OWNER, "bob", &json!({ "context_window": null }));
     assert_eq!(cleared.status, 200);
     assert_eq!(json_of(&cleared)["persisted"], false);
-    assert_eq!(json_of(&cleared)["method"], "next-launch");
+    assert_eq!(json_of(&cleared)["method"], "stored");
     assert_eq!(tmux.pasted().len(), 1);
 }
 
+/// A fake `grok` that leaves a marker file when it runs, and the marker's path.
+fn marker_grok(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let marker = dir.join("grok-ran");
+    let bin = dir.join("marker-grok.sh");
+    std::fs::write(&bin, format!("#!/bin/sh\ntouch \"{}\"\n", marker.display())).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, marker)
+}
+
+/// Sets `FL_WIRE_GROK_BIN` for a test and restores it on drop. Hold `TMUX_ENV_LOCK`.
+struct GrokBin(Option<std::ffi::OsString>);
+
+impl GrokBin {
+    fn set(bin: &std::path::Path) -> Self {
+        let prev = std::env::var_os("FL_WIRE_GROK_BIN");
+        // SAFETY: callers hold TMUX_ENV_LOCK; the previous value is restored on drop.
+        unsafe { std::env::set_var("FL_WIRE_GROK_BIN", bin) };
+        Self(prev)
+    }
+}
+
+impl Drop for GrokBin {
+    fn drop(&mut self) {
+        // SAFETY: see `set`.
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("FL_WIRE_GROK_BIN", v),
+                None => std::env::remove_var("FL_WIRE_GROK_BIN"),
+            }
+        }
+    }
+}
+
 #[test]
-fn a_failed_live_send_still_stores_and_reports_next_launch() {
+fn a_dead_pane_never_runs_grok_headless_and_the_window_is_only_stored() {
     let _lock = crate::TMUX_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     write_grok_cache(&tmp);
     let state = hub(&tmp);
+    let tmux = FakeTmux::install_dead(tmp.path());
+    let (grok, marker) = marker_grok(tmp.path());
+    let _grok = GrokBin::set(&grok);
     assert_eq!(
         spin_up(
             &state,
@@ -722,39 +771,264 @@ fn a_failed_live_send_still_stores_and_reports_next_launch() {
         .status,
         200
     );
-    // A tmux that fails every call: the pane is not alive and the headless fallback binary
-    // does not exist, so the send fails.
-    let bin = tmp.path().join("failing-tmux.sh");
-    std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let prev = std::env::var_os("FL_WIRE_TMUX_BIN");
-    let prev_grok = std::env::var_os("FL_WIRE_GROK_BIN");
-    // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
-    unsafe {
-        std::env::set_var("FL_WIRE_TMUX_BIN", &bin);
-        std::env::set_var("FL_WIRE_GROK_BIN", tmp.path().join("no-such-grok"));
-    }
     install_grok_route(&tmp, "ada", "gk-ada");
+
     let resp = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
-    // SAFETY: as above.
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("FL_WIRE_TMUX_BIN", v),
-            None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
-        }
-        match prev_grok {
-            Some(v) => std::env::set_var("FL_WIRE_GROK_BIN", v),
-            None => std::env::remove_var("FL_WIRE_GROK_BIN"),
-        }
-    }
     assert_eq!(resp.status, 200, "{}", error_of(&resp));
     let body = json_of(&resp);
-    assert_eq!(body["method"], "next-launch");
+    assert_eq!(body["method"], "stored");
     assert_eq!(body["persisted"], true);
     assert_eq!(record(&state, "grok:ada")["context_window"], 500_000);
+    assert!(tmux.pasted().is_empty());
+    assert!(!marker.exists(), "grok ran headless");
+
+    // Without a record there is nothing to store on and nothing sent: a 409, still no headless.
+    install_grok_route(&tmp, "bob", "gk-bob");
+    state.set_session_model_override(
+        "gk-bob",
+        crate::session_actions::ModelOverride::new("grok-x".into(), None),
+    );
+    let none = set_window(&state, OWNER, "bob", &json!({ "context_window": 500_000 }));
+    assert_eq!(none.status, 409);
+    assert_eq!(
+        error_of(&none),
+        "the context window was not applied: the session has no hosted record to keep it on and its Grok pane is not live"
+    );
+    assert!(tmux.pasted().is_empty());
+    assert!(!marker.exists(), "grok ran headless");
+}
+
+#[test]
+fn a_live_pane_is_pasted_and_never_runs_grok_headless() {
+    let _lock = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    write_grok_cache(&tmp);
+    let state = hub(&tmp);
+    let tmux = FakeTmux::install(tmp.path());
+    let (grok, marker) = marker_grok(tmp.path());
+    let _grok = GrokBin::set(&grok);
+    assert_eq!(
+        spin_up(
+            &state,
+            OWNER,
+            &spin_up_body("ada", "grok", Some("grok-x"), None)
+        )
+        .status,
+        200
+    );
+    install_grok_route(&tmp, "ada", "gk-ada");
+    let resp = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
+    assert_eq!(resp.status, 200, "{}", error_of(&resp));
+    assert_eq!(json_of(&resp)["method"], "operator-prompt");
+    assert_eq!(tmux.pasted(), vec!["/context-window 500000"]);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn the_not_applied_text_says_which_case_it_is() {
+    assert_eq!(
+        crate::api::context_window_not_applied(false),
+        "the context window was not applied: the session has no hosted record to keep it on and its Grok pane is not live"
+    );
+    assert_eq!(
+        crate::api::context_window_not_applied(true),
+        "the context window was not applied: writing it to the session's hosted record failed and its Grok pane is not live"
+    );
+}
+
+/// A Grok session on disk under `<home>/.grok/sessions/p/<id>/`, with a summary naming `model`
+/// when given (what the CLI writes once the session has a model of its own).
+fn write_grok_session(tmp: &TempDir, session_id: &str, model: Option<&str>) {
+    let dir = tmp.path().join(".grok/sessions/p").join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("chat_history.jsonl"), "").unwrap();
+    if let Some(model) = model {
+        std::fs::write(
+            dir.join("summary.json"),
+            json!({ "current_model_id": model }).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn the_sessions_own_live_model_decides_before_the_override_and_the_record() {
+    let _lock = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    write_grok_cache(&tmp);
+    let state = hub(&tmp);
+    let tmux = FakeTmux::install(tmp.path());
+    // ada: the record (and an override) say grok-x (256000, 500000); the CLI now runs grok-y.
+    assert_eq!(
+        spin_up(
+            &state,
+            OWNER,
+            &spin_up_body("ada", "grok", Some("grok-x"), None)
+        )
+        .status,
+        200
+    );
+    install_grok_route(&tmp, "ada", "gk-ada");
+    write_grok_session(&tmp, "gk-ada", Some("grok-y"));
+    state.set_session_model_override(
+        "gk-ada",
+        crate::session_actions::ModelOverride::new("grok-x".into(), None),
+    );
+    let refused = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
+    assert_eq!(refused.status, 400);
+    assert!(
+        error_of(&refused).contains("grok-y"),
+        "{}",
+        error_of(&refused)
+    );
+    assert!(tmux.pasted().is_empty());
+    assert!(record(&state, "grok:ada").get("context_window").is_none());
+    let ok = set_window(&state, OWNER, "ada", &json!({ "context_window": 256_000 }));
+    assert_eq!(ok.status, 200, "{}", error_of(&ok));
+
+    // cy: the record says grok-y (256000 only); the CLI runs grok-x, which offers 500000.
+    assert_eq!(
+        spin_up(
+            &state,
+            OWNER,
+            &spin_up_body("cy", "grok", Some("grok-y"), None)
+        )
+        .status,
+        200
+    );
+    install_grok_route(&tmp, "cy", "gk-cy");
+    write_grok_session(&tmp, "gk-cy", Some("grok-x"));
+    let ok = set_window(&state, OWNER, "cy", &json!({ "context_window": 500_000 }));
+    assert_eq!(ok.status, 200, "{}", error_of(&ok));
+    assert_eq!(record(&state, "grok:cy")["context_window"], 500_000);
+}
+
+#[test]
+fn a_config_default_model_is_no_live_report_and_falls_to_the_override_then_the_record() {
+    let _lock = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    write_grok_cache(&tmp);
+    // The session has a transcript but no summary, so only the config default (grok-y) is
+    // readable, flagged as a default.
+    std::fs::write(
+        tmp.path().join(".grok/config.toml"),
+        "[models]\ndefault = \"grok-y\"\n",
+    )
+    .unwrap();
+    let state = hub(&tmp);
+    let _tmux = FakeTmux::install(tmp.path());
+    assert_eq!(
+        spin_up(
+            &state,
+            OWNER,
+            &spin_up_body("ada", "grok", Some("grok-x"), None)
+        )
+        .status,
+        200
+    );
+    install_grok_route(&tmp, "ada", "gk-ada");
+    write_grok_session(&tmp, "gk-ada", None);
+
+    // The record's grok-x decides (500000 is on offer), not the default grok-y.
+    let ok = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
+    assert_eq!(ok.status, 200, "{}", error_of(&ok));
+
+    // An override beats the record when there is no live model.
+    state.set_session_model_override(
+        "gk-ada",
+        crate::session_actions::ModelOverride::new("grok-y".into(), None),
+    );
+    let refused = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
+    assert_eq!(refused.status, 400);
+    assert!(error_of(&refused).contains("grok-y"));
+
+    // No record and no override: only the default is readable, and it is not used.
+    install_grok_route(&tmp, "bob", "gk-bob");
+    write_grok_session(&tmp, "gk-bob", None);
+    let none = set_window(&state, OWNER, "bob", &json!({ "context_window": 500_000 }));
+    assert_eq!(none.status, 400);
+    assert!(
+        error_of(&none).contains("name a model"),
+        "{}",
+        error_of(&none)
+    );
+}
+
+#[test]
+fn a_record_of_another_vendor_or_a_decommissioned_one_is_not_used() {
+    let _lock = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    write_grok_cache(&tmp);
+    let state = hub(&tmp);
+    let tmux = FakeTmux::install(tmp.path());
+
+    // gus has a live Claude record and a Grok route: the record's model is not grok's.
+    assert_eq!(
+        spin_up(
+            &state,
+            OWNER,
+            &spin_up_body("gus", "claude", Some("opus[1m]"), None)
+        )
+        .status,
+        200
+    );
+    install_grok_route(&tmp, "gus", "gk-gus");
+    let unnamed = set_window(&state, OWNER, "gus", &json!({ "context_window": 500_000 }));
+    assert_eq!(unnamed.status, 400);
+    assert!(
+        error_of(&unnamed).contains("name a model"),
+        "{}",
+        error_of(&unnamed)
+    );
+    state.set_session_model_override(
+        "gk-gus",
+        crate::session_actions::ModelOverride::new("grok-x".into(), None),
+    );
+    let ok = set_window(&state, OWNER, "gus", &json!({ "context_window": 500_000 }));
+    assert_eq!(ok.status, 200, "{}", error_of(&ok));
+    assert_eq!(json_of(&ok)["persisted"], false);
+    assert!(record(&state, "claude:gus").get("context_window").is_none());
+
+    // A decommissioned Grok record gets no window and gives no model.
+    assert_eq!(
+        spin_up(
+            &state,
+            OWNER,
+            &spin_up_body("ada", "grok", Some("grok-x"), None)
+        )
+        .status,
+        200
+    );
+    install_grok_route(&tmp, "ada", "gk-ada");
+    {
+        // The store is exclusive: drop it before the next request opens it.
+        let store = state.open_store().unwrap();
+        let mut gone = lifecycle::find_hosted_session(&*store, &["grok:ada"])
+            .unwrap()
+            .unwrap();
+        gone.status = lifecycle::STATUS_DECOMMISSIONED.to_string();
+        lifecycle::persist_hosted_session(&*store, &gone, "test").unwrap();
+    }
+    let unnamed = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
+    assert_eq!(unnamed.status, 400);
+    assert!(error_of(&unnamed).contains("name a model"));
+    state.set_session_model_override(
+        "gk-ada",
+        crate::session_actions::ModelOverride::new("grok-x".into(), None),
+    );
+    let sent = set_window(&state, OWNER, "ada", &json!({ "context_window": 500_000 }));
+    assert_eq!(sent.status, 200, "{}", error_of(&sent));
+    assert_eq!(json_of(&sent)["persisted"], false);
+    assert!(record(&state, "grok:ada").get("context_window").is_none());
+    assert_eq!(tmux.pasted().len(), 2);
 }
 
 #[test]
@@ -797,10 +1071,10 @@ fn another_vendor_is_refused_and_a_record_only_session_stores_for_the_next_launc
     let cleared = set_window(&state, OWNER, "cy", &json!({ "context_window": null }));
     assert_eq!(cleared.status, 200, "{}", error_of(&cleared));
     assert_eq!(json_of(&cleared)["vendor"], "claude");
-    assert_eq!(json_of(&cleared)["method"], "next-launch");
+    assert_eq!(json_of(&cleared)["method"], "stored");
     assert_eq!(json_of(&cleared)["persisted"], true);
 
-    // A Grok record with no live route: stored, applied at the next launch.
+    // A Grok record with no live route: stored on the record only.
     assert_eq!(
         spin_up(
             &state,
@@ -817,7 +1091,7 @@ fn another_vendor_is_refused_and_a_record_only_session_stores_for_the_next_launc
         &json!({ "context_window": 500_000 }),
     );
     assert_eq!(stored.status, 200, "{}", error_of(&stored));
-    assert_eq!(json_of(&stored)["method"], "next-launch");
+    assert_eq!(json_of(&stored)["method"], "stored");
     assert_eq!(json_of(&stored)["persisted"], true);
     assert_eq!(record(&state, "grok:eve")["context_window"], 500_000);
     assert!(tmux.pasted().is_empty());

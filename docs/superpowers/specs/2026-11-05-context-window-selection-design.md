@@ -58,13 +58,19 @@ Antigravity: no selector exists. These vendors answer a window request with
   bytes and never panics on non-ASCII input.
 * **Endpoint.** `POST /api/v1/sessions/:id/context-window`, Owner only (403 before the body is
   read). Body `{ "context_window": <positive integer> | null }`. A number is validated, stored on
-  the hosted record (when one exists) and sent to a Grok route session as the text
-  `/context-window <tokens>`, the same way `/model` is dispatched. `null` clears the stored value
-  and sends nothing (Grok has no reset). Response: `{ ok, session_id, vendor, context_window,
-  persisted, method }` with `method` `operator-prompt` (sent to the live session) or `next-launch`
-  (stored only). A number that was neither stored nor sent returns 409 "not applied".
-* **Launch.** Nothing applies a stored window at launch yet; a stored window is recorded and shown.
-  That is the next task.
+  the session's live hosted record of the same vendor (when one exists; a decommissioned record
+  or one of another vendor counts as none) and pasted into a Grok route's live tmux pane as the
+  text `/context-window <tokens>`. The model that decides is the session's own live model (its
+  Grok `summary.json`; a config default is ignored), else the operator's latest model choice,
+  else the hosted record's model; with none the answer is a 400 "name a model". A Grok pane that
+  is not live is never reached through a headless `grok -p` (a separate process, not the running
+  TUI): the window is only stored. `null` clears the stored value and sends nothing (Grok has no
+  reset). Response: `{ ok, session_id, vendor, context_window, persisted, method }` with `method`
+  `operator-prompt` (pasted into the live pane) or `stored` (saved on the hosted record only;
+  applying it at launch is a separate task). A number that was neither stored nor pasted returns
+  409 "not applied", worded for a session with no record or a record whose write failed.
+* **Launch.** Nothing applies a stored window at launch yet; a stored window is recorded and shown
+  (`method: stored` means saved, not "will apply"). That is the next task.
 * **UI.** Agent Settings gets a window selector next to the model selector (editable for Grok,
   read-only for the others); Spin-Up gets an optional window; Settings -> Runtimes & Quotas gets
   the Grok default. The meter keeps showing the effective window from the vendor.

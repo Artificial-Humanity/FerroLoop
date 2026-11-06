@@ -60,7 +60,7 @@ use fl_gate::{
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
-    MAX_DELIVER, PushError, SessionResetMode, clear_or_reforge_session,
+    MAX_DELIVER, PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
     dispatch_operator_prompt_to_route, push_operator_prompt_to_route, push_to_route,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
@@ -97,8 +97,7 @@ use crate::nodes::{
 use crate::operators;
 use crate::records;
 use crate::session_actions::{
-    self, METHOD_NEXT_LAUNCH, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride,
-    route_vendor,
+    self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, METHOD_STORED, ModelOverride, route_vendor,
 };
 use crate::settings;
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
@@ -6296,17 +6295,32 @@ fn handle_post_session_model(
     HttpResponse::json(200, data)
 }
 
+/// The 409 text when a window reached neither the record nor the pane: `had_record` tells a
+/// session with no record to keep it on from a record whose write did not land.
+pub(crate) fn context_window_not_applied(had_record: bool) -> &'static str {
+    if had_record {
+        "the context window was not applied: writing it to the session's hosted record failed and its Grok pane is not live"
+    } else {
+        "the context window was not applied: the session has no hosted record to keep it on and its Grok pane is not live"
+    }
+}
+
 /// `POST /api/v1/sessions/:id/context-window` (Local Record #134): choose a session's context
 /// window, `{ "context_window": <positive integer> | null }`. Owner only (403 for a Peer,
 /// checked before the body is read). `null` clears the choice.
 ///
 /// A number is checked with [`crate::context_window::validate_context_window`] against the
 /// session's vendor and model; only Grok is selectable, and a refusal is a 400 that names the
-/// sizes on offer. The value is stored on the session's hosted record when it has one (a session
-/// without one stores nothing and the response says `persisted: false`). A Grok route is also
-/// sent `/context-window <tokens>` (`method: operator-prompt`); `null` sends nothing, because
-/// Grok has no reset, so clearing takes effect at the next launch. Any other route, or a failed
-/// send, reports `method: next-launch`.
+/// sizes on offer. The model is the session's own live model (read from its Grok session file,
+/// ignoring a config default), else the operator's latest choice, else the hosted record's;
+/// with none the answer is a 400 "name a model". The value is stored on the session's live
+/// hosted record of the same vendor when it has one (a session without one stores nothing and
+/// the response says `persisted: false`). A Grok route whose tmux pane is live is also pasted
+/// `/context-window <tokens>` (`method: operator-prompt`); a pane that is not live is never
+/// reached through a headless `grok -p` (a separate process that is not the running TUI), so the
+/// window is only stored. `null` sends nothing, because Grok has no reset. Any other route, or a
+/// failed send, reports `method: stored`: the window is saved on the record. Applying a stored
+/// window at launch is separate work.
 ///
 /// The response reports what was REQUESTED. The effective window is what the vendor reports
 /// (`context_usage` on the session), which can differ if the vendor ignored the command.
@@ -6362,38 +6376,45 @@ fn handle_post_session_context_window(
         None => (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())),
     };
     let route = vendor_route_for_session(state, persona.as_deref(), &canonical_id).ok();
-    let hosted = hosted_record_for(state, &[trimmed, &canonical_id], persona.as_deref());
-    if matched.is_none() && route.is_none() && hosted.is_none() {
+    let any_record = hosted_record_for(state, &[trimmed, &canonical_id], persona.as_deref());
+    if matched.is_none() && route.is_none() && any_record.is_none() {
         return HttpResponse::json(
             404,
             json!({ "error": format!("unknown session `{trimmed}`") }),
         );
     }
-    let vendor = match (&route, matched, &hosted) {
+    let vendor = match (&route, matched, &any_record) {
         (Some(route), _, _) => route_vendor(route).to_string(),
         (None, Some(s), _) => s.adapter.clone(),
         (None, None, Some(record)) => record.vendor.clone(),
         (None, None, None) => "unknown".to_string(),
     };
+    // Only a live record of the session's own vendor takes (or informs) a window: a persona can
+    // hold records of other vendors, and a decommissioned record is history.
+    let hosted = any_record.filter(|record| {
+        record.vendor == vendor && record.status != lifecycle::STATUS_DECOMMISSIONED
+    });
 
     if let Some(tokens) = requested {
-        // The model whose sizes decide: the operator's latest choice, else the hosted record's,
-        // else what discovery reads from the vendor's own files (Grok only, the only vendor
-        // whose sizes are checked).
+        // The model whose sizes decide, most trustworthy first: what the session itself reports
+        // (Grok only, the only vendor whose sizes are checked; a config default does not count),
+        // the operator's latest choice, then the hosted record's. The override and the record can
+        // be older than an in-CLI `/model`, so they only fill in when the session reports none.
         let override_key = match matched {
             Some(s) => s.id.clone(),
             None => persona.clone().unwrap_or_else(|| canonical_id.clone()),
         };
-        let mut model = state
-            .session_model_override(&override_key)
-            .map(|o| o.model)
+        let live_model = (vendor == "grok")
+            .then(|| {
+                crate::discovery::grok_live_model(
+                    matched.and_then(|s| s.transcript_path.as_deref()),
+                    state.config.home_override.as_deref(),
+                )
+            })
+            .flatten();
+        let model = live_model
+            .or_else(|| state.session_model_override(&override_key).map(|o| o.model))
             .or_else(|| hosted.as_ref().and_then(|r| r.model.clone()));
-        if model.is_none() && vendor == "grok" {
-            model = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref())
-                .into_iter()
-                .find(|s| s.id == canonical_id)
-                .and_then(|s| s.model);
-        }
         if let Err(why) = crate::context_window::validate_context_window(
             &vendor,
             model.as_deref(),
@@ -6425,28 +6446,24 @@ fn handle_post_session_context_window(
         }
     }
 
+    // Only a live pane takes the command: the dispatcher's own Grok path would fall back to a
+    // headless `grok -p` for a dead pane, which is not the running TUI.
     let live = match (&route, requested) {
         (Some(route @ fl_wire::identity::VendorRoute::Grok { .. }), Some(tokens)) => {
-            dispatch_operator_prompt_to_route(
-                route,
-                authority.actor_name(),
-                &session_actions::context_window_command(tokens),
-            )
-            .is_ok()
+            deliver_to_live_grok_pane(route, &session_actions::context_window_command(tokens))
+                .is_ok()
         }
         _ => false,
     };
     let method = if live {
         METHOD_OPERATOR_PROMPT
     } else {
-        METHOD_NEXT_LAUNCH
+        METHOD_STORED
     };
     if requested.is_some() && !live && !persisted {
         return HttpResponse::json(
             409,
-            json!({
-                "error": "the context window was not applied: the session has no stored record to keep it on and the live command could not be sent"
-            }),
+            json!({ "error": context_window_not_applied(hosted.is_some()) }),
         );
     }
 
