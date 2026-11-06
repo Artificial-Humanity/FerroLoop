@@ -1,8 +1,9 @@
 //! `POST /api/v1/agents/:name/recast`: the Owner moves an existing agent to another project or
 //! role.
 //!
-//! Recast changes only the registry record. It does not touch tmux sessions, routes,
-//! `PERSONA.md` or wire state. The rules:
+//! Recast changes the registry record and persists assignment-bound metadata selecting current
+//! guidance on explicit hydration. It does not touch tmux sessions, routes, `PERSONA.md` or wire
+//! state. The rules:
 //!
 //! - Only Owner authority may recast. Any other caller gets 403.
 //! - The agent must exist (404) and be `active` (409 "reactivate it first"). The store's
@@ -15,7 +16,9 @@
 //!   `missing_areas`, and nothing is written.
 //! - A 200 carries `agent`, `retires_lead` (the retired Lead's display name or `null`),
 //!   `creates_areas` (the areas this call created) and, when a Lead was retired, the full
-//!   `retired_lead` record. The `agents:recast` event carries the same fields. A recast that
+//!   `retired_lead` record. Additive `guidance_requires_reforge` stays true for an assignment
+//!   with a persisted recast binding; delivery never claims model consumption or clears it.
+//!   The `agents:recast` event carries the same fields. A recast that
 //!   does not make the agent a Lead never reports a retired Lead.
 //! - Recasting a project's only Lead away leaves the project with no Lead. PR policy then falls
 //!   back to the LabManager tier.
@@ -34,7 +37,7 @@ use fl_core::agent::{AgentRecord, AgentRole, AgentStatus, RegisterAgentArgs};
 use fl_core::at::At;
 use fl_core::ids::AgentId;
 use fl_core::state::validate_slug;
-use fl_core::store::{AgentRegistry, StoreError};
+use fl_core::store::{AgentRegistry, StateStore, StoreError};
 use fl_exec::stamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -208,17 +211,21 @@ pub(crate) fn handle_post_agent_recast(
 
     let at = stamp::now();
     let by = authority.actor_name().to_string();
-    let updated = match store.register_agent(RegisterAgentArgs {
-        display_name: existing.display_name.clone(),
-        email: Some(existing.email.clone()),
-        project: project.clone(),
-        role: body.role.clone(),
-        extra_areas,
-        create_area: body.create_area,
-        replace: true,
-        at: at.clone(),
-        by: by.clone(),
-    }) {
+    let (updated, guidance_requires_reforge) = match register_recast(
+        &*store,
+        &existing,
+        RegisterAgentArgs {
+            display_name: existing.display_name.clone(),
+            email: Some(existing.email.clone()),
+            project: project.clone(),
+            role: body.role.clone(),
+            extra_areas,
+            create_area: body.create_area,
+            replace: true,
+            at: at.clone(),
+            by: by.clone(),
+        },
+    ) {
         Ok(record) => record,
         Err(e) => return store_error(&e),
     };
@@ -249,7 +256,9 @@ pub(crate) fn handle_post_agent_recast(
         "agent": updated,
         "retires_lead": retires_lead,
         "creates_areas": creates_areas,
+        "guidance_requires_reforge": guidance_requires_reforge,
     });
+    event["guidance_requires_reforge"] = json!(guidance_requires_reforge);
     event["retires_lead"] = json!(retires_lead);
     event["creates_areas"] = json!(creates_areas);
     if let Some(lead) = retired_lead {
@@ -258,6 +267,30 @@ pub(crate) fn handle_post_agent_recast(
     }
     state.broadcast("agents", "recast", event);
     HttpResponse::json(200, response)
+}
+
+/// Stage required guidance before changing the registry. Distinct assignment bindings keep
+/// a previously effective marker intact if this registration fails. No prompt is dispatched.
+pub(crate) fn register_recast<S: AgentRegistry + StateStore>(
+    store: &S,
+    existing: &AgentRecord,
+    args: RegisterAgentArgs,
+) -> Result<(AgentRecord, bool), StoreError> {
+    let changed = existing.project != args.project || existing.role != args.role;
+    let required = if changed {
+        crate::lifecycle::stage_recast_guidance(
+            store,
+            existing,
+            &args.project,
+            &args.role,
+            &args.by,
+        )?;
+        true
+    } else {
+        crate::lifecycle::recast_guidance_required(store, existing)?
+    };
+    let updated = store.register_agent(args)?;
+    Ok((updated, required))
 }
 
 /// The Lead that a recast write retired, read back from the store.
@@ -366,6 +399,39 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn recast_reports_guidance_requires_reforge_only_for_assignment_changes() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        register(&state, "Ada", "ferroloop", AgentRole::Assistant);
+        let (status, unchanged) = owner_recast(
+            &state,
+            "ada",
+            &json!({"project":"ferroloop", "role":"assistant"}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(unchanged["guidance_requires_reforge"], false);
+        let (status, changed) = owner_recast(
+            &state,
+            "ada",
+            &json!({"project":"sonora", "role":"custom:council-chair", "create_area":true}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(changed["guidance_requires_reforge"], true);
+        let store = state.open_store().unwrap();
+        let entries = fl_core::store::StateStore::list_state(
+            &*store,
+            Some(&fl_core::state::StateScope::Workspace),
+            Some(fl_core::state::StateConcern::Runtime),
+        )
+        .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.slug.starts_with("recast-guidance-"))
+        );
     }
 
     #[test]

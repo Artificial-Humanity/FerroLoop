@@ -1712,3 +1712,122 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         STATUS_DECOMMISSIONED
     );
 }
+
+#[test]
+fn recast_remodel_uses_bound_current_registration_over_hosted_assignment() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let runtime = FakeRuntime::default();
+    let mut test_env = env(&home);
+    test_env.runtime = &runtime;
+    spin(&store, &test_env, "ada", "assistant", "claude");
+    let old = store.agent_by_name("ada").unwrap().unwrap();
+    crate::agents::register_recast(
+        &store,
+        &old,
+        RegisterAgentArgs {
+            display_name: old.display_name.clone(),
+            email: Some(old.email.clone()),
+            project: "sonora".into(),
+            role: AgentRole::Custom("council-chair".into()),
+            extra_areas: vec![],
+            create_area: true,
+            replace: true,
+            at: stamp::now(),
+            by: "owner".into(),
+        },
+    )
+    .unwrap();
+    let target = target(&store, "claude:ada");
+    let plan = plan_remodel(
+        &store,
+        &test_env,
+        &target,
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(plan.to.project, "sonora");
+    assert_eq!(
+        agent_role_from_label(&plan.to.role),
+        AgentRole::Custom("council-chair".into())
+    );
+}
+
+#[test]
+fn recast_deleted_catalog_role_is_refused_by_remodel_before_any_writes() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let runtime = FakeRuntime::default();
+    let mut test_env = env(&home);
+    test_env.runtime = &runtime;
+    spin(&store, &test_env, "ada", "custom:council-chair", "claude");
+    fl_core::agent::delete_role(&store, "council-chair").unwrap();
+    let before = store.registry_events_after(0).unwrap();
+    let error = remodel_precheck(
+        &store,
+        &test_env,
+        &target(&store, "claude:ada"),
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), 400);
+    assert_eq!(before, store.registry_events_after(0).unwrap());
+    assert_eq!(
+        find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_RUNNING
+    );
+}
+
+#[test]
+fn recast_metadata_write_failure_leaves_registry_and_previous_binding_unchanged() {
+    let store = FaultyStore::default();
+    register(&store.inner, "ada", AgentRole::Assistant);
+    let original = store.agent_by_name("ada").unwrap().unwrap();
+    let args = |project: &str| RegisterAgentArgs {
+        display_name: original.display_name.clone(),
+        email: Some(original.email.clone()),
+        project: project.into(),
+        role: AgentRole::Assistant,
+        extra_areas: vec![],
+        create_area: true,
+        replace: true,
+        at: stamp::now(),
+        by: "owner".into(),
+    };
+    let (moved, _) = crate::agents::register_recast(&store, &original, args("sonora")).unwrap();
+    let revisions = store.state_revisions_after(0).unwrap().len();
+    // A no-change recast must not write metadata at all.
+    *store.fail_state_write.borrow_mut() = Some((
+        guidance_binding_slug(&guidance_binding(&moved, "sonora", &moved.role)),
+        1,
+    ));
+    let (moved, required) = crate::agents::register_recast(&store, &moved, args("sonora")).unwrap();
+    assert!(required);
+    assert_eq!(store.state_revisions_after(0).unwrap().len(), revisions);
+    let before = store.registry_events_after(0).unwrap();
+    *store.fail_state_write.borrow_mut() = Some((
+        guidance_binding_slug(&guidance_binding(&moved, "other", &moved.role)),
+        1,
+    ));
+    assert!(crate::agents::register_recast(&store, &moved, args("other")).is_err());
+    assert_eq!(store.registry_events_after(0).unwrap(), before);
+    assert_eq!(store.agent_by_name("ada").unwrap().unwrap(), moved);
+    assert!(recast_guidance_required(&store, &moved).unwrap());
+    // A staged marker from a failed registration cannot displace the current marker.
+    let mut failed = args("third");
+    failed.create_area = false;
+    assert!(crate::agents::register_recast(&store, &moved, failed).is_err());
+    assert_eq!(store.agent_by_name("ada").unwrap().unwrap(), moved);
+    assert!(recast_guidance_required(&store, &moved).unwrap());
+    let mut another_id = moved.clone();
+    another_id.id = fl_core::ids::AgentId(fl_core::ids::seq_iri(999));
+    assert!(!recast_guidance_required(&store, &another_id).unwrap());
+    let mut other_assignment = moved.clone();
+    other_assignment.project = "not-staged".into();
+    assert!(!recast_guidance_required(&store, &other_assignment).unwrap());
+}

@@ -466,6 +466,18 @@ export interface AgentRecord {
   by?: string;
 }
 
+export type RoleReviewPolicy = "lead-review" | "lab-manager-review" | "peer-review";
+
+/** Editable guidance metadata; labels and builtin do not grant authority. */
+export interface RoleRecord {
+  slug: string;
+  label: string;
+  description: string;
+  builtin: boolean;
+  review_policy: RoleReviewPolicy;
+  prompt_template: string;
+}
+
 export interface RecastAgentRequest {
   project: string;
   role: string;
@@ -475,6 +487,8 @@ export interface RecastAgentRequest {
 }
 
 export interface RecastAgentResponse {
+  /** Registry guidance remains pending until an explicit Reforge. */
+  guidance_requires_reforge?: boolean;
   agent?: AgentRecord;
   /** The retired Lead's full record. Present only when this call retired a Lead. */
   retired_lead?: AgentRecord;
