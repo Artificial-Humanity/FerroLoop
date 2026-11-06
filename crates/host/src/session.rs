@@ -625,34 +625,215 @@ fn pump_read(file: &mut File, buf: &mut [u8], session: &Session) -> std::io::Res
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
-        loop {
-            if session.io_stop.load(Ordering::SeqCst) {
-                return Ok(0);
-            }
-            let mut available = 0;
-            let ok = unsafe {
-                windows_sys::Win32::System::Pipes::PeekNamedPipe(
-                    file.as_raw_handle() as _,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if available != 0 {
-                let n = buf.len().min(available as usize);
-                return file.read(&mut buf[..n]);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let raw = file.as_raw_handle();
+        let started = Instant::now();
+        poll_windows_pipe(
+            WINDOWS_PIPE_REFILL_BUDGET,
+            || session.io_stop.load(Ordering::SeqCst),
+            || {
+                let mut available = 0;
+                let ok = unsafe {
+                    windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                        raw as _,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(available as usize)
+                }
+            },
+            |available| {
+                let n = buf.len().min(available);
+                file.read(&mut buf[..n])
+            },
+            || started.elapsed(),
+            |pause| match pause {
+                PipePause::Refill => std::thread::yield_now(),
+                PipePause::Idle => std::thread::sleep(Duration::from_millis(50)),
+            },
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = session;
         file.read(buf)
+    }
+}
+
+// Anonymous Windows pipes have no readiness wait. Give an active writer one
+// short scheduling window to refill before backing off. Empty peeks and idle
+// waits never renew that budget; only a successful read starts a new call.
+#[cfg(any(windows, test))]
+const WINDOWS_PIPE_REFILL_BUDGET: Duration = Duration::from_millis(2);
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipePause {
+    Refill,
+    Idle,
+}
+
+#[cfg(any(windows, test))]
+fn poll_windows_pipe(
+    refill_budget: Duration,
+    mut stopped: impl FnMut() -> bool,
+    mut peek: impl FnMut() -> std::io::Result<usize>,
+    mut read: impl FnMut(usize) -> std::io::Result<usize>,
+    mut now: impl FnMut() -> Duration,
+    mut pause: impl FnMut(PipePause),
+) -> std::io::Result<usize> {
+    let refill_until = now().saturating_add(refill_budget);
+    loop {
+        if stopped() {
+            return Ok(0);
+        }
+        let available = peek()?;
+        if available != 0 {
+            if stopped() {
+                return Ok(0);
+            }
+            return read(available);
+        }
+        pause(if now() < refill_until {
+            PipePause::Refill
+        } else {
+            PipePause::Idle
+        });
+    }
+}
+
+#[cfg(test)]
+mod pipe_poll_tests {
+    use super::{PipePause, WINDOWS_PIPE_REFILL_BUDGET, poll_windows_pipe};
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    fn sequential_refill_elapsed(budget: Duration) -> Duration {
+        let clock = Cell::new(Duration::ZERO);
+        let next_ready = Cell::new(Duration::from_micros(100));
+        let reads = Cell::new(0);
+        for _ in 0..1024 {
+            let n = poll_windows_pipe(
+                budget,
+                || false,
+                || {
+                    Ok(if clock.get() >= next_ready.get() {
+                        4096
+                    } else {
+                        0
+                    })
+                },
+                |available| {
+                    assert_eq!(available, 4096);
+                    reads.set(reads.get() + 1);
+                    next_ready.set(clock.get() + Duration::from_micros(100));
+                    Ok(available)
+                },
+                || clock.get(),
+                |pause| {
+                    clock.set(
+                        clock.get()
+                            + match pause {
+                                PipePause::Refill => Duration::from_micros(100),
+                                PipePause::Idle => Duration::from_millis(50),
+                            },
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(n, 4096);
+        }
+        assert_eq!(reads.get() * 4096, 4 * 1024 * 1024);
+        clock.get()
+    }
+
+    #[test]
+    fn active_refills_drain_four_mib_without_an_idle_sleep_per_chunk() {
+        // With the old zero-active-window policy, this same driver pays 50 ms
+        // for each refill even though the writer is ready after 100 us.
+        assert!(sequential_refill_elapsed(Duration::ZERO) > Duration::from_secs(2));
+        assert!(sequential_refill_elapsed(WINDOWS_PIPE_REFILL_BUDGET) < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn exhausted_refill_window_stays_idle_and_cancellation_precedes_peek() {
+        let clock = Cell::new(Duration::ZERO);
+        let stopped = Cell::new(false);
+        let peeks = Cell::new(0);
+        let refills = Cell::new(0);
+        let idles = Cell::new(0);
+        assert_eq!(
+            poll_windows_pipe(
+                Duration::from_millis(2),
+                || stopped.get(),
+                || {
+                    peeks.set(peeks.get() + 1);
+                    Ok(0)
+                },
+                |_| panic!("empty pipe must not read"),
+                || clock.get(),
+                |pause| match pause {
+                    PipePause::Refill => {
+                        assert_eq!(idles.get(), 0, "idle sleep must not renew refill window");
+                        refills.set(refills.get() + 1);
+                        clock.set(clock.get() + Duration::from_millis(1));
+                    }
+                    PipePause::Idle => {
+                        idles.set(idles.get() + 1);
+                        clock.set(clock.get() + Duration::from_millis(50));
+                        if idles.get() == 2 {
+                            stopped.set(true);
+                        }
+                    }
+                },
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(refills.get(), 2);
+        assert_eq!(idles.get(), 2);
+        assert_eq!(peeks.get(), 4, "cancellation must precede the next peek");
+        assert_eq!(clock.get(), Duration::from_millis(102));
+    }
+
+    #[test]
+    fn cancellation_after_peek_prevents_read_and_errors_remain_errors() {
+        let stopped = Cell::new(false);
+        assert_eq!(
+            poll_windows_pipe(
+                Duration::from_millis(2),
+                || stopped.get(),
+                || {
+                    stopped.set(true);
+                    Ok(4096)
+                },
+                |_| panic!("cancelled pipe must not read"),
+                || Duration::ZERO,
+                |_| panic!("available pipe must not wait"),
+            )
+            .unwrap(),
+            0
+        );
+        let err = poll_windows_pipe(
+            Duration::from_millis(2),
+            || false,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            },
+            |_| panic!("failed peek must not read"),
+            || Duration::ZERO,
+            |_| panic!("failed peek must not wait"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

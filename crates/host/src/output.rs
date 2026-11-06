@@ -907,6 +907,9 @@ impl Subscriber {
         mut closed: impl FnMut() -> bool + Send,
     ) {
         let hold = hold_dir();
+        if let Some(dir) = hold.as_ref() {
+            let _ = std::fs::write(dir.join(format!("subscribed-{}", self.id)), b"1");
+        }
         let mut sent_any = false;
         loop {
             let next = self.next_event(&hub);
@@ -935,6 +938,14 @@ impl Subscriber {
                     "before-exited"
                 } else {
                     "before-send"
+                };
+                // A targeted test barrier holds only this subscriber, so a healthy
+                // peer can keep draining independently of kernel pipe capacity.
+                let targeted = format!("{phase}-{}", self.id);
+                let phase = if dir.join(format!("arm-{targeted}")).exists() {
+                    targeted.as_str()
+                } else {
+                    phase
                 };
                 if !wait_hold(dir, phase, || {
                     self.dropped(&hub) || self.want_slow(&hub) || closed()

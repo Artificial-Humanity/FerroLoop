@@ -63,6 +63,35 @@ fn main() {
             park();
         }
         "record" => record(rest.first().map(String::as_str)),
+        "record-survive-eof" => {
+            record(rest.first().map(String::as_str));
+            std::fs::write(rest.get(1).expect("EOF marker"), b"eof").expect("EOF marker");
+            park();
+        }
+        "gated-lines" => {
+            ready();
+            for (index, marker) in rest.iter().take(2).enumerate() {
+                while !std::path::Path::new(marker).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if index == 0 {
+                    println!("HOLD");
+                    io::stdout().flush().expect("hold flush");
+                }
+            }
+            let mut out = io::stdout();
+            let batches = std::path::Path::new(rest.get(2).expect("batch gates"));
+            for batch in 0..20 {
+                while !batches.join(batch.to_string()).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                for index in batch * 10..(batch + 1) * 10 {
+                    writeln!(out, "L{index}").expect("line");
+                }
+                out.flush().expect("batch flush");
+            }
+            park();
+        }
         "lines" => lines(
             rest.first().and_then(|text| text.parse().ok()).unwrap_or(1),
             rest.get(1).map(String::as_str),

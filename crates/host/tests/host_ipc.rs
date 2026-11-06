@@ -1029,87 +1029,79 @@ fn status_field(text: &str, key: &str) -> usize {
 #[test]
 fn slow_subscriber_dropped_not_blocking() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let endpoint = daemon.paths.endpoint.clone();
-    let healthy = EventLog::subscribe(&endpoint, Some("out"));
-    let slow_stop = Arc::new(AtomicBool::new(false));
-    let slow_events = Arc::new(Mutex::new(Vec::new()));
-    let stop = Arc::clone(&slow_stop);
-    let sink = Arc::clone(&slow_events);
-    let endpoint2 = endpoint.clone();
-    let slow = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut stream = None;
-        let connect_deadline = Instant::now() + Duration::from_secs(3);
-        let mut last = String::new();
-        while stream.is_none() && Instant::now() < connect_deadline {
-            match runtime.block_on(fl_host_proto::events(&endpoint2, Some(sid("out")))) {
-                Ok(events) => stream = Some(events),
-                Err(err) => {
-                    last = err.to_string();
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-        let mut stream = stream.unwrap_or_else(|| panic!("slow subscribe: {last}"));
-        while !stop.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(20));
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match runtime.block_on(async {
-                tokio::time::timeout(Duration::from_millis(100), stream.next()).await
-            }) {
-                Ok(Ok(event)) => sink.lock().expect("slow").push(event),
-                Ok(Err(_)) => break,
-                Err(_) => break,
-            }
-        }
+    let endpoint = &daemon.paths.endpoint;
+    // The first subscriber's handshake and READY delivery establish its identity
+    // and sent_any state before its next server write is deliberately held.
+    let slow = EventLog::subscribe(endpoint, Some("out"));
+    let mut rpc = Rpc::connect(endpoint);
+    let first_gate = daemon.paths.barrier.join("first-line");
+    let flood_gate = daemon.paths.barrier.join("flood-lines");
+    let batches = daemon.paths.barrier.join("line-batches");
+    std::fs::create_dir(&batches).unwrap();
+    rpc.spawn(
+        "out",
+        &[
+            "gated-lines",
+            first_gate.to_str().unwrap(),
+            flood_gate.to_str().unwrap(),
+            batches.to_str().unwrap(),
+        ],
+    );
+    slow.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "out")
+            .iter()
+            .any(|line| line == b"READY")
     });
-    thread::sleep(Duration::from_millis(100));
-    let mut rpc = Rpc::connect(&endpoint);
-    let started = Instant::now();
-    rpc.spawn("out", &["lines", "200"]);
+    let healthy = EventLog::subscribe(endpoint, Some("out"));
+    wait_file(&daemon.paths.subscriber.join("subscribed-2"), |bytes| {
+        bytes == b"1"
+    });
+    arm(&daemon.paths.subscriber, "before-send-1");
+    std::fs::write(first_gate, b"go").unwrap();
+    wait_at(&daemon.paths.subscriber, "before-send-1");
     healthy.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "out").iter().any(|line| line == b"HOLD")
+    });
+    let started = Instant::now();
+    std::fs::write(flood_gate, b"go").unwrap();
+    // Bound the healthy peer's pending batch below its queue cap. Its observed
+    // progress admits the next batch, while the held peer accumulates all of them.
+    for batch in 0..20 {
+        std::fs::write(batches.join(batch.to_string()), b"go").unwrap();
+        let last = format!("L{}", (batch + 1) * 10 - 1).into_bytes();
+        healthy.wait_until(Duration::from_secs(3), |events| {
+            line_bytes(events, "out").iter().any(|line| line == &last)
+        });
+    }
+    let events = healthy.wait_until(Duration::from_secs(3), |events| {
         line_bytes(events, "out")
             .iter()
             .filter(|line| line.starts_with(b"L"))
             .count()
-            >= 200
+            == 200
     });
     assert!(started.elapsed() < Duration::from_secs(3));
-    let lines = line_bytes(&healthy.snapshot(), "out");
-    let data: Vec<_> = lines
-        .iter()
+    let data: Vec<_> = line_bytes(&events, "out")
+        .into_iter()
         .filter(|line| line.starts_with(b"L"))
-        .cloned()
         .collect();
-    assert_eq!(data.len(), 200);
     for (index, line) in data.iter().enumerate() {
         assert_eq!(line, &format!("L{index}").into_bytes());
     }
-    slow_stop.store(true, Ordering::SeqCst);
-    slow.join().expect("slow");
-    let slow_lines = line_bytes(&slow_events.lock().expect("slow").clone(), "out");
-    let slow_count = slow_lines
-        .iter()
-        .filter(|line| line.starts_with(b"L"))
-        .count();
-    assert!(
-        slow_count < 200,
-        "slow subscriber was not dropped: {slow_count}"
-    );
-    let saw_slow = slow_events.lock().expect("slow").iter().any(|event| {
-        matches!(
-            event,
-            HostEvent::Control(ControlEvent::SlowSubscriber { .. })
-        )
+    let events = slow.wait_until(Duration::from_secs(3), |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                HostEvent::Control(ControlEvent::SlowSubscriber { .. })
+            )
+        })
     });
     assert!(
-        saw_slow,
-        "missing SlowSubscriber after the slow subscriber was dropped; lines {slow_count}"
+        line_bytes(&events, "out")
+            .iter()
+            .filter(|line| line.starts_with(b"L"))
+            .count()
+            < 200
     );
 }
 
@@ -1262,9 +1254,14 @@ fn fenced_session_allows_epoch_guarded_signal_and_kill() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(4) });
     arm(&daemon.paths.barrier, "after-chunk");
     let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let eof = daemon.paths.barrier.join("record-eof");
     let child = owner.spawn(
         "fence",
-        &["record", daemon.paths.transcript.to_str().unwrap()],
+        &[
+            "record-survive-eof",
+            daemon.paths.transcript.to_str().unwrap(),
+            eof.to_str().unwrap(),
+        ],
     );
     let epoch = epoch_of(&child);
     let lease = owner.claim("fence", epoch).expect("lease");
@@ -1273,6 +1270,11 @@ fn fenced_session_allows_epoch_guarded_signal_and_kill() {
     let mut next = Rpc::connect(&daemon.paths.endpoint);
     let renewed = next.claim("fence", epoch).expect("lease");
     let _ = send.join();
+    wait_file(&eof, |bytes| bytes == b"eof");
+    assert_eq!(
+        record(&find(&next.list(), "fence").state).input,
+        InputState::Fenced
+    );
     next.signal("fence", epoch, renewed, SignalKind::Terminate)
         .expect("signal");
     next.kill("fence", epoch, Some(renewed)).expect("kill");
