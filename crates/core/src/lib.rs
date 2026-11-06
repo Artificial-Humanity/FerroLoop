@@ -55,6 +55,7 @@ pub mod token_count;
 pub mod ui_bundle;
 pub mod vendor;
 pub mod verdict;
+pub mod wire_delivery;
 pub mod workflow;
 pub mod workspace;
 
