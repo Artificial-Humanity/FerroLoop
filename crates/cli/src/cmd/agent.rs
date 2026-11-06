@@ -689,6 +689,9 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                     out.unregistered,
                     out.runtime_stopped
                 );
+                if let Some(restore) = &out.restore_source {
+                    println!("restore_source={}", serde_json::to_string(restore).unwrap());
+                }
                 if let (false, Some(prompt)) = (out.handshake_dispatched, &out.prompt) {
                     println!(
                         "no live route took the handshake; send this prompt to the session:\n{prompt}"

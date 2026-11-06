@@ -1346,6 +1346,10 @@ pub(crate) fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapsho
 
 fn handle_get_sessions(state: &HubState) -> HttpResponse {
     drain_ready_session_queues(state);
+    // A store error here must not hide the session list.
+    if let Ok(store) = state.open_store() {
+        let _ = lifecycle::reconcile_dead_hosted_sessions(&*store, &lifecycle_env(state), "hub");
+    }
     let Ok(snap) = state.cached_discovery_snapshot() else {
         return store_open_failure();
     };
@@ -5236,8 +5240,12 @@ pub(crate) fn route_matches_session_id(
                 && (session_id == trimmed
                     || trimmed.strip_prefix("muse-") == Some(session_id.as_str()))
         }
+        // A Grok route made from a live tmux window has an empty id until its first transcript;
+        // it matches no session id, not even an empty one.
         fl_wire::identity::VendorRoute::Grok { session_id, .. } => {
-            session_id == trimmed || trimmed.strip_prefix("grok-") == Some(session_id.as_str())
+            !session_id.is_empty()
+                && (session_id == trimmed
+                    || trimmed.strip_prefix("grok-") == Some(session_id.as_str()))
         }
         fl_wire::identity::VendorRoute::Webhook { .. } => false,
     }

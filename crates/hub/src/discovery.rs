@@ -46,7 +46,7 @@ use fl_core::arch::{
 use fl_core::store::{AgentRegistry, Catalog, Ledger};
 use fl_exec::stamp;
 use fl_store::AnyStore;
-use fl_wire::identity::{RouteTable, VendorRoute};
+use fl_wire::identity::{RouteTable, VendorRoute, is_native_session_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -231,6 +231,9 @@ pub struct SessionQuotaUsage {
 pub struct DiscoveryStoreSnapshot {
     registered_names: BTreeSet<String>,
     attempts: Vec<DiscoveryAttemptRow>,
+    /// Hosted `vendor:persona` ids and native vendor ids of records whose status is
+    /// `decommissioned`. Discovery skips a route that still names one of them.
+    decommissioned_session_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -645,7 +648,22 @@ pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     DiscoveryStoreSnapshot {
         registered_names,
         attempts,
+        decommissioned_session_ids: decommissioned_session_ids(store),
     }
+}
+
+/// Native ids of hosted records that are still decommissioned.
+/// Persona-derived ids stored on an old record are left out, so a stale
+/// `vendor:persona` tombstone does not keep banning the name.
+fn decommissioned_session_ids(store: &AnyStore) -> BTreeSet<String> {
+    let Ok(records) = crate::lifecycle::list_hosted_sessions(store) else {
+        return BTreeSet::new();
+    };
+    let mut ids = BTreeSet::new();
+    for record in records {
+        ids.extend(crate::lifecycle::record_native_ids(&record));
+    }
+    ids
 }
 
 /// The route ordering needs agent names, but not attempt history.
@@ -658,6 +676,7 @@ pub(crate) fn snapshot_discovery_names(store: &AnyStore) -> DiscoveryStoreSnapsh
             .map(|agent| agent.name_key.to_ascii_lowercase())
             .collect(),
         attempts: Vec::new(),
+        decommissioned_session_ids: decommissioned_session_ids(store),
     }
 }
 
@@ -752,6 +771,19 @@ fn discover_sessions_impl(
     )
 }
 
+/// `true` when `route`'s native session id is in `banned`.
+/// An empty id matches nothing. A webhook route is not a vendor session.
+/// A hosted `vendor:persona` id or other persona-derived id does not match.
+fn route_was_decommissioned(banned: &BTreeSet<String>, route: &VendorRoute) -> bool {
+    if banned.is_empty() {
+        return false;
+    }
+    matches!(
+        route.session_identity(),
+        Some((_, id)) if is_native_session_id(id) && banned.contains(id)
+    )
+}
+
 /// The canonical ID used both for fast resolution and complete discovery.
 fn route_session_id(persona: &str, route: &VendorRoute) -> String {
     match route {
@@ -760,9 +792,13 @@ fn route_session_id(persona: &str, route: &VendorRoute) -> String {
         } if session_id.trim().is_empty() => {
             format!("claude-{persona}-{pid}")
         }
-        VendorRoute::Claude { session_id, .. } | VendorRoute::Grok { session_id, .. } => {
-            session_id.clone()
+        VendorRoute::Claude { session_id, .. } => session_id.clone(),
+        // A live Grok window has no transcript yet, so its route stores an empty id. An empty
+        // id would collapse every such window onto one `seen_ids` entry.
+        VendorRoute::Grok { session_id, .. } if session_id.is_empty() => {
+            format!("grok-{persona}")
         }
+        VendorRoute::Grok { session_id, .. } => session_id.clone(),
         VendorRoute::Agy {
             conversation_id, ..
         } => conversation_id.clone(),
@@ -835,6 +871,9 @@ fn discover_sessions_from_routes(
             continue;
         }
         let raw_id = route_session_id(persona, &entry.route);
+        if route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route) {
+            continue;
+        }
         let (adapter, cwd, transcript_path) = match &entry.route {
             VendorRoute::Claude { .. } => {
                 let tpath = home
@@ -898,8 +937,10 @@ fn discover_sessions_from_routes(
             VendorRoute::Grok {
                 session_id, cwd, ..
             } => {
+                // An empty id is the live-window placeholder, not a transcript name.
                 let tpath = home
                     .as_deref()
+                    .filter(|_| !session_id.is_empty())
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
                 ("grok", cwd.as_ref().map(|p| p.display().to_string()), tpath)
             }
@@ -8824,6 +8865,149 @@ mod tests {
     }
 
     #[test]
+    fn a_decommissioned_route_is_skipped_even_when_the_route_file_still_has_it() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        routes.upsert(
+            "cara",
+            VendorRoute::Agy {
+                conversation_id: "conv-2".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        routes.upsert(
+            "bea",
+            VendorRoute::Webhook {
+                socket_path: home.join("bea.sock"),
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::from([
+                "conv-1".to_string(),
+                "antigravity:ada".to_string(),
+            ]),
+        };
+        let sessions = discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(
+            sessions.iter().all(|session| session.id != "conv-1"),
+            "{sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|session| session.id == "conv-2"),
+            "antigravity:ada alone must not skip a different conversation: {sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|session| session.adapter == "webhook"),
+            "{sessions:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_grok_route_resolves_from_its_discovered_id() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Grok {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("Ada:grok".into()),
+                tmux_pane: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::from(["grok:ada".to_string()]),
+        };
+        let sessions = discover_route_sessions_without_model_info(&snap, Some(home));
+        let grok = sessions
+            .iter()
+            .find(|session| session.persona.as_deref() == Some("ada"))
+            .unwrap_or_else(|| panic!("missing ada: {sessions:?}"));
+        assert_eq!(grok.id, "grok-ada");
+        let (id, persona) = crate::api::resolve_session_target_in(&sessions, "grok-ada");
+        assert_eq!(id, "grok-ada");
+        assert_eq!(persona.as_deref(), Some("ada"));
+        let route = VendorRoute::Grok {
+            session_id: String::new(),
+            cwd: None,
+            tmux_target: Some("Ada:grok".into()),
+            tmux_pane: None,
+        };
+        assert!(!crate::api::route_matches_session_id(&route, "grok-ada"));
+        assert!(!crate::api::route_matches_session_id(&route, ""));
+    }
+
+    #[test]
+    fn two_live_grok_placeholders_with_empty_ids_are_both_discovered() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        for (persona, target) in [("felicia", "Felicia:grok"), ("ada", "Ada:grok")] {
+            routes.upsert(
+                persona,
+                VendorRoute::Grok {
+                    session_id: String::new(),
+                    cwd: None,
+                    tmux_target: Some(target.into()),
+                    tmux_pane: None,
+                },
+                fl_core::at::At::from_unix_millis(1),
+            );
+        }
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::new(),
+        };
+        let (sessions, costs) = cost_counters::measure(|| {
+            discover_route_sessions_without_model_info(&snap, Some(home))
+        });
+        let grok: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.adapter == "grok")
+            .collect();
+        assert_eq!(grok.len(), 2, "{sessions:?}");
+        for (persona, id) in [("felicia", "grok-felicia"), ("ada", "grok-ada")] {
+            let session = grok
+                .iter()
+                .find(|session| session.persona.as_deref() == Some(persona))
+                .unwrap_or_else(|| panic!("missing {persona}: {sessions:?}"));
+            assert_eq!(session.id, id);
+            assert_eq!(session.transcript_path, None);
+        }
+        assert_eq!(costs.transcript_finds, 0, "an empty id is not a transcript");
+    }
+
+    #[test]
     fn muse_default_model_is_flagged_and_a_metadata_model_is_not() {
         let other = muse_line(
             "runtime.session",
@@ -8996,6 +9180,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            decommissioned_session_ids: BTreeSet::new(),
             attempts: vec![DiscoveryAttemptRow {
                 id: "attempt-1".into(),
                 adapter: "claude".into(),

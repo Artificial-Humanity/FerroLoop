@@ -7,6 +7,7 @@
 //! concerns (the in-memory operator prompt queue) reach this module through caller closures or the
 //! returned `handshake_dispatched` flag.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,7 +21,9 @@ use fl_core::store::{AgentRegistry, Catalog, StateStore, StoreError};
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
 use fl_exec::stamp;
 use fl_wire::dispatcher::{PushError, push_operator_prompt_to_route};
-use fl_wire::identity::{RouteTable, VendorRoute, default_routes_path, legacy_routes_path};
+use fl_wire::identity::{
+    RouteTable, VendorRoute, default_routes_path, is_native_session_id, legacy_routes_path,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
@@ -82,6 +85,9 @@ const MAX_FIELD_LEN: usize = 128;
 pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_DECOMMISSIONING: &str = "decommissioning";
 pub const STATUS_DECOMMISSIONED: &str = "decommissioned";
+/// The tmux window was confirmed gone twice, with no route of this vendor.
+/// Not decommissioned: the agent stays, and nothing is tombstoned or killed.
+pub const STATUS_STOPPED: &str = "stopped";
 
 /// Failure of a lifecycle operation, with the HTTP status the hub reports for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +295,17 @@ fn check_api_key(env: &LifecycleEnv<'_>, vendor: &str) -> Result<(), LifecycleEr
     )))
 }
 
+/// Whether a tmux window is still the vendor's process.
+///
+/// [`RuntimePresence::Unknown`] means tmux failed to run, timed out, or did not
+/// answer. That is not death: `exists() == false` is not [`RuntimePresence::Gone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePresence {
+    Alive,
+    Gone,
+    Unknown,
+}
+
 /// The runtime calls a lifecycle makes on a session's `tmux` runtime. Only
 /// [`LifecycleEnv::runtime`] makes them, and only when `spawn_runtime` is on.
 ///
@@ -320,8 +337,31 @@ pub trait SessionRuntime: std::fmt::Debug {
     /// name without it (or with another) is not ours, is left alone, and counts as "nothing of
     /// ours to kill" (`true`). A session unit is killed whole, `hosted_id` unused.
     fn kill(&self, unit: &str, hosted_id: &str) -> bool;
+    /// Stop `unit` for an owner teardown of a session this lifecycle did not spawn.
+    /// A bare session is stopped as [`Self::kill`]. A Muse window is stopped when exactly
+    /// one window has that name, even without [`HOSTED_MARK`]. A non-Muse `session:window`
+    /// stops that window, or the whole session when the window is its only one; a missing
+    /// window is already stopped, and no answer from tmux is not. Two Muse windows of the
+    /// name answer `false`. The default is [`Self::kill`], which still requires the mark.
+    fn kill_owner(&self, unit: &str, hosted_id: &str) -> bool {
+        self.kill(unit, hosted_id)
+    }
+    /// Recent pane text, or empty when the runtime has none. Used to notice Grok's
+    /// directory-trust prompt after a spawn.
+    fn capture(&self, _unit: &str) -> String {
+        String::new()
+    }
+    /// Send `keys` to `unit` (for example `y` at Grok's trust prompt).
+    fn send_keys(&self, _unit: &str, _keys: &str) -> bool {
+        false
+    }
     /// `true` when a runtime unit of this name runs, whoever started it.
     fn exists(&self, unit: &str) -> bool;
+    /// Liveness of `unit` for dead-session reconcile. The default is
+    /// [`RuntimePresence::Unknown`], which must not be read as gone.
+    fn presence(&self, _unit: &str) -> RuntimePresence {
+        RuntimePresence::Unknown
+    }
     /// `true` when `unit` runs and is the one `hosted_id` started: for a window unit, a window of
     /// that name carrying the mark `hosted_id`; for a session unit, as [`Self::exists`].
     fn owns(&self, unit: &str, hosted_id: &str) -> bool;
@@ -547,7 +587,7 @@ fn launch_spec_for(
         let (variable, bin, flags): (&str, &str, &[&str]) = match vendor {
             "codex" => ("FL_WIRE_CODEX_BIN", "codex", &["--yolo"]),
             "claude" => ("FL_WIRE_CLAUDE_BIN", "claude", &["--enable-auto-mode"]),
-            "grok" => ("FL_WIRE_GROK_BIN", "grok", &["--yolo"]),
+            "grok" => ("FL_WIRE_GROK_BIN", "grok", &["--yolo", "--always-approve"]),
             "antigravity" => ("FL_WIRE_AGY_BIN", "agy", &["--mode", "auto"]),
             _ => return None,
         };
@@ -668,8 +708,24 @@ impl SessionRuntime for TmuxRuntime {
         kill_tmux_runtime(unit, hosted_id)
     }
 
+    fn kill_owner(&self, unit: &str, hosted_id: &str) -> bool {
+        kill_tmux_runtime_owner(unit, hosted_id)
+    }
+
+    fn capture(&self, unit: &str) -> String {
+        capture_tmux_pane(unit)
+    }
+
+    fn send_keys(&self, unit: &str, keys: &str) -> bool {
+        send_tmux_keys(unit, keys)
+    }
+
     fn exists(&self, unit: &str) -> bool {
         tmux_unit_exists(unit)
+    }
+
+    fn presence(&self, unit: &str) -> RuntimePresence {
+        tmux_runtime_presence(unit)
     }
 
     fn owns(&self, unit: &str, hosted_id: &str) -> bool {
@@ -691,6 +747,11 @@ pub(crate) struct FakeRuntime {
     pub(crate) live: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// The windows of the shared Muse session, as `muse:<window>`.
     pub(crate) windows: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Windows of other sessions, as `Session:window`. Empty means a kill of
+    /// `Session:vendor` treats that window as the session's only window.
+    pub(crate) session_windows: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Scripted [`SessionRuntime::presence`] answers. A missing unit is [`RuntimePresence::Alive`].
+    pub(crate) presence_of: std::cell::RefCell<BTreeMap<String, RuntimePresence>>,
     /// The [`HOSTED_MARK`] of each window of the shared session that has one, by `muse:<window>`.
     /// A window opened by anyone but a spawn has none. Whatever removes a window removes its
     /// mark ([`Self::close_window`]).
@@ -705,6 +766,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) exists_calls: std::cell::Cell<u32>,
     /// How many times `owns` was asked (the survival check of a launched command).
     pub(crate) owns_calls: std::cell::Cell<u32>,
+    /// Pane text [`SessionRuntime::capture`] returns, by runtime unit or tmux target.
+    pub(crate) panes: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -759,6 +822,51 @@ impl FakeRuntime {
         self.windows.borrow_mut().remove(unit);
         self.marks.borrow_mut().remove(unit);
         self.sync_muse_session();
+    }
+
+    /// Register `windows` (`session`, `window`) in one non-Muse session. The session stays
+    /// live while any of them remains.
+    pub(crate) fn add_session_windows(&self, windows: &[(&str, &str)]) {
+        for (session, window) in windows {
+            self.live.borrow_mut().insert((*session).to_string());
+            self.session_windows
+                .borrow_mut()
+                .insert(format!("{session}:{window}"));
+        }
+    }
+
+    pub(crate) fn has_session_window(&self, unit: &str) -> bool {
+        self.session_windows.borrow().contains(unit)
+    }
+
+    /// Stop one non-Muse window. No registered windows means that window is the
+    /// session's only one, so the session stops with it.
+    fn kill_recorded_window(&self, session: &str, window: &str) -> bool {
+        let key = format!("{session}:{window}");
+        let mut windows = self.session_windows.borrow_mut();
+        let in_session: Vec<String> = windows
+            .iter()
+            .filter(|unit| {
+                unit.split_once(':')
+                    .is_some_and(|(name, _)| name == session)
+            })
+            .cloned()
+            .collect();
+        if in_session.is_empty() {
+            drop(windows);
+            self.live.borrow_mut().remove(session);
+            return true;
+        }
+        if !in_session.iter().any(|unit| unit == &key) {
+            return true;
+        }
+        windows.remove(&key);
+        let only = in_session.len() == 1;
+        drop(windows);
+        if only {
+            self.live.borrow_mut().remove(session);
+        }
+        true
     }
 
     /// Someone else (`muse-sessions`, a person) opens a window of the shared session: no mark.
@@ -880,9 +988,48 @@ impl SessionRuntime for FakeRuntime {
         true
     }
 
+    fn kill_owner(&self, unit: &str, _hosted_id: &str) -> bool {
+        self.calls.borrow_mut().push(format!("kill-owner {unit}"));
+        if !is_killable_unit(unit) {
+            return false;
+        }
+        if is_muse_window_target(unit) {
+            // One window of the name, mark or not. A second window of the same name
+            // cannot be represented here; the tmux path refuses that case.
+            if self.windows.borrow().contains(unit) {
+                self.close_window(unit);
+            }
+            true
+        } else if let Some((session, window)) = unit.split_once(':') {
+            self.kill_recorded_window(session, window)
+        } else {
+            self.live.borrow_mut().remove(unit);
+            true
+        }
+    }
+
+    fn capture(&self, unit: &str) -> String {
+        self.panes.borrow().get(unit).cloned().unwrap_or_default()
+    }
+
+    fn send_keys(&self, unit: &str, keys: &str) -> bool {
+        self.calls
+            .borrow_mut()
+            .push(format!("send-keys {unit} {keys}"));
+        true
+    }
+
     fn exists(&self, unit: &str) -> bool {
         self.exists_calls.set(self.exists_calls.get() + 1);
         self.is_live(unit)
+    }
+
+    fn presence(&self, unit: &str) -> RuntimePresence {
+        self.presence_of
+            .borrow()
+            .get(unit)
+            .copied()
+            .unwrap_or(RuntimePresence::Alive)
     }
 
     fn owns(&self, unit: &str, hosted_id: &str) -> bool {
@@ -1224,7 +1371,8 @@ pub struct HostedSessionRecord {
     pub model: Option<String>,
     pub node_id: String,
     pub hosted: bool,
-    /// `running`, `decommissioning`, or `decommissioned`.
+    /// `running`, `decommissioning`, `decommissioned`, or `stopped`.
+    /// `stopped` means the tmux window was confirmed gone; the agent stays.
     pub status: String,
     pub restart_policy: String,
     pub restart_count: u32,
@@ -1235,9 +1383,17 @@ pub struct HostedSessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     pub hydration_dispatched: bool,
-    /// Whether this lifecycle created the tmux session; only then does teardown kill it.
+    /// Whether this lifecycle created the tmux session. Teardown of a runtime it created
+    /// uses [`SessionRuntime::kill`]. An owner teardown of one it did not create still
+    /// stops the persona's tmux unit ([`SessionRuntime::kill_owner`]).
     #[serde(default)]
     pub runtime_spawned: bool,
+    /// Native vendor session ids recorded when the session is decommissioned.
+    /// Discovery skips a route that still names one of them. A hosted
+    /// `vendor:persona` id and other persona-derived ids are not recorded.
+    /// Empty on a running record, including one that replaced a decommissioned record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstone_ids: Vec<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
@@ -1548,10 +1704,15 @@ fn command_succeeds_within(cmd: &mut Command, timeout: Duration) -> bool {
 }
 
 /// The stdout of a `tmux` call that exits 0 within [`TMUX_TIMEOUT`]; `None` otherwise.
-fn tmux_stdout(args: &[&str]) -> Option<String> {
+pub(crate) fn tmux_stdout(args: &[&str]) -> Option<String> {
+    tmux_stdout_of(&tmux_bin(), args)
+}
+
+/// [`tmux_stdout`] on the tmux binary `bin`.
+pub(crate) fn tmux_stdout_of(bin: &Path, args: &[&str]) -> Option<String> {
     use std::io::Read;
 
-    let mut child = Command::new(tmux_bin())
+    let mut child = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1768,6 +1929,115 @@ fn kill_tmux_runtime(unit: &str, hosted_id: &str) -> bool {
     }
 }
 
+/// As [`kill_tmux_runtime`], except a Muse window is stopped when exactly one window has
+/// that name, whether or not it carries `hosted_id`. Two windows of the name are left
+/// alone (`false`). A non-Muse `session:window` stops that window when the session has
+/// another window, or the session when the window is its only one. No answer from tmux
+/// is `false` (the session is not claimed gone). A missing window is `true` and does
+/// not kill the session. A bare session is killed whole, as [`kill_tmux_runtime`].
+fn kill_tmux_runtime_owner(unit: &str, hosted_id: &str) -> bool {
+    if !is_killable_unit(unit) {
+        return false;
+    }
+    if is_muse_window_target(unit) {
+        let Some((session, window)) = unit.split_once(':') else {
+            return false;
+        };
+        let Some(windows) = marked_windows(session) else {
+            return false;
+        };
+        let named: Vec<&TmuxWindow> = windows.iter().filter(|w| w.name == window).collect();
+        return match named.as_slice() {
+            [] => true,
+            [one] if is_window_id(&one.id) => {
+                tmux_ok(&["kill-window", "-t", &one.id])
+                    || marked_windows(session)
+                        .is_some_and(|after| after.iter().all(|w| w.id != one.id))
+            }
+            _ => false,
+        };
+    }
+    let Some((session, window)) = unit.split_once(':') else {
+        return kill_tmux_runtime(unit, hosted_id);
+    };
+    kill_non_muse_window_owner(session, window)
+}
+
+/// Stop `session:window` without taking another vendor's window with it.
+fn kill_non_muse_window_owner(session: &str, window: &str) -> bool {
+    let Some(windows) = list_windows_all() else {
+        return false;
+    };
+    let in_session: Vec<_> = windows.iter().filter(|(name, _)| name == session).collect();
+    if !in_session.iter().any(|(_, name)| name == window) {
+        return true;
+    }
+    if in_session.len() > 1 {
+        let exact = fl_wire::dispatcher::tmux_exact_target(&format!("{session}:{window}"));
+        return tmux_ok(&["kill-window", "-t", &exact]);
+    }
+    let target = format!("={session}");
+    if tmux_ok(&["kill-session", "-t", &target]) {
+        return true;
+    }
+    // A failed kill is not proof the session is gone. Only a later successful list is.
+    match list_windows_all() {
+        Some(after) => !after.iter().any(|(name, _)| name == session),
+        None => false,
+    }
+}
+
+fn capture_tmux_pane(target: &str) -> String {
+    let exact = fl_wire::dispatcher::tmux_exact_target(target);
+    tmux_stdout(&["capture-pane", "-p", "-t", &exact, "-S", "-40"]).unwrap_or_default()
+}
+
+fn send_tmux_keys(target: &str, keys: &str) -> bool {
+    let exact = fl_wire::dispatcher::tmux_exact_target(target);
+    !keys.is_empty() && tmux_ok(&["send-keys", "-t", &exact, keys])
+}
+
+/// The text Grok Build 1.0.70 prints when `--yolo` is not enough for a new directory.
+const GROK_DIRECTORY_TRUST_PROMPT: &str = "Do you trust the contents of this directory";
+
+/// How many times a fresh Grok pane is read for [`GROK_DIRECTORY_TRUST_PROMPT`]. The prompt
+/// is not on screen the instant `tmux new-session -d` returns.
+const GROK_TRUST_CAPTURES: u32 = 10;
+
+fn accept_grok_directory_trust(runtime: &dyn SessionRuntime, target: &str) {
+    poll_grok_directory_trust(
+        target,
+        runtime.settle_delay(),
+        || runtime.capture(target),
+        |keys| {
+            let _ = runtime.send_keys(target, keys);
+        },
+    );
+}
+
+/// Reads `capture` up to [`GROK_TRUST_CAPTURES`] times, [`SessionRuntime::settle_delay`] apart
+/// after a miss. A zero delay does not sleep. Sends `y` on the first capture that contains
+/// [`GROK_DIRECTORY_TRUST_PROMPT`] and then returns. Ten misses send nothing and warn once.
+fn poll_grok_directory_trust(
+    target: &str,
+    delay: Duration,
+    mut capture: impl FnMut() -> String,
+    mut send_keys: impl FnMut(&str),
+) {
+    for attempt in 0..GROK_TRUST_CAPTURES {
+        if capture().contains(GROK_DIRECTORY_TRUST_PROMPT) {
+            send_keys("y");
+            return;
+        }
+        if attempt + 1 < GROK_TRUST_CAPTURES && !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+    eprintln!(
+        "warning: Grok directory trust prompt was not seen on `{target}` after {GROK_TRUST_CAPTURES} captures; the match text is the Grok Build 1.0.70 sentence `{GROK_DIRECTORY_TRUST_PROMPT}`"
+    );
+}
+
 /// One window of a tmux session as [`marked_windows`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TmuxWindow {
@@ -1821,6 +2091,83 @@ fn tmux_unit_owned(unit: &str, hosted_id: &str) -> bool {
 /// `true` when a `tmux` session of exactly this name runs.
 fn tmux_session_exists(session: &str) -> bool {
     tmux_ok(&["has-session", "-t", &format!("={session}")])
+}
+
+/// Every live window, or `None` when tmux did not answer. A failed command is not
+/// an empty list: callers must not treat it as "the window is gone".
+fn list_windows_all() -> Option<Vec<(String, String)>> {
+    let out = tmux_stdout(&[
+        "list-windows",
+        "-a",
+        "-F",
+        "#{session_name}\t#{window_name}",
+    ])?;
+    Some(
+        out.lines()
+            .filter_map(|line| {
+                let (session, window) = line.split_once('\t')?;
+                let session = session.trim();
+                let window = window.trim();
+                if session.is_empty() || window.is_empty() {
+                    return None;
+                }
+                Some((session.to_string(), window.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// Confirmed liveness of a hosted window. `exists() == false` is not gone: a tmux
+/// command that fails to run, times out, or exits non-zero is [`RuntimePresence::Unknown`].
+/// Gone means tmux answered and the window is absent, or `list-panes` on the exact
+/// target shows every pane dead and its process gone. A dead pane whose process
+/// still exists is not gone. A `list-panes` failure is unknown.
+fn tmux_runtime_presence(target: &str) -> RuntimePresence {
+    let Some(windows) = list_windows_all() else {
+        return RuntimePresence::Unknown;
+    };
+    let Some((session, window)) = target.split_once(':') else {
+        return if windows.iter().any(|(name, _)| name == target) {
+            RuntimePresence::Alive
+        } else {
+            RuntimePresence::Gone
+        };
+    };
+    if !windows
+        .iter()
+        .any(|(name, win)| name == session && win == window)
+    {
+        return RuntimePresence::Gone;
+    }
+    panes_presence(&fl_wire::dispatcher::tmux_exact_target(target))
+}
+
+fn panes_presence(exact: &str) -> RuntimePresence {
+    let Some(out) = tmux_stdout(&["list-panes", "-t", exact, "-F", "#{pane_dead}\t#{pane_pid}"])
+    else {
+        return RuntimePresence::Unknown;
+    };
+    let mut saw_pane = false;
+    for line in out.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        saw_pane = true;
+        let Some((dead, pid)) = line.split_once('\t') else {
+            return RuntimePresence::Unknown;
+        };
+        let dead = dead.trim() == "1";
+        let process_gone = match pid.trim().parse::<u32>() {
+            Ok(pid) if pid > 0 => !Path::new(&format!("/proc/{pid}")).exists(),
+            _ => true,
+        };
+        if !dead || !process_gone {
+            return RuntimePresence::Alive;
+        }
+    }
+    if saw_pane {
+        RuntimePresence::Gone
+    } else {
+        // A successful empty list has no live pane.
+        RuntimePresence::Gone
+    }
 }
 
 /// `true` when the runtime unit runs: a session by its name, a window (`session:window`) by the
@@ -2126,7 +2473,7 @@ fn deliver_prompt(
 }
 
 /// Route-table files a teardown prunes: the override, or the default and legacy paths.
-fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
     match home_override {
         Some(home) => vec![home.join(".cache").join("agent-bus").join("routes.json")],
         None => std::iter::once(default_routes_path())
@@ -2290,6 +2637,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         cwd: v.cwd.clone(),
         context_window: v.context_window,
         hydration_dispatched: false,
+        tombstone_ids: Vec::new(),
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
         // Only when the record named this same target: a runtime under another name (an older
@@ -2306,6 +2654,11 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         decommission_prepared_at_ms: None,
     };
     persist_hosted_session(store, &record, by)?;
+    // The running record replaced any decommissioned one on this slug. Drop that
+    // tombstone before hydration, or discovery would hide the new session.
+    refresh_decommission_tombstones(store, env.home_override);
+    // A route left by another vendor would take the hydration prompt.
+    purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
     let launch = launch_spec_for(env, &v.vendor, &v.persona, v.model.as_deref(), &prompt);
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
@@ -2319,6 +2672,12 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             launch.as_ref(),
             &session_id,
         );
+    if spawned
+        && v.vendor == "grok"
+        && let Some(target) = tmux_target.as_deref()
+    {
+        accept_grok_directory_trust(env.runtime, target);
+    }
     // A runtime launched with the prompt as its first input has the prompt already, provided the
     // command stayed up: one that exited at once took its session with it, and there is nothing
     // to deliver to.
@@ -2392,6 +2751,14 @@ pub struct DecommissionResponse {
     pub handshake_dispatched: bool,
     pub unregistered: bool,
     pub runtime_stopped: bool,
+    /// What the teardown did to the tmux restore source (the newest tmux-resurrect save), so a
+    /// host reboot does not start the stopped session again. What is pruned matches what is gone:
+    /// the whole session when it is gone, only the window when a window of a session that stays
+    /// (the shared Muse session) is gone. A runtime that still runs after the teardown is
+    /// reported as `running` and left alone. `None` when the teardown made no runtime call. A
+    /// failure is reported here and never fails the teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_source: Option<crate::restore_source::RestoreSourceOutcome>,
     pub prompt: Option<String>,
 }
 
@@ -2533,6 +2900,7 @@ fn record_for_target<S: AgentRegistry>(
         context_window: None,
         hydration_dispatched: false,
         runtime_spawned: false,
+        tombstone_ids: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
@@ -2565,6 +2933,9 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     if target.hosted.as_ref().is_some_and(is_decommissioned) {
         return Err(decommissioned_conflict(&target.session_id));
     }
+    // Other running records are updated too. This target may become `stopped`
+    // here and is then rewritten to `decommissioning` below.
+    reconcile_dead_hosted_sessions(store, env, by)?;
     let Some((project, role)) = project_and_role(store, target)? else {
         return Err(LifecycleError::NotFound(format!(
             "no hosted session or agent record for `{}`",
@@ -2595,6 +2966,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
         handshake_dispatched,
         unregistered: false,
         runtime_stopped: false,
+        restore_source: None,
         prompt: Some(prompt),
     })
 }
@@ -2615,6 +2987,7 @@ fn is_decommissioned(record: &HostedSessionRecord) -> bool {
 
 /// A hosted record that still manages its session. A decommissioned record is history: it is kept
 /// after teardown, and the persona may since have been registered again outside the lifecycle.
+/// `stopped` is not decommissioned, so the persona does not become unmanaged.
 fn is_live_hosted(record: &HostedSessionRecord) -> bool {
     !is_decommissioned(record)
 }
@@ -2693,6 +3066,287 @@ fn runtime_sharers<S: StateStore>(
         .collect())
 }
 
+/// Drop a saved route for `persona` when it belongs to a vendor other than `vendor`
+/// and that vendor has no other Running hosted record of the persona.
+/// A webhook route stays. A route of `vendor` stays. A decommissioned or
+/// decommissioning sibling does not protect the route.
+fn purge_cross_vendor_routes<S: StateStore>(
+    store: &S,
+    home_override: Option<&Path>,
+    persona: &str,
+    vendor: &str,
+) {
+    let records = list_hosted_sessions(store).unwrap_or_default();
+    crate::discovery::with_route_file_lock(|| {
+        for path in route_table_paths(home_override) {
+            if !path.is_file() {
+                continue;
+            }
+            let mut table = RouteTable::load(Some(&path));
+            let Some(key) = table
+                .entries
+                .keys()
+                .find(|key| key.eq_ignore_ascii_case(persona))
+                .cloned()
+            else {
+                continue;
+            };
+            let keep = table.entries.get(&key).is_some_and(|entry| {
+                matches!(entry.route, VendorRoute::Webhook { .. })
+                    || route_is_vendor(&entry.route, vendor)
+                    || running_vendor_owns_route(&records, persona, &entry.route)
+            });
+            if keep {
+                continue;
+            }
+            table.entries.remove(&key);
+            let _ = table.save(Some(&path));
+        }
+    });
+}
+
+/// `true` when a Running hosted record of `persona` uses the vendor `route` names.
+fn running_vendor_owns_route(
+    records: &[HostedSessionRecord],
+    persona: &str,
+    route: &VendorRoute,
+) -> bool {
+    let Some(route_vendor) = vendor_id_of_route(route) else {
+        return false;
+    };
+    records.iter().any(|record| {
+        record.persona.eq_ignore_ascii_case(persona)
+            && record.vendor == route_vendor
+            && record.status.eq_ignore_ascii_case(STATUS_RUNNING)
+    })
+}
+
+fn vendor_id_of_route(route: &VendorRoute) -> Option<&'static str> {
+    match route {
+        VendorRoute::Claude { .. } => Some("claude"),
+        VendorRoute::Agy { .. } => Some("antigravity"),
+        VendorRoute::Codex { .. } => Some("codex"),
+        VendorRoute::Muse { .. } => Some("muse"),
+        VendorRoute::Grok { .. } => Some("grok"),
+        VendorRoute::Webhook { .. } => None,
+    }
+}
+
+fn route_is_vendor(route: &VendorRoute, vendor: &str) -> bool {
+    matches!(
+        (vendor, route),
+        ("claude", VendorRoute::Claude { .. })
+            | ("antigravity", VendorRoute::Agy { .. })
+            | ("codex", VendorRoute::Codex { .. })
+            | ("muse", VendorRoute::Muse { .. })
+            | ("grok", VendorRoute::Grok { .. })
+    )
+}
+
+fn push_tombstone(ids: &mut Vec<String>, id: &str) {
+    let id = id.trim();
+    if !is_native_session_id(id) || ids.iter().any(|have| have == id) {
+        return;
+    }
+    ids.push(id.to_string());
+}
+
+/// Native session ids discovery should treat as gone. Loaded from the route
+/// files before they are pruned. A persona-derived id is not recorded, even
+/// when the record or the target still stores one.
+fn teardown_route_ids(
+    home_override: Option<&Path>,
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [
+        record.session_id.as_str(),
+        target.session_id.as_str(),
+        target.raw_id.as_str(),
+        target.discovered_id.as_str(),
+    ] {
+        push_tombstone(&mut ids, id);
+    }
+    for path in route_table_paths(home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        // The persona key may be a sibling vendor's route. Only this vendor's route,
+        // or a route that names this session, contributes a native id.
+        let Some(route) = route_for_teardown(&table, record, target) else {
+            continue;
+        };
+        if let Some((_, id)) = route.session_identity() {
+            push_tombstone(&mut ids, id);
+        }
+    }
+    ids
+}
+
+fn route_for_teardown(
+    table: &RouteTable,
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+) -> Option<VendorRoute> {
+    if let Some(entry) = table.get(&record.persona)
+        && (record.vendor == "unknown" || route_is_vendor(&entry.route, &record.vendor))
+    {
+        return Some(entry.route.clone());
+    }
+    table
+        .entries
+        .values()
+        .find(|entry| {
+            [&record.session_id, &target.raw_id, &target.discovered_id]
+                .into_iter()
+                .any(|id| route_matches_session_id(&entry.route, id))
+        })
+        .map(|entry| entry.route.clone())
+}
+
+/// Native session ids of a decommissioned record. Persona-derived ids stored on
+/// an old record are left out, so a stale `vendor:persona` tombstone does not
+/// keep banning the name.
+pub(crate) fn record_native_ids(record: &HostedSessionRecord) -> Vec<String> {
+    if !record.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONED) {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    for id in std::iter::once(record.session_id.as_str())
+        .chain(record.tombstone_ids.iter().map(String::as_str))
+    {
+        push_tombstone(&mut ids, id);
+    }
+    ids
+}
+
+/// Rewrite the decommission sidecar from records that are still decommissioned.
+/// A re-spin overwrites the same slug with a running record, so its ids leave the file.
+/// Only native session ids are written.
+fn refresh_decommission_tombstones<S: StateStore>(store: &S, home_override: Option<&Path>) {
+    let Ok(records) = list_hosted_sessions(store) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    for record in records {
+        ids.extend(record_native_ids(&record));
+    }
+    let _ = fl_wire::identity::save_decommissioned_session_ids(home_override, &ids);
+}
+
+fn dead_session_streaks() -> &'static std::sync::Mutex<BTreeMap<String, u8>> {
+    static STREAKS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, u8>>> =
+        std::sync::OnceLock::new();
+    STREAKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn with_dead_streaks<T>(f: impl FnOnce(&mut BTreeMap<String, u8>) -> T) -> T {
+    let mut guard = dead_session_streaks()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    f(&mut guard)
+}
+
+/// Mark a hosted runtime `stopped` when its tmux window is confirmed gone twice
+/// and no route of its vendor is present.
+///
+/// Call sites: [`prepare_decommission`] (after the owner gate and the decommissioned
+/// 409, before the target is rewritten to `decommissioning`) and `GET /api/v1/sessions`
+/// (`handle_get_sessions`, before the discovery snapshot). Feira's boot reconcile
+/// (Record #129) calls this the same way: `reconcile_dead_hosted_sessions(store, env, by)?`.
+///
+/// A hosted record is considered only when its status is `running` and
+/// `vendor_has_runtime` is true. HTTP API vendors are never marked `stopped` for
+/// lack of tmux.
+///
+/// The route is present when the route table has a route for that persona whose
+/// vendor is this record's vendor. A present route resets the streak.
+///
+/// Runtime presence is three-way ([`RuntimePresence`]). `Unknown` means tmux failed
+/// to run, timed out, or did not answer, and does not change the streak.
+/// `exists() == false` is not proof of death.
+///
+/// Confirmed gone means tmux answered successfully and the pane or process is gone:
+/// the window is absent, or `list-panes` on the exact target shows the pane dead
+/// and the process gone. A `pane_dead` flag with a live process is not gone. A
+/// `list-panes` failure is `Unknown`. The target checked is `record.tmux_target`
+/// when set, otherwise the hosted window (`Ada:grok`), not the stripped session.
+///
+/// The streak is process-local, not a record field. The first consecutive
+/// observation of gone with no route increments the streak and leaves status
+/// `running`. The second sets status to [`STATUS_STOPPED`] (`"stopped"`) and clears
+/// the streak. Alive, or a route of this vendor, resets the streak to 0. A hub
+/// restart resets the streak. Two calls in one process are two checks. When
+/// `spawn_runtime` is false the runtime is not called and the streak is left as it is.
+///
+/// This does not retire the agent, write a tombstone, kill tmux, or delete files.
+/// [`prepare_decommission`] still continues after this and may set the target to
+/// `decommissioning`. Other running records are updated too. A stopped record is
+/// not decommissioned, so it does not become unmanaged.
+pub fn reconcile_dead_hosted_sessions<S: StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    let records = list_hosted_sessions(store)?;
+    for mut record in records {
+        if !record.status.eq_ignore_ascii_case(STATUS_RUNNING)
+            || !vendor_has_runtime(&record.vendor)
+        {
+            continue;
+        }
+        if vendor_route_present(env.home_override, &record.persona, &record.vendor) {
+            with_dead_streaks(|streaks| {
+                streaks.remove(&record.session_id);
+            });
+            continue;
+        }
+        if !env.spawn_runtime {
+            continue;
+        }
+        let target = record
+            .tmux_target
+            .clone()
+            .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+        match env.runtime.presence(&target) {
+            RuntimePresence::Alive => {
+                with_dead_streaks(|streaks| {
+                    streaks.remove(&record.session_id);
+                });
+            }
+            RuntimePresence::Unknown => {}
+            RuntimePresence::Gone => {
+                let streak = with_dead_streaks(|streaks| {
+                    let streak = streaks.entry(record.session_id.clone()).or_insert(0);
+                    *streak = streak.saturating_add(1);
+                    *streak
+                });
+                if streak >= 2 {
+                    record.status = STATUS_STOPPED.to_string();
+                    record.updated_at_ms = now_ms();
+                    persist_hosted_session(store, &record, by)?;
+                    with_dead_streaks(|streaks| {
+                        streaks.remove(&record.session_id);
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `true` when the route table has a route for `persona` on `vendor`.
+fn vendor_route_present(home_override: Option<&Path>, persona: &str, vendor: &str) -> bool {
+    route_table_paths(home_override).into_iter().any(|path| {
+        path.is_file()
+            && RouteTable::load(Some(&path))
+                .get(persona)
+                .is_some_and(|entry| route_is_vendor(&entry.route, vendor))
+    })
+}
+
 /// The gate `teardown_session` runs before its first effect. A caller that wants to act on a
 /// teardown's behalf (such as archiving the session's artifacts) asks this first, so a refused
 /// teardown never causes a side effect and the decision stays in one place.
@@ -2760,27 +3414,61 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         target.raw_id.as_str(),
         target.discovered_id.as_str(),
     ];
+    // Capture native ids before the routes are removed. Discovery uses them to skip a
+    // conversation the hosted `vendor:persona` id does not name.
+    let tombstone_ids = teardown_route_ids(env.home_override, &record, target);
     if persona_still_running {
         remove_routes(env.home_override, &[], &session_ids);
     } else {
         remove_routes(env.home_override, &[target.persona.as_str()], &session_ids);
     }
 
-    // `true` only for a runtime this lifecycle started and has now stopped. A runtime it did not
-    // start, one still running for the sessions that share it, or none at all (runtime calls are
-    // off) is not reported as stopped.
-    let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
-        (Some(tmux_target), true) if env.spawn_runtime => {
-            // The unit, not the session: a Muse window is killed alone, never the shared session.
-            let unit = runtime_unit(tmux_target);
-            let gone = env.runtime.kill(unit, &record.session_id);
-            // The runtime is gone, so the decommissioned record must not claim it any more.
-            record.runtime_spawned &= !gone;
-            // A window of the name that is not ours is left running: "nothing of ours to kill"
-            // clears the claim, but is not a stopped runtime.
-            gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
+    // `true` only for a runtime this call stopped. A runtime still shared, or none at all
+    // (runtime calls are off), is not reported as stopped. A runtime this lifecycle started
+    // is stopped with `kill` (a Muse window only when it carries our mark), then pruned as
+    // `runtime_unit` (the session, or `muse:<persona>`). An owner teardown of a session this
+    // lifecycle never recorded a target for stops that vendor's window (`Ada:grok`), and the
+    // session only when the window is the session's only one, even though `runtime_spawned`
+    // is false, including an unmarked Muse window. That path prunes the same
+    // `session:window` string `kill_owner` received, so a sibling window keeps the session
+    // in the resurrect save. A recorded target with the flag clear is a unit this lifecycle
+    // already decided is not ours, and stays up; it is pruned only when it is already gone.
+    // An HTTP API vendor has no tmux unit, so its teardown never stops one.
+    let mut restore_source = None;
+    let runtime_stopped = if env.spawn_runtime && record.runtime_spawned {
+        match &record.tmux_target {
+            Some(tmux_target) => {
+                let unit = runtime_unit(tmux_target);
+                let gone = env.runtime.kill(unit, &record.session_id);
+                restore_source = Some(prune_unit_after_stop(env, unit));
+                record.runtime_spawned &= !gone;
+                gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
+            }
+            None => false,
         }
-        _ => false,
+    } else if env.spawn_runtime
+        && caller == Caller::Owner
+        && !shared_runtime
+        && !persona_still_running
+        && record.tmux_target.is_none()
+        && vendor_has_runtime(&record.vendor)
+    {
+        let target_name = hosted_tmux_target(&record.vendor, &record.persona);
+        let gone = env.runtime.kill_owner(&target_name, &record.session_id);
+        restore_source = Some(prune_unit_after_stop(env, &target_name));
+        gone && !(is_muse_window_target(&target_name) && env.runtime.exists(&target_name))
+    } else if env.spawn_runtime
+        && !record.runtime_spawned
+        && (record.tmux_target.is_some() || vendor_has_runtime(&record.vendor))
+    {
+        let target = record
+            .tmux_target
+            .clone()
+            .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+        restore_source = Some(prune_unit_after_stop(env, runtime_unit(&target)));
+        false
+    } else {
+        false
     };
     // Its routes are gone and its runtime may be: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
@@ -2793,8 +3481,11 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     }
 
     record.status = STATUS_DECOMMISSIONED.to_string();
+    record.tombstone_ids = tombstone_ids;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
+    // The native conversation id is tombstoned above. Conversation files stay.
+    refresh_decommission_tombstones(store, env.home_override);
 
     Ok(DecommissionResponse {
         session_id: record.session_id,
@@ -2804,8 +3495,48 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         handshake_dispatched: false,
         unregistered: true,
         runtime_stopped,
+        restore_source,
         prompt: None,
     })
+}
+
+/// [`prune_after_stop`] for a runtime unit ([`runtime_unit`]): a window unit (`muse:<persona>`)
+/// is `session:window`, a session unit has no window.
+fn prune_unit_after_stop(
+    env: &LifecycleEnv<'_>,
+    unit: &str,
+) -> crate::restore_source::RestoreSourceOutcome {
+    match unit.split_once(':') {
+        Some((session, window)) => prune_after_stop(env, session, Some(window)),
+        None => prune_after_stop(env, unit, None),
+    }
+}
+
+/// Prune what a teardown stopped from the restore source. The one call a kill path makes after
+/// it has stopped (or found stopped) the tmux runtime `session`, or its window `window`:
+///
+/// - the session is gone: the whole session is pruned;
+/// - the session runs and `window` is given and gone: only that window is pruned (the session's
+///   other windows stay in the save);
+/// - the session or the window still runs: nothing is pruned, because the next resurrect save
+///   would write it back; the result is [`RestoreSourceOutcome::Running`].
+///
+/// [`RestoreSourceOutcome::Running`]: crate::restore_source::RestoreSourceOutcome::Running
+pub(crate) fn prune_after_stop(
+    env: &LifecycleEnv<'_>,
+    session: &str,
+    window: Option<&str>,
+) -> crate::restore_source::RestoreSourceOutcome {
+    use crate::restore_source::{RestoreSourceOutcome, prune_session, prune_window};
+    if !env.runtime.exists(session) {
+        return prune_session(env.home_override, session);
+    }
+    match window {
+        Some(window) if !env.runtime.exists(&format!("{session}:{window}")) => {
+            prune_window(env.home_override, session, window)
+        }
+        _ => RestoreSourceOutcome::Running,
+    }
 }
 
 /// `POST /api/v1/hosted-sessions/:id/restart` response: the updated record plus the reforge prompt.
@@ -3530,7 +4261,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
     // not exist), so only the restored session claims the persona.
     let mut cleanup_error = None;
     if to_session_id != plan.from_session_id
-        && let Err(e) = undo_new_record(store, &to_session_id, to_before, by)
+        && let Err(e) = undo_new_record(store, &to_session_id, to_before, by, env.home_override)
     {
         cleanup_error = Some(format!(
             "; the record of `{to_session_id}` was not reset: {e}"
@@ -3623,22 +4354,31 @@ fn undo_new_record<S: StateStore>(
     session_id: &str,
     before: Option<HostedSessionRecord>,
     by: &str,
+    home_override: Option<&Path>,
 ) -> Result<(), LifecycleError> {
     let Some(mut now) =
         find_hosted_session(store, &[session_id])?.filter(|r| r.session_id == session_id)
     else {
         return Ok(());
     };
-    match before {
-        Some(before) if before != now => persist_hosted_session(store, &before, by),
-        Some(_) => Ok(()),
-        None if is_decommissioned(&now) => Ok(()),
+    let changed = match before {
+        Some(before) if before != now => {
+            persist_hosted_session(store, &before, by)?;
+            true
+        }
+        Some(_) => false,
+        None if is_decommissioned(&now) => false,
         None => {
             now.status = STATUS_DECOMMISSIONED.to_string();
             now.updated_at_ms = now_ms();
-            persist_hosted_session(store, &now, by)
+            persist_hosted_session(store, &now, by)?;
+            true
         }
+    };
+    if changed {
+        refresh_decommission_tombstones(store, home_override);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3649,6 +4389,9 @@ mod vendor_registry_tests;
 
 #[cfg(test)]
 mod muse_launch_tests;
+
+#[cfg(test)]
+mod restore_source_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3800,7 +4543,7 @@ mod tests {
         );
         assert_eq!(
             launch_args("grok", Some("grok-5")),
-            strings(&["--yolo", "--model", "grok-5", "hello"])
+            strings(&["--yolo", "--always-approve", "--model", "grok-5", "hello"])
         );
         assert_eq!(
             launch_args("muse", Some("muse-2")),
@@ -4583,6 +5326,588 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rec.status, STATUS_DECOMMISSIONED);
+        assert!(
+            !rec.tombstone_ids.iter().any(|id| id == "thread-felicity"),
+            "a running sibling's thread is not a tombstone: {:?}",
+            rec.tombstone_ids
+        );
+    }
+
+    #[test]
+    fn owner_teardown_stops_an_unmanaged_tmux_session_and_an_unmarked_muse_window() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::running(&["Ada"]);
+        fake.open_foreign_window("muse:ada");
+        let env = fake.env(home.path());
+
+        let claude = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let peer = teardown_session(&store, &env, &claude, "peer", Caller::Peer, |_| {});
+        assert!(matches!(peer, Err(LifecycleError::Forbidden(_))));
+        assert!(fake.is_live("Ada"));
+
+        let out = teardown_session(&store, &env, &claude, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(out.runtime_stopped);
+        assert!(!fake.is_live("Ada"));
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "kill-owner Ada:claude")
+        );
+
+        let muse = SessionTarget::resolve(&store, "muse:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &muse, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(out.runtime_stopped);
+        assert!(!fake.is_live("muse:ada"));
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "kill-owner muse:ada")
+        );
+    }
+
+    #[test]
+    fn owner_teardown_of_one_vendor_leaves_another_vendors_window() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.add_session_windows(&[("Ada", "grok"), ("Ada", "claude")]);
+        let env = fake.env(home.path());
+
+        let grok = SessionTarget::resolve(&store, "grok:ada", None).unwrap();
+        let peer = teardown_session(&store, &env, &grok, "peer", Caller::Peer, |_| {});
+        assert!(matches!(peer, Err(LifecycleError::Forbidden(_))));
+        assert!(fake.is_live("Ada"));
+        assert!(fake.has_session_window("Ada:claude"));
+        assert!(fake.has_session_window("Ada:grok"));
+
+        let out = teardown_session(&store, &env, &grok, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(out.runtime_stopped);
+        assert!(fake.is_live("Ada"), "session Ada stays");
+        assert!(fake.has_session_window("Ada:claude"), "claude window stays");
+        assert!(!fake.has_session_window("Ada:grok"), "grok window is gone");
+        let calls = fake.calls.borrow();
+        assert!(calls.iter().any(|call| call == "kill-owner Ada:grok"));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == "kill-owner Ada" || call == "kill Ada")
+        );
+    }
+
+    #[test]
+    fn owner_teardown_leaves_a_running_siblings_runtime_up() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::running(&["Ada"]);
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(fake.is_live("Ada"));
+        let grok = SessionTarget::resolve(&store, "grok:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &grok, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(!out.runtime_stopped);
+        assert!(fake.is_live("Ada"));
+        assert!(
+            !fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("kill-owner"))
+        );
+    }
+
+    #[test]
+    fn grok_spin_up_accepts_the_directory_trust_prompt() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.panes.borrow_mut().insert(
+            "Ada:grok".into(),
+            "Do you trust the contents of this directory? Yes, proceed (y)".into(),
+        );
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "grok"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "send-keys Ada:grok y")
+        );
+    }
+
+    #[test]
+    fn grok_trust_poll_sends_y_once_after_two_misses_and_nothing_after_ten() {
+        let mut seen = 0u32;
+        let mut sent = Vec::new();
+        poll_grok_directory_trust(
+            "Ada:grok",
+            Duration::ZERO,
+            || {
+                seen += 1;
+                if seen <= 2 {
+                    String::new()
+                } else {
+                    "Do you trust the contents of this directory?".into()
+                }
+            },
+            |keys| sent.push(keys.to_string()),
+        );
+        assert_eq!(seen, 3, "a hit stops the poll");
+        assert_eq!(sent, ["y".to_string()]);
+
+        let mut misses = 0u32;
+        let mut sent = Vec::new();
+        poll_grok_directory_trust(
+            "Ada:grok",
+            Duration::ZERO,
+            || {
+                misses += 1;
+                String::new()
+            },
+            |keys| sent.push(keys.to_string()),
+        );
+        assert_eq!(misses, 10);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn hydration_prompt_does_not_contain_the_grok_trust_sentence() {
+        let prompt = prompt_for("Ada", "FerroLoop", "assistant");
+        assert!(!prompt.contains(GROK_DIRECTORY_TRUST_PROMPT), "{prompt}");
+        let canonical = canonical_reforge_prompt("Ada", "FerroLoop", "assistant");
+        assert!(!canonical.contains(GROK_DIRECTORY_TRUST_PROMPT));
+    }
+
+    #[test]
+    fn spin_up_drops_a_stale_other_vendor_route_and_keeps_a_webhook() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "thread-ada".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+        spin_up(
+            &store,
+            &env(&home),
+            &req("ada", "assistant", "grok"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(RouteTable::load(Some(&path)).get("ada").is_none());
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "bea",
+            VendorRoute::Webhook {
+                socket_path: home.path().join("none.sock"),
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+        spin_up(
+            &store,
+            &env(&home),
+            &req("bea", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(matches!(
+            RouteTable::load(Some(&path)).get("bea").map(|e| &e.route),
+            Some(VendorRoute::Webhook { .. })
+        ));
+    }
+
+    fn save_claude_route(home: &Path, persona: &str, session_id: &str) -> PathBuf {
+        let mut routes = RouteTable::load(Some(
+            &home.join(".cache").join("agent-bus").join("routes.json"),
+        ));
+        routes.upsert(
+            persona,
+            VendorRoute::Claude {
+                pid: 4_000_000_001,
+                session_id: session_id.into(),
+                socket_path: home.join("claude.sock"),
+                key_path: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        path
+    }
+
+    #[test]
+    fn spin_up_keeps_a_running_siblings_route() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let path = save_claude_route(home.path(), "ada", "sess-claude");
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "grok"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                RouteTable::load(Some(&path)).get("ada").map(|entry| &entry.route),
+                Some(VendorRoute::Claude { session_id, .. }) if session_id == "sess-claude"
+            ),
+            "a running claude sibling keeps its route"
+        );
+
+        spin_up(
+            &store,
+            &env,
+            &req("bea", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut bea = find_hosted_session(&store, &["claude:bea"])
+            .unwrap()
+            .unwrap();
+        bea.status = STATUS_DECOMMISSIONING.into();
+        persist_hosted_session(&store, &bea, "owner").unwrap();
+        save_claude_route(home.path(), "bea", "sess-bea");
+        spin_up(
+            &store,
+            &env,
+            &req("bea", "assistant", "grok"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            RouteTable::load(Some(&path)).get("bea").is_none(),
+            "a decommissioning sibling does not protect the route"
+        );
+    }
+
+    #[test]
+    fn antigravity_teardown_removes_conversation_files_and_a_respin_clears_the_tombstone() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let id = "11111111-1111-1111-1111-111111111111";
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let brain = home.path().join(".gemini/antigravity-cli/brain").join(id);
+        let pb_dir = home.path().join(".gemini/antigravity/conversations");
+        std::fs::create_dir_all(brain.join("logs")).unwrap();
+        std::fs::write(brain.join("logs/transcript.jsonl"), "kept-then-removed").unwrap();
+        std::fs::create_dir_all(&pb_dir).unwrap();
+        std::fs::write(pb_dir.join(format!("{id}.pb")), "pb").unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: id.into(),
+                ls_pid: None,
+                ls_address: Some("127.0.0.1:9".into()),
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        routes.save(Some(&path)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(
+            brain.join("logs/transcript.jsonl").is_file(),
+            "teardown leaves the brain directory"
+        );
+        assert!(
+            pb_dir.join(format!("{id}.pb")).is_file(),
+            "teardown leaves the conversation file"
+        );
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(banned.contains(id), "{banned:?}");
+        assert!(
+            !banned.contains("antigravity:ada"),
+            "the hosted name is not a tombstone: {banned:?}"
+        );
+
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(!banned.contains(id), "{banned:?}");
+        assert!(!banned.contains("antigravity:ada"), "{banned:?}");
+    }
+
+    #[test]
+    fn a_decommissioned_persona_reregistered_by_upsert_stays_discoverable() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let old = "conv-old";
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: old.into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(banned.contains(old), "{banned:?}");
+        assert!(!banned.contains("antigravity:ada"), "{banned:?}");
+
+        let at = At::from_unix_millis(2);
+        let mut table = RouteTable::default();
+        table.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-new".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            at.clone(),
+        );
+        table.discover_routes(Some(home.path()), at.clone());
+        assert!(
+            matches!(
+                table.get("ada").map(|entry| &entry.route),
+                Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-new"
+            ),
+            "a new native id stays deliverable"
+        );
+
+        table.upsert(
+            "ada",
+            VendorRoute::Grok {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("Ada:grok".into()),
+                tmux_pane: None,
+            },
+            at.clone(),
+        );
+        table.discover_routes(Some(home.path()), at.clone());
+        assert!(
+            matches!(
+                table.get("ada").map(|entry| &entry.route),
+                Some(VendorRoute::Grok { session_id, .. }) if session_id.is_empty()
+            ),
+            "an empty grok id stays"
+        );
+
+        table.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: old.into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            at.clone(),
+        );
+        table.discover_routes(Some(home.path()), at);
+        assert!(table.get("ada").is_none(), "the old native id stays banned");
+    }
+
+    #[test]
+    fn refresh_drops_persona_derived_ids_left_on_an_old_record() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let mut rec = hosted_record("codex", "bob", STATUS_DECOMMISSIONED, false);
+        rec.tombstone_ids = vec![
+            "thread-bob".into(),
+            "codex:bob".into(),
+            "grok-bob".into(),
+            "claude-bob-99".into(),
+        ];
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+        refresh_decommission_tombstones(&store, Some(home.path()));
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert_eq!(
+            banned,
+            std::collections::BTreeSet::from(["thread-bob".to_string()])
+        );
+    }
+
+    fn script_presence(
+        persona: &str,
+        vendor: &str,
+        presence: RuntimePresence,
+    ) -> (MemStore, FakeRuntime, TempDir) {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let mut rec = hosted_record(vendor, persona, STATUS_RUNNING, false);
+        rec.tmux_target = Some(hosted_tmux_target(vendor, persona));
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+        fake.presence_of
+            .borrow_mut()
+            .insert(hosted_tmux_target(vendor, persona), presence);
+        (store, fake, home)
+    }
+
+    fn hosted_status(store: &MemStore, session_id: &str) -> String {
+        find_hosted_session(store, &[session_id])
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn one_gone_observation_leaves_running_and_the_second_stops() {
+        let (store, fake, home) = script_presence("streakgone", "grok", RuntimePresence::Gone);
+        let env = fake.env(home.path());
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakgone"), STATUS_RUNNING);
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakgone"), STATUS_STOPPED);
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(banned.is_empty(), "{banned:?}");
+        let calls = fake.calls.borrow();
+        assert!(calls.is_empty(), "reconcile does not kill tmux: {calls:?}");
+    }
+
+    #[test]
+    fn an_unknown_between_gone_observations_does_not_count() {
+        let (store, fake, home) = script_presence("streakunk", "grok", RuntimePresence::Gone);
+        let env = fake.env(home.path());
+        let target = hosted_tmux_target("grok", "streakunk");
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakunk"), STATUS_RUNNING);
+        fake.presence_of
+            .borrow_mut()
+            .insert(target.clone(), RuntimePresence::Unknown);
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakunk"), STATUS_RUNNING);
+        fake.presence_of
+            .borrow_mut()
+            .insert(target, RuntimePresence::Gone);
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakunk"), STATUS_STOPPED);
+    }
+
+    #[test]
+    fn a_present_route_never_stops_the_record() {
+        let (store, fake, home) = script_presence("streakroute", "grok", RuntimePresence::Gone);
+        let env = fake.env(home.path());
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "streakroute",
+            VendorRoute::Grok {
+                session_id: "gs-live".into(),
+                cwd: None,
+                tmux_target: Some("Streakroute:grok".into()),
+                tmux_pane: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakroute"), STATUS_RUNNING);
+    }
+
+    #[test]
+    fn a_transient_tmux_failure_does_not_stop_a_session() {
+        let (store, fake, home) = script_presence("streakmiss", "grok", RuntimePresence::Unknown);
+        let env = fake.env(home.path());
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(hosted_status(&store, "grok:streakmiss"), STATUS_RUNNING);
+    }
+
+    #[test]
+    fn an_api_vendor_is_not_stopped_for_lack_of_tmux() {
+        let (store, fake, home) = script_presence("streakapi", "openai-api", RuntimePresence::Gone);
+        let env = fake.env(home.path());
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(
+            hosted_status(&store, "openai-api:streakapi"),
+            STATUS_RUNNING
+        );
     }
 
     #[test]
@@ -5665,6 +6990,7 @@ mod tests {
             context_window: None,
             hydration_dispatched: false,
             runtime_spawned: spawned,
+            tombstone_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,
