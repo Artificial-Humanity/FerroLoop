@@ -4,7 +4,7 @@
 //! application consumption, and a dropped subscriber does not discard bytes that
 //! nobody has fully written.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -31,6 +31,15 @@ fn line_envelope(len: usize) -> usize {
     let chunk = MAX_FRAME_PAYLOAD - LINE_HEADER_LEN;
     len.div_ceil(chunk).saturating_mul(LINE_HEADER_LEN)
 }
+
+fn control_len(event: &ControlEvent) -> usize {
+    serde_json::to_vec(event)
+        .map(|bytes| bytes.len().clamp(1, MAX_EVENT_ENVELOPE))
+        .unwrap_or(1)
+}
+
+/// One session epoch. `seq` restarts on respawn, so the cursor is not per name alone.
+type StreamKey = (String, u64);
 
 enum Body {
     Line(Vec<u8>),
@@ -80,6 +89,9 @@ struct Sub {
     slow: bool,
     wake: Arc<Condvar>,
     kill: Option<Arc<ShutdownSwitch>>,
+    /// Next `seq` to enqueue for each session epoch. Newer events stay in `ahead`.
+    cursors: HashMap<StreamKey, u64>,
+    ahead: HashMap<StreamKey, BTreeMap<u64, Arc<Logical>>>,
 }
 
 pub struct OutputSession {
@@ -87,6 +99,8 @@ pub struct OutputSession {
     hub: Arc<Hub>,
     inner: Mutex<OutInner>,
     cv: Condvar,
+    /// Held from `seq` and fanout-index allocation through publish.
+    order: Mutex<()>,
     seq: AtomicU64,
     stop: AtomicBool,
     stall_noted: AtomicBool,
@@ -147,6 +161,8 @@ impl Hub {
             slow: false,
             wake: Arc::clone(&wake),
             kill,
+            cursors: HashMap::new(),
+            ahead: HashMap::new(),
         });
         drop(fanout);
         self.pull_preexisting();
@@ -154,29 +170,8 @@ impl Hub {
     }
 
     fn pull_preexisting(&self) {
-        let sessions = self.live_sessions();
-        let mut pending = Vec::new();
-        for session in &sessions {
-            let inner = session.inner.lock().unwrap_or_else(|err| err.into_inner());
-            for event in &inner.events {
-                let track = event.track.lock().unwrap_or_else(|err| err.into_inner());
-                if track.holders == 0 && track.completes == 0 {
-                    pending.push(Arc::clone(event));
-                }
-            }
-        }
-        pending.sort_by_key(|event| event.index);
-        let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        for event in pending {
-            for sub in fanout.subs.iter_mut().filter(|sub| !sub.dropped) {
-                if event.index >= sub.subscribed_at || !sub.wants(&event) {
-                    continue;
-                }
-                let _ = assign(sub, &event, true);
-            }
-        }
-        for sub in &fanout.subs {
-            sub.wake.notify_all();
+        for session in self.live_sessions() {
+            session.deliver_pending();
         }
     }
 
@@ -186,17 +181,16 @@ impl Hub {
         slots.iter().filter_map(|slot| slot.upgrade()).collect()
     }
 
-    fn publish(&self, event: Arc<Logical>) {
+    /// Caller holds the session `order` lock. Enqueue only the next per-epoch `seq`.
+    fn admit(&self, pending: &[Arc<Logical>], key: &StreamKey, next_seq: u64) {
         let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
         for sub in fanout.subs.iter_mut() {
-            if sub.dropped || !sub.wants(&event) {
+            if sub.dropped || !sub.wants_key(key) {
                 continue;
             }
-            // Leave the queue intact so the writer can emit SlowSubscriber at a
-            // message boundary, then drop itself. Overflow never overwrites a slot.
-            if assign(sub, &event, false) == Assign::Overflow {
-                sub.slow = true;
-            }
+            prime_cursor(sub, key, pending, next_seq);
+            drive_cursor(sub, key, pending, next_seq);
+            park_ahead(sub, key, pending);
         }
         for sub in &fanout.subs {
             sub.wake.notify_all();
@@ -297,6 +291,138 @@ enum Assign {
     Overflow,
 }
 
+fn prime_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_seq: u64) {
+    if sub.cursors.contains_key(key) {
+        return;
+    }
+    // An event another subscriber still holds is unfinished. Starting past it
+    // would drop the catch-up once that holder releases it.
+    let mut start = next_seq;
+    for event in pending {
+        if event.session != key.0 || event.epoch != key.1 || event.seq >= start {
+            continue;
+        }
+        let track = event.track.lock().unwrap_or_else(|err| err.into_inner());
+        if track.completes == 0 && !track.delivered.contains(&sub.id) {
+            start = event.seq;
+        }
+    }
+    if let Some(min) = sub.ahead.get(key).and_then(|parked| parked.keys().next()) {
+        start = start.min(*min);
+    }
+    sub.cursors.insert(key.clone(), start);
+}
+
+/// Queue a prefix of this epoch. Stop when the next `seq` is missing or the budget is full.
+fn drive_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_seq: u64) {
+    loop {
+        if sub.dropped {
+            return;
+        }
+        let Some(cursor) = sub.cursors.get(key).copied() else {
+            return;
+        };
+        let parked = sub
+            .ahead
+            .get(key)
+            .and_then(|parked| parked.get(&cursor).cloned());
+        let event = parked.or_else(|| {
+            pending
+                .iter()
+                .find(|event| event.session == key.0 && event.epoch == key.1 && event.seq == cursor)
+                .cloned()
+        });
+        let Some(event) = event else {
+            if cursor < next_seq {
+                let Some(next) = cursor.checked_add(1) else {
+                    return;
+                };
+                sub.cursors.insert(key.clone(), next);
+                continue;
+            }
+            return;
+        };
+        let done = event
+            .track
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .completes
+            > 0
+            && sub
+                .ahead
+                .get(key)
+                .is_none_or(|parked| !parked.contains_key(&cursor));
+        if done {
+            let Some(next) = cursor.checked_add(1) else {
+                return;
+            };
+            sub.cursors.insert(key.clone(), next);
+            continue;
+        }
+        if !offer(sub, key, cursor, &event) {
+            return;
+        }
+    }
+}
+
+/// `true` when the cursor advanced.
+fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> bool {
+    let preexisting = event.index < sub.subscribed_at;
+    match assign(sub, event, preexisting) {
+        Assign::Queued => {
+            if let Some(parked) = sub.ahead.get_mut(key) {
+                parked.remove(&cursor);
+            }
+            let Some(next) = cursor.checked_add(1) else {
+                return false;
+            };
+            sub.cursors.insert(key.clone(), next);
+            true
+        }
+        Assign::Overflow => {
+            sub.slow = true;
+            false
+        }
+        Assign::Skip => {
+            let already = event
+                .track
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .delivered
+                .contains(&sub.id);
+            if already {
+                if let Some(parked) = sub.ahead.get_mut(key) {
+                    parked.remove(&cursor);
+                }
+                let Some(next) = cursor.checked_add(1) else {
+                    return false;
+                };
+                sub.cursors.insert(key.clone(), next);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Keep a newer `seq` out of the queue until `cursor` reaches it, including after reap.
+fn park_ahead(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>]) {
+    let Some(cursor) = sub.cursors.get(key).copied() else {
+        return;
+    };
+    for event in pending {
+        if event.session != key.0 || event.epoch != key.1 || event.seq < cursor {
+            continue;
+        }
+        sub.ahead
+            .entry(key.clone())
+            .or_default()
+            .entry(event.seq)
+            .or_insert_with(|| Arc::clone(event));
+    }
+}
+
 fn take_sub(fanout: &mut Fanout, id: u64) -> Vec<Arc<Logical>> {
     let Some(sub) = fanout.subs.iter_mut().find(|sub| sub.id == id) else {
         return Vec::new();
@@ -306,6 +432,7 @@ fn take_sub(fanout: &mut Fanout, id: u64) -> Vec<Arc<Logical>> {
     }
     sub.dropped = true;
     sub.slow = true;
+    sub.ahead.clear();
     if let Some(kill) = sub.kill.take() {
         kill.trip();
     }
@@ -347,6 +474,7 @@ impl OutputSession {
                 eof: false,
             }),
             cv: Condvar::new(),
+            order: Mutex::new(()),
             seq: AtomicU64::new(1),
             stop: AtomicBool::new(false),
             stall_noted: AtomicBool::new(false),
@@ -364,23 +492,18 @@ impl OutputSession {
     }
 
     pub fn emit_spawned(&self, child: HostedChild) {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        self.emit_control(
-            ControlEvent::Spawned {
-                session: self.session.session.clone(),
-                session_epoch: SessionEpoch(self.session.epoch),
+        let session = self.session.session.clone();
+        let epoch = self.session.epoch;
+        self.publish_with(0, false, move |seq| {
+            let event = ControlEvent::Spawned {
+                session,
+                session_epoch: SessionEpoch(epoch),
                 seq,
                 child,
-            },
-            false,
-            seq,
-        );
-    }
-
-    fn emit_control(&self, event: ControlEvent, exited: bool, seq: u64) {
-        let bytes = serde_json::to_vec(&event).unwrap_or_default();
-        let envelope = bytes.len().clamp(1, MAX_EVENT_ENVELOPE);
-        self.push_event(Body::Control(event), 0, envelope, exited, seq);
+            };
+            let envelope = control_len(&event);
+            (Body::Control(event), envelope)
+        });
     }
 
     fn emit_line(&self, raw: Vec<u8>) {
@@ -388,10 +511,9 @@ impl OutputSession {
         while self.hub.all_backlogged() && started.elapsed() < Duration::from_millis(20) {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let envelope = line_envelope(raw.len());
         let raw_len = raw.len();
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        self.push_event(Body::Line(raw), raw_len, envelope, false, seq);
+        let envelope = line_envelope(raw_len);
+        self.publish_with(raw_len, false, move |_seq| (Body::Line(raw), envelope));
     }
 
     pub fn request_stop(&self) {
@@ -408,8 +530,16 @@ impl OutputSession {
         }
     }
 
-    fn push_event(&self, body: Body, raw_len: usize, envelope: usize, exited: bool, seq: u64) {
+    fn lock_order(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.order.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// `seq` and the fanout index are allocated under `order`, which is held through admit.
+    fn publish_with(&self, raw_len: usize, exited: bool, build: impl FnOnce(u64) -> (Body, usize)) {
+        let _order = self.lock_order();
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let index = self.hub.index.fetch_add(1, Ordering::SeqCst);
+        let (body, envelope) = build(seq);
         let event = Arc::new(Logical {
             index,
             seq,
@@ -426,12 +556,26 @@ impl OutputSession {
             }),
             hub: Arc::downgrade(&self.hub),
         });
-        {
+        let key = (event.session.clone(), event.epoch);
+        let (pending, next_seq) = {
             let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
             inner.events.push(Arc::clone(&event));
-        }
-        self.hub.publish(event);
+            let pending = inner.events.clone();
+            (pending, self.seq.load(Ordering::SeqCst))
+        };
+        // Drop `inner` before admit takes subscriber track locks. `order` still covers publish.
+        self.hub.admit(&pending, &key, next_seq);
         self.cv.notify_all();
+    }
+
+    fn deliver_pending(&self) {
+        let _order = self.lock_order();
+        let key = (self.session.session.as_str().to_owned(), self.session.epoch);
+        let (pending, next_seq) = {
+            let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+            (inner.events.clone(), self.seq.load(Ordering::SeqCst))
+        };
+        self.hub.admit(&pending, &key, next_seq);
     }
 
     fn charge(inner: &OutInner) -> Charge {
@@ -467,17 +611,18 @@ impl OutputSession {
         if !first {
             return;
         }
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        self.emit_control(
-            ControlEvent::ProtocolFailure {
-                session: self.session.session.clone(),
-                session_epoch: SessionEpoch(self.session.epoch),
+        let session = self.session.session.clone();
+        let epoch = self.session.epoch;
+        self.publish_with(0, false, move |seq| {
+            let event = ControlEvent::ProtocolFailure {
+                session,
+                session_epoch: SessionEpoch(epoch),
                 seq,
                 reason: "stdout line exceeds 1 MiB".into(),
-            },
-            false,
-            seq,
-        );
+            };
+            let envelope = control_len(&event);
+            (Body::Control(event), envelope)
+        });
         if let Some(fence) = self
             .fence
             .lock()
@@ -581,11 +726,38 @@ impl StdoutSink for OutputSession {
     }
 
     fn eof(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        inner.eof = true;
-        inner.partial.clear();
-        inner.staging.clear();
-        self.cv.notify_all();
+        if self.flush_out() {
+            self.fail_overflow();
+        }
+        let tail = {
+            let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+            if inner.failed {
+                inner.eof = true;
+                None
+            } else {
+                let len = inner.partial.len().saturating_add(inner.staging.len());
+                if len > MAX_STDOUT_LINE {
+                    Some(Err(()))
+                } else if len == 0 {
+                    inner.eof = true;
+                    None
+                } else {
+                    let mut tail = std::mem::take(&mut inner.partial);
+                    tail.append(&mut inner.staging);
+                    inner.eof = true;
+                    Some(Ok(tail))
+                }
+            }
+        };
+        match tail {
+            None => self.cv.notify_all(),
+            Some(Err(())) => {
+                self.fail_overflow();
+                self.inner.lock().unwrap_or_else(|err| err.into_inner()).eof = true;
+                self.cv.notify_all();
+            }
+            Some(Ok(tail)) => self.release_tail(tail),
+        }
     }
 
     fn wait(&self, timeout: Duration) {
@@ -597,33 +769,35 @@ impl StdoutSink for OutputSession {
     }
 
     fn on_leader(&self, exit: ChildExit) {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        self.emit_control(
-            ControlEvent::Exited {
-                session: self.session.session.clone(),
-                session_epoch: SessionEpoch(self.session.epoch),
+        let session = self.session.session.clone();
+        let epoch = self.session.epoch;
+        self.publish_with(0, true, move |seq| {
+            let event = ControlEvent::Exited {
+                session,
+                session_epoch: SessionEpoch(epoch),
                 seq,
                 exit,
-            },
-            true,
-            seq,
-        );
+            };
+            let envelope = control_len(&event);
+            (Body::Control(event), envelope)
+        });
     }
 
     fn on_cleanup(&self, complete: bool) {
         if !complete {
             return;
         }
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        self.emit_control(
-            ControlEvent::CleanupComplete {
-                session: self.session.session.clone(),
-                session_epoch: SessionEpoch(self.session.epoch),
+        let session = self.session.session.clone();
+        let epoch = self.session.epoch;
+        self.publish_with(0, false, move |seq| {
+            let event = ControlEvent::CleanupComplete {
+                session,
+                session_epoch: SessionEpoch(epoch),
                 seq,
-            },
-            false,
-            seq,
-        );
+            };
+            let envelope = control_len(&event);
+            (Body::Control(event), envelope)
+        });
     }
 
     fn stopped(&self) -> bool {
@@ -632,6 +806,28 @@ impl StdoutSink for OutputSession {
 }
 
 impl OutputSession {
+    /// Emit `tail` without adding an LF. A leftover newline is a separator, not payload.
+    fn release_tail(&self, mut tail: Vec<u8>) {
+        while let Some(pos) = tail.iter().position(|byte| *byte == b'\n') {
+            let mut rest = tail.split_off(pos);
+            let line = std::mem::take(&mut tail);
+            rest.remove(0);
+            tail = rest;
+            if line.len() > MAX_STDOUT_LINE {
+                self.fail_overflow();
+                return;
+            }
+            self.emit_line(line);
+        }
+        if tail.len() > MAX_STDOUT_LINE {
+            self.fail_overflow();
+            return;
+        }
+        if !tail.is_empty() {
+            self.emit_line(tail);
+        }
+    }
+
     fn flush_out(&self) -> bool {
         loop {
             let next = {
@@ -887,9 +1083,7 @@ fn wait_hold(dir: &std::path::Path, phase: &str, mut dropped: impl FnMut() -> bo
 }
 
 impl Sub {
-    fn wants(&self, event: &Logical) -> bool {
-        self.filter
-            .as_ref()
-            .is_none_or(|filter| filter == &event.session)
+    fn wants_key(&self, key: &StreamKey) -> bool {
+        self.filter.as_ref().is_none_or(|filter| filter == &key.0)
     }
 }

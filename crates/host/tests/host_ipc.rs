@@ -1082,7 +1082,10 @@ fn slow_subscriber_dropped_not_blocking() {
             HostEvent::Control(ControlEvent::SlowSubscriber { .. })
         )
     });
-    assert!(saw_slow || slow_count < 200);
+    assert!(
+        saw_slow,
+        "missing SlowSubscriber after the slow subscriber was dropped; lines {slow_count}"
+    );
 }
 
 #[test]
@@ -1121,12 +1124,23 @@ fn subscriber_count_queue_and_terminal_slot_are_bounded() {
     let new_epoch = epoch_of(&child);
     assert!(new_epoch > epoch);
     rpc.kill("slot", new_epoch, None).expect("second kill");
-    log.wait_until(Duration::from_secs(3), |events| {
-        controls(events)
-            .iter()
-            .any(|event| matches!(event, ControlEvent::SlowSubscriber { .. }))
-            || events.is_empty()
+    let held = log.wait_until(Duration::from_secs(3), |events| {
+        !events.is_empty()
+            && controls(events)
+                .iter()
+                .any(|event| matches!(event, ControlEvent::SlowSubscriber { .. }))
     });
+    let replaced = controls(&held).iter().any(|event| {
+        matches!(
+            event,
+            ControlEvent::Exited { session, session_epoch, .. }
+                if session.as_str() == "slot" && session_epoch.0 == new_epoch
+        )
+    });
+    assert!(
+        !replaced,
+        "occupied terminal slot was overwritten by the respawned exit"
+    );
     release(&daemon.paths.subscriber, "before-exited");
     let mut fresh = Rpc::connect(&endpoint);
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -1355,22 +1369,75 @@ fn claim_deadline_cannot_be_extended_by_input_progress() {
 
 #[test]
 fn caller_cancellation_does_not_drop_writer() {
-    let daemon = Daemon::start(DaemonOpts { chunk: None });
-    arm(&daemon.paths.barrier, "pending");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let daemon = Daemon::start(DaemonOpts { chunk: Some(4) });
+    arm(&daemon.paths.barrier, "before-first");
+    let endpoint = daemon.paths.endpoint.clone();
     let path = daemon.paths.transcript.clone();
-    let child = owner.spawn("cancel", &["record", path.to_str().unwrap()]);
+    let mut setup = Rpc::connect(&endpoint);
+    let child = setup.spawn("cancel", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
-    let lease = owner.claim("cancel", epoch).expect("lease");
-    let send = thread::spawn(move || owner.send("cancel", epoch, lease, "KEEP"));
-    wait_at(&daemon.paths.barrier, "pending");
-    let _ = wait_file(&path, |bytes| {
+    drop(setup);
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let (aborted_tx, aborted_rx) = std::sync::mpsc::channel::<()>();
+    let endpoint_task = endpoint.clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let task = runtime.spawn(async move {
+        let mut client = fl_host_proto::AsyncHostClient::connect(&endpoint_task)
+            .await
+            .expect("connect");
+        let response = client
+            .request(HostRequest::ClaimLease {
+                id: RequestId(1),
+                session: sid("cancel"),
+                expected_epoch: SessionEpoch(epoch),
+            })
+            .await
+            .expect("claim");
+        let HostResponse::Lease { lease, .. } = response else {
+            panic!("claim {response:?}");
+        };
+        let cancel = tokio::task::spawn_blocking(move || {
+            let _ = cancel_rx.recv();
+        });
+        {
+            let send = client.request(HostRequest::Send {
+                id: RequestId(2),
+                session: sid("cancel"),
+                expected_epoch: SessionEpoch(epoch),
+                lease,
+                line: "KEEP".into(),
+            });
+            tokio::pin!(send);
+            tokio::select! {
+                _ = &mut send => {}
+                _ = cancel => {}
+            }
+        }
+        // The request future is gone. The socket stays open until the sleep ends.
+        let _ = aborted_tx.send(());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drop(client);
+    });
+    wait_at(&daemon.paths.barrier, "before-first");
+    let early = std::fs::read(&path).unwrap_or_default();
+    assert!(
+        !early.windows(4).any(|window| window == b"KEEP"),
+        "writer was not blocked before the first byte: {early:?}"
+    );
+    cancel_tx.send(()).expect("cancel");
+    aborted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("request future was not aborted while the writer was blocked");
+    release(&daemon.paths.barrier, "before-first");
+    let text = wait_file(&path, |bytes| {
         bytes.windows(5).any(|window| window == b"KEEP\n")
     });
-    // Drop the caller while the writer is still inside the pending operation.
-    drop(send);
-    release(&daemon.paths.barrier, "pending");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    assert!(text.windows(5).any(|window| window == b"KEEP\n"));
+    let mut rpc = Rpc::connect(&endpoint);
     let renewed = rpc
         .claim("cancel", epoch)
         .expect("writer still accepts claims");
@@ -1382,6 +1449,8 @@ fn caller_cancellation_does_not_drop_writer() {
         bytes.windows(5).any(|window| window == b"NEXT\n")
     });
     assert!(text.windows(5).any(|window| window == b"KEEP\n"));
+    task.abort();
+    let _ = runtime.block_on(task);
 }
 
 #[test]

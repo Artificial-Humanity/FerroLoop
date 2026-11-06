@@ -15,16 +15,24 @@ use std::time::{Duration, Instant};
 
 use fl_host_proto::{HostError, windows_command_line, windows_environment_block};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_PIPE_CONNECTED, GENERIC_WRITE, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+    PIPE_ACCESS_INBOUND,
+};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, CreatePipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
@@ -54,7 +62,7 @@ pub fn spawn_in_job(
     publish: impl FnOnce(u32, u64) -> Result<(), HostError>,
 ) -> Result<JobChild, HostError> {
     let job = kill_on_close_job()?;
-    let stdin = inheritable_pipe(false)?;
+    let stdin = overlapped_stdin_pipe()?;
     let stdout = inheritable_pipe(true)?;
     let stderr = inheritable_pipe(true)?;
     clear_inherit(stdin.parent.as_raw_handle() as HANDLE)?;
@@ -333,6 +341,76 @@ fn kill_on_close_job() -> Result<OwnedHandle, HostError> {
 struct PipePair {
     parent: OwnedHandle,
     child: OwnedHandle,
+}
+
+/// Parent write end is overlapped so stdin `WriteFile` can be cancelled at the deadline.
+/// The child read end stays synchronous.
+fn overlapped_stdin_pipe() -> Result<PipePair, HostError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PIPE_SEQ: AtomicU64 = AtomicU64::new(1);
+    let mut last = HostError::Io("stdin pipe".into());
+    for _ in 0..8 {
+        let n = PIPE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!(r"\\.\pipe\fl-host-in-{}-{n}", std::process::id());
+        let wide = wide(&name);
+        let inherit = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: `wide` is NUL-terminated. The server end is the child's synchronous stdin.
+        let read = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                65_536,
+                65_536,
+                0,
+                &inherit,
+            )
+        };
+        if read.is_null() || read == INVALID_HANDLE_VALUE {
+            last = HostError::Io("stdin pipe".into());
+            continue;
+        }
+        let read = unsafe { OwnedHandle::from_raw_handle(read) };
+        let private = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 0,
+        };
+        // SAFETY: this opens the write end of `read`. Overlapped lets the host cancel it.
+        let write = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &private,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+        if write.is_null() || write == INVALID_HANDLE_VALUE {
+            last = HostError::Io("stdin pipe".into());
+            continue;
+        }
+        let write = unsafe { OwnedHandle::from_raw_handle(write) };
+        // SAFETY: the client is already connected. ERROR_PIPE_CONNECTED is that success.
+        let connected =
+            unsafe { ConnectNamedPipe(read.as_raw_handle() as HANDLE, ptr::null_mut()) };
+        if connected == 0 && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
+            last = HostError::Io("stdin pipe".into());
+            continue;
+        }
+        return Ok(PipePair {
+            parent: write,
+            child: read,
+        });
+    }
+    Err(last)
 }
 
 fn inheritable_pipe(parent_reads: bool) -> Result<PipePair, HostError> {

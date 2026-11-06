@@ -6,6 +6,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
+#[cfg(not(windows))]
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -611,6 +612,19 @@ impl WriterHandle {
                     self.abandon(job, written, SendBlock::Timeout);
                     return;
                 }
+                #[cfg(windows)]
+                WriteStep::Uncertain => {
+                    // The overlapped write was joined. The count is still not proven,
+                    // so the epoch stays fenced and a waiting claim must not succeed.
+                    self.finish_active(0);
+                    let mut state = self.lock();
+                    state.uncertain = true;
+                    self.fence_locked(&mut state);
+                    let _ = job.reply.send(SendOutcome::Ambiguous {
+                        reason: SendBlock::Timeout,
+                    });
+                    return;
+                }
                 WriteStep::Wrote(n) => written = written.saturating_add(n),
                 WriteStep::Closed => {
                     self.abandon(job, written, SendBlock::Io);
@@ -806,29 +820,40 @@ enum Pause {
 
 enum WriteStep {
     Wrote(usize),
+    /// Deadline expired before this call started an OS write.
     Timeout,
+    /// A started Windows write was cancelled and its byte count could not be proven.
+    #[cfg(windows)]
+    Uncertain,
     Closed,
     Err,
 }
 
 fn write_some(file: &mut File, buf: &[u8], deadline: Instant) -> WriteStep {
-    if buf.is_empty() {
-        return WriteStep::Wrote(0);
+    #[cfg(windows)]
+    {
+        return write_some_windows(file, buf, deadline);
     }
-    loop {
-        if Instant::now() >= deadline {
-            return WriteStep::Timeout;
+    #[cfg(not(windows))]
+    {
+        if buf.is_empty() {
+            return WriteStep::Wrote(0);
         }
-        match file.write(buf) {
-            Ok(0) => return WriteStep::Closed,
-            Ok(n) => return WriteStep::Wrote(n),
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                if !wait_writable(file, deadline) {
-                    return WriteStep::Timeout;
-                }
+        loop {
+            if Instant::now() >= deadline {
+                return WriteStep::Timeout;
             }
-            Err(_) => return WriteStep::Err,
+            match file.write(buf) {
+                Ok(0) => return WriteStep::Closed,
+                Ok(n) => return WriteStep::Wrote(n),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if !wait_writable(file, deadline) {
+                        return WriteStep::Timeout;
+                    }
+                }
+                Err(_) => return WriteStep::Err,
+            }
         }
     }
 }
@@ -849,7 +874,7 @@ fn wait_writable(file: &File, deadline: Instant) -> bool {
     rc >= 0 || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn wait_writable(_file: &File, deadline: Instant) -> bool {
     let remain = deadline.saturating_duration_since(Instant::now());
     if remain.is_zero() {
@@ -857,6 +882,111 @@ fn wait_writable(_file: &File, deadline: Instant) -> bool {
     }
     thread::sleep(remain.min(Duration::from_millis(50)));
     Instant::now() < deadline
+}
+
+#[cfg(windows)]
+fn write_some_windows(file: &mut File, buf: &[u8], deadline: Instant) -> WriteStep {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+        GetLastError, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    if buf.is_empty() {
+        return WriteStep::Wrote(0);
+    }
+    if Instant::now() >= deadline {
+        return WriteStep::Timeout;
+    }
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: manual-reset event used only as the overlapped signal for this write.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return WriteStep::Err;
+    }
+    struct CloseEvent(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for CloseEvent {
+        fn drop(&mut self) {
+            // SAFETY: `0` is the event created above and not yet closed.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    let _event = CloseEvent(event);
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.hEvent = event;
+    let mut written = 0u32;
+    let to_write = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // SAFETY: `handle` is the session stdin write end, opened overlapped. `buf` stays
+    // borrowed until this function joins the operation. `overlapped` stays on this stack.
+    let started = unsafe {
+        WriteFile(
+            handle,
+            buf.as_ptr(),
+            to_write,
+            &mut written,
+            &mut overlapped,
+        )
+    };
+    if started != 0 {
+        return if written == 0 {
+            WriteStep::Closed
+        } else {
+            WriteStep::Wrote(written as usize)
+        };
+    }
+    let err = unsafe { GetLastError() };
+    if err != ERROR_IO_PENDING {
+        return if err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA {
+            WriteStep::Closed
+        } else {
+            WriteStep::Err
+        };
+    }
+    let remain = deadline.saturating_duration_since(Instant::now());
+    let millis = u32::try_from(remain.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: `event` is the overlapped event. A timeout returns so the write can be cancelled.
+    let waited = unsafe { WaitForSingleObject(event, millis) };
+    if waited == WAIT_OBJECT_0 {
+        let mut transferred = 0u32;
+        // SAFETY: the write completed. `bWait` is false because the event is already signaled.
+        let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) };
+        if ok != 0 {
+            return if transferred == 0 {
+                WriteStep::Closed
+            } else {
+                WriteStep::Wrote(transferred as usize)
+            };
+        }
+        let err = unsafe { GetLastError() };
+        return if err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA {
+            WriteStep::Closed
+        } else {
+            WriteStep::Err
+        };
+    }
+    // SAFETY: cancel this operation only. The following get joins it before the buffer ends.
+    unsafe { CancelIoEx(handle, &overlapped) };
+    let mut transferred = 0u32;
+    // SAFETY: `bWait` joins the cancelled or raced write before the caller fences stdin.
+    let ok = unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) };
+    if ok != 0 {
+        return if transferred == 0 {
+            WriteStep::Closed
+        } else {
+            WriteStep::Wrote(transferred as usize)
+        };
+    }
+    let err = unsafe { GetLastError() };
+    if err == ERROR_OPERATION_ABORTED {
+        WriteStep::Uncertain
+    } else if err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA {
+        WriteStep::Closed
+    } else {
+        WriteStep::Err
+    }
 }
 
 fn signal_session(session: &Session, signal: SignalKind) -> Result<(), String> {
