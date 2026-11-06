@@ -6,15 +6,15 @@ use std::time::Duration;
 use fl_host_proto::{
     ChildExit, ChildRecord, ChildState, ControllerLease, DEFAULT_MAX_SESSIONS, EventSeq,
     FRAME_READ_TIMEOUT, Frame, FrameKind, HANDSHAKE_TIMEOUT, HostError, HostEvent, HostRequest,
-    HostResponse, InputState, LineReassembler, MAX_ARG_BYTES, MAX_ARGV, MAX_ARGV_AGGREGATE,
-    MAX_CWD_BYTES, MAX_ENV_AGGREGATE, MAX_ENV_ENTRIES, MAX_ENV_NAME, MAX_ENV_VALUE,
-    MAX_EVENT_ENVELOPE, MAX_FRAGMENTS, MAX_FRAME_PAYLOAD, MAX_LINE_BYTES, MAX_REASSEMBLY_BYTES,
-    MAX_STDOUT_LINE, MAX_SUBSCRIBERS, MAX_UNAUTH_PAYLOAD, MAX_WINDOWS_COMMAND_UNITS, RequestId,
-    ResponseCorrelator, STDERR_TAIL_BYTES, STDIN_QUEUE_BYTES, STDIN_QUEUE_FRAMES,
-    STDIN_WRITE_TIMEOUT, SendBlock, SendOutcome, SessionEpoch, SessionId, SignalKind, SpawnKind,
-    SpawnSpec, WRITE_TIMEOUT, checked_frame_len, checked_unauth_len, decode_request,
-    encode_request, fragment_line, frame_total_len, read_frame, windows_command_line,
-    windows_environment_block,
+    HostResponse, InputState, LINE_HEADER_LEN, LineReassembler, MAX_ARG_BYTES, MAX_ARGV,
+    MAX_ARGV_AGGREGATE, MAX_CWD_BYTES, MAX_ENV_AGGREGATE, MAX_ENV_ENTRIES, MAX_ENV_NAME,
+    MAX_ENV_VALUE, MAX_EVENT_ENVELOPE, MAX_FRAGMENTS, MAX_FRAME_PAYLOAD, MAX_LINE_BYTES,
+    MAX_REASSEMBLY_BYTES, MAX_STDOUT_LINE, MAX_SUBSCRIBERS, MAX_UNAUTH_PAYLOAD,
+    MAX_WINDOWS_COMMAND_UNITS, RequestId, ResponseCorrelator, STDERR_TAIL_BYTES, STDIN_QUEUE_BYTES,
+    STDIN_QUEUE_FRAMES, STDIN_WRITE_TIMEOUT, SendBlock, SendOutcome, SessionEpoch, SessionId,
+    SignalKind, SpawnKind, SpawnSpec, WRITE_TIMEOUT, checked_frame_len, checked_unauth_len,
+    decode_request, encode_request, fragment_line, frame_total_len, read_frame,
+    windows_command_line, windows_environment_block,
 };
 
 struct HeaderOnly {
@@ -189,8 +189,14 @@ fn reassembly_cap_checked_before_append() {
 fn fragment_count_and_connection_allocation_are_bounded() {
     assert_eq!(MAX_FRAGMENTS, 64);
     assert_eq!(MAX_REASSEMBLY_BYTES, MAX_LINE_BYTES + MAX_EVENT_ENVELOPE);
+    // Sixty-four header copies are 5248 bytes and do not fit the 4 KiB envelope.
+    const {
+        assert!(MAX_FRAGMENTS * LINE_HEADER_LEN > MAX_EVENT_ENVELOPE);
+    };
+    let fit = MAX_EVENT_ENVELOPE / LINE_HEADER_LEN;
+    assert!(fit > 0 && fit < MAX_FRAGMENTS);
     let mut reassembler = LineReassembler::new();
-    for index in 0..MAX_FRAGMENTS {
+    for index in 0..fit {
         let frame = fl_host_proto::line_fragment(
             &session("frag"),
             SessionEpoch(1),
@@ -203,10 +209,46 @@ fn fragment_count_and_connection_allocation_are_bounded() {
     }
     let before = reassembler.allocated();
     let extra =
-        fl_host_proto::line_fragment(&session("frag"), SessionEpoch(1), 8, false, b"Z").unwrap();
-    assert!(reassembler.push_frame(&extra).is_err());
+        fl_host_proto::line_fragment(&session("frag"), SessionEpoch(1), 8, true, b"Z").unwrap();
+    assert!(matches!(
+        reassembler.push_frame(&extra),
+        Err(HostError::EventTooLarge)
+    ));
     assert_eq!(reassembler.allocated(), before);
-    assert_eq!(reassembler.fragment_count(), MAX_FRAGMENTS);
+    assert_eq!(reassembler.fragment_count(), fit);
+    assert!(reassembler.completed().is_none());
+}
+
+#[test]
+fn event_envelope_one_over_is_refused_before_append() {
+    let fit = MAX_EVENT_ENVELOPE / LINE_HEADER_LEN;
+    assert!(fit * LINE_HEADER_LEN <= MAX_EVENT_ENVELOPE);
+    assert!((fit + 1) * LINE_HEADER_LEN > MAX_EVENT_ENVELOPE);
+    let mut reassembler = LineReassembler::new();
+    for index in 0..fit {
+        let frame = fl_host_proto::line_fragment(
+            &session("env"),
+            SessionEpoch(1),
+            1,
+            true,
+            &[u8::try_from(index).unwrap_or(1)],
+        )
+        .unwrap();
+        assert!(reassembler.push_frame(&frame).unwrap().is_none());
+    }
+    let before = reassembler.allocated();
+    assert!(before <= MAX_REASSEMBLY_BYTES);
+    assert_eq!(
+        before,
+        fit + fit * LINE_HEADER_LEN,
+        "one raw byte per fragment plus its header"
+    );
+    let one_over =
+        fl_host_proto::line_fragment(&session("env"), SessionEpoch(1), 1, false, b"X").unwrap();
+    let err = reassembler.push_frame(&one_over).unwrap_err();
+    assert!(matches!(err, HostError::EventTooLarge), "{err}");
+    assert_eq!(reassembler.allocated(), before);
+    assert_eq!(reassembler.fragment_count(), fit);
     assert!(reassembler.completed().is_none());
 }
 

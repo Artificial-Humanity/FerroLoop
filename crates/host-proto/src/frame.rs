@@ -316,6 +316,17 @@ impl LineReassembler {
             .saturating_add(self.fragments.saturating_mul(LINE_HEADER_LEN))
     }
 
+    pub fn has_open_chain(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Drop an unfinished chain. A later fragment must not continue it.
+    pub fn discard_chain(&mut self) {
+        self.open = None;
+        self.raw = Vec::new();
+        self.fragments = 0;
+    }
+
     pub fn completed(&self) -> Option<&HostEvent> {
         self.completed.as_ref()
     }
@@ -350,6 +361,12 @@ impl LineReassembler {
         if new_fragments > MAX_FRAGMENTS {
             return Err(HostError::EventTooLarge);
         }
+        let header_bytes = new_fragments
+            .checked_mul(LINE_HEADER_LEN)
+            .ok_or(HostError::EventTooLarge)?;
+        if header_bytes > MAX_EVENT_ENVELOPE {
+            return Err(HostError::EventTooLarge);
+        }
         let new_raw = self
             .raw
             .len()
@@ -358,8 +375,10 @@ impl LineReassembler {
         if new_raw > MAX_LINE_BYTES {
             return Err(HostError::EventTooLarge);
         }
-        let new_alloc = new_raw.saturating_add(new_fragments.saturating_mul(LINE_HEADER_LEN));
-        if new_alloc > MAX_REASSEMBLY_BYTES || LINE_HEADER_LEN > MAX_EVENT_ENVELOPE {
+        let new_alloc = new_raw
+            .checked_add(header_bytes)
+            .ok_or(HostError::EventTooLarge)?;
+        if new_alloc > MAX_REASSEMBLY_BYTES {
             return Err(HostError::EventTooLarge);
         }
         if self.open.is_none() {

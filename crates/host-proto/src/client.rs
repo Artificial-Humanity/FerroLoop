@@ -8,12 +8,19 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::auth::{self, Deadlines};
+use crate::auth;
+#[cfg(unix)]
+use crate::auth::Deadlines;
 use crate::endpoint::HostEndpoint;
 use crate::frame::{LineReassembler, ResponseCorrelator, decode_response, encode_request};
+#[cfg(unix)]
+use crate::types::AuthToken;
+#[cfg(unix)]
+use crate::types::HANDSHAKE_TIMEOUT;
+#[cfg(unix)]
+use crate::types::constant_time_eq;
 use crate::types::{
-    AuthToken, FRAME_READ_TIMEOUT, HANDSHAKE_TIMEOUT, HostError, HostEvent, HostRequest,
-    HostResponse, SessionId, WRITE_TIMEOUT, constant_time_eq,
+    FRAME_READ_TIMEOUT, HostError, HostEvent, HostRequest, HostResponse, SessionId, WRITE_TIMEOUT,
 };
 
 #[derive(Clone)]
@@ -21,6 +28,9 @@ pub struct ConnectOptions {
     pub major: u16,
     pub minor: u16,
     pub pre_proof: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs after the token snapshot and before the platform open.
+    /// A rename here is still authenticated; it is not a bypass.
+    pub pre_connect: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for ConnectOptions {
@@ -29,6 +39,7 @@ impl Default for ConnectOptions {
             major: crate::PROTO_MAJOR,
             minor: crate::PROTO_MINOR,
             pre_proof: None,
+            pre_connect: None,
         }
     }
 }
@@ -38,6 +49,8 @@ enum ClientIo {
     Unix(tokio::net::UnixStream),
     #[cfg(windows)]
     Pipe(tokio::net::windows::named_pipe::NamedPipeClient),
+    #[cfg(test)]
+    Mem(tokio::io::DuplexStream),
 }
 
 enum SessionMode {
@@ -136,6 +149,25 @@ impl AsyncHostClient {
     pub fn into_stream(self) -> tokio::net::UnixStream {
         match self.io {
             ClientIo::Unix(stream) => stream,
+            #[cfg(test)]
+            ClientIo::Mem(_) => panic!("memory client has no unix stream"),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_pipe(
+        pipe: tokio::net::windows::named_pipe::NamedPipeClient,
+        major: u16,
+        minor: u16,
+    ) -> Self {
+        Self {
+            io: ClientIo::Pipe(pipe),
+            major,
+            minor,
+            correlator: ResponseCorrelator::new(),
+            frame_timeout: FRAME_READ_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
+            mode: SessionMode::Rpc,
         }
     }
 }
@@ -172,10 +204,20 @@ impl HostEventStream {
         loop {
             let frame = read_idle_client(&mut self.client.io, self.client.frame_timeout).await?;
             if frame.kind == crate::FrameKind::Line {
-                if let Some(event) = self.lines.push_frame(&frame)? {
-                    return Ok(event);
+                match self.lines.push_frame(&frame) {
+                    Ok(Some(event)) => return Ok(event),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        self.lines.discard_chain();
+                        return Err(err);
+                    }
                 }
-                continue;
+            }
+            if self.lines.has_open_chain() {
+                self.lines.discard_chain();
+                return Err(HostError::Protocol(
+                    "control frame interleaved with a line chain".into(),
+                ));
             }
             if frame.kind == crate::FrameKind::Event {
                 let event = serde_json::from_slice(&frame.payload)
@@ -236,6 +278,9 @@ async fn connect_unix(
     token: &AuthToken,
     options: &ConnectOptions,
 ) -> Result<AsyncHostClient, HostError> {
+    if let Some(hook) = &options.pre_connect {
+        hook();
+    }
     let stream = tokio::net::UnixStream::connect(endpoint.socket_path())
         .await
         .map_err(|err| HostError::Io(err.to_string()))?;
@@ -280,6 +325,7 @@ fn canonical_unix(endpoint: &HostEndpoint) -> Result<HostEndpoint, HostError> {
     HostEndpoint::unix(path)
 }
 
+#[cfg(unix)]
 fn client_deadlines() -> Deadlines {
     Deadlines {
         handshake: HANDSHAKE_TIMEOUT,
@@ -298,6 +344,8 @@ async fn write_client(
         ClientIo::Unix(stream) => auth::write_frame_async(stream, frame, deadline).await,
         #[cfg(windows)]
         ClientIo::Pipe(stream) => auth::write_frame_async(stream, frame, deadline).await,
+        #[cfg(test)]
+        ClientIo::Mem(stream) => auth::write_frame_async(stream, frame, deadline).await,
     }
 }
 
@@ -312,5 +360,103 @@ async fn read_idle_client(io: &mut ClientIo, timeout: Duration) -> Result<crate:
         ClientIo::Unix(stream) => auth::read_frame_idle(stream, timeout).await,
         #[cfg(windows)]
         ClientIo::Pipe(stream) => auth::read_frame_idle(stream, timeout).await,
+        #[cfg(test)]
+        ClientIo::Mem(stream) => auth::read_frame_idle(stream, timeout).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{Frame, FrameKind, line_fragment, write_frame};
+    use crate::types::{ChildExit, ControlEvent, HostEvent, SessionEpoch, SessionId};
+    use tokio::io::AsyncWriteExt;
+
+    fn write_one(bytes: &mut Vec<u8>, frame: &Frame) {
+        write_frame(bytes, frame).unwrap();
+    }
+
+    async fn send(stream: &mut tokio::io::DuplexStream, frame: &Frame) {
+        let mut bytes = Vec::new();
+        write_one(&mut bytes, frame);
+        stream.write_all(&bytes).await.unwrap();
+    }
+
+    fn memory_stream() -> (HostEventStream, tokio::io::DuplexStream) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let events = HostEventStream {
+            client: AsyncHostClient {
+                io: ClientIo::Mem(client),
+                major: 1,
+                minor: 0,
+                correlator: ResponseCorrelator::new(),
+                frame_timeout: Duration::from_secs(2),
+                write_timeout: Duration::from_secs(2),
+                mode: SessionMode::Stream,
+            },
+            lines: LineReassembler::new(),
+        };
+        (events, server)
+    }
+
+    fn control_frame() -> Frame {
+        let payload = serde_json::to_vec(&ControlEvent::Exited {
+            session: SessionId::new("s").unwrap(),
+            session_epoch: SessionEpoch(1),
+            seq: 4,
+            exit: ChildExit {
+                code: Some(0),
+                signal: None,
+            },
+        })
+        .unwrap();
+        Frame {
+            kind: FrameKind::Event,
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_frame_inside_an_open_line_chain_is_refused() {
+        let (mut events, mut server) = memory_stream();
+        let open = line_fragment(
+            &SessionId::new("s").unwrap(),
+            SessionEpoch(1),
+            1,
+            true,
+            b"ab",
+        )
+        .unwrap();
+        send(&mut server, &open).await;
+        send(&mut server, &control_frame()).await;
+        let err = events.next().await.unwrap_err();
+        assert!(
+            matches!(err, HostError::Protocol(ref text) if text.contains("interleaved")),
+            "{err:?}"
+        );
+        assert!(!events.lines.has_open_chain());
+        let done = line_fragment(
+            &SessionId::new("s").unwrap(),
+            SessionEpoch(1),
+            2,
+            false,
+            b"ok",
+        )
+        .unwrap();
+        send(&mut server, &done).await;
+        match events.next().await.unwrap() {
+            HostEvent::Line { seq, bytes, .. } => {
+                assert_eq!(seq, 2);
+                assert_eq!(bytes, b"ok");
+            }
+            other => panic!("discarded chain must not swallow the next line: {other:?}"),
+        }
+
+        let (mut events, mut server) = memory_stream();
+        send(&mut server, &control_frame()).await;
+        assert!(matches!(
+            events.next().await.unwrap(),
+            HostEvent::Control(_)
+        ));
     }
 }

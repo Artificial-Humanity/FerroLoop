@@ -15,6 +15,7 @@ use crate::endpoint::HostEndpoint;
 use crate::frame::{decode_request, encode_response};
 use crate::types::{AuthToken, HostError, HostRequest, HostResponse};
 
+#[cfg(unix)]
 pub(crate) mod unix;
 #[cfg(unix)]
 pub use unix::interpret_ucred;
@@ -35,6 +36,16 @@ struct Shared {
     major: u16,
     minor: u16,
     identity: Vec<u8>,
+    failures: std::sync::Mutex<Option<HostError>>,
+}
+
+impl Shared {
+    fn note_handshake_failure(&self, err: HostError) {
+        *self
+            .failures
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(err);
+    }
 }
 
 struct Slot(Arc<Shared>);
@@ -66,8 +77,6 @@ enum ConnIo {
     Unix(tokio::net::UnixStream),
     #[cfg(windows)]
     Server(tokio::net::windows::named_pipe::NamedPipeServer),
-    #[cfg(windows)]
-    Client(tokio::net::windows::named_pipe::NamedPipeClient),
 }
 
 pub struct HostConn {
@@ -147,6 +156,14 @@ impl HostListener {
 
     pub fn handshake_attempts(&self) -> usize {
         self.shared.attempts.load(Ordering::SeqCst)
+    }
+
+    pub fn handshake_error(&self) -> Option<HostError> {
+        self.shared
+            .failures
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     pub fn authenticated_requests(&self) -> usize {
@@ -231,6 +248,7 @@ fn spawn_unix(config: HostConfig, setup: unix::UnixSetup) -> HostListener {
         major: config.major,
         minor: config.minor,
         identity: setup.identity,
+        failures: std::sync::Mutex::new(None),
     });
     let (tx, rx) = mpsc::channel(64);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -265,8 +283,11 @@ fn spawn_unix(config: HostConfig, setup: unix::UnixSetup) -> HostListener {
                     tokio::spawn(async move {
                         let _slot = slot;
                         shared.attempts.fetch_add(1, Ordering::SeqCst);
-                        if let Ok(conn) = admit(shared, ConnIo::Unix(stream)).await {
-                            let _ = tx.send(conn).await;
+                        match admit(Arc::clone(&shared), ConnIo::Unix(stream)).await {
+                            Ok(conn) => {
+                                let _ = tx.send(conn).await;
+                            }
+                            Err(err) => shared.note_handshake_failure(err),
                         }
                     });
                 }
@@ -333,10 +354,6 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
             .await?;
             ConnIo::Server(stream)
         }
-        #[cfg(windows)]
-        ConnIo::Client(_) => {
-            return Err(HostError::Protocol("client pipe is not a listener".into()));
-        }
     };
     Ok(HostConn {
         io,
@@ -353,8 +370,6 @@ async fn read_idle(io: &mut ConnIo, timeout: Duration) -> Result<crate::Frame, H
         ConnIo::Unix(stream) => auth::read_frame_idle(stream, timeout).await,
         #[cfg(windows)]
         ConnIo::Server(stream) => auth::read_frame_idle(stream, timeout).await,
-        #[cfg(windows)]
-        ConnIo::Client(stream) => auth::read_frame_idle(stream, timeout).await,
     }
 }
 
@@ -368,7 +383,5 @@ async fn write_frame(
         ConnIo::Unix(stream) => auth::write_frame_async(stream, frame, deadline).await,
         #[cfg(windows)]
         ConnIo::Server(stream) => auth::write_frame_async(stream, frame, deadline).await,
-        #[cfg(windows)]
-        ConnIo::Client(stream) => auth::write_frame_async(stream, frame, deadline).await,
     }
 }

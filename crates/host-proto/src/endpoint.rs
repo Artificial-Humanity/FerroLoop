@@ -111,7 +111,7 @@ impl HostEndpoint {
         }
         #[cfg(windows)]
         {
-            return Self::windows("fl-host", &crate::transport::windows::current_sid_string()?);
+            Self::windows("fl-host", &crate::transport::windows::current_sid_string()?)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
@@ -243,9 +243,4 @@ fn socket_path_fits(path: &Path) -> bool {
 pub(crate) fn unix_euid() -> u32 {
     // SAFETY: geteuid has no arguments and cannot fail.
     unsafe { libc::geteuid() }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn unix_euid() -> u32 {
-    0
 }

@@ -1,19 +1,27 @@
 //! Authenticated transport, endpoint ownership, and platform policy tests.
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use fl_host_proto::{
-    AsyncHostClient, AuthToken, BindDisposition, BlockingHostClient, ConnectOptions, Deadlines,
-    FirstInstance, FrameKind, HANDSHAKE_TIMEOUT, HandshakeParams, HostConfig, HostEndpoint,
-    HostError, HostListener, HostRequest, HostResponse, InstanceLedger, MAX_UNAUTHENTICATED,
-    MutexFastPath, NamedPipeClientOptions, NamedPipeServerOptions, PROTO_MAJOR, PROTO_MINOR,
-    PeerQuery, RequestId, TokenFileCreate, WinPeerLookup, auth_transcript, client_hello_frame,
-    client_proof, decode_challenge, read_frame_async, server_handshake, server_proof,
-    supports_message, validate_unix_peer, verify_client_proof, verify_server_proof,
-    write_frame_async,
+    AsyncHostClient, BlockingHostClient, ConnectOptions, Deadlines, FrameKind, HANDSHAKE_TIMEOUT,
+    HandshakeParams, HostListener, HostRequest, HostResponse, MAX_UNAUTHENTICATED, PROTO_MAJOR,
+    PROTO_MINOR, RequestId, client_hello_frame, decode_challenge, read_frame_async,
+    server_handshake, supports_message, write_frame_async,
+};
+use fl_host_proto::{
+    AuthToken, BindDisposition, FirstInstance, HostConfig, HostEndpoint, HostError, InstanceLedger,
+    MutexFastPath, NamedPipeClientOptions, NamedPipeServerOptions, PeerQuery, TokenFileCreate,
+    WinPeerLookup, auth_transcript, client_proof, server_proof, validate_unix_peer,
+    verify_client_proof, verify_server_proof,
 };
 
+#[cfg(unix)]
 fn short_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -31,7 +39,9 @@ fn short_dir() -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 struct Tmp(PathBuf);
+#[cfg(unix)]
 impl Tmp {
     fn new() -> Self {
         Self(short_dir())
@@ -40,16 +50,19 @@ impl Tmp {
         &self.0
     }
 }
+#[cfg(unix)]
 impl Drop for Tmp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(unix)]
 fn endpoint(dir: &Path) -> HostEndpoint {
     HostEndpoint::unix(dir.join("h.sock")).unwrap()
 }
 
+#[cfg(unix)]
 fn config(dir: &Path) -> HostConfig {
     let mut config = HostConfig::new(endpoint(dir));
     config.daemon_version = "fl-host-version-unique-zz".into();
@@ -69,6 +82,7 @@ fn mode(path: &Path) -> u32 {
         & 0o777
 }
 
+#[cfg(unix)]
 fn deadlines() -> Deadlines {
     Deadlines {
         handshake: Duration::from_secs(2),
@@ -543,8 +557,30 @@ mod unix_transport {
         let mut listener = HostListener::bind(config).await.unwrap();
         let endpoint = listener.endpoint().clone();
         assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(5));
-        let stalled = std::os::unix::net::UnixStream::connect(endpoint.socket_path()).unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        let stalled = tokio::net::UnixStream::connect(endpoint.socket_path())
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let limit = Duration::from_millis(1500);
+        let err = loop {
+            if let Some(err) = listener.handshake_error() {
+                break err;
+            }
+            if started.elapsed() > limit {
+                panic!("stalled peer was not refused within the handshake deadline");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(
+            matches!(err, HostError::FrameTimeout),
+            "configured deadline must surface the timeout, got {err:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "failed before the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < limit);
         drop(stalled);
         let accept = tokio::spawn(async move { listener.accept().await });
         AsyncHostClient::connect(&endpoint).await.unwrap();
@@ -760,21 +796,46 @@ mod unix_transport {
 
     #[tokio::test]
     async fn pathname_swap_cannot_bypass_peer_and_token_auth() {
-        let left = Tmp::new();
-        let right = Tmp::new();
-        let listener_a = HostListener::bind(config(left.path())).await.unwrap();
-        let listener_b = HostListener::bind(config(right.path())).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = Tmp::new();
+        let a_dir = root.path().join("a");
+        let b_dir = root.path().join("b");
+        let hidden = root.path().join("a.hidden");
+        for dir in [&a_dir, &b_dir] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let listener_a = HostListener::bind(config(&a_dir)).await.unwrap();
+        let listener_b = HostListener::bind(config(&b_dir)).await.unwrap();
         let endpoint_a = listener_a.endpoint().clone();
-        let endpoint_b = listener_b.endpoint().clone();
-        let stream = tokio::net::UnixStream::connect(endpoint_b.socket_path())
-            .await
-            .unwrap();
-        let err = AsyncHostClient::connect_preconnected(&endpoint_a, stream)
+        AsyncHostClient::connect(&endpoint_a).await.unwrap();
+        let did_swap = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&did_swap);
+        let from = a_dir.clone();
+        let onto_hidden = hidden.clone();
+        let other = b_dir.clone();
+        let onto = a_dir.clone();
+        let options = ConnectOptions {
+            pre_connect: Some(Arc::new(move || {
+                if flag.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                // Rename the resolved directory entry before connect(2).
+                std::fs::rename(&from, &onto_hidden).unwrap();
+                std::fs::rename(&other, &onto).unwrap();
+            })),
+            ..ConnectOptions::default()
+        };
+        let err = AsyncHostClient::connect_with(&endpoint_a, options)
             .await
             .unwrap_err();
+        assert!(did_swap.load(Ordering::SeqCst));
+        assert!(hidden.join("h.sock").exists());
+        assert!(a_dir.join("h.sock").exists());
         assert!(matches!(err, HostError::Auth), "{err}");
-        // Directory-fd pinning does not make the pathname resolution race-free.
-        // Peer uid and the token proof still fail closed, including foreign root.
+        // Directory-fd pinning does not cover this rename. Peer uid and the
+        // token proof fail closed. The race is not claimed to be impossible.
         assert!(validate_unix_peer(PeerQuery::Uid(0), 1000).is_err());
         drop(listener_a);
         drop(listener_b);
