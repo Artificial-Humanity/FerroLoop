@@ -1032,7 +1032,7 @@ fn a_record_of_another_vendor_or_a_decommissioned_one_is_not_used() {
 }
 
 #[test]
-fn another_vendor_is_refused_and_a_record_only_session_stores_for_the_next_launch() {
+fn another_vendor_is_refused_and_a_record_only_session_is_stored() {
     let _lock = crate::TMUX_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
