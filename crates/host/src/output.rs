@@ -265,11 +265,7 @@ fn assign(sub: &mut Sub, event: &Arc<Logical>, preexisting: bool) -> Assign {
     if event.exited {
         if sub.terminals.contains_key(&event.session) || sub.terminals.len() >= TERMINAL_SLOTS {
             track.delivered.remove(&sub.id);
-            return if preexisting {
-                Assign::Skip
-            } else {
-                Assign::Overflow
-            };
+            return Assign::Overflow;
         }
         track.holders = track.holders.saturating_add(1);
         sub.terminals
@@ -1179,13 +1175,71 @@ mod tests {
         assert_eq!(sub.next_event(&hub).unwrap().epoch, 1);
         sub.abandon(&hub);
         let next = hub.subscribe(None, None).ok().unwrap();
-        let event = next.next_event(&hub).unwrap();
-        assert_eq!(event.epoch, 1);
-        next.pop_sent(&hub, &event);
-        settle(&event, true);
-        hub.pull_preexisting();
-        assert_eq!(next.next_event(&hub).unwrap().epoch, 2);
+        assert!(next.want_slow(&hub));
+        assert_eq!(next.next_event(&hub).unwrap().epoch, 1);
         next.abandon(&hub);
+    }
+
+    #[test]
+    fn historical_occupied_exit_slot_marks_slow_and_teardown_preserves_unread_output() {
+        let hub = Arc::new(Hub::new());
+        let first = fixture(1, &hub);
+        let second = fixture(2, &hub);
+        first.emit_line(b"first epoch".to_vec());
+        first.on_leader(ChildExit {
+            code: Some(1),
+            signal: None,
+        });
+        second.emit_line(b"second epoch".to_vec());
+        second.on_leader(ChildExit {
+            code: Some(2),
+            signal: None,
+        });
+
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert!(sub.want_slow(&hub));
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            let state = &fanout.subs[0];
+            assert_eq!(state.queue.len(), 2);
+            assert_eq!(state.terminals.len(), 1);
+            let terminal = state.terminals.get("same").unwrap();
+            assert_eq!(terminal.epoch, 1);
+            assert!(matches!(
+                &terminal.body,
+                Body::Control(ControlEvent::Exited { exit, .. }) if exit.code == Some(1)
+            ));
+            let pending = second.inner.lock().unwrap();
+            let refused = pending.events.iter().find(|event| event.exited).unwrap();
+            let track = refused.track.lock().unwrap();
+            assert_eq!(track.holders, 0);
+            assert!(!track.delivered.contains(&sub.id));
+        }
+
+        sub.abandon(&hub);
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            let state = &fanout.subs[0];
+            assert!(state.dropped);
+            assert!(state.queue.is_empty());
+            assert_eq!(state.queued_bytes, 0);
+            assert!(state.terminals.is_empty());
+            assert!(state.cursors.is_empty());
+        }
+        for (output, expected) in [
+            (&first, b"first epoch".as_slice()),
+            (&second, b"second epoch".as_slice()),
+        ] {
+            let pending = output.inner.lock().unwrap();
+            assert_eq!(pending.events.len(), 2);
+            assert!(matches!(&pending.events[0].body, Body::Line(raw) if raw == expected));
+            for event in &pending.events {
+                let track = event.track.lock().unwrap();
+                assert_eq!(track.holders, 0);
+                assert_eq!(track.completes, 0);
+                assert!(!track.retired);
+            }
+        }
     }
 
     #[test]
