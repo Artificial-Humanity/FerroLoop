@@ -157,8 +157,11 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
   prepares:u8, attempts:Vec<AttemptSummary>, acknowledgment:AcknowledgmentState, held:Option<HoldReason>, annotation:String }`;
   row schema starts at 1.
 - `CapacityState::{Held,Released,Retired}` is a fixed-size persisted per-attempt flag; `Retired` is a permanent capacity-only tombstone.
-  `LifetimeRegistration { id:Digest, revision:Revision, home:Digest, boot:Digest, emitter_scope:Digest }` identifies the trusted registered local worker
-  and its complete possible-emitter scope, not a numeric PID. Add `lifetime:LifetimeRegistration` to `AttemptBinding` before prepare/arm.
+  `LifetimeRegistration { id:Digest, revision:Revision, home:Digest, boot:Digest, instance:InstanceId, worker:WorkerId,
+  connection:ConnectionId, emitter_scope:Digest }` is a pure persisted descriptor of the exact registered local worker and its complete
+  possible-emitter scope, not a numeric PID. Its public data/serde construction conveys no authority: only an exact immutable row minted
+  by Task 3 admission and independently validated by the owning store is accepted; neither a copied descriptor nor a caller revision
+  enrolls a scope. Add `lifetime:LifetimeRegistration` to `AttemptBinding` before prepare/arm.
   `ActiveOwner { key:DeliveryKey, attempt:AttemptBinding }` includes the exact token/instance/worker/connection and lifetime registration;
   `CapacityRetirementTarget { owner:ActiveOwner, record_revision:Revision, recipient_revision:Revision, global_revision:Revision }`.
 - `RecipientControl { binding:Binding, revision:Revision, active:Option<ActiveOwner>, barrier:Option<DeliveryKey>, identity_conflict:bool }`;
@@ -193,14 +196,19 @@ schemas. Existing types are `WireMessage`, `DeliveryReceipt`, `MessageId`, `Agen
   added to public `DeliveryCommand` or RPC. None of these methods materializes a full snapshot.
 - `TransitionContext { key:DeliveryKey, record:Option<DeliveryRecord>, reservation:Option<IdReservation>,
   recipient:RecipientControl, global:GlobalControl, continuity:Continuity, message:Option<WireMessage>,
-  receipt:Option<DeliveryReceipt>, identity:IdentityContext }` contains only the target key and its indexed predicates.
+  receipt:Option<DeliveryReceipt>, identity:IdentityContext, lifetime:Option<LifetimeRegistration> }` contains only the target key and its
+  indexed predicates. `lifetime` is the owning store's currently validated admission row, never copied from the command; prepare and Arm
+  require exact equality with the attempt descriptor, including instance/worker/connection/scope/revision. Core consumes only this data
+  and performs no OS I/O. Mem supplies it only from its module-local admission fixture; ordinary production Mem prepare/Arm refuse
+  UnsupportedBackend and retirement stays Unproven.
 - `DeliveryDelta { record:Option<DeliveryRecord>, reservation:Option<IdReservation>, recipient:Option<RecipientControl>,
   global:Option<GlobalControl>, receipt:Option<DeliveryReceipt>, result:DeliveryResult }`; `None` means no write to that slot, never deletion.
   Index/binding enrollment and mutation maintenance use typed transactions in Tasks 5–6, not whole-snapshot replacement.
 - `transition(ctx:TransitionContext,command:DeliveryCommand)->Result<DeliveryDelta,StoreError>` validates the per-key contract. Stores
   construct context, check predicates and apply only changed slots inside one native atomic operation. Required point reads are target
   record, original-ID reservation, recipient control, global control, continuity, immutable message, canonical receipt, registry ID and
-  selector/receipt-alias indexes. No table/recipient/history scan or receipt-alias enumeration is permitted on this path; missing/corrupt
+  selector/receipt-alias indexes, plus the one exact lifetime-admission control row at prepare/Arm. No table/recipient/history scan or
+  receipt-alias enumeration is permitted on this path; missing/corrupt
   required metadata refuses rather than rebuilding from history. Independent inspection uses the same bounded key/recipient reads.
 - Prepare atomically requires `global.active_attempts < 16`, `recipient.active.is_none()`, no barrier/conflict and all target predicates;
   committing Prepared increments the count, inserts the exact `ActiveOwner` into the bounded index, sets the recipient slot and marks
@@ -270,7 +278,9 @@ existing `conformance` feature or test cfg.
 **Interfaces:** Consume Task 1 types/trait. Produce `transition` and `impl WireDeliveryStore for MemStore`. Test helper
 `delivery_conformance(store:&impl WireDeliveryStore, seed:impl Fn(&WireMessage))->()` supplies fixed messages/registry via the caller's
 existing typed store APIs. Add `fixture_message()->WireMessage`, `fixture_commands()->Vec<DeliveryCommand>` in that conformance module, with
-deterministic IDs/tokens/time; no threads share `MemStore` across its non-Sync boundary.
+deterministic IDs/tokens/time; each owning backend installs its own module-local admission fixture before invoking shared assertions.
+No public fixture verifier/observation constructor or production Mem admission is added; shared assertions consume accepted registrations
+as ordinary data and cannot mint store authority. No threads share `MemStore` across its non-Sync boundary.
 
 - [ ] **Step 1: Write failing unit tests.** `managed_mem_first_prepare_wins`: two sequential competing commands at one revision give one
   Prepared and one refusal, counter=1. `managed_transition_crash_matrix`: parameterize every crash row in spec §7; no Armed/Settled/Held row
@@ -319,9 +329,114 @@ assert!(matches!(fourth_prepare, DeliveryResult::Refused { reason: HoldReason::B
 `__wire_delivery_v1`, `__wire_delivery_ids_v1`, `__wire_delivery_control_v1`; strict versioned JSON values, collision-free key encoding
 (length-prefixed original ID and registry ID, hex key).
 
+**Local admission interfaces (fl-store, before broker consumption):** Export `wire_delivery_lifetime` as a public module with only the
+following local Rust facade; core retains only the pure descriptor above. `LocalAdmissionInput` has private fields, is non-Clone and has
+no serde, wire representation or public field/unchecked constructor. All OS-handle facade definitions and their broker consumers are
+Linux-cfg gated; other platforms retain disabled managed behavior. Define these public types and the two input factories:
+
+```rust
+pub struct LocalAdmissionInput { /* private validated-candidate fields */ }
+pub enum LocalAdmissionError {
+    UnsupportedBackend, Unproven, Capacity, IdentityConflict, Store(StoreError),
+}
+pub struct BrokerScopeHandles {
+    pub home_dir: std::os::fd::OwnedFd,
+    pub worker_pidfd: std::os::fd::OwnedFd,
+    pub containment: std::os::fd::OwnedFd,
+    pub creation_control: std::os::fd::OwnedFd,
+    pub egress: Vec<std::os::fd::OwnedFd>,
+}
+pub struct HookScopeHandles {
+    pub home_dir: std::os::fd::OwnedFd,
+    pub peer_socket: std::os::fd::OwnedFd,
+    pub containment: std::os::fd::OwnedFd,
+    pub creation_control: std::os::fd::OwnedFd,
+    pub egress: Vec<std::os::fd::OwnedFd>,
+}
+pub struct LocalWorkerBinding {
+    pub instance: InstanceId, pub worker: WorkerId, pub connection: ConnectionId,
+}
+impl LocalAdmissionInput {
+    pub fn broker_owned(binding: LocalWorkerBinding, handles: BrokerScopeHandles)
+        -> Result<Self, LocalAdmissionError>;
+    pub fn hook_peer(binding: LocalWorkerBinding, handles: HookScopeHandles)
+        -> Result<Self, LocalAdmissionError>;
+}
+pub trait LocalLifetimeAdmissionStore: WireDeliveryStore {
+    fn admit_local_lifetime(&self, input: LocalAdmissionInput)
+        -> Result<LifetimeRegistration, LocalAdmissionError>;
+    fn close_local_lifetime(&self, registration: &LifetimeRegistration)
+        -> Result<(), LocalAdmissionError>;
+}
+```
+
+`LocalAdmissionError` is local/non-serializable and implements `std::error::Error`; provide
+`impl From<LocalAdmissionError> for StoreError` with redacted backend-error details, without parsing strings to grant authority.
+These factories are defined/implemented in this task, not private helpers assumed available to fl-wire. They consume real owned local
+handles, bound cardinality/type checking and collect kernel identities; the resulting input is only a validation candidate. They accept no
+home/boot/proof JSON, PID string, epoch or `trusted` flag. `broker_owned` requires the actual worker pidfd obtained by the broker's owned
+worker creation path (race-free pidfd acquisition), plus the broker-owned creation/egress controls for that worker's closed scope.
+`hook_peer` derives the peer process identity and owned lifetime handle from the connected Unix socket's kernel credentials and
+SO_PEERPIDFD or a reviewed race-free equivalent; a claimed PID/UID/session or matching socket pathname is insufficient. Without that
+kernel facility it refuses. Hook identity/transcript checks remain Task 9's additional recipient/route checks and confer no lifetime
+coverage. No arbitrary externally supplied observer, proof implementation or boolean enters either API.
+
+The store-owned admission producer revalidates every candidate independently: descriptor kinds, ownership and physical home match its
+already-pinned trusted local store/authority; validated local procfs boot identity; actual worker identity and its membership in the
+kernel-enforced closed scope; and exclusive owned creation/egress controls covering **all** potential emitters, future descendants and
+endpoints. A pidfd/list of children, open directory, advisory lock, cgroup membership alone or claimed ownership does not establish closure.
+The supported local containment/egress profile must establish that descendants cannot escape or transfer emission/creation rights outside
+the scope and that its controls permit irreversible closure/fencing; otherwise admission returns
+`LocalAdmissionError::UnsupportedBackend` or `Unproven`,
+with no registration and no Arm. The facade is never serialized or exposed as a public local/remote RPC verb. This is the existing
+closed-scope-handle proof route, not a new general sandbox, Host implementation or authority service. Unproven ordinary hook/vendor environments stay disabled; this task must not invent a broader
+containment implementation to claim support. All descriptor/kernel I/O is in fl-store, outside store/global locks.
+
+`impl LocalLifetimeAdmissionStore for RedbStore` durably mints a random unique registration ID and immutable revision bound to the exact
+validated physical home/boot/instance/worker/connection/scope, and keeps its owned handles in the store-owned verifier registry. Store the
+bounded provenance row under `lifetime/<id>` in existing `__wire_delivery_control_v1`, atomically before returning registration; no new
+ledger/table/service. Caller-chosen binding IDs identify the broker's handles but cannot authenticate a worker: admission rejects an ID
+already mapped to another kernel identity, and independently matches hook peer/broker-owned scope as above. Repeated identical binding
+admission returns the same row only after revalidation; conflicting coverage/identity refuses, never rewrites it. Reopen loads durable
+provenance, never synthesizes lost handles or trusts the serialized descriptor as physical-home/boot proof.
+
+At prepare **and** Arm the native backend privately validates the row's exact binding, live registry ownership, closed immutable scope and
+admissible state; construct `TransitionContext.lifetime` from that row, then re-read its revision/state in the same transaction as ordinary
+record/recipient/global CAS. No raw caller registration can bypass this check. Kernel validation occurs outside the transaction; scope
+closure is monotonic and any registry close/fence invalidates the validation generation before a transaction can grant Arm. Internal
+`LifetimeRegistryRow` and validation tickets/constructors remain private; native commits compare the validation generation under the same
+registry synchronization as admission/close, with no lock spanning external I/O. Dropped/lost handles cannot validate a new prepare/Arm.
+
+Privately define `LifetimeRegistryRow { registration:LifetimeRegistration, state:LifetimeAdmissionState, generation:Revision }` and
+`LifetimeAdmissionState::{Open,Closing,Closed}`; public registration fields/revision never change. Define crate-private
+`LocalLifetimeVerifier::validate_admission(&self,registration:&LifetimeRegistration)->Result<Option<AdmissionValidation>,StoreError>`;
+`AdmissionValidation` is non-serializable with private constructors and binds that row's exact registration/generation. Native prepare/Arm
+commit helpers consume it only after the generation/state recheck; the public core transition cannot mint it. Close moves Open→Closing
+and advances generation before egress closure, then moves to Closed only after the verifier's complete positive scope proof. A store-owned
+registry gate coordinates native write transactions in fixed lock order and never spans kernel I/O; independent native handles/processes
+must compare the same durable generation/state in their transaction, so a per-handle in-memory map cannot bypass close.
+
+Bound admission to64 live/pending scopes total (shared across owning handles/processes for the same store), at most16 egress descriptors
+per scope and one containment/creation-control/worker handle set; one containment handle must cover any descendant population. Refuse excess before
+minting without consuming a prepare. Maintain a durable at-most64-entry live-admission index in the existing control namespace; mint/index
+reservation and close/index release are native atomic updates. The provenance row is at most8KiB; there is no scan of historical
+registrations. At most16 scopes can own active attempts. Unreferenced unused admissions are revoked on connection teardown and their live slot removed only after positive
+complete closure; referenced immutable provenance remains with retained attempts and does not occupy a live-admission slot after positive complete closure. Losing descriptors without that proof
+retains its live slot/ownership and Held capacity. A close request identifies an exact registration but is **not** proof: the store revokes
+new prepare/Arm, closes owned creation/output controls and observes or fences the whole scope itself; unresolved emitters remain held.
+Fencing/cleanup does not settle an attempt or decrement capacity; only the existing exact-target retirement CAS can do that. Reopen reads
+only the bounded64 live-admission index and16 active-owner index and their point rows; it preserves unresolved ownership/live-slot limits
+and never resumes output rights. Same-home prior-boot proof can positively close these old scopes; daemon restart alone cannot. A changed
+scope requires a new registration before a new prepare; invalidate an old Prepared attempt by its existing CAS first. Armed scope expansion is forbidden;
+future descendants are allowed only inside its already-proven immutable containment. Replacement/revision changes never transfer an old
+permit/settlement grant. A positive retirement proof may also durably finalize that exact registry row as Closed and release its live
+admission-index slot in the native retirement transaction after registry-generation CAS; the other referenced attempts retain their own
+Held capacity until separately retired. Already Closed is idempotent, and stale proof cannot close a replacement registration. Close, crash
+and admission commit faults preserve these rules and do not reset three-prepares limits.
+
 **Internal lifetime/fence interfaces:** Add `crates/store/src/wire_delivery_lifetime.rs` (and its module declaration) for the trusted local
-verifier shared by redb/ferro. Internal verifier/observation visibility is crate-private for the two owning backend modules, never a
-public construction/serialization interface. `LocalLifetimeVerifier::observe(&self,target:&CapacityRetirementTarget)->Result<Option<CapacityOnlyObservation>,StoreError>`
+verifier shared by redb/ferro behind the public admission facade above. Internal verifier/observation visibility is crate-private for the
+two owning backend modules, never a public construction/serialization interface. `LocalLifetimeVerifier::observe(&self,target:&CapacityRetirementTarget)->Result<Option<CapacityOnlyObservation>,StoreError>`
 returns an opaque, non-serializable observation with private constructors. It binds the exact `ActiveOwner` and registered
 scope revision; it is not a `DeliveryEvidence` or no-mutation proof. Production stores own this verifier and accept neither caller booleans,
 proof structs nor caller-selected verifier implementations. Test-only injection stays owning-module/conformance fixtures. An internal
@@ -377,6 +492,12 @@ assert_eq!(reopened_barrier, committed_barrier);
   race-order assertions. `managed_lifetime_proof_scope_and_boot` rejects wrong key/token/instance/worker/connection/registration/revision,
   incomplete emitter coverage, live descendant, stale observations and reused process identities; tests joined-complete-scope and pinned
   same-home prior-boot proof positively, and rejects new epoch/caller boot/snapshot/moved-home claims. These are fixtures, not runtime proof.
+  `managed_redb_local_admission_contract` covers both real-descriptor factory paths with owning-module kernel fixtures and rejects forged
+  binding/foreign home, caller boot/PID claims, wrong descriptor kinds, escaped/live descendant or endpoint, incomplete creation/egress
+  coverage, unsupported kernel facilities and copied registration without registry ownership. Prove exact valid admission→prepare→Arm;
+  register/close/replace racing prepare and Arm must refuse stale validation. Cover64/65 live scopes,16/17 egress handles, unused cleanup,
+  loss-of-handles hold, immutable replacement, prior-boot reopen and before/after admission-commit faults. No caller observer injection;
+  deterministic proof fixtures remain module-local and are not an exported production factory.
 - [ ] **Step 5: Commit gate.** Fresh review checks durable commit boundaries and no policy activation; commit `feat(store): persist redb
   peer delivery transitions` with the Freya trailer.
 
@@ -385,14 +506,18 @@ assert_eq!(reopened_barrier, committed_barrier);
 **Files:** Create `crates/store/src/ferrostore/traits_wire_delivery.rs`; modify `ferrostore/mod.rs`, `ferrostore/doc.rs`,
 `crates/store/src/any.rs`. Unit tests in the owning modules.
 
-**Interfaces:** Consume Tasks 1–3; produce `impl WireDeliveryStore for FerroStore`, forwarding `impl WireDeliveryStore for AnyStore`,
+**Interfaces:** Consume Tasks 1–3; produce `impl WireDeliveryStore for FerroStore`, `impl LocalLifetimeAdmissionStore for FerroStore`,
+forwarding `impl WireDeliveryStore for AnyStore` and `impl LocalLifetimeAdmissionStore for AnyStore`,
 internal `apply_delivery_in(tx:&mut super::Txn,command:DeliveryCommand)->Result<DeliveryResult,StoreError>` in the ferro module, plus
 `retire_capacity_in(tx:&mut super::Txn,target:&CapacityRetirementTarget,observation:CapacityOnlyObservation)->Result<CapacityRetirementResult,StoreError>`
-using Task 3's private shared verifier. Use the same logical collection names/schema/key encoding as redb, within existing `with_write`
-transaction machinery.
+using Task 3's private shared verifier and admission producer/registry. Forward both admission/close methods to the native backend;
+`Inner::Remote` (including same-host Unix) returns UnsupportedBackend before consuming authority, opening an embedded fallback or creating
+a ledger. Use the same admission provenance, bounds, prepare/Arm validation and lifecycle as redb, with the same logical collection
+names/schema/key encoding inside existing `with_write` transaction machinery.
 
 - [ ] **Step 1: Write failing unit tests.** `managed_ferro_transaction_conformance` runs shared assertions;
-  `managed_any_store_forwards_delivery` covers both variants; `managed_ferro_atomic_reopen` injects append/sync errors and validates no
+  `managed_any_store_forwards_delivery` covers both native variants and admission/close forwarding; `managed_ferro_atomic_reopen` injects
+  append/sync errors and validates no
   partial receipt/control projection or new permission after unknown commit. Assertion anchors for the named tests (each variable is the
   observed result of the fixture operation described above):
 
@@ -416,6 +541,8 @@ assert_eq!(reopened_barrier, committed_barrier);
 - [ ] **Step 4: Run the Step 2 commands**; expect PASS including two local handles racing CAS, reopen counters, recipient ordering barrier
   and unknown-format refusal. Mem/redb/ferro must yield identical conformance outcomes, including growing-history point-read/work counts,
   global16/recipient1 atomic refusal with unchanged losing-key prepares, and independent ACK/evidence persistence across reopen.
+  `managed_ferro_local_admission_contract` repeats Task 3's admission/prepare/Arm/revision/close/bounds/fault cases;
+  `managed_any_store_local_admission` proves native forwarding and Remote/same-host-Unix refusal without fallback/new ledger.
   `managed_ferro_orphan_capacity_reopen` and `managed_ferro_retirement_commit_faults` repeat Task 3's 16-orphan, proof refusal, race, atomic
   fault/lost-reply and exact-once retirement assertions with native ferro transactions and reopened handles; AnyStore forwards both
   retirement and bounded active discovery. `managed_any_store_remote_delivery_unsupported` covers TCP and same-host Unix daemon-backed
@@ -575,14 +702,22 @@ assert_eq!(legacy_handoffs, 0);
 **Interfaces:** Consume store contract and complete fences. Define `ManagedPolicy { enabled:bool, node_id:String, daemon_uid:u32,
 socket:PathBuf, registry_allowlist:Vec<AgentId>, codex_executable:PathBuf, codex_executable_digest:Digest, codex_control_socket:PathBuf,
 transcript_root:PathBuf, policy_hash:Digest }` in policy module; default is disabled, no enrolled IDs, no inferred home.
-`VerifiedConnection`, `ManagedClient`, `ManagedBroker<S:WireDeliveryStore>` and `WorkerContext` are opaque runtime types. Define
+`VerifiedConnection`, `ManagedClient`, `ManagedBroker<S:LocalLifetimeAdmissionStore>` and `WorkerContext` are opaque runtime types;
+import `fl_store::wire_delivery_lifetime::{LocalLifetimeAdmissionStore,LocalAdmissionInput,LocalWorkerBinding,BrokerScopeHandles,HookScopeHandles}`.
+This bound includes `WireDeliveryStore`; no downcast, private verifier access or undeclared registration factory is needed. Define
 `InvocationBudget` using monotonic deadline and operation minima. Define `PreparedAttempt` (key/revision/attempt/route) and non-Clone
 `EmissionPermit` (private fields, consumed once).
 `ManagedBroker::prepare(&self,worker:&WorkerContext,input:PrepareInput)->Result<PreparedAttempt,StoreError>`;
 `arm(&self,worker:&WorkerContext,prepared:PreparedAttempt,frozen:FrozenPayload,now:At)->Result<EmissionPermit,StoreError>`;
 `settle(&self,worker:&WorkerContext,input:SettleInput)->Result<DeliveryView,StoreError>`. Store Armed alone never creates a permit.
-The broker obtains each `AttemptBinding.lifetime` from Task 3's trusted local admission registry for the verified worker/instance and complete
-emitter scope before prepare; caller fields cannot construct or revise registrations. Define internal
+Before prepare, broker-owned push workers pass their actual owned creation-path pidfd and scope/egress descriptors to
+`LocalAdmissionInput::broker_owned`; hook workers pass the accepted verified connection's duplicated connected socket and validated local
+scope/egress descriptors to `LocalAdmissionInput::hook_peer`. Broker IDs come from the already-issued instance/worker/connection context,
+never request fields. The store independently checks the actual kernel identity/closed coverage; Task 9's claims cannot substitute for
+missing handles. Call `store.admit_local_lifetime(input)` and retain its immutable returned registration in private `WorkerContext`;
+fill `AttemptBinding.lifetime` from it at prepare/Arm, never a request descriptor. If scope controls cannot be acquired/proven, refuse the
+managed lane; caller-chosen socket/path/UID or broker ID alone cannot enroll it. Connection teardown/worker shutdown invokes
+`store.close_local_lifetime(&registration)` once; that revokes new grants but supplies no retirement proof. Define internal
 `ManagedBroker::reconcile_orphan_capacity(&self)->Result<Vec<CapacityRetirementResult>,StoreError>`: inspect only
 `store.active_delivery_owners()` (at most16), invoke `store.retire_orphan_capacity(target)` once per candidate, and leave stale/unproven
 entries held/inspectable. Startup/observed worker exit may request this bounded capacity reconciliation; it performs no prepare, model
@@ -644,7 +779,7 @@ Unit tests in these modules.
 `freeze_peer_steer(conn:&mut
 ManagedCodexConnection,preflight:&ManagedPreflight,generation:Digest,text:&[u8])->Result<FrozenPayload,StoreError>`;
 `send_peer_steer(conn:ManagedCodexConnection,payload:FrozenPayload,permit:EmissionPermit)->DeliveryEvidence`. Define
-`dispatch_peer<S:WireDeliveryStore>(broker:&ManagedBroker<S>,worker:&WorkerContext,key:DeliveryKey,budget:InvocationBudget)->Result<DeliveryView,StoreError>`
+`dispatch_peer<S:LocalLifetimeAdmissionStore>(broker:&ManagedBroker<S>,worker:&WorkerContext,key:DeliveryKey,budget:InvocationBudget)->Result<DeliveryView,StoreError>`
 in push module. A queue helper
 `send_peer_queue(policy:&ManagedPolicy,route:&RoutePin,payload:FrozenPayload,permit:EmissionPermit,budget:&InvocationBudget)->DeliveryEvidence`
 performs exactly one OS spawn, preserving existing vendor child environment policy.
