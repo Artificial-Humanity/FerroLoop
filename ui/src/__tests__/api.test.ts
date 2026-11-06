@@ -745,4 +745,61 @@ describe("HubWsClient", () => {
     expect(wsClient.isConnected()).toBe(false);
     expect(statuses).toEqual([true, false]);
   });
+
+  it("setSessionContextWindow POSTs { context_window } to the URL-encoded session path", async () => {
+    const calls: Array<{ url: string; method?: string; body: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method, body: JSON.parse(String(init?.body)) });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          session_id: "sess/ferris 01",
+          vendor: "grok",
+          context_window: null,
+          persisted: true,
+          method: "stored",
+        }),
+        { status: 200 },
+      );
+    });
+    const client = new HubApiClient({
+      baseUrl: "http://127.0.0.1:8420",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const sent = await client.setSessionContextWindow("sess/ferris 01", 500_000);
+    expect(sent.method).toBe("stored");
+    await client.setSessionContextWindow("sess/ferris 01", null);
+
+    expect(calls).toEqual([
+      {
+        url: "http://127.0.0.1:8420/api/v1/sessions/sess%2Fferris%2001/context-window",
+        method: "POST",
+        body: { context_window: 500_000 },
+      },
+      {
+        url: "http://127.0.0.1:8420/api/v1/sessions/sess%2Fferris%2001/context-window",
+        method: "POST",
+        body: { context_window: null },
+      },
+    ]);
+  });
+
+  it.each([400, 403, 404, 409])(
+    "setSessionContextWindow maps a %i answer to a HubApiError with the server's error text",
+    async (status) => {
+      const mockFetch = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: `server said ${status}` }), { status }),
+      );
+      const client = new HubApiClient({
+        baseUrl: "http://127.0.0.1:8420",
+        fetchImpl: mockFetch as unknown as typeof fetch,
+      });
+      const err = await client.setSessionContextWindow("s1", 500_000).catch((e) => e);
+      expect(err).toBeInstanceOf(HubApiError);
+      expect((err as HubApiError).status).toBe(status);
+      expect((err as HubApiError).message).toBe(`server said ${status}`);
+    },
+  );
 });

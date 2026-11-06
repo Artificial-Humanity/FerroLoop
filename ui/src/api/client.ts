@@ -52,6 +52,7 @@ import {
   type SessionQueueResponse,
   type SessionTranscriptResponse,
   type SetSessionModelResponse,
+  type SetSessionContextWindowResponse,
   type SlashCommandEntry,
   type SpinUpSessionRequest,
   type SpinUpSessionResponse,
@@ -1010,6 +1011,23 @@ export class HubApiClient {
           model,
           ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
         }),
+      },
+    );
+  }
+
+  /**
+   * Choose a session's context window (Owner only). `null` clears the stored value. The answer
+   * says what the hub did; the effective window is what the session reports in `context_usage`.
+   */
+  public async setSessionContextWindow(
+    sessionId: string,
+    tokens: number | null,
+  ): Promise<SetSessionContextWindowResponse> {
+    return this.request<SetSessionContextWindowResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/context-window`,
+      {
+        method: "POST",
+        body: JSON.stringify({ context_window: tokens }),
       },
     );
   }

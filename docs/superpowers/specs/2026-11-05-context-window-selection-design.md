@@ -74,6 +74,8 @@ Antigravity: no selector exists. These vendors answer a window request with
 * **UI.** Agent Settings gets a window selector next to the model selector (editable for Grok,
   read-only for the others); Spin-Up gets an optional window; Settings -> Runtimes & Quotas gets
   the Grok default. The meter keeps showing the effective window from the vendor.
+  The Spin-Up field and the Runtimes & Quotas default follow launch-time apply: until a stored
+  window is applied at launch they would promise something that does not happen.
 * **Performance (Lead's review of #339).** The Codex catalog window slices the tail of the
   in-memory rollout instead of re-reading the file; the Grok catalog is read only when the session
   has token usage.
