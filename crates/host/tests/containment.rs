@@ -25,7 +25,7 @@ use fl_host::{
     CrashPoint, LeaderAnchor, STARTUP_CLEANUP_DEADLINE, SurvivorRecord, refusal,
     signal_anchored_group, write_raw_state, write_registry_fixture,
 };
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use fl_host_proto::BlockingHostClient;
 use fl_host_proto::{
     ChildState, HostConfig, HostEndpoint, SessionEpoch, SessionId, SpawnKind, SpawnSpec,
