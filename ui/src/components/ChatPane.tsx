@@ -1115,61 +1115,6 @@ export interface ChatPaneProps {
   apiClient?: HubApiClient;
 }
 
-export function detectTranscriptPermissionPrompts(
-  turns: TranscriptTurn[],
-  agentName?: string | null,
-  adapter?: string | null,
-  sessionId?: string | null,
-): PendingPermissionPromptItem[] {
-  if (!Array.isArray(turns) || turns.length === 0) {
-    return [];
-  }
-  const vendor = (adapter ?? "claude").trim().toLowerCase() || "claude";
-  const isRpcChannel =
-    vendor.includes("claude") ||
-    vendor.includes("codex") ||
-    vendor.includes("muse");
-  const channelKind: PermissionChannelKind = isRpcChannel
-    ? "rpc"
-    : "pty-snapshot";
-  const transport = vendor.includes("claude")
-    ? "stdio-control_request"
-    : vendor.includes("codex")
-      ? "app-server-rpc"
-      : vendor.includes("muse")
-        ? "msp-socket"
-        : "tmux-pty-snapshot";
-
-  const results: PendingPermissionPromptItem[] = [];
-  for (const turn of turns) {
-    const content = turn.content ?? "";
-    if (
-      content.includes("control_request") ||
-      content.includes("requestApproval") ||
-      content.includes("[PERMISSION PROMPT]")
-    ) {
-      results.push({
-        id: `turn-perm-${turn.index}`,
-        session_id: sessionId || `sess-${agentName || "agent"}`,
-        agent: agentName || "agent",
-        vendor,
-        transport,
-        channel_kind: channelKind,
-        request_kind: content.includes("fileChange")
-          ? "item/fileChange/requestApproval"
-          : "canUseTool",
-        capability: content.includes("fileChange")
-          ? "fs_write_workspace"
-          : "shell_exec",
-        command_or_target: content.trim().slice(0, 160),
-        always_allow_supported: isRpcChannel,
-        status: "pending",
-      });
-    }
-  }
-  return results;
-}
-
 function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -3197,15 +3142,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
       {/* Record #103: Live Permission-Prompt Interception & Remote Approval Banner */}
       {(() => {
-        const basePrompts =
-          pendingPermissionPrompts !== undefined
-            ? pendingPermissionPrompts
-            : detectTranscriptPermissionPrompts(
-                effectiveTurns,
-                agentName,
-                adapter,
-                sessionId,
-              );
+        // Transcript text is not a permission channel. Only explicit structured
+        // requests supplied by the caller can populate the approval panel.
+        const basePrompts = pendingPermissionPrompts ?? [];
         const resolvedPrompts = basePrompts.map((p) =>
           permPromptOverrides[p.id]
             ? { ...p, status: permPromptOverrides[p.id] }
