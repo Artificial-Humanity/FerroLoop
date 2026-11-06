@@ -36,7 +36,7 @@ export function roleOptions(
   return Array.from(options.values());
 }
 
-/** A modal session owns its catalog requests; mutations invalidate earlier reads. */
+/** A modal session owns its catalog request and reconciles acknowledged mutations. */
 export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
   const client = useMemo(() => apiClient ?? new HubApiClient(), [apiClient]);
   const [roles, setRoles] = useState<RoleRecord[]>([]);
@@ -47,10 +47,14 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
   const session = useRef(0);
   const revision = useRef(0);
   const busy = useRef(false);
+  // Only retain overlays while this session's initial catalog is pending.
+  const pendingCatalog = useRef<Map<string, RoleRecord | null> | null>(null);
 
   useEffect(() => {
     const currentSession = ++session.current;
     const currentRevision = ++revision.current;
+    const overlays = new Map<string, RoleRecord | null>();
+    pendingCatalog.current = enabled ? overlays : null;
     busy.current = false;
     setSaving(false);
     setStatus(null);
@@ -63,11 +67,13 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
           const loaded = await client.getRoles();
           if (!Array.isArray(loaded))
             throw new Error("Invalid role catalog response");
-          if (
-            session.current === currentSession &&
-            revision.current === currentRevision
-          ) {
-            setRoles(loaded);
+          if (session.current === currentSession) {
+            const reconciled = new Map(loaded.map((role) => [role.slug, role]));
+            for (const [slug, record] of overlays) {
+              if (record) reconciled.set(slug, record);
+              else reconciled.delete(slug);
+            }
+            setRoles(Array.from(reconciled.values()));
           }
         } catch (err) {
           if (
@@ -79,10 +85,8 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
             );
           }
         } finally {
-          if (
-            session.current === currentSession &&
-            revision.current === currentRevision
-          ) {
+          if (session.current === currentSession) {
+            pendingCatalog.current = null;
             setLoading(false);
           }
         }
@@ -95,7 +99,8 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
 
   async function mutate(
     operation: () => Promise<{
-      roles: (previous: RoleRecord[]) => RoleRecord[];
+      slug: string;
+      record: RoleRecord | null;
       message: string;
     }>,
   ) {
@@ -110,7 +115,11 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
     try {
       const result = await operation();
       if (session.current === currentSession) {
-        setRoles(result.roles);
+        pendingCatalog.current?.set(result.slug, result.record);
+        setRoles((previous) => [
+          ...previous.filter((role) => role.slug !== result.slug),
+          ...(result.record ? [result.record] : []),
+        ]);
         setStatus(result.message);
       }
     } catch (err) {
@@ -129,10 +138,8 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
     mutate(async () => {
       const saved = await client.upsertRole(draft);
       return {
-        roles: (previous: RoleRecord[]) => [
-          ...previous.filter((role) => role.slug !== saved.slug),
-          saved,
-        ],
+        slug: saved.slug,
+        record: saved,
         message: `Saved RoleRecord '${saved.slug}' (${saved.review_policy}) to registry.`,
       };
     });
@@ -140,8 +147,8 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
     mutate(async () => {
       await client.deleteRole(slug);
       return {
-        roles: (previous: RoleRecord[]) =>
-          previous.filter((role) => role.slug !== slug),
+        slug,
+        record: null,
         message: `Removed RoleRecord '${slug}' from registry.`,
       };
     });

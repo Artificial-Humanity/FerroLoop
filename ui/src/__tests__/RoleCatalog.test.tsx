@@ -29,6 +29,7 @@ const chair = {
   review_policy: "lead-review" as const,
   prompt_template: "Offer bounded advice.",
 };
+const reviewer = { ...chair, slug: "reviewer", label: "Evidence Reviewer" };
 const agent = {
   id: "ag-felix",
   name_key: "felix",
@@ -53,6 +54,7 @@ function server(
   options: {
     get?: () => Promise<Response>;
     save?: (body: typeof chair) => Promise<Response>;
+    remove?: () => Promise<Response>;
   } = {},
 ) {
   const fetchImpl = vi.fn(
@@ -67,7 +69,9 @@ function server(
         return options.get ? options.get() : json([chair]);
       }
       if (url.endsWith("/api/v1/roles/council-chair") && method === "DELETE")
-        return json({ deleted: true, slug: "council-chair" });
+        return options.remove
+          ? options.remove()
+          : json({ deleted: true, slug: "council-chair" });
       if (url.endsWith("/recast"))
         return json({
           agent: { ...agent, ...JSON.parse(String(init?.body)) },
@@ -374,6 +378,112 @@ describe("authenticated editable role catalog", () => {
       "Draft Chair",
     );
   });
+
+  it.each(["before", "after"])(
+    "retains unrelated catalog rows when the initial read resolves %s a save acknowledgement",
+    async (order) => {
+      const read = deferred<Response>();
+      const save = deferred<Response>();
+      const { client } = server({
+        get: () => read.promise,
+        save: () => save.promise,
+      });
+      render(<SettingsModal isOpen onClose={vi.fn()} apiClient={client} />);
+      fillDraft();
+      fireEvent.click(screen.getByTestId("role-registry-save-btn"));
+      fireEvent.change(screen.getByTestId("role-registry-label-input"), {
+        target: { value: "Newer unsaved draft" },
+      });
+      const load = () => act(async () => read.resolve(json([chair, reviewer])));
+      if (order === "before") await load();
+      await act(async () =>
+        save.resolve(json({ ...chair, label: "Server acknowledged" })),
+      );
+      if (order === "after") await load();
+      expect(screen.getByTestId("role-registry-row-reviewer")).toHaveTextContent(
+        "Evidence Reviewer",
+      );
+      expect(screen.getByTestId("role-registry-row-council-chair")).toHaveTextContent(
+        "Server acknowledged",
+      );
+      expect(screen.getByTestId("role-registry-count-badge")).toHaveTextContent("2");
+      expect(screen.getByTestId("role-registry-label-input")).toHaveValue(
+        "Newer unsaved draft",
+      );
+      expect(screen.getByTestId("role-registry-prompt-input")).toHaveValue(
+        "My draft guidance",
+      );
+      expect(screen.getByTestId("role-registry-status-banner")).toHaveTextContent("Saved");
+      expect(screen.queryByTestId("role-registry-error")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["before", "after"])(
+    "retains the catalog and refusal when the initial read resolves %s a failed save",
+    async (order) => {
+      const read = deferred<Response>();
+      const save = deferred<Response>();
+      const { client } = server({
+        get: () => read.promise,
+        save: () => save.promise,
+      });
+      render(<SettingsModal isOpen onClose={vi.fn()} apiClient={client} />);
+      fillDraft();
+      fireEvent.click(screen.getByTestId("role-registry-save-btn"));
+      const load = () => act(async () => read.resolve(json([chair, reviewer])));
+      if (order === "before") await load();
+      await act(async () => save.resolve(json({ error: "Owner required" }, 403)));
+      if (order === "after") await load();
+      expect(screen.getByTestId("role-registry-row-reviewer")).toHaveTextContent(
+        "Evidence Reviewer",
+      );
+      expect(screen.getByTestId("role-registry-row-council-chair")).toHaveTextContent(
+        "Council Chair",
+      );
+      expect(screen.getByTestId("role-registry-count-badge")).toHaveTextContent("2");
+      expect(screen.getByTestId("role-registry-label-input")).toHaveValue("Draft Chair");
+      expect(screen.getByTestId("role-registry-prompt-input")).toHaveValue(
+        "My draft guidance",
+      );
+      expect(screen.getByTestId("role-registry-error")).toHaveTextContent("Owner required");
+      expect(screen.queryByTestId("role-registry-status-banner")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["before", "after"])(
+    "keeps a deletion without losing unrelated rows when the initial read resolves %s delete acknowledgement",
+    async (order) => {
+      const read = deferred<Response>();
+      const remove = deferred<Response>();
+      const { client } = server({
+        get: () => read.promise,
+        remove: () => remove.promise,
+      });
+      render(<SettingsModal isOpen onClose={vi.fn()} apiClient={client} />);
+      fillDraft();
+      fireEvent.click(screen.getByTestId("role-registry-save-btn"));
+      await screen.findByTestId("role-registry-row-council-chair");
+      fireEvent.click(screen.getByTestId("role-registry-delete-btn-council-chair"));
+      const load = () => act(async () => read.resolve(json([chair, reviewer])));
+      if (order === "before") {
+        await load();
+        expect(screen.getByTestId("role-registry-row-council-chair")).toHaveTextContent(
+          "Draft Chair",
+        );
+      }
+      await act(async () =>
+        remove.resolve(json({ deleted: true, slug: "council-chair" })),
+      );
+      if (order === "after") await load();
+      expect(screen.queryByTestId("role-registry-row-council-chair")).not.toBeInTheDocument();
+      expect(screen.getByTestId("role-registry-row-reviewer")).toHaveTextContent(
+        "Evidence Reviewer",
+      );
+      expect(screen.getByTestId("role-registry-count-badge")).toHaveTextContent("1");
+      expect(screen.getByTestId("role-registry-status-banner")).toHaveTextContent("Removed");
+      expect(screen.queryByTestId("role-registry-error")).not.toBeInTheDocument();
+    },
+  );
 
   it("ignores a save response from a closed editor session", async () => {
     const save = deferred<Response>();
