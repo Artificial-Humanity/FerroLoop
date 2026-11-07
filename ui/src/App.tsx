@@ -1006,11 +1006,10 @@ export const App: React.FC<AppProps> = ({
     setSessionMetadataOwner((previous) => previous && sameTranscriptOwner(previous, previousOwner) &&
       previousOwner.agentKey === nextOwner.agentKey && previousOwner.sessionId === sessionId
       ? nextOwner : null);
-    const previous = snapshotRef.current;
-    if (sessionId && previous && sameTranscriptOwner(previous.owner, previousOwner) &&
-      previousOwner.agentKey === nextOwner.agentKey && previousOwner.sessionId === sessionId) {
-      setTranscriptSnapshot({ ...previous, owner: nextOwner });
-    }
+    // A triage click can advance the same target twice before the next render.
+    setTranscriptSnapshot((previous) => sessionId && previous && sameTranscriptOwner(previous.owner, previousOwner) &&
+      previousOwner.agentKey === nextOwner.agentKey && previousOwner.sessionId === sessionId
+      ? { ...previous, owner: nextOwner } : previous);
   }, [transcriptGuard]);
   const selectTranscriptAgent = useCallback((nameKey: string) => {
     const key = nameKey.trim().toLowerCase();
@@ -2387,8 +2386,15 @@ export const App: React.FC<AppProps> = ({
             loading={loading}
             onRefresh={() => void loadAllInitialState()}
             onSelectAgent={(nameKey) => {
-              selectTranscriptAgent(nameKey);
               const nextKey = nameKey.trim().toLowerCase();
+              const currentOwner = ownerRef.current;
+              // An incident can apply its concrete session target next.
+              // Do not detour a same-agent selection through the first session.
+              if (currentOwner.agentKey === nextKey && currentOwner.sessionId) {
+                advanceTranscriptSelection(nextKey, currentOwner.sessionId);
+              } else {
+                selectTranscriptAgent(nameKey);
+              }
               if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
                 selectedAgentNameRef.current = nameKey;
                 selectedSessionIdRef.current = null;
@@ -2406,17 +2412,7 @@ export const App: React.FC<AppProps> = ({
               void refreshSessionsAndTranscript();
             }}
             onSelectSession={(sessionId) => {
-              advanceTranscriptSelection(selectedAgentNameRef.current, sessionId);
-              if (sessionId !== selectedSessionIdRef.current) {
-                selectedSessionIdRef.current = sessionId;
-                activeSessionIdRef.current = sessionId;
-                setTranscriptTurns([]);
-                setSessionQueue([]);
-                setIsSessionBusy(false);
-                setSessionContextUsage(null);
-                setSessionQuotaUsage(null);
-              }
-              setSelectedSessionId(sessionId);
+              selectConcreteTranscriptSession(sessionId);
               if (deviceLayoutRef.current === "phone") {
                 setPhoneView("chat");
               }
@@ -2823,11 +2819,14 @@ export const App: React.FC<AppProps> = ({
     setSettingsModalOpen(true);
   };
 
-  const handleSelectSessionFromHeader = (sessionId: string) => {
-    advanceTranscriptSelection(selectedAgentNameRef.current, sessionId);
-    if (sessionId !== selectedSessionIdRef.current) {
-      selectedSessionIdRef.current = sessionId;
-      activeSessionIdRef.current = sessionId;
+  const selectConcreteTranscriptSession = (sessionId: string) => {
+    const agentKey = selectedAgentNameRef.current.trim().toLowerCase();
+    const previousOwner = ownerRef.current;
+    const targetChanged = previousOwner.agentKey !== agentKey || previousOwner.sessionId !== sessionId;
+    advanceTranscriptSelection(agentKey, sessionId);
+    selectedSessionIdRef.current = sessionId;
+    activeSessionIdRef.current = sessionId;
+    if (targetChanged) {
       setTranscriptTurns([]);
       setSessionQueue([]);
       setIsSessionBusy(false);
@@ -2835,6 +2834,10 @@ export const App: React.FC<AppProps> = ({
       setSessionQuotaUsage(null);
     }
     setSelectedSessionId(sessionId);
+  };
+
+  const handleSelectSessionFromHeader = (sessionId: string) => {
+    selectConcreteTranscriptSession(sessionId);
     void refreshSessionsAndTranscript(sessionId);
   };
 

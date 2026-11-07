@@ -1438,6 +1438,107 @@ describe("App transcript observation ownership", () => {
     h.unmount();
   });
 
+  it.each([["implicit", "503"], ["implicit", "network"], ["explicit", "503"], ["explicit-non-first", "503"]])("retains %s same-session history and metadata through actual triage navigation and %s", async (preference, failure) => {
+    const richHistory = () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Same-target triage history" })], is_busy: true,
+      queue: [{ id: "same-target-held", session_id: "session-a", prompt: "Same-target held prompt", by: "owner", created_at: "now", delivery_state: "unconfirmed" }],
+      context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Same-target quota" } });
+    const h = harness(async (target) => target.includes("session-b")
+      ? response({ session_id: "session-b", turns: [turn({ index: 0, content: "Alternate concrete baseline" })], queue: [], is_busy: false })
+      : richHistory());
+    const sameTarget = { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "failed", updated_at: "t1" };
+    const alternate = { id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" };
+    h.setSessions(preference === "explicit-non-first" ? [alternate, sameTarget] : [sameTarget, alternate]);
+    if (preference === "explicit-non-first") {
+      await screen.findByText("Alternate concrete baseline");
+      fireEvent.change(screen.getByTestId("session-selector"), { target: { value: "session-a" } });
+      await screen.findByText("Same-target triage history");
+    } else {
+      await screen.findByText("Same-target triage history");
+    }
+    if (preference === "explicit") {
+      // Establish an explicit preference using genuine different-value changes.
+      fireEvent.change(screen.getByTestId("session-selector"), { target: { value: "session-b" } });
+      await screen.findByText("Alternate concrete baseline");
+      fireEvent.change(screen.getByTestId("session-selector"), { target: { value: "session-a" } });
+      await screen.findByText("Same-target triage history");
+    }
+    await screen.findByText("Same-target held prompt");
+    const assertBaseline = () => {
+      expect(screen.getByText("Same-target triage history")).toBeInTheDocument();
+      expect(screen.getByText("Same-target held prompt")).toBeInTheDocument();
+      expect(screen.getByTestId("queued-send-now-same-target-held")).toBeDisabled();
+      expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+      expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("quota-exhausted-toolbar-pill"));
+      expect(screen.getByTestId("context-level-text")).toHaveTextContent("50k");
+      expect(screen.getByTestId("context-max")).toHaveTextContent("200k");
+      fireEvent.click(screen.getByTestId("close-agent-settings-btn"));
+    };
+    assertBaseline();
+    const send = vi.spyOn(h.api, "sendSessionPrompt");
+    const sendQueued = vi.spyOn(h.api, "sendQueuedPromptNow");
+    const reset = vi.spyOn(h.api, "clearSession");
+    fireEvent.click(screen.getByTestId("left-panel-tab-triage"));
+    const incident = await screen.findByTestId("triage-incident-attempt-session-session-a");
+    let release!: (result: Response) => void;
+    let reject!: (error: Error) => void;
+    const pending = new Promise<Response>((resolve, rejectRead) => { release = resolve; reject = rejectRead; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; });
+    // The real card invokes onSelectAgent followed by onSelectSession for the
+    // displayed session, including when its session preference was implicit.
+    fireEvent.click(incident);
+    await waitFor(() => expect(started).toBe(true));
+    assertBaseline();
+    await act(async () => {
+      if (failure === "network") reject(new TypeError("offline"));
+      else release(response({ code: "transcript_unavailable" }, 503));
+      await pending.catch(() => {});
+    });
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    assertBaseline();
+    h.setRead(async () => observed("Stable same-target recovery")); h.refresh();
+    await screen.findByText("Stable same-target recovery");
+    expect(screen.queryByText("History refresh unavailable; showing last loaded history")).toBeNull();
+    h.setRead(async () => observed("")); h.refresh();
+    await waitFor(() => expect(screen.queryByText("Stable same-target recovery")).toBeNull());
+    expect(screen.queryByText("Same-target triage history")).toBeNull();
+    expect(screen.queryByText("Same-target held prompt")).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+    expect(sendQueued).not.toHaveBeenCalled();
+    expect(reset).not.toHaveBeenCalled();
+    h.unmount();
+  });
+
+  it("masks a different-session triage target and rejects the old selected response", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Before different-target navigation" })], is_busy: true,
+      queue: [{ id: "previous-target", session_id: "session-a", prompt: "Previous target queue", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Previous target quota" } }));
+    h.setSessions([{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      { id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "failed", updated_at: "t1" }]);
+    await screen.findByText("Before different-target navigation");
+    await screen.findByText("Previous target queue");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    fireEvent.click(screen.getByTestId("left-panel-tab-triage"));
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    fireEvent.click(await screen.findByTestId("triage-incident-attempt-session-session-b"));
+    expect(screen.queryByText("Before different-target navigation")).toBeNull();
+    expect(screen.queryByText("Previous target queue")).toBeNull();
+    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    await act(async () => { release(observed("Late previous-session response")); await pending; });
+    await screen.findByText("History unavailable");
+    expect((screen.getByTestId("session-selector") as HTMLSelectElement).value).toBe("session-b");
+    expect(screen.queryByText("Late previous-session response")).toBeNull();
+    expect(screen.queryByText("Before different-target navigation")).toBeNull();
+    expect(screen.queryByText("Previous target queue")).toBeNull();
+    h.unmount();
+  });
+
   it("does not install persona badge history into a different concrete session", async () => {
     const h = harness(); await screen.findByText("Last good history");
     h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }, { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }]);
