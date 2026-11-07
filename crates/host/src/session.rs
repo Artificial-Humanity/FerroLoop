@@ -346,9 +346,17 @@ impl Session {
 
     pub fn stdout_tail(&self, max_bytes: usize) -> String {
         let buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
-        let cap = max_bytes.min(64 * 1024);
+        let cap = max_bytes.min(fl_host_proto::MAX_RAW_INPUT);
         let start = buf.bytes.len().saturating_sub(cap);
-        String::from_utf8_lossy(&buf.bytes[start..]).into_owned()
+        let mut text = String::from_utf8_lossy(&buf.bytes[start..]).into_owned();
+        if text.len() > fl_host_proto::MAX_RAW_INPUT {
+            let mut trim_from = text.len() - fl_host_proto::MAX_RAW_INPUT;
+            while trim_from < text.len() && !text.is_char_boundary(trim_from) {
+                trim_from += 1;
+            }
+            text.drain(..trim_from);
+        }
+        text
     }
 
     pub fn stdout_eof(&self) {

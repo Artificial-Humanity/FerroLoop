@@ -2246,11 +2246,22 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
                 let _ = client.write_raw(stream, grant.lease, b"\r".to_vec());
             }
         } else {
-            let outcome = client
-                .send_line(stream, grant.lease, text.trim().to_string())
-                .map_err(|e| format!("fl-host send_line failed: {e}"))?;
-            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-                return Err(format!("fl-host send_line returned {outcome:?}"));
+            let trimmed = text.trim();
+            if trimmed.contains('\n') {
+                let raw = format!("{trimmed}\r").into_bytes();
+                let outcome = client
+                    .write_raw(stream, grant.lease, raw)
+                    .map_err(|e| format!("fl-host write_raw multiline failed: {e}"))?;
+                if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                    return Err(format!("fl-host write_raw multiline returned {outcome:?}"));
+                }
+            } else {
+                let outcome = client
+                    .send_line(stream, grant.lease, trimmed.to_string())
+                    .map_err(|e| format!("fl-host send_line failed: {e}"))?;
+                if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                    return Err(format!("fl-host send_line returned {outcome:?}"));
+                }
             }
         }
         return Ok(());
@@ -6861,12 +6872,20 @@ exit 1"#,
                                     }
                                 }
                                 ExtensionRequest::SendLine { stream, line, .. } => {
-                                    lines_conn
-                                        .lock()
-                                        .unwrap()
-                                        .push((stream.session.as_str().to_string(), line));
-                                    ExtensionResponse::Input {
-                                        outcome: SendOutcome::Written,
+                                    if line.as_bytes().contains(&b'\n') {
+                                        ExtensionResponse::Input {
+                                            outcome: SendOutcome::NotWritten {
+                                                reason: fl_host_proto::SendBlock::Io,
+                                            },
+                                        }
+                                    } else {
+                                        lines_conn
+                                            .lock()
+                                            .unwrap()
+                                            .push((stream.session.as_str().to_string(), line));
+                                        ExtensionResponse::Input {
+                                            outcome: SendOutcome::Written,
+                                        }
                                     }
                                 }
                                 ExtensionRequest::Write { stream, bytes, .. } => {
@@ -6992,35 +7011,39 @@ exit 1"#,
 
         let lines = recorded_lines.lock().unwrap().clone();
         assert!(
-            lines
-                .iter()
-                .any(|(s, l)| s == "Fay.lemonade" && l.contains(&msg.body)),
-            "expected lemonade WireMessage line, got: {lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(s, l)| s == "Fay.lemonade" && l.contains("operator lemonade")),
-            "expected lemonade operator prompt line, got: {lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(s, l)| s == "Gus.ollama" && l.contains(&gus_msg.body)),
-            "expected ollama WireMessage line, got: {lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|(s, l)| s == "muse.eve" && l.contains(&eve_msg.body)),
-            "expected muse WireMessage line, got: {lines:?}"
-        );
-        assert!(
             lines.iter().any(|(s, l)| s == "Dee.grok" && l == "/new"),
             "expected grok /new reset line, got: {lines:?}"
         );
 
         let writes = recorded_writes.lock().unwrap().clone();
+        let writes_str: Vec<(String, String)> = writes
+            .iter()
+            .map(|(s, b)| (s.clone(), String::from_utf8_lossy(b).into_owned()))
+            .collect();
+        assert!(
+            writes_str
+                .iter()
+                .any(|(s, w)| s == "Fay.lemonade" && w.contains(&msg.body)),
+            "expected lemonade WireMessage write, got: {writes_str:?}"
+        );
+        assert!(
+            writes_str
+                .iter()
+                .any(|(s, w)| s == "Fay.lemonade" && w.contains("operator lemonade")),
+            "expected lemonade operator prompt write, got: {writes_str:?}"
+        );
+        assert!(
+            writes_str
+                .iter()
+                .any(|(s, w)| s == "Gus.ollama" && w.contains(&gus_msg.body)),
+            "expected ollama WireMessage write, got: {writes_str:?}"
+        );
+        assert!(
+            writes_str
+                .iter()
+                .any(|(s, w)| s == "muse.eve" && w.contains(&eve_msg.body)),
+            "expected muse WireMessage write, got: {writes_str:?}"
+        );
         assert!(
             writes
                 .iter()

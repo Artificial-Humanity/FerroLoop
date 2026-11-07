@@ -195,7 +195,9 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                 .list_sessions()
                 .context("failed to list fl-host sessions")?;
             let summary = resolve_target_session(&sessions, &session)?;
-            let limit = u32::try_from(max_bytes).unwrap_or(u32::MAX);
+            let limit = u32::try_from(max_bytes)
+                .unwrap_or(u32::MAX)
+                .min(fl_host_proto::MAX_RAW_INPUT as u32);
             let output = client
                 .capture_output(summary.stream.session.clone(), limit)
                 .with_context(|| format!("failed to capture output from `{session}`"))?;

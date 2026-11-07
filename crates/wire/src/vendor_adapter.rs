@@ -591,8 +591,17 @@ impl VendorCliAdapter for OllamaCliAdapter {
     }
 
     fn normalize_model(&self, requested: Option<&str>) -> Option<String> {
-        normalize_plain_model(requested)
-            .filter(|m| split_window_tag(m).is_none())
+        requested
+            .map(str::trim)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 64
+                    && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+                    && id.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'/')
+                    })
+            })
+            .map(str::to_string)
             .or_else(|| Some(OLLAMA_DEFAULT_CLI_MODEL.to_string()))
     }
 

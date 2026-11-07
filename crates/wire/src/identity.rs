@@ -2308,19 +2308,13 @@ fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
             .map(|s| crate::vendor_adapter::host_session_id_to_unit(&s.stream.session))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut windows = parse_tmux_windows(&lines);
-        if std::env::var_os("FL_HOST_SOCK").is_none()
-            && let Some(tmux_windows) = run_tmux_list_windows(timeout)
-        {
-            for win in tmux_windows {
-                if !windows.contains(&win) {
-                    windows.push(win);
-                }
-            }
-        }
+        let windows = parse_tmux_windows(&lines);
         return Some(windows);
     }
-    run_tmux_list_windows(timeout)
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
+        return run_tmux_list_windows(timeout);
+    }
+    None
 }
 
 fn run_tmux_list_windows(timeout: Duration) -> Option<Vec<TmuxWindow>> {

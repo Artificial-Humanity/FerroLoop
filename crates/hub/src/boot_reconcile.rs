@@ -155,7 +155,7 @@ impl PaneSource for HostPanes {
                 };
                 out.push(Pane {
                     session,
-                    pane_id: format!("host:{}", s.stream.session.as_str()),
+                    pane_id: s.stream.session.as_str().to_string(),
                     window,
                     command: bin.clone(),
                     start_command: bin,
