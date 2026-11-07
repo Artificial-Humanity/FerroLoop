@@ -621,20 +621,33 @@ fn launch_spec_for(
     };
     argv.push(muse_prompt_argument(prompt));
     Some(LaunchSpec {
-        env: launch_env(persona, home.as_deref()),
+        env: launch_env_for_vendor(vendor, persona, home.as_deref()),
         argv,
     })
 }
 
-/// `AGENT_PERSONA` plus a `PATH` that starts with `<home>/.local/bin` when that
-/// directory is not already a `PATH` entry. A new tmux session otherwise inherits
-/// the hub service path, which does not contain `fl`.
-pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, String)> {
-    let mut env = vec![("AGENT_PERSONA".into(), persona.into())];
+/// `AGENT_PERSONA` (omitted for `codex`, which shares one `codex app-server` daemon across
+/// sessions) plus a `PATH` that starts with `<home>/.local/bin` when that directory is not
+/// already a `PATH` entry. A new tmux session otherwise inherits the hub service path, which
+/// does not contain `fl`.
+pub(crate) fn launch_env_for_vendor(
+    vendor: &str,
+    persona: &str,
+    home: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if vendor != "codex" {
+        env.push(("AGENT_PERSONA".into(), persona.into()));
+    }
     if let Some(path) = path_with_local_bin(home) {
         env.push(("PATH".into(), path));
     }
     env
+}
+
+#[cfg(test)]
+pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, String)> {
+    launch_env_for_vendor("claude", persona, home)
 }
 
 fn path_with_local_bin(home: Option<&Path>) -> Option<String> {
@@ -3221,6 +3234,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     let mut record = record_for_target(store, target)?;
     if record.vendor == "unknown"
         && let Some(vendor) = infer_vendor_from_routes(env.home_override, &record, target)
+            .or_else(|| infer_vendor_from_hosted_siblings(store, &record))
     {
         record.vendor = vendor;
     }
@@ -3316,10 +3330,37 @@ fn decommissioned_conflict(session_id: &str) -> LifecycleError {
     ))
 }
 
+fn is_same_vendor_sibling(a: &HostedSessionRecord, b: &HostedSessionRecord) -> bool {
+    a.session_id != b.session_id
+        && a.persona.eq_ignore_ascii_case(&b.persona)
+        && a.vendor != "unknown"
+        && b.vendor.eq_ignore_ascii_case(&a.vendor)
+}
+
+fn infer_vendor_from_hosted_siblings<S: StateStore>(
+    store: &S,
+    record: &HostedSessionRecord,
+) -> Option<String> {
+    let records = list_hosted_sessions(store).ok()?;
+    let mut vendors: BTreeSet<String> = records
+        .into_iter()
+        .filter(|other| {
+            other.session_id != record.session_id
+                && other.persona.eq_ignore_ascii_case(&record.persona)
+                && is_live_hosted(other)
+                && other.vendor != "unknown"
+        })
+        .map(|other| other.vendor.to_ascii_lowercase())
+        .collect();
+    (vendors.len() == 1).then(|| vendors.pop_first().unwrap())
+}
+
 /// The other live hosted records whose runtime is `record`'s runtime unit ([`runtime_unit`]).
 /// The tmux session name is the capitalised persona, so `claude:ada` and `codex:ada` share
 /// session `Ada`; killing it would end the other, still-live session. A Muse window is its own
-/// unit: another persona's window in the shared `muse` session is not a sharer.
+/// unit: another persona's window in the shared `muse` session is not a sharer. Same-vendor
+/// sibling records of the same persona (such as `codex:ada` alongside an adopted `<uuid>` record)
+/// represent the same session rather than a second vendor.
 fn runtime_sharers<S: StateStore>(
     store: &S,
     record: &HostedSessionRecord,
@@ -3332,6 +3373,7 @@ fn runtime_sharers<S: StateStore>(
         .filter(|r| {
             r.session_id != record.session_id
                 && !is_decommissioned(r)
+                && !is_same_vendor_sibling(record, r)
                 && r.tmux_target.as_deref().map(runtime_unit) == Some(name)
         })
         .collect())
@@ -3516,10 +3558,11 @@ pub(crate) fn record_native_ids(record: &HostedSessionRecord) -> Vec<String> {
     ids
 }
 
-/// Rewrite the decommission sidecar from records that are still decommissioned.
-/// A re-spin overwrites the same slug with a running record, so its ids leave the file.
-/// Only native session ids are written.
-pub(crate) fn refresh_decommission_tombstones<S: StateStore>(
+/// Rewrite the decommission sidecar from records that are still decommissioned
+/// and agents that are currently retired. A re-spin overwrites the same slug
+/// with a running record and re-activates the agent, so both leave the file.
+/// Only native session ids are written to `session_ids`.
+pub(crate) fn refresh_decommission_tombstones<S: AgentRegistry + StateStore>(
     store: &S,
     home_override: Option<&Path>,
 ) {
@@ -3530,7 +3573,25 @@ pub(crate) fn refresh_decommission_tombstones<S: StateStore>(
     for record in records {
         ids.extend(record_native_ids(&record));
     }
-    let _ = fl_wire::identity::save_decommissioned_session_ids(home_override, &ids);
+    let mut active_names = BTreeSet::new();
+    let mut retired_candidates = BTreeSet::new();
+    for agent in store.list_agents(None, true).unwrap_or_default() {
+        let key = agent.name_key.to_ascii_lowercase();
+        match agent.status {
+            AgentStatus::Active => {
+                active_names.insert(key);
+            }
+            AgentStatus::Retired => {
+                retired_candidates.insert(key);
+            }
+        }
+    }
+    let retired_personas: BTreeSet<String> = retired_candidates
+        .difference(&active_names)
+        .cloned()
+        .collect();
+    let _ =
+        fl_wire::identity::save_decommissioned_tombstones(home_override, &ids, &retired_personas);
 }
 
 fn dead_session_streaks() -> &'static std::sync::Mutex<BTreeMap<String, u8>> {
@@ -3680,8 +3741,29 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     let mut record = record_for_target(store, target)?;
     if record.vendor == "unknown"
         && let Some(vendor) = infer_vendor_from_routes(env.home_override, &record, target)
+            .or_else(|| infer_vendor_from_hosted_siblings(store, &record))
     {
         record.vendor = vendor;
+    }
+    let all_hosted = list_hosted_sessions(store)?;
+    let same_vendor_siblings: Vec<HostedSessionRecord> = all_hosted
+        .iter()
+        .filter(|other| is_same_vendor_sibling(&record, other))
+        .cloned()
+        .collect();
+    let mut runtime_owner_id = record.session_id.clone();
+    if (record.tmux_target.is_none() || !record.runtime_spawned)
+        && let Some(sib) = same_vendor_siblings
+            .iter()
+            .find(|s| !is_decommissioned(s) && (s.tmux_target.is_some() || s.runtime_spawned))
+    {
+        if record.tmux_target.is_none() {
+            record.tmux_target = sib.tmux_target.clone();
+        }
+        if !record.runtime_spawned && sib.runtime_spawned {
+            record.runtime_spawned = true;
+            runtime_owner_id = sib.session_id.clone();
+        }
     }
     let agent = store.agent_by_name(&target.persona)?;
     let sharing = runtime_sharers(store, &record)?;
@@ -3700,10 +3782,11 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     // Another running session of this persona (a second vendor) still owns the registry
     // record, the persona route, and the persona-keyed queue. One lookup covers the route
     // and queue decision and the retire guard below.
-    let persona_still_running = list_hosted_sessions(store)?.iter().any(|other| {
+    let persona_still_running = all_hosted.iter().any(|other| {
         other.session_id != record.session_id
             && other.persona.eq_ignore_ascii_case(&target.persona)
             && other.status.eq_ignore_ascii_case(STATUS_RUNNING)
+            && !is_same_vendor_sibling(&record, other)
     });
     for key in target.keys() {
         if persona_still_running && key.eq_ignore_ascii_case(&target.persona) {
@@ -3718,7 +3801,13 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     ];
     // Capture native ids before the routes are removed. Discovery uses them to skip a
     // conversation the hosted `vendor:persona` id does not name.
-    let tombstone_ids = teardown_route_ids(env.home_override, &record, target);
+    let mut tombstone_ids = teardown_route_ids(env.home_override, &record, target);
+    for sib in &same_vendor_siblings {
+        push_tombstone(&mut tombstone_ids, &sib.session_id);
+        for tid in &sib.tombstone_ids {
+            push_tombstone(&mut tombstone_ids, tid);
+        }
+    }
     if persona_still_running {
         remove_routes(env.home_override, &[], &session_ids);
     } else {
@@ -3741,7 +3830,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         match &record.tmux_target {
             Some(tmux_target) => {
                 let unit = runtime_unit(tmux_target);
-                let gone = env.runtime.kill(unit, &record.session_id);
+                let gone = env.runtime.kill(unit, &runtime_owner_id);
                 restore_source = Some(prune_unit_after_stop(env, unit));
                 record.runtime_spawned &= !gone;
                 gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
@@ -3756,7 +3845,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         && vendor_has_runtime(&record.vendor)
     {
         let target_name = hosted_tmux_target(&record.vendor, &record.persona);
-        let gone = env.runtime.kill_owner(&target_name, &record.session_id);
+        let gone = env.runtime.kill_owner(&target_name, &runtime_owner_id);
         restore_source = Some(prune_unit_after_stop(env, &target_name));
         gone && !(is_muse_window_target(&target_name) && env.runtime.exists(&target_name))
     } else if env.spawn_runtime
@@ -3782,10 +3871,22 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         store.retire_agent(&agent.id, stamp::now(), by)?;
     }
 
+    let updated_ms = now_ms();
     record.status = STATUS_DECOMMISSIONED.to_string();
     record.tombstone_ids = tombstone_ids;
-    record.updated_at_ms = now_ms();
+    record.updated_at_ms = updated_ms;
     persist_hosted_session(store, &record, by)?;
+    for mut sib in same_vendor_siblings {
+        if !is_decommissioned(&sib) {
+            sib.status = STATUS_DECOMMISSIONED.to_string();
+            sib.runtime_spawned = false;
+            for tid in &record.tombstone_ids {
+                push_tombstone(&mut sib.tombstone_ids, tid);
+            }
+            sib.updated_at_ms = updated_ms;
+            persist_hosted_session(store, &sib, by)?;
+        }
+    }
     // The native conversation id is tombstoned above. Conversation files stay.
     refresh_decommission_tombstones(store, env.home_override);
 
@@ -4671,7 +4772,7 @@ fn require_runtime(
 
 /// Put the record of `session_id` back as it was before a failed remodel's spin-up wrote it:
 /// `before` when there was one, else the record marked decommissioned.
-fn undo_new_record<S: StateStore>(
+fn undo_new_record<S: AgentRegistry + StateStore>(
     store: &S,
     session_id: &str,
     before: Option<HostedSessionRecord>,
@@ -7812,5 +7913,96 @@ mod tests {
             assert!(matches!(err, LifecycleError::Invalid(_)), "{err:?}");
         }
         assert!(list_hosted_sessions(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_launch_env_omits_agent_persona_while_other_vendors_include_it() {
+        let home = TempDir::new().unwrap();
+        let codex_env = launch_env_for_vendor("codex", "fiona", Some(home.path()));
+        assert!(
+            codex_env.iter().all(|(k, _)| k != "AGENT_PERSONA"),
+            "codex shares one app-server daemon and must not set AGENT_PERSONA: {codex_env:?}"
+        );
+        for vendor in ["claude", "grok", "antigravity", "muse"] {
+            let env = launch_env_for_vendor(vendor, "fiona", Some(home.path()));
+            assert!(
+                env.iter()
+                    .any(|(k, v)| k == "AGENT_PERSONA" && v == "fiona"),
+                "{vendor} must include AGENT_PERSONA: {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn teardown_of_adopted_native_uuid_also_decommissions_same_vendor_sibling_record_and_retires_agent()
+     {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = LifecycleEnv {
+            runtime: &fake,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+        spin_up(
+            &store,
+            &env,
+            &req("fiona", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+
+        let native_id = "019d8f34-89cd-7e43-8a66-31f3b49788b7";
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "fiona",
+            VendorRoute::Codex {
+                thread_id: native_id.into(),
+                cwd: None,
+            },
+            At::from_unix_millis(100),
+        );
+        let rpath = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&rpath)).unwrap();
+
+        // Simulate prepare_decommission having persisted an adopted native-UUID record alongside
+        // the original `codex:fiona` record.
+        let mut adopted = hosted_record("codex", "fiona", STATUS_DECOMMISSIONING, false);
+        adopted.session_id = native_id.to_string();
+        adopted.tmux_target = None;
+        adopted.runtime_spawned = false;
+        persist_hosted_session(&store, &adopted, "owner").unwrap();
+
+        let target = SessionTarget::resolve(
+            &store,
+            native_id,
+            Some((native_id.to_string(), Some("fiona".to_string()))),
+        )
+        .unwrap();
+        assert_eq!(target.session_id, native_id);
+
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(
+            out.runtime_stopped,
+            "inherited sibling runtime must be stopped"
+        );
+
+        let all = list_hosted_sessions(&store).unwrap();
+        assert_eq!(all.len(), 2, "{all:?}");
+        for rec in &all {
+            assert_eq!(rec.status, STATUS_DECOMMISSIONED, "{rec:?}");
+            assert!(!rec.runtime_spawned, "{rec:?}");
+            assert!(
+                rec.tombstone_ids.iter().any(|id| id == native_id),
+                "{rec:?}"
+            );
+        }
+        assert_eq!(
+            store.agent_by_name("fiona").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+        let retired = fl_wire::identity::load_retired_personas(Some(home.path()));
+        assert!(retired.contains("fiona"), "{retired:?}");
     }
 }

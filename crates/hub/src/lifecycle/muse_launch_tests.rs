@@ -587,7 +587,10 @@ fn built_in_vendors_launch_with_their_prompt() {
         let mut expected = vec![expected_bin];
         expected.extend(flags.into_iter().map(String::from));
         expected.push(out.prompt.unwrap());
-        assert_eq!(spec.env, launch_env("ada", Some(home.path())));
+        assert_eq!(
+            spec.env,
+            launch_env_for_vendor(vendor, "ada", Some(home.path()))
+        );
         assert_eq!(spec.argv, expected, "{vendor}");
     }
 }
@@ -668,7 +671,10 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             expected.push("--prompt-interactive".into());
         }
         expected.push(out.prompt);
-        assert_eq!(spec.env, launch_env("ada", Some(home.path())));
+        assert_eq!(
+            spec.env,
+            launch_env_for_vendor(vendor, "ada", Some(home.path()))
+        );
         assert_eq!(spec.argv, expected, "{vendor}");
     }
 }

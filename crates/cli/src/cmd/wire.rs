@@ -463,9 +463,7 @@ fn remove_route_at(sock: &Path, paths: &[PathBuf], persona: &str) -> Result<(), 
         }
         let mut routes = RouteTable::load(Some(path));
         if routes.entries.remove(persona).is_some() {
-            routes
-                .save(Some(path))
-                .map_err(|error| error.to_string())?;
+            routes.save(Some(path)).map_err(|error| error.to_string())?;
         }
     }
     if let Some(err) = daemon_err {
@@ -1376,13 +1374,29 @@ fn vendor_hook_response(
 
     // Codex 0.166 shares one app-server daemon. That process keeps AGENT_PERSONA from
     // whichever session started it, so the hook environment is not the session that fired.
-    // The rollout names the session. Read it before the process environment.
-    let (persona, persona_source) = if is_codex
-        && let Some(found) = transcript_path
+    // Never fall back to the process environment for Codex: resolve from the transcript or
+    // an existing Codex route for `session_id`.
+    let (persona, persona_source) = if is_codex {
+        if let Some(found) = transcript_path
             .as_deref()
             .and_then(|tp| scan_transcript_for_persona(tp, 50))
-    {
-        (found, PersonaSource::Transcript)
+        {
+            (found, PersonaSource::Transcript)
+        } else if !session_id.is_empty()
+            && let Some(entry) = RouteTable::load(resolve_routes_path_for(&hook_env).as_deref())
+                .entries
+                .values()
+                .find(|entry| {
+                    matches!(
+                        &entry.route,
+                        VendorRoute::Codex { thread_id, .. } if thread_id == &session_id
+                    )
+                })
+        {
+            (entry.persona.clone(), PersonaSource::Transcript)
+        } else {
+            return Ok(json!({}));
+        }
     } else {
         resolve_caller_with_source(&hook_env, None, transcript_path.as_deref())
     };
@@ -2500,6 +2514,47 @@ mod tests {
             rig.route_of("freya")
         );
         assert!(rig.route_of("fiona").is_none());
+    }
+
+    #[test]
+    fn codex_hook_without_transcript_never_falls_back_to_daemon_agent_persona_env() {
+        let rig = HookRig::new(Some("fiona"));
+        let out = rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-unclaimed",
+                "cwd": "/tmp/ferris",
+            }),
+        );
+        assert_eq!(out, json!({}));
+        assert!(
+            rig.route_of("fiona").is_none(),
+            "codex hook must not register fiona from shared daemon AGENT_PERSONA"
+        );
+
+        // Once a Codex route is registered for the thread_id, a hook without transcript resolves it.
+        rig.seed(
+            "ferris",
+            VendorRoute::Codex {
+                thread_id: "thread-ferris".into(),
+                cwd: None,
+            },
+        );
+        rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "thread-ferris",
+                "cwd": "/tmp/ferris",
+            }),
+        );
+        assert!(rig.route_of("fiona").is_none());
+        assert!(matches!(
+            rig.route_of("ferris"),
+            Some(VendorRoute::Codex { thread_id, cwd })
+                if thread_id == "thread-ferris" && cwd == Some(PathBuf::from("/tmp/ferris"))
+        ));
     }
 
     #[test]
