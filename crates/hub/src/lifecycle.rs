@@ -61,16 +61,18 @@ pub fn spin_up_vendor_ids() -> Vec<String> {
         .collect()
 }
 
-/// Whether a vendor runs as an interactive process in a `tmux` window. An HTTP API vendor has no
-/// CLI to host; an id the registry does not know is treated as a CLI (a legacy record).
+/// Whether a vendor runs as an interactive CLI process in a hosted runtime window. An HTTP API
+/// vendor without a CLI adapter has no CLI to host; an id with a registered CLI adapter or an id
+/// the registry does not know is treated as a CLI.
 fn vendor_has_runtime(vendor: &str) -> bool {
-    !matches!(
-        lookup_vendor(vendor),
-        Some(VendorDescriptor {
-            transport: VendorTransport::HttpApi { .. },
-            ..
-        })
-    )
+    fl_wire::vendor_adapter::lookup_vendor_cli_adapter(vendor).is_some()
+        || !matches!(
+            lookup_vendor(vendor),
+            Some(VendorDescriptor {
+                transport: VendorTransport::HttpApi { .. },
+                ..
+            })
+        )
 }
 /// Node a session lands on when the request names none.
 pub const DEFAULT_NODE_ID: &str = "ai-lab-0";
@@ -169,14 +171,14 @@ pub struct LifecycleEnv<'a> {
 }
 
 impl<'a> LifecycleEnv<'a> {
-    /// Real `tmux` calls are off under `cfg(test)` and when `FL_TEST_SPINUP_NO_SPAWN=1`.
+    /// Real runtime calls are off under `cfg(test)` and when `FL_TEST_SPINUP_NO_SPAWN=1`.
     pub fn new(home_override: Option<&'a Path>) -> Self {
         let disabled =
             cfg!(test) || std::env::var("FL_TEST_SPINUP_NO_SPAWN").is_ok_and(|v| v.trim() == "1");
         Self {
             home_override,
             spawn_runtime: !disabled,
-            runtime: &TmuxRuntime,
+            runtime: &HostRuntime,
             key_probe: &HostKeyProbe,
             workspace_root: None,
         }
@@ -453,119 +455,13 @@ fn launch_survived(env: &LifecycleEnv<'_>, unit: &str, hosted_id: &str) -> bool 
     false
 }
 
-/// The command a runtime window starts in place of a blank shell: run as an argument vector,
-/// never through a shell, so no argument needs quoting.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchSpec {
-    /// Environment variables set for the command.
-    pub env: Vec<(String, String)>,
-    /// The program, then its arguments.
-    pub argv: Vec<String>,
-}
-
-/// The Muse model used when none is requested (or the request is unusable).
-pub(crate) const MUSE_DEFAULT_MODEL: &str = "muse-wonder-full-1.0";
-
-/// The Muse catalog model ids the CLI accepts for `--model`, default first. Discovery offers
-/// these as the selectable models; [`normalize_muse_model`] maps a request onto them.
-pub(crate) const MUSE_CATALOG_MODELS: [&str; 3] =
-    [MUSE_DEFAULT_MODEL, "muse-wonder-1.0", "muse-spark-1.3"];
-
-/// Unversioned names the CLI rejects ("model ... does not exist"), with the catalog id each means.
-const MUSE_MODEL_ALIASES: [(&str, &str); 3] = [
-    ("muse-wonder-full", MUSE_DEFAULT_MODEL),
-    ("muse-wonder", "muse-wonder-1.0"),
-    ("muse-spark", "muse-spark-1.3"),
-];
-
-/// The model id to hand to `muse --model` for a requested `model`: a catalog id as is (any
-/// case), an unversioned name as its catalog id, nothing as [`MUSE_DEFAULT_MODEL`], and any
-/// other value as is only when it is a plain id (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, so it
-/// can never start with `-` and be read as a flag). An unusable value falls back to the default
-/// instead of failing the spin-up.
-pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
-    let trimmed = requested.map_or("", str::trim);
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(id) = MUSE_CATALOG_MODELS.iter().find(|id| **id == lower) {
-        return (*id).to_string();
-    }
-    if let Some((_, id)) = MUSE_MODEL_ALIASES.iter().find(|(alias, _)| *alias == lower) {
-        return (*id).to_string();
-    }
-    let plain = trimmed.len() <= 64
-        && trimmed
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphanumeric())
-        && trimmed
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if plain {
-        trimmed.to_string()
-    } else {
-        MUSE_DEFAULT_MODEL.to_string()
-    }
-}
-
-/// Split a trailing context-window tag (`[1m]`, `[200k]`: one to four digits, then lower-case
-/// `k` or `m`) off a model id. `None` for an id with no such tag.
-pub(crate) fn split_window_tag(id: &str) -> Option<(&str, &str)> {
-    let open = id.rfind('[')?;
-    let (base, tag) = id.split_at(open);
-    let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
-    // Work on bytes: the last char of the tag may be multi-byte, so slicing the `str` at
-    // `len - 1` could land inside it. A valid tag is all ASCII, and any non-ASCII byte fails
-    // the checks below.
-    let bytes = inner.as_bytes();
-    let (&unit, digits) = bytes.split_last()?;
-    let valid = matches!(unit, b'k' | b'm')
-        && (1..=4).contains(&digits.len())
-        && digits.iter().all(u8::is_ascii_digit);
-    valid.then_some((base, tag))
-}
-
-/// `true` for `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
-fn is_plain_model_id(id: &str) -> bool {
-    id.len() <= 64
-        && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// A plain model id cannot be interpreted as a command-line option. It may end in ONE
-/// context-window tag (`opus[1m]`, `sonnet[1m]`: [`split_window_tag`]); no other bracket is
-/// accepted. The launch passes each argument to the process as is (never through a shell), so
-/// the tag is not glob-expanded.
-fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
-    let id = requested?.trim();
-    let base = split_window_tag(id).map_or(id, |(base, _)| base);
-    is_plain_model_id(base).then(|| id.to_string())
-}
-
-/// The `agy --model` id for `model`. `agy models` lists every id with an effort suffix
-/// (`-low`, `-medium` or `-high`), so a bare id such as `claude-sonnet-5-5` is not accepted.
-/// A suffix already on `model` is kept unless `thinking_level` (case-insensitive `low`, `medium`
-/// or `high`; anything else is ignored) names another; with no suffix the effort is appended,
-/// `medium` by default. `gpt-oss-120b` only exists as `-medium`. The input is trimmed and lowercased, and an
-/// empty model gives an empty string, which callers treat as absent.
-pub(crate) fn agy_cli_model_id(model: &str, thinking_level: Option<&str>) -> String {
-    let model = model.trim().to_ascii_lowercase();
-    if model.is_empty() {
-        return String::new();
-    }
-    let (base, existing) = crate::discovery::split_agy_thinking_suffix(&model);
-    if base == "gpt-oss-120b" {
-        return format!("{base}-medium");
-    }
-    let explicit = thinking_level
-        .map(|level| level.trim().to_ascii_lowercase())
-        .filter(|level| matches!(level.as_str(), "low" | "medium" | "high"));
-    let effort = explicit
-        .or(existing)
-        .unwrap_or_else(|| "medium".to_string());
-    format!("{base}-{effort}")
-}
+pub use fl_wire::vendor_adapter::LaunchSpec;
+#[allow(unused_imports)]
+pub(crate) use fl_wire::vendor_adapter::{
+    MUSE_CATALOG_MODELS, MUSE_DEFAULT_MODEL, agy_cli_model_id, is_plain_model_id,
+    launch_env_for_vendor, muse_prompt_argument, normalize_muse_model, normalize_plain_model,
+    resolve_vendor_bin, split_window_tag, with_local_bin,
+};
 
 /// Build a launch command for built-in CLI vendors; custom vendors use prompt delivery.
 fn launch_spec_for(
@@ -579,70 +475,8 @@ fn launch_spec_for(
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let mut argv = if vendor == "muse" {
-        vec![
-            resolve_muse_bin(std::env::var_os("FL_WIRE_MUSE_BIN"), home.as_deref()),
-            "--model".into(),
-            normalize_muse_model(model),
-        ]
-    } else {
-        let (variable, bin, flags): (&str, &str, &[&str]) = match vendor {
-            "codex" => ("FL_WIRE_CODEX_BIN", "codex", &["--yolo"]),
-            "claude" => ("FL_WIRE_CLAUDE_BIN", "claude", &["--enable-auto-mode"]),
-            "grok" => ("FL_WIRE_GROK_BIN", "grok", &["--yolo", "--always-approve"]),
-            "antigravity" => ("FL_WIRE_AGY_BIN", "agy", &["--mode", "auto"]),
-            _ => return None,
-        };
-        let mut args = vec![resolve_vendor_bin(
-            std::env::var_os(variable),
-            home.as_deref(),
-            bin,
-        )];
-        args.extend(flags.iter().map(|flag| (*flag).to_string()));
-        let agy_model = (vendor == "antigravity")
-            .then(|| model.map(|m| agy_cli_model_id(m, None)))
-            .flatten();
-        let model = if vendor == "antigravity" {
-            agy_model.as_deref()
-        } else {
-            model
-        };
-        // Only Claude names its window in the model id (`opus[1m]`); another vendor's id never
-        // carries a tag, so a tagged one is dropped as it always was.
-        if let Some(model) = normalize_plain_model(model)
-            .filter(|m| vendor == "claude" || split_window_tag(m).is_none())
-        {
-            args.extend(["--model".into(), model]);
-        }
-        if vendor == "antigravity" {
-            args.push("--prompt-interactive".into());
-        }
-        args
-    };
-    argv.push(muse_prompt_argument(prompt));
-    Some(LaunchSpec {
-        env: launch_env_for_vendor(vendor, persona, home.as_deref()),
-        argv,
-    })
-}
-
-/// `AGENT_PERSONA` (omitted for `codex`, which shares one `codex app-server` daemon across
-/// sessions) plus a `PATH` that starts with `<home>/.local/bin` when that directory is not
-/// already a `PATH` entry. A new tmux session otherwise inherits the hub service path, which
-/// does not contain `fl`.
-pub(crate) fn launch_env_for_vendor(
-    vendor: &str,
-    persona: &str,
-    home: Option<&Path>,
-) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if vendor != "codex" {
-        env.push(("AGENT_PERSONA".into(), persona.into()));
-    }
-    if let Some(path) = path_with_local_bin(home) {
-        env.push(("PATH".into(), path));
-    }
-    env
+    let adapter = fl_wire::vendor_adapter::lookup_vendor_cli_adapter(vendor)?;
+    Some(adapter.build_launch_spec(persona, model, prompt, home.as_deref()))
 }
 
 #[cfg(test)]
@@ -650,57 +484,283 @@ pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, Str
     launch_env_for_vendor("claude", persona, home)
 }
 
-fn path_with_local_bin(home: Option<&Path>) -> Option<String> {
-    let local = home?.join(".local").join("bin");
-    let current = std::env::var("PATH").unwrap_or_default();
-    Some(with_local_bin(&local, &current))
-}
-
-/// `path` unchanged when `local` is already a component; otherwise `local` first.
-fn with_local_bin(local: &Path, path: &str) -> String {
-    if std::env::split_paths(path).any(|entry| entry == local) {
-        return path.to_string();
-    }
-    let local = local.to_string_lossy();
-    if path.is_empty() {
-        local.into_owned()
-    } else {
-        format!("{local}:{path}")
-    }
-}
-
-/// The prompt as Muse's positional argument. Muse's CLI rejects a bare `--`, so nothing can
-/// mark the end of the options: a prompt starting with `-` is given a neutral leading word so
-/// it cannot be read as a flag. Any other prompt is passed unchanged.
-fn muse_prompt_argument(prompt: &str) -> String {
-    if prompt.starts_with('-') {
-        format!("Prompt: {prompt}")
-    } else {
-        prompt.to_string()
-    }
-}
-
-/// The Muse binary: `configured` (`FL_WIRE_MUSE_BIN`, the one the dispatcher honours) when set,
-/// else `<home>/.local/bin/muse` when that file exists, else `muse` from `PATH`.
+#[cfg(test)]
 fn resolve_muse_bin(configured: Option<std::ffi::OsString>, home: Option<&Path>) -> String {
     resolve_vendor_bin(configured, home, "muse")
 }
 
-/// Resolve a configured binary, then a user-local binary, then a PATH command.
-fn resolve_vendor_bin(
-    configured: Option<std::ffi::OsString>,
-    home: Option<&Path>,
-    bin_name: &str,
-) -> String {
-    if let Some(bin) = configured.filter(|b| !b.is_empty()) {
-        return bin.to_string_lossy().into_owned();
+/// The native runtime: `fl-host`, falling back to `TmuxRuntime` only when `FL_WIRE_TMUX_BIN` is
+/// explicitly configured and `fl-host` is not reachable.
+#[derive(Debug, Clone, Copy)]
+pub struct HostRuntime;
+
+fn use_legacy_tmux_fallback() -> bool {
+    std::env::var_os("FL_WIRE_TMUX_BIN").is_some()
+        && fl_host_proto::HostEndpoint::discover()
+            .and_then(|ep| fl_host_proto::BlockingHostClient::connect(&ep))
+            .is_err()
+}
+
+fn connect_host_client() -> Option<fl_host_proto::BlockingHostClient> {
+    let endpoint = fl_host_proto::HostEndpoint::discover().ok()?;
+    fl_host_proto::BlockingHostClient::connect(&endpoint).ok()
+}
+
+fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
+    if !is_killable_unit(unit) {
+        return false;
     }
-    home.map(|h| h.join(".local").join("bin").join(bin_name))
-        .filter(|p| p.is_file())
-        .map_or_else(
-            || bin_name.to_string(),
-            |p| p.to_string_lossy().into_owned(),
-        )
+    if !owner_mode && is_muse_window_target(unit) && hosted_id.is_empty() {
+        return false;
+    }
+    let Some(mut client) = connect_host_client() else {
+        return false;
+    };
+    let Ok(sessions) = client.list_sessions() else {
+        return false;
+    };
+    let ids = fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit);
+    if ids.is_empty() {
+        return true;
+    }
+    let mut all_ok = true;
+    for id in &ids {
+        let Some(summary) = sessions.iter().find(|s| {
+            s.stream.session == *id && matches!(s.state, fl_host_proto::ChildState::Running(_))
+        }) else {
+            continue;
+        };
+        let killed = client
+            .claim_controller(summary.stream.clone())
+            .and_then(|grant| client.kill_session(summary.stream.clone(), grant.lease))
+            .is_ok();
+        if !killed {
+            all_ok = false;
+        }
+    }
+    for _ in 0..50 {
+        let Ok(after) = client.list_sessions() else {
+            break;
+        };
+        let still_active = after.iter().any(|s| {
+            ids.contains(&s.stream.session)
+                && !matches!(s.state, fl_host_proto::ChildState::CleanupComplete(_))
+        });
+        if !still_active {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    all_ok
+}
+
+impl SessionRuntime for HostRuntime {
+    fn spawn(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> bool {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.spawn(session, window, cwd, launch, hosted_id);
+        }
+        let session = session.trim();
+        let window = window.trim();
+        if session.is_empty()
+            || (session == MUSE_SESSION && (window.is_empty() || hosted_id.trim().is_empty()))
+        {
+            return false;
+        }
+        let Some(mut client) = connect_host_client() else {
+            return false;
+        };
+        let Ok(sessions) = client.list_sessions() else {
+            return false;
+        };
+        let unit_check = if session == MUSE_SESSION {
+            format!("{MUSE_SESSION}:{window}")
+        } else {
+            session.to_string()
+        };
+        if !fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, &unit_check).is_empty()
+        {
+            return false;
+        }
+        let raw_id = if window.is_empty() {
+            session.to_string()
+        } else {
+            format!("{session}.{window}")
+        };
+        let Ok(session_id) = fl_host_proto::SessionId::new(&raw_id) else {
+            return false;
+        };
+        let argv = match launch {
+            Some(spec) if !spec.argv.is_empty() => spec.argv.clone(),
+            _ => vec!["/bin/sh".to_string()],
+        };
+        let cwd_path = cwd
+            .filter(|d| Path::new(d).is_dir())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+        let mut env_map = BTreeMap::new();
+        let mut env_allow: BTreeSet<String> = fl_core::child_env::BASELINE_EXACT
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        if let Some(spec) = launch {
+            for (k, v) in &spec.env {
+                env_allow.insert(k.clone());
+                env_map.insert(k.clone(), v.clone());
+            }
+        }
+        env_allow.insert("FL_HOST_PTY".to_string());
+        env_map.insert("FL_HOST_PTY".to_string(), "1".to_string());
+        if !hosted_id.is_empty() {
+            env_allow.insert("FL_HOSTED_ID".to_string());
+            env_map.insert("FL_HOSTED_ID".to_string(), hosted_id.to_string());
+        }
+        let spec = fl_host_proto::SpawnSpec {
+            session: session_id,
+            kind: fl_host_proto::SpawnKind::Pipe,
+            argv,
+            cwd: cwd_path,
+            env: env_map,
+            env_allow,
+        };
+        client.spawn_reliable_session(spec).is_ok()
+    }
+
+    fn kill(&self, unit: &str, hosted_id: &str) -> bool {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.kill(unit, hosted_id);
+        }
+        kill_host_unit(unit, hosted_id, false)
+    }
+
+    fn kill_owner(&self, unit: &str, hosted_id: &str) -> bool {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.kill_owner(unit, hosted_id);
+        }
+        kill_host_unit(unit, hosted_id, true)
+    }
+
+    fn capture(&self, unit: &str) -> String {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.capture(unit);
+        }
+        let Some(mut client) = connect_host_client() else {
+            return String::new();
+        };
+        let target_id = client
+            .list_sessions()
+            .ok()
+            .and_then(|sessions| {
+                fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit)
+                    .into_iter()
+                    .next()
+            })
+            .or_else(|| fl_wire::vendor_adapter::unit_to_host_session_id(unit));
+        let Some(id) = target_id else {
+            return String::new();
+        };
+        client.capture_output(id, 16_384).unwrap_or_default()
+    }
+
+    fn send_keys(&self, unit: &str, keys: &str) -> bool {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.send_keys(unit, keys);
+        }
+        if keys.is_empty() {
+            return false;
+        }
+        let Some(mut client) = connect_host_client() else {
+            return false;
+        };
+        let Ok(sessions) = client.list_sessions() else {
+            return false;
+        };
+        let target_id = fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit)
+            .into_iter()
+            .next()
+            .or_else(|| fl_wire::vendor_adapter::unit_to_host_session_id(unit));
+        let Some(id) = target_id else {
+            return false;
+        };
+        let Some(summary) = sessions.iter().find(|s| {
+            s.stream.session == id && matches!(s.state, fl_host_proto::ChildState::Running(_))
+        }) else {
+            return false;
+        };
+        let Ok(grant) = client.claim_controller(summary.stream.clone()) else {
+            return false;
+        };
+        match keys {
+            "Escape" => matches!(
+                client.write_raw(summary.stream.clone(), grant.lease, b"\x1b".to_vec()),
+                Ok(fl_host_proto::SendOutcome::Written)
+            ),
+            "C-c" => client
+                .signal_session(
+                    summary.stream.clone(),
+                    grant.lease,
+                    fl_host_proto::SignalKind::Interrupt,
+                )
+                .is_ok(),
+            "Enter" => matches!(
+                client.write_raw(summary.stream.clone(), grant.lease, b"\r".to_vec()),
+                Ok(fl_host_proto::SendOutcome::Written)
+            ),
+            other => matches!(
+                client.send_line(summary.stream.clone(), grant.lease, other.to_string()),
+                Ok(fl_host_proto::SendOutcome::Written)
+            ),
+        }
+    }
+
+    fn exists(&self, unit: &str) -> bool {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.exists(unit);
+        }
+        let Some(mut client) = connect_host_client() else {
+            return false;
+        };
+        client.list_sessions().is_ok_and(|sessions| {
+            !fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit).is_empty()
+        })
+    }
+
+    fn presence(&self, unit: &str) -> RuntimePresence {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.presence(unit);
+        }
+        let Some(mut client) = connect_host_client() else {
+            return RuntimePresence::Unknown;
+        };
+        let Ok(sessions) = client.list_sessions() else {
+            return RuntimePresence::Unknown;
+        };
+        if !fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit).is_empty() {
+            RuntimePresence::Alive
+        } else {
+            RuntimePresence::Gone
+        }
+    }
+
+    fn owns(&self, unit: &str, hosted_id: &str) -> bool {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.owns(unit, hosted_id);
+        }
+        if unit.contains(':') && hosted_id.is_empty() {
+            return false;
+        }
+        self.exists(unit)
+    }
+
+    fn settle_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(50)
+    }
 }
 
 /// The real runtime: the host's `tmux`.
@@ -2265,6 +2325,40 @@ fn poll_claude_auto_mode_prompt(
     }
 }
 
+fn apply_startup_prompt_rules(runtime: &dyn SessionRuntime, vendor: &str, target: &str) {
+    if vendor == "grok" {
+        accept_grok_directory_trust(runtime, target);
+        return;
+    }
+    if vendor == "claude" {
+        dismiss_claude_auto_mode_prompt(runtime, target);
+        return;
+    }
+    let Some(adapter) = fl_wire::vendor_adapter::lookup_vendor_cli_adapter(vendor) else {
+        return;
+    };
+    let delay = runtime.settle_delay();
+    for rule in adapter.startup_prompt_rules() {
+        let mut matched = false;
+        for attempt in 0..GROK_TRUST_CAPTURES {
+            if runtime.capture(target).contains(rule.match_text) {
+                let _ = runtime.send_keys(target, rule.response_keys);
+                matched = true;
+                break;
+            }
+            if attempt + 1 < GROK_TRUST_CAPTURES && !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
+        if !matched && rule.warn_on_miss {
+            eprintln!(
+                "warning: startup prompt `{}` was not seen on `{target}` after {GROK_TRUST_CAPTURES} captures",
+                rule.match_text
+            );
+        }
+    }
+}
+
 /// One window of a tmux session as [`marked_windows`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TmuxWindow {
@@ -2620,8 +2714,11 @@ pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
     }
 }
 
-/// `true` when tmux knows `target` (the binary fl-wire uses: `FL_WIRE_TMUX_BIN`, else `tmux`).
+/// `true` when `fl-host` or tmux knows `target` (the binary fl-wire uses: `FL_WIRE_TMUX_BIN`, else `tmux`).
 fn tmux_target_exists(target: &str) -> bool {
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && HostRuntime.exists(target) {
+        return true;
+    }
     let mut cmd = Command::new(tmux_bin());
     cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
@@ -2946,17 +3043,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             launch.as_ref(),
             &session_id,
         );
-    if spawned
-        && v.vendor == "grok"
-        && let Some(target) = tmux_target.as_deref()
-    {
-        accept_grok_directory_trust(env.runtime, target);
-    }
-    if spawned
-        && v.vendor == "claude"
-        && let Some(target) = tmux_target.as_deref()
-    {
-        dismiss_claude_auto_mode_prompt(env.runtime, target);
+    if spawned && let Some(target) = tmux_target.as_deref() {
+        apply_startup_prompt_rules(env.runtime, &v.vendor, target);
     }
     // A runtime launched with the prompt as its first input has the prompt already, provided the
     // command stayed up: one that exited at once took its session with it, and there is nothing

@@ -122,6 +122,54 @@ impl PaneSource for TmuxPanes {
     }
 }
 
+/// The host's `fl-host` session supervisor, with fallback to `TmuxPanes` when `FL_WIRE_TMUX_BIN`
+/// is set and `fl-host` is unreachable.
+#[derive(Default)]
+pub(crate) struct HostPanes;
+
+impl PaneSource for HostPanes {
+    fn panes(&self) -> Option<Vec<Pane>> {
+        let endpoint = fl_host_proto::HostEndpoint::discover().ok();
+        let client_res = endpoint
+            .as_ref()
+            .and_then(|ep| fl_host_proto::BlockingHostClient::connect(ep).ok());
+        if let Some(mut client) = client_res
+            && let Ok(sessions) = client.list_sessions()
+        {
+            let mut out = Vec::new();
+            for s in sessions {
+                if !matches!(s.state, fl_host_proto::ChildState::Running(_)) {
+                    continue;
+                }
+                let unit = fl_wire::vendor_adapter::host_session_id_to_unit(&s.stream.session);
+                let (session, window) = match unit.split_once(':') {
+                    Some((sess, win)) => (sess.to_string(), win.to_string()),
+                    None => (unit, String::new()),
+                };
+                let bin = if session.eq_ignore_ascii_case(MUSE_SESSION) {
+                    "muse".to_string()
+                } else {
+                    fl_wire::vendor_adapter::lookup_vendor_cli_adapter(&window)
+                        .map(|a| a.default_binary().to_string())
+                        .unwrap_or_else(|| window.clone())
+                };
+                out.push(Pane {
+                    session,
+                    pane_id: format!("host:{}", s.stream.session.as_str()),
+                    window,
+                    command: bin.clone(),
+                    start_command: bin,
+                });
+            }
+            return Some(out);
+        }
+        if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
+            return TmuxPanes::default().panes();
+        }
+        None
+    }
+}
+
 pub(crate) fn parse_panes(text: &str) -> Vec<Pane> {
     text.lines()
         .filter_map(|line| {
@@ -224,7 +272,7 @@ pub(crate) struct Memory {
 }
 
 pub(crate) fn vendor_binaries() -> Vec<String> {
-    VendorRegistry::global()
+    let mut bins: BTreeSet<String> = VendorRegistry::global()
         .list()
         .into_iter()
         .filter_map(|v| match v.transport {
@@ -233,7 +281,11 @@ pub(crate) fn vendor_binaries() -> Vec<String> {
                 .map(|n| n.to_string_lossy().to_ascii_lowercase()),
             VendorTransport::HttpApi { .. } => None,
         })
-        .collect()
+        .collect();
+    for b in fl_wire::vendor_adapter::vendor_cli_binaries() {
+        bins.insert(b);
+    }
+    bins.into_iter().collect()
 }
 
 /// Whether a pane runs a vendor CLI: one of the first words of its current or start command is a
@@ -636,11 +688,11 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// The real host and its tmux, at the production pace.
+    /// The real host and its session supervisor, at the production pace.
     pub(crate) fn host() -> Self {
         Self {
             host: None,
-            panes: std::sync::Arc::new(TmuxPanes::default()),
+            panes: std::sync::Arc::new(HostPanes),
             interval: RETRY_INTERVAL,
             max_passes: MAX_PASSES,
             min_window: MIN_WINDOW,

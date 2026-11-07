@@ -8,4 +8,5 @@ pub mod dispatcher;
 pub mod identity;
 pub mod peer;
 pub mod scanner;
+pub mod vendor_adapter;
 pub mod ws;

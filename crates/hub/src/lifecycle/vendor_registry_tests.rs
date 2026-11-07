@@ -303,13 +303,7 @@ fn every_registered_vendor_with_its_longest_persona_persists_a_valid_slug() {
 #[test]
 fn spin_up_on_an_api_vendor_opens_no_tmux_window() {
     let custom = custom_http("hubreg-nowindow", None, None);
-    for vendor in [
-        "kimi-api",
-        "openrouter-api",
-        "ollama",
-        "lemonade",
-        custom.as_str(),
-    ] {
+    for vendor in ["kimi-api", "openrouter-api", custom.as_str()] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let fake = FakeRuntime::default();
@@ -333,7 +327,15 @@ fn spin_up_on_an_api_vendor_opens_no_tmux_window() {
 #[test]
 fn a_cli_vendor_still_opens_its_window() {
     let custom = custom_cli("hubreg-cli");
-    for vendor in ["claude", custom.as_str()] {
+    for vendor in [
+        "claude",
+        "codex",
+        "antigravity",
+        "grok",
+        "lemonade",
+        "ollama",
+        custom.as_str(),
+    ] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let fake = FakeRuntime::default();
