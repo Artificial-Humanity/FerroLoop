@@ -1438,16 +1438,23 @@ describe("App transcript observation ownership", () => {
     h.unmount();
   });
 
-  it.each([["implicit", "503"], ["implicit", "network"], ["explicit", "503"]])("retains %s same-session history and metadata through actual triage navigation and %s", async (preference, failure) => {
+  it.each([["implicit", "503"], ["implicit", "network"], ["explicit", "503"], ["explicit-non-first", "503"]])("retains %s same-session history and metadata through actual triage navigation and %s", async (preference, failure) => {
     const richHistory = () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Same-target triage history" })], is_busy: true,
       queue: [{ id: "same-target-held", session_id: "session-a", prompt: "Same-target held prompt", by: "owner", created_at: "now", delivery_state: "unconfirmed" }],
       context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Same-target quota" } });
     const h = harness(async (target) => target.includes("session-b")
       ? response({ session_id: "session-b", turns: [turn({ index: 0, content: "Alternate concrete baseline" })], queue: [], is_busy: false })
       : richHistory());
-    h.setSessions([{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "failed", updated_at: "t1" },
-      { id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }]);
-    await screen.findByText("Same-target triage history");
+    const sameTarget = { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "failed", updated_at: "t1" };
+    const alternate = { id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" };
+    h.setSessions(preference === "explicit-non-first" ? [alternate, sameTarget] : [sameTarget, alternate]);
+    if (preference === "explicit-non-first") {
+      await screen.findByText("Alternate concrete baseline");
+      fireEvent.change(screen.getByTestId("session-selector"), { target: { value: "session-a" } });
+      await screen.findByText("Same-target triage history");
+    } else {
+      await screen.findByText("Same-target triage history");
+    }
     if (preference === "explicit") {
       // Establish an explicit preference using genuine different-value changes.
       fireEvent.change(screen.getByTestId("session-selector"), { target: { value: "session-b" } });

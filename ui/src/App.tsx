@@ -2386,8 +2386,15 @@ export const App: React.FC<AppProps> = ({
             loading={loading}
             onRefresh={() => void loadAllInitialState()}
             onSelectAgent={(nameKey) => {
-              selectTranscriptAgent(nameKey);
               const nextKey = nameKey.trim().toLowerCase();
+              const currentOwner = ownerRef.current;
+              // An incident can apply its concrete session target next.
+              // Do not detour a same-agent selection through the first session.
+              if (currentOwner.agentKey === nextKey && currentOwner.sessionId) {
+                advanceTranscriptSelection(nextKey, currentOwner.sessionId);
+              } else {
+                selectTranscriptAgent(nameKey);
+              }
               if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
                 selectedAgentNameRef.current = nameKey;
                 selectedSessionIdRef.current = null;
