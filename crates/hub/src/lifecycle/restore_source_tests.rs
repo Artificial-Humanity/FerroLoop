@@ -648,6 +648,97 @@ fn a_running_session_adopted_without_a_target_is_stopped_and_pruned() {
 }
 
 #[test]
+fn an_unmanaged_native_uuid_session_resolves_its_vendor_from_routes_stops_tmux_and_prunes_resurrect()
+ {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let dir = resurrect_dir(&home);
+    let fake = FakeRuntime::running(&["Fiona", "Feira"]);
+    let env = fake.env(home.path());
+
+    let codex_uuid = "019dc759-7b95-7e90-b411-579a0c7f43a5";
+    let claude_uuid = "173cb085-d823-4705-b3a4-b5dd6e1cb061";
+    let routes_path = home.path().join(".cache/agent-bus/routes.json");
+    let mut routes = RouteTable::default();
+    routes.upsert(
+        "fiona",
+        VendorRoute::Codex {
+            thread_id: codex_uuid.into(),
+            cwd: None,
+        },
+        fl_core::At::from_unix_millis(1),
+    );
+    routes.upsert(
+        "feira",
+        VendorRoute::Claude {
+            pid: 4_000_000_001,
+            session_id: claude_uuid.into(),
+            socket_path: home.path().join("claude.sock"),
+            key_path: None,
+        },
+        fl_core::At::from_unix_millis(1),
+    );
+    routes.save(Some(&routes_path)).unwrap();
+
+    let fiona_target = SessionTarget::resolve(
+        &store,
+        codex_uuid,
+        Some((codex_uuid.into(), Some("Fiona".into()))),
+    )
+    .unwrap();
+    assert_eq!(
+        record_for_target(&store, &fiona_target).unwrap().vendor,
+        "unknown"
+    );
+
+    let out =
+        teardown_session(&store, &env, &fiona_target, "owner", Caller::Owner, |_| {}).unwrap();
+    assert!(out.runtime_stopped);
+    assert!(!fake.is_live("Fiona"));
+    assert!(
+        fake.calls
+            .borrow()
+            .iter()
+            .any(|call| call == "kill-owner Fiona:codex")
+    );
+    let fiona_rec = find_hosted_session(&store, &[codex_uuid]).unwrap().unwrap();
+    assert_eq!(fiona_rec.vendor, "codex");
+    assert_eq!(
+        out.restore_source,
+        Some(RestoreSourceOutcome::Pruned {
+            file: SAVE.into(),
+            lines: 5
+        })
+    );
+    assert!(
+        !fs::read_to_string(dir.join(SAVE))
+            .unwrap()
+            .contains("Fiona\t")
+    );
+
+    let feira_target = SessionTarget::resolve(
+        &store,
+        claude_uuid,
+        Some((claude_uuid.into(), Some("Feira".into()))),
+    )
+    .unwrap();
+    let out =
+        teardown_session(&store, &env, &feira_target, "owner", Caller::Owner, |_| {}).unwrap();
+    assert!(out.runtime_stopped);
+    assert!(!fake.is_live("Feira"));
+    assert!(
+        fake.calls
+            .borrow()
+            .iter()
+            .any(|call| call == "kill-owner Feira:claude")
+    );
+    let feira_rec = find_hosted_session(&store, &[claude_uuid])
+        .unwrap()
+        .unwrap();
+    assert_eq!(feira_rec.vendor, "claude");
+}
+
+#[test]
 fn an_adopted_vendor_window_is_pruned_and_a_sibling_window_stays() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();

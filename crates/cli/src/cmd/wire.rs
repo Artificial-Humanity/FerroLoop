@@ -27,7 +27,7 @@ use fl_wire::identity::{
 };
 use serde_json::{Value, json};
 
-use crate::cmd::agent::{now_at, preserve_on_replace, resolve_agent, sync_registry_markdown};
+use crate::cmd::agent::{now_at, preserve_on_replace, resolve_agent};
 use crate::cmd::state::StateEnv;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -411,32 +411,88 @@ fn prune_muse_roster(persona: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
+pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        match client.request(&LocalRequest::UnregisterRoute {
-            persona: persona.into(),
-        })? {
-            LocalResponse::RouteUnregistered => {}
-            other => return Err(format!("unexpected daemon response: {other:?}")),
-        }
-    }
     let paths: Vec<PathBuf> = match resolve_routes_path_for(env) {
         Some(path) => vec![path],
         None => std::iter::once(fl_wire::identity::default_routes_path())
             .chain(fl_wire::identity::legacy_routes_path())
             .collect(),
     };
+    remove_route_at(&sock, &paths, persona)
+}
+
+pub(crate) fn sync_store_retired_personas<S: AgentRegistry>(store: &S) {
+    #[cfg(test)]
+    if resolve_routes_path().is_none() {
+        return;
+    }
+    let mut active_names = std::collections::BTreeSet::new();
+    let mut retired_candidates = std::collections::BTreeSet::new();
+    for agent in store.list_agents(None, true).unwrap_or_default() {
+        let key = agent.name_key.to_ascii_lowercase();
+        match agent.status {
+            fl_core::agent::AgentStatus::Active => {
+                active_names.insert(key);
+            }
+            fl_core::agent::AgentStatus::Retired => {
+                retired_candidates.insert(key);
+            }
+        }
+    }
+    let retired: std::collections::BTreeSet<String> = retired_candidates
+        .difference(&active_names)
+        .cloned()
+        .collect();
+    let _ = fl_wire::identity::sync_retired_personas_in_tombstones(None, &retired);
+}
+
+pub(crate) fn evict_persona_route(persona: &str) {
+    #[cfg(test)]
+    if resolve_routes_path().is_none() {
+        return;
+    }
+    let sock = std::env::var_os("FL_WIRE_SOCKET")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            crate::config::load(crate::config::path().as_deref())
+                .ok()
+                .and_then(|cfg| cfg.wire)
+                .and_then(|w| w.socket)
+        })
+        .unwrap_or_else(default_socket_path);
+    let paths: Vec<PathBuf> = match resolve_routes_path() {
+        Some(path) => vec![path],
+        None => std::iter::once(fl_wire::identity::default_routes_path())
+            .chain(fl_wire::identity::legacy_routes_path())
+            .collect(),
+    };
+    let _ = remove_route_at(&sock, &paths, persona);
+}
+
+fn remove_route_at(sock: &Path, paths: &[PathBuf], persona: &str) -> Result<(), String> {
+    let mut daemon_err = None;
+    if let Ok(mut client) = LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+        match client.request(&LocalRequest::UnregisterRoute {
+            persona: persona.into(),
+        }) {
+            Ok(LocalResponse::RouteUnregistered) => {}
+            Ok(other) => daemon_err = Some(format!("unexpected daemon response: {other:?}")),
+            Err(e) => daemon_err = Some(e),
+        }
+    }
     for path in paths {
         if !path.is_file() {
             continue;
         }
-        let mut routes = RouteTable::load(Some(&path));
+        let mut routes = RouteTable::load(Some(path));
         if routes.entries.remove(persona).is_some() {
-            routes
-                .save(Some(&path))
-                .map_err(|error| error.to_string())?;
+            routes.save(Some(path)).map_err(|error| error.to_string())?;
         }
+    }
+    if let Some(err) = daemon_err {
+        return Err(err);
     }
     Ok(())
 }
@@ -1343,13 +1399,29 @@ fn vendor_hook_response(
 
     // Codex 0.166 shares one app-server daemon. That process keeps AGENT_PERSONA from
     // whichever session started it, so the hook environment is not the session that fired.
-    // The rollout names the session. Read it before the process environment.
-    let (persona, persona_source) = if is_codex
-        && let Some(found) = transcript_path
+    // Never fall back to the process environment for Codex: resolve from the transcript or
+    // an existing Codex route for `session_id`.
+    let (persona, persona_source) = if is_codex {
+        if let Some(found) = transcript_path
             .as_deref()
             .and_then(|tp| scan_transcript_for_persona(tp, 50))
-    {
-        (found, PersonaSource::Transcript)
+        {
+            (found, PersonaSource::Transcript)
+        } else if !session_id.is_empty()
+            && let Some(entry) = RouteTable::load(resolve_routes_path_for(&hook_env).as_deref())
+                .entries
+                .values()
+                .find(|entry| {
+                    matches!(
+                        &entry.route,
+                        VendorRoute::Codex { thread_id, .. } if thread_id == &session_id
+                    )
+                })
+        {
+            (entry.persona.clone(), PersonaSource::Transcript)
+        } else {
+            return Ok(json!({}));
+        }
     } else {
         resolve_caller_with_source(&hook_env, None, transcript_path.as_deref())
     };
@@ -1578,6 +1650,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                 by,
             }) {
                 Ok(rec) => {
+                    sync_store_retired_personas(&store);
                     if let Some(route) = capture_current_env_route() {
                         record_caller_route_with_provenance(env, &rec.name_key, route, true)
                             .map_err(|error| {
@@ -1587,7 +1660,6 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                                 )
                             })?;
                     }
-                    sync_registry_markdown(&store, env.cwd);
                     let all_active = store.list_agents(None, false).unwrap_or_default();
                     let mgr = reports_to(&rec, &all_active);
                     println!(
@@ -1615,6 +1687,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             let retired = store
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
+            sync_store_retired_personas(&store);
             remove_caller_route(env, &by)
                 .map_err(|e| (1, format!("agent retired but route removal failed: {e}")))?;
             prune_muse_roster(&by).map_err(|e| {
@@ -1623,7 +1696,6 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                     format!("agent retired but Muse roster removal failed: {e}"),
                 )
             })?;
-            sync_registry_markdown(&store, env.cwd);
             println!("Retired {} ({})", retired.display_name, retired.id);
             Ok(0)
         }
@@ -1787,7 +1859,7 @@ fn dispatch_diagnostics_summary(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     fn test_send_args() -> SendWireArgs {
         SendWireArgs {
             id: None,
@@ -2089,6 +2161,70 @@ mod tests {
         assert!(roster.get("ada").is_none());
         assert_eq!(roster["bob"]["session_id"], "keep");
     }
+
+    #[test]
+    fn agent_retire_evicts_the_retired_personas_route() {
+        let rig = HookRig::new(Some("ada"));
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: now_at(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        rig.seed("ada", grok_route("old"));
+        crate::cmd::agent::run(
+            &store,
+            crate::cmd::agent::AgentCmd::Retire {
+                agent: "Ada".into(),
+                by: "owner".into(),
+                json: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            RouteTable::load(Some(&rig.routes_path()))
+                .get("ada")
+                .is_none()
+        );
+        assert!(
+            fl_wire::identity::load_retired_personas(None).contains("ada"),
+            "fl agent retire must sync retired_personas in decommission sidecar"
+        );
+
+        crate::cmd::agent::run(
+            &store,
+            crate::cmd::agent::AgentCmd::Register {
+                name: "Ada".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                create_area: false,
+                extra_areas: vec![],
+                email: None,
+                replace: true,
+                by: "ada".into(),
+                json: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            !fl_wire::identity::load_retired_personas(None).contains("ada"),
+            "fl agent register --replace must clear retired_personas in decommission sidecar"
+        );
+    }
     #[test]
     fn retention_cutoff_saturates_instead_of_wrapping() {
         assert_eq!(super::retention_cutoff_ms(1_000, u64::MAX), 0);
@@ -2110,12 +2246,13 @@ mod tests {
     static HOOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Serialises the tests that read or write process-global environment variables.
-    fn hook_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn hook_env_lock() -> std::sync::MutexGuard<'static, ()> {
         HOOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    const HOOK_ENV_VARS: [&str; 15] = [
+    const HOOK_ENV_VARS: [&str; 16] = [
         "HOME",
+        "XDG_RUNTIME_DIR",
         "AGENT_PERSONA",
         "AGENT_NAME",
         "FL_WIRE_ROUTES",
@@ -2432,6 +2569,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_hook_without_transcript_never_falls_back_to_daemon_agent_persona_env() {
+        let rig = HookRig::new(Some("fiona"));
+        let out = rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-unclaimed",
+                "cwd": "/tmp/ferris",
+            }),
+        );
+        assert_eq!(out, json!({}));
+        assert!(
+            rig.route_of("fiona").is_none(),
+            "codex hook must not register fiona from shared daemon AGENT_PERSONA"
+        );
+
+        // Once a Codex route is registered for the thread_id, a hook without transcript resolves it.
+        rig.seed(
+            "ferris",
+            VendorRoute::Codex {
+                thread_id: "thread-ferris".into(),
+                cwd: None,
+            },
+        );
+        rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "thread-ferris",
+                "cwd": "/tmp/ferris",
+            }),
+        );
+        assert!(rig.route_of("fiona").is_none());
+        assert!(matches!(
+            rig.route_of("ferris"),
+            Some(VendorRoute::Codex { thread_id, cwd })
+                if thread_id == "thread-ferris" && cwd == Some(PathBuf::from("/tmp/ferris"))
+        ));
+    }
+
+    #[test]
     fn codex_transcript_claims_a_thread_held_by_an_explicit_alias() {
         let rig = HookRig::new(Some("fiona"));
         let path = rig.routes_path();
@@ -2638,13 +2816,8 @@ mod tests {
 
     #[test]
     fn test_wire_cli_send_read_ack_reply_and_agent_msg_compat() {
-        let _env_lock = hook_env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: isolates test from discovering host agent routes.
-        unsafe {
-            std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
-            std::env::set_var("FL_WIRE_ROUTES", dir.path().join("routes.json"));
-        }
+        let rig = HookRig::new(None);
+        let dir = &rig.dir;
         let db = dir.path().join("fl.redb");
         let sock = dir.path().join("wire.sock");
         let cfg = Config {

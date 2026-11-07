@@ -6,6 +6,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 struct Machine {
+    root: PathBuf,
     cfg_dir: PathBuf,
     data_dir: PathBuf,
     repo_dir: PathBuf,
@@ -15,8 +16,11 @@ impl Machine {
     fn fl(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fl"));
         cmd.current_dir(&self.repo_dir)
+            .env("HOME", &self.root)
+            .env("XDG_RUNTIME_DIR", &self.root)
             .env("XDG_CONFIG_HOME", &self.cfg_dir)
             .env("XDG_DATA_HOME", &self.data_dir)
+            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
             .env_remove("FL_DB");
         cmd
     }
@@ -95,6 +99,7 @@ fn setup_two_machines(private_remote: bool) -> (TempDir, PathBuf, Machine, Machi
         .unwrap();
 
         Machine {
+            root,
             cfg_dir,
             data_dir,
             repo_dir,

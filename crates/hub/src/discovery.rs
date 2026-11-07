@@ -230,6 +230,10 @@ pub struct SessionQuotaUsage {
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryStoreSnapshot {
     registered_names: BTreeSet<String>,
+    /// Lowercase `name_key`s that have at least one `AgentStatus::Retired` record and no
+    /// `AgentStatus::Active` record. Passive routes (`!entry.explicit`) for these names are
+    /// skipped so historical transcripts of retired agents do not reappear as active sessions.
+    pub(crate) retired_names: BTreeSet<String>,
     attempts: Vec<DiscoveryAttemptRow>,
     /// Hosted `vendor:persona` ids and native vendor ids of records whose status is
     /// `decommissioned`. Discovery skips a route that still names one of them.
@@ -609,16 +613,34 @@ pub(crate) fn with_route_file_lock<T>(write: impl FnOnce() -> T) -> T {
     write()
 }
 
+fn snapshot_agent_name_sets(store: &AnyStore) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut registered_names = BTreeSet::new();
+    let mut active_names = BTreeSet::new();
+    let mut retired_candidates = BTreeSet::new();
+    for agent in store.list_agents(None, true).unwrap_or_default() {
+        let key = agent.name_key.to_ascii_lowercase();
+        registered_names.insert(key.clone());
+        match agent.status {
+            fl_core::AgentStatus::Active => {
+                active_names.insert(key);
+            }
+            fl_core::AgentStatus::Retired => {
+                retired_candidates.insert(key);
+            }
+        }
+    }
+    let retired_names = retired_candidates
+        .difference(&active_names)
+        .cloned()
+        .collect();
+    (registered_names, retired_names)
+}
+
 /// Read agent names and attempt rows. Does not walk the filesystem.
 pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     #[cfg(test)]
     cost_counters::bump(&cost_counters::STORE_SNAPSHOTS);
-    let registered_names = store
-        .list_agents(None, true)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|agent| agent.name_key.to_ascii_lowercase())
-        .collect();
+    let (registered_names, retired_names) = snapshot_agent_name_sets(store);
     let mut attempts = Vec::new();
     if let Ok(projects) = store.list_projects() {
         for project in projects {
@@ -647,6 +669,7 @@ pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     }
     DiscoveryStoreSnapshot {
         registered_names,
+        retired_names,
         attempts,
         decommissioned_session_ids: decommissioned_session_ids(store),
     }
@@ -668,13 +691,10 @@ fn decommissioned_session_ids(store: &AnyStore) -> BTreeSet<String> {
 
 /// The route ordering needs agent names, but not attempt history.
 pub(crate) fn snapshot_discovery_names(store: &AnyStore) -> DiscoveryStoreSnapshot {
+    let (registered_names, retired_names) = snapshot_agent_name_sets(store);
     DiscoveryStoreSnapshot {
-        registered_names: store
-            .list_agents(None, true)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|agent| agent.name_key.to_ascii_lowercase())
-            .collect(),
+        registered_names,
+        retired_names,
         attempts: Vec::new(),
         decommissioned_session_ids: decommissioned_session_ids(store),
     }
@@ -830,6 +850,9 @@ pub(crate) fn lookup_one_route_session(
     let mut seen = BTreeSet::new();
     let requested = requested.trim();
     let persona = ordered.into_iter().find_map(|(persona, entry)| {
+        if !entry.explicit && snap.retired_names.contains(&persona.to_ascii_lowercase()) {
+            return None;
+        }
         let id = route_session_id(persona, &entry.route);
         (seen.insert(id.clone()) && (id == requested || persona == requested))
             .then(|| persona.clone())
@@ -866,12 +889,19 @@ fn discover_sessions_from_routes(
         )
     });
 
+    let file_decommissioned = fl_wire::identity::load_decommissioned_session_ids(home_override);
+
     for (persona, entry) in ordered_routes {
         if only_persona.is_some_and(|selected| selected != persona) {
             continue;
         }
+        if !entry.explicit && snap.retired_names.contains(&persona.to_ascii_lowercase()) {
+            continue;
+        }
         let raw_id = route_session_id(persona, &entry.route);
-        if route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route) {
+        if route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route)
+            || route_was_decommissioned(&file_decommissioned, &entry.route)
+        {
             continue;
         }
         let (adapter, cwd, transcript_path) = match &entry.route {
@@ -9680,6 +9710,7 @@ mod tests {
         routes.save(Some(&path)).unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            retired_names: BTreeSet::new(),
             attempts: Vec::new(),
             decommissioned_session_ids: BTreeSet::from([
                 "conv-1".to_string(),
@@ -9702,6 +9733,50 @@ mod tests {
     }
 
     #[test]
+    fn retired_names_skip_passive_routes_while_keeping_explicit_ones() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "fiona",
+            VendorRoute::Codex {
+                thread_id: "thread-fiona-old".into(),
+                cwd: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        routes.upsert_explicit(
+            "mira",
+            VendorRoute::Codex {
+                thread_id: "thread-mira-explicit".into(),
+                cwd: None,
+            },
+            fl_core::at::At::from_unix_millis(2),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::from(["fiona".to_string(), "mira".to_string()]),
+            retired_names: BTreeSet::from(["fiona".to_string(), "mira".to_string()]),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::new(),
+        };
+        let sessions = discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.persona.as_deref() != Some("fiona")),
+            "passive route for retired persona must be skipped: {sessions:?}"
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.persona.as_deref() == Some("mira") && s.id == "thread-mira-explicit"),
+            "explicit route for retired persona must stay discoverable: {sessions:?}"
+        );
+    }
+
+    #[test]
     fn an_empty_grok_route_resolves_from_its_discovered_id() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -9720,6 +9795,7 @@ mod tests {
         routes.save(Some(&path)).unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            retired_names: BTreeSet::new(),
             attempts: Vec::new(),
             decommissioned_session_ids: BTreeSet::from(["grok:ada".to_string()]),
         };
@@ -9763,6 +9839,7 @@ mod tests {
         routes.save(Some(&path)).unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            retired_names: BTreeSet::new(),
             attempts: Vec::new(),
             decommissioned_session_ids: BTreeSet::new(),
         };
@@ -9958,6 +10035,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            retired_names: BTreeSet::new(),
             decommissioned_session_ids: BTreeSet::new(),
             attempts: vec![DiscoveryAttemptRow {
                 id: "attempt-1".into(),

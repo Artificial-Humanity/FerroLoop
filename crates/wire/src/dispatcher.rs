@@ -66,7 +66,7 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             agentapi_exe,
             ..
         } => {
-            let title = format!("--title={}", format_push_header(msg));
+            let title = format_push_header(msg);
             let delivered_body = if is_owner_sender(&msg.sender_name) {
                 if msg.body.starts_with("[Operator Prompt via FerroDeck") {
                     msg.body.clone()
@@ -1129,8 +1129,9 @@ fn deliver_to_agy_route(
     let mut cmd = Command::new(&exe);
     // `agy agentapi send-message [--title=<title>] <recipient_id> <content>`: a bare title
     // would be read as the recipient.
+    let clean_title = title.strip_prefix("--title=").unwrap_or(title);
     cmd.args(["agentapi", "send-message"])
-        .arg(format!("--title={title}"))
+        .arg(format!("--title={clean_title}"))
         .args([conversation_id, body]);
     let mut extra = vec![
         (
@@ -2260,7 +2261,7 @@ pub fn dispatch_operator_prompt_to_route(
             agentapi_exe,
             ..
         } => {
-            let title = "--title=[Operator Prompt via FerroDeck]";
+            let title = "[Operator Prompt via FerroDeck]";
             // `/clear` and `/new` must reach Antigravity as the reset command.
             // Every other body, including the reforge prompt, keeps the prefix.
             let trimmed = body.trim();
@@ -6263,7 +6264,7 @@ mod tests {
             "conv-7",
             &None,
             &None,
-            &Some(script),
+            &Some(script.clone()),
             "the title",
             "the body",
         )
@@ -6279,6 +6280,31 @@ mod tests {
                 "agentapi",
                 "send-message",
                 "--title=the title",
+                "conv-7",
+                "the body"
+            ]
+        );
+
+        deliver_to_agy_route(
+            "conv-7",
+            &None,
+            &None,
+            &Some(script),
+            "--title=already prefixed",
+            "the body",
+        )
+        .unwrap();
+        let lines: Vec<String> = fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "agentapi",
+                "send-message",
+                "--title=already prefixed",
                 "conv-7",
                 "the body"
             ]

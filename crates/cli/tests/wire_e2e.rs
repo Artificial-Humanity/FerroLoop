@@ -28,7 +28,6 @@ impl TestEnv {
         std::fs::create_dir_all(cfg_dir.join("fl")).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(work_dir.join(".agents")).unwrap();
-        std::fs::write(work_dir.join(".agents/REGISTRY.md"), "# placeholder\n").unwrap();
 
         let store_path = data_dir.join("fl/fl.redb");
         std::fs::write(
@@ -130,10 +129,17 @@ fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
         );
     }
 
-    // Verify .agents/REGISTRY.md was updated automatically by agent-msg register
-    let reg_md = std::fs::read_to_string(env.work_dir.join(".agents/REGISTRY.md")).unwrap();
-    assert!(reg_md.contains("Ferris") && reg_md.contains("journalist"));
-    assert!(!reg_md.contains("scribe"), "{reg_md}");
+    // Verify agent-msg roster reflects registered agents without creating .agents/REGISTRY.md
+    let roster_out = env
+        .cmd_for(&agent_msg_bin)
+        .args(["roster"])
+        .output()
+        .unwrap();
+    assert!(roster_out.status.success());
+    let roster_txt = String::from_utf8_lossy(&roster_out.stdout);
+    assert!(roster_txt.contains("Ferris") && roster_txt.contains("journalist"));
+    assert!(!roster_txt.contains("scribe"), "{roster_txt}");
+    assert!(!env.work_dir.join(".agents/REGISTRY.md").exists());
 
     // Verify collision returns exit code 2 without --replace
     let dup = env
@@ -608,10 +614,21 @@ fn agent_msg_register_and_unregister_update_the_workspace_registry_from_a_subdir
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let md = std::fs::read_to_string(&registry).unwrap();
+    let roster_out = env
+        .cmd_for(&agent_msg_bin)
+        .current_dir(&sub)
+        .args(["roster"])
+        .output()
+        .unwrap();
+    assert!(roster_out.status.success());
+    let roster = String::from_utf8_lossy(&roster_out.stdout);
     assert!(
-        md.contains("**Ferris**") && md.contains("**Kayla**"),
-        "{md}"
+        roster.contains("Ferris") && roster.contains("Kayla"),
+        "{roster}"
+    );
+    assert!(
+        !registry.exists(),
+        ".agents/REGISTRY.md must not be created in the workspace root"
     );
     assert!(
         !sub.join(".agents").exists(),
@@ -629,11 +646,22 @@ fn agent_msg_register_and_unregister_update_the_workspace_registry_from_a_subdir
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let md = std::fs::read_to_string(&registry).unwrap();
-    assert!(md.contains("**Ferris**"), "{md}");
+    let roster_out = env
+        .cmd_for(&agent_msg_bin)
+        .current_dir(&sub)
+        .args(["roster"])
+        .output()
+        .unwrap();
+    assert!(roster_out.status.success());
+    let roster = String::from_utf8_lossy(&roster_out.stdout);
+    assert!(roster.contains("Ferris"), "{roster}");
     assert!(
-        !md.contains("**Kayla**"),
-        "a retired agent must leave the active table: {md}"
+        !roster.contains("Kayla"),
+        "a retired agent must leave the active roster: {roster}"
+    );
+    assert!(
+        !registry.exists(),
+        ".agents/REGISTRY.md must not be created after unregister"
     );
 }
 

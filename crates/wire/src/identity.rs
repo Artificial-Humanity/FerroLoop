@@ -119,20 +119,70 @@ pub fn decommissioned_sessions_path(home_override: Option<&Path>) -> PathBuf {
             .join(".cache")
             .join("agent-bus")
             .join(DECOMMISSIONED_SESSIONS_FILE),
-        None => default_routes_path()
-            .parent()
-            .map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE))
+        None => std::env::var_os("FL_WIRE_ROUTES")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| Some(default_routes_path()))
+            .and_then(|p| p.parent().map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE)))
             .unwrap_or_else(|| PathBuf::from("/tmp").join(DECOMMISSIONED_SESSIONS_FILE)),
     }
+}
+
+fn persistent_decommissioned_sessions_path() -> Option<PathBuf> {
+    if std::env::var_os("FL_WIRE_ROUTES")
+        .map(PathBuf::from)
+        .is_some_and(|p| p.is_absolute())
+        || std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1")
+    {
+        return None;
+    }
+    legacy_routes_path().and_then(|p| p.parent().map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE)))
+}
+
+fn write_decommissioned_session_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn read_decommissioned_sessions_value_from(
+    primary: &Path,
+    fallback: Option<&Path>,
+) -> Option<serde_json::Value> {
+    if let Ok(raw) = fs::read_to_string(primary)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        return Some(val);
+    }
+    if let Some(fallback) = fallback
+        && let Ok(raw) = fs::read_to_string(fallback)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        return Some(val);
+    }
+    None
+}
+
+fn read_decommissioned_sessions_value(home_override: Option<&Path>) -> Option<serde_json::Value> {
+    let primary = decommissioned_sessions_path(home_override);
+    let fallback = home_override
+        .is_none()
+        .then(persistent_decommissioned_sessions_path)
+        .flatten();
+    read_decommissioned_sessions_value_from(&primary, fallback.as_deref())
 }
 
 /// Ids in the decommission sidecar. An empty or unreadable file is an empty set.
 /// Empty strings are ignored.
 pub fn load_decommissioned_session_ids(home_override: Option<&Path>) -> BTreeSet<String> {
-    let Ok(raw) = fs::read_to_string(decommissioned_sessions_path(home_override)) else {
-        return BTreeSet::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Some(value) = read_decommissioned_sessions_value(home_override) else {
         return BTreeSet::new();
     };
     value
@@ -147,25 +197,71 @@ pub fn load_decommissioned_session_ids(home_override: Option<&Path>) -> BTreeSet
         .collect()
 }
 
-/// Replace the decommission sidecar with `ids`. Callers rebuild it from records that
-/// are still decommissioned rather than appending.
+/// Lowercase persona names marked retired in the decommission sidecar.
+pub fn load_retired_personas(home_override: Option<&Path>) -> BTreeSet<String> {
+    let Some(value) = read_decommissioned_sessions_value(home_override) else {
+        return BTreeSet::new();
+    };
+    value
+        .get("retired_personas")
+        .and_then(|names| names.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+        .collect()
+}
+
+/// Replace the decommission sidecar with `ids` (preserving any existing `retired_personas`).
+/// Callers rebuild it from records that are still decommissioned rather than appending.
 pub fn save_decommissioned_session_ids(
     home_override: Option<&Path>,
     ids: &BTreeSet<String>,
 ) -> std::io::Result<()> {
+    let retired = load_retired_personas(home_override);
+    save_decommissioned_tombstones(home_override, ids, &retired)
+}
+
+/// Replace the decommission sidecar with `ids` and `retired_personas`.
+pub fn save_decommissioned_tombstones(
+    home_override: Option<&Path>,
+    ids: &BTreeSet<String>,
+    retired_personas: &BTreeSet<String>,
+) -> std::io::Result<()> {
     let path = decommissioned_sessions_path(home_override);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "session_ids": ids }))
-        .map_err(std::io::Error::other)?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    fs::write(&tmp, bytes)?;
-    if let Err(err) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
+    let retired_lower: BTreeSet<String> = retired_personas
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let payload = if retired_lower.is_empty() {
+        serde_json::json!({ "session_ids": ids })
+    } else {
+        serde_json::json!({
+            "session_ids": ids,
+            "retired_personas": retired_lower,
+        })
+    };
+    let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
+    write_decommissioned_session_bytes(&path, &bytes)?;
+    if home_override.is_none()
+        && let Some(persistent) = persistent_decommissioned_sessions_path()
+        && persistent != path
+    {
+        let _ = write_decommissioned_session_bytes(&persistent, &bytes);
     }
     Ok(())
+}
+
+/// Update `retired_personas` in the decommission sidecar while preserving existing `session_ids`.
+pub fn sync_retired_personas_in_tombstones(
+    home_override: Option<&Path>,
+    retired_personas: &BTreeSet<String>,
+) -> std::io::Result<()> {
+    let ids = load_decommissioned_session_ids(home_override);
+    save_decommissioned_tombstones(home_override, &ids, retired_personas)
 }
 
 /// Vendors whose `vendor:persona` slug is a hosted session name, not a native id.
@@ -799,6 +895,12 @@ impl RouteTable {
         };
         let check_proc = home_override.is_none()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1");
+        self.drop_decommissioned_routes(home_override);
+        let pre_existing: BTreeSet<String> = self
+            .entries
+            .keys()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
         self.discover_claude_routes(&home, check_proc, &at);
         self.discover_agy_routes(&home, check_proc, &at);
         self.discover_codex_routes(&home, &at);
@@ -814,7 +916,7 @@ impl RouteTable {
         {
             self.attach_grok_tmux_placeholders(&windows, &at);
         }
-        self.drop_decommissioned_routes(home_override);
+        self.drop_decommissioned_and_retired_routes(home_override, &pre_existing);
     }
 
     /// Drop routes whose native session id was decommissioned.
@@ -827,6 +929,26 @@ impl RouteTable {
         }
         self.entries
             .retain(|_persona, entry| !route_is_decommissioned(&entry.route, &banned));
+    }
+
+    /// Drop routes whose native session id was decommissioned, plus any passive route
+    /// newly discovered during this scan for a retired persona that had no route before
+    /// the scan.
+    fn drop_decommissioned_and_retired_routes(
+        &mut self,
+        home_override: Option<&Path>,
+        pre_existing: &BTreeSet<String>,
+    ) {
+        self.drop_decommissioned_routes(home_override);
+        let retired = load_retired_personas(home_override);
+        if retired.is_empty() {
+            return;
+        }
+        self.entries.retain(|persona, entry| {
+            entry.explicit
+                || pre_existing.contains(&persona.to_ascii_lowercase())
+                || !retired.contains(&persona.to_ascii_lowercase())
+        });
     }
 
     /// Merge the routes of every scanner registered with
@@ -1111,10 +1233,12 @@ impl RouteTable {
             }
         }
 
-        // Scan brain/*/transcript.jsonl for persona registrations
+        // Scan brain/*/transcript.jsonl for persona registrations, newest mtime first so the
+        // latest conversation for a persona wins and carries its transcript mtime.
         let Ok(read_dir) = fs::read_dir(&brain_dir) else {
             return;
         };
+        let mut candidates: Vec<(u64, String, PathBuf)> = Vec::new();
         for entry in read_dir.flatten() {
             let conv_dir = entry.path();
             let Some(conv_id) = conv_dir.file_name().and_then(|s| s.to_str()) else {
@@ -1124,6 +1248,13 @@ impl RouteTable {
                 .join(".system_generated")
                 .join("logs")
                 .join("transcript.jsonl");
+            if !transcript.is_file() {
+                continue;
+            }
+            candidates.push((mtime_ms(&transcript), conv_id.to_string(), transcript));
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (file_ms, conv_id, transcript) in candidates {
             if let Some(persona) = scan_transcript_for_persona(&transcript, 50)
                 && !self.entries.contains_key(&persona)
                 && !self.entries.values().any(|existing| {
@@ -1132,20 +1263,21 @@ impl RouteTable {
                         VendorRoute::Agy {
                             conversation_id: existing_id,
                             ..
-                        } if existing_id == conv_id
+                        } if existing_id == &conv_id
                     )
                 })
             {
-                self.upsert_passive(
+                self.upsert_discovered(
                     &persona,
                     VendorRoute::Agy {
-                        conversation_id: conv_id.to_string(),
+                        conversation_id: conv_id,
                         ls_pid: None,
                         ls_address: shared_ls_addr.clone(),
                         csrf_token: shared_csrf.clone(),
                         agentapi_exe: Some(resolved_shared.clone()),
                     },
-                    at.clone(),
+                    file_ms,
+                    at,
                 );
             }
         }
@@ -2418,6 +2550,25 @@ fn first_system_message_is_grok_subagent(text: &str) -> bool {
     false
 }
 
+/// The first row of an Antigravity subagent transcript (`invoke_subagent`).
+fn first_message_is_agy_subagent(text: &str) -> bool {
+    for line in text.lines().take(50) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return false;
+        };
+        if val.get("type").and_then(|v| v.as_str()) == Some("SYSTEM_MESSAGE") {
+            let content = row_text(&val).unwrap_or_default();
+            return content.contains("<SYSTEM_MESSAGE>");
+        }
+        return false;
+    }
+    false
+}
+
 fn row_text(val: &serde_json::Value) -> Option<String> {
     val.get("content")
         .and_then(extract_text_from_json_content)
@@ -2556,7 +2707,7 @@ fn scan_muse_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Str
 }
 
 fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
-    if first_system_message_is_grok_subagent(text) {
+    if first_system_message_is_grok_subagent(text) || first_message_is_agy_subagent(text) {
         return None;
     }
     let mut latest_field: Option<String> = None;
@@ -7191,5 +7342,141 @@ mod tests {
         let (resolved_newer, _) =
             resolve_persona_traced(None, None, tmp.path(), None, || raw_routes, &env);
         assert_eq!(resolved_newer, "kayla");
+    }
+
+    #[test]
+    fn agy_subagent_transcript_starting_with_system_message_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"step_index\":0,\"type\":\"SYSTEM_MESSAGE\",\"content\":\"The following is a <SYSTEM_MESSAGE> not actually sent by the user.\\n\\n<SYSTEM_MESSAGE>\\nYou are a subagent.\\n</SYSTEM_MESSAGE>\"}\n",
+                "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"content\":\"agent-msg register Felicity\"}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(scan_transcript_for_persona(&transcript, 50), None);
+    }
+
+    #[test]
+    fn discover_agy_routes_picks_newest_conversation_by_mtime_and_stamps_file_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let brain = home.join(".gemini").join("antigravity-cli").join("brain");
+        let old_transcript = brain
+            .join("aaa-older-conv")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let new_transcript = brain
+            .join("zzz-newer-conv")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(old_transcript.parent().unwrap()).unwrap();
+        fs::create_dir_all(new_transcript.parent().unwrap()).unwrap();
+        let line = "{\"type\":\"USER_INPUT\",\"content\":\"agent-msg register Ferris --project ferroloop --role lead\"}\n";
+        fs::write(&old_transcript, line).unwrap();
+        fs::write(&new_transcript, line).unwrap();
+        set_mtime(&old_transcript, 1_000_000);
+        set_mtime(&new_transcript, 2_000_000);
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), At::from_unix_millis(9_000_000));
+        let entry = table.get("ferris").expect("ferris route");
+        assert_eq!(entry.updated_at.unix_millis(), 2_000_000);
+        assert!(matches!(
+            &entry.route,
+            VendorRoute::Agy { conversation_id, .. } if conversation_id == "zzz-newer-conv"
+        ));
+    }
+
+    #[test]
+    fn retired_personas_in_decommission_tombstones_block_passive_rediscovery() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let brain_transcript = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("conv-fiona-old")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(brain_transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &brain_transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"agent-msg register Fiona --project ferroloop --role assistant\"}\n",
+        )
+        .unwrap();
+        set_mtime(&brain_transcript, 1_500_000);
+
+        let ids = BTreeSet::new();
+        let retired = BTreeSet::from(["fiona".to_string()]);
+        save_decommissioned_tombstones(Some(home), &ids, &retired).unwrap();
+        assert_eq!(load_retired_personas(Some(home)), retired);
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), At::from_unix_millis(5_000_000));
+        assert!(
+            table.get("fiona").is_none(),
+            "passive transcript discovery must skip retired personas"
+        );
+
+        table.upsert_explicit(
+            "fiona",
+            agy_route("conv-fiona-new"),
+            At::from_unix_millis(6_000_000),
+        );
+        table.discover_routes(Some(home), At::from_unix_millis(7_000_000));
+        assert!(
+            table.get("fiona").is_some(),
+            "explicit route registration for a retired persona stays"
+        );
+    }
+
+    #[test]
+    fn empty_or_corrupt_primary_decommission_sidecar_falls_back_to_persistent_copy() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("primary.json");
+        let fallback = tmp.path().join("persistent.json");
+        fs::write(
+            &fallback,
+            r#"{"session_ids":["conv-persisted"],"retired_personas":["fiona"]}"#,
+        )
+        .unwrap();
+
+        // Empty primary falls back to persistent file.
+        fs::write(&primary, "").unwrap();
+        let val = read_decommissioned_sessions_value_from(&primary, Some(&fallback))
+            .expect("fallback value");
+        assert_eq!(val["session_ids"], serde_json::json!(["conv-persisted"]));
+        assert_eq!(val["retired_personas"], serde_json::json!(["fiona"]));
+
+        // Corrupt primary falls back to persistent file.
+        fs::write(&primary, "{not-valid-json").unwrap();
+        let val = read_decommissioned_sessions_value_from(&primary, Some(&fallback))
+            .expect("fallback value");
+        assert_eq!(val["session_ids"], serde_json::json!(["conv-persisted"]));
+
+        // sync_retired_personas_in_tombstones preserves existing session_ids.
+        let home = tmp.path().join("home");
+        save_decommissioned_tombstones(
+            Some(&home),
+            &BTreeSet::from(["conv-keep".to_string()]),
+            &BTreeSet::from(["fiona".to_string()]),
+        )
+        .unwrap();
+        sync_retired_personas_in_tombstones(Some(&home), &BTreeSet::from(["ada".to_string()]))
+            .unwrap();
+        assert_eq!(
+            load_decommissioned_session_ids(Some(&home)),
+            BTreeSet::from(["conv-keep".to_string()])
+        );
+        assert_eq!(
+            load_retired_personas(Some(&home)),
+            BTreeSet::from(["ada".to_string()])
+        );
     }
 }
