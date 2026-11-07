@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError } from "./api/client";
 import { HubWsClient } from "./api/ws";
+import { createTranscriptReadGuard, isTransientTranscriptReadError, type TranscriptReadOwner } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane } from "./components/ChatPane";
 import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
@@ -79,6 +80,8 @@ import {
   type ArchitectureResponse,
   type BulkSessionAction,
   type CockpitTab,
+  type ClearSessionMode,
+  type SessionTranscriptResponse,
   type DecommissionMode,
   type DiscoveredSessionSummary,
   type EnrolledNode,
@@ -100,6 +103,11 @@ import {
   type WorktreeDiff,
   type WorktreeSummary,
 } from "./types/api";
+
+const sameTranscriptOwner = (a: TranscriptReadOwner, b: TranscriptReadOwner) =>
+  a.authEpoch === b.authEpoch && a.selectionEpoch === b.selectionEpoch &&
+  a.agentKey === b.agentKey && a.sessionId === b.sessionId && a.resetEpoch === b.resetEpoch;
+type TranscriptRefreshState = "loading" | "ready" | "stale" | "unavailable" | "denied";
 
 export interface AppProps {
   apiClient?: HubApiClient;
@@ -209,6 +217,7 @@ export interface OptimisticPrompt {
   sentAt: number;
   agentKey?: string;
   sessionId?: string;
+  authEpoch?: number;
 }
 
 export const OPTIMISTIC_PROMPT_TTL_MS = 60_000;
@@ -965,14 +974,63 @@ export const App: React.FC<AppProps> = ({
   selectedAgentNameRef.current = selectedAgentName;
   const selectedSessionIdRef = useRef<string | null>(selectedSessionId);
   selectedSessionIdRef.current = selectedSessionId;
-  const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([]);
-  const [sessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
-  const [isSessionBusy, setIsSessionBusy] = useState<boolean>(false);
+  const transcriptGuard = useRef(createTranscriptReadGuard()).current;
+  const ownerRef = useRef<TranscriptReadOwner>({ authEpoch: 0, selectionEpoch: 0,
+    agentKey: selectedAgentName.trim().toLowerCase(), sessionId: null, resetEpoch: 0 });
+  const mountedRef = useRef(true);
+  const resetPendingRef = useRef(false);
+  const [transcriptSnapshot, setTranscriptSnapshot] = useState<{
+    owner: TranscriptReadOwner; turns: TranscriptTurn[]; status: TranscriptRefreshState;
+  } | null>(null);
+  const snapshotRef = useRef(transcriptSnapshot);
+  snapshotRef.current = transcriptSnapshot;
+  const authIdentityRef = useRef({ apiClient, token: apiClient.getToken() });
+  if (authIdentityRef.current.apiClient !== apiClient || authIdentityRef.current.token !== apiClient.getToken()) {
+    authIdentityRef.current = { apiClient, token: apiClient.getToken() };
+    ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
+    resetPendingRef.current = false;
+    transcriptGuard.invalidate();
+  }
+  const [, refreshOptimisticView] = useState(0);
+  const setTranscriptTurns = useCallback((turns: TranscriptTurn[]) => {
+    const owner = { ...ownerRef.current };
+    setTranscriptSnapshot((previous) => ({ owner, turns,
+      status: previous && sameTranscriptOwner(previous.owner, owner) ? previous.status : "loading",
+    }));
+  }, []);
+  const advanceTranscriptSelection = useCallback((agentKey: string, sessionId: string | null) => {
+    const previousOwner = ownerRef.current;
+    const nextOwner = { ...previousOwner, agentKey: agentKey.trim().toLowerCase(), sessionId,
+      selectionEpoch: previousOwner.selectionEpoch + 1 };
+    ownerRef.current = nextOwner;
+    resetPendingRef.current = false;
+    transcriptGuard.invalidate();
+    setSessionMetadataOwner((previous) => previous && sameTranscriptOwner(previous, previousOwner) &&
+      previousOwner.agentKey === nextOwner.agentKey && previousOwner.sessionId === sessionId
+      ? nextOwner : null);
+    const previous = snapshotRef.current;
+    if (sessionId && previous && sameTranscriptOwner(previous.owner, previousOwner) &&
+      previousOwner.agentKey === nextOwner.agentKey && previousOwner.sessionId === sessionId) {
+      setTranscriptSnapshot({ ...previous, owner: nextOwner });
+    }
+  }, [transcriptGuard]);
+  const selectTranscriptAgent = useCallback((nameKey: string) => {
+    const key = nameKey.trim().toLowerCase();
+    const concrete = sessions.find((session) => (session.persona ?? "").toLowerCase() === key)?.id ??
+      routes.find((route) => (route.persona ?? "").toLowerCase() === key)?.id ?? null;
+    advanceTranscriptSelection(key, concrete);
+  }, [sessions, routes, advanceTranscriptSelection]);
+  useEffect(() => { mountedRef.current = true; return () => {
+    mountedRef.current = false; transcriptGuard.invalidate();
+  }; }, [transcriptGuard]);
+  const [rawSessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
+  const [rawIsSessionBusy, setIsSessionBusy] = useState<boolean>(false);
   const [unconfirmedBySession, setUnconfirmedBySession] = useState<Record<string, boolean>>({});
-  const [sessionContextUsage, setSessionContextUsage] =
+  const [rawSessionContextUsage, setSessionContextUsage] =
     useState<SessionContextUsage | null>(null);
-  const [sessionQuotaUsage, setSessionQuotaUsage] =
+  const [rawSessionQuotaUsage, setSessionQuotaUsage] =
     useState<SessionQuotaUsage | null>(null);
+  const [sessionMetadataOwner, setSessionMetadataOwner] = useState<TranscriptReadOwner | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt[]>([]);
   const activeSessionIdRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
@@ -987,10 +1045,30 @@ export const App: React.FC<AppProps> = ({
   const backgroundTranscriptsRef = useRef<Record<string, TranscriptTurn[]>>({});
   backgroundTranscriptsRef.current = backgroundTranscripts;
   const backgroundStampRef = useRef<Record<string, string>>({});
+  const backgroundOwnersRef = useRef<Record<string, TranscriptReadOwner>>({});
   const [busyByAgent, setBusyByAgent] = useState<Record<string, boolean>>({});
   const [contextUsageByAgent, setContextUsageByAgent] = useState<
     Record<string, SessionContextUsage | null>
   >({});
+
+  const advanceTranscriptAuth = () => {
+    authIdentityRef.current = { apiClient, token: apiClient.getToken() };
+    ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
+    transcriptGuard.invalidate();
+    resetPendingRef.current = false;
+    refreshInFlightRef.current = false;
+    refreshQueuedRef.current = null;
+    optimisticPromptRef.current = [];
+    backgroundTranscriptsRef.current = {};
+    backgroundStampRef.current = {};
+    backgroundOwnersRef.current = {};
+    setTranscriptSnapshot(null);
+    setBackgroundTranscripts({});
+    setBusyByAgent({}); setContextUsageByAgent({});
+    setSessionQueue([]); setIsSessionBusy(false);
+    setSessionContextUsage(null); setSessionQuotaUsage(null);
+    setUnconfirmedBySession({});
+  };
 
   const recordAgentBusy = useCallback(
     (agentKey: string | undefined | null, isBusy: boolean) => {
@@ -1046,6 +1124,7 @@ export const App: React.FC<AppProps> = ({
           sentAt,
           agentKey: normalizedKey || undefined,
           sessionId: sessionId || undefined,
+          authEpoch: ownerRef.current.authEpoch,
         });
       }
       optimisticPromptRef.current = current;
@@ -1088,13 +1167,6 @@ export const App: React.FC<AppProps> = ({
   const applyTranscriptTurns = useCallback((turns: TranscriptTurn[]) => {
     const nowMs = Date.now();
     const activeKey = selectedAgentNameRef.current;
-    const merged = preserveOptimisticTurn(
-      turns,
-      optimisticPromptRef.current,
-      nowMs,
-      activeKey,
-      activeSessionIdRef.current,
-    );
     optimisticPromptRef.current = pruneOptimisticPrompts(
       optimisticPromptRef.current,
       turns,
@@ -1102,8 +1174,50 @@ export const App: React.FC<AppProps> = ({
       activeKey,
       activeSessionIdRef.current,
     );
-    setTranscriptTurns(merged);
+    setTranscriptTurns(turns);
   }, []);
+
+  const readSelectedTranscript = useCallback(async (targetId: string) => {
+    if (loggedOutRef.current || resetPendingRef.current || !mountedRef.current) return;
+    const owner = { ...ownerRef.current };
+    if (owner.sessionId && targetId !== owner.sessionId) return;
+    const ticket = transcriptGuard.begin(owner);
+    const accepts = () => mountedRef.current && !loggedOutRef.current && !resetPendingRef.current &&
+      transcriptGuard.accepts(ticket, ownerRef.current);
+    try {
+      const result: SessionTranscriptResponse = await apiClient.getSessionTranscript(targetId);
+      if (!accepts()) return;
+      if (!Array.isArray(result.turns) || !result.turns.every((turn) => turn &&
+        typeof turn.index === "number" && typeof turn.role === "string" && typeof turn.content === "string" &&
+        (turn.thinking == null || typeof turn.thinking === "string") &&
+        (turn.tool_calls == null || Array.isArray(turn.tool_calls)))) throw new Error("Transcript observation unavailable");
+      if (result.resolved_session_id && owner.sessionId && result.resolved_session_id !== owner.sessionId) {
+        throw new Error("Transcript session changed");
+      }
+      recordTranscript(owner.agentKey, result.turns);
+      applyTranscriptTurns(result.turns);
+      setTranscriptSnapshot((previous) => previous ? { ...previous, owner, status: "ready" } : null);
+      setSessionMetadataOwner(owner);
+      recordAgentContextUsage(owner.agentKey, result.context_usage);
+      recordAgentBusy(owner.agentKey, typeof result.is_busy === "boolean" ? result.is_busy : hasTrailingIncompleteWork(result.turns));
+      if (Array.isArray(result.queue)) setSessionQueue(result.queue);
+      if (typeof result.is_busy === "boolean") setIsSessionBusy(result.is_busy);
+      setUnconfirmedBySession((previous) => ({ ...previous, [targetId]: Boolean(result.in_flight_unconfirmed) }));
+      setSessionContextUsage(result.context_usage ?? null);
+      setSessionQuotaUsage(result.quota_usage ?? null);
+    } catch (error) {
+      if (!accepts()) return;
+      const transient = isTransientTranscriptReadError(error);
+      const denied = error instanceof HubApiError && (error.status === 401 || error.status === 403);
+      setTranscriptSnapshot((previous) => {
+        const retain = transient && owner.sessionId && previous && sameTranscriptOwner(previous.owner, owner) && (previous.status === "ready" || previous.status === "stale");
+        return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
+      });
+      if (error instanceof HubApiError && error.status === 401) {
+        setAuthority(null); setPairingOpen(true);
+      }
+    }
+  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage]);
 
   const [worktrees, setWorktrees] = useState<WorktreeSummary[]>([]);
   const [selectedWorktreeId, setSelectedWorktreeId] = useState<string | null>(null);
@@ -1239,17 +1353,18 @@ export const App: React.FC<AppProps> = ({
           continue;
         }
         scannedPersonas.add(persona);
-        const stamp = session.updated_at ?? "";
+        const stamp = `${session.id}:${session.updated_at ?? ""}`;
         if (backgroundStampRef.current[persona] === stamp) {
           continue;
         }
-        const bgRes = await apiClient
-          .getSessionTranscript(session.id)
-          .catch(() => null);
-        if (loggedOutRef.current) {
-          return;
-        }
-        if (bgRes) {
+        const viewOwner = { ...ownerRef.current };
+        const bgOwner = { ...viewOwner, agentKey: persona, sessionId: session.id };
+        backgroundOwnersRef.current[persona] = bgOwner;
+        const ticket = transcriptGuard.begin(bgOwner);
+        const bgRes = await apiClient.getSessionTranscript(session.id).catch(() => null);
+        if (!mountedRef.current || loggedOutRef.current || resetPendingRef.current ||
+          !sameTranscriptOwner(viewOwner, ownerRef.current) || !transcriptGuard.accepts(ticket, backgroundOwnersRef.current[persona] ?? bgOwner)) return;
+        if (bgRes && Array.isArray(bgRes.turns) && (!bgRes.resolved_session_id || bgRes.resolved_session_id === session.id)) {
           if (bgRes.turns) {
             backgroundStampRef.current[persona] = stamp;
             recordTranscript(persona, bgRes.turns);
@@ -1286,111 +1401,40 @@ export const App: React.FC<AppProps> = ({
         return;
       }
       refreshInFlightRef.current = true;
+      const viewOwner = { ...ownerRef.current };
+      const ticket = transcriptGuard.begin(viewOwner);
       try {
-        const requestedAgentName = selectedAgentNameRef.current;
-        const requestedAgentKey = requestedAgentName.trim().toLowerCase();
-        const requestedSessionId = selectedSessionIdRef.current;
-        const requestedActiveSessionId = activeSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
-        if (loggedOutRef.current) {
-          return;
-        }
-        const rawList = sessRes?.sessions ?? [];
-        const list = rawList.filter(
-          (s) =>
-            !tornDownTargetsRef.current.has(s.id.toLowerCase()) &&
-            !tornDownTargetsRef.current.has((s.persona ?? "").toLowerCase()),
-        );
+        if (!mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(viewOwner, ownerRef.current)) return;
+        // Session discovery also feeds roster model/liveness data. A newer transcript read
+        // supersedes this read's transcript work, while this same-view discovery remains useful.
+        const mayReadTranscript = transcriptGuard.accepts(ticket, ownerRef.current);
+        const list = (sessRes?.sessions ?? []).filter((session) =>
+          !tornDownTargetsRef.current.has(session.id.toLowerCase()) &&
+          !tornDownTargetsRef.current.has((session.persona ?? "").toLowerCase()));
+        const concrete = selectedSessionIdRef.current ?? list.find((session) =>
+          (session.persona ?? "").toLowerCase() === viewOwner.agentKey)?.id ?? activeSessionIdRef.current;
         if (sessRes) {
+          if (concrete !== ownerRef.current.sessionId) advanceTranscriptSelection(viewOwner.agentKey, concrete);
+          activeSessionIdRef.current = concrete;
           setSessions(list);
         }
         void scanBackgroundTranscripts(list);
-        const rawTargetId =
-          sessionOverride === null
-            ? null
-            : (sessionOverride ?? requestedSessionId ?? requestedActiveSessionId ??
-              list.find((session) => (session.persona ?? "").toLowerCase() === requestedAgentKey)?.id ??
-              requestedAgentName);
-        const targetId =
-          rawTargetId &&
-          !tornDownTargetsRef.current.has(rawTargetId.trim().toLowerCase()) &&
-          !tornDownTargetsRef.current.has(requestedAgentKey)
-            ? rawTargetId
-            : null;
-        if (targetId) {
-          const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
-          if (loggedOutRef.current) {
-            return;
-          }
-          if (trRes) {
-            // A persona can have multiple sessions. Never publish or cache a
-            // response after the concrete session changed while awaiting it.
-            const activeNow = activeSessionIdRef.current;
-            const stillSameTarget =
-              selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
-              selectedSessionIdRef.current === requestedSessionId &&
-              (requestedActiveSessionId
-                ? activeNow === requestedActiveSessionId && targetId === requestedActiveSessionId
-                : activeNow === null || activeNow === targetId);
-            if (!stillSameTarget) return;
-            const targetPersona =
-              list.find((session) => session.id === targetId)?.persona ??
-              (list.some(
-                (session) =>
-                  (session.persona ?? "").toLowerCase() ===
-                  targetId.toLowerCase(),
-              )
-                ? targetId
-                : requestedAgentKey);
-            if (trRes.turns) {
-              recordTranscript(targetPersona, trRes.turns);
-            }
-            if (trRes.context_usage !== undefined) {
-              recordAgentContextUsage(targetPersona, trRes.context_usage);
-            }
-            recordAgentBusy(
-              targetPersona,
-              typeof trRes.is_busy === "boolean"
-                ? trRes.is_busy
-                : hasTrailingIncompleteWork(trRes.turns ?? []),
-            );
-            if (targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase()) {
-              if (trRes.turns) {
-                applyTranscriptTurns(trRes.turns);
-              }
-              setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: Boolean(trRes.in_flight_unconfirmed) }));
-              setSessionContextUsage(trRes.context_usage ?? null);
-              setSessionQuotaUsage(trRes.quota_usage ?? null);
-              if (typeof trRes.is_busy === "boolean") {
-                setIsSessionBusy(trRes.is_busy);
-              }
-              if (Array.isArray(trRes.queue)) {
-                setSessionQueue(trRes.queue);
-              }
-            }
-          }
+        const target = sessionOverride === null ? null : (concrete ?? sessionOverride ?? selectedAgentNameRef.current);
+        if (mayReadTranscript && target && !tornDownTargetsRef.current.has(target.toLowerCase()) && !tornDownTargetsRef.current.has(viewOwner.agentKey)) {
+          await readSelectedTranscript(target);
         }
-      } catch {
-        // Ignore
       } finally {
-        refreshInFlightRef.current = false;
-        const queued = refreshQueuedRef.current;
-        if (queued) {
+        // An old principal's completion must not launch work under the new principal.
+        if (viewOwner.authEpoch === ownerRef.current.authEpoch && mountedRef.current) {
+          refreshInFlightRef.current = false;
+          const queued = refreshQueuedRef.current;
           refreshQueuedRef.current = null;
-          void refreshSessionsAndTranscriptRef.current(queued.override);
+          if (queued) void refreshSessionsAndTranscriptRef.current(queued.override);
         }
       }
     },
-    // Selection is read through refs so the identity is stable across agent
-    // and session switches (the WebSocket effect depends on this callback).
-    [
-      apiClient,
-      applyTranscriptTurns,
-      scanBackgroundTranscripts,
-      recordTranscript,
-      recordAgentBusy,
-      recordAgentContextUsage,
-    ],
+    [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection],
   );
   refreshSessionsAndTranscriptRef.current = refreshSessionsAndTranscript;
 
@@ -1425,7 +1469,8 @@ export const App: React.FC<AppProps> = ({
   }, [apiClient]);
 
   const loadAllInitialState = useCallback(async () => {
-    loggedOutRef.current = false;
+    const initialOwner = { ...ownerRef.current };
+    if (loggedOutRef.current || !mountedRef.current) return;
     setLoading(true);
     try {
       const [
@@ -1456,6 +1501,7 @@ export const App: React.FC<AppProps> = ({
         apiClient.getSettings().catch(() => null),
       ]);
 
+      if (!mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(initialOwner, ownerRef.current)) return;
       if (settingsRes?.timezone) {
         setActiveTimeZone(settingsRes.timezone);
       }
@@ -1477,7 +1523,6 @@ export const App: React.FC<AppProps> = ({
       }
       if (sessionsRes?.sessions) {
         setSessions(sessionsRes.sessions);
-        void scanBackgroundTranscripts(sessionsRes.sessions);
       }
       if (worktreesRes?.worktrees) {
         setWorktrees(worktreesRes.worktrees);
@@ -1503,62 +1548,28 @@ export const App: React.FC<AppProps> = ({
         setStats(statsRes);
       }
 
-      const initialAgentName = selectedAgentNameRef.current;
-      const initialKey = initialAgentName.trim().toLowerCase();
-      const initialSessionId = selectedSessionIdRef.current;
-      const matchedSessionId =
-        initialSessionId ??
-        sessionsRes?.sessions?.find((s) => (s.persona ?? "").toLowerCase() === initialKey)?.id ??
-        agentsRes?.routes?.find((r) => (r.persona ?? "").toLowerCase() === initialKey)?.id ??
-        initialAgentName;
-      if (
-        matchedSessionId &&
-        !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
-        !tornDownTargetsRef.current.has(initialKey)
-      ) {
-        const trRes = await apiClient.getSessionTranscript(matchedSessionId).catch(() => null);
-        if (
-          trRes &&
-          !loggedOutRef.current &&
-          selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
-          selectedSessionIdRef.current === initialSessionId &&
-          (activeSessionIdRef.current === null || activeSessionIdRef.current === matchedSessionId) &&
-          !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
-          !tornDownTargetsRef.current.has(initialKey)
-        ) {
-          recordTranscript(initialAgentName, trRes.turns ?? []);
-          if (trRes.context_usage !== undefined) {
-            recordAgentContextUsage(initialAgentName, trRes.context_usage);
-          }
-          recordAgentBusy(
-            initialAgentName,
-            typeof trRes.is_busy === "boolean"
-              ? trRes.is_busy
-              : hasTrailingIncompleteWork(trRes.turns ?? []),
-          );
-          applyTranscriptTurns(trRes.turns ?? []);
-          setSessionQueue(trRes.queue ?? []);
-          setUnconfirmedBySession((prev) => ({ ...prev, [matchedSessionId]: Boolean(trRes.in_flight_unconfirmed) }));
-          setIsSessionBusy(Boolean(trRes.is_busy));
-          setSessionContextUsage(trRes.context_usage ?? null);
-          setSessionQuotaUsage(trRes.quota_usage ?? null);
+      if (initialOwner.selectionEpoch === ownerRef.current.selectionEpoch && initialOwner.resetEpoch === ownerRef.current.resetEpoch) {
+        const concrete = selectedSessionIdRef.current ??
+          sessionsRes?.sessions?.find((session) => (session.persona ?? "").toLowerCase() === initialOwner.agentKey)?.id ??
+          agentsRes?.routes?.find((session) => (session.persona ?? "").toLowerCase() === initialOwner.agentKey)?.id ?? null;
+        if (concrete !== ownerRef.current.sessionId) advanceTranscriptSelection(initialOwner.agentKey, concrete);
+        activeSessionIdRef.current = concrete;
+        void scanBackgroundTranscripts(sessionsRes?.sessions ?? []);
+        const target = concrete ?? initialOwner.agentKey;
+        if (target && !tornDownTargetsRef.current.has(target.toLowerCase()) && !tornDownTargetsRef.current.has(initialOwner.agentKey)) {
+          await readSelectedTranscript(target);
         }
       }
     } finally {
-      setLoading(false);
+      if (mountedRef.current && initialOwner.authEpoch === ownerRef.current.authEpoch) setLoading(false);
     }
-  }, [
-    apiClient,
-    applyTranscriptTurns,
-    scanBackgroundTranscripts,
-    recordTranscript,
-    recordAgentBusy,
-    recordAgentContextUsage,
-  ]);
+  }, [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection]);
 
   // Startup URL pairing check + Auth session check + initial load
   useEffect(() => {
     let cancelled = false;
+    const bootstrapAuthEpoch = ownerRef.current.authEpoch;
+    const acceptsBootstrap = () => !cancelled && !loggedOutRef.current && bootstrapAuthEpoch === ownerRef.current.authEpoch;
 
     const bootstrap = async () => {
       if (typeof window !== "undefined" && window.location) {
@@ -1590,15 +1601,16 @@ export const App: React.FC<AppProps> = ({
       if (pendingPair) {
         try {
           const pairRes = await pendingPair;
-          if (!cancelled) {
+          if (acceptsBootstrap()) {
             if (pairRes.authority) {
+              authIdentityRef.current = { apiClient, token: apiClient.getToken() };
               setAuthority(pairRes.authority);
             }
             wsClient.setToken(apiClient.getToken());
             wsClient.connect();
           }
         } catch (err) {
-          if (!cancelled) {
+          if (acceptsBootstrap()) {
             setPairingError(err instanceof Error ? err.message : "Pairing code rejected");
             setPairingOpen(true);
           }
@@ -1611,22 +1623,23 @@ export const App: React.FC<AppProps> = ({
 
       try {
         const authRes = await apiClient.getAuthSession();
-        if (!cancelled) {
+        if (acceptsBootstrap()) {
           if (authRes.authenticated && authRes.authority) {
+            authIdentityRef.current = { apiClient, token: apiClient.getToken() };
             setAuthority(authRes.authority);
           } else {
             setPairingOpen(true);
           }
         }
       } catch (err) {
-        if (!cancelled) {
+        if (acceptsBootstrap()) {
           if (err instanceof HubApiError && err.status === 401) {
             setPairingOpen(true);
           }
         }
       }
 
-      if (!cancelled) {
+      if (acceptsBootstrap()) {
         await loadAllInitialState();
       }
     };
@@ -1648,6 +1661,7 @@ export const App: React.FC<AppProps> = ({
       void refreshWireAndRoster();
     });
     const unsubSession = wsClient.subscribe("session", (frame) => {
+      if (loggedOutRef.current || !mountedRef.current) return;
       if (
         frame?.event === "prompt_sent" &&
         frame.data &&
@@ -1676,11 +1690,10 @@ export const App: React.FC<AppProps> = ({
           : !activeSessionId && Boolean(rawPersona) && rawPersona === activeKey;
         if (matchesActive && rawContent && data.delivered !== false) {
           recordOptimisticPrompt(rawContent, activeKey, Date.now(), rawSessionId || null);
-          setTranscriptTurns((prev) =>
-            preserveOptimisticTurn(prev, optimisticPromptRef.current, Date.now(), activeKey, activeSessionId),
-          );
+          refreshOptimisticView((previous) => previous + 1);
         }
         if (matchesActive) {
+          setSessionMetadataOwner({ ...ownerRef.current });
           if (Array.isArray(data.queue)) setSessionQueue(data.queue as QueuedOperatorPrompt[]);
           if (typeof data.is_busy === "boolean") setIsSessionBusy(data.is_busy);
         }
@@ -1770,7 +1783,26 @@ export const App: React.FC<AppProps> = ({
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
 
-  activeSessionIdRef.current = activeSession?.id ?? null;
+  const concreteSessionId = activeSession?.id ?? null;
+  const derivedAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
+  if (ownerRef.current.agentKey !== derivedAgentKey || ownerRef.current.sessionId !== concreteSessionId) {
+    advanceTranscriptSelection(derivedAgentKey, concreteSessionId);
+  }
+  activeSessionIdRef.current = concreteSessionId;
+  const snapshotMatches = transcriptSnapshot && sameTranscriptOwner(transcriptSnapshot.owner, ownerRef.current);
+  const transcriptRefreshState: TranscriptRefreshState = snapshotMatches ? transcriptSnapshot.status : "loading";
+  const metadataMatches = sessionMetadataOwner && sameTranscriptOwner(sessionMetadataOwner, ownerRef.current) &&
+    transcriptRefreshState !== "denied";
+  const sessionQueue = metadataMatches ? rawSessionQueue : [];
+  const isSessionBusy = metadataMatches ? rawIsSessionBusy : false;
+  const sessionContextUsage = metadataMatches ? rawSessionContextUsage : null;
+  const sessionQuotaUsage = metadataMatches ? rawSessionQuotaUsage : null;
+  const transcriptTurns = preserveOptimisticTurn(
+    snapshotMatches ? transcriptSnapshot.turns : [],
+    loggedOutRef.current || transcriptRefreshState === "denied" ? [] : optimisticPromptRef.current.filter(
+      (prompt) => prompt.authEpoch === ownerRef.current.authEpoch),
+    Date.now(), ownerRef.current.agentKey, ownerRef.current.sessionId,
+  );
 
   const activeAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
   const activeRoute = useMemo(
@@ -1825,78 +1857,13 @@ export const App: React.FC<AppProps> = ({
     return null;
   }, [activeSession, activeRoute, activeSpunUp]);
 
-  const prevLoadedAgentKeyRef = useRef<string>("");
-
-  // Load transcript when activeSession or selectedAgentName changes
+  // Selection ownership is advanced synchronously above and at every navigation entry point.
   useEffect(() => {
-    const nextAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
-    const targetId = activeSession?.id || selectedAgent?.name_key;
-    if (
-      loggedOutRef.current ||
-      !targetId ||
-      tornDownTargetsRef.current.has(targetId.trim().toLowerCase()) ||
-      (nextAgentKey && tornDownTargetsRef.current.has(nextAgentKey))
-    ) {
-      prevLoadedAgentKeyRef.current = nextAgentKey;
-      setTranscriptTurns([]);
-      setSessionQueue([]);
-      setIsSessionBusy(false);
-      setSessionContextUsage(null);
-      setSessionQuotaUsage(null);
-      return;
-    }
-    let cancelled = false;
-    if (prevLoadedAgentKeyRef.current !== nextAgentKey) {
-      prevLoadedAgentKeyRef.current = nextAgentKey;
-      applyTranscriptTurns(
-        nextAgentKey ? (backgroundTranscriptsRef.current[nextAgentKey] ?? []) : [],
-      );
-      setSessionQueue([]);
-      setIsSessionBusy(false);
-      setSessionContextUsage(null);
-      setSessionQuotaUsage(null);
-    } else if (selectedSessionIdRef.current !== null) {
-      setTranscriptTurns([]);
-      setSessionQueue([]);
-      setIsSessionBusy(false);
-      setSessionContextUsage(null);
-      setSessionQuotaUsage(null);
-    }
-    apiClient
-      .getSessionTranscript(targetId)
-      .then((res) => {
-        if (!cancelled && !loggedOutRef.current) {
-          applyTranscriptTurns(res.turns ?? []);
-          recordTranscript(selectedAgent?.name_key, res.turns ?? []);
-          recordAgentBusy(
-            selectedAgent?.name_key,
-            typeof res.is_busy === "boolean"
-              ? res.is_busy
-              : hasTrailingIncompleteWork(res.turns ?? []),
-          );
-          setSessionQueue(res.queue ?? []);
-          setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: Boolean(res.in_flight_unconfirmed) }));
-          setIsSessionBusy(Boolean(res.is_busy));
-          setSessionContextUsage(res.context_usage ?? null);
-          if (res.context_usage !== undefined) {
-            recordAgentContextUsage(selectedAgent?.name_key, res.context_usage);
-          }
-          setSessionQuotaUsage(res.quota_usage ?? null);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setTranscriptTurns([]);
-          setSessionQueue([]);
-          setIsSessionBusy(false);
-          setSessionContextUsage(null);
-          setSessionQuotaUsage(null);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [apiClient, activeSession?.id, selectedAgent?.name_key, authority?.tier, applyTranscriptTurns, recordTranscript, recordAgentContextUsage]);
+    const target = activeSession?.id ?? selectedAgent?.name_key;
+    if (!target || loggedOutRef.current || tornDownTargetsRef.current.has(target.toLowerCase()) ||
+      tornDownTargetsRef.current.has((selectedAgent?.name_key ?? "").toLowerCase())) return;
+    void readSelectedTranscript(target);
+  }, [activeSession?.id, selectedAgent?.name_key, authority, readSelectedTranscript]);
 
   // The hub emits no WebSocket event for raw transcript.jsonl appends, so
   // poll the active transcript while the chat is on screen.
@@ -1992,7 +1959,10 @@ export const App: React.FC<AppProps> = ({
 
   const handlePairWithCode = async (code: string) => {
     setPairingError(null);
+    advanceTranscriptAuth();
     const res = await apiClient.pair({ code });
+    loggedOutRef.current = false;
+    authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     if (res.authority) {
       setAuthority(res.authority);
     }
@@ -2004,7 +1974,10 @@ export const App: React.FC<AppProps> = ({
 
   const handlePairWithToken = async (token: string) => {
     setPairingError(null);
+    advanceTranscriptAuth();
     const res = await apiClient.pair({ token });
+    loggedOutRef.current = false;
+    authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     if (res.authority) {
       setAuthority(res.authority);
     }
@@ -2016,6 +1989,9 @@ export const App: React.FC<AppProps> = ({
 
   const handleLogout = async () => {
     loggedOutRef.current = true;
+    ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
+    transcriptGuard.invalidate(); refreshInFlightRef.current = false; refreshQueuedRef.current = null;
+    setTranscriptSnapshot(null);
     await apiClient.logout().catch(() => {});
     setAuthority(null);
     wsClient.setToken(null);
@@ -2051,6 +2027,7 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
+    const submittedOwner = { ...ownerRef.current };
     const submittedAgent = selectedAgentNameRef.current;
     const submittedSession = selectedSessionIdRef.current;
     const submittedActiveSession = activeSessionIdRef.current;
@@ -2058,6 +2035,7 @@ export const App: React.FC<AppProps> = ({
     const res = activeAdapter === "codex" && authority?.tier !== "peer" && payload.send_now
       ? codexSendNowReceipt(targetId, response) : response;
     if (
+      !mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(submittedOwner, ownerRef.current) ||
       (!res.queued && res.status !== "queued" && isPromptDeliveryFailure(res)) ||
       selectedAgentNameRef.current !== submittedAgent ||
       selectedSessionIdRef.current !== submittedSession ||
@@ -2066,6 +2044,9 @@ export const App: React.FC<AppProps> = ({
     ) {
       return res;
     }
+    // This independently observed send result supersedes metadata in older transcript reads.
+    transcriptGuard.invalidate();
+    setSessionMetadataOwner({ ...submittedOwner });
     if (typeof res.in_flight_unconfirmed === "boolean") {
       const unconfirmed = res.in_flight_unconfirmed;
       setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: unconfirmed }));
@@ -2082,15 +2063,7 @@ export const App: React.FC<AppProps> = ({
         .trim()
         .toLowerCase();
       recordOptimisticPrompt(content, agentKey, Date.now(), submittedActiveSession);
-      setTranscriptTurns((prev) =>
-        preserveOptimisticTurn(
-          prev,
-          optimisticPromptRef.current,
-          Date.now(),
-          selectedAgentNameRef.current,
-          submittedActiveSession,
-        ),
-      );
+      refreshOptimisticView((previous) => previous + 1);
     }
     void refreshSessionsAndTranscript(targetId);
     return res;
@@ -2099,13 +2072,18 @@ export const App: React.FC<AppProps> = ({
   const handleSendQueuedNow = async (promptId: string) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) return;
+    const submittedOwner = { ...ownerRef.current };
     const submittedSession = activeSessionIdRef.current;
     const submittedAgent = selectedAgentNameRef.current;
     const response = await apiClient.sendQueuedPromptNow(targetId, promptId);
     const res = activeAdapter === "codex" && authority?.tier !== "peer" ? codexSendNowReceipt(targetId, response) : response;
-    if (activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
+    if (!mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(submittedOwner, ownerRef.current) ||
+      activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
       return res;
     }
+    // This independently observed send result supersedes metadata in older transcript reads.
+    transcriptGuard.invalidate();
+    setSessionMetadataOwner({ ...submittedOwner });
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
     }
@@ -2121,15 +2099,7 @@ export const App: React.FC<AppProps> = ({
         .trim()
         .toLowerCase();
       recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
-      setTranscriptTurns((prev) =>
-        preserveOptimisticTurn(
-          prev,
-          optimisticPromptRef.current,
-          Date.now(),
-          selectedAgentNameRef.current,
-          activeSessionIdRef.current,
-        ),
-      );
+      refreshOptimisticView((previous) => previous + 1);
     }
     void refreshSessionsAndTranscript(targetId);
     return res;
@@ -2203,6 +2173,7 @@ export const App: React.FC<AppProps> = ({
     }
     if (res.persona) {
       tornDownTargetsRef.current.delete(res.persona.trim().toLowerCase());
+      advanceTranscriptSelection(res.persona, res.session_id ?? null);
       selectedAgentNameRef.current = res.persona;
       setSelectedAgentName(res.persona);
     }
@@ -2218,23 +2189,71 @@ export const App: React.FC<AppProps> = ({
     return res;
   };
 
+  const beginTranscriptReset = () => {
+    const previous = snapshotRef.current;
+    const previousOwner = ownerRef.current;
+    const lastGood = previous && sameTranscriptOwner(previous.owner, ownerRef.current) ? previous : null;
+    transcriptGuard.invalidate();
+    ownerRef.current = { ...ownerRef.current, resetEpoch: ownerRef.current.resetEpoch + 1 };
+    const resetOwner = { ...ownerRef.current };
+    setSessionMetadataOwner((previous) => previous && sameTranscriptOwner(previous, previousOwner) ? resetOwner : null);
+    resetPendingRef.current = true;
+    if (lastGood) setTranscriptSnapshot({ ...lastGood, owner: resetOwner, status: "loading" });
+    return { resetOwner, lastGood };
+  };
+  const discardTranscriptTarget = (targetId: string, agentKey: string) => {
+    optimisticPromptRef.current = optimisticPromptRef.current.filter((prompt) =>
+      prompt.sessionId ? prompt.sessionId !== targetId : prompt.agentKey !== agentKey);
+    delete backgroundTranscriptsRef.current[agentKey];
+    delete backgroundStampRef.current[agentKey];
+    setBackgroundTranscripts((previous) => {
+      const next = { ...previous }; delete next[agentKey]; return next;
+    });
+    setTranscriptSnapshot(null);
+  };
+  const handleResetSession = async (targetId: string, mode: ClearSessionMode) => {
+    const { resetOwner, lastGood } = beginTranscriptReset();
+    try {
+      const result = await apiClient.clearSession(targetId, mode);
+      if (mountedRef.current && sameTranscriptOwner(resetOwner, ownerRef.current)) {
+        discardTranscriptTarget(targetId, resetOwner.agentKey);
+        resetPendingRef.current = false;
+        await readSelectedTranscript(targetId);
+      }
+      return result;
+    } catch (error) {
+      if (mountedRef.current && sameTranscriptOwner(resetOwner, ownerRef.current)) {
+        setTranscriptSnapshot(lastGood ? { ...lastGood, owner: resetOwner } : { owner: resetOwner, turns: [], status: "unavailable" });
+      }
+      throw error;
+    } finally {
+      if (sameTranscriptOwner(resetOwner, ownerRef.current)) resetPendingRef.current = false;
+    }
+  };
+
   const handleDecommissionSession = async (mode: DecommissionMode) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) {
       throw new Error("No active session selected to decommission.");
     }
-    if (mode === "teardown") {
-      tornDownTargetsRef.current.add(targetId.trim().toLowerCase());
-      if (activeSession?.id) {
-        tornDownTargetsRef.current.add(activeSession.id.trim().toLowerCase());
+    const reset = mode === "teardown" ? beginTranscriptReset() : null;
+    let res;
+    try {
+      res = await apiClient.decommissionSession(targetId, mode);
+    } catch (error) {
+      if (reset && mountedRef.current && sameTranscriptOwner(reset.resetOwner, ownerRef.current)) {
+        setTranscriptSnapshot(reset.lastGood ? { ...reset.lastGood, owner: reset.resetOwner } : null);
+        resetPendingRef.current = false;
       }
-      if (selectedAgent?.name_key) {
-        tornDownTargetsRef.current.add(
-          selectedAgent.name_key.trim().toLowerCase(),
-        );
-      }
+      throw error;
     }
-    const res = await apiClient.decommissionSession(targetId, mode);
+    if (reset && (!mountedRef.current || !sameTranscriptOwner(reset.resetOwner, ownerRef.current))) return res;
+    if (reset) {
+      resetPendingRef.current = false;
+      tornDownTargetsRef.current.add(targetId.trim().toLowerCase());
+      tornDownTargetsRef.current.add(reset.resetOwner.agentKey);
+      discardTranscriptTarget(targetId, reset.resetOwner.agentKey);
+    }
     if (mode === "teardown") {
       const agentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
       if (agentKey) {
@@ -2360,19 +2379,12 @@ export const App: React.FC<AppProps> = ({
             loading={loading}
             onRefresh={() => void loadAllInitialState()}
             onSelectAgent={(nameKey) => {
+              selectTranscriptAgent(nameKey);
               const nextKey = nameKey.trim().toLowerCase();
               if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
                 selectedAgentNameRef.current = nameKey;
                 selectedSessionIdRef.current = null;
-                setTranscriptTurns(
-                  preserveOptimisticTurn(
-                    backgroundTranscriptsRef.current[nextKey] ?? [],
-                    optimisticPromptRef.current,
-                    Date.now(),
-                    nextKey,
-                    null,
-                  ),
-                );
+                setTranscriptTurns([]);
                 setSessionQueue([]);
                 setIsSessionBusy(false);
                 setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
@@ -2386,6 +2398,7 @@ export const App: React.FC<AppProps> = ({
               void refreshSessionsAndTranscript();
             }}
             onSelectSession={(sessionId) => {
+              advanceTranscriptSelection(selectedAgentNameRef.current, sessionId);
               if (sessionId !== selectedSessionIdRef.current) {
                 selectedSessionIdRef.current = sessionId;
                 activeSessionIdRef.current = sessionId;
@@ -2597,17 +2610,10 @@ export const App: React.FC<AppProps> = ({
         const nextKey = nameKey.trim().toLowerCase();
         if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
           switchedAgent = true;
+          selectTranscriptAgent(nameKey);
           selectedAgentNameRef.current = nameKey;
           selectedSessionIdRef.current = null;
-          setTranscriptTurns(
-            preserveOptimisticTurn(
-              backgroundTranscriptsRef.current[nextKey] ?? [],
-              optimisticPromptRef.current,
-              Date.now(),
-              nextKey,
-              null,
-            ),
-          );
+          setTranscriptTurns([]);
           setSessionQueue([]);
           setIsSessionBusy(false);
           setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
@@ -2634,7 +2640,7 @@ export const App: React.FC<AppProps> = ({
         void refreshSessionsAndTranscript();
       }
     },
-    [splitView, activeTab, refreshSessionsAndTranscript, contextUsageByAgent],
+    [splitView, activeTab, refreshSessionsAndTranscript, contextUsageByAgent, selectTranscriptAgent],
   );
 
   const effectiveBusyByAgent = useMemo<Record<string, boolean>>(() => {
@@ -2810,6 +2816,7 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleSelectSessionFromHeader = (sessionId: string) => {
+    advanceTranscriptSelection(selectedAgentNameRef.current, sessionId);
     if (sessionId !== selectedSessionIdRef.current) {
       selectedSessionIdRef.current = sessionId;
       activeSessionIdRef.current = sessionId;
@@ -2854,11 +2861,13 @@ export const App: React.FC<AppProps> = ({
       }
       sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
       turns={transcriptTurns}
-      contextUsage={sessionContextUsage}
-      quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
-      isBusy={isSessionBusy}
+      transcriptRefreshState={transcriptRefreshState}
+      onResetSession={handleResetSession}
+      contextUsage={metadataMatches ? sessionContextUsage : null}
+      quotaUsage={metadataMatches ? sessionQuotaUsage ?? activeSession?.quota_usage ?? null : null}
+      isBusy={metadataMatches ? isSessionBusy : false}
       inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
-      queue={sessionQueue}
+      queue={metadataMatches ? sessionQueue : []}
       loading={loading}
       wsConnected={wsConnected}
       agentSettingsOpen={agentSettingsOpen}
@@ -2913,19 +2922,12 @@ export const App: React.FC<AppProps> = ({
       transcriptsByAgent={transcriptsByAgent}
       selectedAgentName={selectedAgent?.name_key ?? null}
       onSelectAgent={(nameKey) => {
+        selectTranscriptAgent(nameKey);
         const nextKey = nameKey.trim().toLowerCase();
         if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
           selectedAgentNameRef.current = nameKey;
           selectedSessionIdRef.current = null;
-          setTranscriptTurns(
-            preserveOptimisticTurn(
-              backgroundTranscriptsRef.current[nextKey] ?? [],
-              optimisticPromptRef.current,
-              Date.now(),
-              nextKey,
-              null,
-            ),
-          );
+          setTranscriptTurns([]);
           setSessionQueue([]);
           setIsSessionBusy(false);
           setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
@@ -3172,6 +3174,8 @@ export const App: React.FC<AppProps> = ({
         onPairWithCode={handlePairWithCode}
         onPairWithToken={handlePairWithToken}
         onAuthenticated={(auth) => {
+          advanceTranscriptAuth();
+          loggedOutRef.current = false;
           if (auth) {
             setAuthority(auth);
           }
