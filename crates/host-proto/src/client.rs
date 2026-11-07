@@ -12,7 +12,7 @@ use crate::auth;
 #[cfg(unix)]
 use crate::auth::Deadlines;
 use crate::endpoint::HostEndpoint;
-use crate::frame::{LineReassembler, decode_response, encode_request};
+use crate::frame::{LineReassembler, decode_response_for_minor, encode_request_for_minor};
 #[cfg(unix)]
 use crate::types::AuthToken;
 #[cfg(unix)]
@@ -93,6 +93,7 @@ pub struct AsyncHostClient {
     frame_timeout: Duration,
     write_timeout: Duration,
     mode: SessionMode,
+    endpoint: Option<HostEndpoint>,
 }
 
 impl std::fmt::Debug for AsyncHostClient {
@@ -115,11 +116,15 @@ impl AsyncHostClient {
     ) -> Result<Self, HostError> {
         #[cfg(unix)]
         {
-            return connect_retry(endpoint, &options).await;
+            let mut client = connect_retry(endpoint, &options).await?;
+            client.endpoint = Some(endpoint.clone());
+            Ok(client)
         }
         #[cfg(windows)]
         {
-            return crate::transport::windows::connect_client(endpoint, &options).await;
+            let mut client = crate::transport::windows::connect_client(endpoint, &options).await?;
+            client.endpoint = Some(endpoint.clone());
+            Ok(client)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -137,7 +142,9 @@ impl AsyncHostClient {
     ) -> Result<Self, HostError> {
         let canonical = canonical_unix(endpoint)?;
         let token = crate::transport::unix::read_token(&canonical)?;
-        drive_unix(canonical, token, stream, &ConnectOptions::default()).await
+        let mut client = drive_unix(canonical, token, stream, &ConnectOptions::default()).await?;
+        client.endpoint = Some(endpoint.clone());
+        Ok(client)
     }
 
     pub async fn request(&mut self, request: HostRequest) -> Result<HostResponse, HostError> {
@@ -167,7 +174,7 @@ impl AsyncHostClient {
                 "message is not in the negotiated minor".into(),
             ));
         }
-        let frame = encode_request(request)?;
+        let frame = encode_request_for_minor(self.minor, request)?;
         self.correlator.submit(request.request_id().0)?;
         let deadline = Instant::now() + self.write_timeout;
         write_client(&mut self.io, &frame, deadline).await
@@ -180,7 +187,7 @@ impl AsyncHostClient {
                 "stream connection accepts no RPC".into(),
             ));
         }
-        let response = read_response_io(&mut self.io, self.frame_timeout).await?;
+        let response = read_response_io(&mut self.io, self.frame_timeout, self.minor).await?;
         self.correlator.complete(response.request_id().0)?;
         Ok(response)
     }
@@ -193,12 +200,152 @@ impl AsyncHostClient {
         crate::supports_message(self.minor, name)
     }
 
+    /// Explicit minor-one operation. Refusal never triggers a legacy fallback.
+    pub async fn extension_request(
+        &mut self,
+        request: crate::ExtensionRequest,
+    ) -> Result<crate::ExtensionResponse, HostError> {
+        let id = self
+            .correlator
+            .last
+            .checked_add(1)
+            .ok_or_else(|| HostError::Protocol("request id exhausted".into()))?;
+        match self
+            .request(HostRequest::Extended {
+                id: crate::RequestId(id),
+                request,
+            })
+            .await?
+        {
+            HostResponse::Extended { response, .. } => Ok(response),
+            _ => Err(HostError::Protocol("extension response required".into())),
+        }
+    }
+    pub async fn claim_controller(
+        &mut self,
+        stream: crate::StreamId,
+    ) -> Result<ReliableControllerGrant, HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::ClaimController { stream })
+            .await?
+        {
+            crate::ExtensionResponse::Controller {
+                lease,
+                acked,
+                latest,
+            } => Ok(ReliableControllerGrant {
+                lease,
+                acked,
+                latest,
+            }),
+            other => Err(HostError::Protocol(format!(
+                "controller refused: {other:?}"
+            ))),
+        }
+    }
+    pub async fn subscribe_reliable(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        after: Option<u64>,
+    ) -> Result<ReliableEventStream, HostError> {
+        let response = self
+            .extension_request(crate::ExtensionRequest::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: after,
+            })
+            .await?;
+        let (ticket, acked) = match response {
+            crate::ExtensionResponse::Subscription { ticket, acked, .. } => (ticket, acked),
+            other => {
+                return Err(HostError::Protocol(format!(
+                    "subscription refused: {other:?}"
+                )));
+            }
+        };
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| HostError::Protocol("event endpoint unavailable".into()))?;
+        let event = Self::connect_with(
+            endpoint,
+            ConnectOptions {
+                major: self.major,
+                minor: self.minor,
+                ..ConnectOptions::default()
+            },
+        )
+        .await?;
+        let inner = event.open_extension_stream(ticket).await?;
+        let seq = after.unwrap_or(acked);
+        Ok(ReliableEventStream {
+            inner,
+            reassembly: crate::ReliableReassembler::for_stream(stream.clone(), seq),
+            cursor: crate::Cursor { stream, seq },
+        })
+    }
+    /// Call only after durable application, ownership mapping and cursor commit.
+    pub async fn ack(
+        &mut self,
+        cursor: crate::Cursor,
+        lease: crate::ControllerLease,
+    ) -> Result<u64, HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::Ack { cursor, lease })
+            .await?
+        {
+            crate::ExtensionResponse::Acked { through } => Ok(through),
+            other => Err(HostError::Protocol(format!("ack refused: {other:?}"))),
+        }
+    }
+
     #[cfg(unix)]
     pub fn into_stream(self) -> tokio::net::UnixStream {
         match self.io {
             ClientIo::Unix(stream) => stream,
             #[cfg(test)]
             ClientIo::Mem(_) => panic!("memory client has no unix stream"),
+        }
+    }
+
+    /// Opens this independently authenticated connection as an explicit extension
+    /// stream. A ticket is not an implicit upgrade of a legacy event connection.
+    pub async fn open_extension_stream(
+        mut self,
+        ticket: crate::Ticket,
+    ) -> Result<ExtensionEventStream, HostError> {
+        crate::extension::require_minor(self.minor)?;
+        let id = self
+            .correlator
+            .last
+            .checked_add(1)
+            .ok_or_else(|| HostError::Protocol("request id exhausted".into()))?;
+        let response = self
+            .request(HostRequest::Extended {
+                id: crate::RequestId(id),
+                request: crate::ExtensionRequest::OpenStream { ticket },
+            })
+            .await?;
+        if !matches!(
+            response,
+            HostResponse::Extended {
+                response: crate::ExtensionResponse::Opened,
+                ..
+            }
+        ) {
+            return Err(HostError::Protocol("extension stream did not open".into()));
+        }
+        self.mode = SessionMode::Stream;
+        Ok(ExtensionEventStream { client: self })
+    }
+
+    #[cfg(windows)]
+    pub fn into_pipe(self) -> tokio::net::windows::named_pipe::NamedPipeClient {
+        match self.io {
+            ClientIo::Pipe(pipe) => pipe,
+            #[cfg(test)]
+            ClientIo::Mem(_) => panic!("memory client has no pipe"),
         }
     }
 
@@ -216,6 +363,7 @@ impl AsyncHostClient {
             frame_timeout: FRAME_READ_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
             mode: SessionMode::Rpc,
+            endpoint: None,
         }
     }
 }
@@ -247,6 +395,16 @@ impl BlockingHostClient {
 
     pub fn read_response(&mut self) -> Result<HostResponse, HostError> {
         self.runtime.block_on(self.inner.read_response())
+    }
+}
+
+pub struct ExtensionEventStream {
+    client: AsyncHostClient,
+}
+impl ExtensionEventStream {
+    pub async fn next_frame(&mut self) -> Result<crate::ExtensionFrame, HostError> {
+        let frame = read_idle_client(&mut self.client.io, self.client.frame_timeout).await?;
+        crate::decode_extension_frame(self.client.minor, &frame)
     }
 }
 
@@ -379,6 +537,7 @@ async fn drive_unix(
         frame_timeout: FRAME_READ_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
         mode: SessionMode::Rpc,
+        endpoint: None,
     })
 }
 
@@ -412,9 +571,13 @@ async fn write_client(
     }
 }
 
-async fn read_response_io(io: &mut ClientIo, timeout: Duration) -> Result<HostResponse, HostError> {
+async fn read_response_io(
+    io: &mut ClientIo,
+    timeout: Duration,
+    minor: u16,
+) -> Result<HostResponse, HostError> {
     let frame = read_idle_client(io, timeout).await?;
-    decode_response(&frame)
+    decode_response_for_minor(minor, &frame)
 }
 
 async fn read_idle_client(io: &mut ClientIo, timeout: Duration) -> Result<crate::Frame, HostError> {
@@ -456,6 +619,7 @@ mod tests {
                 frame_timeout: Duration::from_secs(2),
                 write_timeout: Duration::from_secs(2),
                 mode: SessionMode::Stream,
+                endpoint: None,
             },
             lines: LineReassembler::new(),
         };
@@ -670,5 +834,79 @@ mod tests {
             events.next().await.unwrap(),
             HostEvent::Control(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod extension_client_tests {
+    use super::*;
+    #[tokio::test]
+    async fn negotiated_zero_client_rejects_raw_extended_response() {
+        let (left, mut right) = tokio::io::duplex(64 * 1024);
+        let mut client = AsyncHostClient {
+            io: ClientIo::Mem(left),
+            major: 1,
+            minor: 0,
+            correlator: ClientCorrelator::new(),
+            frame_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            mode: SessionMode::Rpc,
+            endpoint: None,
+        };
+        client
+            .write_request(&HostRequest::List {
+                id: crate::RequestId(1),
+            })
+            .await
+            .unwrap();
+        let forged = crate::Frame {
+            kind: crate::FrameKind::Response,
+            payload: br#"{"op":"extended","id":1,"response":{"op":"opened"}}"#.to_vec(),
+        };
+        auth::write_frame_async(&mut right, &forged, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(client.read_response().await.is_err());
+    }
+}
+
+/// A controller grant does not imply that any output was durably applied.
+#[derive(Debug)]
+pub struct ReliableControllerGrant {
+    pub lease: crate::ControllerLease,
+    pub acked: u64,
+    pub latest: u64,
+}
+/// Complete reliable events; reading/displaying never sends Ack.
+pub struct ReliableEventStream {
+    inner: ExtensionEventStream,
+    reassembly: crate::ReliableReassembler,
+    cursor: crate::Cursor,
+}
+impl ReliableEventStream {
+    pub fn cursor(&self) -> crate::Cursor {
+        self.cursor.clone()
+    }
+    pub async fn next_event(&mut self) -> Result<crate::ReliableEvent, HostError> {
+        loop {
+            let frame = match self.inner.next_frame().await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.reassembly.discard();
+                    return Err(error);
+                }
+            };
+            match self.reassembly.push(&frame) {
+                Ok(Some(event)) => {
+                    self.cursor.seq = event.seq;
+                    return Ok(event);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.reassembly.discard();
+                    return Err(error);
+                }
+            }
+        }
     }
 }

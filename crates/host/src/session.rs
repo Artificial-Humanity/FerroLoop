@@ -42,6 +42,7 @@ pub struct Session {
     input: Mutex<InputState>,
     stalled: AtomicBool,
     sink: Mutex<Option<Weak<dyn StdoutSink>>>,
+    reliable: Option<Arc<crate::reliable::ReliableJournal>>,
     #[cfg(unix)]
     supervisor: Mutex<Option<std::process::Child>>,
     #[cfg(windows)]
@@ -69,7 +70,37 @@ pub(crate) struct SessionParts {
 }
 
 impl Session {
+    pub(crate) fn mode(&self) -> fl_host_proto::SessionMode {
+        if self.reliable.is_some() {
+            fl_host_proto::SessionMode::ReliablePipe
+        } else {
+            fl_host_proto::SessionMode::LegacyPipe
+        }
+    }
+    pub(crate) fn reliable(&self) -> Option<&Arc<crate::reliable::ReliableJournal>> {
+        self.reliable.as_ref()
+    }
+
     pub fn new(parts: SessionParts) -> Self {
+        Self::with_reliable(parts, None)
+    }
+
+    pub(crate) fn with_reliable(
+        parts: SessionParts,
+        reliable: Option<Arc<crate::reliable::ReliableJournal>>,
+    ) -> Self {
+        if let Some(journal) = &reliable {
+            assert_eq!(
+                journal.stream().session,
+                parts.session,
+                "immutable journal session"
+            );
+            assert_eq!(
+                journal.stream().epoch.0,
+                parts.epoch,
+                "immutable journal epoch"
+            );
+        }
         let SessionParts {
             session,
             epoch,
@@ -118,6 +149,7 @@ impl Session {
             input: Mutex::new(InputState::Writable),
             stalled: AtomicBool::new(false),
             sink: Mutex::new(None),
+            reliable,
             #[cfg(unix)]
             supervisor: Mutex::new(None),
             #[cfg(windows)]
@@ -492,6 +524,9 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 pub(crate) trait StdoutSink: Send + Sync {
+    fn reliable(&self) -> Option<&Arc<crate::reliable::ReliableJournal>> {
+        None
+    }
     fn room(&self) -> usize;
     fn push(&self, bytes: &[u8]) -> bool;
     fn eof(&self);
@@ -517,6 +552,12 @@ pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
                 }
             }
         }
+        return;
+    }
+    if let Some(sink) = session.sink()
+        && let Some(journal) = sink.reliable()
+    {
+        pump_reliable_stdout(&mut file, &session, sink.as_ref(), journal);
         return;
     }
     let mut buf = vec![0u8; 64 * 1024];
@@ -566,6 +607,54 @@ pub fn pump_stdout(mut file: File, session: std::sync::Arc<Session>) {
             }
         }
     }
+}
+
+// No debug-buffer copy in reliable mode. Pending/partial bytes live in the
+// journal, so cancelling this thread cannot silently discard an admitted read.
+fn pump_reliable_stdout(
+    file: &mut File,
+    session: &Session,
+    sink: &dyn StdoutSink,
+    journal: &crate::reliable::ReliableJournal,
+) {
+    pump_reliable_stdout_with(session, sink, journal, |buffer| {
+        pump_read(file, buffer, session)
+    });
+}
+pub(crate) fn pump_reliable_stdout_with(
+    session: &Session,
+    sink: &dyn StdoutSink,
+    journal: &crate::reliable::ReliableJournal,
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) {
+    loop {
+        if session.io_stop.load(Ordering::SeqCst) || sink.stopped() {
+            break;
+        }
+        let mut buffer = match journal.prepare_read() {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                if journal.failed() {
+                    break;
+                }
+                session.set_stalled(true);
+                sink.wait(Duration::from_millis(50));
+                continue;
+            }
+        };
+        session.set_stalled(false);
+        match read(buffer.as_mut_slice()) {
+            Ok(0) | Err(_) => break,
+            Ok(len) => {
+                buffer.truncate(len);
+                if journal.accept_read(buffer).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    sink.eof();
+    session.stdout_eof();
 }
 
 pub fn pump_stderr(mut file: File, session: std::sync::Arc<Session>) {

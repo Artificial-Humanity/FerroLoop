@@ -20,6 +20,7 @@ pub enum FrameKind {
     Response = 6,
     Line = 7,
     Event = 8,
+    ExtensionEvent = 9,
 }
 
 impl FrameKind {
@@ -33,6 +34,7 @@ impl FrameKind {
             6 => Self::Response,
             7 => Self::Line,
             8 => Self::Event,
+            9 => Self::ExtensionEvent,
             _ => {
                 return Err(HostError::Protocol(format!("unknown frame type {byte}")));
             }
@@ -114,10 +116,18 @@ pub(crate) fn decode_body(mut body: Vec<u8>) -> Result<Frame, HostError> {
 }
 
 pub fn encode_request(request: &HostRequest) -> Result<Frame, HostError> {
+    encode_request_for_minor(0, request)
+}
+
+pub fn encode_request_for_minor(minor: u16, request: &HostRequest) -> Result<Frame, HostError> {
+    if let HostRequest::Extended { request, .. } = request {
+        crate::extension::require_minor(minor)?;
+        request.validate()?;
+    }
     if let HostRequest::Spawn { spec, .. } = request {
         spec.validate()?;
     }
-    if !crate::supports_message(0, request.op_name()) && request.op_name() != "resize" {
+    if !crate::supports_message(minor, request.op_name()) && request.op_name() != "resize" {
         return Err(HostError::Protocol("unknown request".into()));
     }
     let payload =
@@ -132,6 +142,10 @@ pub fn encode_request(request: &HostRequest) -> Result<Frame, HostError> {
 }
 
 pub fn decode_request(frame: &Frame) -> Result<HostRequest, HostError> {
+    decode_request_for_minor(0, frame)
+}
+
+pub fn decode_request_for_minor(minor: u16, frame: &Frame) -> Result<HostRequest, HostError> {
     if frame.kind != FrameKind::Request {
         return Err(HostError::Protocol("expected a request frame".into()));
     }
@@ -140,6 +154,10 @@ pub fn decode_request(frame: &Frame) -> Result<HostRequest, HostError> {
     }
     let request: HostRequest = serde_json::from_slice(&frame.payload)
         .map_err(|err| HostError::Protocol(err.to_string()))?;
+    if let HostRequest::Extended { request, .. } = &request {
+        crate::extension::require_minor(minor)?;
+        request.validate()?;
+    }
     if let HostRequest::Spawn { spec, .. } = &request {
         spec.validate()?;
     }
@@ -147,8 +165,34 @@ pub fn decode_request(frame: &Frame) -> Result<HostRequest, HostError> {
 }
 
 pub fn encode_response(response: &HostResponse) -> Result<Frame, HostError> {
-    let payload =
-        serde_json::to_vec(response).map_err(|err| HostError::Protocol(err.to_string()))?;
+    encode_response_for_minor(0, response)
+}
+
+pub fn encode_response_for_minor(minor: u16, response: &HostResponse) -> Result<Frame, HostError> {
+    if let HostResponse::Extended { response, .. } = response {
+        crate::extension::require_minor(minor)?;
+        response.validate()?;
+    }
+    let payload = if matches!(
+        response,
+        HostResponse::Extended {
+            response: crate::ExtensionResponse::Sessions { .. },
+            ..
+        }
+    ) {
+        // List admission precharges this exact capacity. Serialize into a slice:
+        // an oversized response fails without Vec's amortized growth or a second
+        // JSON allocation. Truncation retains the charged capacity through write.
+        let mut payload = vec![0u8; MAX_FRAME_PAYLOAD];
+        let mut remaining = payload.as_mut_slice();
+        serde_json::to_writer(&mut remaining, response)
+            .map_err(|err| HostError::Protocol(err.to_string()))?;
+        let len = MAX_FRAME_PAYLOAD - remaining.len();
+        payload.truncate(len);
+        payload
+    } else {
+        serde_json::to_vec(response).map_err(|err| HostError::Protocol(err.to_string()))?
+    };
     if payload.len() > MAX_FRAME_PAYLOAD {
         return Err(HostError::FrameLength);
     }
@@ -159,10 +203,23 @@ pub fn encode_response(response: &HostResponse) -> Result<Frame, HostError> {
 }
 
 pub fn decode_response(frame: &Frame) -> Result<HostResponse, HostError> {
+    decode_response_for_minor(0, frame)
+}
+
+pub fn decode_response_for_minor(minor: u16, frame: &Frame) -> Result<HostResponse, HostError> {
     if frame.kind != FrameKind::Response {
         return Err(HostError::Protocol("expected a response frame".into()));
     }
-    serde_json::from_slice(&frame.payload).map_err(|err| HostError::Protocol(err.to_string()))
+    if frame.payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(HostError::FrameLength);
+    }
+    let response = serde_json::from_slice(&frame.payload)
+        .map_err(|err| HostError::Protocol(err.to_string()))?;
+    if let HostResponse::Extended { response, .. } = &response {
+        crate::extension::require_minor(minor)?;
+        response.validate()?;
+    }
+    Ok(response)
 }
 
 pub fn line_fragment(

@@ -6,6 +6,8 @@
 mod auth;
 mod client;
 mod endpoint;
+mod extension;
+pub use extension::*;
 mod frame;
 mod transport;
 mod types;
@@ -15,12 +17,17 @@ pub use auth::{
     client_proof, decode_challenge, read_frame_async, reject_equal_nonces, server_handshake,
     server_proof, verify_client_proof, verify_server_proof, write_frame_async,
 };
-pub use client::{AsyncHostClient, BlockingHostClient, ConnectOptions, HostEventStream, events};
+pub use client::{
+    AsyncHostClient, BlockingHostClient, ConnectOptions, ExtensionEventStream, HostEventStream,
+    ReliableControllerGrant, ReliableEventStream, events,
+};
 pub use endpoint::HostEndpoint;
 pub use frame::{
     EventSeq, Frame, FrameKind, LineReassembler, ResponseCorrelator, checked_frame_len,
-    checked_unauth_len, decode_request, encode_request, fragment_line, frame_total_len,
-    line_fragment, read_frame, write_frame,
+    checked_unauth_len, decode_request, decode_request_for_minor, decode_response,
+    decode_response_for_minor, encode_request, encode_request_for_minor, encode_response,
+    encode_response_for_minor, fragment_line, frame_total_len, line_fragment, read_frame,
+    write_frame,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use transport::interpret_ucred;

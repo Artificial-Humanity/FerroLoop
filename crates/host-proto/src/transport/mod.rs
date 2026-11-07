@@ -12,7 +12,9 @@ use crate::HostConfig;
 pub(crate) type TokenPublisher = Arc<dyn Fn(&[u8; 32]) -> Result<(), HostError> + Send + Sync>;
 use crate::auth::{self, Deadlines};
 use crate::endpoint::HostEndpoint;
-use crate::frame::{decode_request, encode_response};
+use crate::frame::{
+    decode_request_for_minor, decode_response_for_minor, encode_response_for_minor,
+};
 use crate::types::{AuthToken, HostError, HostRequest, HostResponse};
 
 #[cfg(unix)]
@@ -81,6 +83,9 @@ enum ConnIo {
 
 pub struct HostConn {
     io: ConnIo,
+    negotiated_minor: u16,
+    extension_opened: bool,
+    extension_stream: bool,
     frame_timeout: Duration,
     write_timeout: Duration,
     requests: Arc<AtomicUsize>,
@@ -92,6 +97,22 @@ pub struct HostConn {
 }
 
 impl HostConn {
+    pub fn negotiated_minor(&self) -> u16 {
+        self.negotiated_minor
+    }
+
+    pub fn enter_extension_stream(&mut self) -> Result<(), HostError> {
+        crate::extension::require_minor(self.negotiated_minor)?;
+        if !self.extension_opened || self.stream_only {
+            return Err(HostError::Protocol(
+                "extension stream was not opened".into(),
+            ));
+        }
+        self.stream_only = true;
+        self.extension_stream = true;
+        Ok(())
+    }
+
     pub async fn recv(&mut self) -> Result<HostRequest, HostError> {
         if self.stream_only {
             return Err(HostError::Protocol("this connection is stream-only".into()));
@@ -102,7 +123,7 @@ impl HostConn {
                 "authenticated connection expected a request".into(),
             ));
         }
-        let request = decode_request(&frame)?;
+        let request = decode_request_for_minor(self.negotiated_minor, &frame)?;
         self.requests.fetch_add(1, Ordering::SeqCst);
         Ok(request)
     }
@@ -118,16 +139,69 @@ impl HostConn {
     }
 
     pub async fn respond(&mut self, response: &HostResponse) -> Result<(), HostError> {
-        let frame = encode_response(response)?;
+        let frame = encode_response_for_minor(self.negotiated_minor, response)?;
         let deadline = std::time::Instant::now() + self.write_timeout;
-        write_frame(&mut self.io, &frame, deadline).await
+        write_frame(&mut self.io, &frame, deadline).await?;
+        if matches!(
+            response,
+            HostResponse::Extended {
+                response: crate::ExtensionResponse::Opened,
+                ..
+            }
+        ) {
+            self.extension_opened = true;
+        }
+        Ok(())
     }
 
     /// One frame with this connection's absolute write deadline.
     /// A timeout may already have written a prefix; the caller closes.
     pub async fn write_frame(&mut self, frame: &crate::Frame) -> Result<(), HostError> {
-        let deadline = std::time::Instant::now() + self.write_timeout;
+        let deadline = self.frame_write_deadline(frame)?;
         write_frame(&mut self.io, frame, deadline).await
+    }
+
+    /// Validate a frame and pin the existing write timeout once. Consumers that
+    /// coordinate completion must use this same instant for write and wait.
+    pub fn frame_write_deadline(
+        &self,
+        frame: &crate::Frame,
+    ) -> Result<std::time::Instant, HostError> {
+        self.validate_outbound_frame(frame)?;
+        Ok(std::time::Instant::now() + self.write_timeout)
+    }
+
+    /// Write with a previously pinned absolute deadline; never renew it here.
+    /// Validation is repeated so sharing a deadline cannot bypass frame policy.
+    pub async fn write_frame_until(
+        &mut self,
+        frame: &crate::Frame,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostError> {
+        self.validate_outbound_frame(frame)?;
+        write_frame(&mut self.io, frame, deadline).await
+    }
+
+    fn validate_outbound_frame(&self, frame: &crate::Frame) -> Result<(), HostError> {
+        match frame.kind {
+            crate::FrameKind::Request => {
+                decode_request_for_minor(self.negotiated_minor, frame)?;
+            }
+            crate::FrameKind::Response => {
+                decode_response_for_minor(self.negotiated_minor, frame)?;
+            }
+            crate::FrameKind::ExtensionEvent => {
+                crate::extension::require_minor(self.negotiated_minor)?;
+                if !self.extension_stream {
+                    return Err(HostError::Protocol(
+                        "extension stream was not opened".into(),
+                    ));
+                }
+                crate::decode_extension_frame(self.negotiated_minor, frame)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Resolves when the peer closes. Cancel-safe: it does not consume bytes.
@@ -490,7 +564,7 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
     };
     let token = Arc::clone(&shared.token);
     let load = move || *token.read().unwrap_or_else(|err| err.into_inner());
-    let io = match io {
+    let (io, negotiated_minor) = match io {
         #[cfg(unix)]
         ConnIo::Unix(mut stream) => {
             if shared.garbage.load(Ordering::SeqCst) {
@@ -498,7 +572,7 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
                 let _ = auth::write_garbage(&mut stream, deadline).await;
                 return Err(HostError::Protocol("garbage banner".into()));
             }
-            let (stream, _agreed) = auth::server_with_token(
+            let (stream, agreed) = auth::server_with_token(
                 stream,
                 &shared.identity,
                 deadlines,
@@ -509,7 +583,7 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
                 load,
             )
             .await?;
-            ConnIo::Unix(stream)
+            (ConnIo::Unix(stream), agreed)
         }
         #[cfg(windows)]
         ConnIo::Server(mut stream) => {
@@ -518,7 +592,7 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
                 let _ = auth::write_garbage(&mut stream, deadline).await;
                 return Err(HostError::Protocol("garbage banner".into()));
             }
-            let (stream, _agreed) = auth::server_with_token(
+            let (stream, agreed) = auth::server_with_token(
                 stream,
                 &shared.identity,
                 deadlines,
@@ -529,11 +603,14 @@ async fn admit(shared: Arc<Shared>, io: ConnIo) -> Result<HostConn, HostError> {
                 load,
             )
             .await?;
-            ConnIo::Server(stream)
+            (ConnIo::Server(stream), agreed)
         }
     };
     Ok(HostConn {
         io,
+        negotiated_minor,
+        extension_opened: false,
+        extension_stream: false,
         frame_timeout: shared.frame_timeout,
         write_timeout: shared.write_timeout,
         requests: Arc::clone(&shared.requests),
@@ -664,6 +741,9 @@ mod descriptor_tests {
         let (stream, mut peer) = tokio::net::UnixStream::pair().unwrap();
         let mut conn = HostConn {
             io: ConnIo::Unix(stream),
+            negotiated_minor: 0,
+            extension_opened: false,
+            extension_stream: false,
             frame_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
             requests: Arc::new(AtomicUsize::new(0)),
@@ -693,6 +773,9 @@ mod descriptor_tests {
         let (stream, _peer) = tokio::net::UnixStream::pair().unwrap();
         let conn = HostConn {
             io: ConnIo::Unix(stream),
+            negotiated_minor: 0,
+            extension_opened: false,
+            extension_stream: false,
             frame_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
             requests: Arc::new(AtomicUsize::new(0)),

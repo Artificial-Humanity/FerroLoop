@@ -252,8 +252,12 @@ async fn write_frame_captured<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut bytes = Vec::new();
-    write_frame(&mut bytes, frame)?;
+    // A slice writer prevents hidden amortized capacity growth. This is the
+    // second response allocation retained alongside the JSON frame while parked.
+    let wire_len = usize::try_from(crate::frame_total_len(frame.payload.len() as u64)?)
+        .map_err(|_| HostError::FrameLength)?;
+    let mut bytes = vec![0u8; wire_len];
+    write_frame(&mut bytes.as_mut_slice(), frame)?;
     write_all_deadline(writer, &bytes, deadline).await?;
     if let Some(capture) = capture {
         capture

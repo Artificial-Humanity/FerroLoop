@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub const PROTO_MAJOR: u16 = 1;
-pub const PROTO_MINOR: u16 = 0;
+pub const PROTO_MINOR: u16 = 1;
 
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 pub const MAX_SUBSCRIBERS: usize = 16;
@@ -253,6 +253,10 @@ pub enum SignalKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HostRequest {
+    Extended {
+        id: RequestId,
+        request: crate::ExtensionRequest,
+    },
     Spawn {
         id: RequestId,
         spec: SpawnSpec,
@@ -300,12 +304,14 @@ impl HostRequest {
             | Self::Events { id, .. }
             | Self::ClaimLease { id, .. }
             | Self::Send { id, .. }
-            | Self::Signal { id, .. } => *id,
+            | Self::Signal { id, .. }
+            | Self::Extended { id, .. } => *id,
         }
     }
 
     pub fn op_name(&self) -> &'static str {
         match self {
+            Self::Extended { .. } => "extended",
             Self::Spawn { .. } => "spawn",
             Self::List { .. } => "list",
             Self::Kill { .. } => "kill",
@@ -400,6 +406,10 @@ pub enum SendOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HostResponse {
+    Extended {
+        id: RequestId,
+        response: crate::ExtensionResponse,
+    },
     Spawned {
         id: RequestId,
         child: HostedChild,
@@ -442,7 +452,8 @@ impl HostResponse {
             | Self::Lease { id, .. }
             | Self::Sent { id, .. }
             | Self::Signaled { id }
-            | Self::Failed { id, .. } => *id,
+            | Self::Failed { id, .. }
+            | Self::Extended { id, .. } => *id,
         }
     }
 }
@@ -496,7 +507,7 @@ pub enum HostEvent {
 pub fn supports_message(minor: u16, name: &str) -> bool {
     match name {
         "spawn" | "list" | "kill" | "events" | "claim_lease" | "send" | "signal" => true,
-        "resize" | "write" => minor >= 1,
+        "resize" | "write" | "extended" => minor >= 1,
         _ => false,
     }
 }

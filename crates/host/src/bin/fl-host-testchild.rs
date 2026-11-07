@@ -10,6 +10,29 @@ fn main() {
     let mode = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
     match mode.as_str() {
+        "reliable-controller" => reliable_controller(rest.first().expect("controller config")),
+        "reliable-gated-maxline" => {
+            ready();
+            let wait = |path: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !std::path::Path::new(path).exists() {
+                    assert!(std::time::Instant::now() < deadline, "fixture gate {path}");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            };
+            wait(rest.first().expect("first gate"));
+            let mut out = io::stdout();
+            let chunk = [b'y'; 4096];
+            for _ in 0..256 {
+                out.write_all(&chunk).expect("max line");
+            }
+            out.write_all(b"\n").expect("newline");
+            out.flush().expect("flush");
+            wait(rest.get(1).expect("second gate"));
+            out.write_all(b"TAIL\n").expect("tail");
+            out.flush().expect("tail flush");
+            park();
+        }
         "echo" => echo(),
         #[cfg(unix)]
         "export-pipe-writers" => export_pipe_writers(&rest),
@@ -105,6 +128,175 @@ fn main() {
             let _ = writeln!(io::stderr(), "unknown mode");
             exit(2);
         }
+    }
+}
+
+// Synthetic application owner used by native recovery tests. A single snapshot
+// commits the applied records, exact stream mapping and cursor together.
+fn reliable_controller(config_path: &str) {
+    use fl_host_proto::{AsyncHostClient, Cursor, StreamId};
+    use std::path::Path;
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).expect("config")).expect("config JSON");
+    let endpoint = fl_host::socket_endpoint(config["endpoint"].as_str().expect("endpoint"))
+        .expect("endpoint syntax");
+    let stream: StreamId = serde_json::from_value(config["stream"].clone()).expect("stream");
+    let state_path = Path::new(config["state"].as_str().expect("state path"));
+    let point = config["point"].as_str().expect("crash point");
+    let through = config["through"].as_u64().expect("through");
+    assert!(through <= 64);
+    let mut state = if state_path.exists() {
+        let bytes = std::fs::read(state_path).expect("read durable snapshot");
+        assert!(bytes.len() <= 64 * 1024);
+        serde_json::from_slice::<serde_json::Value>(&bytes).expect("snapshot JSON")
+    } else {
+        serde_json::json!({"stream":stream,"cursor":0,"applied":[],"status":"active"})
+    };
+    assert_eq!(
+        state["stream"], config["stream"],
+        "different ownership mapping"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut rpc = AsyncHostClient::connect(&endpoint)
+            .await
+            .expect("controller RPC");
+        match rpc
+            .extension_request(fl_host_proto::ExtensionRequest::Capabilities)
+            .await
+            .expect("capabilities")
+        {
+            fl_host_proto::ExtensionResponse::Capabilities { host, .. } if host != stream.host => {
+                state["status"] = "interrupted_uncertain".into();
+                state["replacement"] = serde_json::Value::Null;
+                durable_snapshot(
+                    state_path,
+                    &serde_json::to_vec(&state).expect("uncertain snapshot"),
+                );
+                return;
+            }
+            fl_host_proto::ExtensionResponse::Capabilities { .. } => {}
+            other => panic!("capabilities {other:?}"),
+        }
+        let grant = rpc
+            .claim_controller(stream.clone())
+            .await
+            .expect("controller claim");
+        let after = state["cursor"].as_u64().expect("cursor");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let ticket = loop {
+            match rpc
+                .extension_request(fl_host_proto::ExtensionRequest::SubscribeReliable {
+                    stream: stream.clone(),
+                    lease: grant.lease,
+                    after_seq: Some(after),
+                })
+                .await
+                .expect("subscription RPC")
+            {
+                fl_host_proto::ExtensionResponse::Subscription { ticket, .. } => break ticket,
+                fl_host_proto::ExtensionResponse::Refused {
+                    code: fl_host_proto::ExtensionRefusal::Busy,
+                } if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                other => panic!("recovered subscription {other:?}"),
+            }
+        };
+        let mut events = AsyncHostClient::connect(&endpoint)
+            .await
+            .expect("event connection")
+            .open_extension_stream(ticket)
+            .await
+            .expect("event stream");
+        let mut reassembly = fl_host_proto::ReliableReassembler::for_stream(stream.clone(), after);
+        for expected in after + 1..=through {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let frame = events.next_frame().await.expect("event frame");
+                    if let Some(event) = reassembly.push(&frame).expect("event reassembly") {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("event deadline");
+            assert_eq!(event.seq, expected);
+            if point == "before-commit" {
+                std::fs::write(config["marker"].as_str().unwrap(), b"before-commit")
+                    .expect("marker");
+                park();
+            }
+            let row = serde_json::json!({
+                "seq": event.seq,
+                "kind": format!("{:?}", event.kind),
+                "bytes": event.bytes.len()
+            });
+            state["applied"]
+                .as_array_mut()
+                .expect("application rows")
+                .push(row);
+            state["cursor"] = event.seq.into();
+            durable_snapshot(
+                state_path,
+                &serde_json::to_vec(&state).expect("snapshot encoding"),
+            );
+            if point == "after-commit" {
+                std::fs::write(config["marker"].as_str().unwrap(), b"after-commit")
+                    .expect("marker");
+                park();
+            }
+            rpc.ack(
+                Cursor {
+                    stream: stream.clone(),
+                    seq: event.seq,
+                },
+                grant.lease,
+            )
+            .await
+            .expect("explicit Ack after commit");
+        }
+    });
+}
+
+fn durable_snapshot(path: &std::path::Path, bytes: &[u8]) {
+    assert!(bytes.len() <= 64 * 1024);
+    let staged = path.with_extension("pending");
+    let mut file = std::fs::File::create(&staged).expect("staged snapshot");
+    file.write_all(bytes).expect("snapshot bytes");
+    file.sync_all().expect("snapshot fsync");
+    drop(file);
+    #[cfg(unix)]
+    {
+        std::fs::rename(&staged, path).expect("atomic snapshot replacement");
+        std::fs::File::open(path.parent().expect("snapshot directory"))
+            .expect("directory")
+            .sync_all()
+            .expect("directory fsync");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let old: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+        let new: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        assert_ne!(
+            unsafe {
+                MoveFileExW(
+                    old.as_ptr(),
+                    new.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            },
+            0,
+            "atomic snapshot replacement: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
