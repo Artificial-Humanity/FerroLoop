@@ -846,6 +846,12 @@ button.fd-badge:hover:not(:disabled) {
     gap: 4px !important;
   }
 
+  .fd-composer-delivery-receipt,
+  .fd-composer-unconfirmed-warning {
+    font-size: 12px;
+    line-height: 1.35;
+  }
+
   [data-testid="ferrodeck-brand-title"] {
     font-size: 15px !important;
   }
