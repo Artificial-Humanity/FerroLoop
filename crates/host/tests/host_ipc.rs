@@ -204,14 +204,14 @@ impl Rpc {
         }
     }
 
-    fn claim(&mut self, session: &str, epoch: u64) -> Result<ControllerLease, HostResponse> {
+    fn claim(&mut self, session: &str, epoch: u64) -> Result<ControllerLease, Box<HostResponse>> {
         match self.call(|id| HostRequest::ClaimLease {
             id,
             session: sid(session),
             expected_epoch: SessionEpoch(epoch),
         }) {
             Ok(HostResponse::Lease { lease, .. }) => Ok(lease),
-            Ok(other) => Err(other),
+            Ok(other) => Err(Box::new(other)),
             Err(err) => panic!("claim transport: {err}"),
         }
     }
@@ -241,7 +241,7 @@ impl Rpc {
         session: &str,
         epoch: u64,
         lease: Option<ControllerLease>,
-    ) -> Result<(), HostResponse> {
+    ) -> Result<(), Box<HostResponse>> {
         match self.call(|id| HostRequest::Kill {
             id,
             session: sid(session),
@@ -249,7 +249,7 @@ impl Rpc {
             lease,
         }) {
             Ok(HostResponse::Killed { .. }) => Ok(()),
-            Ok(other) => Err(other),
+            Ok(other) => Err(Box::new(other)),
             Err(err) => panic!("kill transport: {err}"),
         }
     }
@@ -260,7 +260,7 @@ impl Rpc {
         epoch: u64,
         lease: ControllerLease,
         signal: SignalKind,
-    ) -> Result<(), HostResponse> {
+    ) -> Result<(), Box<HostResponse>> {
         match self.call(|id| HostRequest::Signal {
             id,
             session: sid(session),
@@ -269,7 +269,7 @@ impl Rpc {
             signal,
         }) {
             Ok(HostResponse::Signaled { .. }) => Ok(()),
-            Ok(other) => Err(other),
+            Ok(other) => Err(Box::new(other)),
             Err(err) => panic!("signal transport: {err}"),
         }
     }
@@ -458,8 +458,8 @@ fn controls(events: &[HostEvent]) -> Vec<ControlEvent> {
         .collect()
 }
 
-fn failed_reason(response: HostResponse) -> String {
-    match response {
+fn failed_reason(response: impl Into<Box<HostResponse>>) -> String {
+    match *response.into() {
         HostResponse::Failed { reason, .. } => reason,
         other => panic!("expected failure, got {other:?}"),
     }
@@ -2429,4 +2429,1219 @@ fn unread_epochs_refuse_admission_at_retained_capacity() {
             .iter()
             .any(|event| matches!(event, ControlEvent::CleanupComplete { .. }))
     });
+}
+
+// Reliable mode uses a distinct authenticated authority and explicit cumulative Ack.
+use fl_host_proto::{
+    AsyncHostClient, Cursor, ExtensionEventStream, ExtensionRefusal as Refuse,
+    ExtensionRequest as XReq, ExtensionResponse as XResp, SessionMode as Mode, StreamId, Ticket,
+};
+fn extended(rpc: &mut Rpc, request: XReq) -> XResp {
+    match rpc
+        .call(|id| HostRequest::Extended { id, request })
+        .expect("extension RPC")
+    {
+        HostResponse::Extended { response, .. } => response,
+        other => panic!("extension response {other:?}"),
+    }
+}
+fn reliable_spawn(rpc: &mut Rpc, name: &str, args: &[&str]) -> StreamId {
+    match extended(
+        rpc,
+        XReq::SpawnSession {
+            spec: spec(name, args),
+            mode: Mode::ReliablePipe,
+            pty: None,
+        },
+    ) {
+        XResp::Session { stream, .. } => stream,
+        other => panic!("reliable spawn {other:?}"),
+    }
+}
+fn controller(rpc: &mut Rpc, stream: &StreamId) -> ControllerLease {
+    match extended(
+        rpc,
+        XReq::ClaimController {
+            stream: stream.clone(),
+        },
+    ) {
+        XResp::Controller { lease, .. } => lease,
+        other => panic!("controller {other:?}"),
+    }
+}
+fn ticket(rpc: &mut Rpc, stream: &StreamId, lease: ControllerLease, after: u64) -> Ticket {
+    match extended(
+        rpc,
+        XReq::SubscribeReliable {
+            stream: stream.clone(),
+            lease,
+            after_seq: Some(after),
+        },
+    ) {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("ticket {other:?}"),
+    }
+}
+fn settled_ticket(rpc: &mut Rpc, stream: &StreamId, lease: ControllerLease, after: u64) -> Ticket {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match extended(
+            rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(after),
+            },
+        ) {
+            XResp::Subscription { ticket, .. } => return ticket,
+            XResp::Refused { code: Refuse::Busy } => {
+                assert!(Instant::now() < deadline, "old authority did not settle");
+                thread::sleep(Duration::from_millis(5));
+            }
+            other => panic!("ticket {other:?}"),
+        }
+    }
+}
+fn event_socket(
+    endpoint: &HostEndpoint,
+    ticket: Ticket,
+) -> (tokio::runtime::Runtime, ExtensionEventStream) {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let stream = rt.block_on(async {
+        AsyncHostClient::connect(endpoint)
+            .await
+            .expect("event connect")
+            .open_extension_stream(ticket)
+            .await
+            .expect("open")
+    });
+    (rt, stream)
+}
+fn event_seq(rt: &tokio::runtime::Runtime, stream: &mut ExtensionEventStream, after: u64) -> u64 {
+    let mut reassembly = fl_host_proto::ReliableReassembler::new(after);
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(event) = reassembly
+                    .push(&stream.next_frame().await.expect("frame"))
+                    .expect("event")
+                {
+                    return event.seq;
+                }
+            }
+        })
+        .await
+        .expect("event deadline")
+    })
+}
+fn ack(rpc: &mut Rpc, stream: &StreamId, lease: ControllerLease, seq: u64) -> XResp {
+    extended(
+        rpc,
+        XReq::Ack {
+            cursor: Cursor {
+                stream: stream.clone(),
+                seq,
+            },
+            lease,
+        },
+    )
+}
+#[test]
+fn second_authoritative_subscribe_is_busy() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "one-stream", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let t = ticket(&mut rpc, &stream, lease, 0);
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(u64::MAX)
+            }
+        ),
+        XResp::Refused { code: Refuse::Busy }
+    );
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    assert_eq!(
+        ack(&mut rpc, &stream, lease, 1),
+        XResp::Acked { through: 1 }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: None
+            }
+        ),
+        XResp::Refused { code: Refuse::Busy }
+    );
+}
+#[test]
+fn ticket_bound_to_live_rpc_lease_and_consumed_once() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "ticket", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let old = ticket(&mut rpc, &stream, lease, 0);
+    let new = ticket(&mut rpc, &stream, lease, 0);
+    let mut event = Rpc::connect(&daemon.paths.endpoint);
+    assert_eq!(
+        extended(&mut event, XReq::OpenStream { ticket: old }),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+    let (_rt, _events) = event_socket(&daemon.paths.endpoint, new.clone());
+    assert_eq!(
+        extended(&mut event, XReq::OpenStream { ticket: new }),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+    let mut other = Rpc::connect(&daemon.paths.endpoint);
+    let lease2 = controller(&mut other, &stream);
+    let pending = settled_ticket(&mut other, &stream, lease2, 0);
+    drop(other);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        extended(&mut event, XReq::OpenStream { ticket: pending }),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+}
+#[test]
+fn ack_lost_reply_is_idempotent() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "ack-retry", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let t = ticket(&mut rpc, &stream, lease, 0);
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    arm(&daemon.paths.subscriber, "reliable-ack-reply");
+    rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Ack {
+            cursor: Cursor {
+                stream: stream.clone(),
+                seq: 1,
+            },
+            lease,
+        },
+    });
+    wait_at(&daemon.paths.subscriber, "reliable-ack-reply");
+    let mut recovered = Rpc::connect(&daemon.paths.endpoint);
+    assert!(
+        matches!(extended(&mut recovered,XReq::ListSessions),XResp::Sessions{records} if records[0].acked==1)
+    );
+    drop(rpc);
+    drop(events);
+    release(&daemon.paths.subscriber, "reliable-ack-reply");
+    let lease = controller(&mut recovered, &stream);
+    assert_eq!(
+        ack(&mut recovered, &stream, lease, 1),
+        XResp::Acked { through: 1 }
+    );
+    assert_eq!(
+        ack(&mut recovered, &stream, lease, 1),
+        XResp::Acked { through: 1 }
+    );
+    assert_eq!(
+        ack(&mut recovered, &stream, lease, u64::MAX),
+        XResp::Refused {
+            code: Refuse::FutureCursor
+        }
+    );
+}
+#[test]
+fn legacy_cannot_access_reliable_epoch() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "private-mode", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    assert!(rpc.list().is_empty());
+    assert!(rpc.claim("private-mode", stream.epoch.0).is_err());
+    assert!(rpc.kill("private-mode", stream.epoch.0, None).is_err());
+    assert!(
+        rpc.signal("private-mode", stream.epoch.0, lease, SignalKind::Terminate)
+            .is_err()
+    );
+    assert!(matches!(
+        rpc.send("private-mode", stream.epoch.0, lease, "BAD"),
+        SendOutcome::NotWritten { .. }
+    ));
+    assert!(
+        matches!(extended(&mut rpc,XReq::ListSessions),XResp::Sessions{records} if records.len()==1 && records[0].mode==Mode::ReliablePipe)
+    );
+}
+#[test]
+fn observer_cannot_advance_ack_ceiling() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "observer", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let t = match extended(
+        &mut rpc,
+        XReq::Observe {
+            stream: stream.clone(),
+            after_seq: Some(0),
+        },
+    ) {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("{other:?}"),
+    };
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    assert_eq!(
+        ack(&mut rpc, &stream, lease, 1),
+        XResp::Refused {
+            code: Refuse::FutureCursor
+        }
+    );
+}
+#[test]
+fn takeover_revokes_old_stream_ceiling() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut old = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut old, "takeover", &["echo"]);
+    let lease = controller(&mut old, &stream);
+    let t = ticket(&mut old, &stream, lease, 0);
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    let mut new = Rpc::connect(&daemon.paths.endpoint);
+    let fresh = controller(&mut new, &stream);
+    assert_ne!(fresh, lease);
+    assert_eq!(
+        ack(&mut old, &stream, lease, 1),
+        XResp::Refused {
+            code: Refuse::StaleLease
+        }
+    );
+    assert_eq!(
+        ack(&mut new, &stream, fresh, 1),
+        XResp::Refused {
+            code: Refuse::FutureCursor
+        }
+    );
+    let _ = settled_ticket(&mut new, &stream, fresh, 1);
+    assert_eq!(
+        ack(&mut new, &stream, fresh, 1),
+        XResp::Acked { through: 1 }
+    );
+}
+#[test]
+fn historical_epoch_ack_survives_writer_retirement() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let old = reliable_spawn(&mut rpc, "history", &["exit", "0"]);
+    let cleanup_lease = controller(&mut rpc, &old);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::KillSession {
+                stream: old.clone(),
+                lease: cleanup_lease
+            }
+        ),
+        XResp::Controlled
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let XResp::Sessions { records } = extended(&mut rpc, XReq::ListSessions) else {
+            panic!("list")
+        };
+        if records
+            .iter()
+            .any(|r| r.stream == old && matches!(r.state, ChildState::CleanupComplete(_)))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let new = reliable_spawn(&mut rpc, "history", &["echo"]);
+    assert_ne!(old.epoch, new.epoch);
+    let lease = controller(&mut rpc, &old);
+    let t = ticket(&mut rpc, &old, lease, 0);
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    assert_eq!(ack(&mut rpc, &old, lease, 1), XResp::Acked { through: 1 });
+    assert!(matches!(
+        extended(
+            &mut rpc,
+            XReq::SendLine {
+                stream: old,
+                lease,
+                line: "BAD".into()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::SessionFenced
+        }
+    ));
+}
+
+#[test]
+fn stale_claim_continuation_cannot_publish_owner() {
+    let daemon = Daemon::start(DaemonOpts { chunk: Some(1) });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let eof = daemon.paths.barrier.join("reliable-eof");
+    let stream = reliable_spawn(
+        &mut owner,
+        "stale-claim",
+        &[
+            "record-survive-eof",
+            daemon.paths.transcript.to_str().unwrap(),
+            eof.to_str().unwrap(),
+        ],
+    );
+    let original = controller(&mut owner, &stream);
+    arm(&daemon.paths.barrier, "after-chunk");
+    owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::SendLine {
+            stream: stream.clone(),
+            lease: original,
+            line: "ACTUAL_WRITE".into(),
+        },
+    });
+    wait_at(&daemon.paths.barrier, "after-chunk"); // first OS byte was written, completion is held.
+    let _ = wait_file(&daemon.paths.transcript, |b| b.starts_with(b"A"));
+    arm(&daemon.paths.barrier, "before-claim");
+    let mut claimant = Rpc::connect(&daemon.paths.endpoint);
+    claimant.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::ClaimController {
+            stream: stream.clone(),
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-claim");
+    drop(claimant);
+    let _ = wait_file(&daemon.paths.barrier.join("revoked"), |b| !b.is_empty());
+    release(&daemon.paths.barrier, "before-claim");
+    release(&daemon.paths.barrier, "after-chunk");
+    assert!(matches!(
+        owner.pull(),
+        HostResponse::Extended {
+            response: XResp::Input {
+                outcome: SendOutcome::Ambiguous { .. }
+            },
+            ..
+        }
+    ));
+    let lease = controller(&mut owner, &stream);
+    assert_eq!(
+        extended(
+            &mut owner,
+            XReq::SendLine {
+                stream,
+                lease,
+                line: "NO_REOPEN".into()
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::NotWritten {
+                reason: SendBlock::SessionFenced
+            }
+        }
+    );
+}
+#[test]
+fn partial_event_cannot_advance_emitted_ceiling() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "partial", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let t = ticket(&mut rpc, &stream, lease, 0);
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    assert_eq!(event_seq(&rt, &mut events, 1), 2);
+    arm(&daemon.paths.subscriber, "reliable-after-part");
+    let text = "x".repeat(60 * 1024);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SendLine {
+                stream: stream.clone(),
+                lease,
+                line: text
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written
+        }
+    );
+    let frame = rt.block_on(events.next_frame()).expect("first fragment");
+    assert!(matches!(
+        frame,
+        fl_host_proto::ExtensionFrame::ReliablePart {
+            seq: 3,
+            more: true,
+            ..
+        }
+    ));
+    wait_at(&daemon.paths.subscriber, "reliable-after-part");
+    assert_eq!(
+        ack(&mut rpc, &stream, lease, 3),
+        XResp::Refused {
+            code: Refuse::FutureCursor
+        }
+    );
+    drop(events);
+    release(&daemon.paths.subscriber, "reliable-after-part");
+}
+#[test]
+fn closed_stream_replacement_waits_for_authority_settlement() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "settlement", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let t = ticket(&mut rpc, &stream, lease, 0);
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    arm(&daemon.paths.subscriber, "reliable-settle");
+    drop(events);
+    wait_at(&daemon.paths.subscriber, "reliable-settle");
+    assert_eq!(
+        ack(&mut rpc, &stream, lease, 1),
+        XResp::Acked { through: 1 }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(1)
+            }
+        ),
+        XResp::Refused { code: Refuse::Busy }
+    );
+    release(&daemon.paths.subscriber, "reliable-settle");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(1),
+            },
+        ) {
+            XResp::Subscription { ticket, .. } => {
+                let (_rt, _events) = event_socket(&daemon.paths.endpoint, ticket);
+                break;
+            }
+            XResp::Refused { code: Refuse::Busy } => {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+#[test]
+fn cancelled_ticket_keeps_real_refs() {
+    // Pending tickets own their cursors/slots until actual revocation; 16 is shared with legacy.
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "capacity", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let pending = ticket(&mut rpc, &stream, lease, 0);
+    let mut observers = Vec::new();
+    for _ in 0..15 {
+        let mut observer = Rpc::connect(&daemon.paths.endpoint);
+        assert!(matches!(
+            extended(
+                &mut observer,
+                XReq::Observe {
+                    stream: stream.clone(),
+                    after_seq: Some(0)
+                }
+            ),
+            XResp::Subscription { .. }
+        ));
+        observers.push(observer);
+    }
+    let mut legacy = Rpc::connect(&daemon.paths.endpoint);
+    assert!(matches!(
+        legacy.call(|id| HostRequest::Events { id, session: None }),
+        Ok(HostResponse::Failed { .. })
+    ));
+    arm(&daemon.paths.subscriber, "reliable-before-part");
+    arm(&daemon.paths.subscriber, "reliable-settle");
+    let (_rt, events) = event_socket(&daemon.paths.endpoint, pending);
+    wait_at(&daemon.paths.subscriber, "reliable-before-part");
+    drop(events);
+    wait_at(&daemon.paths.subscriber, "reliable-settle");
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(0)
+            }
+        ),
+        XResp::Refused { code: Refuse::Busy }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::Observe {
+                stream: stream.clone(),
+                after_seq: Some(0)
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::ResourceLimit
+        }
+    );
+    release(&daemon.paths.subscriber, "reliable-before-part");
+    release(&daemon.paths.subscriber, "reliable-settle");
+    drop(observers);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match extended(
+            &mut legacy,
+            XReq::Observe {
+                stream: stream.clone(),
+                after_seq: Some(0),
+            },
+        ) {
+            XResp::Subscription { .. } => break,
+            XResp::Refused {
+                code: Refuse::ResourceLimit,
+            } => {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+#[test]
+fn reliable_client_yields_complete_events_without_automatic_ack() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "typed-client", &["echo"]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client=AsyncHostClient::connect(&daemon.paths.endpoint).await.unwrap();
+        let grant=client.claim_controller(stream.clone()).await.unwrap();
+        let mut events=client.subscribe_reliable(stream.clone(),grant.lease,Some(0)).await.unwrap();
+        let first=events.next_event().await.unwrap();assert_eq!(first.seq,1);
+        assert_eq!(events.cursor().seq,1);
+        assert!(matches!(client.extension_request(XReq::ListSessions).await.unwrap(),XResp::Sessions{records} if records[0].acked==0));
+        assert_eq!(client.ack(events.cursor(),grant.lease).await.unwrap(),1);
+    });
+}
+
+#[test]
+fn reliable_scope_recovery_and_expiry_refusals() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "scope", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    let mut other = Rpc::connect(&daemon.paths.endpoint);
+    assert_eq!(
+        ack(&mut other, &stream, lease, 0),
+        XResp::Refused {
+            code: Refuse::WrongConnection
+        }
+    );
+    assert_eq!(
+        ack(&mut rpc, &stream, ControllerLease(lease.0 + 1), 0),
+        XResp::Refused {
+            code: Refuse::StaleLease
+        }
+    );
+    let mut wrong = stream.clone();
+    wrong.host = fl_host_proto::HostInstance::new([0; 16]);
+    assert_eq!(
+        ack(&mut rpc, &wrong, lease, 0),
+        XResp::Refused {
+            code: Refuse::WrongInstance
+        }
+    );
+    wrong = stream.clone();
+    wrong.epoch.0 += 1;
+    assert_eq!(
+        ack(&mut rpc, &wrong, lease, 0),
+        XResp::Refused {
+            code: Refuse::StaleEpoch
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(u64::MAX)
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::FutureCursor
+        }
+    );
+    let expiring = ticket(&mut rpc, &stream, lease, 0);
+    thread::sleep(Duration::from_millis(5050));
+    assert_eq!(
+        extended(&mut other, XReq::OpenStream { ticket: expiring }),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+    // A validated durable cursor may exceed host Ack; no stream emission is required for that baseline.
+    let _pending = ticket(&mut rpc, &stream, lease, 1);
+    assert_eq!(
+        ack(&mut rpc, &stream, lease, 1),
+        XResp::Acked { through: 1 }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: None
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::CursorExpired
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::SubscribeReliable {
+                stream: stream.clone(),
+                lease,
+                after_seq: Some(0)
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::CursorExpired
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut other,
+            XReq::Observe {
+                stream,
+                after_seq: Some(0)
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::CursorExpired
+        }
+    );
+}
+
+#[test]
+fn reliable_minor_zero_has_no_extension_fallback() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let _stream = reliable_spawn(&mut rpc, "minor", &["echo"]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut old=AsyncHostClient::connect_with(&daemon.paths.endpoint,fl_host_proto::ConnectOptions{minor:0,..Default::default()}).await.unwrap();
+        assert_eq!(old.negotiated().1,0);
+        assert!(old.extension_request(XReq::Capabilities).await.is_err());
+        assert!(matches!(old.request(HostRequest::List{id:RequestId(1)}).await.unwrap(),HostResponse::Listed{children,..} if children.is_empty()));
+    });
+}
+
+#[test]
+fn reliable_raw_minor_zero_request_is_rejected_before_spawn() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let old = AsyncHostClient::connect_with(
+            &daemon.paths.endpoint,
+            fl_host_proto::ConnectOptions {
+                minor: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        let mut raw = old.into_stream();
+        #[cfg(windows)]
+        let mut raw = old.into_pipe();
+        let frame = fl_host_proto::encode_request_for_minor(
+            1,
+            &HostRequest::Extended {
+                id: RequestId(1),
+                request: XReq::SpawnSession {
+                    spec: spec("forged-minor", &["echo"]),
+                    mode: Mode::ReliablePipe,
+                    pty: None,
+                },
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        fl_host_proto::write_frame_async(&mut raw, &frame, deadline)
+            .await
+            .unwrap();
+        assert!(
+            fl_host_proto::read_frame_async(&mut raw, deadline, false)
+                .await
+                .is_err()
+        );
+    });
+    assert!(
+        matches!(extended(&mut rpc,XReq::ListSessions),XResp::Sessions{records} if records.is_empty())
+    );
+}
+
+#[test]
+fn reliable_observer_lag_is_explicit_after_controller_retirement() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut rpc, "lag", &["echo"]);
+    let lease = controller(&mut rpc, &stream);
+    arm(&daemon.paths.subscriber, "reliable-before-part");
+    let t = match extended(
+        &mut rpc,
+        XReq::Observe {
+            stream: stream.clone(),
+            after_seq: Some(0),
+        },
+    ) {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("{other:?}"),
+    };
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
+    wait_at(&daemon.paths.subscriber, "reliable-before-part");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let XResp::Sessions { records } = extended(&mut rpc, XReq::ListSessions) else {
+            panic!("list")
+        };
+        if records[0].latest >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _pending = ticket(&mut rpc, &stream, lease, 2);
+    assert_eq!(
+        ack(&mut rpc, &stream, lease, 2),
+        XResp::Acked { through: 2 }
+    );
+    release(&daemon.paths.subscriber, "reliable-before-part");
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    assert_eq!(
+        rt.block_on(events.next_frame()).unwrap(),
+        fl_host_proto::ExtensionFrame::Notice {
+            code: Refuse::CursorExpired
+        }
+    );
+}
+
+#[test]
+fn reliable_pending_operations_and_responses_have_finite_admission() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    arm(&daemon.paths.subscriber, "reliable-operation");
+    for _ in 0..64 {
+        rpc.push(|id| HostRequest::Extended {
+            id,
+            request: XReq::Capabilities,
+        });
+    }
+    wait_at(&daemon.paths.subscriber, "reliable-operation");
+    let marker = daemon.paths.barrier.join("must-not-spawn");
+    let extra = rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::SpawnSession {
+            spec: spec("over-cap", &["marker", marker.to_str().unwrap()]),
+            mode: Mode::ReliablePipe,
+            pty: None,
+        },
+    });
+    assert!(
+        matches!(rpc.pull(),HostResponse::Extended{id,response:XResp::Refused{code:Refuse::Busy}} if id==extra)
+    );
+    assert!(!marker.exists());
+    arm(&daemon.paths.subscriber, "reliable-response-write");
+    release(&daemon.paths.subscriber, "reliable-operation");
+    wait_at(&daemon.paths.subscriber, "reliable-response-write");
+    let count = wait_file(
+        &daemon.paths.subscriber.join("reliable-pending-count"),
+        |b| b == b"64",
+    );
+    assert_eq!(count, b"64"); // completed workers and queued/in-flight replies still own all permits.
+    release(&daemon.paths.subscriber, "reliable-response-write");
+    for _ in 0..64 {
+        assert!(matches!(
+            rpc.pull(),
+            HostResponse::Extended {
+                response: XResp::Capabilities { .. },
+                ..
+            }
+        ));
+    }
+    assert!(matches!(
+        extended(&mut rpc, XReq::Capabilities),
+        XResp::Capabilities { .. }
+    ));
+}
+
+#[test]
+fn rpc_stream_legacy_conversion_revokes_pending_reliable_ticket() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut owner, "legacy-conversion", &["echo"]);
+    let lease = controller(&mut owner, &stream);
+    let pending = ticket(&mut owner, &stream, lease, 0);
+    assert!(matches!(
+        owner
+            .call(|id| HostRequest::Events { id, session: None })
+            .unwrap(),
+        HostResponse::Subscribed { .. }
+    ));
+    let mut event = Rpc::connect(&daemon.paths.endpoint);
+    assert_eq!(
+        extended(&mut event, XReq::OpenStream { ticket: pending }),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+    let current = controller(&mut event, &stream);
+    assert_eq!(
+        extended(
+            &mut event,
+            XReq::SendLine {
+                stream,
+                lease: current,
+                line: "still-running".into()
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written
+        }
+    );
+}
+
+#[test]
+fn rpc_stream_extension_conversion_revokes_previous_rpc_ownership() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let first = reliable_spawn(&mut owner, "first-controller", &["echo"]);
+    let lease = controller(&mut owner, &first);
+    let first_ticket = ticket(&mut owner, &first, lease, 0);
+    let mut converting = Rpc::connect(&daemon.paths.endpoint);
+    let second = reliable_spawn(&mut converting, "second-controller", &["echo"]);
+    let second_lease = controller(&mut converting, &second);
+    let second_ticket = ticket(&mut converting, &second, second_lease, 0);
+    assert_eq!(
+        extended(
+            &mut converting,
+            XReq::OpenStream {
+                ticket: first_ticket
+            }
+        ),
+        XResp::Opened
+    );
+    let mut event = Rpc::connect(&daemon.paths.endpoint);
+    assert_eq!(
+        extended(
+            &mut event,
+            XReq::OpenStream {
+                ticket: second_ticket
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+    // Converting the event connection must not revoke the separate first RPC.
+    assert_eq!(
+        extended(
+            &mut owner,
+            XReq::SendLine {
+                stream: first,
+                lease,
+                line: "separate-owner".into()
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written
+        }
+    );
+}
+
+#[test]
+fn rpc_stream_own_ticket_requires_separate_live_rpc() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut owner, "own-ticket", &["echo"]);
+    let lease = controller(&mut owner, &stream);
+    let pending = ticket(&mut owner, &stream, lease, 0);
+    assert_eq!(
+        extended(
+            &mut owner,
+            XReq::OpenStream {
+                ticket: pending.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::TicketInvalid
+        }
+    );
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, pending);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+}
+
+#[test]
+fn rpc_stream_conversion_refuses_outstanding_claim_response() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut owner, "pending-conversion", &["echo"]);
+    let mut separate = Rpc::connect(&daemon.paths.endpoint);
+    let other = reliable_spawn(&mut separate, "pending-other", &["echo"]);
+    let other_lease = controller(&mut separate, &other);
+    let pending_ticket = ticket(&mut separate, &other, other_lease, 0);
+    arm(&daemon.paths.subscriber, "reliable-operation");
+    let claim = owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::ClaimController {
+            stream: stream.clone(),
+        },
+    });
+    wait_at(&daemon.paths.subscriber, "reliable-operation");
+    let events = owner.push(|id| HostRequest::Events { id, session: None });
+    assert!(
+        matches!(owner.pull(), HostResponse::Failed { id, reason } if id == events && reason == "busy")
+    );
+    let open = owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::OpenStream {
+            ticket: pending_ticket.clone(),
+        },
+    });
+    assert!(
+        matches!(owner.pull(), HostResponse::Extended { id, response: XResp::Refused { code: Refuse::Busy } } if id == open)
+    );
+    release(&daemon.paths.subscriber, "reliable-operation");
+    assert!(
+        matches!(owner.pull(), HostResponse::Extended { id, response: XResp::Controller { .. } } if id == claim)
+    );
+    assert!(matches!(
+        owner
+            .call(|id| HostRequest::Events { id, session: None })
+            .unwrap(),
+        HostResponse::Subscribed { .. }
+    ));
+    // Busy did not consume the separate owner's ticket.
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, pending_ticket);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+}
+
+#[test]
+fn pre_enqueue_stale_claim_cannot_change_current_writer() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut older = Rpc::connect(&daemon.paths.endpoint);
+    let eof = daemon.paths.barrier.join("record-eof");
+    let stream = reliable_spawn(
+        &mut older,
+        "claim-order",
+        &[
+            "record-survive-eof",
+            daemon.paths.transcript.to_str().unwrap(),
+            eof.to_str().unwrap(),
+        ],
+    );
+    arm(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    older.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::ClaimController {
+            stream: stream.clone(),
+        },
+    });
+    wait_at(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    let mut newer = Rpc::connect(&daemon.paths.endpoint);
+    let lease = controller(&mut newer, &stream);
+    assert_eq!(
+        extended(
+            &mut newer,
+            XReq::SendLine {
+                stream: stream.clone(),
+                lease,
+                line: "BEFORE".into()
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written
+        }
+    );
+    let _ = wait_file(&daemon.paths.transcript, |b| b == b"BEFORE\n");
+    release(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    assert!(matches!(
+        older.pull(),
+        HostResponse::Extended {
+            response: XResp::Refused {
+                code: Refuse::StaleLease
+            },
+            ..
+        }
+    ));
+    assert_eq!(
+        extended(
+            &mut newer,
+            XReq::SendLine {
+                stream: stream.clone(),
+                lease,
+                line: "AFTER".into()
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written
+        }
+    );
+    let _ = wait_file(&daemon.paths.transcript, |b| b == b"BEFORE\nAFTER\n");
+    assert!(matches!(
+        extended(
+            &mut older,
+            XReq::SendLine {
+                stream,
+                lease,
+                line: "STALE".into()
+            }
+        ),
+        XResp::Refused { .. }
+    ));
+}
+
+#[test]
+fn legacy_lookup_replacement_cannot_select_reliable_writer() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut legacy = Rpc::connect(&daemon.paths.endpoint);
+    let old = legacy.spawn("lookup-race", &["exit", "0"]);
+    let old_epoch = epoch_of(&old);
+    legacy
+        .kill("lookup-race", old_epoch, None)
+        .expect("old cleanup");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if matches!(
+            find(&legacy.list(), "lookup-race").state,
+            ChildState::CleanupComplete(_)
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    arm(&daemon.paths.subscriber, "legacy-writer-lookup");
+    let kill = legacy.push(|id| HostRequest::Kill {
+        id,
+        session: sid("lookup-race"),
+        expected_epoch: SessionEpoch(old_epoch + 1),
+        lease: None,
+    });
+    wait_at(&daemon.paths.subscriber, "legacy-writer-lookup");
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = reliable_spawn(&mut owner, "lookup-race", &["echo"]);
+    assert_eq!(stream.epoch.0, old_epoch + 1);
+    let lease = controller(&mut owner, &stream);
+    release(&daemon.paths.subscriber, "legacy-writer-lookup");
+    let reply = legacy.pull();
+    assert!(
+        matches!(reply, HostResponse::Failed { id, .. } if id == kill),
+        "legacy unleased Kill reached reliable successor: {reply:?}"
+    );
+    assert_eq!(
+        extended(
+            &mut owner,
+            XReq::SendLine {
+                stream: stream.clone(),
+                lease,
+                line: "SURVIVES".into()
+            }
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written
+        }
+    );
+    let XResp::Sessions { records } = extended(&mut owner, XReq::ListSessions) else {
+        panic!("list");
+    };
+    assert!(
+        records
+            .iter()
+            .any(|r| r.stream == stream && matches!(r.state, ChildState::Running(_)))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_reliable_session_supports_capture_output_and_write_raw() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut client = Rpc::connect(&daemon.paths.endpoint).inner;
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("FL_HOST_PTY".into(), "1".into());
+    let mut env_allow = std::collections::BTreeSet::new();
+    env_allow.insert("FL_HOST_PTY".into());
+    let spawn_spec = SpawnSpec {
+        session: sid("pty-prompt"),
+        kind: SpawnKind::Pipe,
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "test -t 0 && printf \"PROMPT>\" && read ans && echo \"GOT:$ans\"".into(),
+        ],
+        cwd: std::env::temp_dir(),
+        env,
+        env_allow,
+    };
+    let (stream, _state) = client
+        .spawn_reliable_session(spawn_spec)
+        .expect("spawn reliable pty");
+    let grant = client.claim_controller(stream.clone()).expect("claim");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let out = client
+            .capture_output(sid("pty-prompt"), 4096)
+            .expect("capture");
+        if out.contains("PROMPT>") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not observe PROMPT>: {out:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let outcome = client
+        .write_raw(stream, grant.lease, b"yes\n".to_vec())
+        .expect("write_raw");
+    assert_eq!(outcome, SendOutcome::Written);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let out = client
+            .capture_output(sid("pty-prompt"), 4096)
+            .expect("capture after write_raw");
+        if out.contains("GOT:yes") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not observe GOT:yes: {out:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }

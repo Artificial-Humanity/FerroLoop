@@ -5758,7 +5758,10 @@ mod tests {
             .iter()
             .map(|e| e["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(engines, ["ollama", "lemonade-8000", "lemonade-8097"]);
+        assert_eq!(
+            engines,
+            ["ollama", "lemonade-8000", "lemonade-8097", "lemonade-13305"]
+        );
 
         // Provision one secret; the matrix reports it and never the value.
         let set = http_call(

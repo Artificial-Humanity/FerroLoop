@@ -416,6 +416,8 @@ dependencies = [
  "fl-exec",
  "fl-gate",
  "fl-github",
+ "fl-host",
+ "fl-host-proto",
  "fl-hub",
  "fl-install",
  "fl-mcp",
@@ -527,6 +529,7 @@ dependencies = [
 name = "fl-host-proto"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "getrandom 0.2.17",
  "libc",
  "ring",
@@ -549,6 +552,7 @@ dependencies = [
  "fl-exec",
  "fl-gate",
  "fl-github",
+ "fl-host-proto",
  "fl-install",
  "fl-mcp",
  "fl-store",
@@ -640,6 +644,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "fl-core",
+ "fl-host-proto",
  "fl-store",
  "libc",
  "ring",
@@ -651,6 +656,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror",
+ "tokio",
  "webpki-roots",
 ]
 

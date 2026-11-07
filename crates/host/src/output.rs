@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,12 +66,20 @@ struct Logical {
     hub: std::sync::Weak<Hub>,
 }
 
+pub(crate) struct SubscriberSlot(Arc<AtomicUsize>);
+impl Drop for SubscriberSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct Hub {
     fanout: Mutex<Fanout>,
     sessions: Mutex<Vec<std::sync::Weak<OutputSession>>>,
     index: AtomicU64,
     status: Option<PathBuf>,
     status_lock: Mutex<()>,
+    slots: Arc<AtomicUsize>,
 }
 
 struct Fanout {
@@ -96,6 +104,7 @@ struct Sub {
 
 pub struct OutputSession {
     session: Arc<Session>,
+    reliable: Option<Arc<crate::reliable::ReliableJournal>>,
     hub: Arc<Hub>,
     inner: Mutex<OutInner>,
     cv: Condvar,
@@ -132,7 +141,18 @@ impl Hub {
             index: AtomicU64::new(1),
             status: std::env::var_os("FL_HOST_BACKLOG_STATUS").map(PathBuf::from),
             status_lock: Mutex::new(()),
+            slots: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn reserve_slot(&self) -> Result<SubscriberSlot, fl_host_proto::ExtensionRefusal> {
+        self.slots
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_add(1).filter(|n| *n <= MAX_SUBSCRIBERS)
+            })
+            .map_err(|_| fl_host_proto::ExtensionRefusal::ResourceLimit)?;
+        Ok(SubscriberSlot(Arc::clone(&self.slots)))
     }
 
     pub fn subscribe(
@@ -140,6 +160,10 @@ impl Hub {
         filter: Option<SessionId>,
         kill: Option<Arc<ShutdownSwitch>>,
     ) -> Result<Subscriber, (Option<Arc<ShutdownSwitch>>, &'static str)> {
+        let slot = match self.reserve_slot() {
+            Ok(slot) => slot,
+            Err(_) => return Err((kill, "subscriber limit")),
+        };
         let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
         fanout.subs.retain(|sub| !sub.dropped);
         let alive = fanout.subs.len();
@@ -166,7 +190,12 @@ impl Hub {
         });
         drop(fanout);
         self.pull_preexisting();
-        Ok(Subscriber { id, wake, lock })
+        Ok(Subscriber {
+            id,
+            wake,
+            lock,
+            _slot: slot,
+        })
     }
 
     fn pull_preexisting(&self) {
@@ -248,6 +277,7 @@ impl Hub {
 }
 
 pub struct Subscriber {
+    _slot: SubscriberSlot,
     id: u64,
     wake: Arc<Condvar>,
     lock: Arc<Mutex<()>>,
@@ -453,6 +483,7 @@ fn retire_unheld(event: &Logical, fanout: &Fanout) {
 impl OutputSession {
     pub fn open(session: Arc<Session>, hub: Arc<Hub>) -> Arc<Self> {
         let output = Arc::new(Self {
+            reliable: session.reliable().cloned(),
             session,
             hub: Arc::clone(&hub),
             inner: Mutex::new(OutInner {
@@ -469,11 +500,17 @@ impl OutputSession {
             stall_noted: AtomicBool::new(false),
             fence: Mutex::new(None),
         });
-        hub.sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .push(Arc::downgrade(&output));
+        if output.session.mode() == fl_host_proto::SessionMode::LegacyPipe {
+            hub.sessions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(Arc::downgrade(&output));
+        }
         output
+    }
+
+    pub(crate) fn session(&self) -> &Arc<Session> {
+        &self.session
     }
 
     pub fn set_fence(&self, fence: Arc<dyn Fn() + Send + Sync>) {
@@ -481,6 +518,16 @@ impl OutputSession {
     }
 
     pub fn emit_spawned(&self, child: HostedChild) {
+        if let Some(journal) = &self.reliable {
+            let result = journal.lifecycle(ControlEvent::Spawned {
+                session: self.session.session.clone(),
+                session_epoch: SessionEpoch(self.session.epoch),
+                seq: 0,
+                child,
+            });
+            debug_assert!(result.is_ok(), "pre-reserved finite lifecycle");
+            return;
+        }
         let session = self.session.session.clone();
         let epoch = self.session.epoch;
         self.publish_with(0, false, move |seq| {
@@ -588,6 +635,11 @@ impl OutputSession {
     }
 
     pub(crate) fn can_retire(&self) -> bool {
+        if let Some(journal) = &self.reliable {
+            return journal.is_eof()
+                && journal.can_retire()
+                && self.session.cleanup_report().is_some_and(|r| r.complete);
+        }
         let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         inner.eof
             && inner.events.is_empty()
@@ -714,7 +766,13 @@ enum Parsed {
 }
 
 impl StdoutSink for OutputSession {
+    fn reliable(&self) -> Option<&Arc<crate::reliable::ReliableJournal>> {
+        self.reliable.as_ref()
+    }
     fn room(&self) -> usize {
+        if self.reliable.is_some() {
+            return 0;
+        }
         if self.flush_out() {
             self.fail_overflow();
             return 0;
@@ -723,6 +781,9 @@ impl StdoutSink for OutputSession {
     }
 
     fn push(&self, bytes: &[u8]) -> bool {
+        if self.reliable.is_some() {
+            return false;
+        }
         {
             let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
             if inner.failed {
@@ -747,6 +808,28 @@ impl StdoutSink for OutputSession {
     }
 
     fn eof(&self) {
+        if let Some(journal) = &self.reliable {
+            journal.eof();
+            if journal.failed() {
+                let _ = journal.lifecycle(ControlEvent::ProtocolFailure {
+                    session: self.session.session.clone(),
+                    session_epoch: SessionEpoch(self.session.epoch),
+                    seq: 0,
+                    reason: "stdout line exceeds 1 MiB".into(),
+                });
+                if let Some(fence) = self
+                    .fence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
+                    fence();
+                }
+                let _ = self.session.request_cleanup();
+            }
+            self.cv.notify_all();
+            return;
+        }
         if self.flush_out() {
             self.fail_overflow();
         }
@@ -790,6 +873,17 @@ impl StdoutSink for OutputSession {
     }
 
     fn on_leader(&self, exit: ChildExit) {
+        if let Some(journal) = &self.reliable {
+            let result = journal.lifecycle(ControlEvent::Exited {
+                session: self.session.session.clone(),
+                session_epoch: SessionEpoch(self.session.epoch),
+                seq: 0,
+                exit,
+            });
+            debug_assert!(result.is_ok(), "pre-reserved finite lifecycle");
+            self.cv.notify_all();
+            return;
+        }
         let session = self.session.session.clone();
         let epoch = self.session.epoch;
         self.publish_with(0, true, move |seq| {
@@ -805,6 +899,17 @@ impl StdoutSink for OutputSession {
     }
 
     fn on_cleanup(&self, complete: bool) {
+        if complete && let Some(journal) = &self.reliable {
+            let result = journal.lifecycle(ControlEvent::CleanupComplete {
+                session: self.session.session.clone(),
+                session_epoch: SessionEpoch(self.session.epoch),
+                seq: 0,
+            });
+            debug_assert!(result.is_ok(), "pre-reserved finite lifecycle");
+            self.fence.lock().unwrap_or_else(|e| e.into_inner()).take();
+            self.cv.notify_all();
+            return;
+        }
         if !complete {
             return;
         }

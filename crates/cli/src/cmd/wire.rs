@@ -534,6 +534,11 @@ fn route_vendor_name(route: &VendorRoute) -> &'static str {
         VendorRoute::Codex { .. } => "Codex",
         VendorRoute::Muse { .. } => "Muse",
         VendorRoute::Grok { .. } => "Grok",
+        VendorRoute::HostCli { vendor, .. } => match vendor.as_str() {
+            "lemonade" => "Lemonade",
+            "ollama" => "Ollama",
+            _ => "HostCli",
+        },
         VendorRoute::Webhook { .. } => "Webhook",
     }
 }

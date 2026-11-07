@@ -6,6 +6,7 @@
 //! subreaper and no cgroup. A `setsid` descendant reparented to launchd stays a residual.
 //! This crate does not claim macOS adoption. The daemon reaps only the supervisor.
 
+mod authority;
 mod child;
 mod daemon;
 mod env;
@@ -16,7 +17,9 @@ mod output;
 #[cfg(unix)]
 mod protocol;
 mod refusal;
+mod reliable;
 mod session;
+mod slice_budget;
 #[cfg(unix)]
 mod supervisor;
 mod survivor_registry;
@@ -100,6 +103,8 @@ pub(crate) struct HostInner {
     pub(crate) stop: AtomicBool,
     pub(crate) wake: tokio::sync::Notify,
     pub(crate) hub: Arc<output::Hub>,
+    reliable_budget: Arc<slice_budget::SliceBudget>,
+    pub(crate) authority: Arc<authority::AuthorityRegistry>,
     pub(crate) writers: Mutex<HashMap<String, Arc<input::WriterHandle>>>,
     pub(crate) outputs: Mutex<HashMap<(String, u64), Arc<output::OutputSession>>>,
     pub(crate) next_conn: AtomicU64,
@@ -318,9 +323,16 @@ impl Host {
             return Err(err);
         }
         let handle = runtime.handle().clone();
-        Ok(Self {
+        let reliable_budget = slice_budget::SliceBudget::new();
+        let hub = Arc::new(output::Hub::new());
+        let authority =
+            authority::AuthorityRegistry::new(Arc::clone(&reliable_budget), Arc::clone(&hub))
+                .map_err(|_| HostError::Protocol("authority admission".into()))?;
+        let host = Self {
             runtime: Some(runtime),
             inner: Arc::new(HostInner {
+                reliable_budget,
+                authority,
                 endpoint,
                 path,
                 registry: Mutex::new(registry),
@@ -331,7 +343,7 @@ impl Host {
                 handle,
                 stop: AtomicBool::new(false),
                 wake: tokio::sync::Notify::new(),
-                hub: Arc::new(output::Hub::new()),
+                hub,
                 writers: Mutex::new(HashMap::new()),
                 outputs: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
@@ -342,7 +354,9 @@ impl Host {
                 fail_handshake_after_publish: opts.fail_handshake_after_publish,
                 crash: Mutex::new(opts.crash_at),
             }),
-        })
+        };
+        host.inner.authority.bind(&host.inner);
+        Ok(host)
     }
 
     pub fn endpoint(&self) -> &HostEndpoint {
@@ -421,6 +435,7 @@ impl Host {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         self.inner.stop.store(true, Ordering::SeqCst);
+        self.inner.authority.stop();
         drop(gate);
         self.inner.wake.notify_one();
         self.inner.hub.shutdown();
@@ -497,7 +512,15 @@ impl Host {
         this: &Arc<HostInner>,
         spec: &SpawnSpec,
     ) -> Result<SessionHandle, HostError> {
-        Self::admit_spawn(this, || Self::spawn_admitted(this, spec))
+        Self::spawn_mode(this, spec, false)
+    }
+
+    pub(crate) fn spawn_mode(
+        this: &Arc<HostInner>,
+        spec: &SpawnSpec,
+        reliable: bool,
+    ) -> Result<SessionHandle, HostError> {
+        Self::admit_spawn(this, || Self::spawn_admitted(this, spec, reliable))
     }
 
     fn admit_spawn<T>(
@@ -514,7 +537,11 @@ impl Host {
         spawn()
     }
 
-    fn spawn_admitted(this: &Arc<HostInner>, spec: &SpawnSpec) -> Result<SessionHandle, HostError> {
+    fn spawn_admitted(
+        this: &Arc<HostInner>,
+        spec: &SpawnSpec,
+        reliable: bool,
+    ) -> Result<SessionHandle, HostError> {
         spec.validate()?;
         if spec.kind == fl_host_proto::SpawnKind::Pty {
             return Err(HostError::Unsupported { subject: "pty" });
@@ -584,13 +611,30 @@ impl Host {
             }
             registry.alloc_epoch()?
         };
+        let admission = if reliable {
+            let stream = fl_host_proto::StreamId {
+                host: this.authority.instance().clone(),
+                session: spec.session.clone(),
+                epoch: fl_host_proto::SessionEpoch(epoch),
+            };
+            let journal = this
+                .reserve_reliable_journal(stream)
+                .map_err(|_| HostError::Protocol("reliable capacity".into()))?;
+            Some(
+                this.authority
+                    .prepare_epoch(journal)
+                    .map_err(|_| HostError::Protocol("authority capacity".into()))?,
+            )
+        } else {
+            None
+        };
         #[cfg(unix)]
         {
-            Self::spawn_unix(this, spec, env, epoch)
+            Self::spawn_unix(this, spec, env, epoch, admission)
         }
         #[cfg(windows)]
         {
-            Self::spawn_windows(this, spec, env, epoch)
+            Self::spawn_windows(this, spec, env, epoch, admission)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -605,6 +649,7 @@ impl Host {
         spec: &SpawnSpec,
         env: Vec<(String, String)>,
         epoch: u64,
+        admission: Option<authority::PreparedEpoch>,
     ) -> Result<SessionHandle, HostError> {
         let host = Arc::clone(this);
         let crash = host
@@ -654,7 +699,7 @@ impl Host {
                 return Err(err);
             }
         };
-        let session = Arc::new(Session::new(SessionParts {
+        let parts = SessionParts {
             session: spec.session.clone(),
             epoch,
             vendor_pid: supervised.vendor_pid,
@@ -665,13 +710,17 @@ impl Host {
             control_inode: supervised.control_inode,
             control: Some(supervised.control),
             stdin: Some(supervised.stdin),
-        }));
+        };
+        let session = Arc::new(match admission.as_ref() {
+            Some(admission) => Session::with_reliable(parts, Some(Arc::clone(&admission.journal))),
+            None => Session::new(parts),
+        });
         session.set_supervisor(supervised.child);
         this.sessions
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .insert(spec.session.as_str().to_owned(), Arc::clone(&session));
-        daemon::attach(this, &session);
+        daemon::attach(this, &session, admission);
         Self::arm_unix(
             this,
             Arc::clone(&session),
@@ -712,6 +761,7 @@ impl Host {
         spec: &SpawnSpec,
         env: Vec<(String, String)>,
         epoch: u64,
+        admission: Option<authority::PreparedEpoch>,
     ) -> Result<SessionHandle, HostError> {
         let host = Arc::clone(this);
         let crash = host
@@ -754,7 +804,7 @@ impl Host {
                 return Err(err);
             }
         };
-        let session = Arc::new(Session::new(SessionParts {
+        let parts = SessionParts {
             session: spec.session.clone(),
             epoch,
             vendor_pid: spawned.vendor_pid,
@@ -765,7 +815,11 @@ impl Host {
             control_inode: 0,
             control: None,
             stdin: Some(spawned.stdin),
-        }));
+        };
+        let session = Arc::new(match admission.as_ref() {
+            Some(admission) => Session::with_reliable(parts, Some(Arc::clone(&admission.journal))),
+            None => Session::new(parts),
+        });
         *session.job.lock().unwrap_or_else(|err| err.into_inner()) = Some(spawned.job);
         *session
             .process
@@ -775,7 +829,7 @@ impl Host {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .insert(spec.session.as_str().to_owned(), Arc::clone(&session));
-        daemon::attach(this, &session);
+        daemon::attach(this, &session, admission);
         Self::arm_windows(this, Arc::clone(&session), spawned.stdout, spawned.stderr);
         Ok(SessionHandle { inner: session })
     }
@@ -813,6 +867,13 @@ impl Host {
 }
 
 impl HostInner {
+    fn reserve_reliable_journal(
+        &self,
+        stream: fl_host_proto::StreamId,
+    ) -> Result<Arc<reliable::ReliableJournal>, fl_host_proto::ExtensionRefusal> {
+        reliable::ReliableJournal::new(Arc::clone(&self.reliable_budget), stream)
+    }
+
     fn reap_threads(&self) {
         let mut joins = self.joins.lock().unwrap_or_else(|err| err.into_inner());
         let mut running = Vec::new();
@@ -852,6 +913,11 @@ impl HostInner {
     // Called under spawn_gate. Output is reclaimable only after EOF, successful
     // cleanup, all pending/assigned output and all epoch threads have retired.
     fn reclaim_completed(&self) {
+        self.reclaim_completed_selected(|| {});
+    }
+
+    // Private fixture boundary after candidate selection, before registry retirement.
+    fn reclaim_completed_selected(&self, selected: impl FnOnce()) {
         self.reap_threads();
         let joins = self.joins.lock().unwrap_or_else(|err| err.into_inner());
         let mut outputs = self.outputs.lock().unwrap_or_else(|err| err.into_inner());
@@ -859,13 +925,21 @@ impl HostInner {
             .iter()
             .filter(|(key, output)| {
                 output.can_retire()
+                    && self.authority.can_retire(key)
                     && !joins
                         .iter()
                         .any(|(running, _)| running.as_ref() == Some(*key))
             })
             .map(|(key, _)| key.clone())
             .collect();
+        selected();
         for key in retired {
+            if !self
+                .authority
+                .try_retire(&key, || outputs[&key].can_retire())
+            {
+                continue;
+            }
             outputs.remove(&key);
             let mut sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
             if sessions
@@ -1174,6 +1248,20 @@ mod deadline_tests {
         SurvivorRecord, WatchTick, cleanup_deadline_expired, load_registry, windows_watch_until,
     };
     use fl_host_proto::{HostConfig, HostEndpoint, SessionId};
+
+    #[test]
+    fn reliable_reservation_uses_host_shared_budget() {
+        let (_dir, host, _session, _events) = watch_fixture();
+        let stream = fl_host_proto::StreamId {
+            host: fl_host_proto::HostInstance::new([1; 16]),
+            session: SessionId::new("a").unwrap(),
+            epoch: fl_host_proto::SessionEpoch(1),
+        };
+        let journal = host.inner.reserve_reliable_journal(stream.clone()).unwrap();
+        assert_eq!(journal.stream(), &stream);
+        assert!(journal.can_retire());
+        host.shutdown().unwrap();
+    }
 
     #[derive(Default)]
     struct WatchEvents(std::sync::Mutex<Vec<String>>);
@@ -1550,10 +1638,10 @@ mod deadline_tests {
             }))
         };
         let old = make(1);
-        super::daemon::attach(&host.inner, &old);
+        super::daemon::attach(&host.inner, &old, None);
         let weak = Arc::downgrade(host.inner.writers.lock().unwrap().get("same").unwrap());
         drop(old);
-        super::daemon::attach(&host.inner, &make(2));
+        super::daemon::attach(&host.inner, &make(2), None);
         let deadline = Instant::now() + Duration::from_secs(2);
         while weak.upgrade().is_some() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1562,6 +1650,235 @@ mod deadline_tests {
             weak.upgrade().is_none(),
             "old writer remains alive after replacement"
         );
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retirement_rechecks_historical_claim_after_candidate_selection() {
+        retirement_admission_race(false);
+    }
+
+    #[test]
+    fn retirement_rechecks_observer_after_candidate_selection() {
+        retirement_admission_race(true);
+    }
+
+    #[test]
+    fn retirement_waits_for_unresolved_claim_and_releases_cancelled_admission() {
+        use fl_host_proto::{ConnId, SessionEpoch, StreamId};
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let stream = StreamId {
+            host: host.inner.authority.instance().clone(),
+            session: SessionId::new("claim-fence").unwrap(),
+            epoch: SessionEpoch(1),
+        };
+        let journal = host.inner.reserve_reliable_journal(stream.clone()).unwrap();
+        let session = Arc::new(Session::with_reliable(
+            SessionParts {
+                session: stream.session.clone(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            },
+            Some(Arc::clone(&journal)),
+        ));
+        let writer = super::input::WriterHandle::start(Arc::clone(&session), None);
+        let reg = &host.inner.authority;
+        reg.register(
+            reg.prepare_epoch(Arc::clone(&journal)).unwrap(),
+            &session,
+            &writer,
+        );
+        let key = (stream.session.as_str().to_owned(), 1);
+        host.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(key.0.clone(), Arc::clone(&session));
+        host.inner.outputs.lock().unwrap().insert(
+            key.clone(),
+            super::output::OutputSession::open(Arc::clone(&session), Arc::clone(&host.inner.hub)),
+        );
+        reg.connect(ConnId(81)).unwrap();
+        let mut claim = Box::pin(super::authority::claim(reg, ConnId(81), &stream));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(claim.as_mut().poll(&mut cx), Poll::Pending));
+        // Claim generation is assigned, owner is None, writer fence is unresolved.
+        journal.eof();
+        session.note_cleanup(CleanupReport { complete: true });
+        host.inner.reclaim_completed();
+        assert!(host.inner.outputs.lock().unwrap().contains_key(&key));
+        drop(claim);
+        host.inner.reclaim_completed();
+        assert!(!host.inner.outputs.lock().unwrap().contains_key(&key));
+        writer.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    fn retirement_admission_race(observer: bool) {
+        use fl_host_proto::{ConnId, Cursor, SessionEpoch, StreamId};
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let stream = StreamId {
+            host: host.inner.authority.instance().clone(),
+            session: SessionId::new("retirement-race").unwrap(),
+            epoch: SessionEpoch(1),
+        };
+        let journal = host.inner.reserve_reliable_journal(stream.clone()).unwrap();
+        let session = Arc::new(Session::with_reliable(
+            SessionParts {
+                session: stream.session.clone(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            },
+            Some(Arc::clone(&journal)),
+        ));
+        let writer = super::input::WriterHandle::start(Arc::clone(&session), None);
+        let prepared = host
+            .inner
+            .authority
+            .prepare_epoch(Arc::clone(&journal))
+            .unwrap();
+        host.inner.authority.register(prepared, &session, &writer);
+        let output =
+            super::output::OutputSession::open(Arc::clone(&session), Arc::clone(&host.inner.hub));
+        journal.eof();
+        session.note_cleanup(CleanupReport { complete: true });
+        let key = (stream.session.as_str().to_owned(), 1);
+        host.inner
+            .outputs
+            .lock()
+            .unwrap()
+            .insert(key.clone(), output);
+        let reg = &host.inner.authority;
+        reg.connect(ConnId(71)).unwrap();
+        reg.connect(ConnId(72)).unwrap();
+        let cursor = Cursor {
+            stream: stream.clone(),
+            seq: 0,
+        };
+        // Fill the remaining retained capacity with incomplete legacy epochs.
+        // Reclamation cannot turn this into an available admission slot.
+        for n in 1..64 {
+            let filler = Arc::new(Session::new(SessionParts {
+                session: SessionId::new(&format!("filler-{n}")).unwrap(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            }));
+            let output = super::output::OutputSession::open(
+                Arc::clone(&filler),
+                Arc::clone(&host.inner.hub),
+            );
+            host.inner
+                .outputs
+                .lock()
+                .unwrap()
+                .insert((filler.session.as_str().to_owned(), 1), output);
+        }
+        let mut ticket = None;
+        let mut lease = None;
+        // The callback is the deterministic scheduling barrier: admission completes
+        // after the old eligibility checks and before either removal.
+        host.inner.reclaim_completed_selected(|| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        if observer {
+                            ticket = Some(
+                                super::authority::issue_ticket(
+                                    reg,
+                                    ConnId(71),
+                                    cursor.clone(),
+                                    None,
+                                    true,
+                                    Instant::now(),
+                                )
+                                .unwrap()
+                                .ticket,
+                            );
+                        } else {
+                            lease = Some(
+                                host.inner
+                                    .handle
+                                    .block_on(super::authority::claim(reg, ConnId(71), &stream))
+                                    .unwrap()
+                                    .lease,
+                            );
+                        }
+                    })
+                    .join()
+                    .unwrap()
+            });
+        });
+        assert!(
+            host.inner.outputs.lock().unwrap().contains_key(&key),
+            "accepted authority must retain its counted epoch"
+        );
+        assert_eq!(host.inner.outputs.lock().unwrap().len(), 64);
+        let rows = host
+            .inner
+            .handle
+            .block_on(super::daemon::extended(
+                &host.inner,
+                ConnId(71),
+                fl_host_proto::ExtensionRequest::ListSessions,
+            ))
+            .unwrap();
+        let fl_host_proto::ExtensionResponse::Sessions { records } = rows else {
+            panic!("missing listing")
+        };
+        assert_eq!(records.len(), 64);
+        assert!(records.iter().any(|record| record.stream == stream));
+        if let Some(lease) = lease {
+            host.inner
+                .handle
+                .block_on(reg.acknowledge(ConnId(71), cursor, lease))
+                .unwrap();
+        }
+        let replay = ticket.map(|ticket| {
+            super::authority::consume_ticket(reg, ConnId(72), ticket, Instant::now()).unwrap()
+        });
+        super::authority::revoke_connection(reg, ConnId(71));
+        host.inner.reclaim_completed();
+        assert_eq!(
+            host.inner.outputs.lock().unwrap().contains_key(&key),
+            replay.is_some(),
+            "active observer cursor must remain counted"
+        );
+        drop(replay);
+        host.inner.reclaim_completed();
+        assert!(!host.inner.outputs.lock().unwrap().contains_key(&key));
         host.shutdown().unwrap();
     }
 

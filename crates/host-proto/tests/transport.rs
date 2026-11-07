@@ -956,3 +956,280 @@ mod unix_transport {
         let _ = decode_challenge;
     }
 }
+
+#[cfg(any(unix, windows))]
+mod extension_transport {
+    use fl_host_proto::*;
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+
+    struct Fixture {
+        listener: HostListener,
+        _dir: tempfile::TempDir,
+    }
+    impl Fixture {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            let endpoint = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                HostEndpoint::unix(dir.path().join("h.sock")).unwrap()
+            };
+            #[cfg(windows)]
+            let endpoint = {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                HostEndpoint::windows(
+                    &format!(
+                        "ext-{}-{}",
+                        std::process::id(),
+                        N.fetch_add(1, Ordering::Relaxed)
+                    ),
+                    "test-user",
+                )
+                .unwrap()
+            };
+            let mut config = HostConfig::new(endpoint);
+            config.minor = 1;
+            config.write_timeout = Duration::from_secs(2);
+            Self {
+                listener: HostListener::bind(config).await.unwrap(),
+                _dir: dir,
+            }
+        }
+        async fn connect(&mut self, minor: u16) -> (AsyncHostClient, HostConn) {
+            let endpoint = self.listener.endpoint().clone();
+            let connect = AsyncHostClient::connect_with(
+                &endpoint,
+                ConnectOptions {
+                    minor,
+                    ..ConnectOptions::default()
+                },
+            );
+            let (client, conn) = tokio::join!(connect, self.listener.accept());
+            (client.unwrap(), conn.unwrap())
+        }
+    }
+    fn cap(id: u64) -> HostRequest {
+        HostRequest::Extended {
+            id: RequestId(id),
+            request: ExtensionRequest::Capabilities,
+        }
+    }
+    fn notice() -> Frame {
+        encode_extension_frame(
+            1,
+            &ExtensionFrame::Notice {
+                code: ExtensionRefusal::Busy,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_minor_zero_rpc_rejects_raw_extension() {
+        let mut f = Fixture::new().await;
+        let (client, mut conn) = f.connect(0).await;
+        assert_eq!(conn.negotiated_minor(), 0);
+        #[cfg(unix)]
+        let mut raw = client.into_stream();
+        #[cfg(windows)]
+        let mut raw = client.into_pipe();
+        let payload = br#"{"op":"extended","id":1,"minor":1,"request":{"op":"capabilities"}}"#;
+        write_frame_async(
+            &mut raw,
+            &Frame {
+                kind: FrameKind::Request,
+                payload: payload.to_vec(),
+            },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            conn.recv().await.is_err(),
+            "authenticated minor0 must reject raw Extended before dispatch"
+        );
+        assert!(
+            conn.respond(&HostResponse::Extended {
+                id: RequestId(1),
+                response: ExtensionResponse::Opened
+            })
+            .await
+            .is_err()
+        );
+        drop(raw);
+        drop(conn);
+        f.listener.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_minor_zero_event_socket_rejects_frame9() {
+        let mut f = Fixture::new().await;
+        let (mut rpc, mut rpc_conn) = f.connect(1).await;
+        let (event, mut event_conn) = f.connect(0).await;
+        assert_eq!(rpc.negotiated(), (1, 1));
+        assert_eq!(event.negotiated(), (1, 0));
+        rpc.write_request(&cap(1)).await.unwrap();
+        assert!(matches!(
+            rpc_conn.recv().await.unwrap(),
+            HostRequest::Extended { .. }
+        ));
+        #[cfg(unix)]
+        let mut raw = event.into_stream();
+        #[cfg(windows)]
+        let mut raw = event.into_pipe();
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &notice()).unwrap();
+        raw.write_all(&bytes).await.unwrap();
+        assert!(event_conn.recv().await.is_err());
+        event_conn.enter_stream();
+        assert!(
+            event_conn.write_frame(&notice()).await.is_err(),
+            "minor0 cannot inherit RPC minor1 permission"
+        );
+        drop(raw);
+        drop(event_conn);
+        drop(rpc);
+        drop(rpc_conn);
+        f.listener.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_minor_one_rpc_and_event_stream_work() {
+        let mut f = Fixture::new().await;
+        let (mut rpc, mut rpc_conn) = f.connect(1).await;
+        assert_eq!(rpc_conn.negotiated_minor(), 1);
+        rpc.write_request(&HostRequest::List { id: RequestId(1) })
+            .await
+            .unwrap();
+        assert_eq!(
+            rpc_conn.recv().await.unwrap(),
+            HostRequest::List { id: RequestId(1) }
+        );
+        rpc_conn
+            .respond(&HostResponse::Listed {
+                id: RequestId(1),
+                children: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rpc.read_response().await.unwrap(),
+            HostResponse::Listed { .. }
+        ));
+        rpc.write_request(&cap(2)).await.unwrap();
+        assert_eq!(rpc_conn.recv().await.unwrap(), cap(2));
+        rpc_conn
+            .respond(&HostResponse::Extended {
+                id: RequestId(2),
+                response: ExtensionResponse::Refused {
+                    code: ExtensionRefusal::Unsupported,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rpc.read_response().await.unwrap(),
+            HostResponse::Extended { .. }
+        ));
+        let (event, mut event_conn) = f.connect(1).await;
+        assert!(
+            event_conn.write_frame(&notice()).await.is_err(),
+            "must open explicitly first"
+        );
+        let server = async {
+            let request = event_conn.recv().await.unwrap();
+            assert!(matches!(
+                request,
+                HostRequest::Extended {
+                    request: ExtensionRequest::OpenStream { .. },
+                    ..
+                }
+            ));
+            event_conn
+                .respond(&HostResponse::Extended {
+                    id: request.request_id(),
+                    response: ExtensionResponse::Opened,
+                })
+                .await
+                .unwrap();
+            event_conn.enter_extension_stream().unwrap();
+            event_conn.write_frame(&notice()).await.unwrap();
+        };
+        let client = async {
+            let mut stream = event
+                .open_extension_stream(Ticket::new([7; 32]))
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next_frame().await.unwrap(),
+                ExtensionFrame::Notice {
+                    code: ExtensionRefusal::Busy
+                }
+            );
+        };
+        tokio::join!(server, client);
+        drop(event_conn);
+        drop(rpc);
+        drop(rpc_conn);
+        f.listener.shutdown().await.unwrap();
+    }
+    // Catches renewing a supplied deadline or bypassing negotiated frame checks.
+    #[tokio::test]
+    async fn shared_frame_deadline_expires_without_reset_or_validation_bypass() {
+        let mut f = Fixture::new().await;
+        let (mut client, mut conn) = f.connect(1).await;
+        client
+            .write_request(&HostRequest::List { id: RequestId(1) })
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.recv().await.unwrap(),
+            HostRequest::List { id: RequestId(1) }
+        );
+        let frame = fl_host_proto::encode_response_for_minor(
+            1,
+            &HostResponse::Listed {
+                id: RequestId(1),
+                children: vec![],
+            },
+        )
+        .unwrap();
+        let before = Instant::now();
+        let pinned = conn.frame_write_deadline(&frame).unwrap();
+        let after = Instant::now();
+        assert!(pinned >= before + Duration::from_secs(2));
+        assert!(pinned <= after + Duration::from_secs(2));
+        let expired = before - Duration::from_secs(1);
+        assert!(matches!(
+            conn.write_frame_until(&frame, expired).await,
+            Err(HostError::FrameTimeout)
+        ));
+        // An expired call writes no prefix; a normal call still yields one exact frame.
+        conn.write_frame(&frame).await.unwrap();
+        assert_eq!(
+            client.read_response().await.unwrap(),
+            HostResponse::Listed {
+                id: RequestId(1),
+                children: vec![]
+            }
+        );
+        assert!(conn.frame_write_deadline(&notice()).is_err());
+        assert!(conn.write_frame_until(&notice(), pinned).await.is_err());
+        drop(conn);
+        drop(client);
+        let (client, mut conn) = f.connect(0).await;
+        assert!(conn.frame_write_deadline(&notice()).is_err());
+        assert!(
+            conn.write_frame_until(&notice(), Instant::now() + Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        drop(conn);
+        drop(client);
+        f.listener.shutdown().await.unwrap();
+    }
+}

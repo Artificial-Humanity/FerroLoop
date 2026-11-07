@@ -82,8 +82,22 @@ struct DataJob {
     conn: u64,
     epoch: u64,
     lease: u64,
-    bytes: Vec<u8>,
+    bytes: InputBytes,
     reply: oneshot::Sender<SendOutcome>,
+}
+
+enum InputBytes {
+    Legacy(Vec<u8>),
+    Reliable(crate::reliable::ChargedBytes),
+}
+impl std::ops::Deref for InputBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Legacy(bytes) => bytes,
+            Self::Reliable(bytes) => bytes.as_slice(),
+        }
+    }
 }
 
 enum CtrlKind {
@@ -112,6 +126,7 @@ struct State {
     revoked: HashSet<u64>,
     queued_bytes: usize,
     active: bool,
+    inflight: Option<u64>,
     active_bytes: usize,
     stop: bool,
     /// Set when the active write's completion could not be proven.
@@ -127,6 +142,10 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
+    pub(crate) fn mode(&self) -> fl_host_proto::SessionMode {
+        self.session.mode()
+    }
+
     pub fn start(session: Arc<Session>, stdin: Option<File>) -> Arc<Self> {
         #[cfg(unix)]
         if let Some(file) = stdin.as_ref() {
@@ -150,6 +169,7 @@ impl WriterHandle {
                 revoked: HashSet::new(),
                 queued_bytes: 0,
                 active: false,
+                inflight: None,
                 active_bytes: 0,
                 stop: false,
                 uncertain: false,
@@ -198,6 +218,68 @@ impl WriterHandle {
         }
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
+        self.enqueue_data(conn, epoch, lease, InputBytes::Legacy(bytes))
+    }
+
+    pub(crate) fn send_reliable(
+        &self,
+        conn: u64,
+        epoch: u64,
+        lease: ControllerLease,
+        line: String,
+        budget: &Arc<crate::slice_budget::SliceBudget>,
+    ) -> Result<Result<oneshot::Receiver<SendOutcome>, SendOutcome>, fl_host_proto::ExtensionRefusal>
+    {
+        if line.as_bytes().contains(&b'\n') {
+            return Ok(Err(SendOutcome::NotWritten {
+                reason: SendBlock::Io,
+            }));
+        }
+        let len = line
+            .len()
+            .checked_add(1)
+            .ok_or(fl_host_proto::ExtensionRefusal::ResourceLimit)?;
+        // The continuation already covers the original String. Admit the entire
+        // concurrent copy before allocating, then carry its charge in the job.
+        let reservation =
+            crate::slice_budget::reserve(budget, crate::slice_budget::ChargeKind::Metadata, len)?;
+        let mut bytes = reservation.allocate_bytes(len)?;
+        bytes.as_mut_slice()[..line.len()].copy_from_slice(line.as_bytes());
+        bytes.as_mut_slice()[line.len()] = b'\n';
+        drop(line);
+        Ok(self.enqueue_data(conn, epoch, lease, InputBytes::Reliable(bytes)))
+    }
+
+    pub(crate) fn write_raw_reliable(
+        &self,
+        conn: u64,
+        epoch: u64,
+        lease: ControllerLease,
+        raw: Vec<u8>,
+        budget: &Arc<crate::slice_budget::SliceBudget>,
+    ) -> Result<Result<oneshot::Receiver<SendOutcome>, SendOutcome>, fl_host_proto::ExtensionRefusal>
+    {
+        if raw.is_empty() || raw.len() > fl_host_proto::MAX_RAW_INPUT {
+            return Ok(Err(SendOutcome::NotWritten {
+                reason: SendBlock::Io,
+            }));
+        }
+        let len = raw.len();
+        let reservation =
+            crate::slice_budget::reserve(budget, crate::slice_budget::ChargeKind::Metadata, len)?;
+        let mut bytes = reservation.allocate_bytes(len)?;
+        bytes.as_mut_slice().copy_from_slice(&raw);
+        drop(raw);
+        Ok(self.enqueue_data(conn, epoch, lease, InputBytes::Reliable(bytes)))
+    }
+
+    fn enqueue_data(
+        &self,
+        conn: u64,
+        epoch: u64,
+        lease: ControllerLease,
+        bytes: InputBytes,
+    ) -> Result<oneshot::Receiver<SendOutcome>, SendOutcome> {
         let (tx, rx) = oneshot::channel();
         let mut state = self.lock();
         let outcome = self.classify_send(&state, conn, epoch, lease, bytes.len());
@@ -294,7 +376,9 @@ impl WriterHandle {
 
     pub fn revoke(&self, conn: u64) {
         let mut state = self.lock();
-        state.revoked.insert(conn);
+        if state.inflight == Some(conn) {
+            state.revoked.insert(conn);
+        }
         if state.owner == conn {
             state.owner = 0;
         }
@@ -433,10 +517,12 @@ impl WriterHandle {
                         return;
                     }
                     if let Some(job) = state.control.pop_front() {
+                        state.inflight = Some(job.conn);
                         break Job::Ctrl(job);
                     }
                     if let Some(job) = state.data.pop_front() {
                         state.queued_bytes = state.queued_bytes.saturating_sub(job.bytes.len());
+                        state.inflight = Some(job.conn);
                         state.active = true;
                         state.active_bytes = job.bytes.len();
                         self.publish_depth(&state);
@@ -452,6 +538,10 @@ impl WriterHandle {
             match next {
                 Job::Ctrl(job) => self.run_ctrl(job),
                 Job::Data(job) => self.run_send(job),
+            }
+            let mut state = self.lock();
+            if let Some(conn) = state.inflight.take() {
+                state.revoked.remove(&conn);
             }
         }
     }
@@ -1048,6 +1138,136 @@ mod resource_tests {
     use super::*;
     use crate::session::SessionParts;
     use fl_host_proto::SessionId;
+
+    #[test]
+    fn idle_disconnection_does_not_retain_revocation_tombstones() {
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("bounded").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        let writer = WriterHandle::start(session, None);
+        for conn in 1..10_000 {
+            writer.revoke(conn);
+        }
+        assert!(writer.lock().revoked.is_empty());
+    }
+    fn decoded_exact_line() -> String {
+        use fl_host_proto::*;
+        let payload = format!(
+            r#"{{"op":"extended","id":1,"request":{{"op":"send_line","stream":{{"host":"00000000000000000000000000000000","session":"bounded","epoch":1}},"lease":1,"line":"{}"}}}}"#,
+            "x".repeat(65536)
+        );
+        let request = decode_request_for_minor(
+            1,
+            &Frame {
+                kind: FrameKind::Request,
+                payload: payload.into_bytes(),
+            },
+        )
+        .unwrap();
+        let HostRequest::Extended {
+            request: ExtensionRequest::SendLine { line, .. },
+            ..
+        } = request
+        else {
+            panic!("wrong request")
+        };
+        assert_eq!(line.len(), 65536);
+        assert_eq!(line.capacity(), 65536);
+        line
+    }
+
+    fn parked_reliable_writer() -> Arc<WriterHandle> {
+        let session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("bounded").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        // No writer runner: actual production queue remains parked deterministically.
+        let writer = WriterHandle::start(session, None);
+        {
+            let mut state = writer.lock();
+            state.lease = 1;
+            state.owner = 7;
+        }
+        writer
+    }
+
+    #[test]
+    fn reliable_input_refuses_before_preparation_when_metadata_is_exhausted() {
+        use crate::slice_budget::{ChargeKind, METADATA, SliceBudget, reserve};
+        let budget = SliceBudget::new();
+        let baseline = budget.used(ChargeKind::Metadata);
+        let held = reserve(&budget, ChargeKind::Metadata, METADATA - baseline - 65536).unwrap();
+        let writer = parked_reliable_writer();
+        assert!(matches!(
+            writer.send_reliable(7, 1, ControllerLease(1), decoded_exact_line(), &budget),
+            Err(fl_host_proto::ExtensionRefusal::ResourceLimit)
+        ));
+        assert!(writer.lock().data.is_empty());
+        assert_eq!(writer.lock().queued_bytes, 0);
+        drop(held);
+        assert_eq!(budget.used(ChargeKind::Metadata), baseline);
+    }
+
+    #[test]
+    fn reliable_input_charge_outlives_cancelled_waiter_until_writer_retirement() {
+        use crate::slice_budget::{ChargeKind, SliceBudget};
+        let budget = SliceBudget::new();
+        let baseline = budget.used(ChargeKind::Metadata);
+        let writer = parked_reliable_writer();
+        let rx = writer
+            .send_reliable(7, 1, ControllerLease(1), decoded_exact_line(), &budget)
+            .unwrap()
+            .unwrap();
+        drop(rx); // RPC cancellation does not retire writer-owned bytes.
+        assert_eq!(writer.lock().queued_bytes, 65537);
+        assert!(budget.used(ChargeKind::Metadata) >= baseline + 65537);
+        writer.revoke(7);
+        assert!(writer.lock().data.is_empty());
+        assert_eq!(budget.used(ChargeKind::Metadata), baseline);
+    }
+
+    #[test]
+    fn reliable_input_charge_follows_active_job_and_retires_before_retained_reply() {
+        use crate::slice_budget::{ChargeKind, SliceBudget};
+        let budget = SliceBudget::new();
+        let baseline = budget.used(ChargeKind::Metadata);
+        let writer = parked_reliable_writer();
+        let mut rx = writer
+            .send_reliable(7, 1, ControllerLease(1), decoded_exact_line(), &budget)
+            .unwrap()
+            .unwrap();
+        let job = {
+            let mut state = writer.lock();
+            let job = state.data.pop_front().unwrap();
+            state.queued_bytes = 0;
+            state.active = true;
+            state.inflight = Some(job.conn);
+            state.active_bytes = job.bytes.len();
+            job
+        };
+        writer.revoke(7); // An active job remains owned until the OS-write path returns.
+        assert!(budget.used(ChargeKind::Metadata) >= baseline + 65537);
+        writer.run_send(job);
+        assert_eq!(budget.used(ChargeKind::Metadata), baseline);
+        assert!(matches!(rx.try_recv(), Ok(SendOutcome::NotWritten { .. })));
+    }
 
     #[test]
     fn retiring_writer_settles_queued_requests_and_refuses_new_work() {

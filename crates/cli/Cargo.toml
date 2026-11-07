@@ -21,6 +21,8 @@ fl-install = { path = "../install" }
 fl-gate = { path = "../gate" }
 fl-watch = { path = "../watch" }
 fl-browse = { path = "../browse" }
+fl-host = { path = "../host" }
+fl-host-proto = { path = "../host-proto" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

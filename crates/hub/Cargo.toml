@@ -11,6 +11,7 @@ base64.workspace = true
 fl-core = { path = "../core", features = ["counted-tokens"] }
 fl-exec = { path = "../exec" }
 fl-gate = { path = "../gate" }
+fl-host-proto = { path = "../host-proto" }
 fl-install = { path = "../install" }
 fl-mcp = { path = "../mcp" }
 fl-github = { path = "../github" }

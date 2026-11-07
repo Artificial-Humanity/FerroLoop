@@ -651,3 +651,203 @@ fn wire_session_ids_are_validated_before_request_admission() {
         );
     }
 }
+
+#[test]
+fn extension_requires_minor_one() {
+    use fl_host_proto::{
+        ExtensionRefusal, ExtensionRequest, ExtensionResponse, decode_request_for_minor,
+        decode_response_for_minor, encode_request_for_minor, encode_response_for_minor,
+    };
+    let request = HostRequest::Extended {
+        id: RequestId(1),
+        request: ExtensionRequest::Capabilities,
+    };
+    assert!(encode_request(&request).is_err());
+    assert!(encode_request_for_minor(0, &request).is_err());
+    let frame = encode_request_for_minor(1, &request).unwrap();
+    assert!(decode_request_for_minor(0, &frame).is_err());
+    assert_eq!(decode_request_for_minor(1, &frame).unwrap(), request);
+    let response = HostResponse::Extended {
+        id: RequestId(1),
+        response: ExtensionResponse::Refused {
+            code: ExtensionRefusal::Unsupported,
+        },
+    };
+    let response_frame = encode_response_for_minor(1, &response).unwrap();
+    assert!(decode_response_for_minor(0, &response_frame).is_err());
+    assert_eq!(
+        decode_response_for_minor(1, &response_frame).unwrap(),
+        response
+    );
+    assert!(encode_response_for_minor(0, &response).is_err());
+}
+
+#[test]
+fn legacy_wire_shapes_unchanged() {
+    assert_eq!(
+        encode_request(&HostRequest::List { id: RequestId(7) })
+            .unwrap()
+            .payload,
+        br#"{"op":"list","id":7}"#
+    );
+    let reply =
+        fl_host_proto::encode_response_for_minor(0, &HostResponse::Killed { id: RequestId(8) })
+            .unwrap();
+    assert_eq!(reply.payload, br#"{"op":"killed","id":8}"#);
+    for n in 1..=8 {
+        assert_eq!(FrameKind::from_u8(n).unwrap() as u8, n);
+    }
+    assert_eq!(FrameKind::ExtensionEvent as u8, 9);
+}
+
+#[test]
+fn extension_base64_preflight_bounds() {
+    use fl_host_proto::{BoundedBytes, HostInstance, MAX_EXTENSION_PART, RawInput, Ticket};
+    assert!(BoundedBytes::new(vec![0; MAX_EXTENSION_PART]).is_ok());
+    assert!(BoundedBytes::new(vec![0; MAX_EXTENSION_PART + 1]).is_err());
+    assert!(RawInput::new(vec![0; 64 * 1024]).is_ok());
+    assert!(RawInput::new(vec![0; 64 * 1024 + 1]).is_err());
+    for value in [
+        "\"!!!!\"".to_owned(),
+        format!("\"{}\"", "A".repeat(4 * MAX_EXTENSION_PART)),
+        "[1,2,3]".to_owned(),
+    ] {
+        assert!(serde_json::from_str::<BoundedBytes>(&value).is_err());
+    }
+    assert!(serde_json::from_str::<HostInstance>(&format!("\"{}\"", "a".repeat(33))).is_err());
+    assert!(serde_json::from_str::<HostInstance>(&format!("\"{}\"", "A".repeat(32))).is_err());
+    assert!(serde_json::from_str::<Ticket>(&format!("\"{}\"", "b".repeat(66))).is_err());
+    assert!(!format!("{:?}", Ticket::new([9; 32])).contains("090909"));
+    assert!(!format!("{:?}", HostInstance::new([9; 16])).contains("090909"));
+}
+
+#[test]
+fn extension_reassembly_requires_complete() {
+    use fl_host_proto::{
+        BoundedBytes, ExtensionFrame, MAX_EXTENSION_PART, ReliableKind, ReliableReassembler,
+    };
+    fn part(seq: u64, more: bool, bytes: Vec<u8>) -> ExtensionFrame {
+        ExtensionFrame::ReliablePart {
+            seq,
+            kind: ReliableKind::Line,
+            more,
+            bytes: BoundedBytes::new(bytes).unwrap(),
+        }
+    }
+    let raw = vec![b'x'; MAX_LINE_BYTES];
+    let mut r = ReliableReassembler::new(0);
+    for (i, chunk) in raw.chunks(MAX_EXTENSION_PART).enumerate() {
+        let more = (i + 1) * MAX_EXTENSION_PART < raw.len();
+        let got = r.push(&part(1, more, chunk.to_vec())).unwrap();
+        if more {
+            assert!(got.is_none());
+        } else {
+            assert_eq!(got.unwrap().bytes, raw);
+        }
+    }
+    let mut r = ReliableReassembler::new(0);
+    assert!(r.push(&part(1, true, b"open".to_vec())).unwrap().is_none());
+    assert!(r.push(&part(2, false, b"wrong".to_vec())).is_err());
+    let mut r = ReliableReassembler::new(0);
+    for _ in 0..64 {
+        assert!(r.push(&part(1, true, vec![0])).unwrap().is_none());
+    }
+    assert!(r.push(&part(1, false, vec![0])).is_err());
+    let mut r = ReliableReassembler::new(0);
+    for _ in 0..32 {
+        assert!(
+            r.push(&part(1, true, vec![0; MAX_EXTENSION_PART]))
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(r.push(&part(1, false, vec![0])).is_err());
+}
+
+#[test]
+fn extension_rejects_oversized_envelope_and_unapproved_pty_payloads() {
+    use fl_host_proto::{
+        ExtensionFrame, ExtensionRefusal, decode_extension_frame, encode_extension_frame,
+    };
+    let frame = encode_extension_frame(
+        1,
+        &ExtensionFrame::Notice {
+            code: ExtensionRefusal::Busy,
+        },
+    )
+    .unwrap();
+    assert!(decode_extension_frame(0, &frame).is_err());
+    let mut padded = frame.clone();
+    padded
+        .payload
+        .extend(std::iter::repeat_n(b' ', MAX_EVENT_ENVELOPE));
+    assert!(decode_extension_frame(1, &padded).is_err());
+    for payload in [br#"{"op":"pty_data","output_seq":1,"revision":1,"bytes":"YQ=="}"#.as_slice(),br#"{"op":"snapshot_end","id":1}"#.as_slice(),br#"{"op":"reliable_part","seq":1,"kind":"line","more":false,"bytes":"YQ==","declared_len":18446744073709551615}"#.as_slice()] {
+        assert!(decode_extension_frame(1,&Frame{kind:FrameKind::ExtensionEvent,payload:payload.to_vec()}).is_err());
+    }
+}
+
+#[test]
+fn extension_lifecycle_reassembly_checks_bound_stream() {
+    use fl_host_proto::{
+        BoundedBytes, ExtensionFrame, HostInstance, ReliableKind, ReliableReassembler, StreamId,
+    };
+    let stream = StreamId {
+        host: HostInstance::new([1; 16]),
+        session: session("owner"),
+        epoch: SessionEpoch(3),
+    };
+    let mut r = ReliableReassembler::for_stream(stream, 0);
+    let body = serde_json::to_vec(&fl_host_proto::ControlEvent::CleanupComplete {
+        session: session("other"),
+        session_epoch: SessionEpoch(3),
+        seq: 1,
+    })
+    .unwrap();
+    assert!(
+        r.push(&ExtensionFrame::ReliablePart {
+            seq: 1,
+            kind: ReliableKind::Lifecycle,
+            more: false,
+            bytes: BoundedBytes::new(body).unwrap()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn extension_base64_round_trips_canonical_lengths() {
+    use fl_host_proto::{BoundedBytes, MAX_EXTENSION_PART, RawInput};
+    for len in [0, 1, 2, 3, 4, MAX_EXTENSION_PART] {
+        let value = BoundedBytes::new(vec![0xff; len]).unwrap();
+        let json = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<BoundedBytes>(&json).unwrap(),
+            value
+        );
+    }
+    let input = RawInput::new(vec![0x80; 64 * 1024]).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RawInput>(&serde_json::to_vec(&input).unwrap()).unwrap(),
+        input
+    );
+}
+
+#[test]
+fn extension_completed_tiny_event_does_not_retain_maximum_line_allocation() {
+    use fl_host_proto::{BoundedBytes, ExtensionFrame, ReliableKind, ReliableReassembler};
+    let event = ReliableReassembler::new(0)
+        .push(&ExtensionFrame::ReliablePart {
+            seq: 1,
+            kind: ReliableKind::Line,
+            more: false,
+            bytes: BoundedBytes::new(vec![b'x']).unwrap(),
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        event.bytes.capacity() <= event.bytes.len() + MAX_EVENT_ENVELOPE,
+        "tiny event retains {} allocated bytes",
+        event.bytes.capacity()
+    );
+}

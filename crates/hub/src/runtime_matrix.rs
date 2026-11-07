@@ -125,6 +125,12 @@ pub fn default_local_engines() -> Vec<LocalEngineSpec> {
             path: "/v1/models".into(),
             kind: LocalEngineKind::OpenAiModels,
         },
+        LocalEngineSpec {
+            name: "lemonade-13305".into(),
+            port: 13305,
+            path: "/v1/models".into(),
+            kind: LocalEngineKind::OpenAiModels,
+        },
     ]
 }
 
@@ -1458,10 +1464,11 @@ mod tests {
             ]
         );
         let engines = default_local_engines();
-        assert_eq!(engines.len(), 3);
+        assert_eq!(engines.len(), 4);
         assert_eq!(endpoint_of(&engines[0]), "127.0.0.1:11434/api/tags");
         assert_eq!(endpoint_of(&engines[1]), "127.0.0.1:8000/v1/models");
         assert_eq!(endpoint_of(&engines[2]), "127.0.0.1:8097/v1/models");
+        assert_eq!(endpoint_of(&engines[3]), "127.0.0.1:13305/v1/models");
     }
 
     #[test]
@@ -1779,7 +1786,7 @@ mod tests {
         let sel = select(Some("lemonade-8097"), &engines).unwrap();
         assert_eq!(sel.local.len(), 1);
         let sel = select(Some(""), &engines).unwrap();
-        assert_eq!((sel.cli.len(), sel.vault.len(), sel.local.len()), (5, 6, 3));
+        assert_eq!((sel.cli.len(), sel.vault.len(), sel.local.len()), (5, 6, 4));
         assert!(select(Some("nope"), &engines).is_err());
         assert!(select(Some(&"x".repeat(200)), &engines).is_err());
     }

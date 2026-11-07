@@ -275,3 +275,24 @@ label = "serves GET /api/v1/mcp/catalog and POST /api/v1/mcp/sync over the commi
 from = "fl_host"
 to = "fl_host_proto"
 label = "speaks the authenticated host protocol and reuses its endpoint identity"
+
+[[edges]]
+from = "fl_wire"
+to = "fl_host_proto"
+label = "discovers and dispatches to native fl-host sessions"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_host_proto"
+label = "supervises hosted agent sessions and boot reconciliation through fl-host"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_host"
+label = "runs fl host serve and internal supervisor/containment worker entrypoints"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_host_proto"
+label = "connects to fl-host for status, list, capture, send, and kill CLI subcommands"
+

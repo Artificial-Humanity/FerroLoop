@@ -93,6 +93,7 @@ pub enum RouteAdapter {
     Codex,
     Muse,
     Grok,
+    HostCli,
     Webhook,
 }
 
@@ -185,6 +186,7 @@ impl DispatchReport {
                 VendorRoute::Codex { .. } => RouteAdapter::Codex,
                 VendorRoute::Muse { .. } => RouteAdapter::Muse,
                 VendorRoute::Grok { .. } => RouteAdapter::Grok,
+                VendorRoute::HostCli { .. } => RouteAdapter::HostCli,
                 VendorRoute::Webhook { .. } => RouteAdapter::Webhook,
             },
             identity_digest: entry.route.session_identity().map(|(adapter, identity)| {
@@ -706,6 +708,13 @@ mod tests {
                 tmux_pane: Some("PANE_SECRET".into()),
             },
             VendorRoute::Grok {
+                session_id: "SESSION_SECRET".into(),
+                cwd: Some("/CWD_SECRET".into()),
+                tmux_target: Some("TARGET_SECRET".into()),
+                tmux_pane: Some("PANE_SECRET".into()),
+            },
+            VendorRoute::HostCli {
+                vendor: "lemonade".into(),
                 session_id: "SESSION_SECRET".into(),
                 cwd: Some("/CWD_SECRET".into()),
                 tmux_target: Some("TARGET_SECRET".into()),

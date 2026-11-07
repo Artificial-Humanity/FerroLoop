@@ -825,6 +825,10 @@ fn route_session_id(persona: &str, route: &VendorRoute) -> String {
         VendorRoute::Codex { thread_id, .. } => thread_id.clone(),
         VendorRoute::Muse { session_id, .. } if session_id.is_empty() => format!("muse-{persona}"),
         VendorRoute::Muse { session_id, .. } => session_id.clone(),
+        VendorRoute::HostCli {
+            vendor, session_id, ..
+        } if session_id.is_empty() => format!("{vendor}-{persona}"),
+        VendorRoute::HostCli { session_id, .. } => session_id.clone(),
         VendorRoute::Webhook { .. } => format!("webhook-{persona}"),
     }
 }
@@ -973,6 +977,22 @@ fn discover_sessions_from_routes(
                     .filter(|_| !session_id.is_empty())
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
                 ("grok", cwd.as_ref().map(|p| p.display().to_string()), tpath)
+            }
+            VendorRoute::HostCli {
+                vendor,
+                session_id,
+                cwd,
+                ..
+            } => {
+                let tpath = home
+                    .as_deref()
+                    .filter(|_| !session_id.is_empty())
+                    .and_then(|h| find_transcript_file_in_home(h, session_id));
+                (
+                    vendor.as_str(),
+                    cwd.as_ref().map(|p| p.display().to_string()),
+                    tpath,
+                )
             }
             VendorRoute::Webhook { socket_path } => {
                 ("webhook", Some(socket_path.display().to_string()), None)

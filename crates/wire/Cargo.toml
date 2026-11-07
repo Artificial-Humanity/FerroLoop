@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 fl-core = { path = "../core" }
+fl-host-proto = { path = "../host-proto" }
 fl-store = { path = "../store" }
 libc.workspace = true
 ring.workspace = true
@@ -23,3 +24,4 @@ webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true

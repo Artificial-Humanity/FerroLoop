@@ -10,6 +10,7 @@ pub mod finding;
 pub mod flow;
 pub mod gate;
 pub mod github;
+pub mod host;
 pub mod hub;
 pub mod install;
 pub mod ledger;

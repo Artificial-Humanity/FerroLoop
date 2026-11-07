@@ -58,6 +58,16 @@ pub enum VendorRoute {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tmux_pane: Option<String>,
     },
+    HostCli {
+        vendor: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_pane: Option<String>,
+    },
     /// Used by deterministic integration tests to capture pushed deliveries without vendor binaries.
     Webhook { socket_path: PathBuf },
 }
@@ -72,6 +82,7 @@ impl VendorRoute {
             Self::Codex { thread_id, .. } => ("codex", thread_id.as_str()),
             Self::Muse { session_id, .. } => ("muse", session_id.as_str()),
             Self::Grok { session_id, .. } => ("grok", session_id.as_str()),
+            Self::HostCli { session_id, .. } => ("host_cli", session_id.as_str()),
             Self::Webhook { .. } => return None,
         };
         let id = raw_id.trim();
@@ -265,14 +276,25 @@ pub fn sync_retired_personas_in_tombstones(
 }
 
 /// Vendors whose `vendor:persona` slug is a hosted session name, not a native id.
-const PERSONA_DERIVED_VENDORS: [&str; 6] =
-    ["claude", "antigravity", "agy", "codex", "muse", "grok"];
+const PERSONA_DERIVED_VENDORS: [&str; 9] = [
+    "claude",
+    "antigravity",
+    "agy",
+    "codex",
+    "muse",
+    "grok",
+    "lemonade",
+    "ollama",
+    "host_cli",
+];
 
 /// Discovery placeholders `{prefix}-{persona}` when a route has no native id yet.
-const PERSONA_DERIVED_PREFIXES: [&str; 5] = ["grok", "muse", "webhook", "agy", "codex"];
+const PERSONA_DERIVED_PREFIXES: [&str; 8] = [
+    "grok", "muse", "webhook", "agy", "codex", "lemonade", "ollama", "host_cli",
+];
 
-/// `true` for a hosted slug (`claude:ada`, `agy:ada`) or a discovery placeholder
-/// (`grok-ada`, `codex-ada`, `claude-ada-1234`). Those name the persona, not one
+/// `true` for a hosted slug (`claude:ada`, `agy:ada`, `Ada.claude`, `muse.ada`) or a discovery
+/// placeholder (`grok-ada`, `codex-ada`, `claude-ada-1234`). Those name the persona, not one
 /// vendor conversation, so a tombstone of them would ban the name.
 pub fn is_persona_derived_id(id: &str) -> bool {
     let id = id.trim();
@@ -282,6 +304,18 @@ pub fn is_persona_derived_id(id: &str) -> bool {
     if let Some((vendor, persona)) = id.split_once(':') {
         return PERSONA_DERIVED_VENDORS.contains(&vendor.to_ascii_lowercase().as_str())
             && validate_slug(persona).is_ok();
+    }
+    if let Some((first, second)) = id.split_once('.') {
+        let first_lower = first.to_ascii_lowercase();
+        let second_lower = second.to_ascii_lowercase();
+        if first_lower == "muse" && validate_slug(&second_lower).is_ok() {
+            return true;
+        }
+        if PERSONA_DERIVED_VENDORS.contains(&second_lower.as_str())
+            && validate_slug(&first_lower).is_ok()
+        {
+            return true;
+        }
     }
     let lower = id.to_ascii_lowercase();
     if let Some(rest) = lower.strip_prefix("claude-")
@@ -358,6 +392,30 @@ fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &Ve
                 ..
             },
         ) => {
+            if dst_target.is_none() {
+                *dst_target = src_target.clone();
+            }
+            if dst_pane.is_none() {
+                *dst_pane = src_pane.clone();
+            }
+        }
+        (
+            VendorRoute::HostCli {
+                cwd: dst_cwd,
+                tmux_target: dst_target,
+                tmux_pane: dst_pane,
+                ..
+            },
+            VendorRoute::HostCli {
+                cwd: src_cwd,
+                tmux_target: src_target,
+                tmux_pane: src_pane,
+                ..
+            },
+        ) => {
+            if dst_cwd.is_none() {
+                *dst_cwd = src_cwd.clone();
+            }
             if dst_target.is_none() {
                 *dst_target = src_target.clone();
             }
@@ -911,10 +969,13 @@ impl RouteTable {
         // scan above found for the same persona. Muse keeps a persona that has both a Muse
         // window and a Grok window and no transcript route; Grok fills only what is left.
         self.discover_muse_windows(&home, home_override.is_some(), &at);
-        if muse_tmux_discovery_enabled(&home, home_override.is_some())
-            && let Some(windows) = list_tmux_windows()
-        {
-            self.attach_grok_tmux_placeholders(&windows, &at);
+        if muse_tmux_discovery_enabled(&home, home_override.is_some()) {
+            if let Some(windows) = list_tmux_windows() {
+                self.attach_grok_tmux_placeholders(&windows, &at);
+            }
+            if crate::dispatcher::host_discovery_allowed() {
+                self.discover_host_cli_sessions(&at);
+            }
         }
         self.drop_decommissioned_and_retired_routes(home_override, &pre_existing);
     }
@@ -1821,6 +1882,113 @@ impl RouteTable {
             );
         }
     }
+
+    fn discover_host_cli_sessions(&mut self, at: &At) {
+        let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+            return;
+        };
+        let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
+            return;
+        };
+        let Ok(sessions) = client.list_sessions() else {
+            return;
+        };
+        for s in sessions {
+            let fl_host_proto::ChildState::Running(rec) = &s.state else {
+                continue;
+            };
+            let target = crate::vendor_adapter::host_session_id_to_unit(&s.stream.session);
+            let pane = s.stream.session.as_str().to_string();
+            let Some((session, window)) = target.split_once(':') else {
+                continue;
+            };
+            let (persona, vendor) = if session.eq_ignore_ascii_case("muse") {
+                (
+                    normalize_persona(window).filter(|p| p != "muse"),
+                    "muse".to_string(),
+                )
+            } else {
+                (
+                    normalize_claude_session_name(session),
+                    window.trim().to_ascii_lowercase(),
+                )
+            };
+            let Some(persona) = persona else {
+                continue;
+            };
+            if vendor.is_empty() {
+                continue;
+            }
+            if let Some(existing) = self.entries.get_mut(&persona) {
+                match (&mut existing.route, vendor.as_str()) {
+                    (
+                        VendorRoute::Muse {
+                            tmux_target,
+                            tmux_pane,
+                            ..
+                        },
+                        "muse",
+                    )
+                    | (
+                        VendorRoute::Grok {
+                            tmux_target,
+                            tmux_pane,
+                            ..
+                        },
+                        "grok",
+                    ) => {
+                        if tmux_target.is_none() {
+                            *tmux_target = Some(target);
+                        }
+                        if tmux_pane.is_none() {
+                            *tmux_pane = Some(pane);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let route = match vendor.as_str() {
+                "muse" => VendorRoute::Muse {
+                    session_id: String::new(),
+                    cwd: None,
+                    tmux_target: Some(target),
+                    tmux_pane: Some(pane),
+                },
+                "grok" => VendorRoute::Grok {
+                    session_id: String::new(),
+                    cwd: None,
+                    tmux_target: Some(target),
+                    tmux_pane: Some(pane),
+                },
+                "antigravity" | "agy" => VendorRoute::Agy {
+                    conversation_id: pane,
+                    ls_pid: Some(rec.pid),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                },
+                "claude" => VendorRoute::Claude {
+                    pid: rec.pid,
+                    session_id: pane,
+                    socket_path: PathBuf::new(),
+                    key_path: None,
+                },
+                "codex" => VendorRoute::Codex {
+                    thread_id: pane,
+                    cwd: None,
+                },
+                _ => VendorRoute::HostCli {
+                    vendor,
+                    session_id: pane.clone(),
+                    cwd: None,
+                    tmux_target: Some(target),
+                    tmux_pane: Some(pane),
+                },
+            };
+            self.upsert_passive(&persona, route, at.clone());
+        }
+    }
 }
 
 /// `true` when `route` names a decommissioned native session id.
@@ -2113,7 +2281,8 @@ fn muse_tmux_discovery_enabled(home: &Path, has_home_override: bool) -> bool {
     }
     !has_home_override
         || (std::env::var_os("FL_WIRE_TMUX_DISCOVERY").is_some_and(|h| Path::new(&h) == home)
-            && std::env::var_os("FL_WIRE_TMUX_BIN").is_some())
+            && (std::env::var_os("FL_WIRE_TMUX_BIN").is_some()
+                || std::env::var_os("FL_HOST_SOCK").is_some()))
 }
 
 /// How long [`list_tmux_windows`] waits for tmux.
@@ -2128,6 +2297,27 @@ fn list_tmux_windows() -> Option<Vec<TmuxWindow>> {
 }
 
 fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
+    if crate::dispatcher::host_discovery_allowed()
+        && let Ok(endpoint) = fl_host_proto::HostEndpoint::discover()
+        && let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint)
+        && let Ok(sessions) = client.list_sessions()
+    {
+        let lines: String = sessions
+            .iter()
+            .filter(|s| matches!(s.state, fl_host_proto::ChildState::Running(_)))
+            .map(|s| crate::vendor_adapter::host_session_id_to_unit(&s.stream.session))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let windows = parse_tmux_windows(&lines);
+        return Some(windows);
+    }
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
+        return run_tmux_list_windows(timeout);
+    }
+    None
+}
+
+fn run_tmux_list_windows(timeout: Duration) -> Option<Vec<TmuxWindow>> {
     use std::io::Read;
     use std::process::{Command, Stdio};
 
@@ -2414,6 +2604,40 @@ fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned);
             Some(VendorRoute::Grok {
+                session_id,
+                cwd,
+                tmux_target,
+                tmux_pane,
+            })
+        }
+        "host_cli" | "lemonade" | "ollama" => {
+            let vendor = item
+                .get("vendor")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(vendor)
+                .to_ascii_lowercase();
+            let session_id = item
+                .get("session_id")
+                .or_else(|| item.get("sessionId"))?
+                .as_str()?
+                .to_string();
+            let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+            let tmux_target = item
+                .get("tmux_target")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            let tmux_pane = item
+                .get("tmux_pane")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            Some(VendorRoute::HostCli {
+                vendor,
                 session_id,
                 cwd,
                 tmux_target,
