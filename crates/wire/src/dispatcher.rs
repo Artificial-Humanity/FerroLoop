@@ -2337,6 +2337,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
 }
 
 /// Dispatch only one recipient; the daemon schedules each recipient independently.
+#[expect(dead_code, reason = "legacy tuple adapter retained for compatibility")]
 pub(crate) fn dispatch_message_for_recipient<S: MessageStore>(
     store: &S,
     routes: &mut RouteTable,
@@ -2375,6 +2376,32 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
         Some(recipient),
         report,
         dispatch_to_route,
+    )
+}
+
+/// Unit fault tests observe the same selected pass without vendor I/O. This
+/// callback entrypoint is absent from production builds and public APIs.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_message_for_recipient_with_test_dispatch<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: &str,
+    report: &mut DispatchReport,
+    dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<(), String>,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    dispatch_message_selected(
+        store,
+        routes,
+        home,
+        msg,
+        now,
+        Some(recipient),
+        report,
+        dispatch,
     )
 }
 

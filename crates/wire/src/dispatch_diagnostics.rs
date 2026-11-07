@@ -258,6 +258,84 @@ impl FenceDiagnostic {
     }
 }
 
+/// Bounded safe DTOs only; recipient matching uses their safe label/digest rather
+/// than retaining a second copy of scheduler keys.
+pub(crate) struct DiagnosticsState {
+    pub(crate) snapshot: DispatchDiagnostics,
+}
+
+impl DiagnosticsState {
+    pub(crate) fn new(started_at: At, nonce: Option<String>) -> Self {
+        Self {
+            snapshot: DispatchDiagnostics {
+                schema_version: 1,
+                instance_nonce: nonce,
+                instance_started_at: started_at,
+                scope: DiagnosticsScope::DaemonLifetime,
+                records: Vec::new(),
+                global_capacity_exhausted: false,
+                diagnostics_partial: false,
+                omitted_evidence_total: 0,
+                omitted_evidence_total_saturated: false,
+            },
+        }
+    }
+
+    /// Called with the diagnostics lock paired with the authoritative marker.
+    /// Return only the first retained hold, for logging after all guards drop.
+    pub(crate) fn retain(&mut self, row: FenceDiagnostic) -> Option<FenceDiagnostic> {
+        if let Some(first) = self.snapshot.records.iter_mut().find(|first| {
+            first.recipient == row.recipient && first.recipient_digest == row.recipient_digest
+        }) {
+            if first.phase == SuppressionPhase::PrefixDraining
+                && row.phase == SuppressionPhase::RetainedFence
+            {
+                first.phase = SuppressionPhase::RetainedFence;
+                first.decisive_reason = row.decisive_reason;
+                let mut report = DispatchReport {
+                    failure_stages: first.failure_stages.clone(),
+                    omitted_failure_stages: first.omitted_failure_stages,
+                    omitted_failure_stages_saturated: first.omitted_failure_stages_saturated,
+                    ..DispatchReport::default()
+                };
+                for stage in row.failure_stages {
+                    report.record_failure(stage);
+                }
+                first.failure_stages = report.failure_stages;
+                first.omitted_failure_stages = report.omitted_failure_stages;
+                first.omitted_failure_stages_saturated = report.omitted_failure_stages_saturated;
+                // Prefix marking has no dispatch report. The decisive worker's
+                // bounded report is appended on promotion, never a later ACK.
+                first.route_observations = row.route_observations;
+                first.omitted_route_observations = row.omitted_route_observations;
+                first.omitted_route_observations_saturated =
+                    row.omitted_route_observations_saturated;
+                first.route_dispatch_calls = row.route_dispatch_calls;
+                first.route_dispatch_calls_saturated = row.route_dispatch_calls_saturated;
+                if row.omitted_failure_stages > 0 {
+                    let (total, overflow) = first
+                        .omitted_failure_stages
+                        .overflowing_add(row.omitted_failure_stages);
+                    first.omitted_failure_stages = if overflow { u64::MAX } else { total };
+                    first.omitted_failure_stages_saturated |= overflow;
+                }
+                first.omitted_failure_stages_saturated |= row.omitted_failure_stages_saturated;
+            }
+            return None;
+        }
+        if self.snapshot.records.len() == 128 {
+            self.snapshot.diagnostics_partial = true;
+            increment_saturating(
+                &mut self.snapshot.omitted_evidence_total,
+                &mut self.snapshot.omitted_evidence_total_saturated,
+            );
+            return None;
+        }
+        self.snapshot.records.push(row.clone());
+        Some(row)
+    }
+}
+
 /// The flag means the exact count exceeded u64, rather than merely reaching it.
 pub(crate) fn increment_saturating(value: &mut u64, saturated: &mut bool) {
     if *value == u64::MAX {
@@ -312,6 +390,95 @@ mod tests {
             FenceReason::UnresolvedReceiptStatus,
             report,
         )
+    }
+
+    #[test]
+    fn diagnostic_retention_promotes_without_replacing_first_hold() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(1), None);
+        let mut first = row(&DispatchReport::default());
+        first.phase = SuppressionPhase::PrefixDraining;
+        first.first_reason = FenceReason::QueueOverflow;
+        first.decisive_reason = FenceReason::QueueOverflow;
+        assert!(state.retain(first.clone()).is_some());
+        let mut report = DispatchReport::default();
+        report.record_call_started(&codex());
+        report.record_failure(FailureStage::WorkerPanic);
+        let later = FenceDiagnostic::from_report(
+            "freya",
+            None,
+            At::from_unix_millis(999),
+            SuppressionPhase::RetainedFence,
+            FenceReason::WorkerPanic,
+            &report,
+        );
+        assert!(state.retain(later).is_none());
+        let kept = &state.snapshot.records[0];
+        assert_eq!(kept.trigger_message_id, first.trigger_message_id);
+        assert_eq!(kept.hold_observed_at, At::from_unix_millis(456));
+        assert_eq!(kept.first_reason, FenceReason::QueueOverflow);
+        assert_eq!(kept.decisive_reason, FenceReason::WorkerPanic);
+        assert_eq!(kept.phase, SuppressionPhase::RetainedFence);
+        assert_eq!(kept.failure_stages, vec![FailureStage::WorkerPanic]);
+        assert_eq!(kept.route_dispatch_calls, 1);
+        // A later ACK, route observation or duplicate retention cannot rewrite a fence.
+        assert!(state.retain(first).is_none());
+        assert_eq!(
+            state.snapshot.records[0].decisive_reason,
+            FenceReason::WorkerPanic
+        );
+    }
+
+    #[test]
+    fn diagnostic_prefix_promotion_keeps_bounded_repeated_failure_observations() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(1), None);
+        let mut first = row(&DispatchReport::default());
+        first.phase = SuppressionPhase::PrefixDraining;
+        first.first_reason = FenceReason::QueueOverflow;
+        first.decisive_reason = FenceReason::QueueOverflow;
+        state.retain(first);
+        let mut report = DispatchReport::default();
+        for stage in [
+            FailureStage::TransportError,
+            FailureStage::TransportError,
+            FailureStage::ReceiptWriteError,
+            FailureStage::FinalReceiptReadError,
+            FailureStage::WorkerPanic,
+        ] {
+            report.record_failure(stage);
+        }
+        let mut later = row(&report);
+        later.decisive_reason = FenceReason::WorkerPanic;
+        state.retain(later);
+        assert_eq!(
+            state.snapshot.records[0].failure_stages,
+            vec![
+                FailureStage::TransportError,
+                FailureStage::TransportError,
+                FailureStage::ReceiptWriteError,
+                FailureStage::WorkerPanic
+            ]
+        );
+        assert_eq!(state.snapshot.records[0].omitted_failure_stages, 1);
+    }
+
+    #[test]
+    fn diagnostic_retention_budget_counts_omitted_admissions_without_global_saturation() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(1), None);
+        for n in 0..128 {
+            let mut entry = row(&DispatchReport::default());
+            entry.recipient = Some(format!("recipient-{n}"));
+            assert!(state.retain(entry).is_some());
+        }
+        for _ in 0..2 {
+            assert!(state.retain(row(&DispatchReport::default())).is_none());
+        }
+        assert_eq!(state.snapshot.records.len(), 128);
+        assert!(state.snapshot.diagnostics_partial);
+        assert_eq!(state.snapshot.omitted_evidence_total, 2);
+        assert!(!state.snapshot.global_capacity_exhausted);
+        state.snapshot.omitted_evidence_total = u64::MAX;
+        state.retain(row(&DispatchReport::default()));
+        assert!(state.snapshot.omitted_evidence_total_saturated);
     }
 
     #[test]
