@@ -413,10 +413,7 @@ impl AsyncHostClient {
         max_bytes: u32,
     ) -> Result<String, HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::CaptureOutput {
-                session,
-                max_bytes,
-            })
+            .extension_request(crate::ExtensionRequest::CaptureOutput { session, max_bytes })
             .await?
         {
             crate::ExtensionResponse::CapturedOutput { text } => Ok(text),

@@ -5277,6 +5277,16 @@ pub(crate) fn route_matches_session_id(
                 && (session_id == trimmed
                     || trimmed.strip_prefix("grok-") == Some(session_id.as_str()))
         }
+        fl_wire::identity::VendorRoute::HostCli {
+            vendor, session_id, ..
+        } => {
+            !session_id.is_empty()
+                && (session_id == trimmed
+                    || trimmed
+                        .strip_prefix(&format!("{vendor}-"))
+                        .is_some_and(|rest| rest == session_id.as_str())
+                    || trimmed.strip_prefix("host_cli-") == Some(session_id.as_str()))
+        }
         fl_wire::identity::VendorRoute::Webhook { .. } => false,
     }
 }

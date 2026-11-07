@@ -2701,6 +2701,11 @@ pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
             tmux_target,
             tmux_pane,
             ..
+        }
+        | VendorRoute::HostCli {
+            tmux_target,
+            tmux_pane,
+            ..
         } => {
             let mut targets = [tmux_target, tmux_pane]
                 .into_iter()
@@ -3527,26 +3532,28 @@ fn running_vendor_owns_route(
     })
 }
 
-fn vendor_id_of_route(route: &VendorRoute) -> Option<&'static str> {
+fn vendor_id_of_route(route: &VendorRoute) -> Option<&str> {
     match route {
         VendorRoute::Claude { .. } => Some("claude"),
         VendorRoute::Agy { .. } => Some("antigravity"),
         VendorRoute::Codex { .. } => Some("codex"),
         VendorRoute::Muse { .. } => Some("muse"),
         VendorRoute::Grok { .. } => Some("grok"),
+        VendorRoute::HostCli { vendor, .. } => Some(vendor.as_str()),
         VendorRoute::Webhook { .. } => None,
     }
 }
 
 fn route_is_vendor(route: &VendorRoute, vendor: &str) -> bool {
-    matches!(
-        (vendor, route),
+    match (vendor, route) {
         ("claude", VendorRoute::Claude { .. })
-            | ("antigravity", VendorRoute::Agy { .. })
-            | ("codex", VendorRoute::Codex { .. })
-            | ("muse", VendorRoute::Muse { .. })
-            | ("grok", VendorRoute::Grok { .. })
-    )
+        | ("antigravity", VendorRoute::Agy { .. })
+        | ("codex", VendorRoute::Codex { .. })
+        | ("muse", VendorRoute::Muse { .. })
+        | ("grok", VendorRoute::Grok { .. }) => true,
+        (v, VendorRoute::HostCli { vendor: rv, .. }) => rv.eq_ignore_ascii_case(v),
+        _ => false,
+    }
 }
 
 fn push_tombstone(ids: &mut Vec<String>, id: &str) {

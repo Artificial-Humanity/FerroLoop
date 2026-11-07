@@ -99,6 +99,11 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::hub::HubCmd,
     },
+    /// Run and manage the native FerroLoop Agent Host (`fl-host`) daemon and sessions.
+    Host {
+        #[command(subcommand)]
+        cmd: cmd::host::HostCmd,
+    },
     /// Look at, and tend, the engine file behind the bound store.
     Store {
         #[command(subcommand)]
@@ -159,6 +164,7 @@ impl Command {
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
+            | Command::Host { .. }
             | Command::Store { .. }
             | Command::Vault { .. }
             | Command::Auth { .. }
@@ -205,6 +211,7 @@ impl Command {
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
+            | Command::Host { .. }
             | Command::Store { .. }
             | Command::Vault { .. }
             | Command::Auth { .. }
@@ -245,6 +252,7 @@ impl Command {
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
+            | Command::Host { .. }
             | Command::Store { .. }
             | Command::Vault { .. }
             | Command::Auth { .. }
@@ -731,6 +739,24 @@ fn tracker_for(
 }
 
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("--session-supervisor") => {
+            if let Err(err) = fl_host::session_supervisor() {
+                eprintln!("fl-host: {err}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        Some("--containment-worker") => {
+            if let Err(err) = fl_host::containment_worker() {
+                eprintln!("fl-host: {err}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+
     let argv0_stem = std::env::args_os()
         .next()
         .and_then(|s| PathBuf::from(s).file_stem().map(ToOwned::to_owned));
@@ -920,6 +946,16 @@ fn run(cli: Cli) -> Result<i32> {
             db,
             command: Command::Doctor(c),
         } => return cmd::doctor::run(c, db),
+        other => other,
+    };
+    let cli = match cli {
+        Cli {
+            command: Command::Host { cmd },
+            ..
+        } => {
+            cmd::host::execute(cmd)?;
+            return Ok(0);
+        }
         other => other,
     };
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
@@ -1564,7 +1600,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Browse(_)
         | Command::Version { .. }
         | Command::Install(_)
-        | Command::Doctor(_) => {
+        | Command::Doctor(_)
+        | Command::Host { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

@@ -55,10 +55,10 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
     match route {
         VendorRoute::Claude {
             pid,
+            session_id,
             socket_path,
             key_path,
-            ..
-        } => dispatch_to_claude(*pid, socket_path, key_path.as_deref(), msg),
+        } => dispatch_to_claude(*pid, session_id, socket_path, key_path.as_deref(), msg),
         VendorRoute::Agy {
             conversation_id,
             ls_address,
@@ -117,6 +117,20 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             deliver_to_grok_route(
                 session_id,
                 cwd.as_ref(),
+                tmux_target.as_deref(),
+                tmux_pane.as_deref(),
+                &formatted,
+            )
+        }
+        VendorRoute::HostCli {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        } => {
+            let formatted = format_push_message(msg);
+            deliver_to_host_cli_route(
+                session_id,
                 tmux_target.as_deref(),
                 tmux_pane.as_deref(),
                 &formatted,
@@ -317,6 +331,7 @@ fn push_webhook_line(socket_path: &Path, mut line: String) -> Result<(), PushErr
 /// left there.
 fn dispatch_to_claude(
     pid: u32,
+    session_id: &str,
     socket_path: &Path,
     key_path: Option<&Path>,
     msg: &WireMessage,
@@ -330,7 +345,22 @@ fn dispatch_to_claude(
     };
     match push_claude_tmux(pid, socket_path, key_path, msg) {
         Ok(()) => Ok(()),
-        Err(tmux_err) => Err(format!("{socket_err}; tmux fallback: {tmux_err}")),
+        Err(tmux_err) => {
+            if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
+                let host_target = (!session_id.trim().is_empty())
+                    .then(|| session_id.trim().to_string())
+                    .filter(|id| resolve_live_host_session(id).is_some())
+                    .or_else(|| (pid != 0).then(|| tmux_pane_for_pid(pid)).flatten());
+                if let Some(target) = host_target {
+                    return deliver_via_tmux_paste_opts(
+                        &target,
+                        &sanitize_for_paste(&format_push_message(msg)),
+                        true,
+                    );
+                }
+            }
+            Err(format!("{socket_err}; tmux fallback: {tmux_err}"))
+        }
     }
 }
 
@@ -483,9 +513,31 @@ fn parent_pid(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// The tmux pane (`%<n>`) whose process tree holds `pid`, found from `tmux list-panes -a` and the
-/// parent chain of `pid`. `None` when tmux is absent, no pane matches, or the chain is cut.
+/// The tmux pane (`%<n>`) or `fl-host` session id whose process tree holds `pid`, found from
+/// `fl-host` or `tmux list-panes -a` and the parent chain of `pid`. `None` when neither matches
+/// or the chain is cut.
 pub(crate) fn tmux_pane_for_pid(pid: u32) -> Option<String> {
+    if host_discovery_allowed()
+        && let Ok(endpoint) = fl_host_proto::HostEndpoint::discover()
+        && let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint)
+        && let Ok(sessions) = client.list_sessions()
+    {
+        let mut cur = pid;
+        for _ in 0..64 {
+            if let Some(found) = sessions.iter().find_map(|s| match &s.state {
+                fl_host_proto::ChildState::Running(rec) if rec.pid == cur => {
+                    Some(s.stream.session.as_str().to_string())
+                }
+                _ => None,
+            }) {
+                return Some(found);
+            }
+            let Some(next) = parent_pid(cur).filter(|p| *p > 1) else {
+                break;
+            };
+            cur = next;
+        }
+    }
     let out = Command::new(tmux_bin())
         .args(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
         .stdout(std::process::Stdio::piped())
@@ -860,8 +912,20 @@ fn deliver_to_codex_route(
         match run_codex_queue(&bin, thread_id, cwd, text) {
             Ok(()) => return Ok(()),
             Err(CodexQueueError::Spawn(e)) => last_err = e,
-            Err(CodexQueueError::Exit(e)) => return Err(e),
+            Err(CodexQueueError::Exit(e)) => {
+                if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+                    && resolve_live_host_session(thread_id).is_some()
+                {
+                    return deliver_via_tmux_paste_opts(thread_id, &sanitize_for_paste(text), true);
+                }
+                return Err(e);
+            }
         }
+    }
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+        && resolve_live_host_session(thread_id).is_some()
+    {
+        return deliver_via_tmux_paste_opts(thread_id, &sanitize_for_paste(text), true);
     }
     Err(last_err)
 }
@@ -1155,12 +1219,54 @@ fn deliver_to_agy_route(
             OsString::from(&csrf),
         ));
     }
-    let run = run_vendor_cli_captured(&mut cmd, AdapterKind::Antigravity, &extra, CliKind::Enqueue)
-        .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
+    let run =
+        match run_vendor_cli_captured(&mut cmd, AdapterKind::Antigravity, &extra, CliKind::Enqueue)
+        {
+            Ok(run) => run,
+            Err(e) => {
+                if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+                    && resolve_live_host_session(conversation_id).is_some()
+                {
+                    return deliver_via_tmux_paste_opts(
+                        conversation_id,
+                        &sanitize_for_paste(body),
+                        true,
+                    );
+                }
+                return Err(format!("failed to spawn {}: {e}", exe.display()));
+            }
+        };
     if !run.status.success() {
+        if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+            && resolve_live_host_session(conversation_id).is_some()
+        {
+            return deliver_via_tmux_paste_opts(conversation_id, &sanitize_for_paste(body), true);
+        }
         return Err(failure_with_output("agy send-message", &run));
     }
     Ok(())
+}
+
+fn deliver_to_host_cli_route(
+    session_id: &str,
+    tmux_target: Option<&str>,
+    tmux_pane: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    let mut candidates = Vec::new();
+    for raw in [tmux_pane, tmux_target, Some(session_id)] {
+        if let Some(c) = raw.map(str::trim).filter(|s| !s.is_empty())
+            && !candidates.iter().any(|seen| seen == c)
+        {
+            candidates.push(c.to_string());
+        }
+    }
+    for target in &candidates {
+        if tmux_target_alive(target) {
+            return deliver_via_tmux_paste(target, text);
+        }
+    }
+    Err("the host_cli route's session is not live".to_string())
 }
 
 /// `Ok(true)` after `RevertToCascadeStep` and transcript truncation.
@@ -1685,9 +1791,15 @@ fn require_reforge_prompt(reforge_prompt: Option<&str>) -> Result<&str, String> 
 fn session_reset_slash(route: &VendorRoute) -> &'static str {
     match route {
         VendorRoute::Codex { .. } | VendorRoute::Grok { .. } => "/new",
+        VendorRoute::HostCli { vendor, .. }
+            if vendor.eq_ignore_ascii_case("codex") || vendor.eq_ignore_ascii_case("grok") =>
+        {
+            "/new"
+        }
         VendorRoute::Claude { .. }
         | VendorRoute::Muse { .. }
         | VendorRoute::Agy { .. }
+        | VendorRoute::HostCli { .. }
         | VendorRoute::Webhook { .. } => "/clear",
     }
 }
@@ -1695,6 +1807,11 @@ fn session_reset_slash(route: &VendorRoute) -> &'static str {
 fn alive_tmux_reset_target(route: &VendorRoute) -> Option<String> {
     let ordered: [&Option<String>; 2] = match route {
         VendorRoute::Grok {
+            tmux_pane,
+            tmux_target,
+            ..
+        }
+        | VendorRoute::HostCli {
             tmux_pane,
             tmux_target,
             ..
@@ -1727,6 +1844,26 @@ fn alive_tmux_reset_target(route: &VendorRoute) -> Option<String> {
 }
 
 fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+        && let Some((mut client, stream)) = resolve_live_host_session(target)
+    {
+        let grant = client
+            .claim_controller(stream.clone())
+            .map_err(|e| format!("failed to claim fl-host controller for {target}: {e}"))?;
+        let outcome = client
+            .write_raw(stream.clone(), grant.lease, b"\x15".to_vec())
+            .map_err(|e| format!("fl-host write_raw C-u failed: {e}"))?;
+        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+            return Err(format!("fl-host write_raw C-u returned {outcome:?}"));
+        }
+        let outcome = client
+            .send_line(stream, grant.lease, slash.to_string())
+            .map_err(|e| format!("fl-host send_line {slash} failed: {e}"))?;
+        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+            return Err(format!("fl-host send_line {slash} returned {outcome:?}"));
+        }
+        return Ok(());
+    }
     let tmux = tmux_bin();
     let target = tmux_exact_target(target);
     for key in ["C-u", slash, "Enter"] {
@@ -1798,6 +1935,11 @@ pub fn plan_interrupt(
             tmux_pane,
             tmux_target,
             ..
+        }
+        | VendorRoute::HostCli {
+            tmux_pane,
+            tmux_target,
+            ..
         } => [tmux_pane, tmux_target],
         VendorRoute::Muse {
             tmux_target,
@@ -1844,10 +1986,46 @@ pub fn plan_interrupt(
     })
 }
 
-/// Run `plan`: the real `tmux send-keys`, or the real language-server call.
+/// Run `plan`: `fl-host`, the real `tmux send-keys`, or the real language-server call.
 pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
     match plan {
         InterruptPlan::TmuxKey { targets, key } => {
+            if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+                && let Some((mut client, stream)) =
+                    targets.iter().find_map(|t| resolve_live_host_session(t))
+            {
+                let grant = client
+                    .claim_controller(stream.clone())
+                    .map_err(|e| format!("failed to claim fl-host controller: {e}"))?;
+                match *key {
+                    "Escape" => {
+                        let outcome = client
+                            .write_raw(stream, grant.lease, b"\x1b".to_vec())
+                            .map_err(|e| format!("fl-host write_raw Escape failed: {e}"))?;
+                        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                            return Err(format!("fl-host write_raw Escape returned {outcome:?}"));
+                        }
+                    }
+                    "C-c" => {
+                        client
+                            .signal_session(
+                                stream,
+                                grant.lease,
+                                fl_host_proto::SignalKind::Interrupt,
+                            )
+                            .map_err(|e| format!("fl-host signal_session Interrupt failed: {e}"))?;
+                    }
+                    other => {
+                        let outcome = client
+                            .send_line(stream, grant.lease, other.to_string())
+                            .map_err(|e| format!("fl-host send_line {other} failed: {e}"))?;
+                        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                            return Err(format!("fl-host send_line {other} returned {outcome:?}"));
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let target = targets
                 .iter()
                 .find(|t| tmux_target_alive(t))
@@ -1869,6 +2047,17 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
             csrf_token,
         } => {
             let Some(addr) = agy_listening_address(ls_address) else {
+                if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+                    && let Some((mut client, stream)) = resolve_live_host_session(conversation_id)
+                {
+                    let grant = client
+                        .claim_controller(stream.clone())
+                        .map_err(|e| format!("failed to claim fl-host controller: {e}"))?;
+                    client
+                        .signal_session(stream, grant.lease, fl_host_proto::SignalKind::Interrupt)
+                        .map_err(|e| format!("fl-host signal_session Interrupt failed: {e}"))?;
+                    return Ok(());
+                }
                 return Err(agy_address_error(ls_address).replace("reset", "interrupt"));
             };
             let csrf = agy_csrf_token(csrf_token).ok_or_else(|| {
@@ -1947,7 +2136,52 @@ pub fn tmux_exact_target(target: &str) -> String {
     }
 }
 
+/// `true` when `fl-wire` should query `fl-host`. In unit tests (`cfg(test)`), `fl-host` is
+/// consulted only when `FL_HOST_SOCK` is explicitly set so hermetic tests never reach a live
+/// host daemon on the machine.
+pub(crate) fn host_discovery_allowed() -> bool {
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        std::env::var_os("FL_HOST_SOCK").is_some()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+fn resolve_live_host_session(
+    target: &str,
+) -> Option<(fl_host_proto::BlockingHostClient, fl_host_proto::StreamId)> {
+    if !host_discovery_allowed() {
+        return None;
+    }
+    let endpoint = fl_host_proto::HostEndpoint::discover().ok()?;
+    let mut client = fl_host_proto::BlockingHostClient::connect(&endpoint).ok()?;
+    let sessions = client.list_sessions().ok()?;
+    let matched_ids = crate::vendor_adapter::matching_live_host_sessions(&sessions, target);
+    if let Some(id) = matched_ids.first()
+        && let Some(summary) = sessions.iter().find(|s| {
+            &s.stream.session == id && matches!(s.state, fl_host_proto::ChildState::Running(_))
+        })
+    {
+        return Some((client, summary.stream.clone()));
+    }
+    let summary = sessions.iter().find(|s| {
+        s.stream.session.as_str() == target
+            && matches!(s.state, fl_host_proto::ChildState::Running(_))
+    })?;
+    Some((client, summary.stream.clone()))
+}
+
 fn tmux_target_alive(target: &str) -> bool {
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && resolve_live_host_session(target).is_some()
+    {
+        return true;
+    }
     let exact = tmux_exact_target(target);
     // `display-message` answers for the current window when an exact `session:window` target
     // matches nothing, so a window-qualified target is asked with `list-panes`, which fails.
@@ -1981,6 +2215,46 @@ const TMUX_ENTER_SETTLE_DELAY: Duration = Duration::from_millis(50);
 /// rather than as Enter presses, and a failed Enter clears the prompt line (`C-u`) so a retry
 /// does not paste the message a second time.
 fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Result<(), String> {
+    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+        && let Some((mut client, stream)) = resolve_live_host_session(target)
+    {
+        let grant = client
+            .claim_controller(stream.clone())
+            .map_err(|e| format!("failed to claim fl-host controller for {target}: {e}"))?;
+        if bracketed {
+            let pasted = format!("\x1b[200~{}\x1b[201~", text.trim()).into_bytes();
+            let outcome = client
+                .write_raw(stream.clone(), grant.lease, pasted)
+                .map_err(|e| format!("fl-host write_raw bracketed paste failed: {e}"))?;
+            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                return Err(format!("fl-host write_raw paste returned {outcome:?}"));
+            }
+            std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
+            let outcome = client
+                .write_raw(stream.clone(), grant.lease, b"\r".to_vec())
+                .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
+            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
+            }
+            let session_cap = stream.session.clone();
+            let saw_paste = poll_for_pasted_content(
+                6,
+                || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
+                || client.capture_output(session_cap.clone(), 4096).ok(),
+            );
+            if saw_paste {
+                let _ = client.write_raw(stream, grant.lease, b"\r".to_vec());
+            }
+        } else {
+            let outcome = client
+                .send_line(stream, grant.lease, text.trim().to_string())
+                .map_err(|e| format!("fl-host send_line failed: {e}"))?;
+            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                return Err(format!("fl-host send_line returned {outcome:?}"));
+            }
+        }
+        return Ok(());
+    }
     let tmux = tmux_bin();
     let exact = tmux_exact_target(target);
     let target = exact.as_str();
@@ -2199,14 +2473,31 @@ pub fn dispatch_operator_prompt_to_route(
     match route {
         VendorRoute::Claude {
             pid,
+            session_id,
             socket_path,
             key_path,
-            ..
         } => {
             if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
                 return Err(format!("claude pid {pid} is no longer running"));
             }
-            let (kpath, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
+            let (kpath, key_json) = match read_claude_key(*pid, socket_path, key_path.as_deref()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
+                        let host_target = (!session_id.trim().is_empty())
+                            .then(|| session_id.trim().to_string())
+                            .filter(|id| resolve_live_host_session(id).is_some())
+                            .or_else(|| (*pid != 0).then(|| tmux_pane_for_pid(*pid)).flatten());
+                        if let Some(target) = host_target {
+                            return deliver_via_tmux_paste(
+                                &target,
+                                &prefixed_operator_body(sender_name, body),
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             // The owner's own chat prompt is delivered as direct terminal input when the
             // session runs in a live tmux pane. The peer-session socket below labels every
             // message "came from another Claude session", which is wrong for the owner. Only
@@ -2307,6 +2598,17 @@ pub fn dispatch_operator_prompt_to_route(
             tmux_target.as_deref(),
             tmux_pane.as_deref(),
             body,
+        ),
+        VendorRoute::HostCli {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        } => deliver_to_host_cli_route(
+            session_id,
+            tmux_target.as_deref(),
+            tmux_pane.as_deref(),
+            &prefixed_operator_body(sender_name, body),
         ),
         VendorRoute::Webhook { socket_path } => {
             push_webhook_operator_prompt(socket_path, sender_name, body).map_err(String::from)
@@ -6458,5 +6760,274 @@ exit 1"#,
         CLI_TIMEOUT_OVERRIDE.with(|c| c.set(None));
         assert!(result.unwrap_err().contains("did not finish"));
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn fl_host_discovers_all_seven_vendors_and_dispatches_messages_and_controls() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SignalKind, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+
+        let make_summary = |id: &str, pid: u32| -> SessionSummary {
+            let sid = SessionId::new(id).unwrap();
+            SessionSummary {
+                stream: StreamId {
+                    host: HostInstance::new([1u8; 16]),
+                    session: sid.clone(),
+                    epoch: SessionEpoch(1),
+                },
+                mode: SessionMode::ReliablePipe,
+                state: ChildState::Running(ChildRecord {
+                    pid,
+                    session: sid,
+                    session_epoch: SessionEpoch(1),
+                    kind: SpawnKind::Pipe,
+                    input: InputState::Writable,
+                    started_at_ms: 1000,
+                    exit: None,
+                    consumer_stalled: false,
+                }),
+                acked: 0,
+                latest: 0,
+                input: InputState::Writable,
+            }
+        };
+
+        let self_pid = std::process::id();
+        let summaries = vec![
+            make_summary("Ada.claude", self_pid),
+            make_summary("Bea.codex", self_pid),
+            make_summary("Cy.antigravity", self_pid),
+            make_summary("Dee.grok", self_pid),
+            make_summary("muse.eve", self_pid),
+            make_summary("Fay.lemonade", self_pid),
+            make_summary("Gus.ollama", self_pid),
+        ];
+
+        let recorded_lines = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let recorded_writes = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let recorded_signals = Arc::new(Mutex::new(Vec::<(String, SignalKind)>::new()));
+
+        let lines_srv = Arc::clone(&recorded_lines);
+        let writes_srv = Arc::clone(&recorded_writes);
+        let signals_srv = Arc::clone(&recorded_signals);
+        let summaries_srv = summaries.clone();
+        let ep_srv = endpoint.clone();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summaries_conn = summaries_srv.clone();
+                    let lines_conn = Arc::clone(&lines_srv);
+                    let writes_conn = Arc::clone(&writes_srv);
+                    let signals_conn = Arc::clone(&signals_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: summaries_conn.clone(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::SendLine { stream, line, .. } => {
+                                    lines_conn
+                                        .lock()
+                                        .unwrap()
+                                        .push((stream.session.as_str().to_string(), line));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::Write { stream, bytes, .. } => {
+                                    writes_conn.lock().unwrap().push((
+                                        stream.session.as_str().to_string(),
+                                        bytes.into_vec(),
+                                    ));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::SignalSession { stream, signal, .. } => {
+                                    signals_conn
+                                        .lock()
+                                        .unwrap()
+                                        .push((stream.session.as_str().to_string(), signal));
+                                    ExtensionResponse::Controlled
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: String::new(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _disc = EnvGuard::set("FL_WIRE_TMUX_DISCOVERY", &home);
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+        let missing_codex = tmp.path().join("missing-codex");
+        let missing_agy = tmp.path().join("missing-agy");
+        let _bad_codex = EnvGuard::set("FL_WIRE_CODEX_BIN", &missing_codex);
+        let _bad_agy = EnvGuard::set("ANTIGRAVITY_AGENTAPI_EXE", &missing_agy);
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(&home), At::from_unix_millis(500));
+
+        assert!(matches!(
+            table.get("ada").map(|e| &e.route),
+            Some(VendorRoute::Claude { session_id, .. }) if session_id == "Ada.claude"
+        ));
+        assert!(matches!(
+            table.get("bea").map(|e| &e.route),
+            Some(VendorRoute::Codex { thread_id, .. }) if thread_id == "Bea.codex"
+        ));
+        assert!(matches!(
+            table.get("cy").map(|e| &e.route),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "Cy.antigravity"
+        ));
+        assert!(matches!(
+            table.get("dee").map(|e| &e.route),
+            Some(VendorRoute::Grok {
+                tmux_target: Some(t),
+                tmux_pane: Some(p),
+                ..
+            }) if t == "Dee:grok" && p == "Dee.grok"
+        ));
+        assert!(matches!(
+            table.get("eve").map(|e| &e.route),
+            Some(VendorRoute::Muse {
+                tmux_target: Some(t),
+                tmux_pane: Some(p),
+                ..
+            }) if t == "muse:eve" && p == "muse.eve"
+        ));
+        assert!(matches!(
+            table.get("fay").map(|e| &e.route),
+            Some(VendorRoute::HostCli {
+                vendor,
+                session_id,
+                tmux_target: Some(t),
+                tmux_pane: Some(p),
+                ..
+            }) if vendor == "lemonade" && session_id == "Fay.lemonade" && t == "Fay:lemonade" && p == "Fay.lemonade"
+        ));
+        assert!(matches!(
+            table.get("gus").map(|e| &e.route),
+            Some(VendorRoute::HostCli {
+                vendor,
+                session_id,
+                tmux_target: Some(t),
+                tmux_pane: Some(p),
+                ..
+            }) if vendor == "ollama" && session_id == "Gus.ollama" && t == "Gus:ollama" && p == "Gus.ollama"
+        ));
+
+        // Dispatch a WireMessage to Lemonade (`HostCli`) and Muse (`Muse`) over `fl-host`.
+        let store = MemStore::default();
+        let fay_route = table.get("fay").unwrap().route.clone();
+        let msg = mail_to(&store, "fay");
+        dispatch_to_route(&fay_route, &msg).unwrap();
+        dispatch_operator_prompt_to_route(&fay_route, "owner", "operator lemonade").unwrap();
+
+        let gus_route = table.get("gus").unwrap().route.clone();
+        let gus_msg = mail_to(&store, "gus");
+        dispatch_to_route(&gus_route, &gus_msg).unwrap();
+
+        let eve_route = table.get("eve").unwrap().route.clone();
+        let eve_msg = mail_to(&store, "eve");
+        dispatch_to_route(&eve_route, &eve_msg).unwrap();
+
+        let dee_route = table.get("dee").unwrap().route.clone();
+        clear_or_reforge_session(&dee_route, SessionResetMode::Clear, "owner", None).unwrap();
+
+        let plan = plan_interrupt(&fay_route, None).unwrap();
+        run_interrupt(&plan).unwrap();
+
+        let lines = recorded_lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|(s, l)| s == "Fay.lemonade" && l.contains(&msg.body)),
+            "expected lemonade WireMessage line, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(s, l)| s == "Fay.lemonade" && l.contains("operator lemonade")),
+            "expected lemonade operator prompt line, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(s, l)| s == "Gus.ollama" && l.contains(&gus_msg.body)),
+            "expected ollama WireMessage line, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(s, l)| s == "muse.eve" && l.contains(&eve_msg.body)),
+            "expected muse WireMessage line, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|(s, l)| s == "Dee.grok" && l == "/new"),
+            "expected grok /new reset line, got: {lines:?}"
+        );
+
+        let writes = recorded_writes.lock().unwrap().clone();
+        assert!(
+            writes
+                .iter()
+                .any(|(s, b)| s == "Fay.lemonade" && b == b"\x1b"),
+            "expected Escape interrupt write to Fay.lemonade, got: {writes:?}"
+        );
+
+        drop(server_thread);
     }
 }

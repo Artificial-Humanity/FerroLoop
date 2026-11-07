@@ -416,6 +416,8 @@ dependencies = [
  "fl-exec",
  "fl-gate",
  "fl-github",
+ "fl-host",
+ "fl-host-proto",
  "fl-hub",
  "fl-install",
  "fl-mcp",
@@ -654,6 +656,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror",
+ "tokio",
  "webpki-roots",
 ]
 

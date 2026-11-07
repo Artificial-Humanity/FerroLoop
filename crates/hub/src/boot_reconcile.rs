@@ -427,6 +427,11 @@ fn route_names_pane(route: &VendorRoute, pane_id: &str, target: &str) -> bool {
             tmux_target,
             tmux_pane,
             ..
+        }
+        | VendorRoute::HostCli {
+            tmux_target,
+            tmux_pane,
+            ..
         } => {
             (!pane_id.is_empty() && tmux_pane.as_deref() == Some(pane_id))
                 || tmux_target.as_deref() == Some(target)

@@ -1,0 +1,15 @@
+[Unit]
+Description=FerroLoop Native Agent Host (fl-host)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fl host serve
+KillMode=process
+Restart=on-failure
+RestartSec=2
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

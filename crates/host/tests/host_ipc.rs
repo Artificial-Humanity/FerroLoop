@@ -3620,7 +3620,10 @@ fn pty_reliable_session_supports_capture_output_and_write_raw() {
         if out.contains("PROMPT>") {
             break;
         }
-        assert!(Instant::now() < deadline, "did not observe PROMPT>: {out:?}");
+        assert!(
+            Instant::now() < deadline,
+            "did not observe PROMPT>: {out:?}"
+        );
         thread::sleep(Duration::from_millis(10));
     }
     let outcome = client
@@ -3635,7 +3638,10 @@ fn pty_reliable_session_supports_capture_output_and_write_raw() {
         if out.contains("GOT:yes") {
             break;
         }
-        assert!(Instant::now() < deadline, "did not observe GOT:yes: {out:?}");
+        assert!(
+            Instant::now() < deadline,
+            "did not observe GOT:yes: {out:?}"
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }

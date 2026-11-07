@@ -246,6 +246,11 @@ pub fn route_vendor(route: &VendorRoute) -> &'static str {
         VendorRoute::Codex { .. } => "codex",
         VendorRoute::Muse { .. } => "muse",
         VendorRoute::Grok { .. } => "grok",
+        VendorRoute::HostCli { vendor, .. } => match vendor.as_str() {
+            "lemonade" => "lemonade",
+            "ollama" => "ollama",
+            _ => "host_cli",
+        },
         VendorRoute::Webhook { .. } => "webhook",
     }
 }
