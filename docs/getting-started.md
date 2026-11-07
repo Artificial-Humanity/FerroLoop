@@ -75,6 +75,7 @@ Commands:
   flow        Author, inspect, and execute directed workflow graphs
   arch        Initialize, inspect, check, and export the declarative architecture model
   hub         Run and manage the FerroLoop Hub daemon and FerroDeck command center
+  host        Run and manage the native FerroLoop Agent Host (`fl-host`) daemon and sessions
   store       Look at, and tend, the engine file behind the bound store
   vault       Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway [alias: gateway]
   auth        Owner warrants: signed, scoped, expiring grants of Owner authority (`grant`, `verify`, `list`, `revoke`)
