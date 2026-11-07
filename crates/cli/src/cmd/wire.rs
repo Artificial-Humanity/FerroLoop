@@ -422,6 +422,31 @@ pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(
     remove_route_at(&sock, &paths, persona)
 }
 
+pub(crate) fn sync_store_retired_personas<S: AgentRegistry>(store: &S) {
+    #[cfg(test)]
+    if resolve_routes_path().is_none() {
+        return;
+    }
+    let mut active_names = std::collections::BTreeSet::new();
+    let mut retired_candidates = std::collections::BTreeSet::new();
+    for agent in store.list_agents(None, true).unwrap_or_default() {
+        let key = agent.name_key.to_ascii_lowercase();
+        match agent.status {
+            fl_core::agent::AgentStatus::Active => {
+                active_names.insert(key);
+            }
+            fl_core::agent::AgentStatus::Retired => {
+                retired_candidates.insert(key);
+            }
+        }
+    }
+    let retired: std::collections::BTreeSet<String> = retired_candidates
+        .difference(&active_names)
+        .cloned()
+        .collect();
+    let _ = fl_wire::identity::sync_retired_personas_in_tombstones(None, &retired);
+}
+
 pub(crate) fn evict_persona_route(persona: &str) {
     #[cfg(test)]
     if resolve_routes_path().is_none() {
@@ -1625,6 +1650,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                 by,
             }) {
                 Ok(rec) => {
+                    sync_store_retired_personas(&store);
                     if let Some(route) = capture_current_env_route() {
                         record_caller_route_with_provenance(env, &rec.name_key, route, true)
                             .map_err(|error| {
@@ -1661,6 +1687,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             let retired = store
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
+            sync_store_retired_personas(&store);
             remove_caller_route(env, &by)
                 .map_err(|e| (1, format!("agent retired but route removal failed: {e}")))?;
             prune_muse_roster(&by).map_err(|e| {
@@ -1832,7 +1859,7 @@ fn dispatch_diagnostics_summary(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     fn test_send_args() -> SendWireArgs {
         SendWireArgs {
             id: None,
@@ -2173,6 +2200,30 @@ mod tests {
                 .get("ada")
                 .is_none()
         );
+        assert!(
+            fl_wire::identity::load_retired_personas(None).contains("ada"),
+            "fl agent retire must sync retired_personas in decommission sidecar"
+        );
+
+        crate::cmd::agent::run(
+            &store,
+            crate::cmd::agent::AgentCmd::Register {
+                name: "Ada".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                create_area: false,
+                extra_areas: vec![],
+                email: None,
+                replace: true,
+                by: "ada".into(),
+                json: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            !fl_wire::identity::load_retired_personas(None).contains("ada"),
+            "fl agent register --replace must clear retired_personas in decommission sidecar"
+        );
     }
     #[test]
     fn retention_cutoff_saturates_instead_of_wrapping() {
@@ -2195,12 +2246,13 @@ mod tests {
     static HOOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Serialises the tests that read or write process-global environment variables.
-    fn hook_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn hook_env_lock() -> std::sync::MutexGuard<'static, ()> {
         HOOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    const HOOK_ENV_VARS: [&str; 15] = [
+    const HOOK_ENV_VARS: [&str; 16] = [
         "HOME",
+        "XDG_RUNTIME_DIR",
         "AGENT_PERSONA",
         "AGENT_NAME",
         "FL_WIRE_ROUTES",
@@ -2764,13 +2816,8 @@ mod tests {
 
     #[test]
     fn test_wire_cli_send_read_ack_reply_and_agent_msg_compat() {
-        let _env_lock = hook_env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: isolates test from discovering host agent routes.
-        unsafe {
-            std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
-            std::env::set_var("FL_WIRE_ROUTES", dir.path().join("routes.json"));
-        }
+        let rig = HookRig::new(None);
+        let dir = &rig.dir;
         let db = dir.path().join("fl.redb");
         let sock = dir.path().join("wire.sock");
         let cfg = Config {

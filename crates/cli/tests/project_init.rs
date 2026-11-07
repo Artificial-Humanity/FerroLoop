@@ -40,8 +40,10 @@ impl Env {
     fn fl(&self, cwd: &Path) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
         c.env("HOME", self.home.path())
+            .env("XDG_RUNTIME_DIR", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))
+            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
             .env_remove("FL_DB")
             .env_remove("FL_STORE_BACKEND")
             .env("FL_TEST_SPINUP_NO_SPAWN", "1")

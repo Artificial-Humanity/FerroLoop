@@ -536,6 +536,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             };
             match store.register_agent(args) {
                 Ok(rec) => {
+                    crate::cmd::wire::sync_store_retired_personas(store);
                     let all_active = store.list_agents(None, false).unwrap_or_default();
                     let mgr = reports_to(&rec, &all_active);
                     if json {
@@ -576,6 +577,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let retired = store
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
+            crate::cmd::wire::sync_store_retired_personas(store);
             crate::cmd::wire::evict_persona_route(&retired.name_key);
             if json {
                 println!("{}", serde_json::to_string_pretty(&retired).unwrap());
@@ -1076,6 +1078,7 @@ mod tests {
 
     #[test]
     fn test_agent_run_exit_codes() {
+        let _lock = crate::cmd::wire::tests::hook_env_lock();
         let store = MemStore::default();
         let res = run(
             &store,

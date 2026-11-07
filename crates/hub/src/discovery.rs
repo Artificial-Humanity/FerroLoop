@@ -889,6 +889,8 @@ fn discover_sessions_from_routes(
         )
     });
 
+    let file_decommissioned = fl_wire::identity::load_decommissioned_session_ids(home_override);
+
     for (persona, entry) in ordered_routes {
         if only_persona.is_some_and(|selected| selected != persona) {
             continue;
@@ -897,7 +899,9 @@ fn discover_sessions_from_routes(
             continue;
         }
         let raw_id = route_session_id(persona, &entry.route);
-        if route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route) {
+        if route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route)
+            || route_was_decommissioned(&file_decommissioned, &entry.route)
+        {
             continue;
         }
         let (adapter, cwd, transcript_path) = match &entry.route {

@@ -119,14 +119,23 @@ pub fn decommissioned_sessions_path(home_override: Option<&Path>) -> PathBuf {
             .join(".cache")
             .join("agent-bus")
             .join(DECOMMISSIONED_SESSIONS_FILE),
-        None => default_routes_path()
-            .parent()
-            .map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE))
+        None => std::env::var_os("FL_WIRE_ROUTES")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| Some(default_routes_path()))
+            .and_then(|p| p.parent().map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE)))
             .unwrap_or_else(|| PathBuf::from("/tmp").join(DECOMMISSIONED_SESSIONS_FILE)),
     }
 }
 
 fn persistent_decommissioned_sessions_path() -> Option<PathBuf> {
+    if std::env::var_os("FL_WIRE_ROUTES")
+        .map(PathBuf::from)
+        .is_some_and(|p| p.is_absolute())
+        || std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1")
+    {
+        return None;
+    }
     legacy_routes_path().and_then(|p| p.parent().map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE)))
 }
 
@@ -143,17 +152,31 @@ fn write_decommissioned_session_bytes(path: &Path, bytes: &[u8]) -> std::io::Res
     Ok(())
 }
 
+fn read_decommissioned_sessions_value_from(
+    primary: &Path,
+    fallback: Option<&Path>,
+) -> Option<serde_json::Value> {
+    if let Ok(raw) = fs::read_to_string(primary)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        return Some(val);
+    }
+    if let Some(fallback) = fallback
+        && let Ok(raw) = fs::read_to_string(fallback)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        return Some(val);
+    }
+    None
+}
+
 fn read_decommissioned_sessions_value(home_override: Option<&Path>) -> Option<serde_json::Value> {
     let primary = decommissioned_sessions_path(home_override);
-    let raw = match fs::read_to_string(&primary) {
-        Ok(raw) => raw,
-        Err(_) if home_override.is_none() => {
-            let fallback = persistent_decommissioned_sessions_path()?;
-            fs::read_to_string(fallback).ok()?
-        }
-        Err(_) => return None,
-    };
-    serde_json::from_str::<serde_json::Value>(&raw).ok()
+    let fallback = home_override
+        .is_none()
+        .then(persistent_decommissioned_sessions_path)
+        .flatten();
+    read_decommissioned_sessions_value_from(&primary, fallback.as_deref())
 }
 
 /// Ids in the decommission sidecar. An empty or unreadable file is an empty set.
@@ -230,6 +253,15 @@ pub fn save_decommissioned_tombstones(
         let _ = write_decommissioned_session_bytes(&persistent, &bytes);
     }
     Ok(())
+}
+
+/// Update `retired_personas` in the decommission sidecar while preserving existing `session_ids`.
+pub fn sync_retired_personas_in_tombstones(
+    home_override: Option<&Path>,
+    retired_personas: &BTreeSet<String>,
+) -> std::io::Result<()> {
+    let ids = load_decommissioned_session_ids(home_override);
+    save_decommissioned_tombstones(home_override, &ids, retired_personas)
 }
 
 /// Vendors whose `vendor:persona` slug is a hosted session name, not a native id.
@@ -7401,6 +7433,50 @@ mod tests {
         assert!(
             table.get("fiona").is_some(),
             "explicit route registration for a retired persona stays"
+        );
+    }
+
+    #[test]
+    fn empty_or_corrupt_primary_decommission_sidecar_falls_back_to_persistent_copy() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("primary.json");
+        let fallback = tmp.path().join("persistent.json");
+        fs::write(
+            &fallback,
+            r#"{"session_ids":["conv-persisted"],"retired_personas":["fiona"]}"#,
+        )
+        .unwrap();
+
+        // Empty primary falls back to persistent file.
+        fs::write(&primary, "").unwrap();
+        let val = read_decommissioned_sessions_value_from(&primary, Some(&fallback))
+            .expect("fallback value");
+        assert_eq!(val["session_ids"], serde_json::json!(["conv-persisted"]));
+        assert_eq!(val["retired_personas"], serde_json::json!(["fiona"]));
+
+        // Corrupt primary falls back to persistent file.
+        fs::write(&primary, "{not-valid-json").unwrap();
+        let val = read_decommissioned_sessions_value_from(&primary, Some(&fallback))
+            .expect("fallback value");
+        assert_eq!(val["session_ids"], serde_json::json!(["conv-persisted"]));
+
+        // sync_retired_personas_in_tombstones preserves existing session_ids.
+        let home = tmp.path().join("home");
+        save_decommissioned_tombstones(
+            Some(&home),
+            &BTreeSet::from(["conv-keep".to_string()]),
+            &BTreeSet::from(["fiona".to_string()]),
+        )
+        .unwrap();
+        sync_retired_personas_in_tombstones(Some(&home), &BTreeSet::from(["ada".to_string()]))
+            .unwrap();
+        assert_eq!(
+            load_decommissioned_session_ids(Some(&home)),
+            BTreeSet::from(["conv-keep".to_string()])
+        );
+        assert_eq!(
+            load_retired_personas(Some(&home)),
+            BTreeSet::from(["ada".to_string()])
         );
     }
 }

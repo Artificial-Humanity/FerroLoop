@@ -2926,10 +2926,11 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
     };
+    let dropped_ids = previous.as_ref().map(record_native_ids).unwrap_or_default();
     persist_hosted_session(store, &record, by)?;
     // The running record replaced any decommissioned one on this slug. Drop that
     // tombstone before hydration, or discovery would hide the new session.
-    refresh_decommission_tombstones(store, env.home_override);
+    refresh_decommission_tombstones_dropping(store, env.home_override, &dropped_ids);
     // A route left by another vendor would take the hydration prompt.
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
@@ -3566,10 +3567,30 @@ pub(crate) fn refresh_decommission_tombstones<S: AgentRegistry + StateStore>(
     store: &S,
     home_override: Option<&Path>,
 ) {
+    refresh_decommission_tombstones_dropping(store, home_override, &[]);
+}
+
+pub(crate) fn refresh_decommission_tombstones_dropping<S: AgentRegistry + StateStore>(
+    store: &S,
+    home_override: Option<&Path>,
+    dropped_ids: &[String],
+) {
     let Ok(records) = list_hosted_sessions(store) else {
         return;
     };
-    let mut ids = BTreeSet::new();
+    let mut ids: BTreeSet<String> =
+        fl_wire::identity::load_decommissioned_session_ids(home_override)
+            .into_iter()
+            .filter(|id| is_native_session_id(id))
+            .collect();
+    for id in dropped_ids {
+        ids.remove(id);
+    }
+    for record in &records {
+        if !record.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONED) {
+            ids.remove(&record.session_id);
+        }
+    }
     for record in records {
         ids.extend(record_native_ids(&record));
     }
@@ -8004,5 +8025,102 @@ mod tests {
         );
         let retired = fl_wire::identity::load_retired_personas(Some(home.path()));
         assert!(retired.contains("fiona"), "{retired:?}");
+    }
+
+    #[test]
+    fn pre_existing_native_tombstones_survive_refresh_and_spin_up_and_filter_discovery() {
+        let store = fl_store::AnyStore::in_memory();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+
+        // Seed a pre-existing native session ID in decommissioned-sessions.json that has no
+        // corresponding hosted-session-* record in the store, alongside a persona-derived ID.
+        fl_wire::identity::save_decommissioned_session_ids(
+            Some(home.path()),
+            &BTreeSet::from([
+                "conv-orphan-tombstone".to_string(),
+                "codex:ghost".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        refresh_decommission_tombstones(&store, Some(home.path()));
+        let after_refresh = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(
+            after_refresh.contains("conv-orphan-tombstone"),
+            "pre-existing native tombstone must survive refresh: {after_refresh:?}"
+        );
+        assert!(
+            !after_refresh.contains("codex:ghost"),
+            "non-native persona-derived tombstone must still be cleaned up: {after_refresh:?}"
+        );
+
+        // Spin up and decommission a hosted session, then re-spin it: its own old tombstone
+        // is dropped on re-spin while the orphan native tombstone remains.
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-ada-old".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(10),
+        );
+        routes.upsert(
+            "orphan",
+            VendorRoute::Agy {
+                conversation_id: "conv-orphan-tombstone".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(10),
+        );
+        let rpath = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&rpath)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        let after_teardown = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(after_teardown.contains("conv-orphan-tombstone"));
+        assert!(after_teardown.contains("conv-ada-old"));
+
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let after_respin = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(
+            after_respin.contains("conv-orphan-tombstone"),
+            "orphan tombstone must survive spin_up of another session: {after_respin:?}"
+        );
+        assert!(
+            !after_respin.contains("conv-ada-old"),
+            "re-spun session's own old tombstone must be dropped: {after_respin:?}"
+        );
+
+        let snap = crate::discovery::snapshot_discovery_store(&store);
+        let discovered =
+            crate::discovery::discover_route_sessions_without_model_info(&snap, Some(home.path()));
+        assert!(
+            !discovered.iter().any(|s| s.id == "conv-orphan-tombstone"),
+            "discovery must skip pre-existing sidecar tombstone: {discovered:?}"
+        );
     }
 }
