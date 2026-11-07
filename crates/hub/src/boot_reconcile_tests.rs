@@ -1247,6 +1247,61 @@ fn a_store_that_cannot_be_opened_for_a_send_fails_that_name_only() {
     assert_eq!(inbox(&state, &failed).len(), 1);
 }
 
+#[test]
+fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanning_routes() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    let native_id = "019dc759-7b95-7e90-b411-579a0c7f43a5";
+    {
+        let store = state.open_store().unwrap();
+        let rec = crate::lifecycle::HostedSessionRecord {
+            session_id: "codex:fiona".into(),
+            persona: "fiona".into(),
+            project: "FerroLoop".into(),
+            role: "assistant".into(),
+            vendor: "codex".into(),
+            model: None,
+            node_id: "local".into(),
+            hosted: true,
+            status: crate::lifecycle::STATUS_DECOMMISSIONED.into(),
+            restart_policy: "on-failure".into(),
+            restart_count: 0,
+            tmux_target: Some("Fiona:codex".into()),
+            cwd: None,
+            context_window: None,
+            hydration_dispatched: false,
+            runtime_spawned: false,
+            tombstone_ids: vec![native_id.into()],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            decommission_prepared_at_ms: None,
+        };
+        crate::lifecycle::persist_hosted_session(&*store, &rec, "owner").unwrap();
+    }
+    // Simulate a reboot that wiped the decommission sidecar while a stale route still names the
+    // decommissioned native conversation id.
+    let sidecar = fl_wire::identity::decommissioned_sessions_path(Some(&fx.home()));
+    let _ = std::fs::remove_file(&sidecar);
+    assert!(!sidecar.exists());
+    fx.put_route(
+        "fiona",
+        VendorRoute::Codex {
+            thread_id: native_id.into(),
+            cwd: None,
+        },
+        stamp::now(),
+    );
+
+    reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+
+    let banned = fl_wire::identity::load_decommissioned_session_ids(Some(&fx.home()));
+    assert!(banned.contains(native_id), "{banned:?}");
+    assert!(
+        !fx.has_route("fiona"),
+        "the decommissioned route is dropped during step 1 route scan"
+    );
+}
+
 // The reconciliation ends with `serve`.
 
 #[tokio::test]

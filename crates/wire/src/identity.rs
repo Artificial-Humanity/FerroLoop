@@ -126,11 +126,39 @@ pub fn decommissioned_sessions_path(home_override: Option<&Path>) -> PathBuf {
     }
 }
 
+fn persistent_decommissioned_sessions_path() -> Option<PathBuf> {
+    legacy_routes_path().and_then(|p| p.parent().map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE)))
+}
+
+fn write_decommissioned_session_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Ids in the decommission sidecar. An empty or unreadable file is an empty set.
 /// Empty strings are ignored.
 pub fn load_decommissioned_session_ids(home_override: Option<&Path>) -> BTreeSet<String> {
-    let Ok(raw) = fs::read_to_string(decommissioned_sessions_path(home_override)) else {
-        return BTreeSet::new();
+    let primary = decommissioned_sessions_path(home_override);
+    let raw = match fs::read_to_string(&primary) {
+        Ok(raw) => raw,
+        Err(_) if home_override.is_none() => {
+            let Some(fallback) = persistent_decommissioned_sessions_path() else {
+                return BTreeSet::new();
+            };
+            let Ok(raw) = fs::read_to_string(fallback) else {
+                return BTreeSet::new();
+            };
+            raw
+        }
+        Err(_) => return BTreeSet::new(),
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return BTreeSet::new();
@@ -154,16 +182,14 @@ pub fn save_decommissioned_session_ids(
     ids: &BTreeSet<String>,
 ) -> std::io::Result<()> {
     let path = decommissioned_sessions_path(home_override);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "session_ids": ids }))
         .map_err(std::io::Error::other)?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    fs::write(&tmp, bytes)?;
-    if let Err(err) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
+    write_decommissioned_session_bytes(&path, &bytes)?;
+    if home_override.is_none()
+        && let Some(persistent) = persistent_decommissioned_sessions_path()
+        && persistent != path
+    {
+        let _ = write_decommissioned_session_bytes(&persistent, &bytes);
     }
     Ok(())
 }

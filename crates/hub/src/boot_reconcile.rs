@@ -438,6 +438,7 @@ pub(crate) fn reconcile_pass_with(
     let home = state.config.home_override.as_deref();
     let (agents, hosted, mut epoch) = {
         let store = state.open_store().map_err(|e| e.to_string())?;
+        crate::lifecycle::refresh_decommission_tombstones(&*store, home);
         let agents = store.list_agents(None, true).map_err(|e| e.to_string())?;
         let hosted = list_hosted_sessions(&*store).unwrap_or_default();
         (agents, hosted, epoch_state(&*store))

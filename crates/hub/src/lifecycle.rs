@@ -2223,6 +2223,35 @@ fn poll_grok_directory_trust(
     );
 }
 
+/// The modal Claude Code prints on first launch when auto mode asks for environment setup.
+const CLAUDE_AUTO_MODE_PROMPT: &str = "Teach auto mode about your environment";
+
+fn dismiss_claude_auto_mode_prompt(runtime: &dyn SessionRuntime, target: &str) {
+    poll_claude_auto_mode_prompt(
+        runtime.settle_delay(),
+        || runtime.capture(target),
+        |keys| {
+            let _ = runtime.send_keys(target, keys);
+        },
+    );
+}
+
+fn poll_claude_auto_mode_prompt(
+    delay: Duration,
+    mut capture: impl FnMut() -> String,
+    mut send_keys: impl FnMut(&str),
+) {
+    for attempt in 0..GROK_TRUST_CAPTURES {
+        if capture().contains(CLAUDE_AUTO_MODE_PROMPT) {
+            send_keys("Escape");
+            return;
+        }
+        if attempt + 1 < GROK_TRUST_CAPTURES && !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+}
+
 /// One window of a tmux session as [`marked_windows`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TmuxWindow {
@@ -2681,12 +2710,47 @@ pub(crate) fn remove_routes(
     })
 }
 
+fn unregister_routes_in_daemon<'a>(
+    home_override: Option<&Path>,
+    personas: impl IntoIterator<Item = &'a str>,
+) {
+    #[cfg(test)]
+    let _ = (home_override, personas);
+    #[cfg(not(test))]
+    {
+        if home_override.is_some() {
+            return;
+        }
+        let sock = std::env::var_os("FL_WIRE_SOCKET")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(fl_wire::daemon::default_socket_path);
+        for persona in personas {
+            let persona = persona.trim().to_ascii_lowercase();
+            if persona.is_empty() {
+                continue;
+            }
+            if let Ok(mut client) = fl_wire::daemon::LocalClient::connect(
+                &sock,
+                fl_wire::daemon::DEFAULT_LOCAL_RPC_TIMEOUT,
+            ) {
+                let _ = client.request(&fl_wire::daemon::LocalRequest::UnregisterRoute { persona });
+            }
+        }
+    }
+}
+
 fn remove_routes_locked(
     home_override: Option<&Path>,
     personas: &[&str],
     session_ids: &[&str],
 ) -> usize {
     let mut removed = 0;
+    let mut dropped_personas: BTreeSet<String> = personas
+        .iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
     for path in route_table_paths(home_override) {
         if !path.is_file() {
             continue;
@@ -2698,13 +2762,18 @@ fn remove_routes_locked(
             let by_id = session_ids
                 .iter()
                 .any(|id| route_matches_session_id(&entry.route, id));
-            !(by_key || by_id)
+            let drop_entry = by_key || by_id;
+            if drop_entry {
+                dropped_personas.insert(key.to_ascii_lowercase());
+            }
+            !drop_entry
         });
         let dropped = before - table.entries.len();
         if dropped > 0 && table.save(Some(&path)).is_ok() {
             removed += dropped;
         }
     }
+    unregister_routes_in_daemon(home_override, dropped_personas.iter().map(String::as_str));
     removed
 }
 
@@ -2868,6 +2937,12 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         && let Some(target) = tmux_target.as_deref()
     {
         accept_grok_directory_trust(env.runtime, target);
+    }
+    if spawned
+        && v.vendor == "claude"
+        && let Some(target) = tmux_target.as_deref()
+    {
+        dismiss_claude_auto_mode_prompt(env.runtime, target);
     }
     // A runtime launched with the prompt as its first input has the prompt already, provided the
     // command stayed up: one that exited at once took its session with it, and there is nothing
@@ -3144,6 +3219,11 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
 
     let now = now_ms();
     let mut record = record_for_target(store, target)?;
+    if record.vendor == "unknown"
+        && let Some(vendor) = infer_vendor_from_routes(env.home_override, &record, target)
+    {
+        record.vendor = vendor;
+    }
     record.status = STATUS_DECOMMISSIONING.to_string();
     record.decommission_prepared_at_ms = Some(now);
     record.updated_at_ms = now;
@@ -3269,6 +3349,7 @@ fn purge_cross_vendor_routes<S: StateStore>(
 ) {
     let records = list_hosted_sessions(store).unwrap_or_default();
     crate::discovery::with_route_file_lock(|| {
+        let mut dropped_personas = BTreeSet::new();
         for path in route_table_paths(home_override) {
             if !path.is_file() {
                 continue;
@@ -3290,9 +3371,12 @@ fn purge_cross_vendor_routes<S: StateStore>(
             if keep {
                 continue;
             }
-            table.entries.remove(&key);
+            if table.entries.remove(&key).is_some() {
+                dropped_personas.insert(key.to_ascii_lowercase());
+            }
             let _ = table.save(Some(&path));
         }
+        unregister_routes_in_daemon(home_override, dropped_personas.iter().map(String::as_str));
     });
 }
 
@@ -3397,6 +3481,25 @@ fn route_for_teardown(
         .map(|entry| entry.route.clone())
 }
 
+fn infer_vendor_from_routes(
+    home_override: Option<&Path>,
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+) -> Option<String> {
+    for path in route_table_paths(home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        if let Some(route) = route_for_teardown(&table, record, target)
+            && let Some(vendor) = vendor_id_of_route(&route)
+        {
+            return Some(vendor.to_string());
+        }
+    }
+    None
+}
+
 /// Native session ids of a decommissioned record. Persona-derived ids stored on
 /// an old record are left out, so a stale `vendor:persona` tombstone does not
 /// keep banning the name.
@@ -3416,7 +3519,10 @@ pub(crate) fn record_native_ids(record: &HostedSessionRecord) -> Vec<String> {
 /// Rewrite the decommission sidecar from records that are still decommissioned.
 /// A re-spin overwrites the same slug with a running record, so its ids leave the file.
 /// Only native session ids are written.
-fn refresh_decommission_tombstones<S: StateStore>(store: &S, home_override: Option<&Path>) {
+pub(crate) fn refresh_decommission_tombstones<S: StateStore>(
+    store: &S,
+    home_override: Option<&Path>,
+) {
     let Ok(records) = list_hosted_sessions(store) else {
         return;
     };
@@ -3572,6 +3678,11 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
 ) -> Result<DecommissionResponse, LifecycleError> {
     authorize_teardown(store, target, caller)?;
     let mut record = record_for_target(store, target)?;
+    if record.vendor == "unknown"
+        && let Some(vendor) = infer_vendor_from_routes(env.home_override, &record, target)
+    {
+        record.vendor = vendor;
+    }
     let agent = store.agent_by_name(&target.persona)?;
     let sharing = runtime_sharers(store, &record)?;
     let shared_runtime = record.runtime_spawned && !sharing.is_empty();
@@ -5916,6 +6027,65 @@ mod tests {
         let mut sent = Vec::new();
         poll_grok_directory_trust(
             "Ada:grok",
+            Duration::ZERO,
+            || {
+                misses += 1;
+                String::new()
+            },
+            |keys| sent.push(keys.to_string()),
+        );
+        assert_eq!(misses, 10);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn claude_spin_up_dismisses_the_auto_mode_prompt() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.panes.borrow_mut().insert(
+            "Ada:claude".into(),
+            "Teach auto mode about your environment?\n❯ Yes, open in external editor\n  Skip for now (Esc)".into(),
+        );
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "send-keys Ada:claude Escape")
+        );
+    }
+
+    #[test]
+    fn claude_auto_mode_poll_sends_escape_once_after_two_misses_and_nothing_after_ten() {
+        let mut seen = 0u32;
+        let mut sent = Vec::new();
+        poll_claude_auto_mode_prompt(
+            Duration::ZERO,
+            || {
+                seen += 1;
+                if seen <= 2 {
+                    String::new()
+                } else {
+                    "Teach auto mode about your environment?".into()
+                }
+            },
+            |keys| sent.push(keys.to_string()),
+        );
+        assert_eq!(seen, 3, "a hit stops the poll");
+        assert_eq!(sent, ["Escape".to_string()]);
+
+        let mut misses = 0u32;
+        let mut sent = Vec::new();
+        poll_claude_auto_mode_prompt(
             Duration::ZERO,
             || {
                 misses += 1;
