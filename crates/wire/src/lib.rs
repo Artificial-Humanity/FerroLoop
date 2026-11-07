@@ -3,6 +3,7 @@
 
 mod codex_control;
 pub mod daemon;
+pub mod dispatch_diagnostics;
 pub mod dispatcher;
 pub mod identity;
 pub mod peer;

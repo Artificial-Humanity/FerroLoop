@@ -34,7 +34,11 @@ use fl_core::ids::MessageId;
 use fl_core::store::{AgentRegistry, MessageStore};
 use serde::{Deserialize, Serialize};
 
-use crate::dispatcher::dispatch_message_for_recipient;
+use crate::dispatch_diagnostics::{
+    DiagnosticsState, DispatchDiagnostics, DispatchReport, FailureStage, FenceDiagnostic,
+    FenceReason, SuppressionPhase,
+};
+use crate::dispatcher::dispatch_message_for_recipient_with_report;
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
 use crate::peer::{PeerFrame, handshake_peer};
 use crate::ws::{WsError, WsStream};
@@ -261,6 +265,8 @@ pub struct DaemonStatus {
     pub listen_addr: Option<String>,
     pub connected_peers: Vec<String>,
     pub routes: Vec<RouteEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_diagnostics: Option<DispatchDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +398,67 @@ enum DispatchOutcome {
     Unconfirmed,
 }
 
+/// Acquire entropy once per instance; unavailable entropy never blocks startup.
+fn new_dispatch_diagnostics() -> DiagnosticsState {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 16];
+    #[cfg(test)]
+    let failed = tests::ENTROPY_FAILURE.with(|failure| failure.get());
+    #[cfg(not(test))]
+    let failed = false;
+    #[cfg(test)]
+    tests::ENTROPY_ATTEMPTS.with(|n| n.set(n.get() + 1));
+    let nonce = if !failed && SystemRandom::new().fill(&mut bytes).is_ok() {
+        Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    } else {
+        None
+    };
+    DiagnosticsState::new(now_at(), nonce)
+}
+
+fn failure_reason(stage: FailureStage) -> FenceReason {
+    match stage {
+        FailureStage::MessageLookupMissing => FenceReason::MessageLookupMissing,
+        FailureStage::MessageLookupError => FenceReason::MessageLookupError,
+        FailureStage::InitialReceiptReadError => FenceReason::InitialReceiptReadError,
+        FailureStage::TransportError => FenceReason::TransportError,
+        FailureStage::ReceiptWriteError => FenceReason::ReceiptWriteError,
+        FailureStage::ReceiptWriteMissing => FenceReason::ReceiptWriteMissing,
+        FailureStage::FinalReceiptReadError => FenceReason::FinalReceiptReadError,
+        FailureStage::FinalReceiptReadMissing => FenceReason::FinalReceiptReadMissing,
+        FailureStage::UnresolvedReceiptStatus => FenceReason::UnresolvedReceiptStatus,
+        FailureStage::WorkerPanic => FenceReason::WorkerPanic,
+    }
+}
+
+/// Prepare immutable safe fields outside scheduler/fence locks. The timestamp
+/// is replaced at the actual marker transition, never taken from enqueue time.
+fn hold_evidence(
+    recipient: &str,
+    id: Option<&MessageId>,
+    phase: SuppressionPhase,
+    reason: FenceReason,
+    report: &DispatchReport,
+) -> FenceDiagnostic {
+    let mut row = FenceDiagnostic::from_report(recipient, id, now_at(), phase, reason, report);
+    if let Some(stage) = report.failure_stages.first() {
+        row.first_reason = failure_reason(*stage);
+    }
+    if let Some(stage) = report.failure_stages.last() {
+        row.decisive_reason = failure_reason(*stage);
+    }
+    row
+}
+
+fn log_first_holds(rows: Vec<FenceDiagnostic>) {
+    for row in rows {
+        // All strings are bounded safe projections; JSON escapes control bytes.
+        if let Ok(json) = serde_json::to_string(&row) {
+            warn(&format!("dispatch hold: {json}"));
+        }
+    }
+}
+
 struct DaemonInner<S> {
     store: Arc<S>,
     config: DaemonConfig,
@@ -404,6 +471,7 @@ struct DaemonInner<S> {
     overflow_recipients: Mutex<BTreeSet<String>>,
     /// At the hard metadata limit we can no longer distinguish additional recipients safely.
     overflow_capacity_exhausted: AtomicBool,
+    dispatch_diagnostics: Mutex<DiagnosticsState>,
     #[cfg(test)]
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
@@ -497,16 +565,22 @@ where
         msg: &WireMessage,
         recipient: &str,
         now: At,
+        report: &mut DispatchReport,
     ) -> DispatchOutcome {
         let base = lock(&self.routes).clone();
         let mut working = base.clone();
-        let (updated, attempted) = dispatch_message_for_recipient(
+        #[cfg(test)]
+        let dispatch = tests::dispatch_with_test_transport;
+        #[cfg(not(test))]
+        let dispatch = dispatch_message_for_recipient_with_report;
+        let (updated, attempted) = dispatch(
             self.store.as_ref(),
             &mut working,
             self.config.home_override.as_deref(),
             msg,
             now,
             recipient,
+            report,
         );
         // Discovery inside the dispatch also learns replaced sessions and prunes dead routes;
         // carry both back, and persist them so a restart starts from the refreshed table.
@@ -521,15 +595,21 @@ where
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
         }
-        let receipt = self
-            .store
-            .list_wire_receipts(&msg.id)
-            .ok()
-            .and_then(|receipts| {
-                receipts
+        let receipt = match self.store.list_wire_receipts(&msg.id) {
+            Ok(receipts) => {
+                let receipt = receipts
                     .into_iter()
-                    .find(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient))
-            });
+                    .find(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
+                if receipt.is_none() {
+                    report.record_failure(FailureStage::FinalReceiptReadMissing);
+                }
+                receipt
+            }
+            Err(_) => {
+                report.record_failure(FailureStage::FinalReceiptReadError);
+                None
+            }
+        };
         match receipt {
             Some(receipt)
                 if matches!(
@@ -545,7 +625,12 @@ where
             {
                 DispatchOutcome::NoRoute
             }
-            _ => DispatchOutcome::Unconfirmed,
+            _ => {
+                if receipt.is_some() {
+                    report.record_failure(FailureStage::UnresolvedReceiptStatus);
+                }
+                DispatchOutcome::Unconfirmed
+            }
         }
     }
 
@@ -555,6 +640,8 @@ where
         self: &Arc<Self>,
         queues: &mut BTreeMap<String, RecipientDispatchQueue>,
         recipient: &str,
+        evidence: &FenceDiagnostic,
+        first_holds: &mut Vec<FenceDiagnostic>,
     ) -> Result<(), String> {
         let active = queues.values().filter(|queue| queue.worker_active).count();
         let Some(queue) = queues.get_mut(recipient) else {
@@ -571,7 +658,13 @@ where
         queue.waiting_for_route = false;
         queue.worker_active = true;
         if let Err(error) = self.spawn_recipient_worker(recipient.to_string()) {
-            self.retain_overflow_fence(recipient);
+            let mut row = evidence.clone();
+            row.phase = SuppressionPhase::RetainedFence;
+            row.first_reason = FenceReason::WorkerSpawnFailure;
+            row.decisive_reason = FenceReason::WorkerSpawnFailure;
+            if let Some(log) = self.retain_overflow_fence(recipient, row) {
+                first_holds.push(log);
+            }
             queues.remove(recipient);
             return Err(format!("could not start delivery worker: {error}"));
         }
@@ -595,35 +688,92 @@ where
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        let mut queues = lock(&self.dispatch_queues);
-        let names: Vec<_> = queues
+        // Snapshot inputs only, then project without scheduler locks. Admission
+        // below revalidates existence, pending work, worker state and capacity.
+        let candidates: Vec<_> = lock(&self.dispatch_queues)
             .iter()
             .filter(|(_, queue)| queue.waiting_for_capacity && !queue.pending.is_empty())
-            .map(|(name, _)| name.clone())
+            .map(|(name, queue)| {
+                (
+                    name.clone(),
+                    queue.pending.front().map(|(id, _)| id.clone()),
+                )
+            })
             .collect();
-        for name in names {
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .map(|(name, id)| {
+                let row = hold_evidence(
+                    &name,
+                    id.as_ref(),
+                    SuppressionPhase::RetainedFence,
+                    FenceReason::WorkerSpawnFailure,
+                    &DispatchReport::default(),
+                );
+                (name, id, row)
+            })
+            .collect();
+        let mut first_holds = Vec::new();
+        let mut queues = lock(&self.dispatch_queues);
+        for (name, id, mut row) in candidates {
             if queues.values().filter(|queue| queue.worker_active).count()
                 >= MAX_DISPATCH_RECIPIENTS
             {
                 break;
             }
-            if let Err(error) = self.start_queued_worker(&mut queues, &name) {
+            if !queues
+                .get(&name)
+                .is_some_and(|queue| queue.waiting_for_capacity && !queue.pending.is_empty())
+            {
+                continue;
+            }
+            if queues
+                .get(&name)
+                .and_then(|queue| queue.pending.front())
+                .map(|(id, _)| id)
+                != id.as_ref()
+            {
+                // A different oldest job may have arrived during projection.
+                // Keep scheduling unchanged and leave its trigger unknown.
+                row.trigger_message_id = None;
+                row.trigger_message_id_digest = None;
+                row.trigger_message_id_omitted = false;
+            }
+            if let Err(error) = self.start_queued_worker(&mut queues, &name, &row, &mut first_holds)
+            {
                 warn(&format!("{}: {error}", sanitize_for_warning(&name)));
             }
         }
+        drop(queues);
+        log_first_holds(first_holds);
     }
 
     /// Enqueue while the caller holds `enqueue_gate`. A worker owns each persona until its
     /// queue empties, so IDs are deduplicated even while a push is in flight.
+    /// Return safe first holds through `first_holds`; the caller logs them after
+    /// releasing its enqueue guard as well as the scheduler/fence guards.
     fn schedule_dispatch(
         self: &Arc<Self>,
         msg: &WireMessage,
         recipients: &[DeliveryReceipt],
         now: At,
+        first_holds: &mut Vec<FenceDiagnostic>,
     ) -> Result<(), String> {
+        let evidence: Vec<_> = recipients
+            .iter()
+            .map(|receipt| {
+                hold_evidence(
+                    &receipt.recipient_name.to_ascii_lowercase(),
+                    Some(&msg.id),
+                    SuppressionPhase::PrefixDraining,
+                    FenceReason::QueueOverflow,
+                    &DispatchReport::default(),
+                )
+            })
+            .collect();
         let mut queues = lock(&self.dispatch_queues);
         let mut errors = Vec::new();
-        for receipt in recipients {
+        for (receipt, evidence) in recipients.iter().zip(evidence) {
             if matches!(
                 receipt.status,
                 DeliveryStatus::Acked | DeliveryStatus::Expired
@@ -642,10 +792,22 @@ where
                 #[cfg(not(test))]
                 let queue_limit = MAX_QUEUED_PER_RECIPIENT;
                 if queue.overflowed || queue.pending.len() >= queue_limit {
-                    queue.overflowed = true;
+                    if !queue.overflowed {
+                        let _blocked = lock(&self.overflow_recipients);
+                        let mut diagnostics = lock(&self.dispatch_diagnostics);
+                        let mut row = evidence.clone();
+                        row.hold_observed_at = now_at();
+                        queue.overflowed = true;
+                        if let Some(log) = diagnostics.retain(row) {
+                            first_holds.push(log);
+                        }
+                    }
                     queue.route_generation = queue.route_generation.wrapping_add(1);
                     let wake = queue.waiting_for_route && !queue.pending.is_empty();
-                    if wake && let Err(error) = self.start_queued_worker(&mut queues, &name) {
+                    if wake
+                        && let Err(error) =
+                            self.start_queued_worker(&mut queues, &name, &evidence, first_holds)
+                    {
                         warn(&format!("{}: {error}", sanitize_for_warning(&name)));
                     }
                     errors.push(name);
@@ -656,7 +818,10 @@ where
                 // Otherwise the worker can exit after this arrival without observing it.
                 queue.route_generation = queue.route_generation.wrapping_add(1);
                 let wake = queue.waiting_for_route;
-                if wake && let Err(error) = self.start_queued_worker(&mut queues, &name) {
+                if wake
+                    && let Err(error) =
+                        self.start_queued_worker(&mut queues, &name, &evidence, first_holds)
+                {
                     warn(&format!("{}: {error}", sanitize_for_warning(&name)));
                     errors.push(name);
                 }
@@ -669,14 +834,19 @@ where
                 continue;
             }
             if queues.len() >= MAX_TRACKED_RECIPIENTS {
-                self.retain_overflow_fence(&name);
+                let mut row = evidence.clone();
+                row.phase = SuppressionPhase::RetainedFence;
+                if let Some(log) = self.retain_overflow_fence(&name, row) {
+                    first_holds.push(log);
+                }
                 errors.push(name);
                 continue;
             }
             let mut queue = RecipientDispatchQueue::default();
             queue.pending.push_back((msg.id.clone(), now.clone()));
             queues.insert(name.clone(), queue);
-            if let Err(error) = self.start_queued_worker(&mut queues, &name) {
+            if let Err(error) = self.start_queued_worker(&mut queues, &name, &evidence, first_holds)
+            {
                 warn(&format!(
                     "could not start delivery worker for {}: {error}",
                     sanitize_for_warning(&name)
@@ -684,6 +854,7 @@ where
                 errors.push(name);
             }
         }
+        drop(queues);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -703,6 +874,13 @@ where
 
     fn run_recipient_queue(self: Arc<Self>, recipient: String) {
         loop {
+            let empty_evidence = hold_evidence(
+                &recipient,
+                None,
+                SuppressionPhase::RetainedFence,
+                FenceReason::QueueOverflow,
+                &DispatchReport::default(),
+            );
             let job = {
                 let mut queues = lock(&self.dispatch_queues);
                 if self.shutdown.load(Ordering::SeqCst) {
@@ -720,24 +898,49 @@ where
                         let _ = entered.send(());
                         let _ = resume.recv_timeout(Duration::from_secs(5));
                     }
-                    if queue.overflowed {
-                        self.retain_overflow_fence(&recipient);
-                    }
+                    let first_hold = if queue.overflowed {
+                        self.retain_overflow_fence(&recipient, empty_evidence)
+                    } else {
+                        None
+                    };
                     queues.remove(&recipient);
                     drop(queues);
+                    log_first_holds(first_hold.into_iter().collect());
                     self.wake_capacity_waiters();
                     return;
                 };
                 queue.in_flight = Some(id.clone());
                 (id, now, queue.route_generation)
             };
+            let mut report = DispatchReport::default();
             let outcome = match self.store.get_wire_message(&job.0) {
-                Ok(Some(msg)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.dispatch_and_propagate(&msg, &recipient, job.1.clone())
-                }))
-                .unwrap_or(DispatchOutcome::Unconfirmed),
-                Ok(None) | Err(_) => DispatchOutcome::Unconfirmed,
+                Ok(Some(msg)) => {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.dispatch_and_propagate(&msg, &recipient, job.1.clone(), &mut report)
+                    })) {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            report.record_failure(FailureStage::WorkerPanic);
+                            DispatchOutcome::Unconfirmed
+                        }
+                    }
+                }
+                Ok(None) => {
+                    report.record_failure(FailureStage::MessageLookupMissing);
+                    DispatchOutcome::Unconfirmed
+                }
+                Err(_) => {
+                    report.record_failure(FailureStage::MessageLookupError);
+                    DispatchOutcome::Unconfirmed
+                }
             };
+            let evidence = hold_evidence(
+                &recipient,
+                Some(&job.0),
+                SuppressionPhase::RetainedFence,
+                FenceReason::UnresolvedReceiptStatus,
+                &report,
+            );
             #[cfg(test)]
             if matches!(outcome, DispatchOutcome::NoRoute) {
                 let hook = lock(&self.no_route_hook).take();
@@ -785,13 +988,15 @@ where
             if evicted_no_route {
                 queues.remove(&recipient);
             }
+            let mut first_hold = None;
             if unresolved {
                 // Fence and remove while holding the same map lock: no sender may create
                 // a replacement worker between those two actions.
-                self.retain_overflow_fence(&recipient);
+                first_hold = self.retain_overflow_fence(&recipient, evidence);
                 queues.remove(&recipient);
             }
             drop(queues);
+            log_first_holds(first_hold.into_iter().collect());
             if evicted_no_route || parked_no_route {
                 self.wake_capacity_waiters();
                 return;
@@ -809,14 +1014,31 @@ where
     }
 
     /// The caller holds `dispatch_queues`; this matches `schedule_dispatch` lock order.
-    fn retain_overflow_fence(&self, recipient: &str) {
+    fn retain_overflow_fence(
+        &self,
+        recipient: &str,
+        mut row: FenceDiagnostic,
+    ) -> Option<FenceDiagnostic> {
         let mut blocked = lock(&self.overflow_recipients);
+        let mut diagnostics = lock(&self.dispatch_diagnostics);
+        row.hold_observed_at = now_at();
         if blocked.contains(recipient) || blocked.len() < MAX_OVERFLOW_RECIPIENTS {
             blocked.insert(recipient.to_string());
         } else {
             self.overflow_capacity_exhausted
                 .store(true, Ordering::SeqCst);
+            if row.failure_stages.is_empty() {
+                row.first_reason = FenceReason::GlobalMetadataCap;
+            }
+            row.decisive_reason = FenceReason::GlobalMetadataCap;
         }
+        diagnostics.snapshot.global_capacity_exhausted =
+            self.overflow_capacity_exhausted.load(Ordering::SeqCst);
+        diagnostics.retain(row)
+    }
+
+    fn diagnostics_snapshot(&self) -> DispatchDiagnostics {
+        lock(&self.dispatch_diagnostics).snapshot.clone()
     }
 
     /// Wake only work admitted by this daemon instance. A pre-startup Pending receipt may
@@ -825,6 +1047,8 @@ where
         self: &Arc<Self>,
         queues: &mut BTreeMap<String, RecipientDispatchQueue>,
         recipient: &str,
+        evidence: &FenceDiagnostic,
+        first_holds: &mut Vec<FenceDiagnostic>,
     ) {
         let Some(queue) = queues.get_mut(recipient) else {
             return;
@@ -832,7 +1056,7 @@ where
         queue.route_generation = queue.route_generation.wrapping_add(1);
         if !queue.pending.is_empty()
             && !queue.worker_active
-            && let Err(error) = self.start_queued_worker(queues, recipient)
+            && let Err(error) = self.start_queued_worker(queues, recipient, evidence, first_holds)
         {
             warn(&format!("{}: {error}", sanitize_for_warning(recipient)));
         }
@@ -845,6 +1069,7 @@ where
         let now = now_at();
         match req {
             LocalRequest::Send { mut args } => {
+                let mut first_holds = Vec::new();
                 let _order = lock(&self.enqueue_gate);
                 if args.sender_host.is_none() {
                     args.sender_host = Some(self.config.host.clone());
@@ -859,9 +1084,13 @@ where
                                 receipts: receipts.clone(),
                             },
                         );
-                        if let Err(message) = self.schedule_dispatch(&msg, &receipts, now) {
+                        if let Err(message) =
+                            self.schedule_dispatch(&msg, &receipts, now, &mut first_holds)
+                        {
                             warn(&message);
                         }
+                        drop(_order);
+                        log_first_holds(first_holds);
                         (
                             LocalResponse::Sent {
                                 message: msg,
@@ -950,19 +1179,27 @@ where
                 route,
                 explicit,
             } => {
+                let Some(norm) = normalize_persona(&persona) else {
+                    return (
+                        LocalResponse::Error {
+                            message: "invalid persona".into(),
+                        },
+                        None,
+                    );
+                };
+                let evidence = hold_evidence(
+                    &norm,
+                    None,
+                    SuppressionPhase::RetainedFence,
+                    FenceReason::WorkerSpawnFailure,
+                    &DispatchReport::default(),
+                );
+                let mut first_holds = Vec::new();
                 // Publish a route only while ordered with persistence and backlog enqueue.
                 // Otherwise a concurrent send could overtake older pending messages.
                 let _order = lock(&self.enqueue_gate);
                 {
                     let mut routes = lock(&self.routes);
-                    let Some(norm) = normalize_persona(&persona) else {
-                        return (
-                            LocalResponse::Error {
-                                message: "invalid persona".into(),
-                            },
-                            None,
-                        );
-                    };
                     if !explicit {
                         let conflicts_with_binding = routes.get(&norm).is_some_and(|entry| {
                             entry.explicit
@@ -1010,8 +1247,15 @@ where
                     }
                     // Route publication and the worker's wake generation must be observed
                     // together: a no-route worker may not evict in between them.
-                    self.wake_recipient_after_registration(&mut queues, &norm);
+                    self.wake_recipient_after_registration(
+                        &mut queues,
+                        &norm,
+                        &evidence,
+                        &mut first_holds,
+                    );
                 }
+                drop(_order);
+                log_first_holds(first_holds);
                 (LocalResponse::RouteRegistered, None)
             }
             LocalRequest::UnregisterRoute { persona } => {
@@ -1064,6 +1308,7 @@ where
                         listen_addr: self.config.listen_addr.clone(),
                         connected_peers,
                         routes,
+                        dispatch_diagnostics: Some(self.diagnostics_snapshot()),
                     }),
                     None,
                 )
@@ -1214,6 +1459,7 @@ where
                 messages,
                 receipts,
             } => {
+                let mut first_holds = Vec::new();
                 let _order = lock(&self.enqueue_gate);
                 if !registry_events.is_empty()
                     && let Err(e) = self.store.import_registry_events(&registry_events)
@@ -1246,7 +1492,9 @@ where
                                 receipts: rcpts.clone(),
                             },
                         );
-                        if let Err(error) = self.schedule_dispatch(&m, &rcpts, now.clone()) {
+                        if let Err(error) =
+                            self.schedule_dispatch(&m, &rcpts, now.clone(), &mut first_holds)
+                        {
                             warn(&format!("peer message scheduling failed: {error}"));
                         }
                     }
@@ -1256,8 +1504,11 @@ where
                         }
                     }
                 }
+                drop(_order);
+                log_first_holds(first_holds);
             }
             PeerFrame::Publish { message, receipts } => {
+                let mut first_holds = Vec::new();
                 let _order = lock(&self.enqueue_gate);
                 let known = self
                     .store
@@ -1288,10 +1539,14 @@ where
                             receipts: rcpts.clone(),
                         },
                     );
-                    if let Err(error) = self.schedule_dispatch(&message, &rcpts, now) {
+                    if let Err(error) =
+                        self.schedule_dispatch(&message, &rcpts, now, &mut first_holds)
+                    {
                         warn(&format!("peer message scheduling failed: {error}"));
                     }
                 }
+                drop(_order);
+                log_first_holds(first_holds);
             }
             PeerFrame::ReceiptUpdate { receipt } => {
                 let prev_rank = self
@@ -1439,6 +1694,7 @@ where
         dispatch_queues: Mutex::new(BTreeMap::new()),
         overflow_recipients: Mutex::new(BTreeSet::new()),
         overflow_capacity_exhausted: AtomicBool::new(false),
+        dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
         #[cfg(test)]
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
@@ -1592,6 +1848,11 @@ mod tests {
     use tempfile::TempDir;
 
     thread_local! {
+        pub(super) static TRANSPORT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static TRANSPORT_RESULT: std::cell::RefCell<Option<Result<(), String>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static TRANSPORT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        pub(super) static ENTROPY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static ENTROPY_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The warning lines `warn` wrote on this thread.
         pub(super) static WARNINGS: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
@@ -1630,11 +1891,8 @@ mod tests {
         source: RedbStore,
     }
 
-    fn rig() -> Rig {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
-        let source = RedbStore::open(&tmp.path().join("src.redb")).unwrap();
-        let inner = Arc::new(DaemonInner {
+    fn rig_inner<S>(tmp: &TempDir, store: Arc<S>) -> Arc<DaemonInner<S>> {
+        Arc::new(DaemonInner {
             store,
             config: DaemonConfig {
                 node_id: "node-b".into(),
@@ -1653,6 +1911,7 @@ mod tests {
             dispatch_queues: Mutex::new(BTreeMap::new()),
             overflow_recipients: Mutex::new(BTreeSet::new()),
             overflow_capacity_exhausted: AtomicBool::new(false),
+            dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
             fail_next_worker_spawn: AtomicBool::new(false),
@@ -1663,7 +1922,14 @@ mod tests {
             next_peer_id: Mutex::new(0),
             inbound_peers: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
-        });
+        })
+    }
+
+    fn rig() -> Rig {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
+        let source = RedbStore::open(&tmp.path().join("src.redb")).unwrap();
+        let inner = rig_inner(&tmp, store);
         let (tx, _unused) = mpsc::channel();
         let sender = inner.register_peer("peer-a".into(), tx);
         let (tx, observed) = mpsc::channel();
@@ -1685,6 +1951,1045 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    use fl_core::{
+        agent::{AgentRecord, AreaRecord, RegisterAgentArgs},
+        ferrowire::ThreadId,
+        ids::AgentId,
+        store::StoreError,
+    };
+
+    #[derive(Clone, Copy, Default)]
+    enum Fault {
+        #[default]
+        Forward,
+        Error,
+        Missing,
+        Panic,
+    }
+
+    struct FaultStore {
+        inner: RedbStore,
+        gets: Mutex<VecDeque<Fault>>,
+        reads: Mutex<VecDeque<Fault>>,
+        writes: Mutex<VecDeque<Fault>>,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    const SECRET_FAULT: &str = "ERROR_SECRET /private/token panic=PRIVATE_PAYLOAD";
+    impl FaultStore {
+        fn fault(&self, queue: &Mutex<VecDeque<Fault>>) -> Fault {
+            lock(queue).pop_front().unwrap_or_default()
+        }
+    }
+    impl MessageStore for FaultStore {
+        fn send_wire(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            lock(&self.calls).push("send");
+            self.inner.send_wire(args)
+        }
+        fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
+            lock(&self.calls).push("get");
+            match self.fault(&self.gets) {
+                Fault::Error => Err(StoreError::Backend(SECRET_FAULT.into())),
+                Fault::Missing => Ok(None),
+                Fault::Panic => panic!("{SECRET_FAULT}"),
+                Fault::Forward => self.inner.get_wire_message(id),
+            }
+        }
+        fn list_wire_receipts(&self, id: &MessageId) -> Result<Vec<DeliveryReceipt>, StoreError> {
+            lock(&self.calls).push("receipts");
+            match self.fault(&self.reads) {
+                Fault::Error => Err(StoreError::Backend(SECRET_FAULT.into())),
+                Fault::Missing => Ok(Vec::new()),
+                Fault::Panic => panic!("{SECRET_FAULT}"),
+                Fault::Forward => self.inner.list_wire_receipts(id),
+            }
+        }
+        fn update_wire_receipt(
+            &self,
+            id: &MessageId,
+            recipient: &str,
+            status: DeliveryStatus,
+            increment: bool,
+            at: At,
+        ) -> Result<Option<DeliveryReceipt>, StoreError> {
+            lock(&self.calls).push("update");
+            match self.fault(&self.writes) {
+                Fault::Error => Err(StoreError::Backend(SECRET_FAULT.into())),
+                Fault::Missing => Ok(None),
+                Fault::Panic => panic!("{SECRET_FAULT}"),
+                Fault::Forward => self
+                    .inner
+                    .update_wire_receipt(id, recipient, status, increment, at),
+            }
+        }
+        fn list_wire_inbox(&self, filter: &WireFilter) -> Result<Vec<WireInboxItem>, StoreError> {
+            lock(&self.calls).push("inbox");
+            self.inner.list_wire_inbox(filter)
+        }
+        fn list_wire_thread(&self, id: &ThreadId) -> Result<Vec<WireMessage>, StoreError> {
+            lock(&self.calls).push("thread");
+            self.inner.list_wire_thread(id)
+        }
+        fn list_wire_replies(&self, id: &MessageId) -> Result<Vec<WireMessage>, StoreError> {
+            lock(&self.calls).push("replies");
+            self.inner.list_wire_replies(id)
+        }
+        fn wire_messages_after(&self, seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError> {
+            lock(&self.calls).push("messages_after");
+            self.inner.wire_messages_after(seq)
+        }
+        fn wire_receipts_after(&self, seq: u64) -> Result<Vec<(u64, DeliveryReceipt)>, StoreError> {
+            lock(&self.calls).push("receipts_after");
+            self.inner.wire_receipts_after(seq)
+        }
+        fn import_wire_batch(
+            &self,
+            messages: &[WireMessage],
+            receipts: &[DeliveryReceipt],
+        ) -> Result<WireImportReport, StoreError> {
+            lock(&self.calls).push("import");
+            self.inner.import_wire_batch(messages, receipts)
+        }
+        fn prune_wire(&self, before: At) -> Result<usize, StoreError> {
+            lock(&self.calls).push("prune");
+            self.inner.prune_wire(before)
+        }
+    }
+    impl AgentRegistry for FaultStore {
+        fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError> {
+            self.inner.upsert_area(area)
+        }
+        fn get_area(&self, key: &str) -> Result<Option<AreaRecord>, StoreError> {
+            self.inner.get_area(key)
+        }
+        fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError> {
+            self.inner.list_areas()
+        }
+        fn delete_area(&self, key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+            self.inner.delete_area(key, at, by)
+        }
+        fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
+            self.inner.register_agent(args)
+        }
+        fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError> {
+            self.inner.retire_agent(id, at, by)
+        }
+        fn get_agent(&self, id: &AgentId) -> Result<Option<AgentRecord>, StoreError> {
+            self.inner.get_agent(id)
+        }
+        fn agent_by_name(&self, key: &str) -> Result<Option<AgentRecord>, StoreError> {
+            self.inner.agent_by_name(key)
+        }
+        fn list_agents(
+            &self,
+            project: Option<&str>,
+            retired: bool,
+        ) -> Result<Vec<AgentRecord>, StoreError> {
+            self.inner.list_agents(project, retired)
+        }
+        fn registry_events_after(&self, seq: u64) -> Result<Vec<(u64, RegistryEvent)>, StoreError> {
+            self.inner.registry_events_after(seq)
+        }
+        fn import_registry_events(&self, events: &[RegistryEvent]) -> Result<(), StoreError> {
+            self.inner.import_registry_events(events)
+        }
+    }
+
+    fn fault_rig() -> (TempDir, Arc<DaemonInner<FaultStore>>) {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(FaultStore {
+            inner: RedbStore::open(&tmp.path().join("fault.redb")).unwrap(),
+            gets: Mutex::new(VecDeque::new()),
+            reads: Mutex::new(VecDeque::new()),
+            writes: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(Vec::new()),
+        });
+        let inner = rig_inner(&tmp, store);
+        lock(&inner.routes).upsert_explicit(
+            "held",
+            VendorRoute::Codex {
+                thread_id: "SESSION_SECRET".into(),
+                cwd: Some("/CWD_SECRET".into()),
+            },
+            now_at(),
+        );
+        (tmp, inner)
+    }
+
+    fn run_fault_job(inner: &Arc<DaemonInner<FaultStore>>, recipient: &str) -> MessageId {
+        let (msg, _) = inner
+            .store
+            .send_wire(mail(recipient, "BODY_SECRET"))
+            .unwrap();
+        lock(&inner.dispatch_queues).insert(
+            recipient.into(),
+            RecipientDispatchQueue {
+                pending: VecDeque::from([(msg.id.clone(), At::from_unix_millis(1))]),
+                worker_active: true,
+                ..Default::default()
+            },
+        );
+        Arc::clone(inner).run_recipient_queue(recipient.into());
+        msg.id
+    }
+
+    pub(super) fn dispatch_with_test_transport<S: MessageStore>(
+        store: &S,
+        routes: &mut RouteTable,
+        home: Option<&Path>,
+        msg: &WireMessage,
+        now: At,
+        recipient: &str,
+        report: &mut DispatchReport,
+    ) -> (Vec<DeliveryReceipt>, Option<bool>) {
+        if TRANSPORT_RESULT.with(|cell| cell.borrow().is_some()) {
+            crate::dispatcher::dispatch_message_for_recipient_with_test_dispatch(
+                store,
+                routes,
+                home,
+                msg,
+                now,
+                recipient,
+                report,
+                |_, _| {
+                    TRANSPORT_CALLS.with(|n| n.set(n.get() + 1));
+                    TRANSPORT_PANIC.with(|flag| {
+                        if flag.get() {
+                            panic!("{SECRET_FAULT}");
+                        }
+                    });
+                    TRANSPORT_RESULT.with(|cell| cell.borrow().as_ref().unwrap().clone())
+                },
+            )
+        } else {
+            dispatch_message_for_recipient_with_report(
+                store, routes, home, msg, now, recipient, report,
+            )
+        }
+    }
+
+    fn with_transport(outcome: Result<(), String>, f: impl FnOnce()) {
+        TRANSPORT_RESULT.with(|cell| *cell.borrow_mut() = Some(outcome));
+        TRANSPORT_CALLS.with(|n| n.set(0));
+        f();
+        TRANSPORT_RESULT.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    fn check_fault(
+        gets: &[Fault],
+        reads: &[Fault],
+        writes: &[Fault],
+        stages: &[FailureStage],
+        calls: u64,
+        store_calls: &[&str],
+    ) {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.gets).extend(gets);
+        lock(&inner.store.reads).extend(reads);
+        lock(&inner.store.writes).extend(writes);
+        with_transport(Ok(()), || {
+            run_fault_job(&inner, "held");
+            let snapshot = inner.diagnostics_snapshot();
+            assert_eq!(snapshot.records.len(), 1);
+            let row = &snapshot.records[0];
+            assert_eq!(row.failure_stages, stages);
+            assert_eq!(row.route_dispatch_calls, calls);
+            assert_eq!(*lock(&inner.store.calls), store_calls);
+            assert_eq!(row.first_reason, failure_reason(stages[0]));
+            assert_eq!(row.decisive_reason, failure_reason(*stages.last().unwrap()));
+            assert_eq!(row.phase, SuppressionPhase::RetainedFence);
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+            assert!(!serde_json::to_string(row).unwrap().contains("SECRET"));
+            assert!(!take_warnings().iter().any(|line| line.contains("SECRET")));
+        });
+    }
+
+    #[test]
+    fn diagnostics_message_lookup_missing() {
+        check_fault(
+            &[Fault::Missing],
+            &[],
+            &[],
+            &[FailureStage::MessageLookupMissing],
+            0,
+            &["send", "get"],
+        );
+    }
+    #[test]
+    fn diagnostics_message_lookup_error() {
+        check_fault(
+            &[Fault::Error],
+            &[],
+            &[],
+            &[FailureStage::MessageLookupError],
+            0,
+            &["send", "get"],
+        );
+    }
+    #[test]
+    fn diagnostics_initial_receipt_read_error() {
+        check_fault(
+            &[],
+            &[Fault::Error],
+            &[],
+            &[
+                FailureStage::InitialReceiptReadError,
+                FailureStage::UnresolvedReceiptStatus,
+            ],
+            0,
+            &["send", "get", "receipts", "receipts"],
+        );
+    }
+    #[test]
+    fn diagnostics_receipt_write_error_preserves_successful_call() {
+        check_fault(
+            &[],
+            &[],
+            &[Fault::Error],
+            &[
+                FailureStage::ReceiptWriteError,
+                FailureStage::UnresolvedReceiptStatus,
+            ],
+            1,
+            &["send", "get", "receipts", "update", "receipts"],
+        );
+    }
+    #[test]
+    fn diagnostics_receipt_write_missing_is_distinct() {
+        check_fault(
+            &[],
+            &[],
+            &[Fault::Missing],
+            &[
+                FailureStage::ReceiptWriteMissing,
+                FailureStage::UnresolvedReceiptStatus,
+            ],
+            1,
+            &["send", "get", "receipts", "update", "receipts"],
+        );
+    }
+    #[test]
+    fn diagnostics_final_receipt_read_error() {
+        check_fault(
+            &[],
+            &[Fault::Forward, Fault::Error],
+            &[],
+            &[FailureStage::FinalReceiptReadError],
+            1,
+            &["send", "get", "receipts", "update", "receipts"],
+        );
+    }
+    #[test]
+    fn diagnostics_final_receipt_read_missing() {
+        check_fault(
+            &[],
+            &[Fault::Forward, Fault::Missing],
+            &[],
+            &[FailureStage::FinalReceiptReadMissing],
+            1,
+            &["send", "get", "receipts", "update", "receipts"],
+        );
+    }
+    #[test]
+    fn diagnostics_worker_panic_preserves_report() {
+        check_fault(
+            &[],
+            &[],
+            &[Fault::Panic],
+            &[FailureStage::WorkerPanic],
+            1,
+            &["send", "get", "receipts", "update"],
+        );
+    }
+    #[test]
+    fn diagnostics_transport_panic_keeps_unknown_started_call() {
+        let (_tmp, inner) = fault_rig();
+        with_transport(Ok(()), || {
+            TRANSPORT_PANIC.with(|flag| flag.set(true));
+            run_fault_job(&inner, "held");
+            TRANSPORT_PANIC.with(|flag| flag.set(false));
+            let row = inner.diagnostics_snapshot().records.remove(0);
+            assert_eq!(row.failure_stages, vec![FailureStage::WorkerPanic]);
+            assert_eq!(row.route_dispatch_calls, 1);
+            assert_eq!(
+                row.route_observations[0].outcome,
+                crate::dispatch_diagnostics::DispatchCallOutcome::Unknown
+            );
+            assert_eq!(
+                inner
+                    .store
+                    .inner
+                    .list_wire_inbox(&WireFilter {
+                        recipient: Some("held".into()),
+                        ..WireFilter::default()
+                    })
+                    .unwrap()[0]
+                    .receipt
+                    .attempts,
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn diagnostics_panic_appends_to_prior_failure() {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Panic);
+        with_transport(Err(SECRET_FAULT.into()), || {
+            run_fault_job(&inner, "held");
+            let row = inner.diagnostics_snapshot().records.remove(0);
+            assert_eq!(
+                row.failure_stages,
+                vec![FailureStage::TransportError, FailureStage::WorkerPanic]
+            );
+            assert_eq!(row.first_reason, FenceReason::TransportError);
+            assert_eq!(row.decisive_reason, FenceReason::WorkerPanic);
+        });
+    }
+
+    #[test]
+    fn diagnostics_nested_schedule_defers_first_hold_log() {
+        let rig = rig();
+        rig.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::SeqCst);
+        let (message, receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("held", "BODY_SECRET"))
+            .unwrap();
+        let gate = lock(&rig.inner.enqueue_gate);
+        let mut first_holds = Vec::new();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&message, &receipts, now_at(), &mut first_holds)
+                .is_err()
+        );
+        assert_eq!(first_holds.len(), 1);
+        assert!(
+            take_warnings()
+                .iter()
+                .all(|line| !line.starts_with("dispatch hold:"))
+        );
+        drop(gate);
+        assert!(rig.inner.enqueue_gate.try_lock().is_ok());
+        assert!(rig.inner.dispatch_queues.try_lock().is_ok());
+        assert!(rig.inner.overflow_recipients.try_lock().is_ok());
+        assert!(rig.inner.dispatch_diagnostics.try_lock().is_ok());
+        log_first_holds(first_holds);
+        let warnings = take_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("dispatch hold:"));
+        assert!(!warnings[0].contains("SECRET"));
+    }
+
+    #[test]
+    fn diagnostics_transport_error_is_mutation_unknown() {
+        let (_tmp, inner) = fault_rig();
+        with_transport(Err(SECRET_FAULT.into()), || {
+            run_fault_job(&inner, "held");
+            let row = &inner.diagnostics_snapshot().records[0];
+            assert_eq!(
+                row.failure_stages,
+                vec![
+                    FailureStage::TransportError,
+                    FailureStage::UnresolvedReceiptStatus
+                ]
+            );
+            assert_eq!(row.route_dispatch_calls, 1);
+            assert_eq!(
+                row.route_observations[0].outcome,
+                crate::dispatch_diagnostics::DispatchCallOutcome::ReturnedError
+            );
+        });
+    }
+
+    #[test]
+    fn diagnostics_ack_and_register_preserve_first_hold() {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            let id = run_fault_job(&inner, "held");
+            let first = inner.diagnostics_snapshot();
+            assert_eq!(
+                first.records[0].route_observations[0].outcome,
+                crate::dispatch_diagnostics::DispatchCallOutcome::ReturnedOk
+            );
+            let (response, _) = inner.handle_local_request(LocalRequest::Ack {
+                recipient: "held".into(),
+                message_ids: vec![id.clone()],
+            });
+            assert!(matches!(response, LocalResponse::Acked { .. }));
+            let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: "held".into(),
+                explicit: true,
+                route: VendorRoute::Codex {
+                    thread_id: "new-session".into(),
+                    cwd: None,
+                },
+            });
+            assert!(matches!(response, LocalResponse::RouteRegistered));
+            assert_eq!(inner.diagnostics_snapshot(), first);
+            let calls = TRANSPORT_CALLS.with(|n| n.get());
+            let (response, _) = inner.handle_local_request(LocalRequest::Send {
+                args: mail("held", "later"),
+            });
+            let LocalResponse::Sent { message, .. } = response else {
+                panic!("send did not persist")
+            };
+            assert_eq!(TRANSPORT_CALLS.with(|n| n.get()), calls);
+            assert_eq!(
+                inner.store.inner.list_wire_receipts(&message.id).unwrap()[0].attempts,
+                0
+            );
+            lock(&inner.routes).upsert_explicit(
+                "other",
+                VendorRoute::Codex {
+                    thread_id: "other-session".into(),
+                    cwd: None,
+                },
+                now_at(),
+            );
+            let other = run_fault_job(&inner, "other");
+            assert_eq!(TRANSPORT_CALLS.with(|n| n.get()), calls + 1);
+            assert_eq!(
+                inner.store.inner.list_wire_receipts(&other).unwrap()[0].status,
+                DeliveryStatus::Acked
+            );
+            assert_eq!(inner.diagnostics_snapshot(), first);
+        });
+    }
+
+    #[test]
+    fn diagnostics_fence_and_snapshot_are_atomic() {
+        let rig = rig();
+        rig.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::SeqCst);
+        let (msg, receipts) = rig.inner.store.send_wire(mail("atomic", "stored")).unwrap();
+        let guard = lock(&rig.inner.dispatch_diagnostics);
+        let owner = Arc::clone(&rig.inner);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(
+                owner
+                    .schedule_dispatch(&msg, &receipts, now_at(), &mut Vec::new())
+                    .is_err()
+            );
+            done_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while rig.inner.dispatch_queues.try_lock().is_ok() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(guard.snapshot.records.is_empty());
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.join().unwrap();
+        assert!(lock(&rig.inner.overflow_recipients).contains("atomic"));
+        assert_eq!(
+            rig.inner.diagnostics_snapshot().records[0]
+                .recipient
+                .as_deref(),
+            Some("atomic")
+        );
+    }
+
+    #[test]
+    fn diagnostics_ordinary_no_route_exit_has_no_hold() {
+        let rig = rig();
+        let (msg, _) = rig
+            .inner
+            .store
+            .send_wire(mail("offline", "pending"))
+            .unwrap();
+        lock(&rig.inner.dispatch_queues).insert(
+            "offline".into(),
+            RecipientDispatchQueue {
+                pending: VecDeque::from([(msg.id, At::from_unix_millis(1))]),
+                worker_active: true,
+                ..Default::default()
+            },
+        );
+        Arc::clone(&rig.inner).run_recipient_queue("offline".into());
+        assert!(rig.inner.diagnostics_snapshot().records.is_empty());
+        assert!(lock(&rig.inner.overflow_recipients).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_imported_names_keep_scheduler_prefixes_independent() {
+        let (_tmp, inner) = fault_rig();
+        inner.queue_limit_override.store(0, Ordering::SeqCst);
+        let (message, receipts) = inner.store.send_wire(mail("alice", "rejected")).unwrap();
+        lock(&inner.store.calls).clear();
+        for name in ["alice", " alice ", "\talice\t"] {
+            lock(&inner.dispatch_queues).insert(
+                name.into(),
+                RecipientDispatchQueue {
+                    worker_active: true,
+                    ..Default::default()
+                },
+            );
+        }
+        // Imported receipts preserve their name bytes; bypass send_wire's slug normalization.
+        for name in ["Alice", " ALICE ", "\tAlice\t"] {
+            let mut receipt = receipts[0].clone();
+            receipt.recipient_name = name.into();
+            assert!(
+                inner
+                    .schedule_dispatch(&message, &[receipt], now_at(), &mut Vec::new())
+                    .is_err()
+            );
+        }
+        let first = inner.diagnostics_snapshot();
+        assert_eq!(first.records.len(), 3);
+        assert_eq!(lock(&inner.dispatch_queues).len(), 3);
+        assert!(
+            lock(&inner.dispatch_queues)
+                .values()
+                .all(|queue| queue.overflowed)
+        );
+        assert!(lock(&inner.overflow_recipients).is_empty());
+        assert_eq!(first.records[0].recipient.as_deref(), Some("alice"));
+        assert!(
+            first.records[1..]
+                .iter()
+                .all(|row| row.recipient_invalid && row.recipient.is_none())
+        );
+        let evidence = hold_evidence(
+            " alice ",
+            None,
+            SuppressionPhase::RetainedFence,
+            FenceReason::WorkerSpawnFailure,
+            &DispatchReport::default(),
+        );
+        {
+            let _queues = lock(&inner.dispatch_queues);
+            assert!(inner.retain_overflow_fence(" alice ", evidence).is_none());
+        }
+        let after = inner.diagnostics_snapshot();
+        assert_eq!(after.records[0], first.records[0]);
+        assert_eq!(after.records[2], first.records[2]);
+        let mut promoted = first.records[1].clone();
+        promoted.phase = SuppressionPhase::RetainedFence;
+        promoted.decisive_reason = FenceReason::WorkerSpawnFailure;
+        assert_eq!(after.records[1], promoted);
+        assert_eq!(
+            promoted.trigger_message_id.as_deref(),
+            Some(message.id.as_str())
+        );
+        assert!(lock(&inner.overflow_recipients).contains(" alice "));
+        assert!(!lock(&inner.overflow_recipients).contains("alice"));
+        assert!(lock(&inner.store.calls).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_padded_registration_promotes_only_canonical_prefix_on_spawn_failure() {
+        let (_tmp, inner) = fault_rig();
+        inner.queue_limit_override.store(1, Ordering::SeqCst);
+        let (accepted, _) = inner.store.send_wire(mail("alice", "accepted")).unwrap();
+        for name in ["alice", " alice "] {
+            lock(&inner.dispatch_queues).insert(
+                name.into(),
+                RecipientDispatchQueue {
+                    pending: VecDeque::from([(accepted.id.clone(), At::from_unix_millis(1))]),
+                    worker_active: true,
+                    ..Default::default()
+                },
+            );
+            let (rejected, mut receipts) =
+                inner.store.send_wire(mail("alice", "rejected")).unwrap();
+            // Imported receipt names keep raw bytes, independently of route registration.
+            receipts[0].recipient_name = name.into();
+            assert!(
+                inner
+                    .schedule_dispatch(&rejected, &receipts, now_at(), &mut Vec::new())
+                    .is_err()
+            );
+        }
+        let before = inner.diagnostics_snapshot();
+        assert_eq!(before.records.len(), 2);
+        assert_eq!(before.records[0].recipient.as_deref(), Some("alice"));
+        assert!(before.records[1].recipient_invalid);
+        for row in &before.records {
+            assert_eq!(row.phase, SuppressionPhase::PrefixDraining);
+            assert_eq!(row.first_reason, FenceReason::QueueOverflow);
+            assert!(row.trigger_message_id.is_some());
+        }
+        assert_ne!(
+            before.records[0].trigger_message_id,
+            before.records[1].trigger_message_id
+        );
+        {
+            let mut queues = lock(&inner.dispatch_queues);
+            let canonical = queues.get_mut("alice").unwrap();
+            canonical.worker_active = false;
+            canonical.waiting_for_route = true;
+        }
+        inner.fail_next_worker_spawn.store(true, Ordering::SeqCst);
+        lock(&inner.store.calls).clear();
+        let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: " ALICE ".into(),
+            explicit: true,
+            route: VendorRoute::Codex {
+                thread_id: "registration-session".into(),
+                cwd: None,
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        assert!(lock(&inner.routes).get("alice").unwrap().explicit);
+        assert_eq!(
+            *lock(&inner.overflow_recipients),
+            BTreeSet::from(["alice".into()])
+        );
+        {
+            let queues = lock(&inner.dispatch_queues);
+            assert!(!queues.contains_key("alice"));
+            let raw = queues.get(" alice ").unwrap();
+            assert_eq!(raw.pending.front().map(|(id, _)| id), Some(&accepted.id));
+            assert_eq!(raw.pending.len(), 1);
+            assert!(raw.worker_active && raw.overflowed);
+            assert_eq!(raw.route_generation, 1);
+        }
+        let after = inner.diagnostics_snapshot();
+        assert_eq!(after.records.len(), 2);
+        let mut promoted = before.records[0].clone();
+        promoted.phase = SuppressionPhase::RetainedFence;
+        promoted.decisive_reason = FenceReason::WorkerSpawnFailure;
+        // Full equality also preserves the first overflow trigger, timestamp and cause.
+        assert_eq!(after.records[0], promoted);
+        assert_eq!(after.records[1], before.records[1]);
+        assert!(lock(&inner.store.calls).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_prefix_preserves_earliest_rejected_trigger_during_promotion() {
+        let (_tmp, inner) = fault_rig();
+        inner.queue_limit_override.store(1, Ordering::SeqCst);
+        let (accepted, _) = inner.store.send_wire(mail("held", "accepted")).unwrap();
+        lock(&inner.dispatch_queues).insert(
+            "held".into(),
+            RecipientDispatchQueue {
+                pending: VecDeque::from([(accepted.id, At::from_unix_millis(1))]),
+                worker_active: true,
+                ..Default::default()
+            },
+        );
+        let (rejected, receipts) = inner
+            .store
+            .send_wire(mail("held", "first rejected"))
+            .unwrap();
+        assert!(
+            inner
+                .schedule_dispatch(
+                    &rejected,
+                    &receipts,
+                    At::from_unix_millis(1),
+                    &mut Vec::new()
+                )
+                .is_err()
+        );
+        let first = inner.diagnostics_snapshot().records[0].clone();
+        assert_eq!(first.phase, SuppressionPhase::PrefixDraining);
+        assert_eq!(
+            first.trigger_message_id.as_deref(),
+            Some(rejected.id.as_str())
+        );
+        assert!(!lock(&inner.overflow_recipients).contains("held"));
+        let (later, receipts) = inner
+            .store
+            .send_wire(mail("held", "later rejected"))
+            .unwrap();
+        assert!(
+            inner
+                .schedule_dispatch(&later, &receipts, now_at(), &mut Vec::new())
+                .is_err()
+        );
+        assert_eq!(inner.diagnostics_snapshot().records[0], first);
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            Arc::clone(&inner).run_recipient_queue("held".into())
+        });
+        let promoted = inner.diagnostics_snapshot().records[0].clone();
+        assert_eq!(promoted.phase, SuppressionPhase::RetainedFence);
+        assert_eq!(promoted.trigger_message_id, first.trigger_message_id);
+        assert_eq!(promoted.hold_observed_at, first.hold_observed_at);
+        assert_eq!(promoted.first_reason, FenceReason::QueueOverflow);
+        assert_eq!(
+            promoted.decisive_reason,
+            FenceReason::UnresolvedReceiptStatus
+        );
+        assert_eq!(
+            promoted.failure_stages,
+            vec![
+                FailureStage::ReceiptWriteError,
+                FailureStage::UnresolvedReceiptStatus
+            ]
+        );
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+    }
+
+    #[test]
+    fn diagnostics_prefix_spawn_failure_keeps_first_evidence() {
+        let rig = rig();
+        rig.inner.queue_limit_override.store(1, Ordering::SeqCst);
+        let (accepted, _) = rig
+            .inner
+            .store
+            .send_wire(mail("parked", "accepted"))
+            .unwrap();
+        lock(&rig.inner.dispatch_queues).insert(
+            "parked".into(),
+            RecipientDispatchQueue {
+                pending: VecDeque::from([(accepted.id, At::from_unix_millis(1))]),
+                waiting_for_route: true,
+                ..Default::default()
+            },
+        );
+        rig.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::SeqCst);
+        let (rejected, receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("parked", "rejected"))
+            .unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&rejected, &receipts, now_at(), &mut Vec::new())
+                .is_err()
+        );
+        let row = rig.inner.diagnostics_snapshot().records[0].clone();
+        assert_eq!(row.first_reason, FenceReason::QueueOverflow);
+        assert_eq!(row.decisive_reason, FenceReason::WorkerSpawnFailure);
+        assert_eq!(row.phase, SuppressionPhase::RetainedFence);
+        assert_eq!(
+            row.trigger_message_id.as_deref(),
+            Some(rejected.id.as_str())
+        );
+        assert!(!lock(&rig.inner.dispatch_queues).contains_key("parked"));
+    }
+
+    #[test]
+    fn diagnostics_hold_time_is_not_enqueue_time() {
+        let rig = rig();
+        rig.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::SeqCst);
+        let (message, receipts) = rig.inner.store.send_wire(mail("held", "queued")).unwrap();
+        let before = now_at();
+        assert!(
+            rig.inner
+                .schedule_dispatch(
+                    &message,
+                    &receipts,
+                    At::from_unix_millis(1),
+                    &mut Vec::new()
+                )
+                .is_err()
+        );
+        let snapshot = rig.inner.diagnostics_snapshot();
+        assert_eq!(snapshot.records.len(), 1);
+        assert!(snapshot.records[0].hold_observed_at >= before);
+        assert_eq!(
+            snapshot.records[0].trigger_message_id.as_deref(),
+            Some(message.id.as_str())
+        );
+        assert_eq!(
+            snapshot.records[0].first_reason,
+            FenceReason::WorkerSpawnFailure
+        );
+    }
+
+    #[test]
+    fn diagnostics_capacity_limit_preserves_suppression() {
+        let rig = rig();
+        for n in 0..128 {
+            let row = FenceDiagnostic::from_report(
+                &format!("evidence-{n}"),
+                None,
+                now_at(),
+                SuppressionPhase::PrefixDraining,
+                FenceReason::QueueOverflow,
+                &DispatchReport::default(),
+            );
+            lock(&rig.inner.dispatch_diagnostics).retain(row);
+        }
+        rig.inner
+            .fail_next_worker_spawn
+            .store(true, Ordering::SeqCst);
+        let (message, receipts) = rig.inner.store.send_wire(mail("held", "first")).unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&message, &receipts, now_at(), &mut Vec::new())
+                .is_err()
+        );
+        assert!(lock(&rig.inner.overflow_recipients).contains("held"));
+        assert!(!rig.inner.overflow_capacity_exhausted.load(Ordering::SeqCst));
+        let snapshot = rig.inner.diagnostics_snapshot();
+        assert_eq!(snapshot.records.len(), 128);
+        assert!(snapshot.diagnostics_partial);
+        assert_eq!(snapshot.omitted_evidence_total, 1);
+        let (later, receipts) = rig.inner.store.send_wire(mail("held", "later")).unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&later, &receipts, now_at(), &mut Vec::new())
+                .is_err()
+        );
+        assert!(lock(&rig.inner.dispatch_queues).is_empty());
+        assert_eq!(
+            rig.inner.store.list_wire_receipts(&later.id).unwrap()[0].attempts,
+            0
+        );
+    }
+
+    #[test]
+    fn status_diagnostics_capability_and_serde_compatibility() {
+        // A permissive older client knows only the pre-existing fields.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct OldStatus {
+            node_id: String,
+            host: String,
+            socket_path: PathBuf,
+            listen_addr: Option<String>,
+            connected_peers: Vec<String>,
+            routes: Vec<RouteEntry>,
+        }
+        let (_tmp, inner) = fault_rig();
+        let (response, subscription) = inner.handle_local_request(LocalRequest::Status);
+        assert!(subscription.is_none());
+        let LocalResponse::Status(status) = response else {
+            panic!("expected Status")
+        };
+        let new_json = serde_json::to_value(&status).unwrap();
+        assert!(
+            new_json["dispatch_diagnostics"].is_object(),
+            "supported-empty must be available"
+        );
+        assert_eq!(
+            new_json["dispatch_diagnostics"]["records"],
+            serde_json::json!([])
+        );
+        let old_client: OldStatus = serde_json::from_value(new_json.clone()).unwrap();
+        let mut old_json = new_json;
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("dispatch_diagnostics");
+        let new_client: DaemonStatus = serde_json::from_value(old_json.clone()).unwrap();
+        assert!(new_client.dispatch_diagnostics.is_none());
+        assert_eq!(serde_json::to_value(new_client).unwrap(), old_json);
+        assert_eq!(
+            serde_json::from_value::<OldStatus>(old_json).unwrap(),
+            old_client
+        );
+    }
+
+    #[test]
+    fn repeated_status_clones_evidence_without_io_or_state_changes() {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            run_fault_job(&inner, "held");
+            let before = inner.diagnostics_snapshot();
+            let calls = lock(&inner.store.calls).clone();
+            let discoveries = crate::identity::DISCOVERIES.with(|n| n.get());
+            lock(&inner.dispatch_queues).insert(
+                "parked".into(),
+                RecipientDispatchQueue {
+                    pending: VecDeque::from([(
+                        MessageId(fl_core::ids::seq_iri(999)),
+                        At::from_unix_millis(1),
+                    )]),
+                    waiting_for_route: true,
+                    ..Default::default()
+                },
+            );
+            let queue_state = || {
+                lock(&inner.dispatch_queues)
+                    .iter()
+                    .map(|(name, q)| {
+                        (
+                            name.clone(),
+                            q.pending.clone(),
+                            q.in_flight.clone(),
+                            q.overflowed,
+                            q.waiting_for_route,
+                            q.waiting_for_capacity,
+                            q.worker_active,
+                            q.route_generation,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let queues = queue_state();
+            let blocked = lock(&inner.overflow_recipients).clone();
+            // Further I/O would fail, and must not consume the fault scripts.
+            lock(&inner.store.gets).push_back(Fault::Panic);
+            lock(&inner.store.reads).push_back(Fault::Panic);
+            for _ in 0..5 {
+                let (response, _) = inner.handle_local_request(LocalRequest::Status);
+                // Serialize while explicitly owning the diagnostics lock: Status returned
+                // an owned clone, so serialization needs no daemon guard.
+                let _guard = lock(&inner.dispatch_diagnostics);
+                let value = serde_json::to_value(response).unwrap();
+                let snapshot = &value["dispatch_diagnostics"];
+                assert_eq!(*snapshot, serde_json::to_value(&before).unwrap());
+                assert!(snapshot["records"][0]["registration_generation"].is_null());
+                assert_eq!(
+                    snapshot["records"][0]["route_observations"][0]["outcome"],
+                    "returned_ok"
+                );
+            }
+            assert_eq!(*lock(&inner.store.calls), calls);
+            assert_eq!(lock(&inner.store.gets).len(), 1);
+            assert_eq!(lock(&inner.store.reads).len(), 1);
+            assert_eq!(crate::identity::DISCOVERIES.with(|n| n.get()), discoveries);
+            assert_eq!(TRANSPORT_CALLS.with(|n| n.get()), 1);
+            assert_eq!(queue_state(), queues);
+            assert_eq!(*lock(&inner.overflow_recipients), blocked);
+            assert_eq!(inner.diagnostics_snapshot(), before);
+        });
+    }
+
+    #[test]
+    fn diagnostics_entropy_failure_does_not_block_startup_or_delivery() {
+        ENTROPY_ATTEMPTS.with(|n| n.set(0));
+        ENTROPY_FAILURE.with(|failure| failure.set(true));
+        let (_tmp, inner) = fault_rig();
+        ENTROPY_FAILURE.with(|failure| failure.set(false));
+        assert!(inner.diagnostics_snapshot().instance_nonce.is_none());
+        with_transport(Ok(()), || {
+            let id = run_fault_job(&inner, "held");
+            let receipt = inner.store.inner.list_wire_receipts(&id).unwrap().remove(0);
+            assert_eq!(receipt.status, DeliveryStatus::Acked);
+            assert_eq!(receipt.attempts, 1);
+            assert_eq!(TRANSPORT_CALLS.with(|n| n.get()), 1);
+        });
+        let store_calls = lock(&inner.store.calls).clone();
+        for _ in 0..3 {
+            let (LocalResponse::Status(status), _) =
+                inner.handle_local_request(LocalRequest::Status)
+            else {
+                panic!("expected Status");
+            };
+            assert!(
+                status
+                    .dispatch_diagnostics
+                    .unwrap()
+                    .instance_nonce
+                    .is_none()
+            );
+        }
+        assert_eq!(*lock(&inner.store.calls), store_calls);
+        ENTROPY_ATTEMPTS.with(|n| assert_eq!(n.get(), 1));
     }
 
     #[test]
@@ -1768,6 +3073,12 @@ mod tests {
             ids.push(message.id);
         }
         assert!(lock(&rig.inner.dispatch_queues)["limited"].overflowed);
+        let first_hold = rig.inner.diagnostics_snapshot().records[0].clone();
+        assert_eq!(first_hold.phase, SuppressionPhase::PrefixDraining);
+        assert_eq!(
+            first_hold.trigger_message_id.as_deref(),
+            Some(ids[3].as_str())
+        );
         resume_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1783,6 +3094,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert_eq!(rig.inner.diagnostics_snapshot().records[0], first_hold);
         let socket = rig._tmp.path().join("limited.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1812,6 +3124,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!lock(&rig.inner.dispatch_queues).contains_key("limited"));
+        let retained = rig.inner.diagnostics_snapshot().records[0].clone();
+        assert_eq!(retained.phase, SuppressionPhase::RetainedFence);
+        assert_eq!(retained.trigger_message_id, first_hold.trigger_message_id);
+        assert_eq!(retained.hold_observed_at, first_hold.hold_observed_at);
+        assert_eq!(retained.first_reason, FenceReason::QueueOverflow);
+        assert_eq!(retained.decisive_reason, FenceReason::QueueOverflow);
         assert_eq!(
             rig.inner.store.list_wire_receipts(&ids[3]).unwrap()[0].status,
             DeliveryStatus::Pending
@@ -1934,12 +3252,12 @@ mod tests {
         lock(&rig.inner.dispatch_queues).insert("slow".into(), queue);
         assert!(
             rig.inner
-                .schedule_dispatch(&first.0, &first.1, now_at())
+                .schedule_dispatch(&first.0, &first.1, now_at(), &mut Vec::new())
                 .is_err()
         );
         assert!(
             rig.inner
-                .schedule_dispatch(&other.0, &other.1, now_at())
+                .schedule_dispatch(&other.0, &other.1, now_at(), &mut Vec::new())
                 .is_ok()
         );
     }
@@ -1991,7 +3309,7 @@ mod tests {
         let (starting_tx, starting_rx) = mpsc::channel();
         let enqueue = std::thread::spawn(move || {
             starting_tx.send(()).unwrap();
-            owner.schedule_dispatch(&message, &receipts, now_at())
+            owner.schedule_dispatch(&message, &receipts, now_at(), &mut Vec::new())
         });
         starting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         resume_tx.send(()).unwrap();
@@ -2563,7 +3881,7 @@ mod tests {
         let (message, receipts) = rig.inner.store.send_wire(mail("slow", "overflow")).unwrap();
         let error = rig
             .inner
-            .schedule_dispatch(&message, &receipts, now_at())
+            .schedule_dispatch(&message, &receipts, now_at(), &mut Vec::new())
             .unwrap_err();
         assert!(error.contains(message.id.as_str()));
         assert!(lock(&rig.inner.overflow_recipients).contains("slow"));
@@ -2571,7 +3889,7 @@ mod tests {
         let (later, later_receipts) = rig.inner.store.send_wire(mail("slow", "later")).unwrap();
         assert!(
             rig.inner
-                .schedule_dispatch(&later, &later_receipts, now_at())
+                .schedule_dispatch(&later, &later_receipts, now_at(), &mut Vec::new())
                 .is_err()
         );
         let (other, other_receipts) = rig
@@ -2581,7 +3899,7 @@ mod tests {
             .unwrap();
         assert!(
             rig.inner
-                .schedule_dispatch(&other, &other_receipts, now_at())
+                .schedule_dispatch(&other, &other_receipts, now_at(), &mut Vec::new())
                 .is_ok()
         );
         assert!(
@@ -2607,7 +3925,7 @@ mod tests {
         let (later, receipts) = rig.inner.store.send_wire(mail("slow", "later")).unwrap();
         assert!(
             rig.inner
-                .schedule_dispatch(&later, &receipts, now_at())
+                .schedule_dispatch(&later, &receipts, now_at(), &mut Vec::new())
                 .is_err()
         );
     }
@@ -2629,10 +3947,21 @@ mod tests {
             .unwrap();
         assert!(
             rig.inner
-                .schedule_dispatch(&first, &receipts, now_at())
+                .schedule_dispatch(&first, &receipts, now_at(), &mut Vec::new())
                 .is_err()
         );
         assert!(rig.inner.overflow_capacity_exhausted.load(Ordering::SeqCst));
+        let diagnostics = rig.inner.diagnostics_snapshot();
+        assert!(diagnostics.global_capacity_exhausted);
+        assert!(!diagnostics.diagnostics_partial);
+        assert_eq!(
+            diagnostics.records[0].first_reason,
+            FenceReason::GlobalMetadataCap
+        );
+        assert_eq!(
+            diagnostics.records[0].decisive_reason,
+            FenceReason::GlobalMetadataCap
+        );
         lock(&rig.inner.dispatch_queues).remove("active-0");
         let (later, receipts) = rig
             .inner
@@ -2641,7 +3970,7 @@ mod tests {
             .unwrap();
         assert!(
             rig.inner
-                .schedule_dispatch(&later, &receipts, now_at())
+                .schedule_dispatch(&later, &receipts, now_at(), &mut Vec::new())
                 .is_err()
         );
     }

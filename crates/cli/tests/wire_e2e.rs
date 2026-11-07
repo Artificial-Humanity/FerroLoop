@@ -65,6 +65,13 @@ impl TestEnv {
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
+            .env_remove("AGENT_NAME")
+            .env_remove("CLAUDE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_LS_ADDRESS")
+            .env_remove("ANTIGRAVITY_CSRF_TOKEN")
+            .env_remove("ANTIGRAVITY_AGENTAPI_EXE")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
             .env_remove("ANTIGRAVITY_CONVERSATION_ID")
             .env_remove("CODEX_THREAD_ID")
@@ -798,4 +805,179 @@ fn agent_msg_register_replace_keeps_an_existing_lab_manager_and_never_raises_any
     let manager = find(&r, "manager");
     assert_eq!(manager["role"], "lead", "{manager}");
     assert_eq!(manager["extra_areas"], serde_json::json!([]), "{manager}");
+}
+
+// Scripted peers exercise actual CLI Unix framing with fixture-only paths.
+fn scripted_status(env: &TestEnv, diagnostics: Option<Value>, json_output: bool) -> String {
+    let listener = std::os::unix::net::UnixListener::bind(&env.sock_file).unwrap();
+    let mut response = json!({
+        "status": "status", "node_id": "fixture-node", "host": "fixture-host",
+        "socket_path": env.sock_file, "listen_addr": null,
+        "connected_peers": ["fixture-peer"], "routes": [],
+    });
+    if let Some(snapshot) = diagnostics {
+        response["dispatch_diagnostics"] = snapshot;
+    }
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"op":"status"})
+        );
+        writeln!(stream, "{response}").unwrap();
+    });
+    let mut command = env.fl();
+    command.args(["wire", "status"]);
+    if json_output {
+        command.arg("--json");
+    }
+    let output = command.output().unwrap();
+    peer.join().unwrap();
+    std::fs::remove_file(&env.sock_file).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn diagnostic_fixture(held: bool) -> Value {
+    json!({
+        "schema_version": 1, "instance_nonce": null, "instance_started_at": "2026-11-06T00:00:00.000Z",
+        "scope": "daemon_lifetime", "global_capacity_exhausted": false,
+        "diagnostics_partial": false, "omitted_evidence_total": 0,
+        "omitted_evidence_total_saturated": false,
+        "records": if held { vec![json!({
+            "recipient": "fixture-held", "recipient_digest": null, "recipient_invalid": false,
+            "trigger_message_id": null, "trigger_message_id_digest": null,
+            "trigger_message_id_omitted": false, "hold_observed_at": "2026-11-06T00:00:00.000Z",
+            "phase": "retained_fence", "first_reason": "receipt_write_error",
+            "decisive_reason": "unresolved_receipt_status",
+            "failure_stages": ["receipt_write_error", "unresolved_receipt_status"],
+            "omitted_failure_stages": 0, "omitted_failure_stages_saturated": false,
+            "route_observations": [], "omitted_route_observations": 0,
+            "omitted_route_observations_saturated": false, "route_dispatch_calls": 1,
+            "route_dispatch_calls_saturated": false, "registration_generation": null,
+        })] } else { vec![] },
+    })
+}
+
+#[test]
+fn wire_status_diagnostics_scripted_supported_empty_and_held() {
+    let env = TestEnv::new();
+    for held in [false, true] {
+        let fixture = diagnostic_fixture(held);
+        let output = scripted_status(&env, Some(fixture.clone()), true);
+        let status: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(status["dispatch_diagnostics"], fixture);
+        assert_eq!(status["connected_peers"], json!(["fixture-peer"]));
+        let output = scripted_status(&env, Some(fixture), false);
+        assert!(output.contains(&format!("dispatch_diagnostics=available\tholds={}\tglobal_capacity_exhausted=false\tomitted_evidence=0", usize::from(held))), "{output}");
+        if held {
+            assert!(output.contains("unresolved_receipt_status=1"), "{output}");
+        }
+    }
+}
+
+#[test]
+fn wire_status_diagnostics_old_and_offline_are_unavailable() {
+    let env = TestEnv::new();
+    let output = scripted_status(&env, None, true);
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert!(value.get("dispatch_diagnostics").is_none());
+    let output = scripted_status(&env, None, false);
+    assert!(
+        output.contains("dispatch_diagnostics=unavailable"),
+        "{output}"
+    );
+    assert!(!output.contains("holds="));
+    let mut cmd = env.fl();
+    cmd.args(["wire", "status", "--json"]);
+    let value = run_json(cmd);
+    assert_eq!(value["daemon"], "inactive");
+    assert_eq!(value.get("dispatch_diagnostics"), Some(&Value::Null));
+    let output = env.fl().args(["wire", "status"]).output().unwrap();
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.contains("dispatch_diagnostics=unavailable"),
+        "{output}"
+    );
+    assert!(!output.contains("holds="));
+}
+
+#[test]
+fn wire_status_diagnostics_active_daemon_is_supported_empty() {
+    let env = TestEnv::new();
+    let _daemon = fl_wire::daemon::spawn_daemon(
+        std::sync::Arc::new(fl_store::RedbStore::open(&env.root.join("active.redb")).unwrap()),
+        fl_wire::daemon::DaemonConfig {
+            node_id: "fixture-node".into(),
+            host: "fixture-host".into(),
+            socket_path: env.sock_file.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+    let mut command = env.fl();
+    command.args(["wire", "status", "--json"]);
+    let value = run_json(command);
+    assert_eq!(value["node_id"], "fixture-node");
+    let snapshot = &value["dispatch_diagnostics"];
+    assert_eq!(snapshot["schema_version"], 1);
+    assert_eq!(snapshot["records"], json!([]));
+    assert_eq!(snapshot["global_capacity_exhausted"], false);
+    if let Some(nonce) = snapshot["instance_nonce"].as_str() {
+        assert_eq!(nonce.len(), 32);
+        assert!(
+            nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+    } else {
+        assert!(snapshot["instance_nonce"].is_null());
+    }
+    let output = env.fl().args(["wire", "status"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("dispatch_diagnostics=available\tholds=0")
+    );
+}
+
+#[test]
+fn wire_status_diagnostics_omission_and_saturation_remain_visible() {
+    let env = TestEnv::new();
+    let mut fixture = diagnostic_fixture(false);
+    fixture["global_capacity_exhausted"] = json!(true);
+    fixture["diagnostics_partial"] = json!(true);
+    fixture["omitted_evidence_total"] = json!(u64::MAX);
+    fixture["omitted_evidence_total_saturated"] = json!(true);
+    let value: Value =
+        serde_json::from_str(&scripted_status(&env, Some(fixture.clone()), true)).unwrap();
+    assert_eq!(value["dispatch_diagnostics"], fixture);
+    let output = scripted_status(&env, Some(fixture), false);
+    for field in [
+        "dispatch_diagnostics=available",
+        "holds=0",
+        "global_capacity_exhausted=true",
+        "omitted_evidence=18446744073709551615",
+        "diagnostics_partial=true",
+        "omitted_evidence_saturated=true",
+    ] {
+        assert!(output.contains(field), "missing {field}: {output}");
+    }
 }
