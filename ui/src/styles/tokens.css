@@ -848,7 +848,7 @@ button.fd-badge:hover:not(:disabled) {
 
   .fd-composer-delivery-receipt,
   .fd-composer-unconfirmed-warning {
-    font-size: 12px;
+    font-size: calc(12px * var(--fd-font-scale, 1));
     line-height: 1.35;
   }
 
