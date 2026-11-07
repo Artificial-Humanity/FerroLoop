@@ -1024,7 +1024,13 @@ export const App: React.FC<AppProps> = ({
     useState<SessionContextUsage | null>(null);
   const [rawSessionQuotaUsage, setSessionQuotaUsage] =
     useState<SessionQuotaUsage | null>(null);
-  const [sessionMetadataOwner, setSessionMetadataOwner] = useState<TranscriptReadOwner | null>(null);
+  const [sessionMetadataOwner, setSessionMetadataOwnerState] = useState<TranscriptReadOwner | null>(null);
+  const sessionMetadataOwnerRef = useRef(sessionMetadataOwner);
+  const setSessionMetadataOwner = useCallback((next: React.SetStateAction<TranscriptReadOwner | null>) => {
+    const value = typeof next === "function" ? next(sessionMetadataOwnerRef.current) : next;
+    sessionMetadataOwnerRef.current = value;
+    setSessionMetadataOwnerState(value);
+  }, []);
   const optimisticPromptRef = useRef<OptimisticPrompt[]>([]);
   const activeSessionIdRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
@@ -1176,6 +1182,29 @@ export const App: React.FC<AppProps> = ({
     );
     setTranscriptTurns(turns);
   }, []);
+
+  // Independent queue observations supersede older reads, but can only adopt their dispatch owner.
+  const adoptPromptMetadata = useCallback((response: { queue?: unknown; is_busy?: unknown }, owner: TranscriptReadOwner) => {
+    if (!mountedRef.current || loggedOutRef.current || resetPendingRef.current ||
+      !sameTranscriptOwner(owner, ownerRef.current) ||
+      (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
+    transcriptGuard.invalidate();
+    setTranscriptSnapshot((previous) => {
+      if (previous && sameTranscriptOwner(previous.owner, owner)) {
+        return previous.status === "loading" ? { ...previous, status: "unavailable" } : previous;
+      }
+      return { owner: { ...owner }, turns: [], status: "unavailable" };
+    });
+    if (!sessionMetadataOwnerRef.current || !sameTranscriptOwner(sessionMetadataOwnerRef.current, owner)) {
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    }
+    setSessionMetadataOwner({ ...owner });
+    if (Array.isArray(response.queue)) setSessionQueue(response.queue as QueuedOperatorPrompt[]);
+    if (typeof response.is_busy === "boolean") setIsSessionBusy(response.is_busy);
+  }, [transcriptGuard, setSessionMetadataOwner]);
 
   const readSelectedTranscript = useCallback(async (targetId: string) => {
     if (loggedOutRef.current || resetPendingRef.current || !mountedRef.current) return;
@@ -1688,12 +1717,7 @@ export const App: React.FC<AppProps> = ({
           recordOptimisticPrompt(rawContent, activeKey, Date.now(), rawSessionId || null);
           refreshOptimisticView((previous) => previous + 1);
         }
-        if (matchesActive) {
-          transcriptGuard.invalidate();
-          setSessionMetadataOwner({ ...ownerRef.current });
-          if (Array.isArray(data.queue)) setSessionQueue(data.queue as QueuedOperatorPrompt[]);
-          if (typeof data.is_busy === "boolean") setIsSessionBusy(data.is_busy);
-        }
+        if (matchesActive) adoptPromptMetadata(data, { ...ownerRef.current });
       }
       void refreshSessionsAndTranscript();
     });
@@ -1714,7 +1738,7 @@ export const App: React.FC<AppProps> = ({
       unsubWorkflow();
       wsClient.disconnect();
     };
-  }, [wsClient, apiClient, refreshWireAndRoster, refreshSessionsAndTranscript, refreshWorkflows]);
+  }, [wsClient, apiClient, refreshWireAndRoster, refreshSessionsAndTranscript, refreshWorkflows, adoptPromptMetadata]);
 
   // Load worktree diff when selectedWorktreeId changes
   useEffect(() => {
@@ -2041,18 +2065,10 @@ export const App: React.FC<AppProps> = ({
     ) {
       return res;
     }
-    // This independently observed send result supersedes metadata in older transcript reads.
-    transcriptGuard.invalidate();
-    setSessionMetadataOwner({ ...submittedOwner });
+    adoptPromptMetadata(res, submittedOwner);
     if (typeof res.in_flight_unconfirmed === "boolean") {
       const unconfirmed = res.in_flight_unconfirmed;
       setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: unconfirmed }));
-    }
-    if (Array.isArray(res.queue)) {
-      setSessionQueue(res.queue);
-    }
-    if (typeof res.is_busy === "boolean") {
-      setIsSessionBusy(res.is_busy);
     }
     if (!res.queued && res.status !== "queued" && res.delivery_stage !== "unconfirmed") {
       const content = res.effective_body || payload.prompt;
@@ -2078,15 +2094,7 @@ export const App: React.FC<AppProps> = ({
       activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
       return res;
     }
-    // This independently observed send result supersedes metadata in older transcript reads.
-    transcriptGuard.invalidate();
-    setSessionMetadataOwner({ ...submittedOwner });
-    if (Array.isArray(res.queue)) {
-      setSessionQueue(res.queue);
-    }
-    if (typeof res.is_busy === "boolean") {
-      setIsSessionBusy(res.is_busy);
-    }
+    adoptPromptMetadata(res, submittedOwner);
     if (isPromptDeliveryFailure(res)) {
       return res;
     }
@@ -2105,25 +2113,17 @@ export const App: React.FC<AppProps> = ({
   const handleCancelQueued = async (promptId: string) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) return;
+    const submittedOwner = { ...ownerRef.current };
     const res = await apiClient.cancelQueuedPrompt(targetId, promptId);
-    if (Array.isArray(res.queue)) {
-      setSessionQueue(res.queue);
-    }
-    if (typeof res.is_busy === "boolean") {
-      setIsSessionBusy(res.is_busy);
-    }
+    adoptPromptMetadata(res, submittedOwner);
   };
 
   const handleUpdateQueued = async (promptId: string, prompt: string) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) return;
+    const submittedOwner = { ...ownerRef.current };
     const res = await apiClient.updateQueuedPrompt(targetId, promptId, prompt);
-    if (Array.isArray(res.queue)) {
-      setSessionQueue(res.queue);
-    }
-    if (typeof res.is_busy === "boolean") {
-      setIsSessionBusy(res.is_busy);
-    }
+    adoptPromptMetadata(res, submittedOwner);
   };
 
   const handleReviewPr = async (number: number, payload: PrReviewRequest) => {

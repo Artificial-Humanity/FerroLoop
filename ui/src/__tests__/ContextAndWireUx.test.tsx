@@ -1685,6 +1685,106 @@ describe("App transcript observation ownership", () => {
     h.unmount();
   });
 
+  it.each(["cancel", "edit"] as const)("ignores a late %s reply after a different session installs metadata", async (operation) => {
+    const item = { id: "old-operation", session_id: "session-a", prompt: "Old operation queue", by: "owner", created_at: "now" };
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Original owner" })], queue: [item], is_busy: false }));
+    await screen.findByText("Old operation queue");
+    let release!: (value: never) => void;
+    const pending = new Promise<never>((resolve) => { release = resolve; });
+    vi.spyOn(h.api, operation === "cancel" ? "cancelQueuedPrompt" : "updateQueuedPrompt").mockReturnValue(pending);
+    if (operation === "edit") {
+      fireEvent.click(screen.getByTestId("queued-edit-old-operation"));
+      fireEvent.change(screen.getByTestId("queued-edit-input-old-operation"), { target: { value: "Old edit" } });
+      fireEvent.click(screen.getByTestId("queued-save-old-operation"));
+    } else fireEvent.click(screen.getByTestId("queued-cancel-old-operation"));
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ session_id: "session-b", turns: [turn({ index: 0, content: "Successor owner" })],
+      queue: [{ ...item, id: "new-operation", session_id: "session-b", prompt: "Successor queue" }], is_busy: true })); h.refresh();
+    await screen.findByText("Successor queue");
+    await act(async () => { release({ queue: [], is_busy: false } as never); await pending; });
+    expect(screen.getByText("Successor queue")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    h.unmount();
+  });
+
+  it.each(["cancel", "edit"] as const)("keeps a newer %s observation when an older App transcript completes", async (operation) => {
+    const item = { id: "operation-read", session_id: "session-a", prompt: "Original operation queue", by: "owner", created_at: "now" };
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Operation owner history" })], queue: [item], is_busy: false }));
+    await screen.findByText("Original operation queue");
+    let release!: (value: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    const queue = operation === "cancel" ? [] : [{ ...item, prompt: "Edited operation queue" }];
+    vi.spyOn(h.api, operation === "cancel" ? "cancelQueuedPrompt" : "updateQueuedPrompt").mockResolvedValue({ queue, is_busy: true } as never);
+    if (operation === "edit") {
+      fireEvent.click(screen.getByTestId("queued-edit-operation-read"));
+      fireEvent.change(screen.getByTestId("queued-edit-input-operation-read"), { target: { value: "Edited operation queue" } });
+      fireEvent.click(screen.getByTestId("queued-save-operation-read"));
+      await screen.findByText("Edited operation queue");
+    } else {
+      fireEvent.click(screen.getByTestId("queued-cancel-operation-read"));
+      await waitFor(() => expect(screen.queryByText("Original operation queue")).toBeNull());
+    }
+    await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Obsolete operation history" })], queue: [item], is_busy: false })); await pending; });
+    expect(screen.queryByText("Obsolete operation history")).toBeNull();
+    expect(screen.getByText("Operation owner history")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    expect(screen.queryByText("Original operation queue")).toBeNull();
+    h.unmount();
+  });
+
+  it.each(["partial send", "empty send", "partial event", "empty event"] as const)("does not relabel predecessor metadata after an unavailable successor and %s", async (operation) => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Rich predecessor" })], is_busy: true,
+      queue: [{ id: "predecessor", session_id: "session-a", prompt: "Predecessor queue", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 190000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Predecessor quota exhausted" } }));
+    await screen.findByText("Rich predecessor");
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toBeInTheDocument();
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503)); h.refresh();
+    await screen.findByText("History unavailable");
+    if (operation === "partial send" || operation === "empty send") {
+      vi.spyOn(h.api, "sendSessionPrompt").mockResolvedValue({ session_id: "session-b", delivered: true, queued: false, ...(operation === "partial send" ? { is_busy: false } : {}) } as never);
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Successor send" } });
+      fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+      await screen.findByText("Successor send");
+    } else h.refresh({ session_id: "session-b", persona: "ferris", delivered: false, ...(operation === "partial event" ? { is_busy: false } : {}) });
+    await act(async () => {});
+    expect(screen.queryByText("Predecessor queue")).toBeNull();
+    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("context-level-text")).not.toHaveTextContent("190k");
+    expect(screen.queryByTestId("context-max")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("preserves metadata installed for the current owner while its partial send reply was pending", async () => {
+    const h = harness(async () => response({ code: "transcript_unavailable" }, 503));
+    await screen.findByText("History unavailable");
+    let release!: (value: never) => void;
+    const pending = new Promise<never>((resolve) => { release = resolve; });
+    vi.spyOn(h.api, "sendSessionPrompt").mockReturnValue(pending);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Pending partial send" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    h.setRead(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Current owner observation" })],
+      queue: [{ id: "current", session_id: "session-a", prompt: "Current owner queue", by: "owner", created_at: "now" }], is_busy: true,
+      context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Current owner quota" } })); h.refresh();
+    await screen.findByText("Current owner observation");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    await act(async () => { release({ session_id: "session-a", delivered: true, queued: false, is_busy: false } as never); await pending; });
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Current owner queue")).toBeInTheDocument();
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toHaveTextContent("Current owner quota");
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("context-max")).toHaveTextContent("200k");
+    expect(screen.getByTestId("context-level-text")).toHaveTextContent("50k");
+    h.unmount();
+  });
+
   it("allows a new client's reads while the old client's reset is pending", async () => {
     const h = harness(); await screen.findByText("Last good history");
     let release!: (result: never) => void;

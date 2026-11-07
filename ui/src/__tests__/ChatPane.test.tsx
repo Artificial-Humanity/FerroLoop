@@ -2159,6 +2159,37 @@ describe("standalone transcript ownership and availability", () => {
     expect(screen.queryByText("Owned history")).toBeNull();
     expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
   });
+  it.each(["refusal", "hold", "cancel", "edit"] as const)("keeps a newer independent %s observation when an older transcript completes", async (operation) => {
+    const { pane, reads, client, body } = setup();
+    const item = { id: "guarded", session_id: "session-a", prompt: "Original queue", by: "owner", created_at: "now" };
+    const reply = deferred<import("../types/api").PromptResponse>();
+    if (operation === "cancel") vi.spyOn(client, "cancelQueuedPrompt").mockReturnValue(reply.promise as never);
+    else if (operation === "edit") vi.spyOn(client, "updateQueuedPrompt").mockReturnValue(reply.promise as never);
+    else vi.spyOn(client, "sendQueuedPromptNow").mockReturnValue(reply.promise);
+    render(pane());
+    await act(async () => reads[0].resolve(body(history, { queue: [item], is_busy: false })));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    expect(screen.getByTestId("chat-refresh-btn")).toBeDisabled();
+    if (operation === "edit") {
+      fireEvent.click(screen.getByTestId("queued-edit-guarded"));
+      fireEvent.change(screen.getByTestId("queued-edit-input-guarded"), { target: { value: "Edited queue" } });
+      fireEvent.click(screen.getByTestId("queued-save-guarded"));
+    } else fireEvent.click(screen.getByTestId(operation === "cancel" ? "queued-cancel-guarded" : "queued-send-now-guarded"));
+    const queue = operation === "cancel" ? [] : [{ ...item, prompt: operation === "edit" ? "Edited queue" : item.prompt,
+      ...(operation === "refusal" || operation === "hold" ? { delivery_state: operation === "refusal" ? "refused" : "unconfirmed" } : {}) }];
+    await act(async () => reply.resolve({ session_id: "session-a", delivered: false, delivery_stage: operation === "refusal" ? "refused" : "unconfirmed",
+      delivery_error: operation === "refusal" ? "Queue refused" : undefined, queue, is_busy: true } as never));
+    // These operations do not fetch again; invalidating the read must also settle its spinner.
+    expect(reads).toHaveLength(2);
+    expect(screen.getByTestId("chat-refresh-btn")).toBeEnabled();
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "Obsolete operation history" }], { queue: [item], is_busy: false })));
+    expect(screen.queryByText("Obsolete operation history")).toBeNull();
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    if (operation === "cancel") expect(screen.queryByText("Original queue")).toBeNull();
+    else if (operation === "edit") expect(screen.getByText("Edited queue")).toBeInTheDocument();
+    else expect(screen.getByTestId("queued-send-now-guarded")).toBeDisabled();
+  });
   it("keeps a confirmed optimistic send before any successful transcript through an unavailable followup", async () => {
     const { pane, reads, client, body } = setup();
     const send = deferred<import("../types/api").PromptResponse>();

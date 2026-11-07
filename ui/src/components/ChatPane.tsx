@@ -1450,6 +1450,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // Prompt/queue replies are independent observations, even before a transcript is readable.
   const adoptPromptMetadata = (response: { queue?: unknown; is_busy?: unknown }) => {
     if (!isCurrentOperation() || (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
+    readGuard.invalidate();
+    setInternalLoading(false);
+    setReadState((previous) => {
+      if (sameTranscriptOwner(previous?.owner ?? null, owner) && previous!.status !== "loading") return previous;
+      return { owner: { ...owner }, status: sameTranscriptOwner(snapshotRef.current?.owner ?? null, owner) ? "ready" : "unavailable" };
+    });
     if (!sameTranscriptOwner(metadataOwnerRef.current, owner)) {
       // Hidden values belonging to a previous owner must not reappear with this reply.
       setInternalQueue([]);
