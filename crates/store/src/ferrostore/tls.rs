@@ -492,6 +492,10 @@ impl TlsStream {
         self.sock.set_read_timeout(timeout)
     }
 
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_write_timeout(timeout)
+    }
+
     /// Send `close_notify` (best-effort, see [`Self::send_best_effort`]),
     /// then shut the socket down both ways. A peer that reads it sees the
     /// end of the stream as a clean close, not a truncation.
@@ -658,6 +662,13 @@ impl Wire {
         match self {
             Wire::Plain(stream) => stream.set_read_timeout(timeout),
             Wire::Tls(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    pub(super) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Wire::Plain(stream) => stream.set_write_timeout(timeout),
+            Wire::Tls(stream) => stream.set_write_timeout(timeout),
         }
     }
 

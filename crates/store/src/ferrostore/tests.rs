@@ -4605,3 +4605,70 @@ fn wal_decode_rejects_well_formed_frames_with_bad_contents() {
     frame.extend_from_slice(&payload);
     assert!(layout::decode_wal(&frame).is_err());
 }
+
+#[test]
+fn torn_wal_recovery_overwrites_torn_tail_on_subsequent_write_and_reopens_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("torn_write.fls");
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store.put_doc("docs", "first", &json!(1)).unwrap();
+    }
+    let mut partial = layout::encode_frame(
+        3,
+        &[Op::Put {
+            collection: "docs".into(),
+            id: "torn".into(),
+            doc: json!("garbage"),
+        }],
+    )
+    .unwrap();
+    partial.truncate(partial.len() - 3);
+    extend_wal(&path, &partial);
+
+    {
+        let store = FerroStore::open(&path).unwrap();
+        if let super::Inner::Disk(disk) = &store.inner {
+            let cached = super::lock_mutex(&disk.cache).clone().unwrap();
+            assert!(
+                cached.wal_applied < cached.sb.wal_length,
+                "expected torn WAL tail on open"
+            );
+            assert!(
+                super::checkpoint_due(disk, &cached),
+                "torn WAL tail must mark checkpoint_due true"
+            );
+        } else {
+            panic!("expected disk store");
+        }
+        assert_eq!(store.get_doc("docs", "first").unwrap(), Some(json!(1)));
+        assert_eq!(store.get_doc("docs", "torn").unwrap(), None);
+        store.put_doc("docs", "second", &json!(2)).unwrap();
+    }
+
+    let reopened = FerroStore::open(&path).unwrap();
+    assert_eq!(reopened.get_doc("docs", "first").unwrap(), Some(json!(1)));
+    assert_eq!(reopened.get_doc("docs", "second").unwrap(), Some(json!(2)));
+    assert_eq!(reopened.get_doc("docs", "torn").unwrap(), None);
+}
+
+#[test]
+fn bounded_subscribe_mq_evicts_full_subscriber_after_1024_items_without_blocking() {
+    let store = FerroStore::in_memory();
+    let slow_rx = store.subscribe_mq("events");
+    let total = super::MQ_SUBSCRIBER_BUFFER + 16;
+    for i in 0..total {
+        store.publish_mq("events", "k", &json!(i)).unwrap();
+    }
+    for i in 0..super::MQ_SUBSCRIBER_BUFFER {
+        let rec = slow_rx.try_recv().expect("buffered item");
+        assert_eq!(rec.payload, json!(i));
+    }
+    assert!(
+        matches!(
+            slow_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ),
+        "slow subscriber must be evicted and disconnected after 1024 queued items"
+    );
+}

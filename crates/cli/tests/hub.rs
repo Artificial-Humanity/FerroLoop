@@ -33,7 +33,6 @@ impl TestEnv {
         fs::create_dir_all(cfg_dir.join("fl")).unwrap();
         fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(work_dir.join(".agents")).unwrap();
-        fs::write(work_dir.join(".agents/REGISTRY.md"), "# placeholder\n").unwrap();
         fs::write(&peer_token_file, "peer-wire-secret-token\n").unwrap();
 
         Self {

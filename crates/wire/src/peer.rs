@@ -151,6 +151,21 @@ pub fn handshake_peer(
     last_rcpt_seq: u64,
     last_agent_seq: u64,
 ) -> Result<PeerHandshakeOutcome, WsError> {
+    handshake_peer_with_cursors(ws, local_node_id, local_host, psk, |_| {
+        (last_msg_seq, last_rcpt_seq, last_agent_seq)
+    })
+}
+
+/// Execute the mutual PSK handshake on `ws`, resolving the catch-up sequence cursors
+/// `(last_msg_seq, last_rcpt_seq, last_agent_seq)` for `remote_node_id` after receiving
+/// the remote peer's `Challenge`.
+pub fn handshake_peer_with_cursors(
+    ws: &mut WsStream,
+    local_node_id: &str,
+    local_host: &str,
+    psk: &[u8],
+    cursors_for_remote: impl FnOnce(&str) -> (u64, u64, u64),
+) -> Result<PeerHandshakeOutcome, WsError> {
     ws.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     ws.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
@@ -198,6 +213,7 @@ pub fn handshake_peer(
     } else {
         PeerRole::Server
     };
+    let (last_msg_seq, last_rcpt_seq, last_agent_seq) = cursors_for_remote(&remote_node_id);
     let local_mac = compute_psk_mac(psk, local_role, &remote_nonce, &local_nonce, local_host);
     ws.send_json(&PeerFrame::Auth {
         mac: local_mac,

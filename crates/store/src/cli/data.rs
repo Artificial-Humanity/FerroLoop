@@ -163,9 +163,20 @@ pub(crate) fn open_local(
     what: &str,
     w: &Wording,
 ) -> Result<FerroStore> {
+    let (store, migration_lock) = open_local_locked(path, create, what, w)?;
+    drop(migration_lock);
+    Ok(store)
+}
+
+pub(crate) fn open_local_locked(
+    path: &Path,
+    create: Create,
+    what: &str,
+    w: &Wording,
+) -> Result<(FerroStore, Option<crate::MigrationLock>)> {
     let physical = physical_path(path, BackendKind::Ferro);
     if present(&physical) {
-        return Ok(FerroStore::open(&physical)?);
+        return Ok((FerroStore::open(&physical)?, None));
     }
     refuse_beside_redb(path, &physical, w)?;
     let cmd = w.command;
@@ -201,13 +212,13 @@ pub(crate) fn open_local(
                 .map_err(|e| Error::context(format!("could not make {}", parent.display()), e))?;
         }
     }
-    let _lock = creation_lock(&physical)?;
+    let migration_lock = creation_lock(&physical)?;
     // Under the lock: a migration that finished meanwhile left its `.fls`
     // (opened as it is); a `.redb` that appeared meanwhile is refused.
     if !present(&physical) {
         refuse_beside_redb(path, &physical, w)?;
     }
-    Ok(FerroStore::open(&physical)?)
+    Ok((FerroStore::open(&physical)?, Some(migration_lock)))
 }
 
 /// Refuse when the `.fls` `physical` is missing and a redb store is beside

@@ -504,6 +504,7 @@ impl RouteTable {
             .map(Path::to_path_buf)
             .unwrap_or_else(default_routes_path);
         let legacy = if custom_path.is_none()
+            && !primary.exists()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
         {
             legacy_routes_path()
@@ -513,16 +514,15 @@ impl RouteTable {
         Self::load_with_legacy(&primary, legacy.as_deref())
     }
 
-    /// The table in `primary`, with the newer entries of `legacy` (the file agent-bus sessions
-    /// write) merged in by [`RouteTable::merge_newer`], which keeps `primary`'s entry on a tie.
-    /// A discovery pass that corrects an entry in place must therefore re-stamp it, or a
-    /// `legacy` entry with a later stamp but the stale endpoint wins ([`RouteTable::discover_routes`]).
+    /// The table in `primary`, falling back to `legacy` (`~/.cache/agent-bus/routes.json`) only
+    /// when `primary` does not exist or cannot be loaded (for example right after a reboot when
+    /// `/run/user/$UID/fl-wire-routes.json` is absent). Once `primary` exists, stale entries in
+    /// `legacy` are never merged on top of it.
     fn load_with_legacy(primary: &Path, legacy: Option<&Path>) -> Self {
-        let mut table = Self::load_file(primary).unwrap_or_default();
-        if let Some(legacy_table) = legacy.and_then(Self::load_file) {
-            table.merge_newer(legacy_table);
+        if let Some(table) = Self::load_file(primary) {
+            return table;
         }
-        table
+        legacy.and_then(Self::load_file).unwrap_or_default()
     }
 
     pub fn merge_newer(&mut self, other: Self) {
@@ -5359,7 +5359,16 @@ mod tests {
         // The legacy agent-bus copy carries a later stamp than the primary's, with the stale
         // pre-reboot endpoint.
         save_stale(&primary, 100);
-        save_stale(&legacy, 200);
+        save_stale(&legacy, 999);
+        {
+            let mut leg = RouteTable::load(Some(&legacy));
+            leg.upsert(
+                "stale-legacy-only",
+                stale_agy_route("conv-stale", stale, "csrf"),
+                At::from_unix_millis(999),
+            );
+            leg.save(Some(&legacy)).unwrap();
+        }
 
         let mut table = RouteTable::load_with_legacy(&primary, None);
         table.discover_routes(Some(&home), At::from_unix_millis(300));
@@ -5374,7 +5383,18 @@ mod tests {
         assert_eq!(
             agy_ls_address_of(&reloaded, "kayla").as_deref(),
             Some("127.0.0.1:41547"),
-            "the stale legacy entry must not win the merge"
+            "the stale legacy entry must not win when primary exists"
+        );
+        assert!(
+            reloaded.get("stale-legacy-only").is_none(),
+            "stale entries from legacy routes.json must not merge on top of an existing primary"
+        );
+
+        let missing_primary = tmp.path().join("missing-fl-wire-routes.json");
+        let fallback = RouteTable::load_with_legacy(&missing_primary, Some(&legacy));
+        assert!(
+            fallback.get("stale-legacy-only").is_some(),
+            "missing primary must still fall back to legacy routes.json"
         );
 
         // A scan that changes nothing leaves the stamp alone.

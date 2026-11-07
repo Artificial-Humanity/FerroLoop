@@ -890,7 +890,9 @@ pub trait MessageStore {
     ) -> Result<WireImportReport, StoreError>;
 
     /// Delete transient (`durable == false`) messages whose receipts are all `Acked` or
-    /// `Expired` and whose `created_at < before`. Returns the count of pruned messages.
+    /// `Expired` and whose `created_at < before`, as well as terminal `durable == true`
+    /// messages whose age at `before` is at least [`crate::ferrowire::DURABLE_WIRE_RETENTION_MS`].
+    /// Returns the count of pruned messages.
     fn prune_wire(&self, before: At) -> Result<usize, StoreError>;
 }
 

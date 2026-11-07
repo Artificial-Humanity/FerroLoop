@@ -20,7 +20,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,13 +35,13 @@ use fl_core::store::{AgentRegistry, MessageStore};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch_diagnostics::{
-    DiagnosticsState, DispatchDiagnostics, DispatchReport, FailureStage, FenceDiagnostic,
-    FenceReason, SuppressionPhase,
+    DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
+    FenceDiagnostic, FenceReason, SuppressionPhase,
 };
 use crate::dispatcher::dispatch_message_for_recipient_with_report;
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
-use crate::peer::{PeerFrame, handshake_peer};
-use crate::ws::{WsError, WsStream};
+use crate::peer::{PeerFrame, handshake_peer_with_cursors};
+use crate::ws::{MAX_FRAME_PAYLOAD, WsError, WsStream};
 
 /// How long a [`LocalClient`] waits for `fl wire daemon` to read a request or answer it: the
 /// socket's read and write timeout. A daemon's store is a remote FerroStore, so a reply can take
@@ -369,7 +369,109 @@ pub struct DaemonConfig {
 struct Subscriber {
     recipient: Option<String>,
     correlation_id: Option<MessageId>,
-    tx: Sender<LocalEvent>,
+    tx: SyncSender<LocalEvent>,
+}
+
+const MAX_SUBSCRIBER_BUFFER: usize = 256;
+const MAX_SYNC_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SYNC_BATCH_ITEMS: usize = 256;
+
+fn build_sync_batches(
+    registry_events: Vec<RegistryEvent>,
+    messages: Vec<WireMessage>,
+    receipts: Vec<DeliveryReceipt>,
+) -> Vec<PeerFrame> {
+    if registry_events.is_empty() && messages.is_empty() && receipts.is_empty() {
+        return vec![PeerFrame::SyncBatch {
+            registry_events: Vec::new(),
+            messages: Vec::new(),
+            receipts: Vec::new(),
+        }];
+    }
+    let byte_limit = MAX_SYNC_BATCH_BYTES.min(MAX_FRAME_PAYLOAD.saturating_sub(64 * 1024));
+    let mut batches = Vec::new();
+    let mut cur_events = Vec::new();
+    let mut cur_msgs = Vec::new();
+    let mut cur_rcpts = Vec::new();
+    let mut cur_bytes = 64usize;
+    let mut cur_items = 0usize;
+
+    let flush = |batches: &mut Vec<PeerFrame>,
+                 cur_events: &mut Vec<RegistryEvent>,
+                 cur_msgs: &mut Vec<WireMessage>,
+                 cur_rcpts: &mut Vec<DeliveryReceipt>,
+                 cur_bytes: &mut usize,
+                 cur_items: &mut usize| {
+        if !cur_events.is_empty() || !cur_msgs.is_empty() || !cur_rcpts.is_empty() {
+            batches.push(PeerFrame::SyncBatch {
+                registry_events: std::mem::take(cur_events),
+                messages: std::mem::take(cur_msgs),
+                receipts: std::mem::take(cur_rcpts),
+            });
+            *cur_bytes = 64;
+            *cur_items = 0;
+        }
+    };
+
+    for ev in registry_events {
+        let sz = serde_json::to_vec(&ev).map(|v| v.len() + 2).unwrap_or(256);
+        if cur_items > 0 && (cur_items >= MAX_SYNC_BATCH_ITEMS || cur_bytes + sz > byte_limit) {
+            flush(
+                &mut batches,
+                &mut cur_events,
+                &mut cur_msgs,
+                &mut cur_rcpts,
+                &mut cur_bytes,
+                &mut cur_items,
+            );
+        }
+        cur_bytes += sz;
+        cur_items += 1;
+        cur_events.push(ev);
+    }
+    for msg in messages {
+        let sz = serde_json::to_vec(&msg).map(|v| v.len() + 2).unwrap_or(512);
+        if cur_items > 0 && (cur_items >= MAX_SYNC_BATCH_ITEMS || cur_bytes + sz > byte_limit) {
+            flush(
+                &mut batches,
+                &mut cur_events,
+                &mut cur_msgs,
+                &mut cur_rcpts,
+                &mut cur_bytes,
+                &mut cur_items,
+            );
+        }
+        cur_bytes += sz;
+        cur_items += 1;
+        cur_msgs.push(msg);
+    }
+    for rcpt in receipts {
+        let sz = serde_json::to_vec(&rcpt)
+            .map(|v| v.len() + 2)
+            .unwrap_or(256);
+        if cur_items > 0 && (cur_items >= MAX_SYNC_BATCH_ITEMS || cur_bytes + sz > byte_limit) {
+            flush(
+                &mut batches,
+                &mut cur_events,
+                &mut cur_msgs,
+                &mut cur_rcpts,
+                &mut cur_bytes,
+                &mut cur_items,
+            );
+        }
+        cur_bytes += sz;
+        cur_items += 1;
+        cur_rcpts.push(rcpt);
+    }
+    flush(
+        &mut batches,
+        &mut cur_events,
+        &mut cur_msgs,
+        &mut cur_rcpts,
+        &mut cur_bytes,
+        &mut cur_items,
+    );
+    batches
 }
 
 /// Limits keep a stuck vendor from causing unbounded threads or queued metadata. Messages beyond
@@ -483,6 +585,7 @@ struct DaemonInner<S> {
     #[cfg(test)]
     registration_locked_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     peers: Mutex<BTreeMap<u64, (String, Sender<PeerFrame>)>>,
+    peer_sync_cursors: Mutex<BTreeMap<String, (u64, u64, u64)>>,
     subscribers: Mutex<Vec<Subscriber>>,
     next_peer_id: Mutex<u64>,
     inbound_peers: AtomicUsize,
@@ -528,7 +631,7 @@ where
             });
             if matches_corr && matches_rcpt {
                 sub.tx
-                    .send(LocalEvent::Message {
+                    .try_send(LocalEvent::Message {
                         message: msg.clone(),
                     })
                     .is_ok()
@@ -550,7 +653,7 @@ where
                 .is_none_or(|r| r.eq_ignore_ascii_case(&rcpt.recipient_name));
             if matches_rcpt {
                 sub.tx
-                    .send(LocalEvent::Receipt {
+                    .try_send(LocalEvent::Receipt {
                         receipt: rcpt.clone(),
                     })
                     .is_ok()
@@ -1062,6 +1165,83 @@ where
         }
     }
 
+    /// Clear `overflow_recipients` and resume queued/pending push delivery for `recipient`
+    /// once all unconfirmed (`Pending` with `attempts > 0`) receipts have been acknowledged.
+    fn maybe_unfence_and_resume(self: &Arc<Self>, recipient: &str, now: At) {
+        let name =
+            normalize_persona(recipient).unwrap_or_else(|| recipient.trim().to_ascii_lowercase());
+        if name.is_empty() {
+            return;
+        }
+        let is_fenced = lock(&self.overflow_recipients).contains(&name)
+            || lock(&self.dispatch_queues)
+                .get(&name)
+                .is_some_and(|q| q.overflowed);
+        if !is_fenced {
+            return;
+        }
+        {
+            let diagnostics = lock(&self.dispatch_diagnostics);
+            if diagnostics.snapshot.records.iter().any(|r| {
+                r.recipient.as_deref() == Some(name.as_str())
+                    && (!matches!(
+                        r.first_reason,
+                        FenceReason::TransportError
+                            | FenceReason::UnresolvedReceiptStatus
+                            | FenceReason::QueueOverflow
+                    ) || !matches!(
+                        r.decisive_reason,
+                        FenceReason::TransportError
+                            | FenceReason::UnresolvedReceiptStatus
+                            | FenceReason::QueueOverflow
+                    ) || r.failure_stages.iter().any(|s| {
+                        !matches!(
+                            s,
+                            FailureStage::TransportError | FailureStage::UnresolvedReceiptStatus
+                        )
+                    }) || r
+                        .route_observations
+                        .iter()
+                        .any(|o| o.outcome == DispatchCallOutcome::ReturnedOk))
+            }) {
+                return;
+            }
+        }
+        let _order = lock(&self.enqueue_gate);
+        let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
+            recipient: Some(name.clone()),
+            unread_only: true,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        if unread
+            .iter()
+            .any(|item| item.receipt.status == DeliveryStatus::Pending && item.receipt.attempts > 0)
+        {
+            return;
+        }
+        let mut first_holds = Vec::new();
+        lock(&self.overflow_recipients).remove(&name);
+        if let Some(queue) = lock(&self.dispatch_queues).get_mut(&name) {
+            queue.overflowed = false;
+        }
+        for item in &unread {
+            if item.receipt.status == DeliveryStatus::Pending
+                && let Err(message) = self.schedule_dispatch(
+                    &item.message,
+                    std::slice::from_ref(&item.receipt),
+                    now.clone(),
+                    &mut first_holds,
+                )
+            {
+                warn(&message);
+            }
+        }
+        drop(_order);
+        log_first_holds(first_holds);
+    }
+
     fn handle_local_request(
         self: &Arc<Self>,
         req: LocalRequest,
@@ -1128,6 +1308,7 @@ where
                                 );
                             }
                         }
+                        self.maybe_unfence_and_resume(rec, now);
                     }
                     (LocalResponse::Inbox { items }, None)
                 }
@@ -1171,6 +1352,9 @@ where
                             );
                         }
                     }
+                }
+                if !out.is_empty() {
+                    self.maybe_unfence_and_resume(&recipient, now);
                 }
                 (LocalResponse::Acked { receipts: out }, None)
             }
@@ -1285,7 +1469,7 @@ where
                 recipient,
                 correlation_id,
             } => {
-                let (tx, rx) = mpsc::channel();
+                let (tx, rx) = mpsc::sync_channel(MAX_SUBSCRIBER_BUFFER);
                 let norm_rcpt = recipient.as_deref().and_then(normalize_persona);
                 lock(&self.subscribers).push(Subscriber {
                     recipient: norm_rcpt,
@@ -1321,36 +1505,21 @@ where
     }
 
     fn handle_peer_connection(self: &Arc<Self>, mut ws: WsStream) -> Result<(), WsError> {
-        let last_msg_seq = self
-            .store
-            .wire_messages_after(0)
-            .ok()
-            .and_then(|v| v.last().map(|(s, _)| *s))
-            .unwrap_or(0);
-        let last_rcpt_seq = self
-            .store
-            .wire_receipts_after(0)
-            .ok()
-            .and_then(|v| v.last().map(|(s, _)| *s))
-            .unwrap_or(0);
-        let last_agent_seq = self
-            .store
-            .registry_events_after(0)
-            .ok()
-            .and_then(|v| v.last().map(|(s, _)| *s))
-            .unwrap_or(0);
-
-        let hs = handshake_peer(
+        let hs = handshake_peer_with_cursors(
             &mut ws,
             &self.config.node_id,
             &self.config.host,
             &self.config.psk,
-            last_msg_seq,
-            last_rcpt_seq,
-            last_agent_seq,
+            |remote_node_id| {
+                lock(&self.peer_sync_cursors)
+                    .get(remote_node_id)
+                    .copied()
+                    .unwrap_or((0, 0, 0))
+            },
         )?;
 
-        // Send initial catch-up SyncBatch for everything after remote's cursors
+        // Send initial catch-up SyncBatch frames for everything after remote's cursors,
+        // chunked so no single frame can exceed MAX_FRAME_PAYLOAD.
         let registry_events: Vec<RegistryEvent> = self
             .store
             .registry_events_after(hs.remote_last_agent_seq)
@@ -1373,13 +1542,15 @@ where
             .map(|(_, r)| r)
             .collect();
 
-        ws.send_json(&PeerFrame::SyncBatch {
-            registry_events,
-            messages,
-            receipts,
-        })?;
-
         let (tx, rx) = mpsc::channel::<PeerFrame>();
+        let mut batches = build_sync_batches(registry_events, messages, receipts).into_iter();
+        if let Some(first_batch) = batches.next() {
+            ws.send_json(&first_batch)?;
+        }
+        for batch in batches {
+            let _ = tx.send(batch);
+        }
+
         let peer_label = format!("{}@{}", hs.remote_node_id, hs.remote_host);
         let peer_id = self.register_peer(peer_label, tx);
 
@@ -1438,6 +1609,25 @@ where
             .unwrap_or_else(|| format!("peer #{id}"))
     }
 
+    fn advance_peer_sync_cursors(
+        &self,
+        from_peer_id: u64,
+        msg_delta: u64,
+        rcpt_delta: u64,
+        agent_delta: u64,
+    ) {
+        let label = self.peer_label(from_peer_id);
+        let node_id = label.split('@').next().unwrap_or(&label).to_string();
+        if node_id.is_empty() {
+            return;
+        }
+        let mut cursors = lock(&self.peer_sync_cursors);
+        let entry = cursors.entry(node_id).or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(msg_delta);
+        entry.1 = entry.1.saturating_add(rcpt_delta);
+        entry.2 = entry.2.saturating_add(agent_delta);
+    }
+
     /// Warn about a peer import that skipped an item or failed.
     fn warn_on_import(
         &self,
@@ -1459,6 +1649,12 @@ where
                 messages,
                 receipts,
             } => {
+                self.advance_peer_sync_cursors(
+                    from_peer_id,
+                    messages.len() as u64,
+                    receipts.len() as u64,
+                    registry_events.len() as u64,
+                );
                 let mut first_holds = Vec::new();
                 let _order = lock(&self.enqueue_gate);
                 if !registry_events.is_empty()
@@ -1508,6 +1704,7 @@ where
                 log_first_holds(first_holds);
             }
             PeerFrame::Publish { message, receipts } => {
+                self.advance_peer_sync_cursors(from_peer_id, 1, receipts.len() as u64, 0);
                 let mut first_holds = Vec::new();
                 let _order = lock(&self.enqueue_gate);
                 let known = self
@@ -1549,6 +1746,7 @@ where
                 log_first_holds(first_holds);
             }
             PeerFrame::ReceiptUpdate { receipt } => {
+                self.advance_peer_sync_cursors(from_peer_id, 0, 1, 0);
                 let prev_rank = self
                     .store
                     .list_wire_receipts(&receipt.message_id)
@@ -1577,6 +1775,7 @@ where
                 }
             }
             PeerFrame::RegistryUpdate { event } => {
+                self.advance_peer_sync_cursors(from_peer_id, 0, 0, 1);
                 if self
                     .store
                     .import_registry_events(std::slice::from_ref(&event))
@@ -1671,7 +1870,7 @@ where
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))?;
     }
     unix_listener.set_nonblocking(true)?;
 
@@ -1706,6 +1905,7 @@ where
         #[cfg(test)]
         registration_locked_hook: Mutex::new(None),
         peers: Mutex::new(BTreeMap::new()),
+        peer_sync_cursors: Mutex::new(BTreeMap::new()),
         subscribers: Mutex::new(Vec::new()),
         next_peer_id: Mutex::new(0),
         inbound_peers: AtomicUsize::new(0),
@@ -1843,6 +2043,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::handshake_peer;
     use fl_core::ferrowire::{MessageKind, MessageUrgency, WireAddress};
     use fl_store::RedbStore;
     use tempfile::TempDir;
@@ -1918,6 +2119,7 @@ mod tests {
             queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
             registration_locked_hook: Mutex::new(None),
             peers: Mutex::new(BTreeMap::new()),
+            peer_sync_cursors: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
             next_peer_id: Mutex::new(0),
             inbound_peers: AtomicUsize::new(0),
@@ -4212,7 +4414,7 @@ mod tests {
 
     /// A subscriber on the rig's daemon that sees every message event.
     fn subscribe_all(rig: &Rig) -> Receiver<LocalEvent> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_SUBSCRIBER_BUFFER);
         lock(&rig.inner.subscribers).push(Subscriber {
             recipient: None,
             correlation_id: None,
@@ -5157,5 +5359,228 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn ack_and_read_ack_clear_overflow_fence_and_resume_push_delivery() {
+        let rig = rig();
+
+        // 1. Verify LocalRequest::Ack clears overflow_recipients and resumes pending push delivery.
+        let ack_socket = rig._tmp.path().join("ack-recover.sock");
+        lock(&rig.inner.routes).upsert_explicit(
+            "ack-agent",
+            VendorRoute::Webhook {
+                socket_path: ack_socket.clone(),
+            },
+            now_at(),
+        );
+        let (resp1, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("ack-agent", "first-unconfirmed"),
+        });
+        let LocalResponse::Sent { message: m1, .. } = resp1 else {
+            panic!("send failed: {resp1:?}")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(&rig.inner.overflow_recipients).contains("ack-agent") {
+            assert!(Instant::now() < deadline, "ack-agent was never fenced");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let ack_listener = UnixListener::bind(&ack_socket).unwrap();
+        ack_listener.set_nonblocking(true).unwrap();
+
+        let (resp2, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("ack-agent", "second-queued-behind-fence"),
+        });
+        let LocalResponse::Sent { message: m2, .. } = resp2 else {
+            panic!("second send failed: {resp2:?}")
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            ack_listener.accept().is_err(),
+            "second message must remain blocked while first is unacknowledged"
+        );
+
+        let (ack_resp, _) = rig.inner.handle_local_request(LocalRequest::Ack {
+            message_ids: vec![m1.id.clone()],
+            recipient: "ack-agent".into(),
+        });
+        assert!(matches!(ack_resp, LocalResponse::Acked { .. }));
+        assert!(
+            !lock(&rig.inner.overflow_recipients).contains("ack-agent"),
+            "Ack should clear overflow_recipients"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = false;
+        while Instant::now() < deadline {
+            if let Ok((mut stream, _)) = ack_listener.accept() {
+                let mut payload = String::new();
+                let _ = stream.read_to_string(&mut payload);
+                assert!(
+                    payload.contains(m2.id.as_str()),
+                    "unexpected payload: {payload}"
+                );
+                accepted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            accepted,
+            "second message was not pushed after Ack cleared the fence"
+        );
+
+        // 2. Verify LocalRequest::Read { ack: true, .. } clears overflow_recipients and allows subsequent pushes.
+        let read_socket = rig._tmp.path().join("read-recover.sock");
+        lock(&rig.inner.routes).upsert_explicit(
+            "read-agent",
+            VendorRoute::Webhook {
+                socket_path: read_socket.clone(),
+            },
+            now_at(),
+        );
+        let (resp3, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("read-agent", "first-for-read"),
+        });
+        assert!(matches!(resp3, LocalResponse::Sent { .. }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(&rig.inner.overflow_recipients).contains("read-agent") {
+            assert!(Instant::now() < deadline, "read-agent was never fenced");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let read_listener = UnixListener::bind(&read_socket).unwrap();
+        read_listener.set_nonblocking(true).unwrap();
+
+        let (read_resp, _) = rig.inner.handle_local_request(LocalRequest::Read {
+            filter: WireFilter {
+                recipient: Some("read-agent".into()),
+                unread_only: true,
+                ..Default::default()
+            },
+            ack: true,
+        });
+        assert!(matches!(read_resp, LocalResponse::Inbox { .. }));
+        assert!(
+            !lock(&rig.inner.overflow_recipients).contains("read-agent"),
+            "Read(ack=true) should clear overflow_recipients"
+        );
+
+        let (resp4, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("read-agent", "after-read-ack"),
+        });
+        let LocalResponse::Sent { message: m4, .. } = resp4 else {
+            panic!("fourth send failed: {resp4:?}")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut read_accepted = false;
+        while Instant::now() < deadline {
+            if let Ok((mut stream, _)) = read_listener.accept() {
+                let mut payload = String::new();
+                let _ = stream.read_to_string(&mut payload);
+                assert!(
+                    payload.contains(m4.id.as_str()),
+                    "unexpected payload: {payload}"
+                );
+                read_accepted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            read_accepted,
+            "subsequent message was not pushed after Read(ack=true)"
+        );
+    }
+
+    #[test]
+    fn peer_sync_cursors_and_chunked_sync_batch_sync_asymmetric_stores_within_frame_bounds() {
+        let tmp = TempDir::new().unwrap();
+        let store_a = Arc::new(RedbStore::open(&tmp.path().join("asym-a.redb")).unwrap());
+        let store_b = Arc::new(RedbStore::open(&tmp.path().join("asym-b.redb")).unwrap());
+
+        // Pre-populate store_a with 1 message and store_b with 3 messages BEFORE connecting:
+        // Previously, store_b passed its local seq (3) as last_msg_seq to store_a, causing store_a
+        // to skip its seq 1 message!
+        let (msg_a1, _) = store_a
+            .send_wire(mail("synthetic-recipient", "from-a-1"))
+            .unwrap();
+        let (msg_b1, _) = store_b
+            .send_wire(mail("synthetic-recipient", "from-b-1"))
+            .unwrap();
+        let (msg_b2, _) = store_b
+            .send_wire(mail("synthetic-recipient", "from-b-2"))
+            .unwrap();
+        let (msg_b3, _) = store_b
+            .send_wire(mail("synthetic-recipient", "from-b-3"))
+            .unwrap();
+
+        // Also verify build_sync_batches chunks > MAX_SYNC_BATCH_ITEMS messages into multiple bounded batches.
+        let many_msgs: Vec<WireMessage> = (0..(MAX_SYNC_BATCH_ITEMS + 5))
+            .map(|_| msg_a1.clone())
+            .collect();
+        let chunks = build_sync_batches(vec![], many_msgs, vec![]);
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            let encoded = serde_json::to_vec(chunk).unwrap();
+            assert!(encoded.len() < MAX_FRAME_PAYLOAD);
+        }
+
+        let mut cfg_a = test_config(tmp.path(), "asym-a");
+        cfg_a.listen_addr = Some("127.0.0.1:0".into());
+        let daemon_a = spawn_daemon(Arc::clone(&store_a), cfg_a).unwrap();
+        let addr_a = daemon_a.listen_addr().unwrap().to_string();
+
+        let mut cfg_b = test_config(tmp.path(), "asym-b");
+        cfg_b.peers = vec![format!("ws://{addr_a}/wire")];
+        let _daemon_b = spawn_daemon(Arc::clone(&store_b), cfg_b).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let b_has_a1 = store_b.get_wire_message(&msg_a1.id).unwrap().is_some();
+            let a_has_b1 = store_a.get_wire_message(&msg_b1.id).unwrap().is_some();
+            let a_has_b2 = store_a.get_wire_message(&msg_b2.id).unwrap().is_some();
+            let a_has_b3 = store_a.get_wire_message(&msg_b3.id).unwrap().is_some();
+            if b_has_a1 && a_has_b1 && a_has_b2 && a_has_b3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bidirectional asymmetric SyncBatch (b_has_a1={b_has_a1}, a_has_b1={a_has_b1}, a_has_b2={a_has_b2}, a_has_b3={a_has_b3})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn slow_subscriber_is_dropped_at_bounded_capacity_and_socket_is_mode_0600() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("sub-cap.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "sub-cap");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0o600 on fl-wire.sock, got {mode:#o}");
+        }
+
+        let rig = rig();
+        let _rx = subscribe_all(&rig);
+        assert_eq!(lock(&rig.inner.subscribers).len(), 1);
+        let (msg, receipts) = rig
+            .source
+            .send_wire(send_args("cap", "bounded subscriber check", 1))
+            .unwrap();
+        for _ in 0..=MAX_SUBSCRIBER_BUFFER {
+            rig.inner.notify_subscribers_message(&msg, &receipts);
+        }
+        assert!(
+            lock(&rig.inner.subscribers).is_empty(),
+            "slow subscriber exceeding MAX_SUBSCRIBER_BUFFER must be dropped via try_send"
+        );
     }
 }
