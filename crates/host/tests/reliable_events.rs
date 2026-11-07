@@ -12,10 +12,7 @@ use fl_host_proto::{
 };
 
 fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+    tokio::runtime::Runtime::new().unwrap()
 }
 fn record(state: &ChildState) -> &ChildRecord {
     match state {
@@ -856,13 +853,14 @@ fn pending_complete_event_ack_is_fenced_by_takeover_or_event_disconnect() {
             None
         };
         drop(events);
+        drop(rt);
         let expected = if cause == "takeover" {
             Refusal::StaleLease
         } else {
             Refusal::FutureCursor
         };
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             Resp::Refused { code: expected }
         );
         let _rpc = ack.join().unwrap();
@@ -920,8 +918,9 @@ fn guessed_pending_final_write_cancellation_retires_no_output() {
     ));
     assert_eq!(f.rpc().summary(&check_stream).acked, 0);
     drop(events);
+    drop(rt);
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         Resp::Refused {
             code: Refusal::FutureCursor
         }

@@ -102,6 +102,7 @@ pub(crate) async fn accept_loop(host: Arc<HostInner>) {
     }
 }
 
+#[allow(deprecated)]
 async fn serve_conn(host: Arc<HostInner>, mut conn: HostConn) {
     let Ok(conn_id) = host
         .next_conn
@@ -1038,6 +1039,7 @@ fn list_response_storage_bound() -> Option<usize> {
         .checked_add(std::mem::size_of::<Vec<u8>>())
 }
 
+#[allow(deprecated)]
 fn admit_extension(
     host: &HostInner,
     count: &Arc<std::sync::atomic::AtomicUsize>,

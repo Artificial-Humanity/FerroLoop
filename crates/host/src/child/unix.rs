@@ -49,24 +49,45 @@ pub fn spawn_supervised(
     let (status_r, status_w) = pipe_cloexec()?;
     let use_pty = env.iter().any(|(k, v)| k == "FL_HOST_PTY" && v == "1");
     let (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w) = if use_pty {
-        let winsize = libc::winsize {
-            ws_row: 40,
-            ws_col: 120,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
         let mut master_raw = -1;
         let mut slave_raw = -1;
-        if unsafe {
-            libc::openpty(
-                &mut master_raw,
-                &mut slave_raw,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &winsize,
-            )
-        } != 0
-        {
+        #[cfg(target_os = "macos")]
+        let openpty_rc = {
+            let mut winsize = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            unsafe {
+                libc::openpty(
+                    &mut master_raw,
+                    &mut slave_raw,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut winsize,
+                )
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let openpty_rc = {
+            let winsize = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            unsafe {
+                libc::openpty(
+                    &mut master_raw,
+                    &mut slave_raw,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &winsize,
+                )
+            }
+        };
+        if openpty_rc != 0 {
             return Err(HostError::Io(io::Error::last_os_error().to_string()));
         }
         let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };

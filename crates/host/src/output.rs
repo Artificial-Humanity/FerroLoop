@@ -145,6 +145,7 @@ impl Hub {
         }
     }
 
+    #[allow(deprecated)]
     pub(crate) fn reserve_slot(&self) -> Result<SubscriberSlot, fl_host_proto::ExtensionRefusal> {
         self.slots
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
