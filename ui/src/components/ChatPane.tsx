@@ -1058,6 +1058,7 @@ function clearSessionDraft(targetKey: string): void {
 
 type TranscriptRefreshState = "loading" | "ready" | "stale" | "unavailable" | "denied";
 interface TranscriptSnapshot {
+  turns: TranscriptTurn[];
   owner: TranscriptReadOwner;
   concreteSessionId: string | null;
 }
@@ -1252,7 +1253,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setMetadataOwnerState(next);
   };
   const [readState, setReadState] = React.useState<{ owner: TranscriptReadOwner; status: TranscriptRefreshState } | null>(null);
-  const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
+  const [confirmedPrompts, setConfirmedPrompts] = React.useState<{
+    owner: TranscriptReadOwner; turns: TranscriptTurn[];
+  } | null>(null);
+  const [resetReadEpoch, setResetReadEpoch] = React.useState<number | null>(null);
   const [permPromptOverrides, setPermPromptOverrides] = React.useState<
     Record<string, PendingPermissionPromptItem["status"]>
   >({});
@@ -1415,7 +1419,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const effectiveRefreshState = transcriptRefreshState ?? (
     turns !== undefined ? "ready" : readStateMatches ? readState!.status : "loading"
   );
-  const effectiveTurns = turns ?? (snapshotMatches ? internalTurns : []);
+  const observedTurns = snapshotMatches ? snapshot!.turns : [];
+  const optimisticTurns = sameTranscriptOwner(confirmedPrompts?.owner ?? null, owner) ? confirmedPrompts!.turns : [];
+  const effectiveTurns = turns ?? [...observedTurns, ...optimisticTurns];
   const metadataMatches = sameTranscriptOwner(metadataOwner, owner);
   const effectiveIsBusy = isBusy ?? (metadataMatches ? internalIsBusy : false);
   const effectiveQueue = (queue ?? (metadataMatches ? internalQueue : [])).map((item) =>
@@ -1425,10 +1431,36 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const effectiveLoading = loading || (turns === undefined && (!readStateMatches || internalLoading));
   const effectiveError = error ?? (readStateMatches ? internalError : null);
 
+  // Async callbacks retain their dispatch owner; they cannot borrow a later render's authority.
+  const isCurrentOperation = () => mountedRef.current && !resetPendingRef.current &&
+    sameTranscriptOwner(owner, ownerRef.current) && identityRef.current.apiClient === apiClient &&
+    apiClient?.getToken() === token;
+
+  // Confirmed local sends are independent of whether any transcript has been observed.
+  // A successful transcript (including empty) replaces this optimistic view as before.
+  const appendConfirmedPrompt = (content: string, matchingBefore?: number, submittedContent = content) => {
+    if (!isCurrentOperation()) return;
+    setConfirmedPrompts((previous) => {
+      const local = sameTranscriptOwner(previous?.owner ?? null, owner) ? previous!.turns : [];
+      const observed = sameTranscriptOwner(snapshotRef.current?.owner ?? null, owner) ? snapshotRef.current!.turns : [];
+      if (matchingBefore !== undefined) {
+        const matches = [...observed, ...local].filter((turn) =>
+          turn.role.toLowerCase() === "user" &&
+          extractTurnAttachments(turn.content || "", { stripAgyWrapper: true }).cleanedContent.trim() === submittedContent,
+        ).length;
+        if (matches > matchingBefore) return previous;
+      }
+      return { owner: { ...owner }, turns: [...local, {
+        index: observed.length + local.length, role: "user", content,
+        thinking: null, tool_calls: [], created_at: new Date().toISOString(),
+      }] };
+    });
+  };
+
   // Prompt/queue replies are independent observations, even before a transcript is readable.
   const adoptPromptMetadata = (response: { queue?: unknown; is_busy?: unknown }) => {
-    if (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean") return;
-    if (!sameTranscriptOwner(metadataOwnerRef.current, ownerRef.current)) {
+    if (!isCurrentOperation() || (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
+    if (!sameTranscriptOwner(metadataOwnerRef.current, owner)) {
       // Hidden values belonging to a previous owner must not reappear with this reply.
       setInternalQueue([]);
       setInternalIsBusy(false);
@@ -1436,7 +1468,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setInternalContextUsage(null);
       setInternalQuotaUsage(null);
     }
-    setMetadataOwner({ ...ownerRef.current });
+    setMetadataOwner({ ...owner });
   };
 
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
@@ -1833,6 +1865,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     resetPendingRef.current = true;
     if (lastGood) setSnapshot({ ...lastGood, owner: resetOwner });
     if (metadataMatches) setMetadataOwner(resetOwner);
+    setConfirmedPrompts((previous) => sameTranscriptOwner(previous?.owner ?? null, owner)
+      ? { ...previous!, owner: resetOwner } : null);
     setReadState({ owner: resetOwner, status: "loading" });
     setInternalLoading(true);
     setClearing(true);
@@ -1855,10 +1889,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       if (sameTranscriptOwner(resetOwner, ownerRef.current) && mountedRef.current) {
         setSnapshot(null);
-        setInternalTurns([]);
+        setConfirmedPrompts(null);
         resetPendingRef.current = false;
         setInternalLoading(false);
-        if (turns === undefined) void fetchTranscriptRef.current();
+        if (turns === undefined) setResetReadEpoch(resetOwner.resetEpoch);
         if (!onResetSession) onRefresh?.();
         setCompactFeedback(mode === "reforge" ? "Reforged session" : "Cleared context");
       }
@@ -1947,6 +1981,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       resetPendingRef.current = true;
       if (lastGood) setSnapshot({ ...lastGood, owner: teardownOwner });
       if (metadataMatches) setMetadataOwner(teardownOwner);
+      const nextOwner = teardownOwner;
+      setConfirmedPrompts((previous) => sameTranscriptOwner(previous?.owner ?? null, owner)
+        ? { ...previous!, owner: nextOwner } : null);
       setReadState({ owner: teardownOwner, status: "loading" });
       setInternalLoading(true);
     }
@@ -1960,7 +1997,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await apiClient.decommissionSession(submittedTarget, mode);
         if (currentTargetRef.current === submittedTarget && (!teardownOwner || sameTranscriptOwner(teardownOwner, ownerRef.current))) {
           if (mode === "teardown") {
-            setInternalTurns([]);
+            setConfirmedPrompts(null);
             setInternalQueue([]);
             setInternalIsBusy(false);
           } else if (turns === undefined) {
@@ -1975,6 +2012,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       if (teardownOwner && sameTranscriptOwner(teardownOwner, ownerRef.current) && mountedRef.current) {
         setSnapshot(null);
+        setConfirmedPrompts(null);
         setReadState({ owner: teardownOwner, status: "unavailable" });
         setInternalLoading(false);
       }
@@ -2025,7 +2063,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await onSendPrompt(submittedTarget, payload);
       } else if (apiClient) {
         const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
-        if (currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
           adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
@@ -2035,30 +2073,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }
           if (!res.queued && res.status !== "queued") {
             const content = res.effective_body || payload.prompt;
-            setInternalTurns((prev) => [
-              ...prev,
-              {
-                index: prev.length,
-                role: "user",
-                content,
-                thinking: null,
-                tool_calls: [],
-                created_at: new Date().toISOString(),
-              },
-            ]);
+            appendConfirmedPrompt(content);
           }
           void fetchTranscript();
         }
       } else {
         throw new Error("No message route is configured for this session.");
       }
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setCompactFeedback("Sent /compact");
         scrollToBottom("smooth");
         requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setSubmitError(err instanceof Error ? err.message : "Failed to send /compact");
       }
     } finally {
@@ -2120,10 +2148,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   const fetchTranscript = React.useCallback(async () => {
-    if (!apiClient || turns !== undefined || resetPendingRef.current) return;
+    if (!apiClient || turns !== undefined || !mountedRef.current || resetPendingRef.current ||
+      !sameTranscriptOwner(owner, ownerRef.current) || identityRef.current.apiClient !== apiClient ||
+      apiClient.getToken() !== token) return;
     const targetId = sessionId || agentName;
     if (!targetId) return;
-    const readOwner = { ...ownerRef.current };
+    const readOwner = { ...owner };
     const requestToken = apiClient.getToken();
     const ticket = readGuard.begin(readOwner);
     const accepts = () => mountedRef.current && !resetPendingRef.current &&
@@ -2140,8 +2170,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       const resolvedId = typeof response.resolved_session_id === "string" && response.resolved_session_id.trim()
         ? response.resolved_session_id : null;
-      setInternalTurns(response.turns);
-      setSnapshot({ owner: readOwner, concreteSessionId: sessionId || resolvedId });
+      setConfirmedPrompts(null);
+      setSnapshot({ owner: readOwner, concreteSessionId: sessionId || resolvedId, turns: response.turns });
       setReadState({ owner: readOwner, status: "ready" });
       setMetadataOwner(readOwner);
       setInternalIsBusy(Boolean(response.is_busy));
@@ -2157,7 +2187,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         sameTranscriptOwner(snapshotRef.current?.owner ?? null, readOwner) && Boolean(snapshotRef.current?.concreteSessionId);
       if (!canRetain) {
         setSnapshot(null);
-        setInternalTurns([]);
+        if (!isTransientTranscriptReadError(err)) setConfirmedPrompts(null);
       }
       setReadState({
         owner: readOwner,
@@ -2167,7 +2197,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     } finally {
       if (accepts()) setInternalLoading(false);
     }
-  }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, owner.resetEpoch, readGuard]);
+  }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, owner.resetEpoch, token, readGuard]);
 
   // Snapshot changes must not schedule another read; selection/auth changes do.
   const fetchTranscriptRef = React.useRef(fetchTranscript);
@@ -2175,7 +2205,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   React.useEffect(() => {
     void fetchTranscriptRef.current();
     return () => readGuard.invalidate();
-  }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, readGuard]);
+  }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, resetReadEpoch, readGuard]);
 
   const pendingPrompt = pendingPrompts.get(targetSessionOrAgent);
   const filteredTurns = React.useMemo(() => {
@@ -2402,7 +2432,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         attempted = true;
         response = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
         const res = codexSendNow ? codexSendNowReceipt(submittedTarget, response) : response;
-        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
           adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
@@ -2416,24 +2446,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         if (codexSendNow && res.delivery_stage === "unconfirmed") recordUnconfirmedDelivery(submittedTarget, promptId);
         else recordPromptDelivery(submittedTarget, res);
-        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
           const content = res.effective_body || res.prompt;
           if (content && res.delivery_stage !== "unconfirmed") {
-            setInternalTurns((prev) => [
-              ...prev,
-              {
-                index: prev.length,
-                role: "user",
-                content,
-                thinking: null,
-                tool_calls: [],
-                created_at: new Date().toISOString(),
-              },
-            ]);
+            appendConfirmedPrompt(content);
           }
         }
       }
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         scrollToBottom("smooth");
       }
     } catch (err) {
@@ -2464,7 +2484,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await onCancelQueued(promptId);
       } else if (apiClient) {
         const res = await apiClient.cancelQueuedPrompt(submittedTarget, promptId);
-        if (currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
           adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
@@ -2476,7 +2496,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       unconfirmedQueuedPrompts.get(submittedTarget)?.delete(promptId);
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setSubmitError(
           err instanceof Error ? err.message : "Failed to cancel queued message",
         );
@@ -2497,7 +2517,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           promptId,
           trimmed,
         );
-        if (currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
           adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
@@ -2515,12 +2535,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           ),
         );
       }
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setEditingQueueId(null);
         setEditingQueueText("");
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setSubmitError(
           err instanceof Error ? err.message : "Failed to update queued message",
         );
@@ -2598,30 +2618,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       recordPromptDelivery(submittedTarget, res);
       if (
-        mountedRef.current && !onSendPrompt && apiClient && res &&
-        currentTargetRef.current === submittedTarget
+        isCurrentOperation() && !onSendPrompt && apiClient && res
       ) {
         adoptPromptMetadata(res);
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
         if (!wasQueued && res.delivery_stage !== "unconfirmed") {
           const body = res.effective_body || payload.prompt;
-          setInternalTurns((prev) => {
-            const matches = prev.filter((turn) =>
-              turn.role.toLowerCase() === "user" &&
-              extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
-                .cleanedContent.trim() === content,
-            ).length;
-            if (matches > matchingBefore) return prev;
-            return [...prev, {
-              index: prev.length,
-              role: "user",
-              content: body,
-              thinking: null,
-              tool_calls: [],
-              created_at: new Date().toISOString(),
-            }];
-          });
+          appendConfirmedPrompt(body, matchingBefore, content);
         }
         void fetchTranscript();
       }

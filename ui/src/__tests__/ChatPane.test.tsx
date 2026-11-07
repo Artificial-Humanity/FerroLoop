@@ -2159,6 +2159,119 @@ describe("standalone transcript ownership and availability", () => {
     expect(screen.queryByText("Owned history")).toBeNull();
     expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
   });
+  it("keeps a confirmed optimistic send before any successful transcript through an unavailable followup", async () => {
+    const { pane, reads, client, body } = setup();
+    const send = deferred<import("../types/api").PromptResponse>();
+    vi.spyOn(client, "sendSessionPrompt").mockReturnValue(send.promise);
+    render(pane());
+    await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Confirmed local prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    expect(screen.getByTestId("optimistic-user-turn")).toHaveTextContent("Confirmed local prompt");
+    await act(async () => send.resolve({ session_id: "session-a", queued: false, delivered: true } as never));
+    expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+    expect(within(screen.getByTestId("turn-card-0")).getByText("Confirmed local prompt")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    await act(async () => reads[1].reject(unavailable()));
+    expect(within(screen.getByTestId("turn-card-0")).getByText("Confirmed local prompt")).toBeInTheDocument();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[2].resolve(body([])));
+    expect(screen.queryByText("Confirmed local prompt")).toBeNull();
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it.each(["clear", "reforge", "teardown"] as const)("preserves confirmed optimistic rows on failed %s and discards them on success", async (mode) => {
+    const { pane, reads, client } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: false, delivered: true } as never);
+    const reset = mode === "teardown" ? vi.spyOn(client, "decommissionSession") : vi.spyOn(client, "clearSession");
+    reset.mockRejectedValueOnce(new Error("reset refused")).mockResolvedValue({} as never);
+    render(pane());
+    await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Locally confirmed before reset" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(reads).toHaveLength(2));
+    await act(async () => reads[1].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Draft survives reset" } });
+    const beginReset = () => {
+      if (mode === "teardown") {
+        fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+        fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+        fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+      } else {
+        fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+        fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+      }
+    };
+    beginReset();
+    expect(await screen.findByText("reset refused")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-card-0")).toHaveTextContent("Locally confirmed before reset");
+    expect(screen.getByLabelText("Message")).toHaveValue("Draft survives reset");
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    beginReset();
+    await waitFor(() => expect(reset).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Locally confirmed before reset")).toBeNull());
+    if (mode !== "teardown") {
+      await waitFor(() => expect(reads).toHaveLength(3));
+      await act(async () => reads[2].reject(unavailable()));
+    }
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toHaveValue("Draft survives reset");
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+  });
+  it.each(["principal", "token", "A to B to A"])("masks confirmed optimistic rows immediately after %s changes", async (change) => {
+    const { pane, reads, client } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: false, delivered: true } as never);
+    const first = { tier: "owner", login: "first" } as const;
+    const view = render(pane("session-a", "freya", first));
+    await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Private confirmed prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(reads).toHaveLength(2));
+    await act(async () => reads[1].reject(unavailable()));
+    expect(screen.getByTestId("turn-card-0")).toHaveTextContent("Private confirmed prompt");
+    if (change === "token") client.setToken("replacement-token");
+    if (change === "A to B to A") view.rerender(pane("session-b", "freya", first));
+    view.rerender(pane("session-a", "freya", change === "principal" ? { tier: "owner", login: "second" } : first));
+    expect(screen.queryByText("Private confirmed prompt")).toBeNull();
+    await act(async () => reads[reads.length - 1].reject(unavailable()));
+    expect(screen.queryByText("Private confirmed prompt")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+  });
+  it.each(["client", "principal", "token", "A to B to A"])("rejects a late send's old reader and local metadata after %s replacement", async (change) => {
+    const { pane, reads, client, body } = setup();
+    const replacement = setup();
+    const send = deferred<import("../types/api").PromptResponse>();
+    vi.spyOn(client, "sendSessionPrompt").mockReturnValue(send.promise);
+    const first = { tier: "owner", login: "first" } as const;
+    const view = render(pane("session-a", "freya", first));
+    await act(async () => reads[0].resolve(body([])));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Old owner's send" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    if (change === "token") client.setToken("fixture-replacement-token");
+    if (change === "A to B to A") view.rerender(pane("session-b", "freya", first));
+    view.rerender(change === "client" ? replacement.pane("session-a", "freya", first) : pane(
+      "session-a", "freya", change === "principal" ? { tier: "owner", login: "second" } : first,
+    ));
+    const currentReads = change === "client" ? replacement.reads : reads;
+    const currentRead = currentReads[currentReads.length - 1];
+    const oldReadCount = reads.length;
+    await act(async () => send.resolve({ session_id: "session-a", queued: false, delivered: true,
+      effective_body: "Stale optimistic body", is_busy: true,
+      queue: [{ id: "stale-send", session_id: "session-a", prompt: "Stale send queue", by: "owner", created_at: "" }],
+    } as never));
+    expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+    expect(screen.queryByText("Stale send queue")).toBeNull();
+    expect(screen.queryByText("Stale optimistic body")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).not.toHaveTextContent("Busy · Working");
+    expect(reads).toHaveLength(oldReadCount);
+    expect(screen.getByTestId("chat-refresh-btn")).toBeDisabled();
+    await act(async () => currentRead.resolve(body([{ ...history[0], content: "Current owner's history" }])));
+    expect(screen.getByText("Current owner's history")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-refresh-btn")).not.toBeDisabled();
+    expect(client.sendSessionPrompt).toHaveBeenCalledTimes(1);
+  });
   it("shows initial unavailable separately from observed empty history", async () => {
     const { pane, reads } = setup();
     render(pane());
@@ -2252,6 +2365,7 @@ describe("standalone transcript ownership and availability", () => {
     fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
     fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
     await waitFor(() => expect(client.clearSession).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(reads).toHaveLength(3));
     expect(screen.queryByText("Owned history")).toBeNull();
     await act(async () => reads[reads.length - 1].resolve(body([])));
     expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
