@@ -3798,7 +3798,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             }}
           />
         </div>
-        {deliveryStatus && <div role="status">{deliveryStatus}</div>}
+        {deliveryStatus && <div role="status" className="fd-composer-delivery-receipt">{deliveryStatus}</div>}
         {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
@@ -3812,7 +3812,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         )}
 
         {(inFlightUnconfirmed ?? (metadataMatches && internalInFlightUnconfirmed)) && (
-          <div role="status">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.some((item) => !item.delivery_state || item.delivery_state === "pending") && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
+          <div role="status" className="fd-composer-unconfirmed-warning">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.some((item) => !item.delivery_state || item.delivery_state === "pending") && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
         )}
 
         {effectiveQueue.length > 0 && (

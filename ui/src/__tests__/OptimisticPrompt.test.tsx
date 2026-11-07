@@ -37,6 +37,10 @@ describe("optimistic prompt submission", () => {
     render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now" }]} onSendQueuedNow={onSendQueuedNow} />);
     expect(screen.getByText(/Previous send could not be confirmed/)).toBeInTheDocument();
     expect(screen.getByText(/Check the session before sending queued messages/)).toBeInTheDocument();
+    const warning = screen.getByText(/Previous send could not be confirmed/);
+    expect(warning).toHaveAttribute("role", "status");
+    expect(warning).toHaveClass("fd-composer-unconfirmed-warning");
+    expect(warning.textContent).toContain("Send Now sends that item immediately and may overlap the previous turn.");
     fireEvent.click(screen.getByTestId("queued-send-now-q1"));
     expect(onSendQueuedNow).toHaveBeenCalledWith("q1");
   });
