@@ -149,7 +149,7 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
-    /// List active (or all) registered agents and optionally render `REGISTRY.md`.
+    /// List active (or all) registered agents and optionally render a Markdown roster (`--render <path>`).
     Roster {
         /// Filter to agents covering this project/area slug.
         #[arg(long)]
@@ -286,7 +286,7 @@ pub fn resolve_agent<S: AgentRegistry + Handles>(
 }
 
 /// Format the two-table Markdown roster (`Projects and Coverage Areas` + `Active Agents`)
-/// matching `.agents/REGISTRY.md` (spec §5.1).
+/// for `fl agent roster --render <path>` (spec §5.1).
 pub fn render_registry_markdown(areas: &[AreaRecord], agents: &[AgentRecord]) -> String {
     let mut out = String::from(
         "# Agent and Project Registry\n\n\
@@ -464,24 +464,6 @@ pub fn preserve_on_replace(
     (role, extras)
 }
 
-/// Re-render the workspace `.agents/REGISTRY.md` from `store`, found by walking up from `start`
-/// through its ancestors, so a command run in any project subdirectory updates the workspace's
-/// file rather than looking for `./.agents/REGISTRY.md`. Returns the file written, or `None`
-/// when no ancestor holds one (nothing is created) or the roster could not be read or written.
-pub fn sync_registry_markdown<S: AgentRegistry>(store: &S, start: &Path) -> Option<PathBuf> {
-    // A relative `start` such as `.` has no ancestors to walk; resolve it first.
-    let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-    let candidate = start
-        .ancestors()
-        .map(|dir| dir.join(".agents").join("REGISTRY.md"))
-        .find(|path| path.is_file())?;
-    let areas = store.list_areas().ok()?;
-    let agents = store.list_agents(None, true).ok()?;
-    let md = render_registry_markdown(&areas, &agents);
-    write_atomic_non_symlink(&candidate, md.as_bytes()).ok()?;
-    Some(candidate)
-}
-
 pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
     store: &S,
     cmd: AgentCmd,
@@ -594,6 +576,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let retired = store
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
+            crate::cmd::wire::evict_persona_route(&retired.name_key);
             if json {
                 println!("{}", serde_json::to_string_pretty(&retired).unwrap());
             } else {

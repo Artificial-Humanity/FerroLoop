@@ -27,7 +27,7 @@ use fl_wire::identity::{
 };
 use serde_json::{Value, json};
 
-use crate::cmd::agent::{now_at, preserve_on_replace, resolve_agent, sync_registry_markdown};
+use crate::cmd::agent::{now_at, preserve_on_replace, resolve_agent};
 use crate::cmd::state::StateEnv;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -411,32 +411,65 @@ fn prune_muse_roster(persona: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
+pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        match client.request(&LocalRequest::UnregisterRoute {
-            persona: persona.into(),
-        })? {
-            LocalResponse::RouteUnregistered => {}
-            other => return Err(format!("unexpected daemon response: {other:?}")),
-        }
-    }
     let paths: Vec<PathBuf> = match resolve_routes_path_for(env) {
         Some(path) => vec![path],
         None => std::iter::once(fl_wire::identity::default_routes_path())
             .chain(fl_wire::identity::legacy_routes_path())
             .collect(),
     };
+    remove_route_at(&sock, &paths, persona)
+}
+
+pub(crate) fn evict_persona_route(persona: &str) {
+    #[cfg(test)]
+    if resolve_routes_path().is_none() {
+        return;
+    }
+    let sock = std::env::var_os("FL_WIRE_SOCKET")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            crate::config::load(crate::config::path().as_deref())
+                .ok()
+                .and_then(|cfg| cfg.wire)
+                .and_then(|w| w.socket)
+        })
+        .unwrap_or_else(default_socket_path);
+    let paths: Vec<PathBuf> = match resolve_routes_path() {
+        Some(path) => vec![path],
+        None => std::iter::once(fl_wire::identity::default_routes_path())
+            .chain(fl_wire::identity::legacy_routes_path())
+            .collect(),
+    };
+    let _ = remove_route_at(&sock, &paths, persona);
+}
+
+fn remove_route_at(sock: &Path, paths: &[PathBuf], persona: &str) -> Result<(), String> {
+    let mut daemon_err = None;
+    if let Ok(mut client) = LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+        match client.request(&LocalRequest::UnregisterRoute {
+            persona: persona.into(),
+        }) {
+            Ok(LocalResponse::RouteUnregistered) => {}
+            Ok(other) => daemon_err = Some(format!("unexpected daemon response: {other:?}")),
+            Err(e) => daemon_err = Some(e),
+        }
+    }
     for path in paths {
         if !path.is_file() {
             continue;
         }
-        let mut routes = RouteTable::load(Some(&path));
+        let mut routes = RouteTable::load(Some(path));
         if routes.entries.remove(persona).is_some() {
             routes
-                .save(Some(&path))
+                .save(Some(path))
                 .map_err(|error| error.to_string())?;
         }
+    }
+    if let Some(err) = daemon_err {
+        return Err(err);
     }
     Ok(())
 }
@@ -1587,7 +1620,6 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                                 )
                             })?;
                     }
-                    sync_registry_markdown(&store, env.cwd);
                     let all_active = store.list_agents(None, false).unwrap_or_default();
                     let mgr = reports_to(&rec, &all_active);
                     println!(
@@ -1623,7 +1655,6 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                     format!("agent retired but Muse roster removal failed: {e}"),
                 )
             })?;
-            sync_registry_markdown(&store, env.cwd);
             println!("Retired {} ({})", retired.display_name, retired.id);
             Ok(0)
         }
@@ -2088,6 +2119,46 @@ mod tests {
         let roster: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert!(roster.get("ada").is_none());
         assert_eq!(roster["bob"]["session_id"], "keep");
+    }
+
+    #[test]
+    fn agent_retire_evicts_the_retired_personas_route() {
+        let rig = HookRig::new(Some("ada"));
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: now_at(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        rig.seed("ada", grok_route("old"));
+        crate::cmd::agent::run(
+            &store,
+            crate::cmd::agent::AgentCmd::Retire {
+                agent: "Ada".into(),
+                by: "owner".into(),
+                json: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            RouteTable::load(Some(&rig.routes_path()))
+                .get("ada")
+                .is_none()
+        );
     }
     #[test]
     fn retention_cutoff_saturates_instead_of_wrapping() {

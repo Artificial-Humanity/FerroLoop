@@ -7291,7 +7291,7 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
         "Take the name of {name} and take up residence in {project}/ as the {role}.\n\
          \n\
          This session has just been reset (`/clear`) for clean-slate context hygiene. Perform your root startup hydration now:\n\
-         1. Read `.agents/AGENTS.md` and `.agents/REGISTRY.md`.\n\
+         1. Read `.agents/AGENTS.md` and check the active roster with `fl agent roster`.\n\
          2. Read your role file(s): `.agents/roles/{role}.md`.\n\
          3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
          4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state handoff get --scope {scope} --key {name_lower}` for your own latest handoff (if it reports none, `fl state handoff get --scope {scope}` reads the shared `current` handoff), and `fl state search \"<query>\"` to look up anything specific.\n\

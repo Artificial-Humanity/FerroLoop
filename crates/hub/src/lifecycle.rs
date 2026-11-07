@@ -5413,6 +5413,8 @@ mod tests {
         // FerroState is read before the legacy note.
         assert!(p.find("fl state render").unwrap() < p.find("STATE.md").unwrap());
         // Registration and inbox steps stay.
+        assert!(p.contains("fl agent roster"), "{p}");
+        assert!(!p.contains("REGISTRY.md"), "{p}");
         assert!(p.contains(
             "agent-msg register Felicity --project FerroLoop --role assistant --replace"
         ));
