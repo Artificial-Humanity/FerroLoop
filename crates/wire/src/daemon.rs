@@ -1179,8 +1179,16 @@ where
                 route,
                 explicit,
             } => {
+                let Some(norm) = normalize_persona(&persona) else {
+                    return (
+                        LocalResponse::Error {
+                            message: "invalid persona".into(),
+                        },
+                        None,
+                    );
+                };
                 let evidence = hold_evidence(
-                    &persona.to_ascii_lowercase(),
+                    &norm,
                     None,
                     SuppressionPhase::RetainedFence,
                     FenceReason::WorkerSpawnFailure,
@@ -1192,14 +1200,6 @@ where
                 let _order = lock(&self.enqueue_gate);
                 {
                     let mut routes = lock(&self.routes);
-                    let Some(norm) = normalize_persona(&persona) else {
-                        return (
-                            LocalResponse::Error {
-                                message: "invalid persona".into(),
-                            },
-                            None,
-                        );
-                    };
                     if !explicit {
                         let conflicts_with_binding = routes.get(&norm).is_some_and(|entry| {
                             entry.explicit
@@ -2587,6 +2587,85 @@ mod tests {
         );
         assert!(lock(&inner.overflow_recipients).contains(" alice "));
         assert!(!lock(&inner.overflow_recipients).contains("alice"));
+        assert!(lock(&inner.store.calls).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_padded_registration_promotes_only_canonical_prefix_on_spawn_failure() {
+        let (_tmp, inner) = fault_rig();
+        inner.queue_limit_override.store(1, Ordering::SeqCst);
+        let (accepted, _) = inner.store.send_wire(mail("alice", "accepted")).unwrap();
+        for name in ["alice", " alice "] {
+            lock(&inner.dispatch_queues).insert(
+                name.into(),
+                RecipientDispatchQueue {
+                    pending: VecDeque::from([(accepted.id.clone(), At::from_unix_millis(1))]),
+                    worker_active: true,
+                    ..Default::default()
+                },
+            );
+            let (rejected, mut receipts) =
+                inner.store.send_wire(mail("alice", "rejected")).unwrap();
+            // Imported receipt names keep raw bytes, independently of route registration.
+            receipts[0].recipient_name = name.into();
+            assert!(
+                inner
+                    .schedule_dispatch(&rejected, &receipts, now_at(), &mut Vec::new())
+                    .is_err()
+            );
+        }
+        let before = inner.diagnostics_snapshot();
+        assert_eq!(before.records.len(), 2);
+        assert_eq!(before.records[0].recipient.as_deref(), Some("alice"));
+        assert!(before.records[1].recipient_invalid);
+        for row in &before.records {
+            assert_eq!(row.phase, SuppressionPhase::PrefixDraining);
+            assert_eq!(row.first_reason, FenceReason::QueueOverflow);
+            assert!(row.trigger_message_id.is_some());
+        }
+        assert_ne!(
+            before.records[0].trigger_message_id,
+            before.records[1].trigger_message_id
+        );
+        {
+            let mut queues = lock(&inner.dispatch_queues);
+            let canonical = queues.get_mut("alice").unwrap();
+            canonical.worker_active = false;
+            canonical.waiting_for_route = true;
+        }
+        inner.fail_next_worker_spawn.store(true, Ordering::SeqCst);
+        lock(&inner.store.calls).clear();
+        let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: " ALICE ".into(),
+            explicit: true,
+            route: VendorRoute::Codex {
+                thread_id: "registration-session".into(),
+                cwd: None,
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        assert!(lock(&inner.routes).get("alice").unwrap().explicit);
+        assert_eq!(
+            *lock(&inner.overflow_recipients),
+            BTreeSet::from(["alice".into()])
+        );
+        {
+            let queues = lock(&inner.dispatch_queues);
+            assert!(!queues.contains_key("alice"));
+            let raw = queues.get(" alice ").unwrap();
+            assert_eq!(raw.pending.front().map(|(id, _)| id), Some(&accepted.id));
+            assert_eq!(raw.pending.len(), 1);
+            assert!(raw.worker_active && raw.overflowed);
+            assert_eq!(raw.route_generation, 1);
+        }
+        let after = inner.diagnostics_snapshot();
+        assert_eq!(after.records.len(), 2);
+        let mut promoted = before.records[0].clone();
+        promoted.phase = SuppressionPhase::RetainedFence;
+        promoted.decisive_reason = FenceReason::WorkerSpawnFailure;
+        // Full equality also preserves the first overflow trigger, timestamp and cause.
+        assert_eq!(after.records[0], promoted);
+        assert_eq!(after.records[1], before.records[1]);
         assert!(lock(&inner.store.calls).is_empty());
     }
 
