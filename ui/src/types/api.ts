@@ -640,6 +640,8 @@ export interface SessionContextUsage {
 
 export interface SessionTranscriptResponse {
   session_id: string;
+  /** Concrete discovered session identity; absent on older servers or unresolved requests. */
+  resolved_session_id?: string | null;
   turns: TranscriptTurn[];
   is_busy?: boolean;
   in_flight_unconfirmed?: boolean;

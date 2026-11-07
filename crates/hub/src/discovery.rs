@@ -3845,7 +3845,16 @@ pub(crate) fn transcript_from_sessions(
         .unwrap_or_default()
 }
 
-/// `None` means a discovered transcript could not be read consistently, not an empty transcript.
+/// A transcript observation distinguishes a successful empty read from unavailable history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptObservation {
+    Observed(Vec<TranscriptTurn>),
+    Unavailable,
+    NoSource,
+}
+
+/// Compatibility observation for queue/busy consumers: no source retains the historical
+/// known-empty result, while a discovered source that cannot be read stays unknown.
 pub(crate) fn transcript_observation_from_sessions(
     session_id: &str,
     sessions: &[DiscoveredSessionSummary],
@@ -3853,10 +3862,27 @@ pub(crate) fn transcript_observation_from_sessions(
     home_override: Option<&Path>,
     files: &mut TranscriptReads,
 ) -> Option<Vec<TranscriptTurn>> {
+    match observe_transcript_from_sessions(session_id, sessions, snap, home_override, files) {
+        TranscriptObservation::Observed(turns) => Some(turns),
+        TranscriptObservation::Unavailable => None,
+        TranscriptObservation::NoSource => Some(Vec::new()),
+    }
+}
+
+/// Preserve source precedence, including attempt fallback after a successfully read empty
+/// file. An unreadable earlier source cannot be replaced by a later fallback.
+pub(crate) fn observe_transcript_from_sessions(
+    session_id: &str,
+    sessions: &[DiscoveredSessionSummary],
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> TranscriptObservation {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
-        return Some(Vec::new());
+        return TranscriptObservation::NoSource;
     }
+    let mut observed_source = false;
     for s in sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
@@ -3864,11 +3890,14 @@ pub(crate) fn transcript_observation_from_sessions(
             // Discovery supplies a path only after finding a file. If it disappears,
             // its previous contents are unknown; it is not a new empty transcript.
             if fs::metadata(tpath).is_err() {
-                return None;
+                return TranscriptObservation::Unavailable;
             }
-            let turns = files.turns(tpath)?;
+            let Some(turns) = files.turns(tpath) else {
+                return TranscriptObservation::Unavailable;
+            };
+            observed_source = true;
             if !turns.is_empty() {
-                return Some(turns.to_vec());
+                return TranscriptObservation::Observed(turns.to_vec());
             }
         }
     }
@@ -3878,14 +3907,17 @@ pub(crate) fn transcript_observation_from_sessions(
     if let Some(ref h) = home
         && let Some(tpath) = find_transcript_file_in_home(h, trimmed)
     {
-        let turns = files.turns(&tpath)?;
+        let Some(turns) = files.turns(&tpath) else {
+            return TranscriptObservation::Unavailable;
+        };
+        observed_source = true;
         if !turns.is_empty() {
-            return Some(turns.to_vec());
+            return TranscriptObservation::Observed(turns.to_vec());
         }
     }
     for attempt in &snap.attempts {
         if attempt.id == trimmed || attempt.record_str == trimmed {
-            return Some(vec![TranscriptTurn {
+            return TranscriptObservation::Observed(vec![TranscriptTurn {
                 index: 0,
                 role: "assistant".to_string(),
                 content: attempt.output_excerpt.clone().unwrap_or_default(),
@@ -3895,7 +3927,11 @@ pub(crate) fn transcript_observation_from_sessions(
             }]);
         }
     }
-    Some(Vec::new())
+    if observed_source {
+        TranscriptObservation::Observed(Vec::new())
+    } else {
+        TranscriptObservation::NoSource
+    }
 }
 
 /// Read a queued session without confusing a failed transcript read with no transcript.
@@ -5754,6 +5790,69 @@ pub fn scan_cargo_architecture_conformance(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn transcript_empty_source_preserves_attempt_fallback_and_early_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.jsonl");
+        fs::write(&path, "").unwrap();
+        let session: DiscoveredSessionSummary = serde_json::from_value(serde_json::json!({
+            "id": "example", "source": "route", "adapter": "claude", "status": "active",
+            "transcript_path": path.to_str().unwrap()
+        }))
+        .unwrap();
+        let snapshot = DiscoveryStoreSnapshot {
+            attempts: vec![DiscoveryAttemptRow {
+                id: "example".into(),
+                adapter: "claude".into(),
+                status: "completed".into(),
+                updated_at: None,
+                cwd: String::new(),
+                record_id: "record".into(),
+                record_str: "record".into(),
+                output_excerpt: Some("attempt fallback".into()),
+                created_at: None,
+            }],
+            ..Default::default()
+        };
+        let mut files = TranscriptReads::default();
+        let observed = transcript_observation_from_sessions(
+            "example",
+            std::slice::from_ref(&session),
+            &snapshot,
+            Some(tmp.path()),
+            &mut files,
+        )
+        .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].content, "attempt fallback");
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            transcript_observation_from_sessions(
+                "example",
+                &[session],
+                &snapshot,
+                Some(tmp.path()),
+                &mut files
+            ),
+            None,
+            "an unreadable earlier source must not fall through to the attempt"
+        );
+        assert_eq!(
+            transcript_observation_from_sessions(
+                "unknown",
+                &[],
+                &snapshot,
+                Some(tmp.path()),
+                &mut files
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            transcript_from_sessions("unknown", &[], &snapshot, Some(tmp.path()), &mut files),
+            Vec::new()
+        );
+    }
 
     #[test]
     fn unstable_read_is_unknown_but_missing_transcript_is_known_empty() {

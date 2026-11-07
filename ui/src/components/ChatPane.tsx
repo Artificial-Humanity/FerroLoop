@@ -23,6 +23,12 @@ import {
   type SlashCommandEntry,
   type TranscriptTurn,
 } from "../types/api";
+import {
+  createTranscriptReadGuard,
+  isObservedTranscriptTurns,
+  isTransientTranscriptReadError,
+  type TranscriptReadOwner,
+} from "../lib/transcriptReadGuard";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import { AgentSettingsModal } from "./AgentSettingsModal";
 import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
@@ -1051,6 +1057,17 @@ function clearSessionDraft(targetKey: string): void {
   }
 }
 
+type TranscriptRefreshState = "loading" | "ready" | "stale" | "unavailable" | "denied";
+interface TranscriptSnapshot {
+  turns: TranscriptTurn[];
+  owner: TranscriptReadOwner;
+  concreteSessionId: string | null;
+}
+function sameTranscriptOwner(a: TranscriptReadOwner | null, b: TranscriptReadOwner): boolean {
+  return Boolean(a && a.authEpoch === b.authEpoch && a.selectionEpoch === b.selectionEpoch &&
+    a.agentKey === b.agentKey && a.sessionId === b.sessionId && a.resetEpoch === b.resetEpoch);
+}
+
 export interface ChatPaneProps {
   /** The shared project list, passed on to the agent settings modal. */
   projects?: readonly ProjectSummary[];
@@ -1073,6 +1090,8 @@ export interface ChatPaneProps {
   isBusy?: boolean;
   inFlightUnconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
+  transcriptRefreshState?: TranscriptRefreshState;
+  onResetSession?: (targetId: string, mode: ClearSessionMode) => Promise<unknown>;
   loading?: boolean;
   error?: string | null;
   wsConnected?: boolean;
@@ -1156,6 +1175,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   isBusy,
   inFlightUnconfirmed,
   queue,
+  transcriptRefreshState,
+  onResetSession,
   loading = false,
   error = null,
   wsConnected = false,
@@ -1184,7 +1205,48 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onRespondPermissionPrompt,
   apiClient,
 }) => {
-  const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
+  const readGuard = React.useRef(createTranscriptReadGuard()).current;
+  const token = apiClient?.getToken();
+  const principal = authority?.tier === "owner" ? authority.login : authority?.agent;
+  const identityRef = React.useRef({ apiClient, token, tier: authority?.tier, principal, agentName, sessionId });
+  const ownerRef = React.useRef<TranscriptReadOwner>({
+    authEpoch: 0, selectionEpoch: 0, agentKey: agentName || "", sessionId: sessionId || null, resetEpoch: 0,
+  });
+  const resetPendingRef = React.useRef(false);
+  const previousIdentity = identityRef.current;
+  const authChanged = previousIdentity.apiClient !== apiClient || previousIdentity.token !== token ||
+    previousIdentity.tier !== authority?.tier || previousIdentity.principal !== principal;
+  const selectionChanged = previousIdentity.agentName !== agentName || previousIdentity.sessionId !== sessionId;
+  if (authChanged || selectionChanged) {
+    resetPendingRef.current = false;
+    readGuard.invalidate();
+    ownerRef.current = {
+      ...ownerRef.current,
+      authEpoch: ownerRef.current.authEpoch + Number(authChanged),
+      selectionEpoch: ownerRef.current.selectionEpoch + Number(selectionChanged),
+      agentKey: agentName || "",
+      sessionId: sessionId || null,
+    };
+    identityRef.current = { apiClient, token, tier: authority?.tier, principal, agentName, sessionId };
+  }
+  const owner = ownerRef.current;
+  const [snapshot, setSnapshotState] = React.useState<TranscriptSnapshot | null>(null);
+  const snapshotRef = React.useRef(snapshot);
+  const setSnapshot = (next: TranscriptSnapshot | null) => {
+    snapshotRef.current = next;
+    setSnapshotState(next);
+  };
+  const [metadataOwner, setMetadataOwnerState] = React.useState<TranscriptReadOwner | null>(null);
+  const metadataOwnerRef = React.useRef(metadataOwner);
+  const setMetadataOwner = (next: TranscriptReadOwner | null) => {
+    metadataOwnerRef.current = next;
+    setMetadataOwnerState(next);
+  };
+  const [readState, setReadState] = React.useState<{ owner: TranscriptReadOwner; status: TranscriptRefreshState } | null>(null);
+  const [confirmedPrompts, setConfirmedPrompts] = React.useState<{
+    owner: TranscriptReadOwner; turns: TranscriptTurn[];
+  } | null>(null);
+  const [resetReadEpoch, setResetReadEpoch] = React.useState<number | null>(null);
   const [permPromptOverrides, setPermPromptOverrides] = React.useState<
     Record<string, PendingPermissionPromptItem["status"]>
   >({});
@@ -1342,14 +1404,68 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const prevLastTurnKeyRef = React.useRef<string>("");
   const isNearBottomRef = React.useRef<boolean>(true);
 
-  const effectiveTurns = turns ?? internalTurns;
-  const effectiveIsBusy = isBusy ?? internalIsBusy;
-  const effectiveQueue = (queue ?? internalQueue).map((item) =>
+  const snapshotMatches = sameTranscriptOwner(snapshot?.owner ?? null, owner);
+  const readStateMatches = sameTranscriptOwner(readState?.owner ?? null, owner);
+  const effectiveRefreshState = transcriptRefreshState ?? (
+    turns !== undefined ? "ready" : readStateMatches ? readState!.status : "loading"
+  );
+  const observedTurns = snapshotMatches ? snapshot!.turns : [];
+  const optimisticTurns = sameTranscriptOwner(confirmedPrompts?.owner ?? null, owner) ? confirmedPrompts!.turns : [];
+  const effectiveTurns = turns ?? [...observedTurns, ...optimisticTurns];
+  const metadataMatches = sameTranscriptOwner(metadataOwner, owner);
+  const effectiveIsBusy = isBusy ?? (metadataMatches ? internalIsBusy : false);
+  const effectiveQueue = (queue ?? (metadataMatches ? internalQueue : [])).map((item) =>
     unconfirmedQueuedPrompts.get(targetSessionOrAgent)?.has(item.id)
       ? { ...item, delivery_state: "unconfirmed" as const } : item,
   );
-  const effectiveLoading = loading || internalLoading;
-  const effectiveError = error ?? internalError;
+  const effectiveLoading = loading || (turns === undefined && (!readStateMatches || internalLoading));
+  const effectiveError = error ?? (readStateMatches ? internalError : null);
+
+  // Async callbacks retain their dispatch owner; they cannot borrow a later render's authority.
+  const isCurrentOperation = () => mountedRef.current && !resetPendingRef.current &&
+    sameTranscriptOwner(owner, ownerRef.current) && identityRef.current.apiClient === apiClient &&
+    apiClient?.getToken() === token;
+
+  // Confirmed local sends are independent of whether any transcript has been observed.
+  // A successful transcript (including empty) replaces this optimistic view as before.
+  const appendConfirmedPrompt = (content: string, matchingBefore?: number, submittedContent = content) => {
+    if (!isCurrentOperation()) return;
+    setConfirmedPrompts((previous) => {
+      const local = sameTranscriptOwner(previous?.owner ?? null, owner) ? previous!.turns : [];
+      const observed = sameTranscriptOwner(snapshotRef.current?.owner ?? null, owner) ? snapshotRef.current!.turns : [];
+      if (matchingBefore !== undefined) {
+        const matches = [...observed, ...local].filter((turn) =>
+          turn.role.toLowerCase() === "user" &&
+          extractTurnAttachments(turn.content || "", { stripAgyWrapper: true }).cleanedContent.trim() === submittedContent,
+        ).length;
+        if (matches > matchingBefore) return previous;
+      }
+      return { owner: { ...owner }, turns: [...local, {
+        index: observed.length + local.length, role: "user", content,
+        thinking: null, tool_calls: [], created_at: new Date().toISOString(),
+      }] };
+    });
+  };
+
+  // Prompt/queue replies are independent observations, even before a transcript is readable.
+  const adoptPromptMetadata = (response: { queue?: unknown; is_busy?: unknown }) => {
+    if (!isCurrentOperation() || (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
+    readGuard.invalidate();
+    setInternalLoading(false);
+    setReadState((previous) => {
+      if (sameTranscriptOwner(previous?.owner ?? null, owner) && previous!.status !== "loading") return previous;
+      return { owner: { ...owner }, status: sameTranscriptOwner(snapshotRef.current?.owner ?? null, owner) ? "ready" : "unavailable" };
+    });
+    if (!sameTranscriptOwner(metadataOwnerRef.current, owner)) {
+      // Hidden values belonging to a previous owner must not reappear with this reply.
+      setInternalQueue([]);
+      setInternalIsBusy(false);
+      setInternalInFlightUnconfirmed(false);
+      setInternalContextUsage(null);
+      setInternalQuotaUsage(null);
+    }
+    setMetadataOwner({ ...owner });
+  };
 
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
 
@@ -1378,11 +1494,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     () =>
       estimateSessionContextUsage(
         effectiveTurns,
-        contextUsage ?? internalContextUsage,
+        contextUsage ?? (metadataMatches ? internalContextUsage : null),
       ),
-    [effectiveTurns, contextUsage, internalContextUsage],
+    [effectiveTurns, contextUsage, internalContextUsage, metadataMatches],
   );
-  const effectiveQuotaUsage = quotaUsage ?? internalQuotaUsage;
+  const effectiveQuotaUsage = quotaUsage ?? (metadataMatches ? internalQuotaUsage : null);
   const showQuotaBadge = hasQuotaUsageData(effectiveQuotaUsage);
   const quotaExhausted = Boolean(
     effectiveQuotaUsage &&
@@ -1737,20 +1853,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent || clearing) {
       return;
     }
+    const submittedTarget = targetSessionOrAgent;
+    readGuard.invalidate();
+    ownerRef.current = { ...ownerRef.current, resetEpoch: ownerRef.current.resetEpoch + 1 };
+    const resetOwner = { ...ownerRef.current };
+    const lastGood = snapshotMatches && snapshot?.concreteSessionId ? snapshot : null;
+    resetPendingRef.current = true;
+    if (lastGood) setSnapshot({ ...lastGood, owner: resetOwner });
+    if (metadataMatches) setMetadataOwner(resetOwner);
+    setConfirmedPrompts((previous) => sameTranscriptOwner(previous?.owner ?? null, owner)
+      ? { ...previous!, owner: resetOwner } : null);
+    setReadState({ owner: resetOwner, status: "loading" });
+    setInternalLoading(true);
     setClearing(true);
     setCompactFeedback(null);
     setSubmitError(null);
     try {
-      if (apiClient) {
-        await apiClient.clearSession(targetSessionOrAgent, mode);
-        if (turns === undefined) {
-          void fetchTranscript();
-        }
-        if (onRefresh) {
-          onRefresh();
-        }
+      if (onResetSession) {
+        await onResetSession(submittedTarget, mode);
+      } else if (apiClient) {
+        await apiClient.clearSession(submittedTarget, mode);
       } else if (onSendPrompt) {
-        await onSendPrompt(targetSessionOrAgent, {
+        await onSendPrompt(submittedTarget, {
           prompt: "/clear",
           subject: mode === "reforge" ? "Reforge Context" : "Clear Context",
           urgency: "normal",
@@ -1759,14 +1883,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else {
         throw new Error("No session route is configured for clearing.");
       }
+      if (sameTranscriptOwner(resetOwner, ownerRef.current) && mountedRef.current) {
+        setSnapshot(null);
+        setConfirmedPrompts(null);
+        resetPendingRef.current = false;
+        setInternalLoading(false);
+        if (turns === undefined) setResetReadEpoch(resetOwner.resetEpoch);
+        if (!onResetSession) onRefresh?.();
+        setCompactFeedback(mode === "reforge" ? "Reforged session" : "Cleared context");
+      }
       handleCloseClearModal();
-      setCompactFeedback(mode === "reforge" ? "Reforged session" : "Cleared context");
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : `Failed to ${mode} session`,
-      );
+      if (sameTranscriptOwner(resetOwner, ownerRef.current) && mountedRef.current) {
+        setReadState({ owner: resetOwner, status: lastGood ? "ready" : "unavailable" });
+        setInternalLoading(false);
+        setSubmitError(err instanceof Error ? err.message : `Failed to ${mode} session`);
+      }
       handleCloseClearModal();
     } finally {
+      if (sameTranscriptOwner(resetOwner, ownerRef.current)) resetPendingRef.current = false;
       setClearing(false);
     }
   };
@@ -1833,6 +1968,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       return;
     }
     const submittedTarget = targetSessionOrAgent;
+    let teardownOwner: TranscriptReadOwner | null = null;
+    const lastGood = snapshotMatches && snapshot?.concreteSessionId ? snapshot : null;
+    if (mode === "teardown") {
+      readGuard.invalidate();
+      ownerRef.current = { ...ownerRef.current, resetEpoch: ownerRef.current.resetEpoch + 1 };
+      teardownOwner = { ...ownerRef.current };
+      resetPendingRef.current = true;
+      if (lastGood) setSnapshot({ ...lastGood, owner: teardownOwner });
+      if (metadataMatches) setMetadataOwner(teardownOwner);
+      const nextOwner = teardownOwner;
+      setConfirmedPrompts((previous) => sameTranscriptOwner(previous?.owner ?? null, owner)
+        ? { ...previous!, owner: nextOwner } : null);
+      setReadState({ owner: teardownOwner, status: "loading" });
+      setInternalLoading(true);
+    }
     setDecommissioning(true);
     setCompactFeedback(null);
     setSubmitError(null);
@@ -1841,9 +1991,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await onDecommissionSession(mode);
       } else if (apiClient) {
         await apiClient.decommissionSession(submittedTarget, mode);
-        if (currentTargetRef.current === submittedTarget) {
+        if (currentTargetRef.current === submittedTarget && (!teardownOwner || sameTranscriptOwner(teardownOwner, ownerRef.current))) {
           if (mode === "teardown") {
-            setInternalTurns([]);
+            setConfirmedPrompts(null);
             setInternalQueue([]);
             setInternalIsBusy(false);
           } else if (turns === undefined) {
@@ -1856,6 +2006,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else {
         throw new Error("No session route is configured for decommissioning.");
       }
+      if (teardownOwner && sameTranscriptOwner(teardownOwner, ownerRef.current) && mountedRef.current) {
+        setSnapshot(null);
+        setConfirmedPrompts(null);
+        setReadState({ owner: teardownOwner, status: "unavailable" });
+        setInternalLoading(false);
+      }
       handleCloseDecommissionModal();
       if (currentTargetRef.current === submittedTarget) {
         setCompactFeedback(
@@ -1863,13 +2019,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         );
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (currentTargetRef.current === submittedTarget && (!teardownOwner || sameTranscriptOwner(teardownOwner, ownerRef.current))) {
+        if (teardownOwner) {
+          setReadState({ owner: teardownOwner, status: lastGood ? "ready" : "unavailable" });
+          setInternalLoading(false);
+        }
         setSubmitError(
           err instanceof Error ? err.message : `Failed to ${mode} session`,
         );
       }
       handleCloseDecommissionModal();
     } finally {
+      if (teardownOwner && sameTranscriptOwner(teardownOwner, ownerRef.current)) resetPendingRef.current = false;
       setDecommissioning(false);
     }
   };
@@ -1898,7 +2059,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await onSendPrompt(submittedTarget, payload);
       } else if (apiClient) {
         const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
-        if (currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -1907,30 +2069,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }
           if (!res.queued && res.status !== "queued") {
             const content = res.effective_body || payload.prompt;
-            setInternalTurns((prev) => [
-              ...prev,
-              {
-                index: prev.length,
-                role: "user",
-                content,
-                thinking: null,
-                tool_calls: [],
-                created_at: new Date().toISOString(),
-              },
-            ]);
+            appendConfirmedPrompt(content);
           }
           void fetchTranscript();
         }
       } else {
         throw new Error("No message route is configured for this session.");
       }
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setCompactFeedback("Sent /compact");
         scrollToBottom("smooth");
         requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setSubmitError(err instanceof Error ? err.message : "Failed to send /compact");
       }
     } finally {
@@ -1992,42 +2144,64 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   const fetchTranscript = React.useCallback(async () => {
-    if (!apiClient || turns !== undefined) {
-      return;
-    }
+    if (!apiClient || turns !== undefined || !mountedRef.current || resetPendingRef.current ||
+      !sameTranscriptOwner(owner, ownerRef.current) || identityRef.current.apiClient !== apiClient ||
+      apiClient.getToken() !== token) return;
     const targetId = sessionId || agentName;
-    if (!targetId) {
-      setInternalTurns([]);
-      return;
-    }
+    if (!targetId) return;
+    const readOwner = { ...owner };
+    const requestToken = apiClient.getToken();
+    const ticket = readGuard.begin(readOwner);
+    const accepts = () => mountedRef.current && !resetPendingRef.current &&
+      apiClient.getToken() === requestToken && readGuard.accepts(ticket, ownerRef.current);
+    setReadState({ owner: readOwner, status: "loading" });
     setInternalLoading(true);
     setInternalError(null);
     try {
       const response = await apiClient.getSessionTranscript(targetId);
-      if (currentTargetRef.current === targetId) {
-        setInternalTurns(response.turns ?? []);
-        setInternalIsBusy(Boolean(response.is_busy));
-        setInternalInFlightUnconfirmed(Boolean(response.in_flight_unconfirmed));
-        setInternalQueue(response.queue ?? []);
-        setInternalContextUsage(response.context_usage ?? null);
-        setInternalQuotaUsage(response.quota_usage ?? null);
+      if (!accepts()) return;
+      if (!isObservedTranscriptTurns(response.turns) ||
+        (sessionId && response.resolved_session_id && response.resolved_session_id !== sessionId)) {
+        throw new Error("Transcript response could not be read");
       }
+      const resolvedId = typeof response.resolved_session_id === "string" && response.resolved_session_id.trim()
+        ? response.resolved_session_id : null;
+      setConfirmedPrompts(null);
+      setSnapshot({ owner: readOwner, concreteSessionId: sessionId || resolvedId, turns: response.turns });
+      setReadState({ owner: readOwner, status: "ready" });
+      setMetadataOwner(readOwner);
+      setInternalIsBusy(Boolean(response.is_busy));
+      setInternalInFlightUnconfirmed(Boolean(response.in_flight_unconfirmed));
+      setInternalQueue(response.queue ?? []);
+      setInternalContextUsage(response.context_usage ?? null);
+      setInternalQuotaUsage(response.quota_usage ?? null);
     } catch (err) {
-      if (currentTargetRef.current === targetId) {
-        setInternalError(
-          err instanceof Error ? err.message : "Failed to load transcript",
-        );
+      if (!accepts()) return;
+      const denied = err instanceof HubApiError && (err.status === 401 || err.status === 403);
+      if (denied) setMetadataOwner(null);
+      const canRetain = isTransientTranscriptReadError(err) &&
+        sameTranscriptOwner(snapshotRef.current?.owner ?? null, readOwner) && Boolean(snapshotRef.current?.concreteSessionId);
+      if (!canRetain) {
+        setSnapshot(null);
+        if (!isTransientTranscriptReadError(err)) setConfirmedPrompts(null);
       }
+      setReadState({
+        owner: readOwner,
+        status: denied ? "denied" : canRetain ? "stale" : "unavailable",
+      });
+      setInternalError(err instanceof Error ? err.message : "Failed to load transcript");
     } finally {
-      if (currentTargetRef.current === targetId) {
-        setInternalLoading(false);
-      }
+      if (accepts()) setInternalLoading(false);
     }
-  }, [apiClient, turns, sessionId, agentName]);
+  }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, owner.resetEpoch, token, readGuard]);
 
+  // Snapshot changes must not schedule another read; selection/auth changes do.
+  const fetchTranscriptRef = React.useRef(fetchTranscript);
+  fetchTranscriptRef.current = fetchTranscript;
   React.useEffect(() => {
-    void fetchTranscript();
-  }, [fetchTranscript]);
+    void fetchTranscriptRef.current();
+    return () => readGuard.invalidate();
+  }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, resetReadEpoch, readGuard]);
 
   const pendingPrompt = pendingPrompts.get(targetSessionOrAgent);
   const filteredTurns = React.useMemo(() => {
@@ -2254,7 +2428,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         attempted = true;
         response = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
         const res = codexSendNow ? codexSendNowReceipt(submittedTarget, response) : response;
-        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2267,24 +2442,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         if (codexSendNow && res.delivery_stage === "unconfirmed") recordUnconfirmedDelivery(submittedTarget, promptId);
         else recordPromptDelivery(submittedTarget, res);
-        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
           const content = res.effective_body || res.prompt;
           if (content && res.delivery_stage !== "unconfirmed") {
-            setInternalTurns((prev) => [
-              ...prev,
-              {
-                index: prev.length,
-                role: "user",
-                content,
-                thinking: null,
-                tool_calls: [],
-                created_at: new Date().toISOString(),
-              },
-            ]);
+            appendConfirmedPrompt(content);
           }
         }
       }
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         scrollToBottom("smooth");
       }
     } catch (err) {
@@ -2315,7 +2480,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await onCancelQueued(promptId);
       } else if (apiClient) {
         const res = await apiClient.cancelQueuedPrompt(submittedTarget, promptId);
-        if (currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2326,7 +2492,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       unconfirmedQueuedPrompts.get(submittedTarget)?.delete(promptId);
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setSubmitError(
           err instanceof Error ? err.message : "Failed to cancel queued message",
         );
@@ -2347,7 +2513,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           promptId,
           trimmed,
         );
-        if (currentTargetRef.current === submittedTarget) {
+        if (isCurrentOperation()) {
+          adoptPromptMetadata(res);
           if (Array.isArray(res.queue)) {
             setInternalQueue(res.queue);
           }
@@ -2364,12 +2531,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           ),
         );
       }
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setEditingQueueId(null);
         setEditingQueueText("");
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
+      if (isCurrentOperation()) {
         setSubmitError(
           err instanceof Error ? err.message : "Failed to update queued message",
         );
@@ -2447,29 +2614,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       recordPromptDelivery(submittedTarget, res);
       if (
-        mountedRef.current && !onSendPrompt && apiClient && res &&
-        currentTargetRef.current === submittedTarget
+        isCurrentOperation() && !onSendPrompt && apiClient && res
       ) {
+        adoptPromptMetadata(res);
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
         if (!wasQueued && res.delivery_stage !== "unconfirmed") {
           const body = res.effective_body || payload.prompt;
-          setInternalTurns((prev) => {
-            const matches = prev.filter((turn) =>
-              turn.role.toLowerCase() === "user" &&
-              extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
-                .cleanedContent.trim() === content,
-            ).length;
-            if (matches > matchingBefore) return prev;
-            return [...prev, {
-              index: prev.length,
-              role: "user",
-              content: body,
-              thinking: null,
-              tool_calls: [],
-              created_at: new Date().toISOString(),
-            }];
-          });
+          appendConfirmedPrompt(body, matchingBefore, content);
         }
         void fetchTranscript();
       }
@@ -3479,7 +3631,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         )}
 
-        {filteredTurns.length === 0 && !pendingPrompt ? (
+        {effectiveRefreshState === "stale" && (
+          <div role="status">History refresh unavailable; showing last loaded history</div>
+        )}
+        {effectiveRefreshState === "unavailable" && <div role="status">History unavailable</div>}
+        {effectiveRefreshState === "denied" && <div role="status">History access denied</div>}
+        {effectiveRefreshState === "loading" && effectiveTurns.length === 0 && (
+          <div role="status">Loading history…</div>
+        )}
+
+        {filteredTurns.length === 0 && !pendingPrompt && effectiveRefreshState === "ready" ? (
           <div
             className="fd-card"
             data-testid="chat-empty-state"
@@ -3650,7 +3811,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         )}
 
-        {(inFlightUnconfirmed ?? internalInFlightUnconfirmed) && (
+        {(inFlightUnconfirmed ?? (metadataMatches && internalInFlightUnconfirmed)) && (
           <div role="status">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.some((item) => !item.delivery_state || item.delivery_state === "pending") && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
         )}
 

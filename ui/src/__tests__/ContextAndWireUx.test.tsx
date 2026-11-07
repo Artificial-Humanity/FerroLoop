@@ -1106,7 +1106,7 @@ describe("Agent switch transcript isolation", () => {
     unmount();
   });
 
-  it("applies the initial transcript when its implicit session remains active", async () => {
+  it("rejects an older initial transcript after a newer observed empty read", async () => {
     let releaseInitial!: (response: Response) => void;
     const initialResponse = new Promise<Response>((resolve) => { releaseInitial = resolve; });
     let held = false;
@@ -1129,7 +1129,7 @@ describe("Agent switch transcript isolation", () => {
       releaseInitial(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Legitimate initial A" })], queue: [], is_busy: false }));
       await initialResponse;
     });
-    expect(screen.getByText("Legitimate initial A")).toBeInTheDocument();
+    expect(screen.queryByText("Legitimate initial A")).toBeNull();
     unmount();
   });
 
@@ -1398,4 +1398,722 @@ describe("Agent switch transcript isolation", () => {
     expect(workBlock.style.flexShrink).toBe("0");
     expect(assistantCard.style.flexShrink).toBe("0");
   });
+});
+
+describe("App transcript observation ownership", () => {
+  const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  const observed = (content: string) => response({ session_id: "session-a", turns: content ? [turn({ index: 0, content })] : [], queue: [], is_busy: false });
+  function harness(initialRead?: (target: string) => Promise<Response>) {
+    let sessions = [{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }];
+    let read: (target: string) => Promise<Response> = initialRead ?? (async () => observed("Last good history"));
+    let listener: ((frame: unknown) => void) | undefined;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/auth/session")) return response({ authenticated: true, authority: { tier: "owner", login: "owner" } });
+      if (url.includes("/transcript")) return read(url);
+      if (url.endsWith("/sessions")) return response({ sessions });
+      return response({});
+    });
+    const api = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
+    const ws = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") listener = cb; return () => {}; } } as unknown as HubWsClient;
+    const view = render(<App apiClient={api} wsClient={ws} />);
+    return { ...view, api, ws, fetchImpl, setRead: (next: typeof read) => { read = next; }, setSessions: (next: typeof sessions) => { sessions = next; }, refresh: (data?: Record<string, unknown>) => act(() => listener?.({ type: "event", topic: "session", event: data ? "prompt_sent" : "updated", data: data ?? {} })) };
+  }
+
+  it.each(["503", "network", "malformed"])("keeps same-session history and metadata on %s then accepts recovery and observed empty", async (failure) => {
+    const h = harness();
+    await screen.findByText("Last good history");
+    h.setRead(async () => {
+      if (failure === "network") throw new TypeError("offline");
+      return failure === "503" ? response({ code: "transcript_unavailable" }, 503) : response({ session_id: "session-a" });
+    });
+    h.refresh();
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Last good history")).toBeInTheDocument();
+    h.setRead(async () => observed("Recovered history")); h.refresh();
+    await screen.findByText("Recovered history");
+    expect(screen.queryByText("History refresh unavailable; showing last loaded history")).toBeNull();
+    h.setRead(async () => observed("")); h.refresh();
+    await waitFor(() => expect(screen.queryByText("Recovered history")).toBeNull());
+    h.unmount();
+  });
+
+  it("does not install persona badge history into a different concrete session", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }, { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }]);
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503)); h.refresh();
+    await waitFor(() => expect((screen.getByTestId("session-selector") as HTMLSelectElement).value).toBe("session-b"));
+    expect(screen.queryByText("Last good history")).toBeNull();
+    await screen.findByText("History unavailable");
+    h.unmount();
+  });
+
+  it.each([401, 403])("clears history on denied transcript %s", async (status) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setRead(async () => response({ error: "Denied" }, status)); h.refresh();
+    await waitFor(() => expect(screen.queryByText("Last good history")).toBeNull());
+    expect(screen.queryByText("History refresh unavailable; showing last loaded history")).toBeNull();
+    h.unmount();
+  });
+  it.each(["success", "failure"])("rejects old initial success and its queue/context after newer %s", async (latest) => {
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let concreteReads = 0;
+    const h = harness(async (target) => {
+      if (!target.includes("session-a")) return observed("Alias history");
+      if (++concreteReads === 1) return pending;
+      return latest === "success" ? observed("Newest history") : response({ code: "transcript_unavailable" }, 503);
+    });
+    await screen.findByText(latest === "success" ? "Newest history" : "History unavailable");
+    await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 7, content: "Old response" })], is_busy: true, queue: [{ id: "old", prompt: "Old queued prompt" }], context_usage: { used_tokens: 199999, max_tokens: 200000 } })); await pending; });
+    expect(screen.queryByText("Old response")).toBeNull();
+    expect(screen.queryByText("Old queued prompt")).toBeNull();
+    expect(screen.getByText(latest === "success" ? "Newest history" : "History unavailable")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("rejects A to B to A old reads", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    h.setRead(async () => pending); h.refresh();
+    await waitFor(() => expect(h.fetchImpl.mock.calls.filter(([input]) => String(input).includes("/transcript")).length).toBeGreaterThan(3));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    expect(screen.queryByText("Last good history")).toBeNull();
+    h.setRead(async () => observed("Current A"));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await screen.findByText("Current A");
+    await act(async () => { release(observed("Old A")); await pending; });
+    expect(screen.queryByText("Old A")).toBeNull();
+    expect(screen.getByText("Current A")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge"] as const)("delegates %s once and rejects a pre-reset pending transcript", async (mode) => {
+    const h = harness(); await screen.findByText("Last good history");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    const clear = vi.spyOn(h.api, "clearSession").mockImplementation(async () => {
+      h.setRead(async () => observed("")); return { ok: true } as never;
+    });
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    await waitFor(() => expect(clear).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText("Last good history")).toBeNull());
+    await act(async () => { release(observed("Pre-reset history")); await pending; });
+    expect(screen.queryByText("Pre-reset history")).toBeNull();
+    expect(clear).toHaveBeenCalledWith("session-a", mode);
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("failed %s retains last good history and permits a later refresh", async (mode) => {
+    const h = harness(); await screen.findByText("Last good history");
+    if (mode === "teardown") vi.spyOn(h.api, "decommissionSession").mockRejectedValue(new Error("Reset refused"));
+    else vi.spyOn(h.api, "clearSession").mockRejectedValue(new Error("Reset refused"));
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await screen.findByText("Reset refused");
+    expect(screen.getByText("Last good history")).toBeInTheDocument();
+    h.setRead(async () => observed("After failed reset")); h.refresh();
+    await screen.findByText("After failed reset");
+    h.unmount();
+  });
+
+  it("successful teardown rejects its pending transcript and cache", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    vi.spyOn(h.api, "decommissionSession").mockResolvedValue({ ok: true } as never);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    await waitFor(() => expect(screen.queryByText("Last good history")).toBeNull());
+    await act(async () => { release(observed("Old teardown history")); await pending; });
+    expect(screen.queryByText("Old teardown history")).toBeNull();
+    h.unmount();
+  });
+
+  it("does not retain an unresolved alias's previous successful observation", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setSessions([]);
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("History unavailable");
+    expect(screen.queryByText("Last good history")).toBeNull();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    h.unmount();
+  });
+
+  it("rejects old principal reads after logout and relogin at the same authority tier", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    vi.spyOn(h.api, "logout").mockResolvedValue({} as never);
+    vi.spyOn(h.api, "pair").mockResolvedValue({ authenticated: true, authority: { tier: "owner", login: "other-owner" } });
+    fireEvent.click(screen.getByRole("button", { name: /Sign Out/i }));
+    await screen.findByPlaceholderText("Paste bearer token");
+    expect(screen.queryByText("Last good history")).toBeNull();
+    h.setRead(async () => observed("New principal history"));
+    fireEvent.change(screen.getByPlaceholderText("Paste bearer token"), { target: { value: "other-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Token" }));
+    await screen.findByText("New principal history");
+    await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 1, content: "Old principal secret" })], queue: [{ id: "secret", prompt: "Old principal queue" }], is_busy: true })); await pending; });
+    expect(screen.queryByText("Old principal secret")).toBeNull();
+    expect(screen.queryByText("Old principal queue")).toBeNull();
+    expect(screen.getByText("New principal history")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("rejects old auth initial bulk work after reauthentication", async () => {
+    const h = harness();
+    let release!: (result: never) => void;
+    const pending = new Promise<never>((resolve) => { release = resolve; });
+    vi.spyOn(h.api, "getSettings").mockImplementationOnce(() => pending);
+    await screen.findByText("Last good history");
+    vi.spyOn(h.api, "logout").mockResolvedValue({} as never);
+    vi.spyOn(h.api, "pair").mockResolvedValue({ authenticated: true, authority: { tier: "owner", login: "other-owner" } });
+    fireEvent.click(screen.getByRole("button", { name: /Sign Out/i }));
+    await screen.findByPlaceholderText("Paste bearer token");
+    h.setSessions([{ id: "new-session", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "new" }]);
+    h.setRead(async () => observed("New initial history"));
+    fireEvent.change(screen.getByPlaceholderText("Paste bearer token"), { target: { value: "other-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Token" }));
+    await screen.findByText("New initial history");
+    const readsBefore = h.fetchImpl.mock.calls.filter(([input]) => String(input).includes("/transcript")).length;
+    await act(async () => { release({} as never); await pending; });
+    const laterTargets = h.fetchImpl.mock.calls.filter(([input]) => String(input).includes("/transcript")).slice(readsBefore);
+    expect(laterTargets.every(([input]) => String(input).includes("/new-session/transcript"))).toBe(true);
+    expect(screen.getByText("New initial history")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("does not start a queued refresh after unmount", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    h.refresh(); h.unmount();
+    const before = h.fetchImpl.mock.calls.length;
+    await act(async () => { release(observed("Unmounted history")); await pending; });
+    expect(h.fetchImpl).toHaveBeenCalledTimes(before);
+  });
+
+  it("retains confirmed optimistic output during initial unavailable reads without calling it observed history", async () => {
+    const h = harness(async () => response({ code: "transcript_unavailable" }, 503));
+    await screen.findByText("History unavailable");
+    await waitFor(() => expect(h.fetchImpl.mock.calls.some(([input]) => String(input).includes("/session-a/transcript"))).toBe(true));
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "Confirmed outbound message", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-0")).getByText("Confirmed outbound message")).toBeInTheDocument());
+    await screen.findByText("History unavailable");
+    expect(within(screen.getByTestId("turn-card-0")).getByText("Confirmed outbound message")).toBeInTheDocument();
+    expect(screen.queryByText("History refresh unavailable; showing last loaded history")).toBeNull();
+    h.unmount();
+  });
+
+  it("rejects a background predecessor after the same persona's concrete session changes", async () => {
+    window.localStorage.setItem(LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY, JSON.stringify({ jarvis: 0 }));
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let oldStarted = false;
+    const h = harness(async (target) => {
+      if (target.includes("jarvis-old")) { oldStarted = true; return pending; }
+      if (target.includes("jarvis-new")) return response({ session_id: "jarvis-new", turns: [turn({ index: 1, content: "Current background" })] });
+      return observed("Last good history");
+    });
+    const main = { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" };
+    h.setSessions([main, { ...main, id: "jarvis-old", persona: "jarvis" }]);
+    await screen.findByText("Last good history");
+    await waitFor(() => expect(oldStarted).toBe(true));
+    h.setSessions([main, { ...main, id: "jarvis-new", persona: "jarvis" }]); h.refresh();
+    await waitFor(() => expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("1"));
+    await act(async () => { release(response({ session_id: "jarvis-old", turns: [turn({ index: 7, content: "Old background one" }), turn({ index: 8, content: "Old background two" })], is_busy: true, context_usage: { used_tokens: 199999, max_tokens: 200000 } })); await pending; });
+    expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("1");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("History unavailable");
+    expect(screen.queryByText("Current background")).toBeNull();
+    expect(screen.queryByText("Old background one")).toBeNull();
+    expect(screen.queryByText("Last good history")).toBeNull();
+    h.unmount();
+  });
+
+  it("preserves independently observed busy and queue metadata during a transient read failure", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Busy history" })], is_busy: true,
+      queue: [{ id: "held", session_id: "session-a", prompt: "Held queue metadata", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 100000, max_tokens: 200000, source: "reported" } }));
+    await screen.findByText("Busy history");
+    await screen.findByText("Held queue metadata");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503)); h.refresh();
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Held queue metadata")).toBeInTheDocument();
+    expect(screen.getByText("Busy history")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-queue-bar")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("does not unmask a previous session's queue after the successor's initial failure", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Session A metadata owner" })], is_busy: true,
+      queue: [{ id: "previous-queue", session_id: "session-a", prompt: "Previous session queue", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 190000, max_tokens: 200000 } }));
+    await screen.findByText("Session A metadata owner");
+    await screen.findByText("Previous session queue");
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }, { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }]);
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503)); h.refresh();
+    await screen.findByText("History unavailable");
+    expect(screen.queryByText("Previous session queue")).toBeNull();
+    expect(screen.queryByTestId("live-thinking-indicator")).toBeNull();
+    h.unmount();
+  });
+
+  it("defaults predecessor metadata when a discovered successor omits queue and busy", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Rich A history" })], is_busy: true,
+      queue: [{ id: "old-rich", session_id: "session-a", prompt: "Rich A queue", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 190000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Rich A quota" } }));
+    await screen.findByText("Rich A queue");
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toBeInTheDocument();
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ session_id: "session-b", resolved_session_id: "session-b", turns: [turn({ index: 0, content: "Partial B history" })] })); h.refresh();
+    await screen.findByText("Partial B history");
+    expect(screen.getByTestId("context-ring-ferris")).not.toHaveAttribute("data-percent", "95");
+    expect(screen.queryByText("Rich A queue")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("context-level-text")).not.toHaveTextContent("190k");
+    expect(screen.queryByTestId("context-max")).toBeNull();
+    h.unmount();
+  });
+
+  it("preserves same-owner independently observed queue and busy across a partial transcript", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    h.refresh({ session_id: "session-a", persona: "ferris", delivered: false, is_busy: true,
+      queue: [{ id: "independent", session_id: "session-a", prompt: "Independent current queue", by: "owner", created_at: "now" }] });
+    await screen.findByText("Independent current queue");
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    h.setRead(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Partial current history" })] })); h.refresh();
+    await screen.findByText("Partial current history");
+    expect(screen.getByText("Independent current queue")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("successful %s invalidates its unselected target while preserving another agent", async (mode) => {
+    const h = harness();
+    h.setSessions([
+      { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      { id: "session-b", source: "route", adapter: "claude", persona: "jarvis", status: "active", updated_at: "t2" },
+    ]);
+    await screen.findByText("Last good history");
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "A pre-reset optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("A pre-reset optimism")).toBeInTheDocument());
+    let releaseRead!: (value: Response) => void;
+    const late = new Promise<Response>((resolve) => { releaseRead = resolve; });
+    let oldReadStarted = false;
+    h.setRead(async () => { oldReadStarted = true; return late; }); h.refresh();
+    await waitFor(() => expect(oldReadStarted).toBe(true));
+    let finish!: (value: never) => void;
+    const mutation = new Promise<never>((resolve) => { finish = resolve; });
+    const reset = vi.spyOn(h.api, mode === "teardown" ? "decommissionSession" : "clearSession").mockReturnValue(mutation);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    h.setRead(async (target) => target.includes("session-a") ? late : response({ session_id: "session-b", turns: [turn({ index: 0, content: "B fresh history" })],
+      queue: [{ id: "b-fresh", session_id: "session-b", prompt: "B fresh queue", by: "owner", created_at: "now" }], is_busy: true,
+      context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "B fresh quota" } }));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("B fresh history"); h.refresh();
+    await screen.findByText("B fresh queue");
+    h.refresh({ session_id: "session-b", persona: "jarvis", effective_body: "B fresh optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("B fresh optimism")).toBeInTheDocument());
+    await act(async () => { finish({ ok: true } as never); await mutation; });
+    await act(async () => { releaseRead(observed("Late A before-reset data")); await late; });
+    expect(screen.getByText("B fresh history")).toBeInTheDocument();
+    expect(screen.getByText("B fresh queue")).toBeInTheDocument();
+    expect(within(screen.getByTestId("turn-card-1")).getByText("B fresh optimism")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toHaveTextContent("B fresh quota");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await act(async () => {});
+    expect(screen.queryAllByText("A pre-reset optimism")).toHaveLength(0);
+    expect(screen.queryByText("Last good history")).toBeNull();
+    expect(screen.queryByText("Late A before-reset data")).toBeNull();
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("successful %s preserves a discovered new session for the same persona", async (mode) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "Old concrete optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("Old concrete optimism")).toBeInTheDocument());
+    let finish!: (value: never) => void;
+    const pending = new Promise<never>((resolve) => { finish = resolve; });
+    const reset = vi.spyOn(h.api, mode === "teardown" ? "decommissionSession" : "clearSession").mockReturnValue(pending);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ session_id: "session-b", turns: [turn({ index: 0, content: "Discovered fresh B" })],
+      queue: [{ id: "new-concrete", session_id: "session-b", prompt: "New concrete queue", by: "owner", created_at: "now" }], is_busy: true })); h.refresh();
+    await screen.findByText("Discovered fresh B");
+    h.refresh({ session_id: "session-b", persona: "ferris", effective_body: "New concrete optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("New concrete optimism")).toBeInTheDocument());
+    await act(async () => { finish({ ok: true } as never); await pending; });
+    expect(screen.getByText("Discovered fresh B")).toBeInTheDocument();
+    expect(screen.getByText("New concrete queue")).toBeInTheDocument();
+    expect(within(screen.getByTestId("turn-card-1")).getByText("New concrete optimism")).toBeInTheDocument();
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    h.setSessions([{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t3" }]); h.refresh();
+    await waitFor(() => expect(screen.queryByText("Discovered fresh B")).toBeNull());
+    expect(screen.queryAllByText("Old concrete optimism")).toHaveLength(0);
+    h.unmount();
+  });
+
+  it("completing an unselected teardown does not supersede the successor's pending read", async () => {
+    const h = harness();
+    h.setSessions([
+      { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      { id: "session-b", source: "route", adapter: "claude", persona: "jarvis", status: "active", updated_at: "t1" },
+    ]);
+    await screen.findByText("Last good history");
+    let finish!: (value: never) => void;
+    const mutation = new Promise<never>((resolve) => { finish = resolve; });
+    const reset = vi.spyOn(h.api, "decommissionSession").mockReturnValue(mutation);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    let release!: (value: Response) => void;
+    const read = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return read; });
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await waitFor(() => expect(started).toBe(true));
+    await act(async () => { finish({ ok: true } as never); await mutation; });
+    await act(async () => { release(response({ session_id: "session-b", turns: [turn({ index: 0, content: "Successor pending observation" })] })); await read; });
+    await screen.findByText("Successor pending observation");
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("pending %s suppresses target reads after navigating back and failure releases them", async (mode) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "Failure keeps A optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("Failure keeps A optimism")).toBeInTheDocument());
+    let fail!: (error: Error) => void;
+    const pending = new Promise<never>((_resolve, reject) => { fail = reject; });
+    const reset = vi.spyOn(h.api, mode === "teardown" ? "decommissionSession" : "clearSession").mockReturnValue(pending);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    h.setRead(async (target) => target.includes("session-a") ? observed("Premature target observation") : observed("Other agent fresh"));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("Other agent fresh");
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await act(async () => {});
+    expect(screen.queryByText("Premature target observation")).toBeNull();
+    // Reject while another view is selected: it must remain usable and A's optimism must survive.
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("Other agent fresh");
+    await act(async () => { fail(new Error("Navigated reset refused")); await pending.catch(() => {}); });
+    expect(screen.getByText("Other agent fresh")).toBeInTheDocument();
+    h.setRead(async () => observed("After navigated failure"));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await screen.findByText("After navigated failure");
+    expect(within(screen.getByTestId("turn-card-1")).getByText("Failure keeps A optimism")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it.each(["cancel", "edit"] as const)("ignores a late %s reply after a different session installs metadata", async (operation) => {
+    const item = { id: "old-operation", session_id: "session-a", prompt: "Old operation queue", by: "owner", created_at: "now" };
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Original owner" })], queue: [item], is_busy: false }));
+    await screen.findByText("Old operation queue");
+    let release!: (value: never) => void;
+    const pending = new Promise<never>((resolve) => { release = resolve; });
+    vi.spyOn(h.api, operation === "cancel" ? "cancelQueuedPrompt" : "updateQueuedPrompt").mockReturnValue(pending);
+    if (operation === "edit") {
+      fireEvent.click(screen.getByTestId("queued-edit-old-operation"));
+      fireEvent.change(screen.getByTestId("queued-edit-input-old-operation"), { target: { value: "Old edit" } });
+      fireEvent.click(screen.getByTestId("queued-save-old-operation"));
+    } else fireEvent.click(screen.getByTestId("queued-cancel-old-operation"));
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ session_id: "session-b", turns: [turn({ index: 0, content: "Successor owner" })],
+      queue: [{ ...item, id: "new-operation", session_id: "session-b", prompt: "Successor queue" }], is_busy: true })); h.refresh();
+    await screen.findByText("Successor queue");
+    await act(async () => { release({ queue: [], is_busy: false } as never); await pending; });
+    expect(screen.getByText("Successor queue")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    h.unmount();
+  });
+
+  it.each(["cancel", "edit"] as const)("keeps a newer %s observation when an older App transcript completes", async (operation) => {
+    const item = { id: "operation-read", session_id: "session-a", prompt: "Original operation queue", by: "owner", created_at: "now" };
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Operation owner history" })], queue: [item], is_busy: false }));
+    await screen.findByText("Original operation queue");
+    let release!: (value: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    const queue = operation === "cancel" ? [] : [{ ...item, prompt: "Edited operation queue" }];
+    vi.spyOn(h.api, operation === "cancel" ? "cancelQueuedPrompt" : "updateQueuedPrompt").mockResolvedValue({ queue, is_busy: true } as never);
+    if (operation === "edit") {
+      fireEvent.click(screen.getByTestId("queued-edit-operation-read"));
+      fireEvent.change(screen.getByTestId("queued-edit-input-operation-read"), { target: { value: "Edited operation queue" } });
+      fireEvent.click(screen.getByTestId("queued-save-operation-read"));
+      await screen.findByText("Edited operation queue");
+    } else {
+      fireEvent.click(screen.getByTestId("queued-cancel-operation-read"));
+      await waitFor(() => expect(screen.queryByText("Original operation queue")).toBeNull());
+    }
+    await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Obsolete operation history" })], queue: [item], is_busy: false })); await pending; });
+    expect(screen.queryByText("Obsolete operation history")).toBeNull();
+    expect(screen.getByText("Operation owner history")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    expect(screen.queryByText("Original operation queue")).toBeNull();
+    h.unmount();
+  });
+
+  it.each(["partial send", "empty send", "partial event", "empty event"] as const)("does not relabel predecessor metadata after an unavailable successor and %s", async (operation) => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Rich predecessor" })], is_busy: true,
+      queue: [{ id: "predecessor", session_id: "session-a", prompt: "Predecessor queue", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 190000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Predecessor quota exhausted" } }));
+    await screen.findByText("Rich predecessor");
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toBeInTheDocument();
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503)); h.refresh();
+    await screen.findByText("History unavailable");
+    if (operation === "partial send" || operation === "empty send") {
+      vi.spyOn(h.api, "sendSessionPrompt").mockResolvedValue({ session_id: "session-b", delivered: true, queued: false, ...(operation === "partial send" ? { is_busy: false } : {}) } as never);
+      fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Successor send" } });
+      fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+      await screen.findByText("Successor send");
+    } else h.refresh({ session_id: "session-b", persona: "ferris", delivered: false, ...(operation === "partial event" ? { is_busy: false } : {}) });
+    await act(async () => {});
+    expect(screen.queryByText("Predecessor queue")).toBeNull();
+    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("context-level-text")).not.toHaveTextContent("190k");
+    expect(screen.queryByTestId("context-max")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("preserves metadata installed for the current owner while its partial send reply was pending", async () => {
+    const h = harness(async () => response({ code: "transcript_unavailable" }, 503));
+    await screen.findByText("History unavailable");
+    let release!: (value: never) => void;
+    const pending = new Promise<never>((resolve) => { release = resolve; });
+    vi.spyOn(h.api, "sendSessionPrompt").mockReturnValue(pending);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Pending partial send" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    h.setRead(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Current owner observation" })],
+      queue: [{ id: "current", session_id: "session-a", prompt: "Current owner queue", by: "owner", created_at: "now" }], is_busy: true,
+      context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Current owner quota" } })); h.refresh();
+    await screen.findByText("Current owner observation");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    await act(async () => { release({ session_id: "session-a", delivered: true, queued: false, is_busy: false } as never); await pending; });
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Current owner queue")).toBeInTheDocument();
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toHaveTextContent("Current owner quota");
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("context-max")).toHaveTextContent("200k");
+    expect(screen.getByTestId("context-level-text")).toHaveTextContent("50k");
+    h.unmount();
+  });
+
+  it("allows a new client's reads while the old client's reset is pending", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    let release!: (result: never) => void;
+    const pending = new Promise<never>((resolve) => { release = resolve; });
+    const clear = vi.spyOn(h.api, "clearSession").mockImplementation(() => pending);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
+    await waitFor(() => expect(clear).toHaveBeenCalledOnce());
+    h.setRead(async () => observed("New client history"));
+    const nextApi = new HubApiClient({ fetchImpl: h.fetchImpl as typeof fetch });
+    h.rerender(<App apiClient={nextApi} wsClient={h.ws} />);
+    expect(screen.queryByText("Last good history")).toBeNull();
+    await screen.findByText("New client history");
+    await act(async () => { release({ ok: true } as never); await pending; });
+    expect(screen.getByText("New client history")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("rejects a pre-send transcript after a newer refused queue observation", async () => {
+    const item = { id: "pre-send-read", session_id: "session-a", prompt: "Guarded queued prompt", by: "owner", created_at: "now" };
+    const initial = () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Queue owner history" })], queue: [item], is_busy: false });
+    const h = harness(async () => initial());
+    await screen.findByText("Queue owner history");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    vi.spyOn(h.api, "sendQueuedPromptNow").mockResolvedValue({ delivered: false, delivery_stage: "refused", delivery_error: "Queue refused",
+      queue: [{ ...item, delivery_state: "refused" }] } as never);
+    fireEvent.click(screen.getByTestId("queued-send-now-pre-send-read"));
+    await screen.findByText("Queue refused");
+    expect(screen.getByTestId("queued-send-now-pre-send-read")).toBeDisabled();
+    await act(async () => { release(initial()); await pending; });
+    expect(screen.getByTestId("queued-send-now-pre-send-read")).toBeDisabled();
+    expect(screen.getByText("Queue owner history")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it.each(["client", "token"] as const)("releases retired refresh coordination on automatic %s change", async (change) => {
+    const h = harness(); await screen.findByText("Last good history");
+    let releaseOld!: (result: Response) => void;
+    const oldPending = new Promise<Response>((resolve) => { releaseOld = resolve; });
+    let oldStarted = false;
+    h.setRead(async () => { oldStarted = true; return oldPending; }); h.refresh();
+    await waitFor(() => expect(oldStarted).toBe(true));
+    h.setRead(async () => observed("New authority poll"));
+    const nextApi = change === "client" ? new HubApiClient({ fetchImpl: h.fetchImpl as typeof fetch }) : h.api;
+    if (change === "token") nextApi.setToken("replacement-token");
+    h.rerender(<App apiClient={nextApi} wsClient={h.ws} />);
+    h.refresh();
+    await screen.findByText("New authority poll");
+    expect(screen.queryByText("Last good history")).toBeNull();
+
+    let releaseNew!: (result: Response) => void;
+    const newPending = new Promise<Response>((resolve) => { releaseNew = resolve; });
+    let newStarted = false;
+    h.setRead(async () => { newStarted = true; return newPending; }); h.refresh();
+    await waitFor(() => expect(newStarted).toBe(true));
+    h.setRead(async () => observed("Trailing current authority")); h.refresh();
+    await act(async () => { releaseOld(observed("Retired authority secret")); await oldPending; });
+    expect(screen.queryByText("Retired authority secret")).toBeNull();
+    expect(screen.queryByText("Trailing current authority")).toBeNull();
+    expect(screen.getByText("New authority poll")).toBeInTheDocument();
+    await act(async () => { releaseNew(observed("Current pending result")); await newPending; });
+    await screen.findByText("Trailing current authority");
+    h.unmount();
+  });
+
+  it.each([
+    ["null tool call", { tool_calls: [null] }],
+    ["invalid tool name", { tool_calls: [{ name: 9 }] }],
+    ["invalid timestamp", { created_at: 42 }],
+  ])("treats foreground %s as unavailable and preserves last good history", async (_name, malformed) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setRead(async () => response({ session_id: "session-a", turns: [{ index: 8, role: "assistant", content: "Malformed foreground", ...malformed }], queue: [], is_busy: false }));
+    h.refresh();
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Last good history")).toBeInTheDocument();
+    expect(screen.queryByText("Malformed foreground")).toBeNull();
+    h.unmount();
+  });
+
+  it("shows unavailable for initial malformed nested history without inventing empty history", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [{ index: 1, role: "assistant", content: "Malformed initial", tool_calls: [null] }] }));
+    await screen.findByText("History unavailable");
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    expect(screen.queryByText("Malformed initial")).toBeNull();
+    h.unmount();
+  });
+
+  it.each([
+    ["null tool call", { tool_calls: [null] }],
+    ["invalid timestamp", { created_at: 42 }],
+  ])("rejects background %s before caching badges or metadata", async (_name, malformed) => {
+    window.localStorage.setItem(LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY, JSON.stringify({ jarvis: 0 }));
+    let backgroundRead = 0;
+    let invalid = false;
+    const h = harness(async (target) => {
+      if (!target.includes("jarvis-session")) return observed("Last good history");
+      backgroundRead++;
+      return response({ session_id: "jarvis-session", turns: invalid
+        ? [turn({ index: 1, content: "Good background" }), { index: 8, role: "assistant", content: "Malformed background", ...malformed }]
+        : [turn({ index: 1, content: "Good background" })], is_busy: invalid,
+        context_usage: { used_tokens: invalid ? 199999 : 1000, max_tokens: 200000 } });
+    });
+    const main = { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" };
+    h.setSessions([main, { ...main, id: "jarvis-session", persona: "jarvis" }]);
+    await screen.findByText("Last good history");
+    await waitFor(() => expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("1"));
+    expect(screen.getByTestId("context-ring-jarvis")).toHaveAttribute("data-percent", "1");
+    invalid = true;
+    h.setSessions([main, { ...main, id: "jarvis-session", persona: "jarvis", updated_at: "t2" }]); h.refresh();
+    await waitFor(() => expect(backgroundRead).toBeGreaterThan(1));
+    await act(async () => {});
+    expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("1");
+    expect(screen.getByTestId("context-ring-jarvis")).toHaveAttribute("data-percent", "1");
+    // Invalid observations must not stamp the cache as successfully read: retry the same stamp.
+    invalid = false; h.refresh();
+    await waitFor(() => expect(backgroundRead).toBeGreaterThan(2));
+    h.unmount();
+  });
+
+  it("keeps matching prompt_sent holds and busy metadata when a pre-event read finishes", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Event owner history" })], queue: [], is_busy: false,
+      context_usage: { used_tokens: 100000, max_tokens: 200000 } }));
+    await screen.findByText("Event owner history");
+    expect(screen.getByTestId("context-ring-ferris")).toHaveAttribute("data-percent", "50");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    h.refresh({ session_id: "session-a", persona: "ferris", delivered: false, is_busy: true,
+      queue: [{ id: "event-held", session_id: "session-a", prompt: "Event held queue", by: "owner", created_at: "now", delivery_state: "unconfirmed" }] });
+    await screen.findByText("Event held queue");
+    expect(screen.getByTestId("queued-send-now-event-held")).toBeDisabled();
+    await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 9, content: "Obsolete event predecessor" })], queue: [], is_busy: false,
+      context_usage: { used_tokens: 199999, max_tokens: 200000 } })); await pending; });
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Event held queue")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-send-now-event-held")).toBeDisabled();
+    expect(screen.getByTestId("session-busy-badge")).toBeInTheDocument();
+    expect(screen.getByTestId("context-ring-ferris")).toHaveAttribute("data-percent", "50");
+    expect(screen.queryByText("Obsolete event predecessor")).toBeNull();
+    expect(screen.getByText("Event owner history")).toBeInTheDocument();
+    h.unmount();
+  });
+
 });
