@@ -2523,6 +2523,73 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_imported_names_keep_scheduler_prefixes_independent() {
+        let (_tmp, inner) = fault_rig();
+        inner.queue_limit_override.store(0, Ordering::SeqCst);
+        let (message, receipts) = inner.store.send_wire(mail("alice", "rejected")).unwrap();
+        lock(&inner.store.calls).clear();
+        for name in ["alice", " alice ", "\talice\t"] {
+            lock(&inner.dispatch_queues).insert(
+                name.into(),
+                RecipientDispatchQueue {
+                    worker_active: true,
+                    ..Default::default()
+                },
+            );
+        }
+        // Imported receipts preserve their name bytes; bypass send_wire's slug normalization.
+        for name in ["Alice", " ALICE ", "\tAlice\t"] {
+            let mut receipt = receipts[0].clone();
+            receipt.recipient_name = name.into();
+            assert!(
+                inner
+                    .schedule_dispatch(&message, &[receipt], now_at(), &mut Vec::new())
+                    .is_err()
+            );
+        }
+        let first = inner.diagnostics_snapshot();
+        assert_eq!(first.records.len(), 3);
+        assert_eq!(lock(&inner.dispatch_queues).len(), 3);
+        assert!(
+            lock(&inner.dispatch_queues)
+                .values()
+                .all(|queue| queue.overflowed)
+        );
+        assert!(lock(&inner.overflow_recipients).is_empty());
+        assert_eq!(first.records[0].recipient.as_deref(), Some("alice"));
+        assert!(
+            first.records[1..]
+                .iter()
+                .all(|row| row.recipient_invalid && row.recipient.is_none())
+        );
+        let evidence = hold_evidence(
+            " alice ",
+            None,
+            SuppressionPhase::RetainedFence,
+            FenceReason::WorkerSpawnFailure,
+            &DispatchReport::default(),
+        );
+        {
+            let _queues = lock(&inner.dispatch_queues);
+            assert!(inner.retain_overflow_fence(" alice ", evidence).is_none());
+        }
+        let after = inner.diagnostics_snapshot();
+        assert_eq!(after.records[0], first.records[0]);
+        assert_eq!(after.records[2], first.records[2]);
+        let mut promoted = first.records[1].clone();
+        promoted.phase = SuppressionPhase::RetainedFence;
+        promoted.decisive_reason = FenceReason::WorkerSpawnFailure;
+        assert_eq!(after.records[1], promoted);
+        assert_eq!(
+            promoted.trigger_message_id.as_deref(),
+            Some(message.id.as_str())
+        );
+        assert!(lock(&inner.overflow_recipients).contains(" alice "));
+        assert!(!lock(&inner.overflow_recipients).contains("alice"));
+        assert!(lock(&inner.store.calls).is_empty());
+    }
+
+    #[test]
     fn diagnostics_prefix_preserves_earliest_rejected_trigger_during_promotion() {
         let (_tmp, inner) = fault_rig();
         inner.queue_limit_override.store(1, Ordering::SeqCst);

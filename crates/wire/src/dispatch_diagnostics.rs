@@ -212,7 +212,8 @@ impl DispatchReport {
 
 impl FenceDiagnostic {
     /// Prepare outside scheduler/fence locks. Delivery and suppression retain
-    /// their original keys; only this observational projection normalizes them.
+    /// their original keys; this projection preserves the scheduler's ASCII
+    /// case-folding without merging distinct whitespace-bearing keys.
     pub(crate) fn from_report(
         recipient: &str,
         message_id: Option<&MessageId>,
@@ -221,12 +222,18 @@ impl FenceDiagnostic {
         reason: FenceReason,
         report: &DispatchReport,
     ) -> Self {
-        let safe_recipient = (recipient.trim().len() <= 64)
+        let safe_recipient = (recipient.len() <= 64 && recipient.trim() == recipient)
             .then(|| normalize_persona(recipient))
             .flatten();
         let recipient_invalid = safe_recipient.is_none();
-        let recipient_digest =
-            recipient_invalid.then(|| framed_digest(b"fl-wire-recipient-v1\0", &[recipient]));
+        let recipient_digest = recipient_invalid.then(|| {
+            // Imported names need not be valid slugs. Match exactly the
+            // scheduler's key equivalence, without retaining raw names.
+            framed_digest(
+                b"fl-wire-recipient-v1\0",
+                &[&recipient.to_ascii_lowercase()],
+            )
+        });
         let trigger_message_id_omitted = message_id.is_some_and(|id| id.as_str().len() > 256);
         let trigger_message_id = message_id
             .filter(|_| !trigger_message_id_omitted)
@@ -383,13 +390,111 @@ mod tests {
 
     fn row(report: &DispatchReport) -> FenceDiagnostic {
         FenceDiagnostic::from_report(
-            " Freya ",
+            "Freya",
             Some(&MessageId(seq_iri(1))),
             At::from_unix_millis(456),
             SuppressionPhase::RetainedFence,
             FenceReason::UnresolvedReceiptStatus,
             report,
         )
+    }
+
+    #[test]
+    fn diagnostic_distinct_scheduler_keys_keep_independent_prefix_evidence() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(1), None);
+        let names = ["Alice", " alice ", "\talice\t"];
+        for (n, name) in names.iter().enumerate() {
+            let first = FenceDiagnostic::from_report(
+                name,
+                Some(&MessageId(seq_iri(n as u64 + 10))),
+                At::from_unix_millis(n as u64 + 100),
+                SuppressionPhase::PrefixDraining,
+                FenceReason::QueueOverflow,
+                &DispatchReport::default(),
+            );
+            assert!(state.retain(first).is_some(), "distinct key: {name:?}");
+        }
+        assert_eq!(state.snapshot.records.len(), 3);
+        let reasons = [
+            FenceReason::WorkerPanic,
+            FenceReason::WorkerSpawnFailure,
+            FenceReason::UnresolvedReceiptStatus,
+        ];
+        for n in (0..names.len()).rev() {
+            let later = FenceDiagnostic::from_report(
+                names[n],
+                Some(&MessageId(seq_iri(99))),
+                At::from_unix_millis(999),
+                SuppressionPhase::RetainedFence,
+                reasons[n],
+                &DispatchReport::default(),
+            );
+            assert!(state.retain(later).is_none());
+            for (index, kept) in state.snapshot.records.iter().enumerate() {
+                assert_eq!(
+                    kept.trigger_message_id.as_deref(),
+                    Some(seq_iri(index as u64 + 10).as_str())
+                );
+                assert_eq!(
+                    kept.hold_observed_at,
+                    At::from_unix_millis(index as u64 + 100)
+                );
+                assert_eq!(kept.first_reason, FenceReason::QueueOverflow);
+                assert_eq!(
+                    kept.phase,
+                    if index >= n {
+                        SuppressionPhase::RetainedFence
+                    } else {
+                        SuppressionPhase::PrefixDraining
+                    }
+                );
+                assert_eq!(
+                    kept.decisive_reason,
+                    if index >= n {
+                        reasons[index]
+                    } else {
+                        FenceReason::QueueOverflow
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_recipient_identity_matches_scheduler_casefold_without_trimming() {
+        // Independently calculated SHA256(domain || LE64(length) || case-folded key).
+        for (name, case_variant, digest) in [
+            ("Alice", "aLiCe", None),
+            (
+                " ALICE ",
+                " alice ",
+                Some("b71cb4eb2d70d79d3b12dc7446cc4da923797942e348bf3556376fdb1fcf9589"),
+            ),
+            (
+                "BAD/NAME",
+                "bad/name",
+                Some("43ee3c3a2b38f8e783b8e6a2ff0d1687ee8d75ea059c1e25a8a7d3f4c2054b66"),
+            ),
+        ] {
+            let project = |name| {
+                FenceDiagnostic::from_report(
+                    name,
+                    None,
+                    At::from_unix_millis(1),
+                    SuppressionPhase::RetainedFence,
+                    FenceReason::WorkerSpawnFailure,
+                    &DispatchReport::default(),
+                )
+            };
+            let first = project(name);
+            assert_eq!(first, project(case_variant));
+            assert_eq!(first.recipient_invalid, digest.is_some());
+            assert_eq!(
+                first.recipient.as_deref(),
+                digest.is_none().then_some("alice")
+            );
+            assert_eq!(first.recipient_digest.as_deref(), digest);
+        }
     }
 
     #[test]
