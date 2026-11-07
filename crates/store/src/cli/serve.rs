@@ -16,7 +16,7 @@
 //! Nothing secret is printed: the report names files and the methods in
 //! force, never a key, a token or a hash.
 
-use super::data::{Create, open_local};
+use super::data::{Create, open_local_locked};
 use super::{Error, Result, Wording, line};
 use crate::{
     BackendKind, FerroStoreServer, ServerAuth, default_socket_path_for_store, physical_path,
@@ -156,7 +156,7 @@ pub fn serve(
     if let Some(addr) = &options.tcp {
         FerroStoreServer::check_tcp_bind(addr.as_str(), &auth)?;
     }
-    let store = open_local(path, create, "serve", w)?;
+    let (store, migration_lock) = open_local_locked(path, create, "serve", w)?;
     let physical = physical_path(path, BackendKind::Ferro);
     let mut methods = Vec::new();
     let (mut server, uri, tls) = match &options.tcp {
@@ -177,6 +177,7 @@ pub fn serve(
             (server, format!("unix://{}", socket.display()), false)
         }
     };
+    drop(migration_lock);
     if options.psk_file.is_some() {
         methods.push("psk");
     }

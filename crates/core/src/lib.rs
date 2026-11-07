@@ -120,11 +120,11 @@ pub use ferrostate::{
     probe_git_repo, resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
 };
 pub use ferrowire::{
-    DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES, MAX_WIRE_BODY_BYTES, MessageKind,
-    MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter, WireImportRejectReason,
-    WireImportRejection, WireImportReport, WireInboxItem, WireMessage, fallback_agent_iri,
-    parse_role_selector, resolve_recipients, validate_sender_name, validate_subject,
-    validate_wire_body,
+    DURABLE_WIRE_RETENTION_MS, DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES,
+    MAX_WIRE_BODY_BYTES, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress,
+    WireFilter, WireImportRejectReason, WireImportRejection, WireImportReport, WireInboxItem,
+    WireMessage, fallback_agent_iri, parse_role_selector, resolve_recipients, validate_sender_name,
+    validate_subject, validate_wire_body, wire_message_prune_eligible,
 };
 pub use finding::{Finding, FindingError, FindingState};
 pub use governor::{

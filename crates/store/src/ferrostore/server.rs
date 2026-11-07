@@ -43,6 +43,13 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 const FORWARD_PAUSE: Duration = Duration::from_millis(50);
 /// Spill overdue adaptive queues even when no client is writing.
 const MQ_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound each frame write on an authenticated server connection so a wedged subscriber cannot hold
+/// the connection write lock forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum concurrent active connections served at once.
+const MAX_ACTIVE_CONNECTIONS: usize = 512;
+/// Maximum concurrent MQ topic subscriptions on a single connection.
+const MAX_SUBSCRIPTIONS_PER_CONN: usize = 64;
 
 /// A connection that is authenticating.
 struct Handshake {
@@ -53,6 +60,7 @@ struct Handshake {
 struct ServerState {
     store: Arc<FerroStore>,
     shutdown: AtomicBool,
+    active_conns: Arc<AtomicUsize>,
     conns: Mutex<HashMap<u64, Box<dyn JsonIo>>>,
     next_conn: AtomicU64,
     /// Every connection's open read sessions (spec §6.1).
@@ -97,6 +105,7 @@ impl Drop for ConnReg {
     fn drop(&mut self) {
         lock_mutex(&self.state.conns).remove(&self.id);
         self.state.sessions.drop_conn(self.id);
+        self.state.active_conns.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -364,6 +373,7 @@ fn new_state(store: FerroStore, auth: ServerAuth) -> Arc<ServerState> {
     Arc::new(ServerState {
         store: Arc::new(store),
         shutdown: AtomicBool::new(false),
+        active_conns: Arc::new(AtomicUsize::new(0)),
         conns: Mutex::new(HashMap::new()),
         next_conn: AtomicU64::new(1),
         sessions: Sessions::new(),
@@ -648,6 +658,10 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                     accepted.watch.shutdown_both();
                     break;
                 }
+                if state.active_conns.load(Ordering::SeqCst) >= MAX_ACTIVE_CONNECTIONS {
+                    accepted.watch.shutdown_both();
+                    continue;
+                }
                 let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
                 if !begin_handshake(&state, id, matches!(accepted.peer, Peer::Tcp)) {
                     // Too many TCP connections authenticating: closed
@@ -657,6 +671,7 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                     accepted.watch.shutdown_both();
                     continue;
                 }
+                state.active_conns.fetch_add(1, Ordering::SeqCst);
                 lock_mutex(&state.conns).insert(id, accepted.watch);
                 let conn_state = Arc::clone(&state);
                 let read = accepted.read;
@@ -668,6 +683,7 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                 {
                     Ok(handle) => handlers.push(handle),
                     Err(_) => {
+                        state.active_conns.fetch_sub(1, Ordering::SeqCst);
                         lock_mutex(&state.handshakes).remove(&id);
                         lock_mutex(&state.conns).remove(&id);
                     }
@@ -756,13 +772,22 @@ impl Drop for HandshakeSlot<'_> {
     }
 }
 
+fn is_transient_accept_error(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
 fn poll_unix(listener: &UnixListener) -> AcceptPoll {
     match listener.accept() {
         Ok((stream, _)) => match unix_accepted(stream) {
             Ok(accepted) => AcceptPoll::Conn(accepted),
             Err(_) => AcceptPoll::Retry,
         },
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => AcceptPoll::Wait,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_transient_accept_error(&err) => {
+            AcceptPoll::Wait
+        }
         Err(err) if accept_again(&err) => AcceptPoll::Retry,
         Err(_) => AcceptPoll::Stop,
     }
@@ -774,7 +799,9 @@ fn poll_tcp(listener: &TcpListener, tls: Option<&ServerTls>) -> AcceptPoll {
             Ok(accepted) => AcceptPoll::Conn(accepted),
             Err(_) => AcceptPoll::Retry,
         },
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => AcceptPoll::Wait,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock || is_transient_accept_error(&err) => {
+            AcceptPoll::Wait
+        }
         Err(err) if accept_again(&err) => AcceptPoll::Retry,
         Err(_) => AcceptPoll::Stop,
     }
@@ -980,7 +1007,10 @@ fn authenticate(
         state.own_uid,
     )?;
     // Past the deadline the reaper has shut the connection down already.
-    if !end_handshake(state, slot.id) || read.set_read_timeout(None).is_err() {
+    if !end_handshake(state, slot.id)
+        || read.set_read_timeout(None).is_err()
+        || write.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
+    {
         write.shutdown_both();
         return None;
     }
@@ -998,6 +1028,11 @@ fn subscribe_topic(
     let topic = param_str(params, "topic")?.to_string();
     if subscribed.contains(&topic) {
         return Ok(());
+    }
+    if subscribed.len() >= MAX_SUBSCRIPTIONS_PER_CONN {
+        return Err(backend(format!(
+            "too many MQ subscriptions on one connection (max {MAX_SUBSCRIPTIONS_PER_CONN})"
+        )));
     }
     // One in-process subscription per topic. It does not replay history.
     let rx = store.subscribe_mq(&topic);
@@ -1760,6 +1795,11 @@ pub(super) trait JsonIo: Send {
     /// Bound each read of the stream (`None`: wait forever).
     fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError>;
 
+    /// Bound each write of the stream (`None`: wait forever).
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// The next frame. One that declares more than `max_len` bytes is
     /// refused before anything is allocated for it: before authentication
     /// the caller passes [`auth::PRE_AUTH_FRAME_BYTES`], after it
@@ -1834,6 +1874,10 @@ impl JsonIo for UnixIo {
         self.stream.set_read_timeout(timeout).map_err(backend)
     }
 
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError> {
+        self.stream.set_write_timeout(timeout).map_err(backend)
+    }
+
     fn shutdown_both(&self) {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
@@ -1876,6 +1920,10 @@ impl JsonIo for WsIo {
 
     fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError> {
         self.stream.set_read_timeout(timeout).map_err(backend)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError> {
+        self.stream.set_write_timeout(timeout).map_err(backend)
     }
 
     fn read_value(&mut self, max_len: usize) -> Result<Incoming, StoreError> {
@@ -3333,5 +3381,78 @@ mod tests {
             .find(|item| item["id"] == "b")
             .unwrap();
         assert!(present_meta.get("metadata").unwrap().is_null());
+    }
+
+    #[test]
+    fn transient_accept_errors_are_classified_as_retryable() {
+        for raw in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let err = io::Error::from_raw_os_error(raw);
+            assert!(
+                is_transient_accept_error(&err),
+                "expected errno {raw} to be classified as transient accept error"
+            );
+        }
+        for raw in [libc::EBADF, libc::EINVAL, libc::EACCES] {
+            let err = io::Error::from_raw_os_error(raw);
+            assert!(
+                !is_transient_accept_error(&err),
+                "expected errno {raw} not to be classified as transient accept error"
+            );
+        }
+    }
+
+    #[test]
+    fn subscribe_topic_enforces_per_connection_subscription_cap() {
+        let store = FerroStore::in_memory();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let write: Arc<Mutex<Box<dyn JsonIo>>> = Arc::new(Mutex::new(Box::new(UnixIo::new(
+            a,
+            FrameCounter::default(),
+        ))));
+        let alive = Arc::new(AtomicBool::new(false));
+        let mut subscribed = HashSet::new();
+        let mut forwarders = Vec::new();
+
+        for i in 0..MAX_SUBSCRIPTIONS_PER_CONN {
+            let params = json!({ "topic": format!("topic-{i}") });
+            subscribe_topic(
+                &store,
+                &params,
+                &write,
+                &alive,
+                &mut subscribed,
+                &mut forwarders,
+            )
+            .unwrap();
+        }
+        // Re-subscribing to an existing topic is idempotent even at the cap.
+        subscribe_topic(
+            &store,
+            &json!({ "topic": "topic-0" }),
+            &write,
+            &alive,
+            &mut subscribed,
+            &mut forwarders,
+        )
+        .unwrap();
+
+        let overflow = subscribe_topic(
+            &store,
+            &json!({ "topic": "topic-overflow" }),
+            &write,
+            &alive,
+            &mut subscribed,
+            &mut forwarders,
+        )
+        .unwrap_err();
+        assert!(
+            overflow
+                .to_string()
+                .contains("too many MQ subscriptions on one connection"),
+            "{overflow}"
+        );
+        for handle in forwarders {
+            let _ = handle.join();
+        }
     }
 }

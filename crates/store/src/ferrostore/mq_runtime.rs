@@ -56,6 +56,9 @@ pub(super) struct Runtime {
     pub probe: Arc<dyn MqResourceProbe>,
     pub topics: BTreeMap<String, Topic>,
     pub busy: bool,
+    pub busy_owner: Option<std::thread::ThreadId>,
+    pub closed: bool,
+    pub busy_timeout: std::time::Duration,
     pub groups: usize,
     pub acks: usize,
 }
@@ -68,6 +71,9 @@ impl Default for Runtime {
             probe: Arc::new(MqSystemResourceProbe),
             topics: BTreeMap::new(),
             busy: false,
+            busy_owner: None,
+            closed: false,
+            busy_timeout: std::time::Duration::from_secs(5),
             groups: 0,
             acks: 0,
         }
@@ -1078,6 +1084,7 @@ mod tests {
             }
         }
         let store = Arc::new(FerroStore::in_memory());
+        lock_mutex(&store.mq_runtime).busy_timeout = Duration::from_millis(20);
         store
             .configure_mq(MqTierPolicy::default(), false, Arc::new(Resources))
             .unwrap();
@@ -1438,5 +1445,34 @@ mod tests {
         assert_eq!(store.stats().unwrap().last_seq, 0);
         store.flush_mq(None).unwrap();
         assert!(store.get_doc("mq:events", "1").unwrap().is_none());
+    }
+
+    #[test]
+    fn cross_thread_mq_busy_waits_for_completion_and_times_out_when_wedged() {
+        let store = Arc::new(FerroStore::in_memory());
+        let guard = store.mq_begin().unwrap();
+        let store_waiter = Arc::clone(&store);
+        let waiter = std::thread::spawn(move || {
+            store_waiter.publish_mq_with("events", "k", &json!(1), MqDurability::Adaptive)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        drop(guard);
+        assert_eq!(waiter.join().unwrap().unwrap(), 1);
+
+        // When another thread holds busy past the timeout, the waiter returns "MQ busy; retry".
+        lock_mutex(&store.mq_runtime).busy_timeout = Duration::from_millis(25);
+        let guard = store.mq_begin().unwrap();
+        let store_timeout = Arc::clone(&store);
+        let timed_out = std::thread::spawn(move || {
+            store_timeout.publish_mq_with("events", "k2", &json!(2), MqDurability::Adaptive)
+        })
+        .join()
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            timed_out.to_string().contains("MQ busy; retry"),
+            "{timed_out}"
+        );
+        drop(guard);
     }
 }

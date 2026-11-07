@@ -12,6 +12,22 @@ use std::str::FromStr;
 
 pub const MAX_SUBJECT_BYTES: usize = 512;
 pub const MAX_WIRE_BODY_BYTES: usize = 262_144;
+/// Minimum age (`30` days in milliseconds) before a terminal (`Acked` or `Expired`)
+/// `durable == true` message becomes eligible for [`crate::store::MessageStore::prune_wire`].
+pub const DURABLE_WIRE_RETENTION_MS: u64 = 30 * 86_400 * 1000;
+
+/// Whether `msg` is old enough to be pruned at cutoff `before` once all of its
+/// receipts have reached a terminal state (`Acked` or `Expired`).
+pub fn wire_message_prune_eligible(msg: &WireMessage, before: &At) -> bool {
+    if !msg.durable {
+        msg.created_at < *before
+    } else {
+        msg.created_at
+            .unix_millis()
+            .saturating_add(DURABLE_WIRE_RETENTION_MS)
+            <= before.unix_millis()
+    }
+}
 
 /// Thread root identifier (`MessageId` of the root message in a thread).
 pub type ThreadId = MessageId;
@@ -465,6 +481,12 @@ pub fn resolve_recipients(
             if let Some(agent) = all_agents
                 .iter()
                 .find(|a| a.status == AgentStatus::Active && &a.name_key == name_key)
+                .or_else(|| {
+                    all_agents
+                        .iter()
+                        .filter(|a| &a.name_key == name_key)
+                        .max_by(|a, b| (&a.updated_at, &a.id).cmp(&(&b.updated_at, &b.id)))
+                })
             {
                 vec![(agent.id.0.clone(), agent.name_key.clone())]
             } else {
@@ -983,5 +1005,36 @@ mod tests {
         assert_eq!(merged_ack_exp.attempts, 5);
         assert_eq!(merged_ack_exp.updated_at, At::from_unix_millis(30));
         assert_eq!(merged_ack_exp.acked_at, Some(At::from_unix_millis(25)));
+    }
+
+    #[test]
+    fn retired_agent_recipient_resolves_to_canonical_agent_id_before_fallback_iri() {
+        let mut retired = seat(42, "ferris", AgentRole::Lead, "ferroloop", &[]);
+        retired.status = AgentStatus::Retired;
+        let agents = vec![retired.clone()];
+
+        let resolved = resolve_recipients(
+            &WireAddress::AgentName("ferris".into()),
+            None,
+            "jarvis",
+            &agents,
+            &[],
+        );
+        assert_eq!(resolved, vec![(retired.id.0, "ferris".to_string())]);
+
+        let unknown = resolve_recipients(
+            &WireAddress::AgentName("never-registered".into()),
+            None,
+            "jarvis",
+            &agents,
+            &[],
+        );
+        assert_eq!(
+            unknown,
+            vec![(
+                fallback_agent_iri("never-registered"),
+                "never-registered".to_string()
+            )]
+        );
     }
 }

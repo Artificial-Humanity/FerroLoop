@@ -605,7 +605,7 @@ impl MessageStore for FerroStore {
             let all_receipts = inbox_rows(txn)?;
             let to_prune: Vec<WireMessage> = all_messages
                 .into_iter()
-                .filter(|msg| !msg.durable && msg.created_at < before)
+                .filter(|msg| fl_core::ferrowire::wire_message_prune_eligible(msg, &before))
                 .filter(|msg| {
                     all_receipts
                         .iter()

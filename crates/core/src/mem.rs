@@ -2233,7 +2233,7 @@ impl MessageStore for MemStore {
         let to_prune: Vec<MessageId> = s
             .wire_messages
             .values()
-            .filter(|msg| !msg.durable && msg.created_at < before)
+            .filter(|msg| crate::ferrowire::wire_message_prune_eligible(msg, &before))
             .filter(|msg| {
                 s.wire_inbox
                     .values()

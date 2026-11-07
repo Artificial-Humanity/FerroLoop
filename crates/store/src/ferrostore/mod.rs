@@ -120,8 +120,10 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+
+const MQ_SUBSCRIBER_BUFFER: usize = 1024;
 use std::thread::ThreadId;
 pub use sync::{EnvelopeKind, RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp};
 pub use transaction::Transaction;
@@ -724,18 +726,19 @@ impl Disk {
             file: &dyn ContainerIo,
             poison: &Poison,
             index: usize,
-            sb: &Superblock,
+            base: &DiskCache,
             frames: &[Vec<u8>],
         ) -> Result<Option<Superblock>, StoreError> {
             if frames.is_empty() {
                 return Ok(None);
             }
             poison.check()?;
+            let sb = &base.sb;
             let mut at = sb
                 .wal_offset
-                .checked_add(sb.wal_length)
+                .checked_add(base.wal_applied)
                 .ok_or_else(|| backend("wal offset overflow"))?;
-            let mut wal_length = sb.wal_length;
+            let mut wal_length = base.wal_applied;
             let mut writes = Vec::with_capacity(frames.len());
             for frame in frames {
                 let len =
@@ -770,7 +773,7 @@ impl Disk {
             Ok(Some(new_sb))
         }
 
-        publish_frames(file, &self.poison, index, &base.sb, frames)
+        publish_frames(file, &self.poison, index, base, frames)
             .inspect_err(|_| self.settle_failed_publish(base))
     }
 
@@ -790,20 +793,12 @@ impl Disk {
         new_sb: Superblock,
         change: Change,
     ) -> Arc<DiskCache> {
-        // The base WAL ended torn (published bytes no full frame covers): the
-        // new frames follow those bytes, so the cache is left for the next
-        // refresh, which loads the file and reports it.
-        let torn = base.wal_applied != base.sb.wal_length;
-        let wal_applied = if torn {
-            base.wal_applied
-        } else {
-            new_sb.wal_length
-        };
+        let wal_applied = new_sb.wal_length;
         // The file the publish went to: `base` was read or written through
         // the same locked description.
         let file_id = base.file_id;
         let mut slot = lock_mutex(&self.cache);
-        if !torn && slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &base)) {
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &base)) {
             *slot = None;
         }
         let state = match change {
@@ -823,10 +818,8 @@ impl Disk {
             state,
             wal_applied,
         });
-        if !torn {
-            // The writer checked under the `flock` that the path names it.
-            install_newer(&mut slot, Arc::clone(&entry), file_id);
-        }
+        // The writer checked under the `flock` that the path names it.
+        install_newer(&mut slot, Arc::clone(&entry), file_id);
         entry
     }
 
@@ -1335,8 +1328,9 @@ impl Txn {
 /// [`Self::auto`] is that client when the default socket is listening, and [`Self::open`] otherwise.
 pub struct FerroStore {
     inner: Inner,
-    subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
+    subs: Mutex<HashMap<String, Vec<SyncSender<MqRecord>>>>,
     mq_runtime: Mutex<mq_runtime::Runtime>,
+    mq_busy_cv: Condvar,
     mq_used: AtomicBool,
     /// Named in `NotOwned`: where a lookup looked.
     label: String,
@@ -1373,7 +1367,11 @@ thread_local! {
 
 impl Drop for MqBusyGuard<'_> {
     fn drop(&mut self) {
-        lock_mutex(&self.0.mq_runtime).busy = false;
+        let mut mq = lock_mutex(&self.0.mq_runtime);
+        mq.busy = false;
+        mq.busy_owner = None;
+        drop(mq);
+        self.0.mq_busy_cv.notify_all();
     }
 }
 
@@ -1403,6 +1401,7 @@ impl FerroStore {
             inner,
             subs: Mutex::new(HashMap::new()),
             mq_runtime: Mutex::new(mq_runtime::Runtime::default()),
+            mq_busy_cv: Condvar::new(),
             mq_used: AtomicBool::new(false),
             label,
             sync: Mutex::new(SyncSlot::default()),
@@ -1411,6 +1410,27 @@ impl FerroStore {
             body_threads: Mutex::new(Vec::new()),
             bodies: AtomicUsize::new(0),
         }
+    }
+
+    fn mq_wait_not_busy<'a>(
+        &'a self,
+        mut mq: MutexGuard<'a, mq_runtime::Runtime>,
+    ) -> Result<MutexGuard<'a, mq_runtime::Runtime>, StoreError> {
+        if mq.busy {
+            let me = std::thread::current().id();
+            if mq.busy_owner != Some(me) {
+                let timeout = mq.busy_timeout;
+                let (guard, _) = self
+                    .mq_busy_cv
+                    .wait_timeout_while(mq, timeout, |state| state.busy && !state.closed)
+                    .unwrap_or_else(|e| e.into_inner());
+                mq = guard;
+            }
+        }
+        if mq.busy || mq.closed {
+            return Err(backend("MQ busy; retry"));
+        }
+        Ok(mq)
     }
 
     /// Configure owner-local MQ pressure thresholds and resource probing.
@@ -1429,10 +1449,7 @@ impl FerroStore {
         if matches!(&self.inner, Inner::Remote(_)) {
             return Err(backend("configure MQ on the owning store"));
         }
-        let mut mq = lock_mutex(&self.mq_runtime);
-        if mq.busy {
-            return Err(backend("MQ busy; retry"));
-        }
+        let mut mq = self.mq_wait_not_busy(lock_mutex(&self.mq_runtime))?;
         mq.policy = policy;
         mq.evict_on_first_ack = evict_on_first_ack;
         mq.probe = probe;
@@ -1447,11 +1464,9 @@ impl FerroStore {
     }
 
     fn mq_begin(&self) -> Result<MqBusyGuard<'_>, StoreError> {
-        let mut mq = lock_mutex(&self.mq_runtime);
-        if mq.busy {
-            return Err(backend("MQ busy; retry"));
-        }
+        let mut mq = self.mq_wait_not_busy(lock_mutex(&self.mq_runtime))?;
         mq.busy = true;
+        mq.busy_owner = Some(std::thread::current().id());
         Ok(MqBusyGuard(self))
     }
 
@@ -1478,10 +1493,7 @@ impl FerroStore {
     }
 
     fn mq_begin_inbound_sync(&self) -> Result<MqBusyGuard<'_>, StoreError> {
-        let mut mq = lock_mutex(&self.mq_runtime);
-        if mq.busy {
-            return Err(backend("MQ busy; retry"));
-        }
+        let mut mq = self.mq_wait_not_busy(lock_mutex(&self.mq_runtime))?;
         if mq.topics.values().any(|topic| {
             topic.high_water > topic.persisted_high_water
                 || !topic.messages.is_empty()
@@ -1492,6 +1504,7 @@ impl FerroStore {
             ));
         }
         mq.busy = true;
+        mq.busy_owner = Some(std::thread::current().id());
         Ok(MqBusyGuard(self))
     }
 
@@ -1763,10 +1776,7 @@ impl FerroStore {
                 .map_err(|error| backend(format!("invalid MQ telemetry: {error}")));
         }
         let (probe, mut snapshots) = {
-            let mq = lock_mutex(&self.mq_runtime);
-            if mq.busy {
-                return Err(backend("MQ busy; retry"));
-            }
+            let mq = self.mq_wait_not_busy(lock_mutex(&self.mq_runtime))?;
             (
                 Arc::clone(&mq.probe),
                 mq.topics
@@ -2683,22 +2693,28 @@ impl FerroStore {
         // Sample outside all store mutexes: a caller-supplied probe may execute arbitrary code.
         let probe = { Arc::clone(&lock_mutex(&self.mq_runtime).probe) };
         let resources = probe.probe(self.mq_storage_path());
-        // The gate orders the first memory admission against an already-started durable publish.
-        let gate = lock_mutex(&self.commit_gate);
-        let mut sync = lock_mutex(&self.sync);
-        if sync.adapter.is_some() {
-            if durability == MqDurability::Ephemeral {
-                return Err(backend("Ephemeral MQ is unavailable with a SyncAdapter"));
+        let (gate, mut sync, mut mq) = loop {
+            // The gate orders the first memory admission against an already-started durable publish.
+            let gate = lock_mutex(&self.commit_gate);
+            let sync = lock_mutex(&self.sync);
+            if sync.adapter.is_some() {
+                if durability == MqDurability::Ephemeral {
+                    return Err(backend("Ephemeral MQ is unavailable with a SyncAdapter"));
+                }
+                drop(sync);
+                drop(gate);
+                let (seq, commit) = self.publish_mq_detail(topic, key, payload)?;
+                return Ok((seq, Some(commit)));
+            }
+            let mq = lock_mutex(&self.mq_runtime);
+            if !mq.busy && !mq.closed {
+                break (gate, sync, mq);
             }
             drop(sync);
             drop(gate);
-            let (seq, commit) = self.publish_mq_detail(topic, key, payload)?;
-            return Ok((seq, Some(commit)));
-        }
-        let mut mq = lock_mutex(&self.mq_runtime);
-        if mq.busy {
-            return Err(backend("MQ busy; retry"));
-        }
+            let mq = self.mq_wait_not_busy(mq)?;
+            drop(mq);
+        };
         if !Arc::ptr_eq(&probe, &mq.probe) {
             return Err(backend("MQ probe changed; retry"));
         }
@@ -2810,6 +2826,7 @@ impl FerroStore {
             return Ok((seq, None));
         }
         mq.busy = true;
+        mq.busy_owner = Some(std::thread::current().id());
         // The decision is owner-wide, so persist all affected Adaptive topics in one
         // transaction instead of leaving the topic that caused pressure in memory.
         let mut snapshots: Vec<_> = mq
@@ -3137,10 +3154,7 @@ impl FerroStore {
             let state = self.read_state()?;
             return unread_mq(&state, topic, group, limit);
         }
-        let mq = lock_mutex(&self.mq_runtime);
-        if mq.busy {
-            return Err(backend("MQ busy; retry"));
-        }
+        let mq = self.mq_wait_not_busy(lock_mutex(&self.mq_runtime))?;
         let state = self.read_state()?;
         let mut disk = unread_mq(&state, topic, group, limit)?;
         if let Some(buffer) = mq.topics.get(topic) {
@@ -3252,10 +3266,7 @@ impl FerroStore {
             return Ok(store_seq);
         }
         if self.mq_used.load(Ordering::Acquire) {
-            let mut mq = lock_mutex(&self.mq_runtime);
-            if mq.busy {
-                return Err(backend("MQ busy; retry"));
-            }
+            let mut mq = self.mq_wait_not_busy(lock_mutex(&self.mq_runtime))?;
             let evict = mq.evict_on_first_ack;
             let memory_entry = mq
                 .topics
@@ -3328,7 +3339,7 @@ impl FerroStore {
         if let Inner::Remote(remote) = &self.inner {
             return remote.subscribe_topic(topic);
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MQ_SUBSCRIBER_BUFFER);
         lock_mutex(&self.subs)
             .entry(topic.to_string())
             .or_default()
@@ -4410,7 +4421,7 @@ impl FerroStore {
         let Some(senders) = subs.get_mut(topic) else {
             return;
         };
-        senders.retain(|sender| sender.send(record.clone()).is_ok());
+        senders.retain(|sender| sender.try_send(record.clone()).is_ok());
         if senders.is_empty() {
             subs.remove(topic);
         }
@@ -4751,8 +4762,11 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
 /// since: the failure no longer holds it back.
 fn checkpoint_due(disk: &Disk, base: &DiskCache) -> bool {
     let wal = base.sb.wal_length;
+    if base.wal_applied != wal {
+        return true;
+    }
     let threshold = base.sb.snapshot_length.max(disk.auto_checkpoint_floor());
-    if base.wal_applied != wal || wal <= threshold {
+    if wal <= threshold {
         return false;
     }
     let failed_at = disk.checkpoint_failed_at.load(Ordering::Acquire);

@@ -4621,6 +4621,31 @@ fn prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff<S: 
     assert!(s.get_wire_message(&m_acked.id).unwrap().is_none());
     assert!(s.get_wire_message(&m_pending.id).unwrap().is_some());
     assert!(s.get_wire_message(&m_durable.id).unwrap().is_some());
+
+    // 4. Pending durable message older than 30 days -> kept; acked durable message older than 30 days -> pruned.
+    let (m_durable_pending, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Durable pending".into(),
+            body: "Keep unacked durable".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(15),
+        })
+        .unwrap();
+    let long_cutoff = At::from_unix_millis(13 + crate::ferrowire::DURABLE_WIRE_RETENTION_MS);
+    let pruned_durable = s.prune_wire(long_cutoff).unwrap();
+    assert_eq!(pruned_durable, 1);
+    assert!(s.get_wire_message(&m_durable.id).unwrap().is_none());
+    assert!(s.get_wire_message(&m_durable_pending.id).unwrap().is_some());
 }
 
 fn sample_workflow_def(
