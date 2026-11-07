@@ -3586,3 +3586,56 @@ fn legacy_lookup_replacement_cannot_select_reliable_writer() {
             .any(|r| r.stream == stream && matches!(r.state, ChildState::Running(_)))
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn pty_reliable_session_supports_capture_output_and_write_raw() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut client = Rpc::connect(&daemon.paths.endpoint).inner;
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("FL_HOST_PTY".into(), "1".into());
+    let mut env_allow = std::collections::BTreeSet::new();
+    env_allow.insert("FL_HOST_PTY".into());
+    let spawn_spec = SpawnSpec {
+        session: sid("pty-prompt"),
+        kind: SpawnKind::Pipe,
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "test -t 0 && printf \"PROMPT>\" && read ans && echo \"GOT:$ans\"".into(),
+        ],
+        cwd: std::env::temp_dir(),
+        env,
+        env_allow,
+    };
+    let (stream, _state) = client
+        .spawn_reliable_session(spawn_spec)
+        .expect("spawn reliable pty");
+    let grant = client.claim_controller(stream.clone()).expect("claim");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let out = client
+            .capture_output(sid("pty-prompt"), 4096)
+            .expect("capture");
+        if out.contains("PROMPT>") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "did not observe PROMPT>: {out:?}");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let outcome = client
+        .write_raw(stream, grant.lease, b"yes\n".to_vec())
+        .expect("write_raw");
+    assert_eq!(outcome, SendOutcome::Written);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let out = client
+            .capture_output(sid("pty-prompt"), 4096)
+            .expect("capture after write_raw");
+        if out.contains("GOT:yes") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "did not observe GOT:yes: {out:?}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}

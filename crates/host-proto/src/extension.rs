@@ -295,6 +295,10 @@ pub enum ExtensionRequest {
         lease: ControllerLease,
         bytes: RawInput,
     },
+    CaptureOutput {
+        session: SessionId,
+        max_bytes: u32,
+    },
     Resize {
         stream: StreamId,
         lease: ControllerLease,
@@ -325,7 +329,13 @@ impl ExtensionRequest {
             Self::SendLine { line, .. } if line.len() > MAX_RAW_INPUT => {
                 return Err(HostError::EventTooLarge);
             }
-            Self::Write { .. } | Self::Resize { .. } | Self::Attach { .. } => {
+            Self::Write { bytes, .. } if bytes.as_slice().len() > MAX_RAW_INPUT => {
+                return Err(HostError::EventTooLarge);
+            }
+            Self::CaptureOutput { max_bytes, .. } if *max_bytes as usize > MAX_RAW_INPUT => {
+                return Err(HostError::EventTooLarge);
+            }
+            Self::Resize { .. } | Self::Attach { .. } => {
                 return Err(HostError::Unsupported {
                     subject: "PTY backend/schema",
                 });
@@ -432,6 +442,9 @@ pub enum ExtensionResponse {
         outcome: SendOutcome,
     },
     Controlled,
+    CapturedOutput {
+        text: String,
+    },
     Resized {
         cols: u16,
         rows: u16,
@@ -450,6 +463,9 @@ impl ExtensionResponse {
     pub(crate) fn validate(&self) -> Result<(), HostError> {
         match self {
             Self::Sessions { records } if records.len() > 64 => Err(HostError::EventTooLarge),
+            Self::CapturedOutput { text } if text.len() > MAX_RAW_INPUT => {
+                Err(HostError::EventTooLarge)
+            }
             Self::Attachment { .. } | Self::Resized { .. } => Err(HostError::Unsupported {
                 subject: "PTY backend/schema",
             }),

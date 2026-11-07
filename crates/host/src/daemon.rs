@@ -678,6 +678,39 @@ pub(super) async fn extended(
                 .map_err(|_| Refusal::Io)?;
             Ok(XResp::Controlled)
         }
+        XReq::Write {
+            stream,
+            lease,
+            bytes,
+        } => {
+            let (writer, writer_lease) = host.authority.mutation(conn, &stream, lease)?;
+            let outcome = match writer.write_raw_reliable(
+                conn.0,
+                stream.epoch.0,
+                writer_lease,
+                bytes.into_vec(),
+                &host.reliable_budget,
+            )? {
+                Ok(rx) => rx.await.map_err(|_| Refusal::Io)?,
+                Err(outcome) => outcome,
+            };
+            Ok(XResp::Input { outcome })
+        }
+        XReq::CaptureOutput { session, max_bytes } => {
+            let found = host
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session.as_str())
+                .cloned();
+            let Some(session) = found else {
+                return Err(Refusal::StaleEpoch);
+            };
+            let max_bytes = (max_bytes as usize).min(fl_host_proto::MAX_RAW_INPUT);
+            Ok(XResp::CapturedOutput {
+                text: session.stdout_tail(max_bytes),
+            })
+        }
         _ => Err(Refusal::Unsupported),
     }
 }
@@ -1029,12 +1062,15 @@ fn admit_extension(
                 + 64
         }
         XReq::SendLine { line, .. } => line.capacity() + 64,
+        XReq::Write { bytes, .. } => bytes.as_slice().len() + 64,
         _ => 64,
     };
-    let response = if matches!(request, XReq::ListSessions) {
-        list_response_storage_bound().ok_or(Refusal::ResourceLimit)?
-    } else {
-        4096
+    let response = match request {
+        XReq::ListSessions => list_response_storage_bound().ok_or(Refusal::ResourceLimit)?,
+        XReq::CaptureOutput { max_bytes, .. } => {
+            (*max_bytes as usize).min(fl_host_proto::MAX_RAW_INPUT) + 4096
+        }
+        _ => 4096,
     };
     let bytes = std::mem::size_of::<XReq>()
         .checked_add(std::mem::size_of::<ExtendedReply>())

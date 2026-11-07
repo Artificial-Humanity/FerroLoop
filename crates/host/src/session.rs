@@ -328,6 +328,29 @@ impl Session {
         self.stdout_cv.notify_all();
     }
 
+    pub fn push_stdout_tail(&self, chunk: &[u8], max_cap: usize) {
+        let mut buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        if chunk.len() >= max_cap {
+            buf.bytes.clear();
+            buf.bytes.extend_from_slice(&chunk[chunk.len() - max_cap..]);
+        } else {
+            let total = buf.bytes.len().saturating_add(chunk.len());
+            if total > max_cap {
+                let drop_n = total - max_cap;
+                buf.bytes.drain(..drop_n);
+            }
+            buf.bytes.extend_from_slice(chunk);
+        }
+        self.stdout_cv.notify_all();
+    }
+
+    pub fn stdout_tail(&self, max_bytes: usize) -> String {
+        let buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        let cap = max_bytes.min(64 * 1024);
+        let start = buf.bytes.len().saturating_sub(cap);
+        String::from_utf8_lossy(&buf.bytes[start..]).into_owned()
+    }
+
     pub fn stdout_eof(&self) {
         self.stdout
             .lock()
@@ -647,6 +670,7 @@ pub(crate) fn pump_reliable_stdout_with(
             Ok(0) | Err(_) => break,
             Ok(len) => {
                 buffer.truncate(len);
+                session.push_stdout_tail(buffer.as_slice(), 64 * 1024);
                 if journal.accept_read(buffer).is_err() {
                     break;
                 }

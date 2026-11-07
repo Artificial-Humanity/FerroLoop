@@ -47,14 +47,59 @@ pub fn spawn_supervised(
     block_sigpipe();
     let (control_r, control_w) = pipe_cloexec()?;
     let (status_r, status_w) = pipe_cloexec()?;
-    let (stdin_r, stdin_w) = pipe_cloexec()?;
-    let (stdout_r, stdout_w) = pipe_cloexec()?;
-    let (stderr_r, stderr_w) = pipe_cloexec()?;
+    let use_pty = env.iter().any(|(k, v)| k == "FL_HOST_PTY" && v == "1");
+    let (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w) = if use_pty {
+        let winsize = libc::winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut master_raw = -1;
+        let mut slave_raw = -1;
+        if unsafe {
+            libc::openpty(
+                &mut master_raw,
+                &mut slave_raw,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &winsize,
+            )
+        } != 0
+        {
+            return Err(HostError::Io(io::Error::last_os_error().to_string()));
+        }
+        let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };
+        let slave_fd = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+        for fd in [master_fd.as_raw_fd(), slave_fd.as_raw_fd()] {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                return Err(HostError::Io(io::Error::last_os_error().to_string()));
+            }
+        }
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(slave_fd.as_raw_fd(), &mut termios) } == 0 {
+            termios.c_lflag &= !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ECHONL);
+            let _ = unsafe { libc::tcsetattr(slave_fd.as_raw_fd(), libc::TCSANOW, &termios) };
+        }
+        let stdin_r = elevate(slave_fd)?;
+        let stdout_w = elevate(stdin_r.try_clone()?)?;
+        let stderr_w = elevate(stdin_r.try_clone()?)?;
+        let stdin_w = master_fd.try_clone()?;
+        let stdout_r = master_fd;
+        let (stderr_r, stderr_w_dummy) = pipe_cloexec()?;
+        drop(stderr_w_dummy);
+        (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w)
+    } else {
+        let (stdin_r, stdin_w) = pipe_cloexec()?;
+        let (stdout_r, stdout_w) = pipe_cloexec()?;
+        let (stderr_r, stderr_w) = pipe_cloexec()?;
+        let stdin_r = elevate(stdin_r)?;
+        let stdout_w = elevate(stdout_w)?;
+        let stderr_w = elevate(stderr_w)?;
+        (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w)
+    };
     let control_r = elevate(control_r)?;
     let status_w = elevate(status_w)?;
-    let stdin_r = elevate(stdin_r)?;
-    let stdout_w = elevate(stdout_w)?;
-    let stderr_w = elevate(stderr_w)?;
     let fds = [
         control_r.as_raw_fd(),
         status_w.as_raw_fd(),

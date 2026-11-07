@@ -513,6 +513,14 @@ fn become_vendor(prep: &ExecPrep, release_r: i32, err_w: i32) -> ! {
         unsafe { libc::_exit(127) };
     }
     unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+    }
+    if unsafe { libc::isatty(VENDOR_STDIN) } == 1 {
+        unsafe {
+            libc::ioctl(VENDOR_STDIN, libc::TIOCSCTTY as _, 0);
+        }
+    }
+    unsafe {
         libc::dup2(VENDOR_STDIN, 0);
         libc::dup2(VENDOR_STDOUT, 1);
         libc::dup2(VENDOR_STDERR, 2);

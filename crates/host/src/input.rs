@@ -250,6 +250,29 @@ impl WriterHandle {
         Ok(self.enqueue_data(conn, epoch, lease, InputBytes::Reliable(bytes)))
     }
 
+    pub(crate) fn write_raw_reliable(
+        &self,
+        conn: u64,
+        epoch: u64,
+        lease: ControllerLease,
+        raw: Vec<u8>,
+        budget: &Arc<crate::slice_budget::SliceBudget>,
+    ) -> Result<Result<oneshot::Receiver<SendOutcome>, SendOutcome>, fl_host_proto::ExtensionRefusal>
+    {
+        if raw.is_empty() || raw.len() > fl_host_proto::MAX_RAW_INPUT {
+            return Ok(Err(SendOutcome::NotWritten {
+                reason: SendBlock::Io,
+            }));
+        }
+        let len = raw.len();
+        let reservation =
+            crate::slice_budget::reserve(budget, crate::slice_budget::ChargeKind::Metadata, len)?;
+        let mut bytes = reservation.allocate_bytes(len)?;
+        bytes.as_mut_slice().copy_from_slice(&raw);
+        drop(raw);
+        Ok(self.enqueue_data(conn, epoch, lease, InputBytes::Reliable(bytes)))
+    }
+
     fn enqueue_data(
         &self,
         conn: u64,

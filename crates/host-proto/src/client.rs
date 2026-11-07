@@ -300,6 +300,132 @@ impl AsyncHostClient {
         }
     }
 
+    pub async fn list_sessions(&mut self) -> Result<Vec<crate::SessionSummary>, HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::ListSessions)
+            .await?
+        {
+            crate::ExtensionResponse::Sessions { records } => Ok(records),
+            other => Err(HostError::Protocol(format!(
+                "list_sessions refused: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn spawn_reliable_session(
+        &mut self,
+        spec: crate::SpawnSpec,
+    ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::SpawnSession {
+                spec,
+                mode: crate::SessionMode::ReliablePipe,
+                pty: None,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::Session { stream, state } => Ok((stream, state)),
+            other => Err(HostError::Protocol(format!(
+                "spawn_session refused: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn send_line(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        line: String,
+    ) -> Result<crate::SendOutcome, HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::SendLine {
+                stream,
+                lease,
+                line,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::Input { outcome } => Ok(outcome),
+            other => Err(HostError::Protocol(format!("send_line refused: {other:?}"))),
+        }
+    }
+
+    pub async fn write_raw(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        bytes: Vec<u8>,
+    ) -> Result<crate::SendOutcome, HostError> {
+        let bytes = crate::RawInput::new(bytes)?;
+        match self
+            .extension_request(crate::ExtensionRequest::Write {
+                stream,
+                lease,
+                bytes,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::Input { outcome } => Ok(outcome),
+            other => Err(HostError::Protocol(format!("write_raw refused: {other:?}"))),
+        }
+    }
+
+    pub async fn signal_session(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        signal: crate::SignalKind,
+    ) -> Result<(), HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::SignalSession {
+                stream,
+                lease,
+                signal,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::Controlled => Ok(()),
+            other => Err(HostError::Protocol(format!(
+                "signal_session refused: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn kill_session(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+    ) -> Result<(), HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::KillSession { stream, lease })
+            .await?
+        {
+            crate::ExtensionResponse::Controlled => Ok(()),
+            other => Err(HostError::Protocol(format!(
+                "kill_session refused: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn capture_output(
+        &mut self,
+        session: crate::SessionId,
+        max_bytes: u32,
+    ) -> Result<String, HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::CaptureOutput {
+                session,
+                max_bytes,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::CapturedOutput { text } => Ok(text),
+            other => Err(HostError::Protocol(format!(
+                "capture_output refused: {other:?}"
+            ))),
+        }
+    }
+
     #[cfg(unix)]
     pub fn into_stream(self) -> tokio::net::UnixStream {
         match self.io {
@@ -376,12 +502,19 @@ pub struct BlockingHostClient {
 
 impl BlockingHostClient {
     pub fn connect(endpoint: &HostEndpoint) -> Result<Self, HostError> {
+        Self::connect_with(endpoint, ConnectOptions::default())
+    }
+
+    pub fn connect_with(
+        endpoint: &HostEndpoint,
+        options: ConnectOptions,
+    ) -> Result<Self, HostError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|err| HostError::Io(err.to_string()))?;
         let endpoint = endpoint.clone();
-        let inner = runtime.block_on(AsyncHostClient::connect(&endpoint))?;
+        let inner = runtime.block_on(AsyncHostClient::connect_with(&endpoint, options))?;
         Ok(Self { inner, runtime })
     }
 
@@ -395,6 +528,80 @@ impl BlockingHostClient {
 
     pub fn read_response(&mut self) -> Result<HostResponse, HostError> {
         self.runtime.block_on(self.inner.read_response())
+    }
+
+    pub fn extension_request(
+        &mut self,
+        request: crate::ExtensionRequest,
+    ) -> Result<crate::ExtensionResponse, HostError> {
+        self.runtime.block_on(self.inner.extension_request(request))
+    }
+
+    pub fn list_sessions(&mut self) -> Result<Vec<crate::SessionSummary>, HostError> {
+        self.runtime.block_on(self.inner.list_sessions())
+    }
+
+    pub fn spawn_reliable_session(
+        &mut self,
+        spec: crate::SpawnSpec,
+    ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
+        self.runtime
+            .block_on(self.inner.spawn_reliable_session(spec))
+    }
+
+    pub fn claim_controller(
+        &mut self,
+        stream: crate::StreamId,
+    ) -> Result<ReliableControllerGrant, HostError> {
+        self.runtime.block_on(self.inner.claim_controller(stream))
+    }
+
+    pub fn send_line(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        line: String,
+    ) -> Result<crate::SendOutcome, HostError> {
+        self.runtime
+            .block_on(self.inner.send_line(stream, lease, line))
+    }
+
+    pub fn write_raw(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        bytes: Vec<u8>,
+    ) -> Result<crate::SendOutcome, HostError> {
+        self.runtime
+            .block_on(self.inner.write_raw(stream, lease, bytes))
+    }
+
+    pub fn signal_session(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        signal: crate::SignalKind,
+    ) -> Result<(), HostError> {
+        self.runtime
+            .block_on(self.inner.signal_session(stream, lease, signal))
+    }
+
+    pub fn kill_session(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+    ) -> Result<(), HostError> {
+        self.runtime
+            .block_on(self.inner.kill_session(stream, lease))
+    }
+
+    pub fn capture_output(
+        &mut self,
+        session: crate::SessionId,
+        max_bytes: u32,
+    ) -> Result<String, HostError> {
+        self.runtime
+            .block_on(self.inner.capture_output(session, max_bytes))
     }
 }
 
