@@ -16,6 +16,8 @@ fn main() {
         "../exec",
         "../gate",
         "../github",
+        "../host",
+        "../host-proto",
         "../hub",
         "../install",
         "../mcp",
