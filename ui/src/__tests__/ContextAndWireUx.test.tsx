@@ -1685,6 +1685,186 @@ describe("App transcript observation ownership", () => {
     h.unmount();
   });
 
+  it("defaults predecessor metadata when a discovered successor omits queue and busy", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Rich A history" })], is_busy: true,
+      queue: [{ id: "old-rich", session_id: "session-a", prompt: "Rich A queue", by: "owner", created_at: "now" }],
+      context_usage: { used_tokens: 190000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "Rich A quota" } }));
+    await screen.findByText("Rich A queue");
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toBeInTheDocument();
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ session_id: "session-b", resolved_session_id: "session-b", turns: [turn({ index: 0, content: "Partial B history" })] })); h.refresh();
+    await screen.findByText("Partial B history");
+    expect(screen.getByTestId("context-ring-ferris")).not.toHaveAttribute("data-percent", "95");
+    expect(screen.queryByText("Rich A queue")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("context-level-text")).not.toHaveTextContent("190k");
+    expect(screen.queryByTestId("context-max")).toBeNull();
+    h.unmount();
+  });
+
+  it("preserves same-owner independently observed queue and busy across a partial transcript", async () => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    h.refresh({ session_id: "session-a", persona: "ferris", delivered: false, is_busy: true,
+      queue: [{ id: "independent", session_id: "session-a", prompt: "Independent current queue", by: "owner", created_at: "now" }] });
+    await screen.findByText("Independent current queue");
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    h.setRead(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Partial current history" })] })); h.refresh();
+    await screen.findByText("Partial current history");
+    expect(screen.getByText("Independent current queue")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("successful %s invalidates its unselected target while preserving another agent", async (mode) => {
+    const h = harness();
+    h.setSessions([
+      { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      { id: "session-b", source: "route", adapter: "claude", persona: "jarvis", status: "active", updated_at: "t2" },
+    ]);
+    await screen.findByText("Last good history");
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "A pre-reset optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("A pre-reset optimism")).toBeInTheDocument());
+    let releaseRead!: (value: Response) => void;
+    const late = new Promise<Response>((resolve) => { releaseRead = resolve; });
+    let oldReadStarted = false;
+    h.setRead(async () => { oldReadStarted = true; return late; }); h.refresh();
+    await waitFor(() => expect(oldReadStarted).toBe(true));
+    let finish!: (value: never) => void;
+    const mutation = new Promise<never>((resolve) => { finish = resolve; });
+    const reset = vi.spyOn(h.api, mode === "teardown" ? "decommissionSession" : "clearSession").mockReturnValue(mutation);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    h.setRead(async (target) => target.includes("session-a") ? late : response({ session_id: "session-b", turns: [turn({ index: 0, content: "B fresh history" })],
+      queue: [{ id: "b-fresh", session_id: "session-b", prompt: "B fresh queue", by: "owner", created_at: "now" }], is_busy: true,
+      context_usage: { used_tokens: 50000, max_tokens: 200000 }, quota_usage: { exhausted_reason: "B fresh quota" } }));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("B fresh history"); h.refresh();
+    await screen.findByText("B fresh queue");
+    h.refresh({ session_id: "session-b", persona: "jarvis", effective_body: "B fresh optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("B fresh optimism")).toBeInTheDocument());
+    await act(async () => { finish({ ok: true } as never); await mutation; });
+    await act(async () => { releaseRead(observed("Late A before-reset data")); await late; });
+    expect(screen.getByText("B fresh history")).toBeInTheDocument();
+    expect(screen.getByText("B fresh queue")).toBeInTheDocument();
+    expect(within(screen.getByTestId("turn-card-1")).getByText("B fresh optimism")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    expect(screen.getByTestId("quota-exhausted-toolbar-pill")).toHaveTextContent("B fresh quota");
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await act(async () => {});
+    expect(screen.queryAllByText("A pre-reset optimism")).toHaveLength(0);
+    expect(screen.queryByText("Last good history")).toBeNull();
+    expect(screen.queryByText("Late A before-reset data")).toBeNull();
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("successful %s preserves a discovered new session for the same persona", async (mode) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "Old concrete optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("Old concrete optimism")).toBeInTheDocument());
+    let finish!: (value: never) => void;
+    const pending = new Promise<never>((resolve) => { finish = resolve; });
+    const reset = vi.spyOn(h.api, mode === "teardown" ? "decommissionSession" : "clearSession").mockReturnValue(pending);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    h.setSessions([{ id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t2" }]);
+    h.setRead(async () => response({ session_id: "session-b", turns: [turn({ index: 0, content: "Discovered fresh B" })],
+      queue: [{ id: "new-concrete", session_id: "session-b", prompt: "New concrete queue", by: "owner", created_at: "now" }], is_busy: true })); h.refresh();
+    await screen.findByText("Discovered fresh B");
+    h.refresh({ session_id: "session-b", persona: "ferris", effective_body: "New concrete optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("New concrete optimism")).toBeInTheDocument());
+    await act(async () => { finish({ ok: true } as never); await pending; });
+    expect(screen.getByText("Discovered fresh B")).toBeInTheDocument();
+    expect(screen.getByText("New concrete queue")).toBeInTheDocument();
+    expect(within(screen.getByTestId("turn-card-1")).getByText("New concrete optimism")).toBeInTheDocument();
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    h.setSessions([{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t3" }]); h.refresh();
+    await waitFor(() => expect(screen.queryByText("Discovered fresh B")).toBeNull());
+    expect(screen.queryAllByText("Old concrete optimism")).toHaveLength(0);
+    h.unmount();
+  });
+
+  it("completing an unselected teardown does not supersede the successor's pending read", async () => {
+    const h = harness();
+    h.setSessions([
+      { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      { id: "session-b", source: "route", adapter: "claude", persona: "jarvis", status: "active", updated_at: "t1" },
+    ]);
+    await screen.findByText("Last good history");
+    let finish!: (value: never) => void;
+    const mutation = new Promise<never>((resolve) => { finish = resolve; });
+    const reset = vi.spyOn(h.api, "decommissionSession").mockReturnValue(mutation);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    let release!: (value: Response) => void;
+    const read = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return read; });
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await waitFor(() => expect(started).toBe(true));
+    await act(async () => { finish({ ok: true } as never); await mutation; });
+    await act(async () => { release(response({ session_id: "session-b", turns: [turn({ index: 0, content: "Successor pending observation" })] })); await read; });
+    await screen.findByText("Successor pending observation");
+    h.unmount();
+  });
+
+  it.each(["clear", "reforge", "teardown"] as const)("pending %s suppresses target reads after navigating back and failure releases them", async (mode) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.refresh({ session_id: "session-a", persona: "ferris", effective_body: "Failure keeps A optimism", delivered: true });
+    await waitFor(() => expect(within(screen.getByTestId("turn-card-1")).getByText("Failure keeps A optimism")).toBeInTheDocument());
+    let fail!: (error: Error) => void;
+    const pending = new Promise<never>((_resolve, reject) => { fail = reject; });
+    const reset = vi.spyOn(h.api, mode === "teardown" ? "decommissionSession" : "clearSession").mockReturnValue(pending);
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    if (mode === "teardown") {
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    } else {
+      fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+      fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    }
+    await waitFor(() => expect(reset).toHaveBeenCalledOnce());
+    h.setRead(async (target) => target.includes("session-a") ? observed("Premature target observation") : observed("Other agent fresh"));
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("Other agent fresh");
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await act(async () => {});
+    expect(screen.queryByText("Premature target observation")).toBeNull();
+    // Reject while another view is selected: it must remain usable and A's optimism must survive.
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await screen.findByText("Other agent fresh");
+    await act(async () => { fail(new Error("Navigated reset refused")); await pending.catch(() => {}); });
+    expect(screen.getByText("Other agent fresh")).toBeInTheDocument();
+    h.setRead(async () => observed("After navigated failure"));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await screen.findByText("After navigated failure");
+    expect(within(screen.getByTestId("turn-card-1")).getByText("Failure keeps A optimism")).toBeInTheDocument();
+    h.unmount();
+  });
+
   it.each(["cancel", "edit"] as const)("ignores a late %s reply after a different session installs metadata", async (operation) => {
     const item = { id: "old-operation", session_id: "session-a", prompt: "Old operation queue", by: "owner", created_at: "now" };
     const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Original owner" })], queue: [item], is_busy: false }));

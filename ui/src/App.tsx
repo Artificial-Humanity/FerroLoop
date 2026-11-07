@@ -107,6 +107,8 @@ import {
 const sameTranscriptOwner = (a: TranscriptReadOwner, b: TranscriptReadOwner) =>
   a.authEpoch === b.authEpoch && a.selectionEpoch === b.selectionEpoch &&
   a.agentKey === b.agentKey && a.sessionId === b.sessionId && a.resetEpoch === b.resetEpoch;
+const sameTranscriptTarget = (a: TranscriptReadOwner, b: TranscriptReadOwner) =>
+  a.authEpoch === b.authEpoch && a.agentKey === b.agentKey && a.sessionId === b.sessionId;
 type TranscriptRefreshState = "loading" | "ready" | "stale" | "unavailable" | "denied";
 
 export interface AppProps {
@@ -978,7 +980,10 @@ export const App: React.FC<AppProps> = ({
   const ownerRef = useRef<TranscriptReadOwner>({ authEpoch: 0, selectionEpoch: 0,
     agentKey: selectedAgentName.trim().toLowerCase(), sessionId: null, resetEpoch: 0 });
   const mountedRef = useRef(true);
-  const resetPendingRef = useRef(false);
+  // Entries live only while their authenticated target mutation is in flight.
+  const pendingTranscriptResetsRef = useRef(new Set<TranscriptReadOwner>());
+  const isTranscriptResetPending = useCallback((owner: TranscriptReadOwner) =>
+    Array.from(pendingTranscriptResetsRef.current).some((reset) => sameTranscriptTarget(reset, owner)), []);
   const [transcriptSnapshot, setTranscriptSnapshot] = useState<{
     owner: TranscriptReadOwner; turns: TranscriptTurn[]; status: TranscriptRefreshState;
   } | null>(null);
@@ -997,7 +1002,6 @@ export const App: React.FC<AppProps> = ({
     const nextOwner = { ...previousOwner, agentKey: agentKey.trim().toLowerCase(), sessionId,
       selectionEpoch: previousOwner.selectionEpoch + 1 };
     ownerRef.current = nextOwner;
-    resetPendingRef.current = false;
     transcriptGuard.invalidate();
     setSessionMetadataOwner((previous) => previous && sameTranscriptOwner(previous, previousOwner) &&
       previousOwner.agentKey === nextOwner.agentKey && previousOwner.sessionId === sessionId
@@ -1047,6 +1051,7 @@ export const App: React.FC<AppProps> = ({
   backgroundTranscriptsRef.current = backgroundTranscripts;
   const backgroundStampRef = useRef<Record<string, string>>({});
   const backgroundOwnersRef = useRef<Record<string, TranscriptReadOwner>>({});
+  const cachedTranscriptOwnersRef = useRef<Record<string, TranscriptReadOwner>>({});
   const [busyByAgent, setBusyByAgent] = useState<Record<string, boolean>>({});
   const [contextUsageByAgent, setContextUsageByAgent] = useState<
     Record<string, SessionContextUsage | null>
@@ -1056,13 +1061,14 @@ export const App: React.FC<AppProps> = ({
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
     transcriptGuard.invalidate();
-    resetPendingRef.current = false;
+    pendingTranscriptResetsRef.current.clear();
     refreshInFlightRef.current = false;
     refreshQueuedRef.current = null;
     optimisticPromptRef.current = [];
     backgroundTranscriptsRef.current = {};
     backgroundStampRef.current = {};
     backgroundOwnersRef.current = {};
+    cachedTranscriptOwnersRef.current = {};
     setTranscriptSnapshot(null);
     setSessionMetadataOwner(null);
     setBackgroundTranscripts({});
@@ -1153,11 +1159,12 @@ export const App: React.FC<AppProps> = ({
 
   /** Cache a transcript under its owning agent for roster badge counts. */
   const recordTranscript = useCallback(
-    (agentKey: string | undefined | null, turns: TranscriptTurn[]) => {
-      const key = (agentKey ?? "").trim().toLowerCase();
+    (owner: TranscriptReadOwner, turns: TranscriptTurn[]) => {
+      const key = owner.agentKey.trim().toLowerCase();
       if (!key) {
         return;
       }
+      cachedTranscriptOwnersRef.current[key] = { ...owner };
       backgroundTranscriptsRef.current = {
         ...backgroundTranscriptsRef.current,
         [key]: turns,
@@ -1185,7 +1192,7 @@ export const App: React.FC<AppProps> = ({
 
   // Independent queue observations supersede older reads, but can only adopt their dispatch owner.
   const adoptPromptMetadata = useCallback((response: { queue?: unknown; is_busy?: unknown }, owner: TranscriptReadOwner) => {
-    if (!mountedRef.current || loggedOutRef.current || resetPendingRef.current ||
+    if (!mountedRef.current || loggedOutRef.current || isTranscriptResetPending(ownerRef.current) ||
       !sameTranscriptOwner(owner, ownerRef.current) ||
       (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
     transcriptGuard.invalidate();
@@ -1204,14 +1211,14 @@ export const App: React.FC<AppProps> = ({
     setSessionMetadataOwner({ ...owner });
     if (Array.isArray(response.queue)) setSessionQueue(response.queue as QueuedOperatorPrompt[]);
     if (typeof response.is_busy === "boolean") setIsSessionBusy(response.is_busy);
-  }, [transcriptGuard, setSessionMetadataOwner]);
+  }, [transcriptGuard, setSessionMetadataOwner, isTranscriptResetPending]);
 
   const readSelectedTranscript = useCallback(async (targetId: string) => {
-    if (loggedOutRef.current || resetPendingRef.current || !mountedRef.current) return;
+    if (loggedOutRef.current || isTranscriptResetPending(ownerRef.current) || !mountedRef.current) return;
     const owner = { ...ownerRef.current };
     if (owner.sessionId && targetId !== owner.sessionId) return;
     const ticket = transcriptGuard.begin(owner);
-    const accepts = () => mountedRef.current && !loggedOutRef.current && !resetPendingRef.current &&
+    const accepts = () => mountedRef.current && !loggedOutRef.current && !isTranscriptResetPending(owner) &&
       transcriptGuard.accepts(ticket, ownerRef.current);
     try {
       const result: SessionTranscriptResponse = await apiClient.getSessionTranscript(targetId);
@@ -1220,9 +1227,16 @@ export const App: React.FC<AppProps> = ({
       if (result.resolved_session_id && owner.sessionId && result.resolved_session_id !== owner.sessionId) {
         throw new Error("Transcript session changed");
       }
-      recordTranscript(owner.agentKey, result.turns);
+      recordTranscript(owner, result.turns);
       applyTranscriptTurns(result.turns);
       setTranscriptSnapshot((previous) => previous ? { ...previous, owner, status: "ready" } : null);
+      if (!sessionMetadataOwnerRef.current || !sameTranscriptOwner(sessionMetadataOwnerRef.current, owner)) {
+        setSessionQueue([]);
+        setIsSessionBusy(false);
+        setSessionContextUsage(null);
+        setSessionQuotaUsage(null);
+        recordAgentContextUsage(owner.agentKey, null);
+      }
       setSessionMetadataOwner(owner);
       recordAgentContextUsage(owner.agentKey, result.context_usage);
       recordAgentBusy(owner.agentKey, typeof result.is_busy === "boolean" ? result.is_busy : hasTrailingIncompleteWork(result.turns));
@@ -1243,7 +1257,7 @@ export const App: React.FC<AppProps> = ({
         setAuthority(null); setPairingOpen(true);
       }
     }
-  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage]);
+  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, isTranscriptResetPending, setSessionMetadataOwner]);
 
   const [worktrees, setWorktrees] = useState<WorktreeSummary[]>([]);
   const [selectedWorktreeId, setSelectedWorktreeId] = useState<string | null>(null);
@@ -1385,15 +1399,16 @@ export const App: React.FC<AppProps> = ({
         }
         const viewOwner = { ...ownerRef.current };
         const bgOwner = { ...viewOwner, agentKey: persona, sessionId: session.id };
+        if (isTranscriptResetPending(bgOwner)) continue;
         backgroundOwnersRef.current[persona] = bgOwner;
         const ticket = transcriptGuard.begin(bgOwner);
         const bgRes = await apiClient.getSessionTranscript(session.id).catch(() => null);
-        if (!mountedRef.current || loggedOutRef.current || resetPendingRef.current ||
+        if (!mountedRef.current || loggedOutRef.current || isTranscriptResetPending(bgOwner) ||
           !sameTranscriptOwner(viewOwner, ownerRef.current) || !transcriptGuard.accepts(ticket, backgroundOwnersRef.current[persona] ?? bgOwner)) return;
         if (bgRes && isObservedTranscriptTurns(bgRes.turns) && (!bgRes.resolved_session_id || bgRes.resolved_session_id === session.id)) {
           if (bgRes.turns) {
             backgroundStampRef.current[persona] = stamp;
-            recordTranscript(persona, bgRes.turns);
+            recordTranscript(bgOwner, bgRes.turns);
           }
           if (bgRes.context_usage !== undefined) {
             recordAgentContextUsage(persona, bgRes.context_usage);
@@ -1406,7 +1421,7 @@ export const App: React.FC<AppProps> = ({
         }
       }
     },
-    [apiClient, recordTranscript, recordAgentBusy, recordAgentContextUsage],
+    [apiClient, recordTranscript, recordAgentBusy, recordAgentContextUsage, isTranscriptResetPending],
   );
 
   // A refresh requested while one is in flight is coalesced into a single
@@ -1434,9 +1449,9 @@ export const App: React.FC<AppProps> = ({
         // Session discovery also feeds roster model/liveness data. A newer transcript read
         // supersedes this read's transcript work, while this same-view discovery remains useful.
         const mayReadTranscript = transcriptGuard.accepts(ticket, ownerRef.current);
+        // A torn-down persona alias fences unresolved reads, not a successor's concrete session.
         const list = (sessRes?.sessions ?? []).filter((session) =>
-          !tornDownTargetsRef.current.has(session.id.toLowerCase()) &&
-          !tornDownTargetsRef.current.has((session.persona ?? "").toLowerCase()));
+          !tornDownTargetsRef.current.has(session.id.toLowerCase()));
         const concrete = selectedSessionIdRef.current ?? list.find((session) =>
           (session.persona ?? "").toLowerCase() === viewOwner.agentKey)?.id ?? activeSessionIdRef.current;
         if (sessRes) {
@@ -1446,7 +1461,7 @@ export const App: React.FC<AppProps> = ({
         }
         void scanBackgroundTranscripts(list);
         const target = sessionOverride === null ? null : (concrete ?? sessionOverride ?? selectedAgentNameRef.current);
-        if (mayReadTranscript && target && !tornDownTargetsRef.current.has(target.toLowerCase()) && !tornDownTargetsRef.current.has(viewOwner.agentKey)) {
+        if (mayReadTranscript && target && !tornDownTargetsRef.current.has(target.toLowerCase())) {
           await readSelectedTranscript(target);
         }
       } finally {
@@ -1581,7 +1596,7 @@ export const App: React.FC<AppProps> = ({
         activeSessionIdRef.current = concrete;
         void scanBackgroundTranscripts(sessionsRes?.sessions ?? []);
         const target = concrete ?? initialOwner.agentKey;
-        if (target && !tornDownTargetsRef.current.has(target.toLowerCase()) && !tornDownTargetsRef.current.has(initialOwner.agentKey)) {
+        if (target && !tornDownTargetsRef.current.has(target.toLowerCase())) {
           await readSelectedTranscript(target);
         }
       }
@@ -1881,8 +1896,7 @@ export const App: React.FC<AppProps> = ({
   // Selection ownership is advanced synchronously above and at every navigation entry point.
   useEffect(() => {
     const target = activeSession?.id ?? selectedAgent?.name_key;
-    if (!target || loggedOutRef.current || tornDownTargetsRef.current.has(target.toLowerCase()) ||
-      tornDownTargetsRef.current.has((selectedAgent?.name_key ?? "").toLowerCase())) return;
+    if (!target || loggedOutRef.current || tornDownTargetsRef.current.has(target.toLowerCase())) return;
     void readSelectedTranscript(target);
   }, [activeSession?.id, selectedAgent?.name_key, authority, readSelectedTranscript]);
 
@@ -2189,42 +2203,61 @@ export const App: React.FC<AppProps> = ({
   const beginTranscriptReset = () => {
     const previous = snapshotRef.current;
     const previousOwner = ownerRef.current;
-    const lastGood = previous && sameTranscriptOwner(previous.owner, ownerRef.current) ? previous : null;
+    const lastGood = previous && sameTranscriptOwner(previous.owner, previousOwner) ? previous : null;
     transcriptGuard.invalidate();
-    ownerRef.current = { ...ownerRef.current, resetEpoch: ownerRef.current.resetEpoch + 1 };
+    ownerRef.current = { ...previousOwner, resetEpoch: previousOwner.resetEpoch + 1 };
     const resetOwner = { ...ownerRef.current };
+    pendingTranscriptResetsRef.current.add(resetOwner);
     setSessionMetadataOwner((previous) => previous && sameTranscriptOwner(previous, previousOwner) ? resetOwner : null);
-    resetPendingRef.current = true;
     if (lastGood) setTranscriptSnapshot({ ...lastGood, owner: resetOwner, status: "loading" });
     return { resetOwner, lastGood };
   };
-  const discardTranscriptTarget = (targetId: string, agentKey: string) => {
+  const resetIsCurrentAuth = (resetOwner: TranscriptReadOwner) => mountedRef.current &&
+    !loggedOutRef.current && resetOwner.authEpoch === ownerRef.current.authEpoch &&
+    pendingTranscriptResetsRef.current.has(resetOwner);
+  const discardTranscriptTarget = (resetOwner: TranscriptReadOwner, teardown = false) => {
+    const { agentKey, sessionId, authEpoch } = resetOwner;
     optimisticPromptRef.current = optimisticPromptRef.current.filter((prompt) =>
-      prompt.sessionId ? prompt.sessionId !== targetId : prompt.agentKey !== agentKey);
-    delete backgroundTranscriptsRef.current[agentKey];
-    delete backgroundStampRef.current[agentKey];
-    setBackgroundTranscripts((previous) => {
-      const next = { ...previous }; delete next[agentKey]; return next;
-    });
-    setTranscriptSnapshot(null);
+      prompt.authEpoch !== authEpoch || prompt.agentKey !== agentKey || (prompt.sessionId ?? null) !== sessionId);
+    // Persona caches may already belong to a successor concrete session.
+    const cachedOwner = cachedTranscriptOwnersRef.current[agentKey];
+    if (cachedOwner && sameTranscriptTarget(cachedOwner, resetOwner)) {
+      delete backgroundTranscriptsRef.current[agentKey];
+      delete backgroundStampRef.current[agentKey];
+      delete cachedTranscriptOwnersRef.current[agentKey];
+      setBackgroundTranscripts((previous) => {
+        const next = { ...previous }; delete next[agentKey]; return next;
+      });
+      if (teardown) {
+        setBusyByAgent((previous) => { const next = { ...previous }; delete next[agentKey]; return next; });
+        setContextUsageByAgent((previous) => { const next = { ...previous }; delete next[agentKey]; return next; });
+      }
+    }
+    setTranscriptSnapshot((previous) => previous && sameTranscriptTarget(previous.owner, resetOwner) ? null : previous);
+    if (teardown && sessionMetadataOwnerRef.current && sameTranscriptTarget(sessionMetadataOwnerRef.current, resetOwner)) {
+      setSessionMetadataOwner(null);
+      setSessionQueue([]); setIsSessionBusy(false);
+      setSessionContextUsage(null); setSessionQuotaUsage(null);
+    }
+    refreshOptimisticView((previous) => previous + 1);
   };
   const handleResetSession = async (targetId: string, mode: ClearSessionMode) => {
     const { resetOwner, lastGood } = beginTranscriptReset();
     try {
       const result = await apiClient.clearSession(targetId, mode);
-      if (mountedRef.current && sameTranscriptOwner(resetOwner, ownerRef.current)) {
-        discardTranscriptTarget(targetId, resetOwner.agentKey);
-        resetPendingRef.current = false;
-        await readSelectedTranscript(targetId);
+      if (resetIsCurrentAuth(resetOwner)) {
+        discardTranscriptTarget(resetOwner);
+        pendingTranscriptResetsRef.current.delete(resetOwner);
+        if (sameTranscriptTarget(resetOwner, ownerRef.current)) await readSelectedTranscript(targetId);
       }
       return result;
     } catch (error) {
-      if (mountedRef.current && sameTranscriptOwner(resetOwner, ownerRef.current)) {
+      if (resetIsCurrentAuth(resetOwner) && sameTranscriptOwner(resetOwner, ownerRef.current)) {
         setTranscriptSnapshot(lastGood ? { ...lastGood, owner: resetOwner } : { owner: resetOwner, turns: [], status: "unavailable" });
       }
       throw error;
     } finally {
-      if (sameTranscriptOwner(resetOwner, ownerRef.current)) resetPendingRef.current = false;
+      pendingTranscriptResetsRef.current.delete(resetOwner);
     }
   };
 
@@ -2238,46 +2271,24 @@ export const App: React.FC<AppProps> = ({
     try {
       res = await apiClient.decommissionSession(targetId, mode);
     } catch (error) {
-      if (reset && mountedRef.current && sameTranscriptOwner(reset.resetOwner, ownerRef.current)) {
+      if (reset && resetIsCurrentAuth(reset.resetOwner) && sameTranscriptOwner(reset.resetOwner, ownerRef.current)) {
         setTranscriptSnapshot(reset.lastGood ? { ...reset.lastGood, owner: reset.resetOwner } : null);
-        resetPendingRef.current = false;
       }
+      if (reset) pendingTranscriptResetsRef.current.delete(reset.resetOwner);
       throw error;
     }
-    if (reset && (!mountedRef.current || !sameTranscriptOwner(reset.resetOwner, ownerRef.current))) return res;
     if (reset) {
-      resetPendingRef.current = false;
+      const valid = resetIsCurrentAuth(reset.resetOwner);
+      pendingTranscriptResetsRef.current.delete(reset.resetOwner);
+      if (!valid) return res;
       tornDownTargetsRef.current.add(targetId.trim().toLowerCase());
       tornDownTargetsRef.current.add(reset.resetOwner.agentKey);
-      discardTranscriptTarget(targetId, reset.resetOwner.agentKey);
-    }
-    if (mode === "teardown") {
-      const agentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
-      if (agentKey) {
-        delete backgroundTranscriptsRef.current[agentKey];
-        setBackgroundTranscripts((prev) => {
-          const next = { ...prev };
-          delete next[agentKey];
-          return next;
-        });
-        setBusyByAgent((prev) => {
-          const next = { ...prev };
-          delete next[agentKey];
-          return next;
-        });
-        setContextUsageByAgent((prev) => {
-          const next = { ...prev };
-          delete next[agentKey];
-          return next;
-        });
-      }
+      discardTranscriptTarget(reset.resetOwner, true);
+      // Only the captured target loses its view or schedules selected-view follow-up work.
+      if (!sameTranscriptTarget(reset.resetOwner, ownerRef.current)) return res;
       setSelectedSessionId(null);
       selectedSessionIdRef.current = null;
       setTranscriptTurns([]);
-      setSessionQueue([]);
-      setIsSessionBusy(false);
-      setSessionContextUsage(null);
-      setSessionQuotaUsage(null);
     }
     await Promise.all([
       refreshWireAndRoster(),
