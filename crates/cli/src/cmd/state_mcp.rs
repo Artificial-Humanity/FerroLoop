@@ -618,6 +618,7 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                     by,
                 })
                 .map_err(|e| e.to_string())?;
+            crate::cmd::wire::sync_store_retired_personas(&store);
             let all_active = store.list_agents(None, false).unwrap_or_default();
             let mgr = reports_to(&rec, &all_active);
             let mut val = serde_json::to_value(&rec).unwrap();
