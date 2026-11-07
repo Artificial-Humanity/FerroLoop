@@ -77,12 +77,12 @@ use crate::auth::{
 };
 use crate::cloud_adapters;
 use crate::discovery::{
-    DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
-    discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
-    list_git_worktrees, lookup_one_route_session, lookup_sessions,
-    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot, read_worktree_diff,
-    scan_cargo_architecture_conformance, snapshot_discovery_names, snapshot_discovery_store,
-    transcript_observation_from_sessions,
+    DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptObservation, TranscriptReads,
+    context_usage_from_sessions, discover_route_sessions_without_model_info,
+    discover_sessions_from_snapshot, list_git_worktrees, lookup_one_route_session, lookup_sessions,
+    observe_transcript_from_sessions, read_session_quota_usage_with_reads,
+    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
+    snapshot_discovery_names, snapshot_discovery_store, transcript_observation_from_sessions,
 };
 use crate::github_pr;
 use crate::lifecycle::{
@@ -4830,7 +4830,14 @@ fn handle_dynamic_api_routes(
                 let sessions = lookup_sessions(&snap, home);
                 let mut files = TranscriptReads::default();
                 let (canonical_id, _persona) = resolve_session_target_in(&sessions, &session_id);
-                let all_observation = transcript_observation_from_sessions(
+                let resolved_session_id = sessions
+                    .iter()
+                    .find(|session| {
+                        session.id == session_id.trim()
+                            || session.persona.as_deref() == Some(session_id.trim())
+                    })
+                    .map(|session| session.id.clone());
+                let all_observation = observe_transcript_from_sessions(
                     &session_id,
                     &sessions,
                     &snap,
@@ -4846,13 +4853,33 @@ fn handle_dynamic_api_routes(
                         &mut files,
                     )
                 } else {
-                    all_observation.clone()
+                    match &all_observation {
+                        TranscriptObservation::Observed(turns) => Some(turns.clone()),
+                        TranscriptObservation::Unavailable => None,
+                        TranscriptObservation::NoSource => Some(Vec::new()),
+                    }
                 };
                 let is_busy = state.is_session_busy_from_observation(
                     &canonical_id,
                     canonical_observation.as_deref(),
                 );
-                let all_turns = all_observation.unwrap_or_default();
+                let all_turns = match all_observation {
+                    TranscriptObservation::Observed(turns) => turns,
+                    unavailable => {
+                        let reason = match unavailable {
+                            TranscriptObservation::Unavailable => "unstable_or_unreadable",
+                            TranscriptObservation::NoSource => "source_not_available",
+                            TranscriptObservation::Observed(_) => unreachable!(),
+                        };
+                        return HttpResponse::json(
+                            503,
+                            json!({
+                                "code": "transcript_unavailable",
+                                "reason": reason,
+                            }),
+                        );
+                    }
+                };
                 let total_turns = all_turns.len();
                 let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
                     Some("all" | "0") => None,
@@ -4876,19 +4903,20 @@ fn handle_dynamic_api_routes(
                             }
                         },
                     );
-                return HttpResponse::json(
-                    200,
-                    json!({
-                        "session_id": session_id,
-                        "turns": turns,
-                        "total_turns": total_turns,
-                        "is_busy": is_busy,
-                        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
-                        "queue": queue,
-                        "context_usage": context_usage,
-                        "quota_usage": quota_usage,
-                    }),
-                );
+                let mut body = json!({
+                    "session_id": session_id,
+                    "turns": turns,
+                    "total_turns": total_turns,
+                    "is_busy": is_busy,
+                    "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
+                    "queue": queue,
+                    "context_usage": context_usage,
+                    "quota_usage": quota_usage,
+                });
+                if let Some(resolved_session_id) = resolved_session_id {
+                    body["resolved_session_id"] = json!(resolved_session_id);
+                }
+                return HttpResponse::json(200, body);
             }
             ("GET", "queue") => {
                 drain_ready_session_queues(state);

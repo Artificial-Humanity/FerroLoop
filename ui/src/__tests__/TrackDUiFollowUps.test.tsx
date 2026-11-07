@@ -545,6 +545,7 @@ describe("Track D UI Follow-ups — Wave C F-3 & FerroDeck UI Audit O-3, O-4, O-
       }>();
 
       const mockApiClient = {
+        getToken: () => null,
         listSlashCommands: vi.fn(async () => ({ commands: [] })),
         getSessionTranscript: vi.fn(async (targetId: string) => ({
           session_id: targetId,

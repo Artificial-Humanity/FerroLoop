@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { HubApiClient } from "../api/client";
+import { HubApiClient, HubApiError } from "../api/client";
 import {
   ALWAYS_SEND_NOW_STORAGE_KEY,
   ChatPane,
@@ -2111,5 +2111,374 @@ describe("Resizable chat composer (Record 57 & Record 112)", () => {
       behavior: "smooth",
       block: "center",
     });
+  });
+});
+
+describe("standalone transcript ownership and availability", () => {
+  const history = [{ index: 0, role: "assistant", content: "Owned history", thinking: null, tool_calls: [] }];
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+  function setup() {
+    const reads: ReturnType<typeof deferred<import("../types/api").SessionTranscriptResponse>>[] = [];
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockImplementation(() => {
+      const read = deferred<import("../types/api").SessionTranscriptResponse>();
+      reads.push(read);
+      return read.promise;
+    });
+    const body = (content = history, extra = {}) => ({ session_id: "session-a", turns: content, ...extra });
+    const pane = (sessionId: string | null = "session-a", agentName = "freya", authority: import("../types/api").HubAuthority | null = null) =>
+      <ChatPane apiClient={client} agentName={agentName} adapter="claude" sessionId={sessionId} authority={authority} agentSettingsOpen />;
+    return { reads, client, body, pane };
+  }
+  const unavailable = () => new HubApiError(503, "temporarily unavailable", undefined, undefined, { code: "transcript_unavailable" });
+  const staleNotice = "History refresh unavailable; showing last loaded history";
+  it.each(["503", "network", "malformed", "malformed turn"])("retains exact-session history after %s and recovers, while observed empty clears", async (failure) => {
+    const { pane, reads, body } = setup();
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "protected draft" } });
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => {
+      if (failure === "malformed") reads[1].resolve({ session_id: "session-a" } as never);
+      else if (failure === "malformed turn") reads[1].resolve(body([{ ...history[0], tool_calls: "invalid" }] as never));
+      else reads[1].reject(failure === "503" ? unavailable() : new TypeError("network failed"));
+    });
+    expect(screen.getByText(staleNotice)).toBeInTheDocument();
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toHaveValue("protected draft");
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[2].resolve(body()));
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[3].resolve(body([])));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it.each(["refusal", "hold", "cancel", "edit"] as const)("keeps a newer independent %s observation when an older transcript completes", async (operation) => {
+    const { pane, reads, client, body } = setup();
+    const item = { id: "guarded", session_id: "session-a", prompt: "Original queue", by: "owner", created_at: "now" };
+    const reply = deferred<import("../types/api").PromptResponse>();
+    if (operation === "cancel") vi.spyOn(client, "cancelQueuedPrompt").mockReturnValue(reply.promise as never);
+    else if (operation === "edit") vi.spyOn(client, "updateQueuedPrompt").mockReturnValue(reply.promise as never);
+    else vi.spyOn(client, "sendQueuedPromptNow").mockReturnValue(reply.promise);
+    render(pane());
+    await act(async () => reads[0].resolve(body(history, { queue: [item], is_busy: false })));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    expect(screen.getByTestId("chat-refresh-btn")).toBeDisabled();
+    if (operation === "edit") {
+      fireEvent.click(screen.getByTestId("queued-edit-guarded"));
+      fireEvent.change(screen.getByTestId("queued-edit-input-guarded"), { target: { value: "Edited queue" } });
+      fireEvent.click(screen.getByTestId("queued-save-guarded"));
+    } else fireEvent.click(screen.getByTestId(operation === "cancel" ? "queued-cancel-guarded" : "queued-send-now-guarded"));
+    const queue = operation === "cancel" ? [] : [{ ...item, prompt: operation === "edit" ? "Edited queue" : item.prompt,
+      ...(operation === "refusal" || operation === "hold" ? { delivery_state: operation === "refusal" ? "refused" : "unconfirmed" } : {}) }];
+    await act(async () => reply.resolve({ session_id: "session-a", delivered: false, delivery_stage: operation === "refusal" ? "refused" : "unconfirmed",
+      delivery_error: operation === "refusal" ? "Queue refused" : undefined, queue, is_busy: true } as never));
+    // These operations do not fetch again; invalidating the read must also settle its spinner.
+    expect(reads).toHaveLength(2);
+    expect(screen.getByTestId("chat-refresh-btn")).toBeEnabled();
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "Obsolete operation history" }], { queue: [item], is_busy: false })));
+    expect(screen.queryByText("Obsolete operation history")).toBeNull();
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    if (operation === "cancel") expect(screen.queryByText("Original queue")).toBeNull();
+    else if (operation === "edit") expect(screen.getByText("Edited queue")).toBeInTheDocument();
+    else expect(screen.getByTestId("queued-send-now-guarded")).toBeDisabled();
+  });
+  it("keeps a confirmed optimistic send before any successful transcript through an unavailable followup", async () => {
+    const { pane, reads, client, body } = setup();
+    const send = deferred<import("../types/api").PromptResponse>();
+    vi.spyOn(client, "sendSessionPrompt").mockReturnValue(send.promise);
+    render(pane());
+    await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Confirmed local prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    expect(screen.getByTestId("optimistic-user-turn")).toHaveTextContent("Confirmed local prompt");
+    await act(async () => send.resolve({ session_id: "session-a", queued: false, delivered: true } as never));
+    expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+    expect(within(screen.getByTestId("turn-card-0")).getByText("Confirmed local prompt")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    await act(async () => reads[1].reject(unavailable()));
+    expect(within(screen.getByTestId("turn-card-0")).getByText("Confirmed local prompt")).toBeInTheDocument();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[2].resolve(body([])));
+    expect(screen.queryByText("Confirmed local prompt")).toBeNull();
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it.each(["clear", "reforge", "teardown"] as const)("preserves confirmed optimistic rows on failed %s and discards them on success", async (mode) => {
+    const { pane, reads, client } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: false, delivered: true } as never);
+    const reset = mode === "teardown" ? vi.spyOn(client, "decommissionSession") : vi.spyOn(client, "clearSession");
+    reset.mockRejectedValueOnce(new Error("reset refused")).mockResolvedValue({} as never);
+    render(pane());
+    await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Locally confirmed before reset" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(reads).toHaveLength(2));
+    await act(async () => reads[1].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Draft survives reset" } });
+    const beginReset = () => {
+      if (mode === "teardown") {
+        fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+        fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+        fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+      } else {
+        fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+        fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+      }
+    };
+    beginReset();
+    expect(await screen.findByText("reset refused")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-card-0")).toHaveTextContent("Locally confirmed before reset");
+    expect(screen.getByLabelText("Message")).toHaveValue("Draft survives reset");
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    beginReset();
+    await waitFor(() => expect(reset).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Locally confirmed before reset")).toBeNull());
+    if (mode !== "teardown") {
+      await waitFor(() => expect(reads).toHaveLength(3));
+      await act(async () => reads[2].reject(unavailable()));
+    }
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toHaveValue("Draft survives reset");
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+  });
+  it.each(["principal", "token", "A to B to A"])("masks confirmed optimistic rows immediately after %s changes", async (change) => {
+    const { pane, reads, client } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: false, delivered: true } as never);
+    const first = { tier: "owner", login: "first" } as const;
+    const view = render(pane("session-a", "freya", first));
+    await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Private confirmed prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(reads).toHaveLength(2));
+    await act(async () => reads[1].reject(unavailable()));
+    expect(screen.getByTestId("turn-card-0")).toHaveTextContent("Private confirmed prompt");
+    if (change === "token") client.setToken("replacement-token");
+    if (change === "A to B to A") view.rerender(pane("session-b", "freya", first));
+    view.rerender(pane("session-a", "freya", change === "principal" ? { tier: "owner", login: "second" } : first));
+    expect(screen.queryByText("Private confirmed prompt")).toBeNull();
+    await act(async () => reads[reads.length - 1].reject(unavailable()));
+    expect(screen.queryByText("Private confirmed prompt")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+  });
+  it.each(["client", "principal", "token", "A to B to A"])("rejects a late send's old reader and local metadata after %s replacement", async (change) => {
+    const { pane, reads, client, body } = setup();
+    const replacement = setup();
+    const send = deferred<import("../types/api").PromptResponse>();
+    vi.spyOn(client, "sendSessionPrompt").mockReturnValue(send.promise);
+    const first = { tier: "owner", login: "first" } as const;
+    const view = render(pane("session-a", "freya", first));
+    await act(async () => reads[0].resolve(body([])));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Old owner's send" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    if (change === "token") client.setToken("fixture-replacement-token");
+    if (change === "A to B to A") view.rerender(pane("session-b", "freya", first));
+    view.rerender(change === "client" ? replacement.pane("session-a", "freya", first) : pane(
+      "session-a", "freya", change === "principal" ? { tier: "owner", login: "second" } : first,
+    ));
+    const currentReads = change === "client" ? replacement.reads : reads;
+    const currentRead = currentReads[currentReads.length - 1];
+    const oldReadCount = reads.length;
+    await act(async () => send.resolve({ session_id: "session-a", queued: false, delivered: true,
+      effective_body: "Stale optimistic body", is_busy: true,
+      queue: [{ id: "stale-send", session_id: "session-a", prompt: "Stale send queue", by: "owner", created_at: "" }],
+    } as never));
+    expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+    expect(screen.queryByText("Stale send queue")).toBeNull();
+    expect(screen.queryByText("Stale optimistic body")).toBeNull();
+    expect(screen.getByTestId("session-busy-badge")).not.toHaveTextContent("Busy · Working");
+    expect(reads).toHaveLength(oldReadCount);
+    expect(screen.getByTestId("chat-refresh-btn")).toBeDisabled();
+    await act(async () => currentRead.resolve(body([{ ...history[0], content: "Current owner's history" }])));
+    expect(screen.getByText("Current owner's history")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-refresh-btn")).not.toBeDisabled();
+    expect(client.sendSessionPrompt).toHaveBeenCalledTimes(1);
+  });
+  it("shows initial unavailable separately from observed empty history", async () => {
+    const { pane, reads } = setup();
+    render(pane());
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    await act(async () => reads[0].reject(unavailable()));
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+  });
+  it.each([401, 403, 404])("hides last-good history on HTTP %s instead of stale success", async (status) => {
+    const { pane, reads, body } = setup();
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[1].reject(new HubApiError(status, "access refused")));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("access refused");
+  });
+  it.each(["session", "agent", "principal", "token", "client"])("masks history immediately on %s change and rejects the old read's metadata and finally", async (change) => {
+    const { pane, reads, body, client } = setup();
+    const view = render(pane("session-a", "freya", { tier: "owner", login: "first" }));
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    const replacement = setup();
+    if (change === "token") client.setToken("fixture-new-token");
+    view.rerender(change === "client" ? replacement.pane() : pane(
+      change === "session" ? "session-b" : "session-a",
+      change === "agent" ? "felix" : "freya",
+      { tier: "owner", login: change === "principal" ? "second" : "first" },
+    ));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    await act(async () => reads[1].resolve(body(history, { is_busy: true, queue: [{ id: "old", prompt: "Old queue", session_id: "session-a", by: "owner", created_at: "" }] })));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.queryByText("Old queue")).toBeNull();
+    expect(screen.getByTestId("chat-refresh-btn")).toBeDisabled();
+    const latest = change === "client" ? replacement.reads[0] : reads[2];
+    await act(async () => latest.resolve(body([])));
+    expect(screen.getByTestId("chat-refresh-btn")).not.toBeDisabled();
+  });
+  it("rejects a same-session response from the first A after A to B to A", async () => {
+    const { pane, reads, body } = setup();
+    const view = render(pane());
+    view.rerender(pane("session-b"));
+    view.rerender(pane());
+    await act(async () => reads[2].reject(unavailable()));
+    await act(async () => reads[0].resolve(body()));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+    await act(async () => reads[1].reject(new Error("old failure")));
+    expect(screen.queryByText("old failure")).toBeNull();
+  });
+  it.each([false, true])("requires positive alias resolution for reusable last-good (resolved=%s)", async (resolved) => {
+    const { pane, reads, body } = setup();
+    render(pane(null));
+    await act(async () => reads[0].resolve(body(history, resolved ? { resolved_session_id: "session-a" } : {})));
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[1].reject(unavailable()));
+    expect(Boolean(screen.queryByText("Owned history"))).toBe(resolved);
+    expect(Boolean(screen.queryByText(staleNotice))).toBe(resolved);
+  });
+  it("does not reuse a concrete snapshot after switching to an unknown alias or accept contradictory resolution", async () => {
+    const { pane, reads, body } = setup();
+    const view = render(pane());
+    await act(async () => reads[0].resolve(body()));
+    view.rerender(pane(null));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    await act(async () => reads[1].reject(unavailable()));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    view.rerender(pane());
+    await act(async () => reads[2].resolve(body(history, { resolved_session_id: "session-b" })));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+  });
+  it.each(["clear", "reforge"] as const)("fences a pending read during %s, preserves history on reset failure, discards on success", async (mode) => {
+    const { pane, reads, body, client } = setup();
+    const reset = deferred<never>();
+    vi.spyOn(client, "clearSession").mockReturnValueOnce(reset.promise).mockResolvedValue({} as never);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "pre-reset late result" }])));
+    expect(screen.queryByText("pre-reset late result")).toBeNull();
+    await act(async () => reset.reject(new Error("reset failed")));
+    expect(screen.getByText("Owned history")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("reset failed");
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId(`clear-modal-${mode}-btn`));
+    await waitFor(() => expect(client.clearSession).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(reads).toHaveLength(3));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    await act(async () => reads[reads.length - 1].resolve(body([])));
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it.each(["newer success", "newer failure", "newer still loading"])("rejects overlapping old results after %s, including metadata and finally", async (outcome) => {
+    const { pane, reads, body, client } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: true } as never);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "queued exactly once" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    await waitFor(() => expect(reads).toHaveLength(3));
+    if (outcome === "newer success") await act(async () => reads[2].resolve(body([{ ...history[0], content: "New observation" }])));
+    if (outcome === "newer failure") await act(async () => reads[2].reject(unavailable()));
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "Old observation" }], { is_busy: true, queue: [{ id: "old", prompt: "Old queue", session_id: "session-a", by: "owner", created_at: "" }] })));
+    expect(screen.queryByText("Old observation")).toBeNull();
+    expect(screen.queryByText("Old queue")).toBeNull();
+    if (outcome === "newer success") expect(screen.getByText("New observation")).toBeInTheDocument();
+    if (outcome === "newer failure") expect(screen.getByText(staleNotice)).toBeInTheDocument();
+    expect(screen.getByTestId("chat-refresh-btn").hasAttribute("disabled")).toBe(outcome === "newer still loading");
+    expect(client.sendSessionPrompt).toHaveBeenCalledTimes(1);
+  });
+  it.each(["success", "failure"])("fences pending reads on teardown %s and allows recovery after refusal", async (outcome) => {
+    const { pane, reads, body, client } = setup();
+    const reset = deferred<never>();
+    vi.spyOn(client, "decommissionSession").mockReturnValue(reset.promise);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    await act(async () => reads[1].resolve(body([{ ...history[0], content: "Pre-teardown result" }])));
+    expect(screen.queryByText("Pre-teardown result")).toBeNull();
+    await act(async () => outcome === "success" ? reset.resolve({} as never) : reset.reject(new Error("teardown refused")));
+    expect(Boolean(screen.queryByText("Owned history"))).toBe(outcome === "failure");
+    if (outcome === "failure") expect(screen.getByRole("alert")).toHaveTextContent("teardown refused");
+    fireEvent.click(screen.getByTestId("chat-refresh-btn"));
+    await act(async () => reads[2].resolve(body([])));
+    expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
+  });
+  it("does not resurrect successful reset history when the post-reset read is unavailable", async () => {
+    const { pane, reads, body, client } = setup();
+    vi.spyOn(client, "clearSession").mockResolvedValue({} as never);
+    render(pane());
+    await act(async () => reads[0].resolve(body()));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
+    await waitFor(() => expect(reads).toHaveLength(2));
+    await act(async () => reads[1].reject(unavailable()));
+    expect(screen.queryByText("Owned history")).toBeNull();
+    expect(screen.queryByText(staleNotice)).toBeNull();
+    expect(screen.getByText("History unavailable")).toBeInTheDocument();
+  });
+  it.each([false, true])("shows independently observed send queue/busy before transcript success (controlled=%s)", async (controlled) => {
+    const { client, reads } = setup();
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({ session_id: "session-a", queued: true, is_busy: true,
+      queue: [{ id: "independent", session_id: "session-a", prompt: "Independently observed queue", by: "owner", created_at: "" }],
+    } as never);
+    render(<ChatPane agentName="freya" sessionId="session-a" apiClient={client} adapter="claude" {...(controlled ? { turns: [] } : {})} />);
+    if (!controlled) await act(async () => reads[0].reject(unavailable()));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "queued submission" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+    expect(await screen.findByText("Independently observed queue")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy · Working");
+    if (!controlled) {
+      await act(async () => reads[1].reject(unavailable()));
+      expect(screen.getByText("Independently observed queue")).toBeInTheDocument();
+      expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy · Working");
+    }
+  });
+  it("delegates controlled reset once without issuing the direct reset", async () => {
+    const { client } = setup();
+    const reset = vi.fn(async () => undefined);
+    const direct = vi.spyOn(client, "clearSession");
+    render(<ChatPane agentName="freya" sessionId="session-a" turns={history} apiClient={client} onResetSession={reset} transcriptRefreshState="stale" agentSettingsOpen />);
+    expect(screen.getByText(staleNotice)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
+    await waitFor(() => expect(reset).toHaveBeenCalledWith("session-a", "clear"));
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(direct).not.toHaveBeenCalled();
   });
 });

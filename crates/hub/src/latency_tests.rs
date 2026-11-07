@@ -396,6 +396,130 @@ fn a_home_override_always_scans_fresh_and_never_shares_a_scan() {
 
 // ---- item 2: the transcript and prompt endpoints ----
 
+#[test]
+fn transcript_get_unstable_observation_is_unavailable_then_recovers() {
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let path = "/api/v1/sessions/conv-ferris-1/transcript";
+    let stable = get(&state, path).0;
+    assert_eq!(stable.status, 200);
+    assert_eq!(stable.json_value().unwrap()["total_turns"], 3);
+
+    let home = tmp.path().to_path_buf();
+    crate::discovery::after_next_transcript_read(move || write_ferris_transcript(&home, 4));
+    let unavailable = get(&state, path).0;
+    assert_eq!(unavailable.status, 503);
+    assert_eq!(
+        unavailable.json_value().unwrap(),
+        json!({"code":"transcript_unavailable", "reason":"unstable_or_unreadable"})
+    );
+    assert!(!String::from_utf8_lossy(&unavailable.body).contains(tmp.path().to_str().unwrap()));
+    let recovered = get(&state, path).0;
+    assert_eq!(recovered.status, 200);
+    assert_eq!(recovered.json_value().unwrap()["total_turns"], 4);
+
+    // Alias reads still evaluate the canonical busy observation before returning 503.
+    // The first read changes; the canonical lookup then observes the completed reply.
+    state.mark_session_in_flight_from_turns("conv-ferris-1", &[]);
+    let home = tmp.path().to_path_buf();
+    crate::discovery::after_next_transcript_read(move || write_ferris_transcript(&home, 5));
+    assert_eq!(
+        get(&state, "/api/v1/sessions/ferris/transcript").0.status,
+        503
+    );
+    assert!(
+        !state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .in_flight
+            .contains_key("conv-ferris-1"),
+        "the canonical observation must release completed in-flight state even on 503"
+    );
+
+    // The existing ready-queue drain also runs before an unrelated no-source refusal.
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "queued".into(),
+        "queued".into(),
+        "owner".into(),
+        vec![],
+    );
+    assert_eq!(
+        get(&state, "/api/v1/sessions/ghost/transcript").0.status,
+        503
+    );
+    assert!(state.session_queue("conv-ferris-1").is_empty());
+}
+
+#[test]
+fn transcript_get_distinguishes_observed_empty_absent_and_fallback() {
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let transcript = tmp.path().join(
+        ".gemini/antigravity-cli/brain/conv-ferris-1/.system_generated/logs/transcript.jsonl",
+    );
+    fs::write(transcript, "").unwrap();
+    let empty = get(&state, "/api/v1/sessions/conv-ferris-1/transcript").0;
+    assert_eq!(empty.status, 200);
+    assert_eq!(empty.json_value().unwrap()["turns"], json!([]));
+
+    let absent = get(&state, "/api/v1/sessions/no-such-session/transcript").0;
+    assert_eq!(absent.status, 503);
+    assert_eq!(
+        absent.json_value().unwrap(),
+        json!({"code":"transcript_unavailable", "reason":"source_not_available"})
+    );
+
+    let sessions = get(&state, "/api/v1/sessions").0.json_value().unwrap();
+    let attempt = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["source"] == "attempt")
+        .unwrap();
+    let id = attempt["id"].as_str().unwrap();
+    let fallback = get(&state, &format!("/api/v1/sessions/{id}/transcript")).0;
+    assert_eq!(fallback.status, 200);
+    assert_eq!(
+        fallback.json_value().unwrap()["turns"][0]["content"],
+        "done"
+    );
+}
+
+#[test]
+fn transcript_get_only_reports_proved_resolved_identity() {
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    for id in ["ferris", "conv-ferris-1"] {
+        let response = get(&state, &format!("/api/v1/sessions/{id}/transcript")).0;
+        assert_eq!(response.status, 200);
+        let body = response.json_value().unwrap();
+        assert_eq!(body["session_id"], id);
+        assert_eq!(body["resolved_session_id"], "conv-ferris-1");
+    }
+    let unmatched = get(&state, "/api/v1/sessions/ghost/transcript").0;
+    assert!(
+        unmatched
+            .json_value()
+            .unwrap()
+            .get("resolved_session_id")
+            .is_none()
+    );
+    // Record-based attempt fallback is observed history, but does not prove a session match.
+    let record = seq_iri(9).to_string();
+    let fallback = get(&state, &format!("/api/v1/sessions/{record}/transcript")).0;
+    assert_eq!(fallback.status, 200);
+    let body = fallback.json_value().unwrap();
+    assert_eq!(body["session_id"], record);
+    assert_eq!(body["turns"][0]["content"], "done");
+    assert!(body.get("resolved_session_id").is_none());
+}
+
 /// The transcript response as the handler built it before the shared lookup: each step ran its
 /// own route lookup and read (and parsed) its file again.
 fn transcript_response_reference(
@@ -410,11 +534,13 @@ fn transcript_response_reference(
     let snap = state.cached_discovery_snapshot().unwrap_or_default();
     let home = state.config.home_override.as_deref();
     let trimmed = session_id.trim();
-    let (canonical_id, _) = discover_route_sessions_without_model_info(&snap, home)
+    let resolved = discover_route_sessions_without_model_info(&snap, home)
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
-        .map(|m| (m.id.clone(), m.persona.clone()))
-        .unwrap_or_else(|| (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())));
+        .map(|m| (m.id.clone(), m.persona.clone()));
+    let resolved_session_id = resolved.as_ref().map(|(id, _)| id.clone());
+    let (canonical_id, _) =
+        resolved.unwrap_or_else(|| (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())));
     let all_turns = read_session_transcript_from_snapshot(session_id, &snap, home);
     let total_turns = all_turns.len();
     let turns = match limit {
@@ -436,6 +562,7 @@ fn transcript_response_reference(
         200,
         json!({
             "session_id": session_id,
+            "resolved_session_id": resolved_session_id,
             "turns": turns,
             "total_turns": total_turns,
             "is_busy": is_busy,
@@ -513,8 +640,6 @@ fn the_transcript_endpoint_scans_once_parses_once_and_answers_byte_for_byte_the_
         ("ferris", "?limit=2", Some(2)),
         ("ferris", "?limit=all", None),
         ("conv-ferris-1", "?limit=250", Some(250)),
-        // No session at all: the attempt fallback and the empty answer.
-        ("ghost", "", Some(250)),
     ] {
         let (resp, costs) = get(&state, &format!("/api/v1/sessions/{id}/transcript{query}"));
         assert_eq!(resp.status, 200);
@@ -525,20 +650,15 @@ fn the_transcript_endpoint_scans_once_parses_once_and_answers_byte_for_byte_the_
             "{id}{query}"
         );
         assert_eq!(costs.route_scans, 1, "{id}{query}: one route lookup");
-        let found = id != "ghost";
-        assert_eq!(
-            costs.transcript_parses,
-            u64::from(found),
-            "{id}{query}: parsed once"
-        );
-        assert_eq!(
-            costs.transcript_reads,
-            u64::from(found),
-            "{id}{query}: read once"
-        );
+        assert_eq!(costs.transcript_parses, 1, "{id}{query}: parsed once");
+        assert_eq!(costs.transcript_reads, 1, "{id}{query}: read once");
     }
     let ferris = get(&state, "/api/v1/sessions/ferris/transcript").0;
     assert_eq!(ferris.json_value().unwrap()["total_turns"], 6);
+    let (missing, costs) = get(&state, "/api/v1/sessions/ghost/transcript");
+    assert_eq!(missing.status, 503);
+    assert_eq!(costs.route_scans, 1);
+    assert_eq!((costs.transcript_reads, costs.transcript_parses), (0, 0));
 }
 
 fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
