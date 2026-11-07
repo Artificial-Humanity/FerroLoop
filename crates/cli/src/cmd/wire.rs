@@ -1148,12 +1148,13 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     println!("{}", serde_json::to_string_pretty(&st).unwrap());
                 } else {
                     println!(
-                        "daemon=active\tnode={}\thost={}\tsocket={}\tpeers={}\troutes={}",
+                        "daemon=active\tnode={}\thost={}\tsocket={}\tpeers={}\troutes={}\t{}",
                         st.node_id,
                         st.host,
                         st.socket_path.display(),
                         st.connected_peers.len(),
-                        st.routes.len()
+                        st.routes.len(),
+                        dispatch_diagnostics_summary(st.dispatch_diagnostics.as_ref())
                     );
                 }
                 return Ok(0);
@@ -1165,6 +1166,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "daemon": "inactive",
+                        "dispatch_diagnostics": null,
                         "socket_path": sock,
                         "routes": routes.entries.values().collect::<Vec<_>>(),
                     }))
@@ -1172,7 +1174,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 );
             } else {
                 println!(
-                    "daemon=inactive\tsocket={}\troutes={}",
+                    "daemon=inactive\tsocket={}\troutes={}\tdispatch_diagnostics=unavailable",
                     sock.display(),
                     routes.entries.len()
                 );
@@ -1752,6 +1754,36 @@ pub fn inbox_item_to_json(item: &WireInboxItem) -> Value {
         "body": item.message.body,
         "status": item.receipt.status,
     })
+}
+
+fn dispatch_diagnostics_summary(
+    diagnostics: Option<&fl_wire::dispatch_diagnostics::DispatchDiagnostics>,
+) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return "dispatch_diagnostics=unavailable".into();
+    };
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for row in &diagnostics.records {
+        // Derive labels from the wire enum rather than duplicate its vocabulary.
+        let label = serde_json::to_value(row.decisive_reason).unwrap();
+        *reasons
+            .entry(label.as_str().unwrap().to_owned())
+            .or_default() += 1;
+    }
+    let reasons = reasons
+        .into_iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "dispatch_diagnostics=available\tholds={}\tglobal_capacity_exhausted={}\tomitted_evidence={}\tdiagnostics_partial={}\tomitted_evidence_saturated={}\tdecisive_reasons={}",
+        diagnostics.records.len(),
+        diagnostics.global_capacity_exhausted,
+        diagnostics.omitted_evidence_total,
+        diagnostics.diagnostics_partial,
+        diagnostics.omitted_evidence_total_saturated,
+        reasons,
+    )
 }
 
 #[cfg(test)]

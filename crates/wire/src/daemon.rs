@@ -34,10 +34,9 @@ use fl_core::ids::MessageId;
 use fl_core::store::{AgentRegistry, MessageStore};
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use crate::dispatch_diagnostics::DispatchDiagnostics;
 use crate::dispatch_diagnostics::{
-    DiagnosticsState, DispatchReport, FailureStage, FenceDiagnostic, FenceReason, SuppressionPhase,
+    DiagnosticsState, DispatchDiagnostics, DispatchReport, FailureStage, FenceDiagnostic,
+    FenceReason, SuppressionPhase,
 };
 use crate::dispatcher::dispatch_message_for_recipient_with_report;
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
@@ -266,6 +265,8 @@ pub struct DaemonStatus {
     pub listen_addr: Option<String>,
     pub connected_peers: Vec<String>,
     pub routes: Vec<RouteEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_diagnostics: Option<DispatchDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1036,7 +1037,6 @@ where
         diagnostics.retain(row)
     }
 
-    #[cfg(test)]
     fn diagnostics_snapshot(&self) -> DispatchDiagnostics {
         lock(&self.dispatch_diagnostics).snapshot.clone()
     }
@@ -1308,6 +1308,7 @@ where
                         listen_addr: self.config.listen_addr.clone(),
                         connected_peers,
                         routes,
+                        dispatch_diagnostics: Some(self.diagnostics_snapshot()),
                     }),
                     None,
                 )
@@ -2771,6 +2772,115 @@ mod tests {
     }
 
     #[test]
+    fn status_diagnostics_capability_and_serde_compatibility() {
+        // A permissive older client knows only the pre-existing fields.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct OldStatus {
+            node_id: String,
+            host: String,
+            socket_path: PathBuf,
+            listen_addr: Option<String>,
+            connected_peers: Vec<String>,
+            routes: Vec<RouteEntry>,
+        }
+        let (_tmp, inner) = fault_rig();
+        let (response, subscription) = inner.handle_local_request(LocalRequest::Status);
+        assert!(subscription.is_none());
+        let LocalResponse::Status(status) = response else {
+            panic!("expected Status")
+        };
+        let new_json = serde_json::to_value(&status).unwrap();
+        assert!(
+            new_json["dispatch_diagnostics"].is_object(),
+            "supported-empty must be available"
+        );
+        assert_eq!(
+            new_json["dispatch_diagnostics"]["records"],
+            serde_json::json!([])
+        );
+        let old_client: OldStatus = serde_json::from_value(new_json.clone()).unwrap();
+        let mut old_json = new_json;
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("dispatch_diagnostics");
+        let new_client: DaemonStatus = serde_json::from_value(old_json.clone()).unwrap();
+        assert!(new_client.dispatch_diagnostics.is_none());
+        assert_eq!(serde_json::to_value(new_client).unwrap(), old_json);
+        assert_eq!(
+            serde_json::from_value::<OldStatus>(old_json).unwrap(),
+            old_client
+        );
+    }
+
+    #[test]
+    fn repeated_status_clones_evidence_without_io_or_state_changes() {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            run_fault_job(&inner, "held");
+            let before = inner.diagnostics_snapshot();
+            let calls = lock(&inner.store.calls).clone();
+            let discoveries = crate::identity::DISCOVERIES.with(|n| n.get());
+            lock(&inner.dispatch_queues).insert(
+                "parked".into(),
+                RecipientDispatchQueue {
+                    pending: VecDeque::from([(
+                        MessageId(fl_core::ids::seq_iri(999)),
+                        At::from_unix_millis(1),
+                    )]),
+                    waiting_for_route: true,
+                    ..Default::default()
+                },
+            );
+            let queue_state = || {
+                lock(&inner.dispatch_queues)
+                    .iter()
+                    .map(|(name, q)| {
+                        (
+                            name.clone(),
+                            q.pending.clone(),
+                            q.in_flight.clone(),
+                            q.overflowed,
+                            q.waiting_for_route,
+                            q.waiting_for_capacity,
+                            q.worker_active,
+                            q.route_generation,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let queues = queue_state();
+            let blocked = lock(&inner.overflow_recipients).clone();
+            // Further I/O would fail, and must not consume the fault scripts.
+            lock(&inner.store.gets).push_back(Fault::Panic);
+            lock(&inner.store.reads).push_back(Fault::Panic);
+            for _ in 0..5 {
+                let (response, _) = inner.handle_local_request(LocalRequest::Status);
+                // Serialize while explicitly owning the diagnostics lock: Status returned
+                // an owned clone, so serialization needs no daemon guard.
+                let _guard = lock(&inner.dispatch_diagnostics);
+                let value = serde_json::to_value(response).unwrap();
+                let snapshot = &value["dispatch_diagnostics"];
+                assert_eq!(*snapshot, serde_json::to_value(&before).unwrap());
+                assert!(snapshot["records"][0]["registration_generation"].is_null());
+                assert_eq!(
+                    snapshot["records"][0]["route_observations"][0]["outcome"],
+                    "returned_ok"
+                );
+            }
+            assert_eq!(*lock(&inner.store.calls), calls);
+            assert_eq!(lock(&inner.store.gets).len(), 1);
+            assert_eq!(lock(&inner.store.reads).len(), 1);
+            assert_eq!(crate::identity::DISCOVERIES.with(|n| n.get()), discoveries);
+            assert_eq!(TRANSPORT_CALLS.with(|n| n.get()), 1);
+            assert_eq!(queue_state(), queues);
+            assert_eq!(*lock(&inner.overflow_recipients), blocked);
+            assert_eq!(inner.diagnostics_snapshot(), before);
+        });
+    }
+
+    #[test]
     fn diagnostics_entropy_failure_does_not_block_startup_or_delivery() {
         ENTROPY_ATTEMPTS.with(|n| n.set(0));
         ENTROPY_FAILURE.with(|failure| failure.set(true));
@@ -2786,8 +2896,18 @@ mod tests {
         });
         let store_calls = lock(&inner.store.calls).clone();
         for _ in 0..3 {
-            inner.handle_local_request(LocalRequest::Status);
-            assert!(inner.diagnostics_snapshot().instance_nonce.is_none());
+            let (LocalResponse::Status(status), _) =
+                inner.handle_local_request(LocalRequest::Status)
+            else {
+                panic!("expected Status");
+            };
+            assert!(
+                status
+                    .dispatch_diagnostics
+                    .unwrap()
+                    .instance_nonce
+                    .is_none()
+            );
         }
         assert_eq!(*lock(&inner.store.calls), store_calls);
         ENTROPY_ATTEMPTS.with(|n| assert_eq!(n.get(), 1));
