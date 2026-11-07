@@ -14,6 +14,7 @@ use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
 use fl_core::telemetry::AdapterKind;
 
+use crate::dispatch_diagnostics::{DispatchCallOutcome, DispatchReport, FailureStage};
 use crate::identity::{
     RouteTable, VendorRoute, normalize_persona, resolve_agy_exe, resolve_claude_key_path,
 };
@@ -2322,7 +2323,17 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     msg: &WireMessage,
     now: At,
 ) -> Vec<DeliveryReceipt> {
-    dispatch_message_selected(store, routes, home_override, msg, now, None).0
+    dispatch_message_selected(
+        store,
+        routes,
+        home_override,
+        msg,
+        now,
+        None,
+        &mut DispatchReport::default(),
+        dispatch_to_route,
+    )
+    .0
 }
 
 /// Dispatch only one recipient; the daemon schedules each recipient independently.
@@ -2334,9 +2345,42 @@ pub(crate) fn dispatch_message_for_recipient<S: MessageStore>(
     now: At,
     recipient: &str,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
-    dispatch_message_selected(store, routes, home_override, msg, now, Some(recipient))
+    dispatch_message_for_recipient_with_report(
+        store,
+        routes,
+        home_override,
+        msg,
+        now,
+        recipient,
+        &mut DispatchReport::default(),
+    )
 }
 
+/// Observe the same recipient pass without changing dispatch or receipt decisions.
+pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: &str,
+    report: &mut DispatchReport,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    dispatch_message_selected(
+        store,
+        routes,
+        home_override,
+        msg,
+        now,
+        Some(recipient),
+        report,
+        dispatch_to_route,
+    )
+}
+
+// The private callback keeps fault tests on this same pass without invoking vendor I/O.
+// Production callers always supply dispatch_to_route.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_message_selected<S: MessageStore>(
     store: &S,
     routes: &mut RouteTable,
@@ -2344,8 +2388,11 @@ fn dispatch_message_selected<S: MessageStore>(
     msg: &WireMessage,
     now: At,
     recipient: Option<&str>,
+    report: &mut DispatchReport,
+    mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<(), String>,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
     let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
+        report.record_failure(FailureStage::InitialReceiptReadError);
         return (Vec::new(), None);
     };
     if let Some(recipient) = recipient {
@@ -2381,28 +2428,52 @@ fn dispatch_message_selected<S: MessageStore>(
             continue;
         };
         attempted = true;
-        let mut pushed = dispatch_to_route(&entry.route, msg);
+        let slot = report.record_call_started(&entry);
+        let mut pushed = dispatch(&entry.route, msg);
+        report.record_call_finished(
+            slot,
+            if pushed.is_ok() {
+                DispatchCallOutcome::ReturnedOk
+            } else {
+                DispatchCallOutcome::ReturnedError
+            },
+        );
         if pushed.is_err() {
+            report.record_failure(FailureStage::TransportError);
             // The session may have restarted since this route was learned (a new pid, socket or
             // pane). Rescan for this persona, and push once more only when its route changed.
             if routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
                 && let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
             {
-                pushed = dispatch_to_route(&fresh.route, msg);
+                let slot = report.record_call_started(&fresh);
+                pushed = dispatch(&fresh.route, msg);
+                report.record_call_finished(
+                    slot,
+                    if pushed.is_ok() {
+                        DispatchCallOutcome::ReturnedOk
+                    } else {
+                        DispatchCallOutcome::ReturnedError
+                    },
+                );
+                if pushed.is_err() {
+                    report.record_failure(FailureStage::TransportError);
+                }
             }
         }
         let target_status = match pushed {
             Ok(()) => DeliveryStatus::Acked,
             Err(_) => DeliveryStatus::Pending,
         };
-        if let Ok(Some(new_rcpt)) = store.update_wire_receipt(
+        match store.update_wire_receipt(
             &msg.id,
             &rcpt.recipient_name,
             target_status,
             true,
             now.clone(),
         ) {
-            updated.push(new_rcpt);
+            Ok(Some(new_rcpt)) => updated.push(new_rcpt),
+            Ok(None) => report.record_failure(FailureStage::ReceiptWriteMissing),
+            Err(_) => report.record_failure(FailureStage::ReceiptWriteError),
         }
     }
     (updated, Some(attempted))
@@ -2429,6 +2500,529 @@ mod tests {
     /// for the whole test so a mock binary cannot hide a live revert, and a live
     /// revert cannot run against the host language server.
     static AGY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    use crate::dispatch_diagnostics::{
+        DispatchCallOutcome, DispatchReport, FailureStage, FenceDiagnostic, FenceReason,
+        SuppressionPhase,
+    };
+    use fl_core::ferrowire::{ThreadId, WireFilter, WireImportReport, WireInboxItem};
+    use fl_core::ids::MessageId;
+    use fl_core::store::StoreError;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    const DIAGNOSTIC_ERROR_SENTINEL: &str = "SECRET_ERROR_TOKEN /private/socket stderr=secret";
+
+    #[derive(Default)]
+    enum ReceiptWrite {
+        #[default]
+        Forward,
+        Error,
+        Missing,
+    }
+
+    #[derive(Default)]
+    struct DiagnosticStore {
+        inner: MemStore,
+        receipt_read_errors: RefCell<VecDeque<bool>>,
+        receipt_writes: RefCell<VecDeque<ReceiptWrite>>,
+        calls: RefCell<Vec<&'static str>>,
+        writes: RefCell<Vec<(String, DeliveryStatus, bool, At)>>,
+    }
+
+    // Forward every operation to a real store except explicitly scripted receipt faults.
+    impl MessageStore for DiagnosticStore {
+        fn send_wire(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            self.calls.borrow_mut().push("send");
+            self.inner.send_wire(args)
+        }
+        fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
+            self.calls.borrow_mut().push("get");
+            self.inner.get_wire_message(id)
+        }
+        fn list_wire_inbox(&self, filter: &WireFilter) -> Result<Vec<WireInboxItem>, StoreError> {
+            self.calls.borrow_mut().push("inbox");
+            self.inner.list_wire_inbox(filter)
+        }
+        fn list_wire_thread(&self, id: &ThreadId) -> Result<Vec<WireMessage>, StoreError> {
+            self.calls.borrow_mut().push("thread");
+            self.inner.list_wire_thread(id)
+        }
+        fn list_wire_replies(&self, id: &MessageId) -> Result<Vec<WireMessage>, StoreError> {
+            self.calls.borrow_mut().push("replies");
+            self.inner.list_wire_replies(id)
+        }
+        fn list_wire_receipts(&self, id: &MessageId) -> Result<Vec<DeliveryReceipt>, StoreError> {
+            self.calls.borrow_mut().push("receipts");
+            if self
+                .receipt_read_errors
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(false)
+            {
+                Err(StoreError::Backend(DIAGNOSTIC_ERROR_SENTINEL.into()))
+            } else {
+                self.inner.list_wire_receipts(id)
+            }
+        }
+        fn update_wire_receipt(
+            &self,
+            id: &MessageId,
+            recipient: &str,
+            status: DeliveryStatus,
+            increment_attempts: bool,
+            at: At,
+        ) -> Result<Option<DeliveryReceipt>, StoreError> {
+            self.calls.borrow_mut().push("update");
+            self.writes.borrow_mut().push((
+                recipient.into(),
+                status,
+                increment_attempts,
+                at.clone(),
+            ));
+            match self
+                .receipt_writes
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default()
+            {
+                ReceiptWrite::Forward => {
+                    self.inner
+                        .update_wire_receipt(id, recipient, status, increment_attempts, at)
+                }
+                ReceiptWrite::Error => Err(StoreError::Backend(DIAGNOSTIC_ERROR_SENTINEL.into())),
+                ReceiptWrite::Missing => Ok(None),
+            }
+        }
+        fn wire_messages_after(&self, seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError> {
+            self.calls.borrow_mut().push("messages_after");
+            self.inner.wire_messages_after(seq)
+        }
+        fn wire_receipts_after(&self, seq: u64) -> Result<Vec<(u64, DeliveryReceipt)>, StoreError> {
+            self.calls.borrow_mut().push("receipts_after");
+            self.inner.wire_receipts_after(seq)
+        }
+        fn import_wire_batch(
+            &self,
+            messages: &[WireMessage],
+            receipts: &[DeliveryReceipt],
+        ) -> Result<WireImportReport, StoreError> {
+            self.calls.borrow_mut().push("import");
+            self.inner.import_wire_batch(messages, receipts)
+        }
+        fn prune_wire(&self, before: At) -> Result<usize, StoreError> {
+            self.calls.borrow_mut().push("prune");
+            self.inner.prune_wire(before)
+        }
+    }
+
+    fn diagnostic_fixture() -> (DiagnosticStore, WireMessage, RouteTable) {
+        let store = DiagnosticStore::default();
+        let msg = mail_to(&store.inner, "diagnostic-recipient");
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "diagnostic-recipient",
+            VendorRoute::Codex {
+                thread_id: "SECRET_SESSION_ID".into(),
+                cwd: Some(PathBuf::from("/SECRET_CWD")),
+            },
+            At::from_unix_millis(5),
+        );
+        routes.set_last_discovery(Some(Instant::now()));
+        (store, msg, routes)
+    }
+
+    fn assert_safe_report(report: &DispatchReport) {
+        let row = FenceDiagnostic::from_report(
+            "diagnostic-recipient",
+            None,
+            At::from_unix_millis(20),
+            SuppressionPhase::RetainedFence,
+            FenceReason::UnresolvedReceiptStatus,
+            report,
+        );
+        let json = serde_json::to_string(&row).unwrap();
+        let debug = format!("{report:?}");
+        for secret in [DIAGNOSTIC_ERROR_SENTINEL, "SECRET_SESSION_ID", "SECRET_CWD"] {
+            assert!(!json.contains(secret), "{json}");
+            assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    // Removing receipt-read observation, adding any retry/read/write, or changing None breaks this.
+    #[test]
+    fn diagnostics_receipt_read_failure_has_zero_dispatch_calls() {
+        let (store, msg, mut routes) = diagnostic_fixture();
+        store.receipt_read_errors.borrow_mut().push_back(true);
+        let mut report = DispatchReport::default();
+        let result = dispatch_message_for_recipient_with_report(
+            &store,
+            &mut routes,
+            None,
+            &msg,
+            At::from_unix_millis(20),
+            "diagnostic-recipient",
+            &mut report,
+        );
+        assert_eq!(result, (vec![], None));
+        assert_eq!(*store.calls.borrow(), ["receipts"]);
+        assert!(store.writes.borrow().is_empty());
+        assert_eq!(report.route_dispatch_calls, 0);
+        assert!(report.route_observations.is_empty());
+        assert_eq!(
+            report.failure_stages,
+            [FailureStage::InitialReceiptReadError]
+        );
+        assert_eq!(
+            store.inner.list_wire_receipts(&msg.id).unwrap()[0].attempts,
+            0
+        );
+        assert_safe_report(&report);
+    }
+
+    // The shared selected pass must retain transport success even when the receipt write fails.
+    #[test]
+    fn diagnostics_receipt_write_failure_preserves_transport_success() {
+        let (store, msg, mut routes) = diagnostic_fixture();
+        store
+            .receipt_writes
+            .borrow_mut()
+            .push_back(ReceiptWrite::Error);
+        let mut report = DispatchReport::default();
+        let mut transports = 0;
+        let result = dispatch_message_selected(
+            &store,
+            &mut routes,
+            None,
+            &msg,
+            At::from_unix_millis(20),
+            Some("DIAGNOSTIC-RECIPIENT"),
+            &mut report,
+            |_, _| {
+                transports += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result, (vec![], Some(true)));
+        assert_eq!(transports, 1);
+        assert_eq!(*store.calls.borrow(), ["receipts", "update"]);
+        assert_eq!(
+            *store.writes.borrow(),
+            [(
+                "diagnostic-recipient".into(),
+                DeliveryStatus::Acked,
+                true,
+                At::from_unix_millis(20)
+            )]
+        );
+        let unchanged = &store.inner.list_wire_receipts(&msg.id).unwrap()[0];
+        assert_eq!(
+            (unchanged.status, unchanged.attempts),
+            (DeliveryStatus::Pending, 0)
+        );
+        assert_eq!(report.route_dispatch_calls, 1);
+        assert_eq!(
+            report.route_observations[0].outcome,
+            DispatchCallOutcome::ReturnedOk
+        );
+        assert_eq!(report.failure_stages, [FailureStage::ReceiptWriteError]);
+        assert_safe_report(&report);
+    }
+
+    #[test]
+    fn diagnostics_missing_receipt_write_is_distinct() {
+        let (store, msg, mut routes) = diagnostic_fixture();
+        store
+            .receipt_writes
+            .borrow_mut()
+            .push_back(ReceiptWrite::Missing);
+        let mut report = DispatchReport::default();
+        let mut transports = 0;
+        let result = dispatch_message_selected(
+            &store,
+            &mut routes,
+            None,
+            &msg,
+            At::from_unix_millis(20),
+            Some("diagnostic-recipient"),
+            &mut report,
+            |_, _| {
+                transports += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result, (vec![], Some(true)));
+        assert_eq!(transports, 1);
+        assert_eq!(*store.calls.borrow(), ["receipts", "update"]);
+        assert_eq!(
+            *store.writes.borrow(),
+            [(
+                "diagnostic-recipient".into(),
+                DeliveryStatus::Acked,
+                true,
+                At::from_unix_millis(20)
+            )]
+        );
+        let unchanged = &store.inner.list_wire_receipts(&msg.id).unwrap()[0];
+        assert_eq!(
+            (unchanged.status, unchanged.attempts),
+            (DeliveryStatus::Pending, 0)
+        );
+        assert_eq!(report.route_dispatch_calls, 1);
+        assert_eq!(
+            report.route_observations[0].outcome,
+            DispatchCallOutcome::ReturnedOk
+        );
+        assert_eq!(report.failure_stages, [FailureStage::ReceiptWriteMissing]);
+        assert_safe_report(&report);
+    }
+
+    // A same-name receipt is still dispatched after an earlier receipt updated that name.
+    #[test]
+    fn diagnostics_multiple_matching_receipts_count_all_calls() {
+        let (store, msg, mut routes) = diagnostic_fixture();
+        let base = store.inner.list_wire_receipts(&msg.id).unwrap()[0].clone();
+        let mut imports = Vec::new();
+        for (id, name, status, attempts) in [
+            (
+                "urn:x:duplicate-1",
+                "DIAGNOSTIC-RECIPIENT",
+                DeliveryStatus::Pending,
+                0,
+            ),
+            (
+                "urn:x:duplicate-2",
+                "diagnostic-recipient",
+                DeliveryStatus::Delivered,
+                1,
+            ),
+            (
+                "urn:x:acked",
+                "diagnostic-recipient",
+                DeliveryStatus::Acked,
+                0,
+            ),
+            (
+                "urn:x:expired",
+                "diagnostic-recipient",
+                DeliveryStatus::Expired,
+                0,
+            ),
+            (
+                "urn:x:max",
+                "diagnostic-recipient",
+                DeliveryStatus::Pending,
+                MAX_DELIVER,
+            ),
+            ("urn:x:other", "other-recipient", DeliveryStatus::Pending, 0),
+        ] {
+            imports.push(DeliveryReceipt {
+                recipient_id: fl_core::iri::Iri::parse(id).unwrap(),
+                recipient_name: name.into(),
+                status,
+                attempts,
+                acked_at: (status == DeliveryStatus::Acked).then(|| At::from_unix_millis(10)),
+                ..base.clone()
+            });
+        }
+        store.inner.import_wire_batch(&[], &imports).unwrap();
+        let mut report = DispatchReport::default();
+        let mut transports = 0;
+        let result = dispatch_message_selected(
+            &store,
+            &mut routes,
+            None,
+            &msg,
+            At::from_unix_millis(20),
+            Some("diagnostic-recipient"),
+            &mut report,
+            |_, _| {
+                transports += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result.1, Some(true));
+        assert_eq!(transports, 3);
+        assert_eq!(
+            *store.calls.borrow(),
+            ["receipts", "update", "update", "update"]
+        );
+        assert_eq!(store.writes.borrow().len(), 3);
+        assert!(
+            store
+                .writes
+                .borrow()
+                .iter()
+                .all(
+                    |(_, status, increment, at)| *status == DeliveryStatus::Acked
+                        && *increment
+                        && *at == At::from_unix_millis(20)
+                )
+        );
+        assert_eq!(result.0.len(), 3);
+        assert!(result.0.iter().all(|r| r.status == DeliveryStatus::Acked));
+        // MemStore updates the first matching name each time: preserve the existing returned tuple.
+        assert_eq!(
+            result.0.iter().map(|r| r.attempts).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(report.route_dispatch_calls, 3);
+        assert_eq!(report.route_observations.len(), 2);
+        assert_eq!(report.omitted_route_observations, 1);
+        assert!(!report.omitted_route_observations_saturated);
+        assert!(
+            report
+                .route_observations
+                .iter()
+                .all(|r| r.outcome == DispatchCallOutcome::ReturnedOk)
+        );
+        assert!(report.failure_stages.is_empty());
+        assert_safe_report(&report);
+    }
+
+    #[test]
+    fn diagnostics_no_deliverable_route_preserves_some_false() {
+        let (store, msg, mut routes) = diagnostic_fixture();
+        let mut report = DispatchReport::default();
+        let result = dispatch_message_selected(
+            &store,
+            &mut routes,
+            None,
+            &msg,
+            At::from_unix_millis(20),
+            Some("other-recipient"),
+            &mut report,
+            |_, _| panic!("no matching receipt must not dispatch"),
+        );
+        assert_eq!(result, (vec![], Some(false)));
+        assert_eq!(*store.calls.borrow(), ["receipts"]);
+        assert_eq!(report, DispatchReport::default());
+    }
+
+    #[test]
+    fn diagnostics_panicking_call_is_counted_with_unknown_outcome() {
+        let (store, msg, mut routes) = diagnostic_fixture();
+        let mut report = DispatchReport::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_message_selected(
+                &store,
+                &mut routes,
+                None,
+                &msg,
+                At::from_unix_millis(20),
+                Some("diagnostic-recipient"),
+                &mut report,
+                |_, _| panic!("{DIAGNOSTIC_ERROR_SENTINEL}"),
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(*store.calls.borrow(), ["receipts"]);
+        assert!(store.writes.borrow().is_empty());
+        assert_eq!(report.route_dispatch_calls, 1);
+        assert_eq!(
+            report.route_observations[0].outcome,
+            DispatchCallOutcome::Unknown
+        );
+        assert!(report.failure_stages.is_empty());
+        assert_safe_report(&report);
+    }
+
+    #[test]
+    fn diagnostics_refresh_counts_changed_route_calls_without_extra_receipt_attempt() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (changed, succeeds) in [(true, true), (true, false), (false, false)] {
+            let tmp = TempDir::new().unwrap();
+            let sessions = tmp.path().join(".claude/sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("123.json");
+            let write_session = |id: &str| {
+                fs::write(&path, serde_json::json!({
+                    "name": "diagnostic-recipient", "nameSource": "user",
+                    "sessionId": id, "messagingSocketPath": tmp.path().join(format!("{id}.sock")),
+                }).to_string()).unwrap();
+            };
+            write_session("before");
+            let (store, msg, _) = diagnostic_fixture();
+            let mut routes = RouteTable::default();
+            let mut report = DispatchReport::default();
+            let mut calls = Vec::new();
+            let result = dispatch_message_selected(
+                &store,
+                &mut routes,
+                Some(tmp.path()),
+                &msg,
+                At::from_unix_millis(20),
+                Some("diagnostic-recipient"),
+                &mut report,
+                |route: &VendorRoute, _: &WireMessage| {
+                    calls.push(route.session_identity().unwrap().1.to_owned());
+                    if calls.len() == 1 {
+                        if changed {
+                            write_session("after");
+                        }
+                        Err(DIAGNOSTIC_ERROR_SENTINEL.into())
+                    } else if succeeds {
+                        Ok(())
+                    } else {
+                        Err(DIAGNOSTIC_ERROR_SENTINEL.into())
+                    }
+                },
+            );
+            assert_eq!(result.1, Some(true));
+            assert_eq!(*store.calls.borrow(), ["receipts", "update"]);
+            assert_eq!(store.writes.borrow().len(), 1);
+            assert_eq!(result.0.len(), 1);
+            assert_eq!(result.0[0].attempts, 1);
+            assert_eq!(
+                result.0[0].status,
+                if succeeds {
+                    DeliveryStatus::Acked
+                } else {
+                    DeliveryStatus::Pending
+                }
+            );
+            assert_eq!(
+                calls,
+                if changed {
+                    vec!["before", "after"]
+                } else {
+                    vec!["before"]
+                }
+            );
+            assert_eq!(report.route_dispatch_calls, if changed { 2 } else { 1 });
+            assert_eq!(report.route_observations.len(), calls.len());
+            assert_eq!(
+                report.route_observations[0].outcome,
+                DispatchCallOutcome::ReturnedError
+            );
+            if changed {
+                assert_eq!(
+                    report.route_observations[1].outcome,
+                    if succeeds {
+                        DispatchCallOutcome::ReturnedOk
+                    } else {
+                        DispatchCallOutcome::ReturnedError
+                    }
+                );
+                assert_ne!(
+                    report.route_observations[0].identity_digest,
+                    report.route_observations[1].identity_digest
+                );
+            }
+            assert_eq!(
+                report.failure_stages,
+                if changed && !succeeds {
+                    vec![FailureStage::TransportError, FailureStage::TransportError]
+                } else {
+                    vec![FailureStage::TransportError]
+                }
+            );
+            assert_safe_report(&report);
+        }
+    }
 
     #[test]
     fn tmux_paste_settle_delays_are_short() {
