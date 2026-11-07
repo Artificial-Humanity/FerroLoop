@@ -25,6 +25,7 @@ import {
 } from "../types/api";
 import {
   createTranscriptReadGuard,
+  isObservedTranscriptTurns,
   isTransientTranscriptReadError,
   type TranscriptReadOwner,
 } from "../lib/transcriptReadGuard";
@@ -1065,17 +1066,6 @@ interface TranscriptSnapshot {
 function sameTranscriptOwner(a: TranscriptReadOwner | null, b: TranscriptReadOwner): boolean {
   return Boolean(a && a.authEpoch === b.authEpoch && a.selectionEpoch === b.selectionEpoch &&
     a.agentKey === b.agentKey && a.sessionId === b.sessionId && a.resetEpoch === b.resetEpoch);
-}
-
-/** A malformed successful body is an unavailable observation, never an empty transcript. */
-function isObservedTranscriptTurns(value: unknown): value is TranscriptTurn[] {
-  return Array.isArray(value) && value.every((turn) => turn &&
-    typeof turn.index === "number" && typeof turn.role === "string" && typeof turn.content === "string" &&
-    (turn.thinking == null || typeof turn.thinking === "string") &&
-    (turn.created_at == null || typeof turn.created_at === "string") &&
-    (turn.tool_calls == null || (Array.isArray(turn.tool_calls) && turn.tool_calls.every(
-      (call: unknown) => call !== null && typeof call === "object" && "name" in call && typeof call.name === "string",
-    ))));
 }
 
 export interface ChatPaneProps {

@@ -1,4 +1,5 @@
 import { HubApiError } from "../api/client";
+import type { TranscriptTurn } from "../types/api";
 
 export interface TranscriptReadOwner {
   authEpoch: number;
@@ -42,4 +43,15 @@ export function isTransientTranscriptReadError(error: unknown): boolean {
   }
   // Fetch and body readers reject with ordinary Error/TypeError/DOMException.
   return error instanceof Error;
+}
+
+/** A malformed successful body is an unavailable observation, never an empty transcript. */
+export function isObservedTranscriptTurns(value: unknown): value is TranscriptTurn[] {
+  return Array.isArray(value) && value.every((turn) => turn &&
+    typeof turn.index === "number" && typeof turn.role === "string" && typeof turn.content === "string" &&
+    (turn.thinking == null || typeof turn.thinking === "string") &&
+    (turn.created_at == null || typeof turn.created_at === "string") &&
+    (turn.tool_calls == null || (Array.isArray(turn.tool_calls) && turn.tool_calls.every(
+      (call: unknown) => call !== null && typeof call === "object" && "name" in call && typeof call.name === "string",
+    ))));
 }

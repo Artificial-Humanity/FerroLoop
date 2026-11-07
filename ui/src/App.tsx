@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError } from "./api/client";
 import { HubWsClient } from "./api/ws";
-import { createTranscriptReadGuard, isTransientTranscriptReadError, type TranscriptReadOwner } from "./lib/transcriptReadGuard";
+import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane } from "./components/ChatPane";
 import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
@@ -985,12 +985,6 @@ export const App: React.FC<AppProps> = ({
   const snapshotRef = useRef(transcriptSnapshot);
   snapshotRef.current = transcriptSnapshot;
   const authIdentityRef = useRef({ apiClient, token: apiClient.getToken() });
-  if (authIdentityRef.current.apiClient !== apiClient || authIdentityRef.current.token !== apiClient.getToken()) {
-    authIdentityRef.current = { apiClient, token: apiClient.getToken() };
-    ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
-    resetPendingRef.current = false;
-    transcriptGuard.invalidate();
-  }
   const [, refreshOptimisticView] = useState(0);
   const setTranscriptTurns = useCallback((turns: TranscriptTurn[]) => {
     const owner = { ...ownerRef.current };
@@ -1034,6 +1028,7 @@ export const App: React.FC<AppProps> = ({
   const optimisticPromptRef = useRef<OptimisticPrompt[]>([]);
   const activeSessionIdRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
+  const refreshQueuedRef = useRef<{ override: string | null | undefined } | null>(null);
   const tornDownTargetsRef = useRef<Set<string>>(new Set());
   const loggedOutRef = useRef<boolean>(false);
   const pairInFlightRef = useRef<Promise<AuthSessionResponse> | null>(null);
@@ -1063,12 +1058,17 @@ export const App: React.FC<AppProps> = ({
     backgroundStampRef.current = {};
     backgroundOwnersRef.current = {};
     setTranscriptSnapshot(null);
+    setSessionMetadataOwner(null);
     setBackgroundTranscripts({});
     setBusyByAgent({}); setContextUsageByAgent({});
     setSessionQueue([]); setIsSessionBusy(false);
     setSessionContextUsage(null); setSessionQuotaUsage(null);
     setUnconfirmedBySession({});
   };
+
+  if (authIdentityRef.current.apiClient !== apiClient || authIdentityRef.current.token !== apiClient.getToken()) {
+    advanceTranscriptAuth();
+  }
 
   const recordAgentBusy = useCallback(
     (agentKey: string | undefined | null, isBusy: boolean) => {
@@ -1187,10 +1187,7 @@ export const App: React.FC<AppProps> = ({
     try {
       const result: SessionTranscriptResponse = await apiClient.getSessionTranscript(targetId);
       if (!accepts()) return;
-      if (!Array.isArray(result.turns) || !result.turns.every((turn) => turn &&
-        typeof turn.index === "number" && typeof turn.role === "string" && typeof turn.content === "string" &&
-        (turn.thinking == null || typeof turn.thinking === "string") &&
-        (turn.tool_calls == null || Array.isArray(turn.tool_calls)))) throw new Error("Transcript observation unavailable");
+      if (!isObservedTranscriptTurns(result.turns)) throw new Error("Transcript observation unavailable");
       if (result.resolved_session_id && owner.sessionId && result.resolved_session_id !== owner.sessionId) {
         throw new Error("Transcript session changed");
       }
@@ -1364,7 +1361,7 @@ export const App: React.FC<AppProps> = ({
         const bgRes = await apiClient.getSessionTranscript(session.id).catch(() => null);
         if (!mountedRef.current || loggedOutRef.current || resetPendingRef.current ||
           !sameTranscriptOwner(viewOwner, ownerRef.current) || !transcriptGuard.accepts(ticket, backgroundOwnersRef.current[persona] ?? bgOwner)) return;
-        if (bgRes && Array.isArray(bgRes.turns) && (!bgRes.resolved_session_id || bgRes.resolved_session_id === session.id)) {
+        if (bgRes && isObservedTranscriptTurns(bgRes.turns) && (!bgRes.resolved_session_id || bgRes.resolved_session_id === session.id)) {
           if (bgRes.turns) {
             backgroundStampRef.current[persona] = stamp;
             recordTranscript(persona, bgRes.turns);
@@ -1386,7 +1383,6 @@ export const App: React.FC<AppProps> = ({
   // A refresh requested while one is in flight is coalesced into a single
   // trailing run instead of being dropped (a dropped post-send or post-switch
   // refresh leaves the transcript stale until the next poll tick).
-  const refreshQueuedRef = useRef<{ override: string | null | undefined } | null>(null);
   const refreshSessionsAndTranscriptRef = useRef<
     (sessionOverride?: string | null) => Promise<void>
   >(async () => {});
@@ -1693,6 +1689,7 @@ export const App: React.FC<AppProps> = ({
           refreshOptimisticView((previous) => previous + 1);
         }
         if (matchesActive) {
+          transcriptGuard.invalidate();
           setSessionMetadataOwner({ ...ownerRef.current });
           if (Array.isArray(data.queue)) setSessionQueue(data.queue as QueuedOperatorPrompt[]);
           if (typeof data.is_busy === "boolean") setIsSessionBusy(data.is_busy);

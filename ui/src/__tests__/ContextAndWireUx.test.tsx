@@ -1725,4 +1725,115 @@ describe("App transcript observation ownership", () => {
     h.unmount();
   });
 
+  it.each(["client", "token"] as const)("releases retired refresh coordination on automatic %s change", async (change) => {
+    const h = harness(); await screen.findByText("Last good history");
+    let releaseOld!: (result: Response) => void;
+    const oldPending = new Promise<Response>((resolve) => { releaseOld = resolve; });
+    let oldStarted = false;
+    h.setRead(async () => { oldStarted = true; return oldPending; }); h.refresh();
+    await waitFor(() => expect(oldStarted).toBe(true));
+    h.setRead(async () => observed("New authority poll"));
+    const nextApi = change === "client" ? new HubApiClient({ fetchImpl: h.fetchImpl as typeof fetch }) : h.api;
+    if (change === "token") nextApi.setToken("replacement-token");
+    h.rerender(<App apiClient={nextApi} wsClient={h.ws} />);
+    h.refresh();
+    await screen.findByText("New authority poll");
+    expect(screen.queryByText("Last good history")).toBeNull();
+
+    let releaseNew!: (result: Response) => void;
+    const newPending = new Promise<Response>((resolve) => { releaseNew = resolve; });
+    let newStarted = false;
+    h.setRead(async () => { newStarted = true; return newPending; }); h.refresh();
+    await waitFor(() => expect(newStarted).toBe(true));
+    h.setRead(async () => observed("Trailing current authority")); h.refresh();
+    await act(async () => { releaseOld(observed("Retired authority secret")); await oldPending; });
+    expect(screen.queryByText("Retired authority secret")).toBeNull();
+    expect(screen.queryByText("Trailing current authority")).toBeNull();
+    expect(screen.getByText("New authority poll")).toBeInTheDocument();
+    await act(async () => { releaseNew(observed("Current pending result")); await newPending; });
+    await screen.findByText("Trailing current authority");
+    h.unmount();
+  });
+
+  it.each([
+    ["null tool call", { tool_calls: [null] }],
+    ["invalid tool name", { tool_calls: [{ name: 9 }] }],
+    ["invalid timestamp", { created_at: 42 }],
+  ])("treats foreground %s as unavailable and preserves last good history", async (_name, malformed) => {
+    const h = harness(); await screen.findByText("Last good history");
+    h.setRead(async () => response({ session_id: "session-a", turns: [{ index: 8, role: "assistant", content: "Malformed foreground", ...malformed }], queue: [], is_busy: false }));
+    h.refresh();
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Last good history")).toBeInTheDocument();
+    expect(screen.queryByText("Malformed foreground")).toBeNull();
+    h.unmount();
+  });
+
+  it("shows unavailable for initial malformed nested history without inventing empty history", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [{ index: 1, role: "assistant", content: "Malformed initial", tool_calls: [null] }] }));
+    await screen.findByText("History unavailable");
+    expect(screen.queryByTestId("chat-empty-state")).toBeNull();
+    expect(screen.queryByText("Malformed initial")).toBeNull();
+    h.unmount();
+  });
+
+  it.each([
+    ["null tool call", { tool_calls: [null] }],
+    ["invalid timestamp", { created_at: 42 }],
+  ])("rejects background %s before caching badges or metadata", async (_name, malformed) => {
+    window.localStorage.setItem(LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY, JSON.stringify({ jarvis: 0 }));
+    let backgroundRead = 0;
+    let invalid = false;
+    const h = harness(async (target) => {
+      if (!target.includes("jarvis-session")) return observed("Last good history");
+      backgroundRead++;
+      return response({ session_id: "jarvis-session", turns: invalid
+        ? [turn({ index: 1, content: "Good background" }), { index: 8, role: "assistant", content: "Malformed background", ...malformed }]
+        : [turn({ index: 1, content: "Good background" })], is_busy: invalid,
+        context_usage: { used_tokens: invalid ? 199999 : 1000, max_tokens: 200000 } });
+    });
+    const main = { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" };
+    h.setSessions([main, { ...main, id: "jarvis-session", persona: "jarvis" }]);
+    await screen.findByText("Last good history");
+    await waitFor(() => expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("1"));
+    expect(screen.getByTestId("context-ring-jarvis")).toHaveAttribute("data-percent", "1");
+    invalid = true;
+    h.setSessions([main, { ...main, id: "jarvis-session", persona: "jarvis", updated_at: "t2" }]); h.refresh();
+    await waitFor(() => expect(backgroundRead).toBeGreaterThan(1));
+    await act(async () => {});
+    expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("1");
+    expect(screen.getByTestId("context-ring-jarvis")).toHaveAttribute("data-percent", "1");
+    // Invalid observations must not stamp the cache as successfully read: retry the same stamp.
+    invalid = false; h.refresh();
+    await waitFor(() => expect(backgroundRead).toBeGreaterThan(2));
+    h.unmount();
+  });
+
+  it("keeps matching prompt_sent holds and busy metadata when a pre-event read finishes", async () => {
+    const h = harness(async () => response({ session_id: "session-a", turns: [turn({ index: 0, content: "Event owner history" })], queue: [], is_busy: false,
+      context_usage: { used_tokens: 100000, max_tokens: 200000 } }));
+    await screen.findByText("Event owner history");
+    expect(screen.getByTestId("context-ring-ferris")).toHaveAttribute("data-percent", "50");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    h.setRead(async () => { started = true; return pending; }); h.refresh();
+    await waitFor(() => expect(started).toBe(true));
+    h.setRead(async () => response({ code: "transcript_unavailable" }, 503));
+    h.refresh({ session_id: "session-a", persona: "ferris", delivered: false, is_busy: true,
+      queue: [{ id: "event-held", session_id: "session-a", prompt: "Event held queue", by: "owner", created_at: "now", delivery_state: "unconfirmed" }] });
+    await screen.findByText("Event held queue");
+    expect(screen.getByTestId("queued-send-now-event-held")).toBeDisabled();
+    await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 9, content: "Obsolete event predecessor" })], queue: [], is_busy: false,
+      context_usage: { used_tokens: 199999, max_tokens: 200000 } })); await pending; });
+    await screen.findByText("History refresh unavailable; showing last loaded history");
+    expect(screen.getByText("Event held queue")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-send-now-event-held")).toBeDisabled();
+    expect(screen.getByTestId("session-busy-badge")).toBeInTheDocument();
+    expect(screen.getByTestId("context-ring-ferris")).toHaveAttribute("data-percent", "50");
+    expect(screen.queryByText("Obsolete event predecessor")).toBeNull();
+    expect(screen.getByText("Event owner history")).toBeInTheDocument();
+    h.unmount();
+  });
+
 });
