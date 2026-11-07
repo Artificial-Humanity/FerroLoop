@@ -975,7 +975,8 @@ fn no_consumer_sets_stalled_without_unbounded_growth() {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(saw, "empty-line flood did not stall");
-    let status = std::fs::read_to_string(&daemon.paths.status).unwrap_or_default();
+    let status = backlog_status::wait_record(&daemon.paths.status, 0, deadline)
+        .unwrap_or_else(|err| panic!("{err}"));
     let events = status_field(&status, "events");
     let charge = status_field(&status, "charge");
     assert!(events <= 4096, "{status}");
@@ -984,14 +985,18 @@ fn no_consumer_sets_stalled_without_unbounded_growth() {
 
     rpc.spawn("bytes", &["flood-stdout"]);
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
     while Instant::now() < deadline {
         let listed = rpc.list();
         if record(&find(&listed, "bytes").state).consumer_stalled {
+            saw = true;
             break;
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let status = std::fs::read_to_string(&daemon.paths.status).unwrap_or_default();
+    assert!(saw, "byte flood did not stall");
+    let status = backlog_status::wait_record(&daemon.paths.status, 1, deadline)
+        .unwrap_or_else(|err| panic!("{err}"));
     let charge = status_field(&status, "charge");
     let raw = status_field(&status, "raw");
     assert!(raw > 1024 * 1024, "{status}");
@@ -1007,6 +1012,135 @@ fn no_consumer_sets_stalled_without_unbounded_growth() {
             .expect("rss");
         let kb: u64 = rss.split_whitespace().next().unwrap().parse().unwrap();
         assert!(kb < 128 * 1024, "rss {kb}");
+    }
+}
+
+mod backlog_status {
+    use super::*;
+
+    pub(super) fn wait_record(
+        path: &Path,
+        previous_records: usize,
+        deadline: Instant,
+    ) -> Result<String, String> {
+        wait_with_poll(path, previous_records, deadline, || {
+            thread::sleep(Duration::from_millis(20));
+        })
+    }
+
+    fn wait_with_poll(
+        path: &Path,
+        previous_records: usize,
+        deadline: Instant,
+        mut poll: impl FnMut(),
+    ) -> Result<String, String> {
+        let mut last_status = String::new();
+        let mut last_io_error = None;
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(text) => last_status = text,
+                Err(err) => last_io_error = Some(err.to_string()),
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for status record {} in {}; last status: {last_status:?}; last I/O error: {last_io_error:?}",
+                    previous_records + 1,
+                    path.display(),
+                ));
+            }
+            if let Some(row) = last_status
+                .split_inclusive('\n')
+                .filter(|row| row.ends_with('\n'))
+                .nth(previous_records)
+            {
+                return Ok(row.to_owned());
+            }
+            poll();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const FIRST: &str = "events=200 charge=20000 raw=0\n";
+        const SECOND: &str = "events=4 charge=2097408 raw=2097152\n";
+
+        #[test]
+        fn waits_through_missing_empty_partial_and_unterminated_status() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("status");
+            // Each pending read releases the next writer step. No scheduling
+            // delay can skip the absent, empty, partial, or unterminated file.
+            let writes = ["", "events=200 charge=", FIRST.trim_end(), FIRST];
+            let mut step = 0;
+            let row = wait_with_poll(&path, 0, Instant::now() + Duration::from_secs(5), || {
+                std::fs::write(&path, writes[step]).unwrap();
+                step += 1;
+            })
+            .unwrap();
+            assert_eq!(row, FIRST);
+            assert_eq!(step, writes.len());
+        }
+
+        #[test]
+        fn waits_for_second_complete_record_instead_of_stale_first() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("status");
+            std::fs::write(&path, FIRST).unwrap();
+            let writes = [
+                format!("{FIRST}events=4 charge="),
+                format!("{FIRST}{}", SECOND.trim_end()),
+                format!("{FIRST}{SECOND}"),
+            ];
+            let mut step = 0;
+            let row = wait_with_poll(&path, 1, Instant::now() + Duration::from_secs(5), || {
+                std::fs::write(&path, &writes[step]).unwrap();
+                step += 1;
+            })
+            .unwrap();
+            assert_eq!(row, SECOND);
+            assert_eq!(step, writes.len());
+        }
+
+        #[test]
+        fn selects_next_record_without_waiting_for_numerical_limits() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("status");
+            let over_limit = "events=9999 charge=99999999 raw=99999999\n";
+            std::fs::write(&path, format!("{FIRST}{over_limit}{SECOND}")).unwrap();
+            let row = wait_with_poll(&path, 1, Instant::now() + Duration::from_secs(5), || {
+                panic!("a complete new record must be returned immediately");
+            })
+            .unwrap();
+            assert_eq!(row, over_limit);
+        }
+
+        #[test]
+        fn deadline_reports_complete_and_partial_status() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("status");
+            let text = format!("{FIRST}events=4 charge=");
+            std::fs::write(&path, &text).unwrap();
+            let err = wait_with_poll(&path, 1, Instant::now(), || {
+                panic!("must not poll beyond the supplied deadline");
+            })
+            .unwrap_err();
+            assert!(err.contains(&format!("{text:?}")), "{err}");
+        }
+
+        #[test]
+        fn deadline_reports_status_io_error() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("missing-status");
+            let io_error = std::fs::read_to_string(&path).unwrap_err().to_string();
+            let err = wait_with_poll(&path, 0, Instant::now(), || {
+                panic!("must not poll beyond the supplied deadline");
+            })
+            .unwrap_err();
+            assert!(err.contains(&io_error), "{err}");
+            assert!(err.contains("last status: \"\""), "{err}");
+        }
     }
 }
 
