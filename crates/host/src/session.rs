@@ -665,9 +665,6 @@ pub(crate) fn pump_reliable_stdout_with(
         let mut buffer = match journal.prepare_read() {
             Ok(buffer) => buffer,
             Err(_) => {
-                if journal.failed() {
-                    break;
-                }
                 session.set_stalled(true);
                 sink.wait(Duration::from_millis(50));
                 continue;

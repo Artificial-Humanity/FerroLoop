@@ -629,7 +629,7 @@ impl HostEventStream {
                 }
             };
             if frame.kind == crate::FrameKind::Line {
-                match self.lines.push_frame(&frame) {
+                match self.lines.push_frame_for_minor(self.client.minor, &frame) {
                     Ok(Some(event)) => return Ok(event),
                     Ok(None) => continue,
                     Err(err) => {
@@ -1102,7 +1102,9 @@ impl ReliableEventStream {
             };
             match self.reassembly.push(&frame) {
                 Ok(Some(event)) => {
-                    self.cursor.seq = event.seq;
+                    if event.kind != crate::ReliableKind::Gap {
+                        self.cursor.seq = event.seq;
+                    }
                     return Ok(event);
                 }
                 Ok(None) => {}

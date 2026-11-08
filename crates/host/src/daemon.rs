@@ -486,12 +486,14 @@ async fn begin_events(
             let handle = host.handle.clone();
             let hub = Arc::clone(&host.hub);
             let host_for_thread = Arc::clone(&host);
+            let minor = conn.negotiated_minor();
             host.spawn_thread(move || {
                 let conn = std::sync::Mutex::new(conn);
                 let writing = std::sync::Arc::new(conn);
                 let probing = std::sync::Arc::clone(&writing);
                 sub.run(
                     hub,
+                    minor,
                     move |frame| {
                         let mut conn = writing.lock().unwrap_or_else(|err| err.into_inner());
                         handle.block_on(conn.write_frame(&frame)).map_err(|_| ())
@@ -829,6 +831,36 @@ async fn run_extension(
         {
             break;
         }
+        if let Some(gap) = active.gap() {
+            let Ok(_wire) = crate::slice_budget::reserve(
+                journal.budget(),
+                crate::slice_budget::ChargeKind::Viewer,
+                256 * 1024,
+            ) else {
+                break;
+            };
+            let notice = if conn.negotiated_minor() < 2 {
+                fl_host_proto::ExtensionFrame::Notice {
+                    code: fl_host_proto::ExtensionRefusal::Unsupported,
+                }
+            } else {
+                fl_host_proto::ExtensionFrame::Gap {
+                    from_seq: gap.from_seq,
+                    next_seq: gap.next_seq,
+                }
+            };
+            let Ok(frame) = fl_host_proto::encode_extension_frame(conn.negotiated_minor(), &notice)
+            else {
+                break;
+            };
+            if conn.write_frame(&frame).await.is_err() || conn.negotiated_minor() < 2 {
+                break;
+            }
+            if active.advance_gap(gap).is_err() {
+                break;
+            }
+            continue;
+        }
         let record = match active.next() {
             Ok(Some(record)) => record,
             Ok(None) => {
@@ -858,18 +890,35 @@ async fn run_extension(
             break;
         };
         let lifecycle;
-        let (kind, bytes) = match &record.body {
-            crate::reliable::ReliableBody::Line(bytes) => {
-                (fl_host_proto::ReliableKind::Line, bytes.as_slice())
-            }
+        let (kind, bytes, terminated) = match &record.body {
+            crate::reliable::ReliableBody::Line(bytes) => (
+                fl_host_proto::ReliableKind::Line,
+                bytes.as_slice(),
+                bytes.terminated,
+            ),
             crate::reliable::ReliableBody::Lifecycle(event, _) => {
                 lifecycle = match serde_json::to_vec(event) {
                     Ok(bytes) => bytes,
                     Err(_) => break,
                 };
-                (fl_host_proto::ReliableKind::Lifecycle, lifecycle.as_slice())
+                (
+                    fl_host_proto::ReliableKind::Lifecycle,
+                    lifecycle.as_slice(),
+                    true,
+                )
             }
         };
+        if !terminated && conn.negotiated_minor() < 2 {
+            if let Ok(frame) = fl_host_proto::encode_extension_frame(
+                conn.negotiated_minor(),
+                &fl_host_proto::ExtensionFrame::Notice {
+                    code: fl_host_proto::ExtensionRefusal::Unsupported,
+                },
+            ) {
+                let _ = conn.write_frame(&frame).await;
+            }
+            break;
+        }
         let parts = bytes
             .len()
             .max(1)
@@ -891,6 +940,7 @@ async fn run_extension(
             let frame = match fl_host_proto::encode_extension_frame(
                 conn.negotiated_minor(),
                 &fl_host_proto::ExtensionFrame::ReliablePart {
+                    terminated,
                     seq: record.seq,
                     kind,
                     more: index + 1 < parts,

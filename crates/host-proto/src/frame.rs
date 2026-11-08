@@ -229,12 +229,23 @@ pub fn line_fragment(
     more: bool,
     raw: &[u8],
 ) -> Result<Frame, HostError> {
+    line_fragment_with_termination(session, epoch, seq, more, true, raw)
+}
+
+pub fn line_fragment_with_termination(
+    session: &SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+    more: bool,
+    terminated: bool,
+    raw: &[u8],
+) -> Result<Frame, HostError> {
     if raw.is_empty() && more {
         return Err(HostError::Protocol(
             "an empty raw fragment must be the sole final frame".into(),
         ));
     }
-    let payload = encode_line_payload(session, epoch, seq, more, raw)?;
+    let payload = encode_line_payload(session, epoch, seq, more, terminated, raw)?;
     if payload.len() > MAX_FRAME_PAYLOAD {
         return Err(HostError::FrameLength);
     }
@@ -250,11 +261,23 @@ pub fn fragment_line(
     seq: u64,
     raw: &[u8],
 ) -> Result<Vec<Frame>, HostError> {
+    fragment_line_with_termination(session, epoch, seq, true, raw)
+}
+
+pub fn fragment_line_with_termination(
+    session: &SessionId,
+    epoch: SessionEpoch,
+    seq: u64,
+    terminated: bool,
+    raw: &[u8],
+) -> Result<Vec<Frame>, HostError> {
     if raw.len() > MAX_LINE_BYTES {
         return Err(HostError::EventTooLarge);
     }
     if raw.is_empty() {
-        return Ok(vec![line_fragment(session, epoch, seq, false, raw)?]);
+        return Ok(vec![line_fragment_with_termination(
+            session, epoch, seq, false, terminated, raw,
+        )?]);
     }
     let chunk = MAX_FRAME_PAYLOAD - LINE_HEADER_LEN;
     let mut frames = Vec::new();
@@ -265,7 +288,14 @@ pub fn fragment_line(
         }
         let end = (offset + chunk).min(raw.len());
         let more = end < raw.len();
-        frames.push(line_fragment(session, epoch, seq, more, &raw[offset..end])?);
+        frames.push(line_fragment_with_termination(
+            session,
+            epoch,
+            seq,
+            more,
+            terminated,
+            &raw[offset..end],
+        )?);
         offset = end;
     }
     Ok(frames)
@@ -276,6 +306,7 @@ fn encode_line_payload(
     epoch: SessionEpoch,
     seq: u64,
     more: bool,
+    terminated: bool,
     raw: &[u8],
 ) -> Result<Vec<u8>, HostError> {
     let name = session.as_str().as_bytes();
@@ -295,7 +326,7 @@ fn encode_line_payload(
     payload[1..1 + name.len()].copy_from_slice(name);
     payload[65..73].copy_from_slice(&epoch.0.to_be_bytes());
     payload[73..81].copy_from_slice(&seq.to_be_bytes());
-    payload[81] = u8::from(more);
+    payload[81] = u8::from(more) | (u8::from(!terminated) << 1);
     payload[LINE_HEADER_LEN..].copy_from_slice(raw);
     Ok(payload)
 }
@@ -305,6 +336,7 @@ struct LineHeader<'a> {
     epoch: SessionEpoch,
     seq: u64,
     more: bool,
+    terminated: bool,
     raw: &'a [u8],
 }
 
@@ -324,22 +356,24 @@ fn decode_line_header(payload: &[u8]) -> Result<LineHeader<'_>, HostError> {
     let session = SessionId::new(name)?;
     let epoch = SessionEpoch(u64::from_be_bytes(payload[65..73].try_into().unwrap()));
     let seq = u64::from_be_bytes(payload[73..81].try_into().unwrap());
-    let more = match payload[81] {
-        0 => false,
-        1 => true,
-        _ => return Err(HostError::Protocol("line more flag".into())),
-    };
+    if payload[81] & !3 != 0 {
+        return Err(HostError::Protocol("line flags".into()));
+    }
+    let more = payload[81] & 1 != 0;
+    let terminated = payload[81] & 2 == 0;
     Ok(LineHeader {
         session,
         epoch,
         seq,
         more,
+        terminated,
         raw: &payload[LINE_HEADER_LEN..],
     })
 }
 
 #[derive(Debug)]
 struct OpenLine {
+    terminated: bool,
     session: SessionId,
     epoch: SessionEpoch,
     seq: u64,
@@ -386,6 +420,14 @@ impl LineReassembler {
     /// completed event with `Ok(Some(event))`. Errors produce no event; callers
     /// discard the chain on errors or disconnect to release its storage.
     pub fn push_frame(&mut self, frame: &Frame) -> Result<Option<HostEvent>, HostError> {
+        self.push_frame_for_minor(crate::PROTO_MINOR, frame)
+    }
+
+    pub fn push_frame_for_minor(
+        &mut self,
+        minor: u16,
+        frame: &Frame,
+    ) -> Result<Option<HostEvent>, HostError> {
         if frame.kind != FrameKind::Line {
             if self.fragments > 0 {
                 return Err(HostError::Protocol(
@@ -397,6 +439,11 @@ impl LineReassembler {
             ));
         }
         let header = decode_line_header(&frame.payload)?;
+        if !header.terminated && minor < 2 {
+            return Err(HostError::Protocol(
+                "stdout fragments require minor two".into(),
+            ));
+        }
         if header.raw.is_empty() && (header.more || self.fragments > 0) {
             return Err(HostError::Protocol(
                 "empty raw fragments are only a single final empty line".into(),
@@ -405,7 +452,8 @@ impl LineReassembler {
         if let Some(open) = &self.open
             && (open.session != header.session
                 || open.epoch != header.epoch
-                || open.seq != header.seq)
+                || open.seq != header.seq
+                || open.terminated != header.terminated)
         {
             return Err(HostError::Protocol(
                 "line fragment identity does not match the open chain".into(),
@@ -444,6 +492,7 @@ impl LineReassembler {
         }
         if self.open.is_none() {
             self.open = Some(OpenLine {
+                terminated: header.terminated,
                 session: header.session.clone(),
                 epoch: header.epoch,
                 seq: header.seq,
@@ -459,6 +508,7 @@ impl LineReassembler {
             .take()
             .ok_or_else(|| HostError::Protocol("finished a line with no identity".into()))?;
         let event = HostEvent::Line {
+            terminated: open.terminated,
             session: open.session,
             session_epoch: open.epoch,
             seq: open.seq,
@@ -537,6 +587,25 @@ impl EventSeq {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    #[test]
+    fn unterminated_flag_is_accepted_and_multipart_must_agree() {
+        let session = SessionId::new("fragment").unwrap();
+        let mut frame = line_fragment(&session, SessionEpoch(1), 1, false, b"tail").unwrap();
+        frame.payload[81] = 2;
+        assert!(
+            LineReassembler::new()
+                .push_frame_for_minor(1, &frame)
+                .is_err()
+        );
+        assert!(LineReassembler::new().push_frame(&frame).unwrap().is_some());
+        let mut first = line_fragment(&session, SessionEpoch(1), 2, true, b"first").unwrap();
+        first.payload[81] = 3;
+        let last = line_fragment(&session, SessionEpoch(1), 2, false, b"last").unwrap();
+        let mut assembler = LineReassembler::new();
+        assert!(assembler.push_frame(&first).unwrap().is_none());
+        assert!(assembler.push_frame(&last).is_err());
+    }
 
     #[test]
     fn consecutive_maximum_lines_bound_owned_buffer_capacity() {

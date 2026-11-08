@@ -15,6 +15,7 @@ const ARC_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
 const RECORD_METADATA: usize = std::mem::size_of::<ReliableRecord>() + ARC_OVERHEAD;
 
 pub(crate) struct ChargedBytes {
+    pub(crate) terminated: bool,
     bytes: Box<[u8]>,
     len: usize,
     reservation: Reservation,
@@ -22,6 +23,7 @@ pub(crate) struct ChargedBytes {
 impl ChargedBytes {
     pub(crate) fn from_reservation(reservation: Reservation, len: usize) -> Self {
         Self {
+            terminated: true,
             bytes: vec![0; len].into_boxed_slice(),
             len,
             reservation,
@@ -43,6 +45,7 @@ pub(crate) enum ReliableBody {
     Lifecycle(ControlEvent, Reservation),
 }
 pub(crate) struct ReliableRecord {
+    exposed: bool,
     pub(crate) seq: u64,
     pub(crate) body: ReliableBody,
     _metadata: Reservation,
@@ -84,10 +87,8 @@ struct State {
     lifecycle_bytes: [Option<Reservation>; 4],
     lifecycle_metadata: [Option<Reservation>; 4],
     partial: Option<ChargedBytes>,
-    partial_complete: bool,
     pending: Option<Pending>,
     eof: bool,
-    failed: bool,
 }
 pub(crate) struct ReliableJournal {
     self_ref: Weak<ReliableJournal>,
@@ -170,10 +171,8 @@ impl ReliableJournal {
                 lifecycle_bytes,
                 lifecycle_metadata,
                 partial: None,
-                partial_complete: false,
                 pending: None,
                 eof: false,
-                failed: false,
             }),
         }))
     }
@@ -210,15 +209,25 @@ impl ReliableJournal {
     pub(crate) fn prepare_read(&self) -> Result<ChargedBytes, ExtensionRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.drain(&mut state)?;
-        if state.eof
-            || state.failed
-            || state.pending.is_some()
-            || self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS
-        {
+        if state.eof || state.pending.is_some() {
             return Err(ExtensionRefusal::ResourceLimit);
         }
-        let _admission = reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)?;
-        self.allocate(READ_BYTES)
+        loop {
+            let admission = if self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS
+                && !self.coalescible(&state)
+            {
+                Err(ExtensionRefusal::ResourceLimit)
+            } else {
+                reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)
+                    .and_then(|_admission| self.allocate(READ_BYTES))
+            };
+            match admission {
+                Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(&mut state) => {
+                    continue;
+                }
+                result => return result,
+            }
+        }
     }
     pub(crate) fn accept_read(&self, bytes: ChargedBytes) -> Result<(), ExtensionRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -239,9 +248,6 @@ impl ReliableJournal {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.eof = true;
         let _ = self.drain(&mut state); // quota saturation retains partial/pending bytes
-    }
-    pub(crate) fn failed(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).failed
     }
     pub(crate) fn lifecycle(&self, event: ControlEvent) -> Result<u64, ExtensionRefusal> {
         let kind = lifecycle_kind(&event)?;
@@ -297,6 +303,34 @@ impl ReliableJournal {
                 Some(kind)
             }
         };
+        if kind.is_none() && self.coalescible(state) {
+            let incoming = match body.as_ref().expect("body") {
+                ReliableBody::Line(b) => b,
+                _ => unreachable!(),
+            };
+            let idx = (state.head + state.len - 1) % SLOTS;
+            let old = state.records[idx].as_ref().expect("tail");
+            let ReliableBody::Line(previous) = &old.body else {
+                unreachable!()
+            };
+            if let Some(len) = previous
+                .len
+                .checked_add(incoming.len)
+                .filter(|n| *n <= MAX_STDOUT_LINE)
+            {
+                let mut combined = self.allocate(len)?;
+                combined.terminated = incoming.terminated;
+                combined.as_mut_slice()[..previous.len].copy_from_slice(previous.as_slice());
+                combined.as_mut_slice()[previous.len..].copy_from_slice(incoming.as_slice());
+                let envelope = self.line_envelope(&combined)?;
+                let tail = Arc::get_mut(state.records[idx].as_mut().expect("tail"))
+                    .expect("unexposed tail");
+                tail.body = ReliableBody::Line(combined);
+                tail._envelope = Some(envelope);
+                body.take();
+                return Ok(tail.seq);
+            }
+        }
         let (count, limit) = if kind.is_some() {
             (&self.counts.lifecycle, MAX_LIFECYCLE_RECORDS)
         } else {
@@ -313,35 +347,18 @@ impl ReliableJournal {
         } else {
             reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)?
         };
-        let envelope =
-            if let ReliableBody::Line(bytes) = body.as_ref().expect("owned admission body") {
-                let fragments = bytes.len.max(1).div_ceil(fl_host_proto::MAX_EXTENSION_PART);
-                // The actual minor-1 JSON part header is counted with the largest seq;
-                // payload storage itself is shared, and wire copies belong to Task 3.
-                let part = fl_host_proto::ExtensionFrame::ReliablePart {
-                    seq: u64::MAX,
-                    kind: fl_host_proto::ReliableKind::Line,
-                    more: false,
-                    bytes: fl_host_proto::BoundedBytes::new(Vec::new()).expect("empty part"),
-                };
-                let mut counter = BoundedCounter(0);
-                if serde_json::to_writer(&mut counter, &part).is_err() {
-                    return Err(ExtensionRefusal::ResourceLimit);
-                }
-                let bytes = match fragments.checked_mul(counter.0) {
-                    Some(v) => v,
-                    None => return Err(ExtensionRefusal::ResourceLimit),
-                };
-                Some(reserve(&self.budget, ChargeKind::ReliableData, bytes)?)
-            } else {
-                None
-            };
+        let envelope = if let ReliableBody::Line(bytes) = body.as_ref().expect("body") {
+            Some(self.line_envelope(bytes)?)
+        } else {
+            None
+        };
         if let ReliableBody::Lifecycle(event, _) = body.as_mut().expect("owned admission body") {
             set_seq(event, state.next);
         }
         let seq = state.next;
         count.fetch_add(1, Ordering::SeqCst);
         let record = Arc::new(ReliableRecord {
+            exposed: false,
             seq,
             body: body.take().expect("admitted body"),
             _metadata: metadata,
@@ -360,45 +377,98 @@ impl ReliableJournal {
         }
         Ok(seq)
     }
+    fn coalescible(&self, state: &State) -> bool {
+        if state.len == 0 {
+            return false;
+        }
+        let tail = state.records[(state.head + state.len - 1) % SLOTS]
+            .as_ref()
+            .expect("tail");
+        !tail.exposed
+            && Arc::strong_count(tail) == 1
+            && matches!(&tail.body, ReliableBody::Line(b) if !b.terminated && b.len < MAX_STDOUT_LINE)
+    }
+    fn line_envelope(&self, bytes: &ChargedBytes) -> Result<Reservation, ExtensionRefusal> {
+        let fragments = bytes.len.max(1).div_ceil(fl_host_proto::MAX_EXTENSION_PART);
+        let part = fl_host_proto::ExtensionFrame::ReliablePart {
+            terminated: bytes.terminated,
+            seq: u64::MAX,
+            kind: fl_host_proto::ReliableKind::Line,
+            more: false,
+            bytes: fl_host_proto::BoundedBytes::new(Vec::new()).expect("empty"),
+        };
+        let mut counter = BoundedCounter(0);
+        serde_json::to_writer(&mut counter, &part).map_err(|_| ExtensionRefusal::ResourceLimit)?;
+        reserve(
+            &self.budget,
+            ChargeKind::ReliableData,
+            fragments
+                .checked_mul(counter.0)
+                .ok_or(ExtensionRefusal::ResourceLimit)?,
+        )
+    }
+    /// Only unattended data is disposable. Lifecycle records and ACK state remain authoritative.
+    fn evict_oldest_data(&self, state: &mut State) -> bool {
+        if self.counts.cursors.load(Ordering::SeqCst) != 0
+            || self.counts.references.load(Ordering::SeqCst) != 0
+        {
+            return false;
+        }
+        let Some(offset) = (0..state.len).find(|offset| {
+            matches!(
+                state.records[(state.head + offset) % SLOTS]
+                    .as_ref()
+                    .map(|r| &r.body),
+                Some(ReliableBody::Line(_))
+            )
+        }) else {
+            return false;
+        };
+        let index = (state.head + offset) % SLOTS;
+        state.records[index] = None;
+        // Move only the lifecycle prefix, at most MAX_LIFECYCLE_RECORDS slots.
+        for prefix in (0..offset).rev() {
+            let from = (state.head + prefix) % SLOTS;
+            let to = (from + 1) % SLOTS;
+            state.records[to] = state.records[from].take();
+        }
+        state.head = (state.head + 1) % SLOTS;
+        state.len -= 1;
+        true
+    }
     fn drain(&self, state: &mut State) -> Result<(), ExtensionRefusal> {
         loop {
-            if state.partial_complete {
-                self.publish_partial(state)?;
+            match self.drain_once(state) {
+                Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(state) => continue,
+                result => return result,
             }
-            if self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS {
-                return Err(ExtensionRefusal::ResourceLimit);
+        }
+    }
+    fn drain_once(&self, state: &mut State) -> Result<(), ExtensionRefusal> {
+        loop {
+            if state.partial.is_some() {
+                self.publish_partial(state)?;
             }
             let Some(pending) = state.pending.as_ref() else {
                 break;
             };
             let remaining = &pending.bytes.as_slice()[pending.offset..];
-            let newline = remaining.iter().position(|b| *b == b'\n');
-            let take = newline.unwrap_or(remaining.len());
-            let old_len = state.partial.as_ref().map_or(0, |p| p.len);
-            let len = old_len
-                .checked_add(take)
-                .filter(|n| *n <= MAX_STDOUT_LINE)
-                .ok_or_else(|| {
-                    state.failed = true;
-                    ExtensionRefusal::Io
-                })?;
-            let mut combined = self.allocate(len)?;
-            if let Some(partial) = &state.partial {
-                combined.as_mut_slice()[..old_len].copy_from_slice(partial.as_slice());
+            if remaining.is_empty() {
+                state.pending = None;
+                continue;
             }
-            combined.as_mut_slice()[old_len..].copy_from_slice(&remaining[..take]);
-            state.partial = Some(combined);
+            let newline = remaining.iter().position(|b| *b == b'\n');
+            let take = newline.unwrap_or(remaining.len()).min(MAX_STDOUT_LINE);
+            let terminated = newline == Some(take);
+            let mut fragment = self.allocate(take)?;
+            fragment.terminated = terminated;
+            fragment.as_mut_slice().copy_from_slice(&remaining[..take]);
+            state.partial = Some(fragment);
             let pending = state.pending.as_mut().expect("pending");
-            pending.offset += take + usize::from(newline.is_some());
+            pending.offset += take + usize::from(terminated);
             if pending.offset == pending.bytes.len {
                 state.pending = None;
             }
-            if newline.is_some() {
-                state.partial_complete = true;
-                self.publish_partial(state)?;
-            }
-        }
-        if state.eof && state.partial.is_some() {
             self.publish_partial(state)?;
         }
         Ok(())
@@ -413,9 +483,6 @@ impl ReliableJournal {
             && let Some(ReliableBody::Line(bytes)) = body
         {
             state.partial = Some(bytes);
-        }
-        if result.is_ok() {
-            state.partial_complete = false;
         }
         result.map(|_| ())
     }
@@ -513,6 +580,16 @@ pub(crate) fn begin_replay(
     let next = after
         .checked_add(1)
         .ok_or(ExtensionRefusal::ResourceLimit)?;
+    // An admitted cursor must never miss future bytes coalesced behind `next`.
+    // Cursors that still include the tail can retain the usual coalescing benefit.
+    if j.coalescible(&state) {
+        let index = (state.head + state.len - 1) % SLOTS;
+        let tail =
+            Arc::get_mut(state.records[index].as_mut().expect("tail")).expect("unexposed tail");
+        if tail.seq <= after {
+            tail.exposed = true;
+        }
+    }
     j.counts.cursors.fetch_add(1, Ordering::SeqCst);
     Ok((
         watermark,
@@ -528,6 +605,30 @@ impl ReplayCursor {
     pub(crate) fn journal(&self) -> Arc<ReliableJournal> {
         Arc::clone(&self.journal)
     }
+    pub(crate) fn gap(&self) -> Option<fl_host_proto::ReliableGap> {
+        let state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.next <= state.acked || self.next >= state.next {
+            return None;
+        }
+        let next_seq = (0..state.len)
+            .filter_map(|offset| state.records[(state.head + offset) % SLOTS].as_ref())
+            .find(|record| record.seq >= self.next)
+            .map_or(state.next, |record| record.seq);
+        (next_seq > self.next).then_some(fl_host_proto::ReliableGap {
+            from_seq: self.next,
+            next_seq,
+        })
+    }
+    pub(crate) fn advance_gap(
+        &mut self,
+        gap: fl_host_proto::ReliableGap,
+    ) -> Result<(), ExtensionRefusal> {
+        if self.gap() != Some(gap) {
+            return Err(ExtensionRefusal::CursorExpired);
+        }
+        self.next = gap.next_seq;
+        Ok(())
+    }
     pub(crate) fn next(&mut self) -> Result<Option<RecordReference>, ExtensionRefusal> {
         let mut state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.journal.drain(&mut state);
@@ -537,9 +638,18 @@ impl ReplayCursor {
         if self.next >= state.next {
             return Ok(None);
         }
-        let offset = usize::try_from(self.next - state.acked - 1)
-            .map_err(|_| ExtensionRefusal::ResourceLimit)?;
-        let record = state.records[(state.head + offset) % SLOTS]
+        let index = (0..state.len)
+            .map(|offset| (state.head + offset) % SLOTS)
+            .find(|index| {
+                state.records[*index]
+                    .as_ref()
+                    .is_some_and(|r| r.seq == self.next)
+            })
+            .ok_or(ExtensionRefusal::CursorExpired)?;
+        if let Some(record) = state.records[index].as_mut().and_then(Arc::get_mut) {
+            record.exposed = true;
+        }
+        let record = state.records[index]
             .as_ref()
             .ok_or(ExtensionRefusal::CursorExpired)?;
         if self.journal.counts.references.load(Ordering::SeqCst)
@@ -642,9 +752,212 @@ mod tests {
         );
         (session, output)
     }
+    fn admit(j: &ReliableJournal, raw: &[u8]) {
+        let mut bytes = j.prepare_read().unwrap();
+        bytes.as_mut_slice()[..raw.len()].copy_from_slice(raw);
+        bytes.truncate(raw.len());
+        j.accept_read(bytes).unwrap();
+    }
+    #[test]
+    fn coalescing_remains_available_at_record_cap_with_live_cursor() {
+        let j = journal();
+        let (_, _cursor) = begin_replay(&j, 0).unwrap();
+        for _ in 0..MAX_DATA_RECORDS - 1 {
+            admit(&j, b"x\n");
+        }
+        admit(&j, b"tail");
+        admit(&j, b"more");
+        assert_eq!(j.live_data_records(), MAX_DATA_RECORDS);
+        let state = j.state.lock().unwrap();
+        let last = state.records[(state.head + state.len - 1) % SLOTS]
+            .as_ref()
+            .unwrap();
+        assert!(matches!(&last.body, ReliableBody::Line(b) if b.as_slice()==b"tailmore"));
+    }
+
+    #[test]
+    fn cursor_after_tail_receives_future_bytes_and_lf() {
+        for observe_before_lf in [false, true] {
+            let j = journal();
+            admit(&j, b"a");
+            let (watermark, mut cursor) = begin_replay(&j, 1).unwrap();
+            assert_eq!(watermark, 1);
+            admit(&j, b"b");
+            let mut got = Vec::new();
+            if observe_before_lf {
+                let record = cursor.next().unwrap().expect("new bytes after attach");
+                assert_eq!(record.seq, 2);
+                let ReliableBody::Line(bytes) = &record.body else {
+                    panic!("line")
+                };
+                assert!(!bytes.terminated);
+                got.extend_from_slice(bytes.as_slice());
+            }
+            admit(&j, b"\n");
+            while let Some(record) = cursor.next().unwrap() {
+                let ReliableBody::Line(bytes) = &record.body else {
+                    panic!("line")
+                };
+                got.extend_from_slice(bytes.as_slice());
+                if bytes.terminated {
+                    got.push(b'\n');
+                }
+            }
+            assert_eq!(got, b"b\n");
+        }
+    }
+
+    #[test]
+    fn cursor_before_unobserved_tail_preserves_coalescing() {
+        let j = journal();
+        admit(&j, b"a");
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        admit(&j, b"b\n");
+        let record = cursor.next().unwrap().unwrap();
+        assert_eq!(record.seq, 1);
+        assert!(matches!(&record.body, ReliableBody::Line(b)
+            if b.as_slice() == b"ab" && b.terminated));
+        assert!(cursor.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn tiny_reads_coalesce_and_exposed_tail_never_changes() {
+        let j = journal();
+        let mut expected = Vec::new();
+        for i in 0..100_000 {
+            let raw: &[u8] = if i % 1000 == 999 { b"x\n" } else { b"x" };
+            admit(&j, raw);
+            expected.extend_from_slice(raw);
+        }
+        assert_eq!(j.live_data_records(), 100);
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        let mut got = Vec::new();
+        while let Some(record) = cursor.next().unwrap() {
+            let ReliableBody::Line(bytes) = &record.body else {
+                panic!("line")
+            };
+            got.extend_from_slice(bytes.as_slice());
+            if bytes.terminated {
+                got.push(b'\n');
+            }
+        }
+        assert_eq!(got, expected);
+        drop(cursor);
+        let k = journal();
+        admit(&k, b"a");
+        let (_, mut cursor) = begin_replay(&k, 0).unwrap();
+        drop(cursor.next().unwrap().unwrap());
+        drop(cursor);
+        admit(&k, b"b");
+        let (_, mut cursor) = begin_replay(&k, 0).unwrap();
+        assert!(
+            matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"a")
+        );
+        assert!(
+            matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"b")
+        );
+    }
+    #[test]
+    fn unattended_eviction_preserves_lifecycle_and_reports_exact_gap() {
+        let j = journal();
+        j.lifecycle(ControlEvent::CleanupComplete {
+            session: stream().session,
+            session_epoch: stream().epoch,
+            seq: 0,
+        })
+        .unwrap();
+        for i in 0..100_000 {
+            admit(&j, format!("{i}\n").as_bytes());
+        }
+        assert_eq!(j.position().0, 0);
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        assert!(cursor.gap().is_none());
+        assert!(matches!(
+            cursor.next().unwrap().unwrap().body,
+            ReliableBody::Lifecycle(..)
+        ));
+        let gap = cursor.gap().expect("data loss notice");
+        assert_eq!(gap.from_seq, 2);
+        assert_eq!(gap.next_seq, 100_002 - MAX_DATA_RECORDS as u64);
+        assert_eq!(
+            cursor.gap(),
+            Some(gap),
+            "notice is not consumed before write success"
+        );
+        cursor.advance_gap(gap).unwrap();
+        for i in 100_000 - MAX_DATA_RECORDS..100_000 {
+            let r = cursor.next().unwrap().unwrap();
+            assert!(
+                matches!(&r.body, ReliableBody::Line(b) if b.terminated && b.as_slice()==i.to_string().as_bytes())
+            );
+        }
+        assert!(cursor.next().unwrap().is_none());
+    }
+    #[test]
+    fn unattended_byte_pressure_and_live_cursor_backpressure_are_distinct() {
+        let j = journal();
+        for _ in 0..100_000 {
+            admit(&j, &[b'z'; 128]);
+        }
+        assert!(j.budget.used(ChargeKind::ReliableData) <= EPOCH_DATA);
+        assert_eq!(j.position().0, 0);
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        assert!(cursor.gap().is_some());
+        let gap = cursor.gap().unwrap();
+        cursor.advance_gap(gap).unwrap();
+        while let Some(r) = cursor.next().unwrap() {
+            assert!(
+                matches!(&r.body, ReliableBody::Line(b) if !b.terminated && b.as_slice().iter().all(|x| *x==b'z'))
+            );
+        }
+        let k = journal();
+        let (_, _live) = begin_replay(&k, 0).unwrap();
+        for _ in 0..MAX_DATA_RECORDS {
+            admit(&k, b"x\n");
+        }
+        assert!(k.prepare_read().is_err());
+        assert_eq!(k.live_data_records(), MAX_DATA_RECORDS);
+        assert_eq!(k.position(), (0, MAX_DATA_RECORDS as u64));
+    }
+
+    #[test]
+    fn unattended_record_pressure_drops_oldest_without_ack() {
+        let j = journal();
+        for _ in 0..100_000 {
+            let mut bytes = j.prepare_read().expect("unattended producer remains live");
+            bytes.as_mut_slice()[..2].copy_from_slice(b"x\n");
+            bytes.truncate(2);
+            j.accept_read(bytes).unwrap();
+        }
+        assert_eq!(j.position().0, 0, "eviction is not acknowledgement");
+        assert!(j.live_data_records() <= MAX_DATA_RECORDS);
+        assert!(j.budget.used(ChargeKind::ReliableData) <= EPOCH_DATA);
+    }
+
+    #[test]
+    fn arbitrarily_long_unterminated_output_is_not_a_protocol_failure() {
+        let j = journal();
+        for _ in 0..513 {
+            let mut bytes = j.prepare_read().unwrap();
+            bytes.as_mut_slice().fill(b'x');
+            assert_eq!(j.accept_read(bytes), Ok(()));
+        }
+        j.eof();
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        let mut count = 0;
+        while let Some(record) = cursor.next().unwrap() {
+            if let ReliableBody::Line(bytes) = &record.body {
+                count += bytes.as_slice().len();
+                assert!(bytes.as_slice().iter().all(|b| *b == b'x'));
+            }
+        }
+        assert_eq!(count, 513 * 4096);
+    }
+
     #[test]
     fn real_sink_driver_retains_pending_read_at_saturation_and_stop() {
         let j = journal();
+        let (_watermark, _active) = begin_replay(&j, 0).unwrap();
         for _ in 0..MAX_DATA_RECORDS - 1 {
             append(&j, line(&j, b"previous")).unwrap();
         }
@@ -659,7 +972,7 @@ mod tests {
         });
         assert!(j.is_eof());
         assert_eq!(j.retained(), MAX_DATA_RECORDS);
-        assert!(j.state.lock().unwrap().pending.is_some());
+        assert!(j.state.lock().unwrap().partial.is_some());
         acknowledge(&j, MAX_DATA_RECORDS as u64).unwrap();
         let (_, mut cursor) = begin_replay(&j, MAX_DATA_RECORDS as u64).unwrap();
         let record = cursor.next().unwrap().unwrap();
@@ -734,7 +1047,6 @@ mod tests {
         let mut state = j.state.lock().unwrap();
         state.partial = Some(j.allocate(1).unwrap());
         state.partial.as_mut().unwrap().as_mut_slice()[0] = b'a';
-        state.partial_complete = true;
         let mut bytes = j.allocate(2).unwrap();
         bytes.as_mut_slice().copy_from_slice(b"b\n");
         state.pending = Some(Pending { bytes, offset: 0 });
@@ -887,12 +1199,13 @@ mod tests {
     #[test]
     fn journal_limits_checked_before_read() {
         let j = journal();
+        let (_watermark, _active) = begin_replay(&j, 0).unwrap();
         for _ in 0..MAX_DATA_RECORDS {
             append(&j, line(&j, b"x")).unwrap();
         }
         assert!(j.prepare_read().is_err());
         let mut cursors = Vec::new();
-        for _ in 0..MAX_CURSORS {
+        for _ in 1..MAX_CURSORS {
             cursors.push(begin_replay(&j, 0).unwrap().1);
         }
         assert!(matches!(

@@ -360,6 +360,15 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
     let lease = rpc.claim(&stream);
     let (ticket, watermark) = rpc.ticket(&stream, lease, 0);
     assert_eq!(watermark, 2, "capture before gated publication");
+    std::fs::write(&first, b"go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rpc.summary(&stream).latest < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "full cap record and separate LF retained"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
     let rt = runtime();
     let mut events = rt.block_on(async {
         AsyncHostClient::connect(&f.endpoint)
@@ -380,7 +389,6 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
         assert_eq!(partial.push(&frame).unwrap().unwrap().seq, expected);
     }
     f.arm("reliable-after-part");
-    std::fs::write(&first, b"go").unwrap();
     let frame = rt.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), events.next_frame())
             .await
@@ -388,7 +396,7 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
             .unwrap()
     });
     assert!(
-        matches!(&frame,ExtensionFrame::ReliablePart{seq:3,kind:ReliableKind::Line,more:true,bytes} if bytes.as_slice().len()==32*1024)
+        matches!(&frame,ExtensionFrame::ReliablePart{seq:3,kind:ReliableKind::Line,more:true,bytes,..} if bytes.as_slice().len()==32*1024)
     );
     assert!(partial.push(&frame).unwrap().is_none());
     f.at("reliable-after-part");
@@ -441,8 +449,8 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
         .unwrap();
     let mut reassembly = fl_host_proto::ReliableReassembler::for_stream(stream.clone(), 0);
     let mut seen = Vec::new();
-    for expected in 1..=4 {
-        if expected == 4 {
+    for expected in 1..=5 {
+        if expected == 5 {
             std::fs::write(&second, b"go").unwrap();
         }
         let event = rt.block_on(async {
@@ -460,6 +468,10 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
             assert!(event.bytes.iter().all(|b| *b == b'y'));
         }
         if expected == 4 {
+            assert!(event.bytes.is_empty());
+            assert!(event.terminated);
+        }
+        if expected == 5 {
             assert_eq!(event.bytes, b"TAIL");
         }
         rt.block_on(recovered.ack(
@@ -471,12 +483,12 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
         ))
         .unwrap();
     }
-    assert_eq!(seen, [1, 2, 3, 4]);
+    assert_eq!(seen, [1, 2, 3, 4, 5]);
     let mut inspector = f.rpc();
     let current = inspector.summary(&stream);
     assert_eq!(record(&current.state).pid, original.pid);
     assert_eq!(current.stream, stream);
-    assert_eq!(current.acked, 4);
+    assert_eq!(current.acked, 5);
 }
 
 #[test]
@@ -484,7 +496,16 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
     let f = Fixture::new();
     let mut rpc = f.rpc();
     let flushed = f.root.path().join("flushed");
-    let (stream, _) = rpc.spawn("saturated", &["lines", "4500", flushed.to_str().unwrap()]);
+    let gate = f.root.path().join("produce");
+    let (stream, _) = rpc.spawn(
+        "saturated",
+        &[
+            "lines",
+            "4500",
+            flushed.to_str().unwrap(),
+            gate.to_str().unwrap(),
+        ],
+    );
     let lease = rpc.claim(&stream);
     f.arm("reliable-before-part");
     let (ticket, _) = rpc.ticket(&stream, lease, 0);
@@ -498,6 +519,7 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
             .unwrap()
     });
     f.at("reliable-before-part");
+    std::fs::write(&gate, b"go").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !record(&rpc.summary(&stream).state).consumer_stalled {
         assert!(Instant::now() < deadline, "real data-count saturation");
@@ -530,21 +552,7 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
         }
     ));
     f.release("reliable-before-part");
-    drop(held);
-    let mut recovered = rt.block_on(AsyncHostClient::connect(&f.endpoint)).unwrap();
-    let grant = rt
-        .block_on(recovered.claim_controller(stream.clone()))
-        .unwrap();
-    let ticket = rt.block_on(reliable_ticket(&mut recovered, &stream, grant.lease, 0));
-    let mut events = rt
-        .block_on(async {
-            AsyncHostClient::connect(&f.endpoint)
-                .await
-                .unwrap()
-                .open_extension_stream(ticket)
-                .await
-        })
-        .unwrap();
+    let mut events = held;
     let mut reassembly = fl_host_proto::ReliableReassembler::for_stream(stream.clone(), 0);
     let mut next_line = 0;
     let mut saw_ready = false;
@@ -552,7 +560,10 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
     let mut cleanups = 0;
     let mut exit_seq = 0;
     let mut cleanup_seq = 0;
-    for seq in 1..=4504 {
+    let mut seq = 0;
+    let mut pending_line = Vec::new();
+    while next_line < 4500 || cleanups == 0 {
+        seq += 1;
         let event = rt.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -563,13 +574,19 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
         });
         assert_eq!(event.seq, seq);
         match event.kind {
-            ReliableKind::Line if event.bytes == b"READY" => {
-                assert!(!saw_ready);
-                saw_ready = true;
-            }
+            ReliableKind::Gap => panic!("unexpected gap {event:?}"),
             ReliableKind::Line => {
-                assert_eq!(event.bytes, format!("L{next_line}").as_bytes());
-                next_line += 1;
+                pending_line.extend_from_slice(&event.bytes);
+                if event.terminated {
+                    if !saw_ready {
+                        assert_eq!(pending_line, b"READY");
+                        saw_ready = true;
+                    } else {
+                        assert_eq!(pending_line, format!("L{next_line}").as_bytes());
+                        next_line += 1;
+                    }
+                    pending_line.clear();
+                }
             }
             ReliableKind::Lifecycle => {
                 match serde_json::from_slice::<fl_host_proto::ControlEvent>(&event.bytes).unwrap() {
@@ -586,14 +603,16 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
                 }
             }
         }
-        rt.block_on(recovered.ack(
-            Cursor {
-                stream: stream.clone(),
-                seq: event.seq,
-            },
-            grant.lease,
-        ))
-        .unwrap();
+        assert!(matches!(
+            rpc.call(Req::Ack {
+                cursor: Cursor {
+                    stream: stream.clone(),
+                    seq: event.seq
+                },
+                lease
+            }),
+            Resp::Acked { .. }
+        ));
     }
     assert!(saw_ready);
     assert_eq!(next_line, 4500);
@@ -927,4 +946,211 @@ fn guessed_pending_final_write_cancellation_retires_no_output() {
     );
     let _rpc = ack.join().unwrap();
     assert_eq!(f.rpc().summary(&check_stream).acked, 0);
+}
+
+#[test]
+fn reliable_large_unterminated_stream_is_exact_and_child_remains_running() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    let done = f.root.path().join("output-done");
+    let (stream, _) = rpc.spawn(
+        "large-tail",
+        &["stdout-fragments", "tail", done.to_str().unwrap()],
+    );
+    wait_file(&done);
+    let rt = runtime();
+    rt.block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client
+            .subscribe_reliable(stream.clone(), grant.lease, Some(0))
+            .await
+            .unwrap();
+        let mut expected = vec![b'z'; 513 * 4096];
+        expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.kind {
+                ReliableKind::Line => {
+                    got.extend_from_slice(&event.bytes);
+                    if event.terminated {
+                        got.push(b'\n');
+                    }
+                }
+                ReliableKind::Lifecycle => {
+                    assert!(!matches!(
+                        serde_json::from_slice::<fl_host_proto::ControlEvent>(&event.bytes)
+                            .unwrap(),
+                        fl_host_proto::ControlEvent::ProtocolFailure { .. }
+                    ));
+                }
+                ReliableKind::Gap => panic!("unexpected gap"),
+            }
+            client.ack(events.cursor(), grant.lease).await.unwrap();
+        }
+        assert_eq!(got, expected);
+    });
+    assert!(matches!(rpc.summary(&stream).state, ChildState::Running(_)));
+}
+
+#[test]
+fn unattended_daemon_sends_gap_then_retained_data_without_ack_credit() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    let done = f.root.path().join("output-done");
+    let (stream, _) = rpc.spawn(
+        "pressure",
+        &["stdout-fragments", "lines", done.to_str().unwrap()],
+    );
+    wait_file(&done);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rpc.summary(&stream).latest < 100_001 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(rpc.summary(&stream).acked, 0);
+    let rt = runtime();
+    rt.block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client
+            .subscribe_reliable(stream.clone(), grant.lease, Some(0))
+            .await
+            .unwrap();
+        let lifecycle = events.next_event().await.unwrap();
+        assert_eq!(lifecycle.kind, ReliableKind::Lifecycle);
+        assert_eq!(lifecycle.seq, 1);
+        let notice = events.next_event().await.unwrap();
+        assert_eq!(notice.kind, ReliableKind::Gap);
+        let gap = notice.gap.unwrap();
+        assert_eq!(gap.from_seq, 2);
+        assert!(gap.next_seq > 2);
+        assert_eq!(
+            events.cursor().seq,
+            1,
+            "gap must not create ACK cursor credit"
+        );
+        for expected_seq in gap.next_seq..=100_001 {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.seq, expected_seq);
+            assert_eq!(event.kind, ReliableKind::Line);
+            assert!(event.terminated);
+            assert_eq!(event.bytes, (expected_seq - 2).to_string().as_bytes());
+        }
+    });
+    assert_eq!(rpc.summary(&stream).acked, 0);
+    assert!(matches!(rpc.summary(&stream).state, ChildState::Running(_)));
+}
+
+#[test]
+fn minor_one_refuses_unterminated_subscription_without_ack_or_cleanup() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    let done = f.root.path().join("done");
+    let (stream, _) = rpc.spawn(
+        "legacy",
+        &["stdout-fragments", "tail", done.to_str().unwrap()],
+    );
+    wait_file(&done);
+    let rt = runtime();
+    rt.block_on(async {
+        let options = fl_host_proto::ConnectOptions {
+            minor: 1,
+            ..Default::default()
+        };
+        let mut client = AsyncHostClient::connect_with(&f.endpoint, options)
+            .await
+            .unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let ticket = reliable_ticket(&mut client, &stream, grant.lease, 0).await;
+        let peer = AsyncHostClient::connect_with(
+            &f.endpoint,
+            fl_host_proto::ConnectOptions {
+                minor: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut events = peer.open_extension_stream(ticket).await.unwrap();
+        let first = events.next_frame().await.unwrap();
+        assert!(matches!(
+            first,
+            ExtensionFrame::ReliablePart {
+                seq: 1,
+                kind: ReliableKind::Lifecycle,
+                ..
+            }
+        ));
+        let notice = events.next_frame().await.unwrap();
+        assert_eq!(
+            notice,
+            ExtensionFrame::Notice {
+                code: Refusal::Unsupported
+            }
+        );
+        assert!(events.next_frame().await.is_err());
+        assert_eq!(
+            client
+                .extension_request(Req::Ack {
+                    cursor: Cursor {
+                        stream: stream.clone(),
+                        seq: 2
+                    },
+                    lease: grant.lease
+                })
+                .await
+                .unwrap(),
+            Resp::Refused {
+                code: Refusal::FutureCursor
+            }
+        );
+    });
+    assert_eq!(rpc.summary(&stream).acked, 0);
+    assert!(matches!(rpc.summary(&stream).state, ChildState::Running(_)));
+}
+
+#[test]
+fn reliable_eof_preserves_unterminated_tail_without_lf() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    let done = f.root.path().join("done");
+    let (stream, _) = rpc.spawn(
+        "eof",
+        &["stdout-fragments", "tail", done.to_str().unwrap(), "eof"],
+    );
+    wait_file(&done);
+    let rt = runtime();
+    rt.block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client
+            .subscribe_reliable(stream.clone(), grant.lease, Some(0))
+            .await
+            .unwrap();
+        let mut expected = vec![b'z'; 513 * 4096];
+        expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(event.kind, ReliableKind::Gap);
+            if event.kind == ReliableKind::Line {
+                got.extend_from_slice(&event.bytes);
+                if event.terminated {
+                    got.push(b'\n');
+                }
+            }
+        }
+        assert_eq!(got, expected);
+    });
 }

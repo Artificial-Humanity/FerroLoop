@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub const PROTO_MAJOR: u16 = 1;
-pub const PROTO_MINOR: u16 = 1;
+pub const PROTO_MINOR: u16 = 2;
 
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 pub const MAX_SUBSCRIBERS: usize = 16;
@@ -495,6 +495,7 @@ pub enum ControlEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     Line {
+        terminated: bool,
         session: SessionId,
         session_epoch: SessionEpoch,
         seq: u64,

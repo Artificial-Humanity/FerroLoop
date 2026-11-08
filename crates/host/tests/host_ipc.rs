@@ -420,7 +420,17 @@ impl EventLog {
                 return events;
             }
             if Instant::now() >= deadline {
-                panic!("events {events:?}");
+                panic!(
+                    "timed out after {} events ({} line bytes)",
+                    events.len(),
+                    events
+                        .iter()
+                        .map(|e| match e {
+                            HostEvent::Line { bytes, .. } => bytes.len(),
+                            _ => 0,
+                        })
+                        .sum::<usize>()
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -437,15 +447,27 @@ impl Drop for EventLog {
 }
 
 fn line_bytes(events: &[HostEvent], session: &str) -> Vec<Vec<u8>> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            HostEvent::Line {
-                session: id, bytes, ..
-            } if id.as_str() == session => Some(bytes.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut lines = Vec::new();
+    let mut tail = Vec::new();
+    for event in events {
+        if let HostEvent::Line {
+            session: id,
+            bytes,
+            terminated,
+            ..
+        } = event
+            && id.as_str() == session
+        {
+            tail.extend_from_slice(bytes);
+            if *terminated {
+                lines.push(std::mem::take(&mut tail));
+            }
+        }
+    }
+    if !tail.is_empty() {
+        lines.push(tail);
+    }
+    lines
 }
 
 fn controls(events: &[HostEvent]) -> Vec<ControlEvent> {
@@ -738,41 +760,46 @@ fn daemon_restart_never_reuses_session_epoch() {
 }
 
 #[test]
-fn stdout_line_overflow_fails_session() {
+fn stdout_fragments_preserve_large_binary_stream_and_keep_child_alive() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("big"));
     let mut rpc = Rpc::connect(&daemon.paths.endpoint);
-    let child = rpc.spawn("big", &["overflow"]);
-    let epoch = epoch_of(&child);
-    log.wait_until(Duration::from_secs(3), |events| {
-        controls(events).iter().any(|event| {
-            matches!(
-                event,
-                ControlEvent::ProtocolFailure { session, session_epoch, .. }
-                    if session.as_str() == "big" && session_epoch.0 == epoch
-            )
-        })
+    let done = daemon.paths.transcript.with_extension("done");
+    rpc.spawn("big", &["stdout-fragments", "tail", done.to_str().unwrap()]);
+    let mut expected = vec![b'z'; 513 * 4096];
+    expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+    let reconstruct = |events: &[HostEvent]| {
+        let mut bytes = Vec::new();
+        for event in events {
+            if let HostEvent::Line {
+                bytes: raw,
+                terminated,
+                ..
+            } = event
+            {
+                bytes.extend_from_slice(raw);
+                if *terminated {
+                    bytes.push(b'\n');
+                }
+            }
+        }
+        bytes
+    };
+    log.wait_until(Duration::from_secs(5), |events| {
+        reconstruct(events).len() == expected.len()
     });
+    let events = log.snapshot();
+    assert_eq!(reconstruct(&events), expected);
     assert!(
-        line_bytes(&log.snapshot(), "big")
+        !controls(&events)
             .iter()
-            .all(|line| line.len() <= 1024 * 1024 && line != &vec![b'z'; 1024 * 1024])
+            .any(|e| matches!(e, ControlEvent::ProtocolFailure { .. }))
     );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let listed = rpc.list();
-        if let Some(child) = listed
+    assert!(
+        rpc.list()
             .iter()
-            .find(|child| record(&child.state).session.as_str() == "big")
-            && !matches!(child.state, ChildState::Running(_))
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("overflow did not fail the session");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+            .any(|c| matches!(&c.state, ChildState::Running(r) if r.session.as_str()=="big"))
+    );
 }
 
 #[test]
@@ -1158,6 +1185,70 @@ fn status_field(text: &str, key: &str) -> usize {
             })
         })
         .unwrap_or_else(|| panic!("missing {key} in {text}"))
+}
+
+#[test]
+fn healthy_subscriber_receives_single_buffered_line_burst() {
+    healthy_subscribers_receive_buffered_line_burst(1);
+}
+
+#[test]
+fn two_healthy_subscribers_receive_single_buffered_line_burst() {
+    healthy_subscribers_receive_buffered_line_burst(2);
+}
+
+fn healthy_subscribers_receive_buffered_line_burst(subscriber_count: usize) {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let endpoint = &daemon.paths.endpoint;
+    let subscribers: Vec<_> = (0..subscriber_count)
+        .map(|_| EventLog::subscribe(endpoint, Some("burst")))
+        .collect();
+    let mut rpc = Rpc::connect(endpoint);
+    let gate = daemon.paths.barrier.join("burst");
+    let child = rpc.spawn("burst", &["gated-line-burst", gate.to_str().unwrap()]);
+    for events in &subscribers {
+        events.wait_until(Duration::from_secs(3), |events| {
+            line_bytes(events, "burst").contains(&b"READY".to_vec())
+        });
+    }
+    std::fs::write(gate, b"go").unwrap();
+    for events in &subscribers {
+        let received = events.wait_until(Duration::from_secs(3), |events| {
+            let lines = line_bytes(events, "burst");
+            lines.iter().any(|line| line == b"L255")
+                || events
+                    .iter()
+                    .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+        });
+        assert!(
+            !received
+                .iter()
+                .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+        );
+        let actual: Vec<_> = line_bytes(&received, "burst")
+            .into_iter()
+            .filter(|line| line.starts_with(b"L"))
+            .collect();
+        let expected: Vec<_> = (0..256).map(|i| format!("L{i:03}").into_bytes()).collect();
+        assert_eq!(actual, expected);
+    }
+    // A subsequent echo proves every subscription remains attached.
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("burst", epoch).expect("lease");
+    assert_eq!(
+        rpc.send("burst", epoch, lease, "AFTER"),
+        SendOutcome::Written
+    );
+    for events in &subscribers {
+        let received = events.wait_until(Duration::from_secs(3), |events| {
+            line_bytes(events, "burst").contains(&b"AFTER".to_vec())
+        });
+        assert!(
+            !received
+                .iter()
+                .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+        );
+    }
 }
 
 #[test]
@@ -2882,6 +2973,7 @@ fn partial_event_cannot_advance_emitted_ceiling() {
     assert!(matches!(
         frame,
         fl_host_proto::ExtensionFrame::ReliablePart {
+            terminated: true,
             seq: 3,
             more: true,
             ..
@@ -2906,6 +2998,9 @@ fn closed_stream_replacement_waits_for_authority_settlement() {
     let t = ticket(&mut rpc, &stream, lease, 0);
     let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
     assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    // The server completes seq 1 before it can emit seq 2. Receiving seq 1
+    // alone can race peer-close against completion and legitimately lose credit.
+    assert_eq!(event_seq(&rt, &mut events, 1), 2);
     arm(&daemon.paths.subscriber, "reliable-settle");
     drop(events);
     wait_at(&daemon.paths.subscriber, "reliable-settle");
@@ -3644,4 +3739,44 @@ fn pty_reliable_session_supports_capture_output_and_write_raw() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn non_reliable_eof_preserves_exact_unterminated_tail() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("eof-tail"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let done = daemon.paths.transcript.with_extension("done");
+    rpc.spawn(
+        "eof-tail",
+        &["stdout-fragments", "tail", done.to_str().unwrap(), "eof"],
+    );
+    let mut expected = vec![b'z'; 513 * 4096];
+    expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+    let reconstruct = |events: &[HostEvent]| {
+        let mut bytes = Vec::new();
+        for event in events {
+            if let HostEvent::Line {
+                bytes: raw,
+                terminated,
+                ..
+            } = event
+            {
+                bytes.extend_from_slice(raw);
+                if *terminated {
+                    bytes.push(b'\n');
+                }
+            }
+        }
+        bytes
+    };
+    let events = log.wait_until(Duration::from_secs(5), |events| {
+        reconstruct(events).len() >= expected.len()
+    });
+    assert_eq!(reconstruct(&events), expected);
+    assert!(
+        !controls(&events)
+            .iter()
+            .any(|e| matches!(e, ControlEvent::ProtocolFailure { .. }))
+    );
 }
