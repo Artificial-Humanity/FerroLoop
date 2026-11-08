@@ -6533,11 +6533,15 @@ fn handle_post_session_model(
                         && let Some(ref effort) = thinking_level
                     {
                         // Best effort: the model switch already landed.
-                        let _ = dispatch_operator_prompt_to_route(
+                        if let Err(err) = dispatch_operator_prompt_to_route(
                             route,
                             authority.actor_name(),
                             &session_actions::effort_command(effort),
-                        );
+                        ) {
+                            eprintln!(
+                                "fl: /effort dispatch for session {canonical_id} failed: {err:?}"
+                            );
+                        }
                     }
                     METHOD_OPERATOR_PROMPT
                 }

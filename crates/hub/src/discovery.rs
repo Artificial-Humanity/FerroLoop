@@ -8942,6 +8942,73 @@ mod tests {
         );
     }
 
+    fn effort_line(level: &str) -> String {
+        model_command_line(Value::String(format!(
+            "<local-command-stdout>Set effort level to {level}</local-command-stdout>"
+        )))
+    }
+
+    fn model_cmd_line(name: &str, inline_effort: Option<&str>) -> String {
+        let tail = inline_effort.map_or(String::new(), |e| format!(" with `{e}` effort"));
+        model_command_line(Value::String(format!(
+            "<local-command-stdout>Set model to `{name}`{tail}</local-command-stdout>"
+        )))
+    }
+
+    #[test]
+    fn claude_effort_older_than_model_command_is_not_inherited() {
+        let transcript = [effort_line("low"), model_cmd_line("Opus 5.5", None)].join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&transcript),
+            Some(("claude-opus-5-5".to_string(), None))
+        );
+        let inline = [effort_line("low"), model_cmd_line("Opus 5.5", Some("high"))].join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&inline),
+            Some(("claude-opus-5-5".to_string(), Some("high".to_string())))
+        );
+    }
+
+    #[test]
+    fn claude_effort_after_model_command_pairs_with_the_winning_model() {
+        // The assistant turn names a different model than the newest `/model`, and a newer
+        // `/effort` exists: the winner keeps that effort.
+        let transcript = [
+            model_cmd_line("Opus 5.5", Some("high")),
+            effort_line("low"),
+            assistant_line("claude-sonnet-5-5"),
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&transcript),
+            Some(("claude-sonnet-5-5".to_string(), Some("low".to_string())))
+        );
+        // With no model command at all, the newest effort rides with the winner.
+        let no_cmd = [
+            assistant_line("claude-sonnet-5-5"),
+            effort_line("medium"),
+            effort_line("xhigh"),
+            assistant_line("claude-sonnet-5-5"),
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&no_cmd),
+            Some(("claude-sonnet-5-5".to_string(), Some("xhigh".to_string())))
+        );
+    }
+
+    #[test]
+    fn claude_effort_command_trims_punctuation_and_rejects_bad_tokens() {
+        let parse = |level: &str| {
+            claude_effort_command(&serde_json::from_str(&effort_line(level)).unwrap())
+        };
+        assert_eq!(parse("high, saved"), Some("high".to_string()));
+        assert_eq!(parse("`high`."), Some("high".to_string()));
+        assert_eq!(parse(&"x".repeat(CODEX_EFFORT_MAX_CHARS + 1)), None);
+        assert_eq!(parse("hi\u{1}gh"), None);
+        assert_eq!(parse(","), None);
+    }
+
     #[test]
     fn claude_model_names_and_shorthands_normalize_to_canonical_ids() {
         for (raw, want) in [
