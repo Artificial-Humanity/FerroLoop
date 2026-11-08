@@ -4000,12 +4000,14 @@ fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
     let mut rpc = Rpc::connect(&daemon.paths.endpoint);
     let gate = daemon.paths.barrier.join("produce");
     let done = daemon.paths.barrier.join("flushed");
+    let fragment_gate = daemon.paths.barrier.join("finish-fragment");
     rpc.spawn(
         "safety-flood",
         &[
             "safety-flood",
             gate.to_str().unwrap(),
             done.to_str().unwrap(),
+            fragment_gate.to_str().unwrap(),
         ],
     );
     std::fs::write(&gate, b"go").unwrap();
@@ -4029,19 +4031,41 @@ fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
             .unwrap();
         let mut count = 0;
         let mut bytes = 0;
+        let mut pending_line = Vec::new();
+        let mut saw_ready = false;
+        let mut saw_fragment = false;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match events.next().await.unwrap() {
-                    HostEvent::Line { bytes: line, .. }
-                        if line == safety_flood::FINAL.as_bytes() =>
-                    {
-                        break;
-                    }
-                    HostEvent::Line { bytes: line, .. } if line == b"READY" => {}
-                    HostEvent::Line { bytes: line, .. } => {
-                        assert_eq!(line, safety_flood::line(count), "record {count}");
-                        bytes += line.len();
-                        count += 1;
+                    HostEvent::Line {
+                        bytes: fragment,
+                        terminated,
+                        ..
+                    } => {
+                        // Pipe reads can split a logical line into multiple events.
+                        pending_line.extend_from_slice(&fragment);
+                        if !terminated {
+                            if count == safety_flood::LINES - 1 && pending_line.len() == 1174 {
+                                // Release only after observing the gated prefix: no timing
+                                // assumption can let this test skip fragmented delivery.
+                                assert_eq!(pending_line, safety_flood::line(count)[..1174]);
+                                assert!(!saw_fragment);
+                                saw_fragment = true;
+                                std::fs::write(&fragment_gate, b"go").unwrap();
+                            }
+                            continue;
+                        }
+                        let line = std::mem::take(&mut pending_line);
+                        if !saw_ready {
+                            assert_eq!(line, b"READY");
+                            saw_ready = true;
+                        } else if line == safety_flood::FINAL.as_bytes() {
+                            break;
+                        } else {
+                            assert_eq!(line, safety_flood::line(count), "record {count}");
+                            bytes += line.len();
+                            count += 1;
+                        }
                     }
                     HostEvent::Control(ControlEvent::SlowSubscriber { .. }) => {
                         panic!("draining subscriber was shed after {count} records ({bytes} bytes)")
@@ -4052,6 +4076,9 @@ fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
         })
         .await
         .expect("drain final marker");
+        assert!(saw_ready);
+        assert!(saw_fragment);
+        assert!(pending_line.is_empty());
         assert_eq!(count, safety_flood::LINES);
         assert_eq!(bytes, safety_flood::LINES * safety_flood::LINE_BYTES);
         assert!(bytes > 8 * 1024 * 1024);

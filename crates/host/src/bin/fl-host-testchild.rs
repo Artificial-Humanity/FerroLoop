@@ -23,8 +23,21 @@ fn main() {
             }
             let mut out = io::stdout().lock();
             for index in 0..safety_flood::LINES {
-                out.write_all(&safety_flood::line(index))
-                    .expect("flood line");
+                let line = safety_flood::line(index);
+                if let Some(gate) = rest.get(2).filter(|_| index == safety_flood::LINES - 1) {
+                    // Hold the suffix until the subscriber observes this partial record.
+                    const SPLIT_BYTES: usize = 1174;
+                    out.write_all(&line[..SPLIT_BYTES]).expect("flood prefix");
+                    out.flush().expect("flood prefix flush");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !std::path::Path::new(gate).exists() {
+                        assert!(std::time::Instant::now() < deadline, "fragment gate");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    out.write_all(&line[SPLIT_BYTES..]).expect("flood suffix");
+                } else {
+                    out.write_all(&line).expect("flood line");
+                }
                 out.write_all(b"\n").expect("flood newline");
             }
             writeln!(out, "{}", safety_flood::FINAL).expect("final marker");
