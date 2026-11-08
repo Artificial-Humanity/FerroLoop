@@ -1,13 +1,14 @@
 # Bounded stdout fragments — Record 178
 
-Status: approved by Ferris with the retention amendment below.
+Status: approved by Ferris, including unattended eviction and explicit gap reporting.
 
 ## Problem and outcome
 
 Both host output paths treat more than 1 MiB without LF as a protocol failure and
 clean up the child. Terminal redraws can produce arbitrarily long runs without LF.
-Such output must remain bounded, promptly visible, and byte-exact without killing
-the child. Retain existing backlog, record, transport, and slice-budget ceilings.
+Such output must remain bounded and promptly visible without killing the child.
+Retained output must reconstruct byte-exactly; unattended eviction must report
+loss explicitly. Retain existing backlog, record, transport, and slice-budget ceilings.
 
 ## Approach
 
@@ -21,8 +22,9 @@ Publish trailing nonempty output at each completed OS read, with false terminati
 and split any larger admitted input into records of at most `MAX_STDOUT_LINE`.
 Publish LF-delimited segments with true termination, including an empty segment
 when an LF follows a previously emitted fragment. EOF never invents an LF.
-CR, ANSI escapes, and arbitrary byte sequences remain unchanged. Quota exhaustion
-retains pending data and applies backpressure; it must not become child cleanup.
+CR, ANSI escapes, and arbitrary byte sequences remain unchanged. With a live
+reliable cursor, quota exhaustion retains pending data and applies backpressure.
+Without one, apply the bounded eviction rule below. Neither case causes cleanup.
 
 ## Compatibility
 
@@ -48,11 +50,17 @@ frames to an old connection. New readers accept old frames as terminated records
 
 ## Unattended retention and coalescing
 
-Reliable records retire only through `acknowledge` in `crates/host/src/reliable.rs`;
-an absent subscriber does not ACK. Non-reliable records retire after a completed
+Before this repair, reliable records retire only through `acknowledge` in
+`crates/host/src/reliable.rs`; an absent subscriber does not ACK. There is no ring
+overwrite or timed eviction. LF-terminated unattended sessions also reach the cap:
+each LF creates another retained record. Non-reliable records retire after a completed
 subscriber write and satisfaction of outstanding holders/cursors (`settle_locked`
 in `crates/host/src/output.rs`). An absent subscriber does not retire data there
-either. Preserve these guarantees; never introduce silent eviction or implicit ACK.
+either. `crates/hub/src/lifecycle.rs` uses `spawn_reliable_session` for hosted
+production sessions. A repository call-site search found no production hub, CLI,
+or wire subscriber or journal ACK sender: `AsyncHostClient::ack` defines the API,
+the daemon handles it, and tests plus `fl-host-testchild` exercise it. Wire message
+ACKs are unrelated. Production capture reads `stdout_tail` and does not ACK it.
 
 Append newly read unterminated bytes to the latest unterminated data record, up to
 1 MiB, if it has never been exposed to a reader. Preserve its sequence. Freeze a
@@ -69,10 +77,36 @@ Test 100,000 one-byte read admissions with an LF-terminated read every 1,000 rea
 without a subscriber. This keeps total bytes and true line count within existing
 caps while independently exceeding the read count cap. Both paths must remain
 unstalled, within budget, and reconstruct exactly for a later minor-2 reader.
-Also exercise a no-LF stream across multiple 1 MiB record boundaries. Finite
-retention still backpressures when actual byte/line limits are exhausted: arbitrary
-unacknowledged output or more than 4096 distinct LF records cannot be retained
-indefinitely under the existing contract. This change does not promise otherwise.
+Also exercise a no-LF stream across multiple 1 MiB record boundaries.
+
+## Bounded unattended reliable eviction
+
+Coalescing alone cannot keep an unattended production session running indefinitely.
+When no reliable subscriber holds a live cursor on the stream, and admitting the
+next record would exhaust the data-record cap or byte budget, retire the oldest
+unacknowledged data records until bounded admission can proceed. Never evict a
+lifecycle record, advance the acknowledged watermark, or claim delivery of evicted
+data. Preserve lifecycle records even when retained data sequence numbers have gaps;
+do not assume the retained journal remains contiguous after eviction.
+
+Record the loss explicitly. A later subscriber must receive a gap/notice naming
+the first sequence it can still receive, before replaying retained data. The reader
+must be able to resume at that sequence and reconstruct the retained bytes exactly.
+Do not turn a gap into a silent cursor jump or acknowledge data on the reader's
+behalf. Protocol changes needed for this notice belong to negotiated minor 2.
+
+While any live reliable cursor exists, preserve lossless backpressure and do not
+evict data. Cursor admission, release, eviction, and record exposure must be
+serialized so a newly attached reader cannot race eviction. A stalled live reader
+can still stall the producer; this is a known risk deliberately outside this fix.
+
+Hard gates: no subscriber and 100,000 LF-terminated plus unterminated admissions
+must never stall the reliable producer while record count and byte charges stay
+bounded; a later subscriber receives a gap then exact retained bytes; a live
+subscriber still receives lossless backpressure. Exercise both record and byte
+pressure, preserved lifecycle records, and unchanged ACK state after eviction.
+The non-reliable path retains its existing delivery guarantees and the coalescing
+and 100,000-read tests above; this eviction policy applies to the reliable journal.
 
 ## Validation and boundaries
 
