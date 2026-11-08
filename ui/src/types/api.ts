@@ -699,12 +699,20 @@ export interface ClearSessionResponse {
   prompt?: string | null;
 }
 
+export type PermissionPosture =
+  | "ask"
+  | "accept-edits"
+  | "auto"
+  | "plan"
+  | "bypass";
+
 export interface SpinUpSessionRequest {
   persona: string;
   project: string;
   role: string;
   vendor: string;
   model?: string;
+  posture?: PermissionPosture;
   node_id?: string;
   hosted?: boolean;
   cwd?: string;
@@ -723,6 +731,12 @@ export interface SpinUpSessionResponse {
   role: string;
   vendor: string;
   model?: string | null;
+  posture?: PermissionPosture;
+  permission_receipts?: Array<{
+    class: string;
+    summary: string;
+    evidence?: string;
+  }>;
   node_id: string;
   hosted: boolean;
   status: string;
@@ -1951,6 +1965,7 @@ export type RemodelMode = "prepare" | "execute";
 export interface RemodelSessionRequest {
   vendor: string;
   model?: string | null;
+  posture?: PermissionPosture;
   mode?: RemodelMode;
   cwd?: string | null;
   node_id?: string | null;
@@ -1967,6 +1982,12 @@ export interface RemodelSessionResponse {
   from_vendor: string;
   vendor: string;
   model: string | null;
+  posture?: PermissionPosture;
+  permission_receipts?: Array<{
+    class: string;
+    summary: string;
+    evidence?: string;
+  }>;
   node_id: string;
   hosted: boolean;
   cwd: string | null;

@@ -73,6 +73,7 @@ describe("SpinUpAgentModal", () => {
         role: "assistant",
         vendor: "antigravity",
         model: "gemini-4-argon",
+        posture: "auto",
         node_id: "ai-lab-0",
         hosted: true,
       });
@@ -371,6 +372,7 @@ describe("SpinUpAgentModal", () => {
           project: "kaggle-gemma4",
           role: "assistant",
           vendor: "claude",
+          posture: "auto",
           node_id: "ai-lab-0",
           hosted: true,
         },
@@ -495,6 +497,96 @@ describe("SpinUpAgentModal", () => {
         /claude · claude-haiku-4-5/i,
       );
     });
+
+    unmount();
+  });
+
+  it("defaults permission posture to auto, requires explicit choice for bypass, resets on reopen, and surfaces posture rejection errors", async () => {
+    const onSpinUp = vi.fn(
+      async (req: SpinUpSessionRequest): Promise<SpinUpSessionResponse> => {
+        if (req.vendor === "antigravity" && req.posture === "accept-edits") {
+          throw new Error(
+            "Unsupported permission posture 'accept-edits' for vendor 'antigravity'",
+          );
+        }
+        return {
+          session_id: "sess-felix-382",
+          persona: req.persona,
+          project: req.project,
+          role: req.role,
+          vendor: req.vendor,
+          model: req.model ?? null,
+          posture: req.posture,
+          node_id: req.node_id ?? "ai-lab-0",
+          hosted: Boolean(req.hosted),
+          status: "running",
+          hydration_dispatched: true,
+        };
+      },
+    );
+    const onClose = vi.fn();
+
+    const { rerender, unmount } = render(
+      <SpinUpAgentModal isOpen onClose={onClose} onSpinUp={onSpinUp} />,
+    );
+
+    const postureSelect = screen.getByTestId(
+      "spin-up-posture-select",
+    ) as HTMLSelectElement;
+    expect(postureSelect.value).toBe("auto");
+    expect(Array.from(postureSelect.options).map((o) => o.value)).toEqual([
+      "ask",
+      "accept-edits",
+      "auto",
+      "plan",
+      "bypass",
+    ]);
+
+    // Explicitly choose bypass and verify reopening resets back to auto
+    fireEvent.change(postureSelect, { target: { value: "bypass" } });
+    expect(postureSelect.value).toBe("bypass");
+
+    rerender(<SpinUpAgentModal isOpen={false} onClose={onClose} onSpinUp={onSpinUp} />);
+    rerender(<SpinUpAgentModal isOpen onClose={onClose} onSpinUp={onSpinUp} />);
+
+    const reopenedPostureSelect = screen.getByTestId(
+      "spin-up-posture-select",
+    ) as HTMLSelectElement;
+    expect(reopenedPostureSelect.value).toBe("auto");
+
+    // Surface server error when unsupported vendor+posture is rejected
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "felix" },
+    });
+    fireEvent.change(screen.getByTestId("spin-up-vendor-select"), {
+      target: { value: "antigravity" },
+    });
+    fireEvent.change(reopenedPostureSelect, {
+      target: { value: "accept-edits" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Unsupported permission posture 'accept-edits' for vendor 'antigravity'/i,
+    );
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Explicit bypass selection submits posture: "bypass"
+    fireEvent.change(reopenedPostureSelect, {
+      target: { value: "bypass" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpinUp).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          persona: "felix",
+          vendor: "antigravity",
+          posture: "bypass",
+        }),
+      );
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
 
     unmount();
   });

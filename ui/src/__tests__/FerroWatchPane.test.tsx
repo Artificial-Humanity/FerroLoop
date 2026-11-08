@@ -520,6 +520,17 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
     expect(within(balanceControls).getByTestId("watch-remodel-agent-select")).toHaveValue(
       "ferris",
     );
+    const remodelPostureSelect = within(balanceControls).getByTestId(
+      "watch-remodel-posture-select",
+    ) as HTMLSelectElement;
+    expect(remodelPostureSelect.value).toBe("auto");
+    expect(Array.from(remodelPostureSelect.options).map((o) => o.value)).toEqual([
+      "ask",
+      "accept-edits",
+      "auto",
+      "plan",
+      "bypass",
+    ]);
     fireEvent.change(within(balanceControls).getByTestId("watch-remodel-vendor-select"), {
       target: { value: "codex" },
     });
@@ -534,11 +545,28 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
           (r) =>
             r.method === "POST" &&
             r.url.includes("/api/v1/sessions/ferris/remodel") &&
-            r.body?.includes('"vendor":"codex"'),
+            r.body?.includes('"vendor":"codex"') &&
+            r.body?.includes('"posture":"auto"'),
         ),
       ).toBe(true);
     });
     expect(onAfterRemodel).toHaveBeenCalledTimes(1);
+
+    // Explicit posture choice (e.g. bypass) is forwarded in remodelSession
+    fireEvent.change(remodelPostureSelect, { target: { value: "bypass" } });
+    fireEvent.click(within(balanceControls).getByTestId("watch-remodel-submit-btn"));
+
+    await waitFor(() => {
+      expect(
+        requestLog.some(
+          (r) =>
+            r.method === "POST" &&
+            r.url.includes("/api/v1/sessions/ferris/remodel") &&
+            r.body?.includes('"posture":"bypass"'),
+        ),
+      ).toBe(true);
+    });
+    expect(onAfterRemodel).toHaveBeenCalledTimes(2);
 
     // 5. Agent & Peer Liveness Table
     const livenessSection = screen.getByTestId("watch-liveness-section");

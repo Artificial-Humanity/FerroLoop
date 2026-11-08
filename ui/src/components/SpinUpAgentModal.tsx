@@ -8,6 +8,7 @@ import {
 import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
 import type {
   EnrolledNode,
+  PermissionPosture,
   ProjectSummary,
   SpinUpSessionRequest,
   SpinUpSessionResponse,
@@ -136,12 +137,7 @@ export function computeWorktreeBootstrapPreview(
 
 // Record #103: Universal Agent Permission & Auto-Accept Management
 // Converged 5-Vendor 3-Layer Model: Posture + Sandbox + Rules
-export type UniversalPermissionPosture =
-  | "ask"
-  | "accept-edits"
-  | "auto"
-  | "plan"
-  | "bypass";
+export type UniversalPermissionPosture = PermissionPosture;
 
 export type UniversalSandboxMode = "vendor-default" | "off";
 
@@ -845,7 +841,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [worktreePolicyTouched, setWorktreePolicyTouched] = useState(false);
   const [localProviderPreset, setLocalProviderPreset] =
     useState<string>("vendor-native");
-  const [posture, setPosture] = useState<UniversalPermissionPosture>("ask");
+  const [posture, setPosture] = useState<UniversalPermissionPosture>("auto");
   const [sandbox, setSandbox] =
     useState<UniversalSandboxMode>("vendor-default");
   const [rulePreset, setRulePreset] =
@@ -866,6 +862,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       setProject(resolveSpinUpProject(initialProject, projectsRef.current));
+      setPosture("auto");
       setWorktreePolicyTouched(false);
       setPermissionsTouched(false);
     }
@@ -920,6 +917,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       role,
       vendor,
       ...(model.trim() ? { model: model.trim() } : {}),
+      posture,
       node_id: nodeId.trim() || "ai-lab-0",
       hosted,
       ...(worktreePolicyTouched
@@ -1523,9 +1521,9 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                       }}
                       style={{ width: "100%", fontSize: "10.5px" }}
                     >
-                      <option value="ask">ask (default)</option>
+                      <option value="ask">ask</option>
                       <option value="accept-edits">accept-edits</option>
-                      <option value="auto">auto</option>
+                      <option value="auto">auto (default)</option>
                       <option value="plan">plan</option>
                       <option value="bypass">bypass (skip prompts)</option>
                     </select>
