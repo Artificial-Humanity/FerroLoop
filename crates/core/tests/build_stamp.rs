@@ -162,6 +162,47 @@ mod as_a_build_script {
         let _ = repo;
     }
 
+    #[test]
+    fn shared_stamp_changes_mark_a_binary_without_core_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((repo, krate)) = checkout(tmp.path(), "shared_stamp_changes") else {
+            return;
+        };
+        let core_source = repo.join("crates/core/src/lib.rs");
+        std::fs::create_dir_all(core_source.parent().unwrap()).unwrap();
+        std::fs::write(&core_source, "").unwrap();
+        assert!(git(&repo, &["add", "."]));
+        assert!(git(&repo, &["commit", "-q", "-m", "core runtime"]));
+        let exe = compile(tmp.path());
+        let dirty =
+            || value(&run(&exe, &krate, tmp.path(), &[]), "FL_BUILD_DIRTY").map(String::from);
+        assert_eq!(dirty().as_deref(), Some("false"));
+        // This binary shares the build helper but does not depend on core's runtime.
+        std::fs::write(core_source, "// unrelated runtime edit").unwrap();
+        assert_eq!(dirty().as_deref(), Some("false"));
+        std::fs::write(repo.join("crates/core/build/stamp.rs"), "// helper edit").unwrap();
+        assert_eq!(dirty().as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn shared_stamp_is_watched_without_core_runtime_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((repo, krate)) = checkout(tmp.path(), "shared_stamp_is_watched") else {
+            return;
+        };
+        std::fs::create_dir_all(repo.join("crates/core/src")).unwrap();
+        let exe = compile(tmp.path());
+        let lines = run(&exe, &krate, tmp.path(), &[]);
+        let watched = |relative: &str| {
+            lines.contains(&format!(
+                "cargo:rerun-if-changed={}",
+                repo.join(relative).canonicalize().unwrap().display()
+            ))
+        };
+        assert!(watched("crates/core/build/stamp.rs"), "{lines:?}");
+        assert!(!watched("crates/core/src"));
+    }
+
     /// The same sources always stamp the same bytes, whatever the clock, and the status read
     /// does not write the index (which would make the script rerun for its own write).
     #[test]

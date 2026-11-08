@@ -211,11 +211,11 @@ pub fn watch_paths(git_dir: &Path) -> Vec<PathBuf> {
 /// What of a crate's directory the compiler reads; the dirty flag and the rerun list use
 /// exactly these.
 pub const CRATE_INPUTS: [&str; 4] = ["src", "build", "build.rs", "Cargo.toml"];
-/// What of the workspace root every crate is built with.
-pub const WORKSPACE_INPUTS: [&str; 2] = ["Cargo.toml", "Cargo.lock"];
+/// Workspace files every stamped crate builds with, including this shared build helper.
+pub const WORKSPACE_INPUTS: [&str; 3] = ["Cargo.toml", "Cargo.lock", WORKSPACE_MARKER];
 
 /// The existing source paths of `crates` (directories relative to `manifest_dir`, such as
-/// `"."` and `"../core"`) plus the workspace manifest and lock file two levels above
+/// `"."` and `"../core"`) plus the shared workspace inputs rooted two levels above
 /// `manifest_dir`: absolute, without `..`, sorted.
 pub fn inputs(manifest_dir: &Path, crates: &[&str]) -> Vec<PathBuf> {
     let root = manifest_dir.join("../..");
