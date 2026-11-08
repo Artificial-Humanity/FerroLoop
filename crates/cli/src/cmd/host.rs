@@ -74,6 +74,34 @@ fn session_vendor_and_state(summary: &SessionSummary) -> (String, &'static str, 
     (vendor, state, pid)
 }
 
+fn state_rank(state: &ChildState) -> u8 {
+    match state {
+        ChildState::Running(_) => 2,
+        ChildState::LeaderExited(_) => 1,
+        ChildState::CleanupComplete(_) => 0,
+    }
+}
+
+/// Deduplicate `fl-host` session summaries by session ID, keeping the running or newest epoch
+/// so superseded `cleanup_complete` epochs from prior restarts do not appear alongside a live
+/// session of the same name.
+pub fn dedup_session_summaries(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    let mut by_session: std::collections::BTreeMap<String, SessionSummary> =
+        std::collections::BTreeMap::new();
+    for s in sessions {
+        let key = s.stream.session.as_str().to_string();
+        match by_session.get(&key) {
+            Some(prev)
+                if (state_rank(&prev.state), prev.stream.epoch.0)
+                    >= (state_rank(&s.state), s.stream.epoch.0) => {}
+            _ => {
+                by_session.insert(key, s);
+            }
+        }
+    }
+    by_session.into_values().collect()
+}
+
 fn resolve_target_session<'a>(
     sessions: &'a [SessionSummary],
     target: &str,
@@ -116,9 +144,11 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     endpoint.socket_path().display()
                 )
             })?;
-            let sessions = client
-                .list_sessions()
-                .context("failed to list fl-host sessions")?;
+            let sessions = dedup_session_summaries(
+                client
+                    .list_sessions()
+                    .context("failed to list fl-host sessions")?,
+            );
             let active = sessions
                 .iter()
                 .filter(|s| matches!(s.state, ChildState::Running(_)))
@@ -146,9 +176,11 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     endpoint.socket_path().display()
                 )
             })?;
-            let sessions = client
-                .list_sessions()
-                .context("failed to list fl-host sessions")?;
+            let sessions = dedup_session_summaries(
+                client
+                    .list_sessions()
+                    .context("failed to list fl-host sessions")?,
+            );
             if json {
                 let rows: Vec<_> = sessions
                     .iter()
@@ -191,9 +223,11 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     endpoint.socket_path().display()
                 )
             })?;
-            let sessions = client
-                .list_sessions()
-                .context("failed to list fl-host sessions")?;
+            let sessions = dedup_session_summaries(
+                client
+                    .list_sessions()
+                    .context("failed to list fl-host sessions")?,
+            );
             let summary = resolve_target_session(&sessions, &session)?;
             let limit = u32::try_from(max_bytes)
                 .unwrap_or(u32::MAX)
@@ -213,9 +247,11 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     endpoint.socket_path().display()
                 )
             })?;
-            let sessions = client
-                .list_sessions()
-                .context("failed to list fl-host sessions")?;
+            let sessions = dedup_session_summaries(
+                client
+                    .list_sessions()
+                    .context("failed to list fl-host sessions")?,
+            );
             let summary = resolve_target_session(&sessions, &session)?;
             let stream = summary.stream.clone();
             let grant = client
@@ -256,9 +292,11 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     endpoint.socket_path().display()
                 )
             })?;
-            let sessions = client
-                .list_sessions()
-                .context("failed to list fl-host sessions")?;
+            let sessions = dedup_session_summaries(
+                client
+                    .list_sessions()
+                    .context("failed to list fl-host sessions")?,
+            );
             let summary = resolve_target_session(&sessions, &session)?;
             let stream = summary.stream.clone();
             let grant = client
@@ -342,5 +380,51 @@ mod tests {
 
         let resolved_muse = resolve_target_session(&sessions, "muse:eve").unwrap();
         assert_eq!(resolved_muse.stream.session.as_str(), "muse.eve");
+    }
+
+    #[test]
+    fn dedup_session_summaries_drops_superseded_cleanup_complete_epochs() {
+        use fl_host_proto::ChildExit;
+        let sid = SessionId::new("Feira.antigravity").unwrap();
+        let old_cleanup = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([7u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::CleanupComplete(ChildRecord {
+                session: sid.clone(),
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                pid: 1111,
+                input: InputState::Fenced,
+                started_at_ms: 100,
+                exit: Some(ChildExit {
+                    code: Some(0),
+                    signal: None,
+                }),
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Fenced,
+        };
+        let mut new_running = make_summary("Feira.antigravity", 2270049);
+        new_running.stream.epoch = SessionEpoch(2);
+        if let ChildState::Running(ref mut rec) = new_running.state {
+            rec.session_epoch = SessionEpoch(2);
+        }
+
+        let deduped = dedup_session_summaries(vec![old_cleanup.clone(), new_running.clone()]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].stream.epoch, SessionEpoch(2));
+        assert!(matches!(deduped[0].state, ChildState::Running(_)));
+
+        // Reversed input order still keeps the running epoch.
+        let deduped_rev = dedup_session_summaries(vec![new_running, old_cleanup]);
+        assert_eq!(deduped_rev.len(), 1);
+        assert_eq!(deduped_rev[0].stream.epoch, SessionEpoch(2));
+        assert!(matches!(deduped_rev[0].state, ChildState::Running(_)));
     }
 }

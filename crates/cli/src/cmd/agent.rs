@@ -75,7 +75,7 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Spin up a hosted agent session: register the agent, open its tmux runtime, and hydrate it.
+    /// Spin up a hosted agent session: register the agent, open its hosted runtime, and hydrate it.
     SpinUp {
         /// Persona slug (`felicity`): lowercase letters, digits and `-`.
         persona: String,
@@ -90,6 +90,7 @@ pub enum AgentCmd {
         /// Vendor runtime (`claude`, `antigravity`, `codex`, `grok`, or `muse`).
         #[arg(long)]
         vendor: String,
+        /// Model on the vendor runtime (default: the vendor's own default).
         #[arg(long)]
         model: Option<String>,
         /// Vendor-native thinking level (`--effort` for Claude, reasoning effort for Codex, the
@@ -100,10 +101,10 @@ pub enum AgentCmd {
         /// Node the session runs on (default `ai-lab-0`).
         #[arg(long = "node-id")]
         node_id: Option<String>,
-        /// Open a tmux runtime for the session (`--hosted false` records it without one).
+        /// Open a hosted runtime (`fl-host`) for the session (`--hosted false` records it without one).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         hosted: bool,
-        /// Working directory for the tmux session.
+        /// Working directory for the hosted session.
         #[arg(long)]
         cwd: Option<String>,
         /// Author recording this spin-up.
@@ -148,7 +149,7 @@ pub enum AgentCmd {
         /// Node the new session runs on (default: the session's own).
         #[arg(long = "node", visible_alias = "node-id")]
         node_id: Option<String>,
-        /// Open a tmux runtime for the new session (default: as the session was).
+        /// Open a hosted runtime (`fl-host`) for the new session (default: as the session was).
         #[arg(long, action = clap::ArgAction::Set)]
         hosted: Option<bool>,
         /// Author recording this remodel.
@@ -269,14 +270,16 @@ pub fn resolve_agent<S: AgentRegistry + Handles>(
     store: &S,
     input: &str,
 ) -> Result<AgentRecord, String> {
-    if let Ok(r) = input.parse::<Ref>() {
+    if let Ok(r) = input.parse::<Ref>()
+        && !matches!(r, Ref::Slug(_))
+    {
         let iri = match r {
             Ref::Iri(iri) => iri,
             Ref::Handle(h) => store
                 .resolve_handle(Kind::Agent, h)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("no agent with handle {h} in this store"))?,
-            Ref::Issue(_) => {
+            Ref::Issue(_) | Ref::Slug(_) => {
                 return Err(format!(
                     "`{input}` is an issue reference, not an agent handle, IRI, or name"
                 ));
@@ -382,15 +385,149 @@ fn format_verdict_label(verdict: &LivenessVerdict) -> String {
 fn format_liveness_line(
     target: &str,
     hb: Option<&AttemptHeartbeat>,
+    adapter: Option<&str>,
     verdict: &LivenessVerdict,
 ) -> String {
     let v = format_verdict_label(verdict);
-    match hb {
-        Some(hb) => format!(
+    match (hb, verdict) {
+        (Some(hb), _) => format!(
             "{target}\t{v}\tadapter={}\tduration={}ms\ttokens={}/{}\tcost={} micro-USD",
             hb.adapter, hb.duration_ms, hb.tokens_in, hb.tokens_out, hb.cost_usd_micros
         ),
-        None => format!("{target}\t{v}"),
+        (None, LivenessVerdict::Live { duration_ms, .. }) => format!(
+            "{target}\t{v}\tadapter={}\tduration={duration_ms}ms\ttokens=0/0\tcost=0 micro-USD",
+            adapter.unwrap_or("-")
+        ),
+        (None, _) => format!("{target}\t{v}"),
+    }
+}
+
+/// Evaluate live `fl-host` session or active `RouteTable` liveness for `target` when no
+/// wrapper `AttemptHeartbeat` exists in the store.
+pub fn hosted_session_liveness<F>(
+    target: &str,
+    sessions: &[fl_host_proto::SessionSummary],
+    routes: Option<&fl_wire::identity::RouteTable>,
+    now: &At,
+    local_host: &str,
+    pid_alive: F,
+) -> Option<(String, String, LivenessVerdict)>
+where
+    F: Fn(u32) -> bool,
+{
+    let target_trimmed = target.trim();
+    for summary in sessions {
+        let fl_host_proto::ChildState::Running(rec) = &summary.state else {
+            continue;
+        };
+        if !pid_alive(rec.pid) {
+            continue;
+        }
+        let sid = summary.stream.session.as_str();
+        let matched = match sid.split_once('.') {
+            Some((s, w)) if s.eq_ignore_ascii_case("muse") => (w
+                .eq_ignore_ascii_case(target_trimmed)
+                || sid.eq_ignore_ascii_case(target_trimmed)
+                || format!("{s}:{w}").eq_ignore_ascii_case(target_trimmed))
+            .then(|| (w.trim().to_ascii_lowercase(), "muse".to_string())),
+            Some((s, w)) => (s.eq_ignore_ascii_case(target_trimmed)
+                || sid.eq_ignore_ascii_case(target_trimmed)
+                || format!("{s}:{w}").eq_ignore_ascii_case(target_trimmed))
+            .then(|| (s.trim().to_ascii_lowercase(), w.trim().to_ascii_lowercase())),
+            None => sid
+                .eq_ignore_ascii_case(target_trimmed)
+                .then(|| (sid.trim().to_ascii_lowercase(), "unknown".to_string())),
+        };
+        if let Some((persona, adapter)) = matched {
+            let duration_ms = now.unix_millis().saturating_sub(rec.started_at_ms);
+            return Some((
+                adapter,
+                persona,
+                LivenessVerdict::Live {
+                    pid: rec.pid,
+                    host: local_host.to_string(),
+                    heartbeat_at: now.clone(),
+                    duration_ms,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd_micros: 0,
+                },
+            ));
+        }
+    }
+
+    if let Some(table) = routes
+        && let Some(entry) = table.get(target)
+    {
+        let matched = match &entry.route {
+            fl_wire::identity::VendorRoute::Claude { pid, .. } if *pid > 0 && pid_alive(*pid) => {
+                Some(("claude".to_string(), *pid))
+            }
+            fl_wire::identity::VendorRoute::Agy {
+                ls_pid: Some(pid), ..
+            } if *pid > 0 && pid_alive(*pid) => Some(("antigravity".to_string(), *pid)),
+            _ => None,
+        };
+        if let Some((adapter, pid)) = matched {
+            let duration_ms = now
+                .unix_millis()
+                .saturating_sub(entry.updated_at.unix_millis());
+            return Some((
+                adapter,
+                entry.persona.clone(),
+                LivenessVerdict::Live {
+                    pid,
+                    host: local_host.to_string(),
+                    heartbeat_at: now.clone(),
+                    duration_ms,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd_micros: 0,
+                },
+            ));
+        }
+    }
+    None
+}
+
+fn discover_live_host_sessions_for_liveness() -> Vec<fl_host_proto::SessionSummary> {
+    if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1")
+        && std::env::var_os("FL_HOST_SOCK").is_none()
+    {
+        return Vec::new();
+    }
+    #[cfg(test)]
+    if std::env::var_os("FL_HOST_SOCK").is_none() {
+        return Vec::new();
+    }
+    let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+        return Vec::new();
+    };
+    let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
+        return Vec::new();
+    };
+    client
+        .list_sessions()
+        .map(crate::cmd::host::dedup_session_summaries)
+        .unwrap_or_default()
+}
+
+fn load_routes_for_liveness() -> Option<fl_wire::identity::RouteTable> {
+    if let Some(explicit) = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from) {
+        return Some(fl_wire::identity::RouteTable::load(Some(&explicit)));
+    }
+    if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1") {
+        return None;
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        let path = fl_wire::identity::default_routes_path();
+        path.is_file()
+            .then(|| fl_wire::identity::RouteTable::load(Some(&path)))
     }
 }
 
@@ -861,27 +998,40 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                     })
                     .map(|(_, hb)| hb);
 
-                let verdict = evaluate_liveness(
-                    matched_hb.as_ref(),
-                    &now,
-                    stale_after_ms,
-                    &host,
-                    pid_is_alive,
-                );
+                let (adapter, agent, verdict) = if let Some(ref hb) = matched_hb {
+                    let v = evaluate_liveness(Some(hb), &now, stale_after_ms, &host, pid_is_alive);
+                    (Some(hb.adapter.clone()), hb.agent.clone(), v)
+                } else {
+                    let host_sessions = discover_live_host_sessions_for_liveness();
+                    let routes = load_routes_for_liveness();
+                    if let Some((adapter, agent, v)) = hosted_session_liveness(
+                        &t,
+                        &host_sessions,
+                        routes.as_ref(),
+                        &now,
+                        &host,
+                        pid_is_alive,
+                    ) {
+                        (Some(adapter), Some(agent), v)
+                    } else {
+                        let v = evaluate_liveness(None, &now, stale_after_ms, &host, pid_is_alive);
+                        (None, None, v)
+                    }
+                };
                 if json {
                     let item = LivenessReportItem {
                         target: t,
                         attempt_id: matched_hb.as_ref().map(|h| h.attempt_id.clone()),
                         record: matched_hb.as_ref().map(|h| h.record.clone()),
-                        adapter: matched_hb.as_ref().map(|h| h.adapter.clone()),
-                        agent: matched_hb.as_ref().and_then(|h| h.agent.clone()),
+                        adapter,
+                        agent,
                         verdict,
                     };
                     println!("{}", serde_json::to_string_pretty(&item).unwrap());
                 } else {
                     println!(
                         "{}",
-                        format_liveness_line(&t, matched_hb.as_ref(), &verdict)
+                        format_liveness_line(&t, matched_hb.as_ref(), adapter.as_deref(), &verdict,)
                     );
                 }
                 Ok(())
@@ -898,10 +1048,12 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                     }
                 }
                 let mut items = Vec::new();
+                let mut seen_agents = std::collections::BTreeSet::new();
                 for (_, (slug, hb)) in dedup {
                     let verdict =
                         evaluate_liveness(Some(&hb), &now, stale_after_ms, &host, pid_is_alive);
                     let label = hb.agent.clone().unwrap_or(slug);
+                    seen_agents.insert(label.to_ascii_lowercase());
                     if json {
                         items.push(LivenessReportItem {
                             target: label,
@@ -912,7 +1064,54 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                             verdict,
                         });
                     } else {
-                        println!("{}", format_liveness_line(&label, Some(&hb), &verdict));
+                        println!(
+                            "{}",
+                            format_liveness_line(
+                                &label,
+                                Some(&hb),
+                                Some(hb.adapter.as_str()),
+                                &verdict,
+                            )
+                        );
+                    }
+                }
+                let host_sessions = discover_live_host_sessions_for_liveness();
+                for summary in &host_sessions {
+                    if !matches!(summary.state, fl_host_proto::ChildState::Running(_)) {
+                        continue;
+                    }
+                    let sess_name = summary.stream.session.as_str();
+                    if let Some((adapter, agent, verdict)) = hosted_session_liveness(
+                        sess_name,
+                        &host_sessions,
+                        None,
+                        &now,
+                        &host,
+                        pid_is_alive,
+                    ) {
+                        if !seen_agents.insert(agent.to_ascii_lowercase()) {
+                            continue;
+                        }
+                        if json {
+                            items.push(LivenessReportItem {
+                                target: agent.clone(),
+                                attempt_id: None,
+                                record: None,
+                                adapter: Some(adapter),
+                                agent: Some(agent),
+                                verdict,
+                            });
+                        } else {
+                            println!(
+                                "{}",
+                                format_liveness_line(
+                                    &agent,
+                                    None,
+                                    Some(adapter.as_str()),
+                                    &verdict
+                                )
+                            );
+                        }
                     }
                 }
                 if json {
@@ -1198,5 +1397,108 @@ mod tests {
             },
         );
         assert!(matches!(second_lead, Err((2, _))));
+    }
+
+    #[test]
+    fn hosted_session_liveness_resolves_running_fl_host_session_and_active_route() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, HostInstance, InputState, SessionEpoch, SessionId,
+            SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use fl_wire::identity::{RouteTable, VendorRoute};
+
+        let sid = SessionId::new("Feira.antigravity").unwrap();
+        let sessions = vec![SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([1u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(2),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: 2270049,
+                session: sid,
+                session_epoch: SessionEpoch(2),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1_000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        }];
+        let now = At::from_unix_millis(6_000);
+        let (adapter, agent, verdict) =
+            hosted_session_liveness("feira", &sessions, None, &now, "ai-lab-0", |pid| {
+                pid == 2270049
+            })
+            .expect("live fl-host session must report live");
+        assert_eq!(adapter, "antigravity");
+        assert_eq!(agent, "feira");
+        assert_eq!(
+            verdict,
+            LivenessVerdict::Live {
+                pid: 2270049,
+                host: "ai-lab-0".into(),
+                heartbeat_at: now.clone(),
+                duration_ms: 5_000,
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd_micros: 0,
+            }
+        );
+        let line = format_liveness_line("feira", None, Some(&adapter), &verdict);
+        assert!(line.starts_with("feira\tlive\tadapter=antigravity\tduration=5000ms"));
+
+        // RouteTable fallback when fl-host session list is empty.
+        let mut routes = RouteTable::default();
+        routes.upsert_explicit(
+            "felix",
+            VendorRoute::Agy {
+                conversation_id: "conv-felix".into(),
+                ls_pid: Some(2667475),
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(2_000),
+        );
+        let (adapter2, agent2, verdict2) =
+            hosted_session_liveness("felix", &[], Some(&routes), &now, "ai-lab-0", |pid| {
+                pid == 2667475
+            })
+            .expect("live route pid must report live");
+        assert_eq!(adapter2, "antigravity");
+        assert_eq!(agent2, "felix");
+        assert!(matches!(
+            verdict2,
+            LivenessVerdict::Live {
+                pid: 2667475,
+                duration_ms: 4_000,
+                ..
+            }
+        ));
+
+        // An Agy route with `ls_pid: None` must return `None` even when `ls_address` is listening.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        routes.upsert_explicit(
+            "pidless",
+            VendorRoute::Agy {
+                conversation_id: "conv-pidless".into(),
+                ls_pid: None,
+                ls_address: Some(format!("127.0.0.1:{port}")),
+                csrf_token: Some("csrf-tok".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(2_000),
+        );
+        assert!(
+            hosted_session_liveness("pidless", &[], Some(&routes), &now, "ai-lab-0", |_| true)
+                .is_none(),
+            "Agy route without live ls_pid must not report Live (pid 0)"
+        );
     }
 }

@@ -214,7 +214,7 @@ pub enum FlowCmd {
 }
 
 impl FlowCmd {
-    fn project_ref(&self) -> Option<&Ref> {
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
         match self {
             Self::Add { project, .. }
             | Self::List { project, .. }
@@ -339,7 +339,9 @@ fn resolve_workflow_def(
     explicit_project: Option<&Ref>,
     cwd: &Path,
 ) -> Result<WorkflowDef> {
-    if let Ok(r) = raw.parse::<Ref>() {
+    if let Ok(r) = raw.parse::<Ref>()
+        && !matches!(r, Ref::Slug(_))
+    {
         match r {
             Ref::Iri(iri) => {
                 if let Some(def) = ctx.store.get_workflow_def(&WorkflowId(iri))? {
@@ -357,6 +359,7 @@ fn resolve_workflow_def(
                     return Ok(def);
                 }
             }
+            Ref::Slug(_) => {}
         }
     }
 

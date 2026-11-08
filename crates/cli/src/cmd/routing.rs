@@ -93,6 +93,14 @@ impl Cmd {
         refs::has_handle(&self.refs())
     }
 
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::Set { project, .. } | Cmd::Remove { project, .. } | Cmd::Show { project } => {
+                Some(project)
+            }
+        }
+    }
+
     /// Whether this command writes a routing map.
     pub fn sets_routing(&self) -> bool {
         matches!(self, Cmd::Set { .. })
@@ -328,5 +336,18 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn routing_show_accepts_project_slug_and_resolves_project() {
+        let s = fl_core::MemStore::default();
+        let p = s.add_project("/workspace/FerroLoop").unwrap();
+        let slug: Ref = "ferroloop".parse().unwrap();
+        let cmd = Cmd::Show { project: slug };
+        assert_eq!(cmd.project_ref().and_then(Ref::as_slug), Some("ferroloop"));
+        assert!(!cmd.has_handle());
+        let resolved = refs::resolve(&s, "memory", Kind::Project, cmd.project_ref().unwrap())
+            .expect("project slug resolves");
+        assert_eq!(ProjectId(resolved), p);
     }
 }

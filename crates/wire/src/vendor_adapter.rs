@@ -209,6 +209,10 @@ pub fn agy_cli_model_id(model: &str, thinking_level: Option<&str>) -> String {
         return String::new();
     }
     let (base, existing) = split_agy_thinking_suffix(&model);
+    let base = match base.as_str() {
+        "argon" | "argon-4" | "argon-4.0" | "gemini-4.0-argon" => "gemini-4-argon",
+        other => other,
+    };
     if base == "gpt-oss-120b" {
         return format!("{base}-medium");
     }
@@ -1032,6 +1036,17 @@ mod tests {
             ]
         );
         assert_eq!(agy.interrupt_key(), "C-c");
+        for alias in [
+            "argon-4.0",
+            "argon-4.0-medium",
+            "argon-4",
+            "argon",
+            "gemini-4.0-argon",
+            "gemini-4-argon",
+        ] {
+            assert_eq!(agy_cli_model_id(alias, None), "gemini-4-argon-medium");
+            assert_eq!(agy_cli_model_id(alias, Some("high")), "gemini-4-argon-high");
+        }
 
         let grok = lookup_vendor_cli_adapter("grok").unwrap();
         let spec = grok.build_launch_spec("ada", Some("grok-4"), None, "-start", None);

@@ -736,6 +736,10 @@ impl Handles for FerroStore {
             Iri::parse(&raw).map(Some).map_err(decode)
         })
     }
+
+    fn projects_for_slug(&self) -> Result<Vec<Project>, StoreError> {
+        self.list_projects()
+    }
 }
 
 impl Bindings for FerroStore {

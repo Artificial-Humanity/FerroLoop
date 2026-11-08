@@ -109,6 +109,18 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::List { project, .. } => project.as_ref(),
+            Cmd::Raise { .. }
+            | Cmd::Reproduce { .. }
+            | Cmd::Assign { .. }
+            | Cmd::Verify { .. }
+            | Cmd::Withdraw { .. }
+            | Cmd::Escalate { .. } => None,
+        }
+    }
 }
 
 /// The id `r` names, resolved to the finding's PRIMARY id when `r` is an
