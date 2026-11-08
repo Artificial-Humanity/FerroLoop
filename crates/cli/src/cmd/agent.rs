@@ -1509,10 +1509,17 @@ mod tests {
     }
 
     #[test]
-    fn composed_vendor_host_adapters_contains_codex() {
+    fn composed_vendor_host_adapters_contains_codex_and_claude() {
         let reg = composed_vendor_host_adapters();
+        assert_eq!(
+            reg.vendor_ids(),
+            vec!["claude".to_string(), "codex".to_string()]
+        );
         let codex = reg.lookup("codex").expect("codex host adapter composed");
         assert_eq!(codex.vendor_id(), "codex");
         assert_eq!(codex.default_binary(), "codex");
+        let claude = reg.lookup("claude").expect("claude host adapter composed");
+        assert_eq!(claude.vendor_id(), "claude");
+        assert_eq!(claude.default_binary(), "claude");
     }
 }
