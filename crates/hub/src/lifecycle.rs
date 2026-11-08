@@ -1185,8 +1185,13 @@ impl SpinUpRequest {
     /// one, an agent of a virtual scope (an area with no path, or a project no area names yet,
     /// which spin-up makes as one) starts in `workspace_root`, the one directory such a scope
     /// has; an agent of a directory-backed project keeps what the request said (no `cwd`).
-    /// A `workspace_root` that is not a directory on this host is not used.
-    pub fn with_default_cwd<S: AgentRegistry>(mut self, store: &S, workspace_root: &Path) -> Self {
+    /// A virtual scope whose name matches a project directory ([`resolve_project_cwd`]) starts
+    /// there instead. A `workspace_root` that is not a directory on this host is not used.
+    pub fn with_default_cwd<S: AgentRegistry + Catalog>(
+        mut self,
+        store: &S,
+        workspace_root: &Path,
+    ) -> Self {
         if trimmed_opt(&self.cwd).is_some() {
             return self;
         }
@@ -1198,8 +1203,12 @@ impl SpinUpRequest {
             Ok(None) => true,
             Err(_) => false,
         };
-        if virtual_scope && workspace_root.is_dir() {
-            self.cwd = Some(workspace_root.to_string_lossy().into_owned());
+        if virtual_scope {
+            if let Some(dir) = resolve_project_cwd(store, &project, Some(workspace_root)) {
+                self.cwd = Some(dir);
+            } else if workspace_root.is_dir() {
+                self.cwd = Some(workspace_root.to_string_lossy().into_owned());
+            }
         }
         self
     }

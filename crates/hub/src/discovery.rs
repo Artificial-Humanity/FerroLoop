@@ -1851,6 +1851,10 @@ fn latest_claude_transcript_signal(jsonl: &str) -> Option<(String, Option<String
     let mut winner: Option<String> = None;
     // The newest `/effort` command seen so far (the scan runs newest to oldest).
     let mut effort_cmd: Option<String> = None;
+    // The winning assistant turn's own `effort` / `perTurnEffort` (a session launched with
+    // `--effort` writes no `/effort` command), and the `/effort` command newer than that turn.
+    let mut turn_effort: Option<String> = None;
+    let mut newer_cmd: Option<String> = None;
     for line in jsonl.lines().rev() {
         let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
@@ -1859,10 +1863,13 @@ fn latest_claude_transcript_signal(jsonl: &str) -> Option<(String, Option<String
             effort_cmd = claude_effort_command(&val);
         }
         if let Some((model, effort)) = claude_model_command(&val) {
+            // The turn's effort beats any command older than the turn; a newer command beats it.
+            let in_use = newer_cmd.clone().or(turn_effort.clone());
             return match &winner {
                 // An assistant turn after the command names the model in use now.
-                Some(w) if *w != model => Some((w.clone(), effort_cmd)),
-                _ => Some((model, effort_cmd.or(effort))),
+                Some(w) if *w != model => Some((w.clone(), in_use.or(effort_cmd))),
+                Some(_) => Some((model, in_use.or(effort_cmd).or(effort))),
+                None => Some((model, effort_cmd.or(effort))),
             };
         }
         if winner.is_none()
@@ -1872,9 +1879,12 @@ fn latest_claude_transcript_signal(jsonl: &str) -> Option<(String, Option<String
                     .filter(|model| !model.starts_with('<'))
         {
             winner = Some(normalize_claude_model(&model));
+            turn_effort = plain_bounded_str(val.get("effort"), CODEX_EFFORT_MAX_CHARS)
+                .or_else(|| plain_bounded_str(val.get("perTurnEffort"), CODEX_EFFORT_MAX_CHARS));
+            newer_cmd = effort_cmd.clone();
         }
     }
-    winner.map(|model| (model, effort_cmd))
+    winner.map(|model| (model, newer_cmd.or(turn_effort).or(effort_cmd)))
 }
 
 /// Latest model named in Claude transcript JSONL (see [`latest_claude_transcript_signal`]).
@@ -8882,6 +8892,43 @@ mod tests {
             latest_claude_transcript_signal(&later_same),
             Some(("claude-opus-5-5".to_string(), Some("high".to_string())))
         );
+    }
+
+    #[test]
+    fn claude_assistant_turn_effort_is_reported_and_ranked_against_effort_commands() {
+        let turn = |key: &str, level: &str| {
+            serde_json::json!({
+                "type":"assistant",
+                key: level,
+                "message":{"role":"assistant","model":"claude-sonnet-5-5","content":"hi"},
+            })
+            .to_string()
+        };
+        let medium = Some(("claude-sonnet-5-5".to_string(), Some("medium".to_string())));
+        assert_eq!(
+            latest_claude_transcript_signal(&turn("effort", "medium")),
+            medium
+        );
+        assert_eq!(
+            latest_claude_transcript_signal(&turn("perTurnEffort", "medium")),
+            medium
+        );
+        // A newer `/effort` command wins over the turn's effort; an older one does not.
+        let cmd = |level: &str| {
+            serde_json::json!({
+                "type":"user",
+                "message":{"role":"user","content":
+                    format!("<local-command-stdout>Set effort level to {level}</local-command-stdout>")},
+            })
+            .to_string()
+        };
+        let newer = [turn("effort", "medium"), cmd("high")].join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&newer),
+            Some(("claude-sonnet-5-5".to_string(), Some("high".to_string())))
+        );
+        let older = [cmd("high"), turn("effort", "medium")].join("\n");
+        assert_eq!(latest_claude_transcript_signal(&older), medium);
     }
 
     #[test]
