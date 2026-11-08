@@ -536,6 +536,16 @@ describe("optimistic prompt preservation", () => {
     ).toBe(diskTurns);
   });
 
+  it("does not restamp another agent's unresolved prompt to the active agent's session id", () => {
+    const resolved = "72e7cfb2-13cc-4e34-8b49-ee789472fdc6";
+    const other = { content: "for ferris", sentAt: 1_000, agentKey: "ferris", sessionId: undefined };
+    const kept = pruneOptimisticPrompts([other], diskTurns, 3_000, "felix", resolved);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].sessionId).toBeUndefined();
+    const own = { content: "for felix", sentAt: 1_000, agentKey: "felix", sessionId: undefined };
+    expect(pruneOptimisticPrompts([own], diskTurns, 3_000, "felix", resolved)[0].sessionId).toBe(resolved);
+  });
+
   it("keeps recording a send whose active session id resolved mid-flight, not one that switched", () => {
     const resolved = "72e7cfb2-13cc-4e34-8b49-ee789472fdc6";
     expect(activeSessionStillCurrent(null, resolved, "felix")).toBe(true);

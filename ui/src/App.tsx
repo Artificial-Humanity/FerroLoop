@@ -304,6 +304,7 @@ export function pruneOptimisticPrompts(
   // A prompt recorded before the session id resolved now belongs to the resolved id.
   return kept.map((p) =>
     typeof currentSessionId === "string" && (p.sessionId ?? null) !== currentSessionId
+      && !!activeKey && (p.agentKey ?? "").trim().toLowerCase() === activeKey
       && optimisticSessionMatches(p.sessionId, currentSessionId, true)
       ? { ...p, sessionId: currentSessionId }
       : p,
@@ -1175,7 +1176,7 @@ export const App: React.FC<AppProps> = ({
       if (!trimmed) return;
       const normalizedKey = (agentKey ?? "").trim().toLowerCase();
       const current = optimisticPromptRef.current.filter(
-        (p) => sentAt - p.sentAt <= OPTIMISTIC_PROMPT_TTL_MS,
+        (p) => sentAt - p.sentAt <= OPTIMISTIC_PROMPT_BUSY_MAX_MS,
       );
       const duplicate = current.some(
         (p) =>
