@@ -3,6 +3,8 @@
 //! Covers all interactive CLI vendors hosted under `fl-host`:
 //! `claude`, `codex`, `antigravity`, `grok`, `muse`, `lemonade`, and `ollama`.
 
+pub use crate::host_runtime::HostRuntimePort;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;

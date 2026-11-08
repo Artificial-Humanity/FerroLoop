@@ -2407,7 +2407,13 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
         let saw_paste = poll_for_pasted_content(
             6,
             || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
-            || client.capture_output(session_cap.clone(), 4096).ok(),
+            || {
+                client
+                    .capture_rendered(stream.clone())
+                    .map(|screen| screen.contents)
+                    .ok()
+                    .or_else(|| client.capture_output(session_cap.clone(), 4096).ok())
+            },
         );
         if saw_paste {
             let _ = client.write_raw(stream, grant.lease, b"\r".to_vec());
@@ -7360,11 +7366,12 @@ exit 1"#,
     }
 
     #[test]
-    fn fl_host_paste_writes_payload_then_a_separate_carriage_return() {
+    fn fl_host_paste_prefers_rendered_screen_and_falls_back_to_raw_output() {
         use fl_host_proto::{
-            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
-            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
-            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRefusal,
+            ExtensionRequest, ExtensionResponse, HostConfig, HostEndpoint, HostInstance,
+            HostListener, HostRequest, HostResponse, InputState, RENDERED_PTY_FEATURE,
+            RenderedScreen, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
             SpawnKind, StreamId,
         };
         use std::os::unix::fs::PermissionsExt;
@@ -7383,12 +7390,12 @@ exit 1"#,
                 session: sid.clone(),
                 epoch: SessionEpoch(1),
             },
-            mode: SessionMode::ReliablePipe,
+            mode: SessionMode::Pty,
             state: ChildState::Running(ChildRecord {
                 pid: std::process::id(),
                 session: sid,
                 session_epoch: SessionEpoch(1),
-                kind: SpawnKind::Pipe,
+                kind: SpawnKind::Pty,
                 input: InputState::Writable,
                 started_at_ms: 1000,
                 exit: None,
@@ -7400,10 +7407,13 @@ exit 1"#,
         };
         let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let show_paste = Arc::new(AtomicBool::new(false));
+        let rendered = Arc::new(Mutex::new(Ok::<String, ExtensionRefusal>(String::new())));
         let writes_srv = Arc::clone(&writes);
         let paste_srv = Arc::clone(&show_paste);
+        let rendered_srv = Arc::clone(&rendered);
         let ep_srv = endpoint.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let server_thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -7414,19 +7424,65 @@ exit 1"#,
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
                 let _ = ready_tx.send(());
-                while let Ok(mut conn) = listener.accept().await {
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
                     let summary = summary.clone();
                     let writes = Arc::clone(&writes_srv);
                     let paste = Arc::clone(&paste_srv);
+                    let rendered = Arc::clone(&rendered_srv);
                     tokio::spawn(async move {
                         while let Ok(req) = conn.recv().await {
                             let HostRequest::Extended { id, request } = req else {
                                 break;
                             };
                             let resp = match request {
-                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
-                                    records: vec![summary.clone()],
+                                ExtensionRequest::ListSessions => {
+                                    let mut summary = summary.clone();
+                                    if *rendered.lock().unwrap() == Err(ExtensionRefusal::WrongMode)
+                                    {
+                                        summary.mode = SessionMode::ReliablePipe;
+                                        if let ChildState::Running(child) = &mut summary.state {
+                                            child.kind = SpawnKind::Pipe;
+                                        }
+                                    }
+                                    ExtensionResponse::Sessions {
+                                        records: vec![summary],
+                                    }
+                                }
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: if *rendered.lock().unwrap()
+                                        == Err(ExtensionRefusal::Unsupported)
+                                    {
+                                        0
+                                    } else {
+                                        RENDERED_PTY_FEATURE
+                                    },
+                                    limits: ExtensionLimits::default(),
                                 },
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    assert_eq!(stream, summary.stream);
+                                    match rendered.lock().unwrap().clone() {
+                                        Ok(contents) => ExtensionResponse::RenderedCapture {
+                                            screen: RenderedScreen {
+                                                schema: 1,
+                                                stream,
+                                                contents,
+                                                cursor_row: 0,
+                                                cursor_col: 0,
+                                                rows: 24,
+                                                cols: 80,
+                                                generation: 1,
+                                                output_seq: 0,
+                                                output_bytes: 0,
+                                            },
+                                        },
+                                        Err(code) => ExtensionResponse::Refused { code },
+                                    }
+                                }
                                 ExtensionRequest::ClaimController { .. } => {
                                     ExtensionResponse::Controller {
                                         lease: ControllerLease(1),
@@ -7440,7 +7496,9 @@ exit 1"#,
                                         outcome: SendOutcome::Written,
                                     }
                                 }
-                                ExtensionRequest::CaptureOutput { .. } => {
+                                ExtensionRequest::CaptureOutput { session, max_bytes } => {
+                                    assert_eq!(session, summary.stream.session);
+                                    assert_eq!(max_bytes, 4096);
                                     ExtensionResponse::CapturedOutput {
                                         text: if paste.load(Ordering::SeqCst) {
                                             "[Pasted Content 12 chars]".to_string()
@@ -7484,8 +7542,8 @@ exit 1"#,
             vec![b"/effort high".to_vec(), b"\r".to_vec()]
         );
         assert_eq!(run("   ", false), vec![b"\r".to_vec()]);
-        // A paste placeholder still on screen after Enter earns a second CR.
-        show_paste.store(true, Ordering::SeqCst);
+        // The current rendered screen earns a second CR even when raw output has no marker.
+        *rendered.lock().unwrap() = Ok("[Pasted Content 12 chars]".to_string());
         assert_eq!(
             run("long", true),
             vec![
@@ -7494,7 +7552,29 @@ exit 1"#,
                 b"\r".to_vec()
             ]
         );
-        drop(server_thread);
+        // A stale marker in raw history must not override a successful empty rendered screen.
+        *rendered.lock().unwrap() = Ok(String::new());
+        show_paste.store(true, Ordering::SeqCst);
+        assert_eq!(
+            run("long", true),
+            vec![b"\x1b[200~long\x1b[201~".to_vec(), b"\r".to_vec()]
+        );
+        // Old daemons lack the rendered capability; pipe sessions refuse it with WrongMode.
+        // Both must still use the raw capture to decide whether another Enter is needed.
+        for refusal in [ExtensionRefusal::Unsupported, ExtensionRefusal::WrongMode] {
+            *rendered.lock().unwrap() = Err(refusal);
+            assert_eq!(
+                run("long", true),
+                vec![
+                    b"\x1b[200~long\x1b[201~".to_vec(),
+                    b"\r".to_vec(),
+                    b"\r".to_vec()
+                ],
+                "raw fallback for {refusal:?} must send another Enter"
+            );
+        }
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
     }
 
     #[test]
