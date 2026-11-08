@@ -534,6 +534,12 @@ describe("optimistic prompt preservation", () => {
     expect(
       preserveOptimisticTurn(diskTurns, canonical, 3_000, "felix", "11111111-2222-4333-8444-555555555555"),
     ).toBe(diskTurns);
+    const hexLetterUuid = "deadbeef-1234-4abc-8def-123456789012";
+    const hexLetterPrompt = { content: "Hello", sentAt: 1_000, agentKey: "felix", sessionId: hexLetterUuid };
+    expect(preserveOptimisticTurn(diskTurns, hexLetterPrompt, 3_000, "felix", resolved)).toBe(diskTurns);
+    expect(pruneOptimisticPrompts([hexLetterPrompt], diskTurns, 3_000, "felix", resolved)[0].sessionId).toBe(
+      hexLetterUuid,
+    );
   });
 
   it("does not restamp another agent's unresolved prompt to the active agent's session id", () => {
@@ -548,21 +554,42 @@ describe("optimistic prompt preservation", () => {
 
   it("keeps recording a send whose active session id resolved mid-flight, not one that switched", () => {
     const resolved = "72e7cfb2-13cc-4e34-8b49-ee789472fdc6";
+    const hexLetterUuid = "deadbeef-1234-4abc-8def-123456789012";
     expect(activeSessionStillCurrent(null, resolved, "felix")).toBe(true);
     expect(activeSessionStillCurrent("claude-felix-2027881", resolved, resolved)).toBe(true);
     expect(activeSessionStillCurrent(resolved, resolved, resolved)).toBe(true);
     expect(activeSessionStillCurrent(resolved, "11111111-2222-4333-8444-555555555555", resolved)).toBe(false);
+    expect(activeSessionStillCurrent(hexLetterUuid, resolved, hexLetterUuid)).toBe(false);
     expect(activeSessionStillCurrent(resolved, null, resolved)).toBe(false);
     expect(activeSessionStillCurrent(resolved, resolved, "other-target")).toBe(false);
   });
 
   it("keeps an expired optimistic prompt while the session is busy, up to a hard cap", () => {
     const prompt = { content: "Still working", sentAt: 1_000, agentKey: "felix" };
+    const otherAgentPrompt = { content: "Other agent expired", sentAt: 1_000, agentKey: "ferris" };
+    const otherSessionPrompt = {
+      content: "Other session expired",
+      sentAt: 1_000,
+      agentKey: "felix",
+      sessionId: "11111111-2222-4333-8444-555555555555",
+    };
     const late = 1_000 + OPTIMISTIC_PROMPT_TTL_MS + 1;
     expect(preserveOptimisticTurn(diskTurns, prompt, late, "felix")).toBe(diskTurns);
     expect(preserveOptimisticTurn(diskTurns, prompt, late, "felix", undefined, true)).toHaveLength(2);
     expect(pruneOptimisticPrompts([prompt], diskTurns, late, "felix", undefined, true)).toHaveLength(1);
     expect(pruneOptimisticPrompts([prompt], diskTurns, late, "felix", undefined, false)).toHaveLength(0);
+    expect(
+      pruneOptimisticPrompts(
+        [prompt, otherAgentPrompt, otherSessionPrompt],
+        diskTurns,
+        late,
+        "felix",
+        "72e7cfb2-13cc-4e34-8b49-ee789472fdc6",
+        true,
+      ),
+    ).toEqual([
+      { ...prompt, sessionId: "72e7cfb2-13cc-4e34-8b49-ee789472fdc6" },
+    ]);
     const beyondCap = 1_000 + OPTIMISTIC_PROMPT_BUSY_MAX_MS + 1;
     expect(preserveOptimisticTurn(diskTurns, prompt, beyondCap, "felix", undefined, true)).toBe(diskTurns);
   });
