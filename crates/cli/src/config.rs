@@ -1190,6 +1190,43 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
     Ok(Some(winners[0].clone()))
 }
 
+/// The config entry matching `slug` (by explicit `name` or `root` basename).
+///
+/// When multiple entries match `slug` and differ in `(root, store, tracker)`,
+/// refuses by naming the conflicting candidates.
+pub fn entry_by_slug(entries: &[Entry], slug: &str) -> Result<Option<Entry>> {
+    let matches: Vec<&Entry> = entries.iter().filter(|e| e.matches_slug(slug)).collect();
+    let Some(&first) = matches.first() else {
+        return Ok(None);
+    };
+    let mut distinct: Vec<(&PathBuf, &PathBuf, &Option<TrackerBinding>)> = Vec::new();
+    for e in &matches {
+        let key = (&e.root, &e.store, &e.tracker);
+        if !distinct.contains(&key) {
+            distinct.push(key);
+        }
+    }
+    if distinct.len() > 1 {
+        let names = matches
+            .iter()
+            .map(|e| {
+                let tracker = match &e.tracker {
+                    Some(t) if t.github_ledger() => format!("github:{} (ledger github)", t.github),
+                    Some(t) => format!("github:{}", t.github),
+                    None => "the store's own tracker".to_string(),
+                };
+                format!("{} -> {} -> {tracker}", e.root.display(), e.store.display())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "the project slug `{slug}` matches more than one entry in the config: \
+             {names}. Disambiguate with a unique `name` in `[[project]]` or pass `--project-root`"
+        );
+    }
+    Ok(Some(first.clone()))
+}
+
 /// The `[[mcp]]` entry for the project containing `cwd`, by
 /// [`bound_entry`]'s rule: the entry whose root is the longest ancestor of
 /// `cwd` (MCP spec §2.2). Two entries on one root that switch differently

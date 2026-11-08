@@ -1253,10 +1253,10 @@ fn run(cli: Cli) -> Result<i32> {
         cli => cli,
     };
     let entries = &cfg.projects;
-    let slug_entry = cli
-        .command
-        .project_slug()
-        .and_then(|slug| entries.iter().find(|e| e.matches_slug(slug)).cloned());
+    let slug_entry = match cli.command.project_slug() {
+        Some(slug) => config::entry_by_slug(entries, slug)?,
+        None => None,
+    };
     let locus = match cli.command.project_root() {
         Some(root) => cwd.join(root),
         None => match &slug_entry {
@@ -1858,5 +1858,16 @@ mod tests {
         let (path, confined) = db_path(None, Some(shared.join("cfg/app.redb"))).unwrap();
         assert!(!confined);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn ambiguous_project_slug_entries_in_config_are_refused() {
+        let a = entry("/work/alpha/widgets", "/s/a.redb", None);
+        let b = entry("/work/beta/widgets", "/s/b.redb", Some("acme/widgets"));
+        let err = config::entry_by_slug(&[a, b], "widgets").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("widgets"), "{msg}");
+        assert!(msg.contains("/work/alpha/widgets -> /s/a.redb"), "{msg}");
+        assert!(msg.contains("/work/beta/widgets -> /s/b.redb"), "{msg}");
     }
 }

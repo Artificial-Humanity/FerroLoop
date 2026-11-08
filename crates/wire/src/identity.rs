@@ -372,16 +372,18 @@ fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &Ve
             VendorRoute::Claude {
                 pid: dst_pid,
                 session_id: dst_sid,
+                socket_path: dst_sock,
                 key_path: dst_key,
-                ..
             },
             VendorRoute::Claude {
                 pid: src_pid,
                 session_id: src_sid,
+                socket_path: src_sock,
                 key_path: src_key,
-                ..
             },
-        ) if *dst_pid == *src_pid || *dst_pid == 0 || *src_pid == 0 => {
+        ) if (*dst_pid > 0 && *dst_pid == *src_pid)
+            || (!dst_sock.as_os_str().is_empty() && dst_sock == src_sock) =>
+        {
             if dst_sid.trim().is_empty() && !src_sid.trim().is_empty() {
                 *dst_sid = src_sid.clone();
             }
@@ -574,13 +576,49 @@ pub fn agy_ls_address_listening(addr: &str) -> bool {
     TcpStream::connect_timeout(&target, Duration::from_millis(50)).is_ok()
 }
 
+fn pid_alive(pid: u32) -> bool {
+    pid > 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn agy_route_accepts_shared_endpoint(
+    route_pid: Option<u32>,
+    shared_ls_pid: Option<u32>,
+    check_proc: bool,
+) -> bool {
+    match route_pid {
+        None | Some(0) => true,
+        Some(pid) if check_proc && !pid_alive(pid) => true,
+        Some(pid) => shared_ls_pid == Some(pid),
+    }
+}
+
 /// Read one `/proc/<pid>/environ` blob. A language-server address is kept only
 /// when its port is listening, a CSRF token is kept only as a pair with a live
 /// listening language-server address from that same process, and an `agentapi`
 /// path is kept only when the file is usable. Dead `bwrap` ports and unlinked
 /// `.old` binaries are skipped so a later process can still supply the live values.
+#[cfg(test)]
 fn note_agy_proc_env(
     env_bytes: &[u8],
+    shared_csrf: &mut Option<String>,
+    shared_ls_addr: &mut Option<String>,
+    shared_exe: &mut Option<PathBuf>,
+) {
+    let mut ignored_pid = None;
+    note_agy_proc_env_with_pid(
+        env_bytes,
+        None,
+        &mut ignored_pid,
+        shared_csrf,
+        shared_ls_addr,
+        shared_exe,
+    );
+}
+
+fn note_agy_proc_env_with_pid(
+    env_bytes: &[u8],
+    proc_pid: Option<u32>,
+    shared_ls_pid: &mut Option<u32>,
     shared_csrf: &mut Option<String>,
     shared_ls_addr: &mut Option<String>,
     shared_exe: &mut Option<PathBuf>,
@@ -617,15 +655,21 @@ fn note_agy_proc_env(
     }
     if let Some(addr) = proc_ls_addr {
         if let Some(existing_addr) = shared_ls_addr.as_deref() {
-            if shared_csrf.is_none()
-                && let Some(csrf) = proc_csrf
-                && agy_ls_port(existing_addr).is_some()
+            if agy_ls_port(existing_addr).is_some()
                 && agy_ls_port(existing_addr) == agy_ls_port(addr)
             {
-                *shared_csrf = Some(csrf.to_string());
+                if shared_ls_pid.is_none() {
+                    *shared_ls_pid = proc_pid;
+                }
+                if shared_csrf.is_none()
+                    && let Some(csrf) = proc_csrf
+                {
+                    *shared_csrf = Some(csrf.to_string());
+                }
             }
         } else {
             *shared_ls_addr = Some(addr.to_string());
+            *shared_ls_pid = proc_pid;
             if shared_csrf.is_none()
                 && let Some(csrf) = proc_csrf
             {
@@ -1252,6 +1296,7 @@ impl RouteTable {
             }
             return;
         }
+        let mut shared_ls_pid: Option<u32> = None;
         let mut shared_ls_addr: Option<String> = None;
         let mut shared_csrf: Option<String> = None;
         let mut shared_exe: Option<PathBuf> = None;
@@ -1279,7 +1324,10 @@ impl RouteTable {
 
         // 2. Inspect live /proc/*/environ when host discovery is enabled.
         if check_proc
-            && (shared_csrf.is_none() || shared_ls_addr.is_none() || shared_exe.is_none())
+            && (shared_csrf.is_none()
+                || shared_ls_addr.is_none()
+                || shared_ls_pid.is_none()
+                || shared_exe.is_none())
             && let Ok(proc_dir) = fs::read_dir("/proc")
         {
             for entry in proc_dir.flatten() {
@@ -1290,16 +1338,23 @@ impl RouteTable {
                 if !s.chars().all(|c| c.is_ascii_digit()) {
                     continue;
                 }
+                let proc_pid = s.parse::<u32>().ok().filter(|&p| p > 0);
                 let Ok(env_bytes) = fs::read(entry.path().join("environ")) else {
                     continue;
                 };
-                note_agy_proc_env(
+                note_agy_proc_env_with_pid(
                     &env_bytes,
+                    proc_pid,
+                    &mut shared_ls_pid,
                     &mut shared_csrf,
                     &mut shared_ls_addr,
                     &mut shared_exe,
                 );
-                if shared_csrf.is_some() && shared_ls_addr.is_some() && shared_exe.is_some() {
+                if shared_csrf.is_some()
+                    && shared_ls_addr.is_some()
+                    && shared_ls_pid.is_some()
+                    && shared_exe.is_some()
+                {
                     break;
                 }
             }
@@ -1316,12 +1371,14 @@ impl RouteTable {
         agy_entries.sort_by_key(|e| std::cmp::Reverse(e.updated_at.unix_millis()));
         for entry in agy_entries {
             if let VendorRoute::Agy {
+                ls_pid,
                 ls_address,
                 csrf_token,
                 agentapi_exe,
                 ..
             } = &entry.route
             {
+                let live_pid = ls_pid.filter(|&pid| pid > 0 && (!check_proc || pid_alive(pid)));
                 let live_addr = ls_address.as_ref().filter(|addr| {
                     !addr.trim().is_empty() && (!check_proc || agy_ls_address_listening(addr))
                 });
@@ -1329,17 +1386,26 @@ impl RouteTable {
                 if shared_ls_addr.is_none() {
                     if let Some(addr) = live_addr {
                         shared_ls_addr = Some(addr.clone());
+                        if shared_ls_pid.is_none() {
+                            shared_ls_pid = live_pid;
+                        }
                         if shared_csrf.is_none() {
                             shared_csrf = valid_csrf.cloned();
                         }
                     }
-                } else if shared_csrf.is_none()
-                    && let (Some(current_addr), Some(entry_addr), Some(csrf)) =
-                        (shared_ls_addr.as_deref(), live_addr, valid_csrf)
+                } else if let (Some(current_addr), Some(entry_addr)) =
+                    (shared_ls_addr.as_deref(), live_addr)
                     && agy_ls_port(current_addr).is_some()
                     && agy_ls_port(current_addr) == agy_ls_port(entry_addr)
                 {
-                    shared_csrf = Some(csrf.clone());
+                    if shared_ls_pid.is_none() {
+                        shared_ls_pid = live_pid;
+                    }
+                    if shared_csrf.is_none()
+                        && let Some(csrf) = valid_csrf
+                    {
+                        shared_csrf = Some(csrf.clone());
+                    }
                 }
                 if shared_exe.is_none()
                     && let Some(exe) = agentapi_exe.as_ref().filter(|path| agy_exe_is_usable(path))
@@ -1350,9 +1416,10 @@ impl RouteTable {
         }
 
         // 4. Propagate the live/newest shared ls_address and csrf_token across Agy routes that do
-        // not already hold a live listening `(ls_address, csrf_token)` pair of their own, so
-        // pre-reboot entries do not retain stale language-server ports or CSRF tokens while live
-        // standalone `fl-host` Antigravity sessions keep their own paired endpoint.
+        // not already hold a live listening `(ls_address, csrf_token)` pair of their own and whose
+        // `ls_pid` is absent, dead, or matches `shared_ls_pid`, so pre-reboot entries do not retain
+        // stale language-server ports or CSRF tokens while live standalone `fl-host` Antigravity
+        // sessions keep their own process-bound endpoint.
         // Replace a missing or `.old` agentapi binary. A usable exe already on the route stays.
         // Host `ANTIGRAVITY_AGENTAPI_EXE` is consulted only for live `/proc` discovery so a
         // temp-home unit test does not pick up the machine's binary.
@@ -1366,10 +1433,11 @@ impl RouteTable {
         for entry in self.entries.values_mut() {
             let mut changed = false;
             if let VendorRoute::Agy {
+                conversation_id,
+                ls_pid,
                 ls_address,
                 csrf_token,
                 agentapi_exe,
-                ..
             } = &mut entry.route
             {
                 let before = (ls_address.clone(), csrf_token.clone(), agentapi_exe.clone());
@@ -1378,8 +1446,10 @@ impl RouteTable {
                         && csrf_token
                             .as_deref()
                             .is_some_and(|token| !token.trim().is_empty());
+                let accepts_shared =
+                    agy_route_accepts_shared_endpoint(*ls_pid, shared_ls_pid, check_proc);
                 if !has_live_paired_endpoint {
-                    if shared_ls_addr.is_some() {
+                    if accepts_shared && shared_ls_addr.is_some() {
                         *ls_address = shared_ls_addr.clone();
                     } else if check_proc
                         && ls_address
@@ -1388,7 +1458,7 @@ impl RouteTable {
                     {
                         *ls_address = None;
                     }
-                    if shared_csrf.is_some() {
+                    if accepts_shared && shared_csrf.is_some() {
                         *csrf_token = shared_csrf.clone();
                     } else if before.0.as_deref().and_then(agy_ls_port)
                         != ls_address.as_deref().and_then(agy_ls_port)
@@ -1403,10 +1473,12 @@ impl RouteTable {
                     *agentapi_exe = Some(resolved_shared.clone());
                 }
                 // Filling an exe the route never had is no correction: the legacy copy holds none
-                // either, or a stale one a later scan replaces.
-                changed = before.0 != *ls_address
-                    || before.1 != *csrf_token
-                    || (before.2.is_some() && before.2 != *agentapi_exe);
+                // either, or a stale one a later scan replaces. Do not advance a placeholder's
+                // `updated_at` before the brain scan compares it against transcript `file_ms`.
+                changed = is_native_session_id(conversation_id)
+                    && (before.0 != *ls_address
+                        || before.1 != *csrf_token
+                        || (before.2.is_some() && before.2 != *agentapi_exe));
             }
             // A corrected endpoint is a newer entry: `RouteTable::load` merges the legacy
             // agent-bus file in by `updated_at`, and an entry that kept its old stamp would lose
@@ -1451,7 +1523,7 @@ impl RouteTable {
                 })
             {
                 let placeholder = match self.entries.get(&persona) {
-                    None => Some((None, None, None, None, false)),
+                    None => Some((None, None, None, None, None, false)),
                     Some(entry) => match &entry.route {
                         VendorRoute::Agy {
                             conversation_id,
@@ -1459,13 +1531,18 @@ impl RouteTable {
                             ls_address,
                             csrf_token,
                             agentapi_exe,
-                        } if !is_native_session_id(conversation_id) => Some((
-                            *ls_pid,
-                            ls_address.clone(),
-                            csrf_token.clone(),
-                            agentapi_exe.clone(),
-                            entry.explicit,
-                        )),
+                        } if !is_native_session_id(conversation_id)
+                            && file_ms >= entry.updated_at.unix_millis() =>
+                        {
+                            Some((
+                                *ls_pid,
+                                ls_address.clone(),
+                                csrf_token.clone(),
+                                agentapi_exe.clone(),
+                                Some(entry.updated_at.clone()),
+                                entry.explicit,
+                            ))
+                        }
                         _ => None,
                     },
                 };
@@ -1474,28 +1551,32 @@ impl RouteTable {
                     existing_addr,
                     existing_csrf,
                     existing_exe,
+                    existing_updated_at,
                     explicit_placeholder,
                 )) = placeholder
                 else {
                     continue;
                 };
-                if !explicit_placeholder && self.entries.contains_key(&persona) {
-                    self.entries.remove(&persona);
-                }
+                let accepts_shared =
+                    agy_route_accepts_shared_endpoint(existing_pid, shared_ls_pid, check_proc);
                 let route = VendorRoute::Agy {
                     conversation_id: conv_id,
                     ls_pid: existing_pid,
-                    ls_address: existing_addr.or_else(|| shared_ls_addr.clone()),
-                    csrf_token: existing_csrf.or_else(|| shared_csrf.clone()),
+                    ls_address: existing_addr
+                        .or_else(|| accepts_shared.then(|| shared_ls_addr.clone()).flatten()),
+                    csrf_token: existing_csrf
+                        .or_else(|| accepts_shared.then(|| shared_csrf.clone()).flatten()),
                     agentapi_exe: existing_exe.or_else(|| Some(resolved_shared.clone())),
                 };
-                if explicit_placeholder {
-                    let file_at = if file_ms > 0 {
-                        At::from_unix_millis(file_ms)
+                if let Some(mut upgraded_at) = existing_updated_at {
+                    if file_ms > 0 {
+                        restamp_if_newer(&mut upgraded_at, &At::from_unix_millis(file_ms));
+                    }
+                    if explicit_placeholder {
+                        self.upsert_explicit(&persona, route, upgraded_at);
                     } else {
-                        at.clone()
-                    };
-                    self.upsert_passive(&persona, route, file_at);
+                        self.upsert_passive(&persona, route, upgraded_at);
+                    }
                 } else {
                     self.upsert_discovered(&persona, route, file_ms, at);
                 }
@@ -3328,6 +3409,14 @@ fn capture_env_route_from(
                 let sessions_dir = home.as_ref()?.join(".claude").join("sessions");
                 let raw = fs::read_to_string(sessions_dir.join(format!("{pid}.json"))).ok()?;
                 let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+                if val
+                    .get("messagingSocketPath")
+                    .and_then(|v| v.as_str())
+                    .map(Path::new)
+                    != Some(socket_path.as_path())
+                {
+                    return None;
+                }
                 val.get("sessionId")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
@@ -5829,8 +5918,9 @@ mod tests {
             other => panic!("expected Agy route for jarvis, got {other:?}"),
         }
 
-        // 3. Felix's placeholder route is upgraded to `conv-felix-new` with `felix_addr` and
-        // preserves `ls_pid`, without attaching Jarvis's `f5174f82` CSRF token from port 33047.
+        // 3. Felix's placeholder route is upgraded to `conv-felix-new` and preserves `ls_pid`,
+        // without copying an unpaired cli.log address or Jarvis's `f5174f82` CSRF token onto a
+        // route with a different live `ls_pid`.
         match &table.get("felix").expect("felix route").route {
             VendorRoute::Agy {
                 conversation_id,
@@ -5841,7 +5931,10 @@ mod tests {
             } => {
                 assert_eq!(conversation_id, "conv-felix-new");
                 assert_eq!(*ls_pid, Some(2667475));
-                assert_eq!(ls_address.as_deref(), Some(felix_addr.as_str()));
+                assert!(
+                    ls_address.is_none(),
+                    "felix must not inherit an unverified shared ls_address, got {ls_address:?}"
+                );
                 assert!(
                     csrf_token.is_none(),
                     "felix must not inherit jarvis's daemon csrf f5174f82 on a different port, got {csrf_token:?}"
@@ -8291,7 +8384,7 @@ mod tests {
             VendorRoute::Claude {
                 pid: 4242,
                 session_id: String::new(),
-                socket_path: sock_path,
+                socket_path: sock_path.clone(),
                 key_path: None,
             },
             At::from_unix_millis(200),
@@ -8308,6 +8401,197 @@ mod tests {
                 assert_eq!(key_path.as_deref(), Some(key_file.as_path()));
             }
             other => panic!("expected Claude route, got {other:?}"),
+        }
+
+        // A `<pid>.json` whose `messagingSocketPath` does not match `socket_path` (e.g. from a
+        // recycled PID) must be ignored.
+        let other_sock = sessions_dir.join("9999.sock");
+        fs::write(
+            sessions_dir.join("4242.json"),
+            serde_json::json!({
+                "pid": 4242,
+                "sessionId": "stale-recycled-session-uuid",
+                "messagingSocketPath": other_sock,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mismatched_route = capture_env_route_from(&env_of(&[
+            ("HOME", home_str),
+            ("CLAUDE_CODE_MESSAGING_SOCKET", sock_str),
+        ]))
+        .expect("claude route");
+        match mismatched_route {
+            VendorRoute::Claude { session_id, .. } => {
+                assert!(
+                    session_id.is_empty(),
+                    "mismatched messagingSocketPath must not attach stale sessionId, got {session_id:?}"
+                );
+            }
+            other => panic!("expected Claude route, got {other:?}"),
+        }
+
+        // A legacy pid-0 Claude route with a different socket path must not copy its session_id
+        // onto another Claude route.
+        let mut pid0_table = RouteTable::default();
+        pid0_table.upsert_explicit(
+            "sonya",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "legacy-pid0-session".into(),
+                socket_path: PathBuf::from("/tmp/claude-old.sock"),
+                key_path: Some(key_file.clone()),
+            },
+            At::from_unix_millis(100),
+        );
+        pid0_table.upsert_explicit(
+            "sonya",
+            VendorRoute::Claude {
+                pid: 5150,
+                session_id: String::new(),
+                socket_path: PathBuf::from("/tmp/claude-new-5150.sock"),
+                key_path: None,
+            },
+            At::from_unix_millis(200),
+        );
+        match &pid0_table.get("sonya").expect("sonya route").route {
+            VendorRoute::Claude {
+                pid,
+                session_id,
+                key_path,
+                ..
+            } => {
+                assert_eq!(*pid, 5150);
+                assert!(
+                    session_id.is_empty(),
+                    "pid-0 route with different socket must not leak session_id, got {session_id:?}"
+                );
+                assert!(
+                    key_path.is_none(),
+                    "pid-0 route with different socket must not leak key_path, got {key_path:?}"
+                );
+            }
+            other => panic!("expected Claude route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_agy_routes_does_not_copy_endpoint_across_different_live_ls_pids_or_downgrade_newer_placeholder()
+     {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        let brain_dir = agy_dir.join("brain");
+        fs::create_dir_all(&brain_dir).unwrap();
+
+        let feira_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let feira_port = feira_listener.local_addr().unwrap().port();
+        let feira_addr = format!("127.0.0.1:{feira_port}");
+
+        // `cli.log` still holds Feira's port while Felix's new process is spinning up.
+        fs::write(
+            agy_dir.join("cli.log"),
+            format!("Language server listening on random port at {feira_port} for HTTP\n"),
+        )
+        .unwrap();
+
+        // An older transcript for Felix from a previous session (`file_ms = 200`) exists on disk
+        // before Felix's new spin-up placeholder (`updated_at = 300`).
+        let old_felix_transcript = brain_dir
+            .join("conv-felix-old")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(old_felix_transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &old_felix_transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"agent-msg register Felix --project ferroloop --role ui-developer\"}\n",
+        )
+        .unwrap();
+        set_mtime(&old_felix_transcript, 200);
+
+        let mut table = RouteTable::default();
+        table.upsert_explicit(
+            "feira",
+            VendorRoute::Agy {
+                conversation_id: "conv-feira-live".into(),
+                ls_pid: Some(1111),
+                ls_address: Some(feira_addr.clone()),
+                csrf_token: Some("csrf-feira-1111".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(250),
+        );
+        table.upsert_explicit(
+            "felix",
+            VendorRoute::Agy {
+                conversation_id: "antigravity:felix".into(),
+                ls_pid: Some(2222),
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(300),
+        );
+
+        // Pass 1: Felix's placeholder (`updated_at = 300`) is newer than `conv-felix-old`
+        // (`file_ms = 200`), and Felix's live `ls_pid = Some(2222)` differs from Feira's
+        // `ls_pid = Some(1111)`. Felix must keep his placeholder conversation_id and must not
+        // inherit Feira's `(ls_address, csrf_token)`.
+        table.discover_agy_routes(home, false, &At::from_unix_millis(350));
+        let felix_entry = table.get("felix").expect("felix route after pass 1");
+        assert!(felix_entry.explicit);
+        assert_eq!(felix_entry.updated_at.unix_millis(), 300);
+        match &felix_entry.route {
+            VendorRoute::Agy {
+                conversation_id,
+                ls_pid,
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(conversation_id, "antigravity:felix");
+                assert_eq!(*ls_pid, Some(2222));
+                assert!(ls_address.is_none(), "got {ls_address:?}");
+                assert!(csrf_token.is_none(), "got {csrf_token:?}");
+            }
+            other => panic!("expected Agy route for felix, got {other:?}"),
+        }
+
+        // Pass 2: Felix's new session writes its transcript at `file_ms = 400` (`>= 300`).
+        // The placeholder upgrades to `conv-felix-new`, keeps `updated_at = 400` and `explicit`,
+        // and still does not inherit Feira's `(ls_address, csrf_token)` from `ls_pid = 1111`.
+        let new_felix_transcript = brain_dir
+            .join("conv-felix-new")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(new_felix_transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &new_felix_transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"agent-msg register Felix --project ferroloop --role ui-developer\"}\n",
+        )
+        .unwrap();
+        set_mtime(&new_felix_transcript, 400);
+
+        table.discover_agy_routes(home, false, &At::from_unix_millis(450));
+        let felix_upgraded = table.get("felix").expect("felix route after pass 2");
+        assert!(felix_upgraded.explicit);
+        assert_eq!(felix_upgraded.updated_at.unix_millis(), 400);
+        match &felix_upgraded.route {
+            VendorRoute::Agy {
+                conversation_id,
+                ls_pid,
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-felix-new");
+                assert_eq!(*ls_pid, Some(2222));
+                assert!(ls_address.is_none(), "got {ls_address:?}");
+                assert!(csrf_token.is_none(), "got {csrf_token:?}");
+            }
+            other => panic!("expected Agy route for felix, got {other:?}"),
         }
     }
 }

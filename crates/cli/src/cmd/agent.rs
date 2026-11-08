@@ -464,22 +464,8 @@ where
                 Some(("claude".to_string(), *pid))
             }
             fl_wire::identity::VendorRoute::Agy {
-                ls_pid, ls_address, ..
-            } => {
-                if let Some(pid) = *ls_pid
-                    && pid > 0
-                    && pid_alive(pid)
-                {
-                    Some(("antigravity".to_string(), pid))
-                } else if ls_address
-                    .as_deref()
-                    .is_some_and(fl_wire::identity::agy_ls_address_listening)
-                {
-                    Some(("antigravity".to_string(), ls_pid.unwrap_or(0)))
-                } else {
-                    None
-                }
-            }
+                ls_pid: Some(pid), ..
+            } if *pid > 0 && pid_alive(*pid) => Some(("antigravity".to_string(), *pid)),
             _ => None,
         };
         if let Some((adapter, pid)) = matched {
@@ -1494,5 +1480,25 @@ mod tests {
                 ..
             }
         ));
+
+        // An Agy route with `ls_pid: None` must return `None` even when `ls_address` is listening.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        routes.upsert_explicit(
+            "pidless",
+            VendorRoute::Agy {
+                conversation_id: "conv-pidless".into(),
+                ls_pid: None,
+                ls_address: Some(format!("127.0.0.1:{port}")),
+                csrf_token: Some("csrf-tok".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(2_000),
+        );
+        assert!(
+            hosted_session_liveness("pidless", &[], Some(&routes), &now, "ai-lab-0", |_| true)
+                .is_none(),
+            "Agy route without live ls_pid must not report Live (pid 0)"
+        );
     }
 }

@@ -124,21 +124,26 @@ pub fn resolve(store: &dyn Handles, label: &str, kind: Kind, r: &Ref) -> Result<
 }
 
 fn resolve_project_slug(store: &dyn Handles, label: &str, slug: &str) -> Result<Iri> {
+    #[cfg(not(test))]
+    let cfg_entries = match crate::config::path() {
+        Some(cfg_path) => crate::config::load(Some(&cfg_path))
+            .map(|c| c.projects)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    #[cfg(test)]
+    let cfg_entries: Vec<crate::config::Entry> = Vec::new();
+    resolve_project_slug_with_entries(store, label, slug, &cfg_entries)
+}
+
+fn resolve_project_slug_with_entries(
+    store: &dyn Handles,
+    label: &str,
+    slug: &str,
+    entries: &[crate::config::Entry],
+) -> Result<Iri> {
     let projects = store.projects_for_slug()?;
-    for p in &projects {
-        let trimmed = p.root.trim_end_matches(['/', '\\']);
-        if std::path::Path::new(trimmed)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|base| base.eq_ignore_ascii_case(slug))
-        {
-            return Ok(p.id.0.clone());
-        }
-    }
-    if let Some(cfg_path) = crate::config::path()
-        && let Ok(cfg) = crate::config::load(Some(&cfg_path))
-        && let Some(entry) = cfg.projects.iter().find(|e| e.matches_slug(slug))
-    {
+    if let Some(entry) = crate::config::entry_by_slug(entries, slug)? {
         let entry_canon = entry.root.canonicalize().ok();
         for p in &projects {
             let p_path = std::path::Path::new(&p.root);
@@ -148,10 +153,37 @@ fn resolve_project_slug(store: &dyn Handles, label: &str, slug: &str) -> Result<
                 return Ok(p.id.0.clone());
             }
         }
+        bail!(
+            "there is no project `{slug}` in the store at {label}. List them to see the ones that exist."
+        );
     }
-    bail!(
-        "there is no project `{slug}` in the store at {label}. List them to see the ones that exist."
-    )
+    let matched: Vec<&fl_core::Project> = projects
+        .iter()
+        .filter(|p| {
+            let trimmed = p.root.trim_end_matches(['/', '\\']);
+            std::path::Path::new(trimmed)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|base| base.eq_ignore_ascii_case(slug))
+        })
+        .collect();
+    match matched.as_slice() {
+        [p] => Ok(p.id.0.clone()),
+        [] => bail!(
+            "there is no project `{slug}` in the store at {label}. List them to see the ones that exist."
+        ),
+        many => {
+            let roots = many
+                .iter()
+                .map(|p| p.root.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "project slug `{slug}` is ambiguous in the store at {label}: matches {roots}. \
+                 Pass the project handle or IRI, or disambiguate with `name` in `[[project]]`"
+            )
+        }
+    }
 }
 
 /// How a person reads an id: its handle, or the full IRI if it has none here.
@@ -281,6 +313,66 @@ mod tests {
                 .to_string()
                 .contains("`ferroloop` is neither a handle"),
             "unexpected error: {wrong_kind}"
+        );
+    }
+
+    #[test]
+    fn resolve_project_slug_prefers_config_entry_over_store_basename_and_refuses_ambiguous_basenames()
+     {
+        use fl_core::store::Catalog;
+        let s = fl_core::MemStore::default();
+        let p_first = s.add_project("/workspace/alpha/widgets").unwrap();
+        let p_second = s.add_project("/workspace/beta/widgets").unwrap();
+        let p_named = s.add_project("/workspace/gamma/custom-root").unwrap();
+
+        // Without config entries, two projects in the store sharing the `widgets` basename are refused.
+        let ambig_err =
+            resolve_project_slug_with_entries(&s, "memory", "widgets", &[]).unwrap_err();
+        let ambig_msg = ambig_err.to_string();
+        assert!(
+            ambig_msg.contains("/workspace/alpha/widgets"),
+            "{ambig_msg}"
+        );
+        assert!(ambig_msg.contains("/workspace/beta/widgets"), "{ambig_msg}");
+        assert_ne!(p_first, p_second);
+
+        // An authoritative config entry with `name = "widgets"` resolves to `p_named` first,
+        // before store basename matching.
+        let cfg_entries = vec![crate::config::Entry {
+            name: Some("widgets".into()),
+            root: "/workspace/gamma/custom-root".into(),
+            store: "/s/main.redb".into(),
+            tracker: None,
+            state: None,
+        }];
+        let resolved =
+            resolve_project_slug_with_entries(&s, "memory", "widgets", &cfg_entries).unwrap();
+        assert_eq!(resolved, p_named.0);
+
+        // Ambiguous config entries for the same slug propagate the config refusal.
+        let conflicting_cfg = vec![
+            crate::config::Entry {
+                name: None,
+                root: "/workspace/alpha/widgets".into(),
+                store: "/s/a.redb".into(),
+                tracker: None,
+                state: None,
+            },
+            crate::config::Entry {
+                name: None,
+                root: "/workspace/beta/widgets".into(),
+                store: "/s/b.redb".into(),
+                tracker: None,
+                state: None,
+            },
+        ];
+        let cfg_err = resolve_project_slug_with_entries(&s, "memory", "widgets", &conflicting_cfg)
+            .unwrap_err();
+        assert!(
+            cfg_err
+                .to_string()
+                .contains("matches more than one entry in the config"),
+            "unexpected error: {cfg_err}"
         );
     }
 }
