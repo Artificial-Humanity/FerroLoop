@@ -101,6 +101,11 @@ pub fn model_command(model: &str) -> String {
     format!("/model {model}")
 }
 
+/// The text pasted into a live Claude CLI to set its effort level for the session.
+pub fn effort_command(effort: &str) -> String {
+    format!("/effort {effort}")
+}
+
 /// The text pasted into a live Grok CLI to set its context window for the session:
 /// `/context-window <tokens>`. Grok accepts the raw token count as well as the short label.
 pub fn context_window_command(tokens: u64) -> String {

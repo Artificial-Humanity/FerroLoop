@@ -6528,7 +6528,19 @@ fn handle_post_session_model(
                 authority.actor_name(),
                 &session_actions::model_command(&model),
             ) {
-                Ok(()) => METHOD_OPERATOR_PROMPT,
+                Ok(()) => {
+                    if matches!(route, fl_wire::identity::VendorRoute::Claude { .. })
+                        && let Some(ref effort) = thinking_level
+                    {
+                        // Best effort: the model switch already landed.
+                        let _ = dispatch_operator_prompt_to_route(
+                            route,
+                            authority.actor_name(),
+                            &session_actions::effort_command(effort),
+                        );
+                    }
+                    METHOD_OPERATOR_PROMPT
+                }
                 Err(_) => METHOD_OVERRIDE_ONLY,
             }
         }
@@ -7287,6 +7299,11 @@ pub(crate) fn project_state_scope(project: &str) -> String {
 
 pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) -> String {
     let name_lower = name.to_ascii_lowercase();
+    // Web and mobile developers share the `ui-developer` role file.
+    let role_file = match role {
+        "web-developer" | "mobile-developer" => "ui-developer",
+        other => other,
+    };
     // The handoff key is the lowercase persona. It relies on the upstream persona validators
     // (`is_valid_persona` / `validate_agent_identity`), which always yield a valid state slug.
     // Known limitation: a persona named `current` or `checkpoint-<x>` would collide with the shared
@@ -7302,7 +7319,7 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
          \n\
          This session has just been reset (`/clear`) for clean-slate context hygiene. Perform your root startup hydration now:\n\
          1. Read `.agents/AGENTS.md` and check the active roster with `fl agent roster`.\n\
-         2. Read your role file(s): `.agents/roles/{role}.md`.\n\
+         2. Read your role file(s): `.agents/roles/{role_file}.md`.\n\
          3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
          4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state handoff get --scope {scope} --key {name_lower}` for your own latest handoff (if it reports none, `fl state handoff get --scope {scope}` reads the shared `current` handoff), and `fl state search \"<query>\"` to look up anything specific.\n\
          5. Optional legacy reference: if `Notes/{project}/STATE.md` exists, skim it; FerroState wins wherever the two disagree. Do not require it.\n\

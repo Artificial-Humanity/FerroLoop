@@ -1787,7 +1787,7 @@ fn normalize_claude_model(raw: &str) -> String {
 /// ``<local-command-stdout>Set model to `Opus 5.5` ... with `high` effort</local-command-stdout>``.
 /// Only a genuine user turn whose whole text is that local-command output counts, so a prompt
 /// that merely quotes the sentence, or an API-request blob that embeds one, is not a model change.
-fn claude_model_command(val: &Value) -> Option<(String, Option<String>)> {
+fn claude_local_command_stdout(val: &Value) -> Option<String> {
     if val.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
@@ -1805,10 +1805,29 @@ fn claude_model_command(val: &Value) -> Option<(String, Option<String>)> {
             .join(""),
         _ => return None,
     };
-    let inner = text
-        .trim()
+    text.trim()
         .strip_prefix("<local-command-stdout>")?
-        .strip_suffix("</local-command-stdout>")?;
+        .strip_suffix("</local-command-stdout>")
+        .map(str::to_string)
+}
+
+/// The level an `/effort` command left in a transcript line:
+/// `<local-command-stdout>Set effort level to medium (saved ...): ...</local-command-stdout>`.
+fn claude_effort_command(val: &Value) -> Option<String> {
+    let inner = claude_local_command_stdout(val)?;
+    let rest = inner.trim().strip_prefix("Set effort level to ")?;
+    let token = rest
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| c == '`' || c.is_ascii_punctuation());
+    plain_bounded_str(
+        Some(&Value::String(token.to_string())),
+        CODEX_EFFORT_MAX_CHARS,
+    )
+}
+
+fn claude_model_command(val: &Value) -> Option<(String, Option<String>)> {
+    let inner = claude_local_command_stdout(val)?;
     let rest = inner.trim().strip_prefix("Set model to `")?;
     let (name, after) = rest.split_once('`')?;
     let name = plain_bounded_str(Some(&Value::String(name.to_string())), MODEL_ID_MAX_CHARS)?;
@@ -1830,15 +1849,20 @@ fn claude_model_command(val: &Value) -> Option<(String, Option<String>)> {
 /// Claude Code's `<synthetic>` placeholder is not a model name and is skipped.
 fn latest_claude_transcript_signal(jsonl: &str) -> Option<(String, Option<String>)> {
     let mut winner: Option<String> = None;
+    // The newest `/effort` command seen so far (the scan runs newest to oldest).
+    let mut effort_cmd: Option<String> = None;
     for line in jsonl.lines().rev() {
         let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
+        if effort_cmd.is_none() {
+            effort_cmd = claude_effort_command(&val);
+        }
         if let Some((model, effort)) = claude_model_command(&val) {
             return match &winner {
                 // An assistant turn after the command names the model in use now.
-                Some(w) if *w != model => Some((w.clone(), None)),
-                _ => Some((model, effort)),
+                Some(w) if *w != model => Some((w.clone(), effort_cmd)),
+                _ => Some((model, effort_cmd.or(effort))),
             };
         }
         if winner.is_none()
@@ -1850,7 +1874,7 @@ fn latest_claude_transcript_signal(jsonl: &str) -> Option<(String, Option<String
             winner = Some(normalize_claude_model(&model));
         }
     }
-    winner.map(|model| (model, None))
+    winner.map(|model| (model, effort_cmd))
 }
 
 /// Latest model named in Claude transcript JSONL (see [`latest_claude_transcript_signal`]).
@@ -8890,6 +8914,32 @@ mod tests {
             "m".repeat(MODEL_ID_MAX_CHARS + 1)
         )));
         assert_eq!(latest_claude_transcript_signal(&bad), None);
+    }
+
+    #[test]
+    fn claude_effort_command_sets_thinking_level() {
+        let effort = model_command_line(Value::String(
+            "<local-command-stdout>Set effort level to medium (saved as your default for new \
+             sessions): balanced</local-command-stdout>"
+                .to_string(),
+        ));
+        assert_eq!(
+            claude_effort_command(&serde_json::from_str(&effort).unwrap()),
+            Some("medium".to_string())
+        );
+        let transcript = [
+            model_command_line(Value::String(
+                "<local-command-stdout>Set model to `Opus 5.5` with `high` effort\
+                 </local-command-stdout>"
+                    .to_string(),
+            )),
+            effort,
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&transcript),
+            Some(("claude-opus-5-5".to_string(), Some("medium".to_string())))
+        );
     }
 
     #[test]

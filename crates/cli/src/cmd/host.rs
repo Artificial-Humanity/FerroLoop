@@ -226,9 +226,18 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     .write_raw(stream, grant.lease, text.into_bytes())
                     .with_context(|| format!("failed to write raw bytes to `{session}`"))?
             } else {
+                if !text.is_empty() {
+                    let outcome = client
+                        .write_raw(stream.clone(), grant.lease, text.into_bytes())
+                        .with_context(|| format!("failed to write text to `{session}`"))?;
+                    if !matches!(outcome, SendOutcome::Written) {
+                        bail!("send to `{session}` returned {outcome:?}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 client
-                    .send_line(stream, grant.lease, text)
-                    .with_context(|| format!("failed to send line to `{session}`"))?
+                    .write_raw(stream, grant.lease, b"\r".to_vec())
+                    .with_context(|| format!("failed to send Enter to `{session}`"))?
             };
             if !matches!(outcome, SendOutcome::Written) {
                 bail!("send to `{session}` returned {outcome:?}");
