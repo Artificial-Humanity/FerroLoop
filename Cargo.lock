@@ -428,6 +428,7 @@ dependencies = [
  "fl-install",
  "fl-mcp",
  "fl-store",
+ "fl-vendor-adapters",
  "fl-watch",
  "fl-wire",
  "libc",
@@ -630,6 +631,21 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "zeroize",
+]
+
+[[package]]
+name = "fl-vendor-adapters"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "fl-core",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -170,6 +170,17 @@ pub struct LifecycleEnv<'a> {
     pub workspace_root: Option<&'a Path>,
 }
 
+/// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
+static HOST_ADAPTER_REGISTRY: std::sync::OnceLock<fl_core::VendorHostAdapterRegistry> =
+    std::sync::OnceLock::new();
+
+/// Install the concrete [`fl_core::VendorHostAdapterRegistry`] composed at `fl-cli` into `fl-hub`.
+pub fn set_global_vendor_host_adapters(
+    registry: fl_core::VendorHostAdapterRegistry,
+) -> &'static fl_core::VendorHostAdapterRegistry {
+    HOST_ADAPTER_REGISTRY.get_or_init(|| registry)
+}
+
 impl<'a> LifecycleEnv<'a> {
     /// Real runtime calls are off under `cfg(test)` and when `FL_TEST_SPINUP_NO_SPAWN=1`.
     pub fn new(home_override: Option<&'a Path>) -> Self {
@@ -182,6 +193,16 @@ impl<'a> LifecycleEnv<'a> {
             key_probe: &HostKeyProbe,
             workspace_root: None,
         }
+    }
+
+    /// Look up a dependency-injected [`fl_core::VendorHostAdapter`] for `vendor`.
+    pub fn host_vendor_adapter(
+        &self,
+        vendor: &str,
+    ) -> Option<std::sync::Arc<dyn fl_core::VendorHostAdapter>> {
+        HOST_ADAPTER_REGISTRY
+            .get()
+            .and_then(|reg| reg.lookup(vendor))
     }
 
     /// Resolve the vendor CLI adapter for `vendor` via the adapter registry, allowing callers
@@ -4227,6 +4248,21 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         }
     }
     delete_agy_cascade_trajectories(env.home_override, &record, target, &tombstone_ids);
+    if (env.spawn_runtime || env.home_override.is_some())
+        && let Some(adapter) = env.host_vendor_adapter(&record.vendor)
+    {
+        let host_session = record.tmux_target.as_deref().unwrap_or(&record.session_id);
+        let binding =
+            fl_core::AdapterIdentityBinding::new(record.session_id.clone(), 1, host_session, None);
+        for tid in &tombstone_ids {
+            let _ = adapter.archive(&fl_core::TeardownTarget {
+                binding: binding.clone(),
+                vendor_session_id: Some(tid.clone()),
+                control_endpoint: None,
+                home_dir: env.home_override.map(Path::to_path_buf),
+            });
+        }
+    }
     if persona_still_running {
         remove_routes(env.home_override, &[], &session_ids);
     } else {

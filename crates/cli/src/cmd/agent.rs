@@ -28,6 +28,13 @@ pub fn now_at() -> At {
     fl_exec::stamp::now()
 }
 
+/// Compose and install the concrete [`fl_core::VendorHostAdapterRegistry`] from `fl-vendor-adapters`.
+pub fn composed_vendor_host_adapters() -> &'static fl_core::VendorHostAdapterRegistry {
+    fl_hub::lifecycle::set_global_vendor_host_adapters(
+        fl_vendor_adapters::default_vendor_host_adapter_registry(),
+    )
+}
+
 #[derive(Subcommand)]
 pub enum AgentCmd {
     /// Manage workspace coverage areas and projects (`areas` table).
@@ -760,14 +767,10 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 store,
                 &fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default()),
             );
-            let out = lifecycle::spin_up(
-                store,
-                &LifecycleEnv::new(None),
-                &req,
-                &by,
-                lifecycle::Caller::Owner,
-            )
-            .map_err(lifecycle_failure)?;
+            let _ = composed_vendor_host_adapters();
+            let env = LifecycleEnv::new(None);
+            let out = lifecycle::spin_up(store, &env, &req, &by, lifecycle::Caller::Owner)
+                .map_err(lifecycle_failure)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
@@ -788,6 +791,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             json,
         } => {
             let mode = DecommissionMode::parse(&mode).map_err(lifecycle_failure)?;
+            let _ = composed_vendor_host_adapters();
             let env = LifecycleEnv::new(None);
             let target =
                 SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
@@ -856,9 +860,11 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let target =
                 SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
             // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
+            let _ = composed_vendor_host_adapters();
+            let env = LifecycleEnv::new(None);
             let out = lifecycle::remodel_session(
                 store,
-                &LifecycleEnv::new(None),
+                &env,
                 &target,
                 &req,
                 &by,
@@ -1500,5 +1506,20 @@ mod tests {
                 .is_none(),
             "Agy route without live ls_pid must not report Live (pid 0)"
         );
+    }
+
+    #[test]
+    fn composed_vendor_host_adapters_contains_codex_and_claude() {
+        let reg = composed_vendor_host_adapters();
+        assert_eq!(
+            reg.vendor_ids(),
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        let codex = reg.lookup("codex").expect("codex host adapter composed");
+        assert_eq!(codex.vendor_id(), "codex");
+        assert_eq!(codex.default_binary(), "codex");
+        let claude = reg.lookup("claude").expect("claude host adapter composed");
+        assert_eq!(claude.vendor_id(), "claude");
+        assert_eq!(claude.default_binary(), "claude");
     }
 }
