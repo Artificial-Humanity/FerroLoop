@@ -3733,7 +3733,7 @@ fn delete_agy_cascade_trajectories(
 
     let (ls_addr, csrf) = match route_ls_addr {
         Some(addr) => (Some(addr), route_csrf),
-        None => {
+        None if crate::discovery::agy_env_fallback_allowed(home_override) => {
             let env_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS")
                 .ok()
                 .map(|a| a.trim().to_string())
@@ -3746,6 +3746,7 @@ fn delete_agy_cascade_trajectories(
             });
             (env_addr, env_csrf)
         }
+        None => (None, None),
     };
 
     let Some(addr) = ls_addr else {
@@ -8665,6 +8666,8 @@ mod tests {
             "expected DeleteCascadeTrajectory POST, got: {raw_http:?}"
         );
         let lower_http = raw_http.to_ascii_lowercase();
+        assert!(lower_http.contains("connect-protocol-version: 1"));
+        assert!(lower_http.contains("content-type: application/json"));
         assert!(
             lower_http.contains("x-codeium-csrf-token: csrf-secret-159"),
             "expected CSRF token header in request: {raw_http:?}"
@@ -8724,5 +8727,80 @@ mod tests {
         assert!(RouteTable::load(Some(&rpath)).get("ada").is_none());
         let tombstones = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
         assert!(tombstones.contains("conv-ada-dead-159"));
+    }
+
+    #[test]
+    fn teardown_of_agy_route_with_home_override_ignores_env_language_server() {
+        struct RestoreAgyEnv {
+            addr: Option<std::ffi::OsString>,
+            csrf: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestoreAgyEnv {
+            fn drop(&mut self) {
+                // SAFETY: caller holds `with_probe_lock`.
+                unsafe {
+                    match &self.addr {
+                        Some(v) => std::env::set_var("ANTIGRAVITY_LS_ADDRESS", v),
+                        None => std::env::remove_var("ANTIGRAVITY_LS_ADDRESS"),
+                    }
+                    match &self.csrf {
+                        Some(v) => std::env::set_var("ANTIGRAVITY_CSRF_TOKEN", v),
+                        None => std::env::remove_var("ANTIGRAVITY_CSRF_TOKEN"),
+                    }
+                }
+            }
+        }
+
+        crate::direct_quota::with_probe_lock(|| {
+            let _restore = RestoreAgyEnv {
+                addr: std::env::var_os("ANTIGRAVITY_LS_ADDRESS"),
+                csrf: std::env::var_os("ANTIGRAVITY_CSRF_TOKEN"),
+            };
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let env_addr = listener.local_addr().unwrap().to_string();
+            // SAFETY: serialized by `with_probe_lock` and restored on drop.
+            unsafe {
+                std::env::set_var("ANTIGRAVITY_LS_ADDRESS", &env_addr);
+                std::env::set_var("ANTIGRAVITY_CSRF_TOKEN", "csrf-env-159");
+            }
+
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let env = env(&home);
+            spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "antigravity"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Agy {
+                    conversation_id: "conv-ada-no-addr-159".into(),
+                    ls_pid: None,
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                },
+                At::from_unix_millis(10),
+            );
+            let rpath = home.path().join(".cache/agent-bus/routes.json");
+            routes.save(Some(&rpath)).unwrap();
+
+            let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+            let out =
+                teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+            assert_eq!(out.status, "decommissioned");
+            assert!(
+                listener.accept().is_err(),
+                "home_override must not fall back to ANTIGRAVITY_LS_ADDRESS"
+            );
+        });
     }
 }
