@@ -117,6 +117,9 @@ pub const OLLAMA_DEFAULT_CLI_MODEL: &str = "llama3.2";
 /// The text Grok Build 1.0.70 prints when `--yolo` is not enough for a new directory.
 pub const GROK_DIRECTORY_TRUST_PROMPT: &str = "Do you trust the contents of this directory";
 
+/// The text Antigravity CLI prints when launching in an untrusted workspace directory.
+pub const AGY_PROJECT_TRUST_PROMPT: &str = "Do you trust the contents of this project?";
+
 /// The modal Claude Code prints on first launch when auto mode asks for environment setup.
 pub const CLAUDE_AUTO_MODE_PROMPT: &str = "Teach auto mode about your environment";
 
@@ -130,6 +133,12 @@ static GROK_STARTUP_RULES: [StartupPromptRule; 1] = [StartupPromptRule {
     match_text: GROK_DIRECTORY_TRUST_PROMPT,
     response_keys: "y",
     warn_on_miss: true,
+}];
+
+static AGY_STARTUP_RULES: [StartupPromptRule; 1] = [StartupPromptRule {
+    match_text: AGY_PROJECT_TRUST_PROMPT,
+    response_keys: "Enter",
+    warn_on_miss: false,
 }];
 
 /// The model id to hand to `muse --model` for a requested `model`.
@@ -472,6 +481,7 @@ impl VendorCliAdapter for AntigravityCliAdapter {
             self.resolve_binary(home),
             "--mode".to_string(),
             "auto".to_string(),
+            "--remote-control".to_string(),
         ];
         let cli_model = model
             .map(|m| agy_cli_model_id(m, thinking_level))
@@ -486,6 +496,10 @@ impl VendorCliAdapter for AntigravityCliAdapter {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
         }
+    }
+
+    fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
+        &AGY_STARTUP_RULES
     }
 }
 
@@ -1029,6 +1043,7 @@ mod tests {
             &[
                 "--mode",
                 "auto",
+                "--remote-control",
                 "--model",
                 "claude-sonnet-5-5-medium",
                 "--prompt-interactive",
@@ -1036,6 +1051,13 @@ mod tests {
             ]
         );
         assert_eq!(agy.interrupt_key(), "C-c");
+        assert_eq!(agy.startup_prompt_rules().len(), 1);
+        assert_eq!(
+            agy.startup_prompt_rules()[0].match_text,
+            AGY_PROJECT_TRUST_PROMPT
+        );
+        assert_eq!(agy.startup_prompt_rules()[0].response_keys, "Enter");
+        assert!(!agy.startup_prompt_rules()[0].warn_on_miss);
         for alias in [
             "argon-4.0",
             "argon-4.0-medium",

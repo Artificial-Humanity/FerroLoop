@@ -5426,7 +5426,7 @@ mod tests {
     #[test]
     fn antigravity_launch_maps_the_model_to_an_effort_suffixed_id() {
         let want = |model: &[&str]| {
-            let mut args = vec!["--mode", "auto"];
+            let mut args = vec!["--mode", "auto", "--remote-control"];
             args.extend_from_slice(model);
             args.extend(["--prompt-interactive", "hello"]);
             strings(&args)
@@ -6679,6 +6679,32 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|call| call == "send-keys Ada:claude Escape")
+        );
+    }
+
+    #[test]
+    fn antigravity_spin_up_accepts_the_project_trust_prompt() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.panes.borrow_mut().insert(
+            "Ada:antigravity".into(),
+            "Do you trust the contents of this project?\n● 1. Trust this project\n  2. Trust parent folder".into(),
+        );
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "send-keys Ada:antigravity Enter")
         );
     }
 

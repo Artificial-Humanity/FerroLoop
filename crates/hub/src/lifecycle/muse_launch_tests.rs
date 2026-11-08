@@ -569,7 +569,7 @@ fn built_in_vendors_launch_with_their_prompt() {
             "antigravity",
             "agy",
             "FL_WIRE_AGY_BIN",
-            vec!["--mode", "auto", "--prompt-interactive"],
+            vec!["--mode", "auto", "--remote-control", "--prompt-interactive"],
         ),
     ] {
         let store = MemStore::default();
@@ -638,7 +638,7 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             "antigravity",
             "agy",
             "FL_WIRE_AGY_BIN",
-            vec!["--mode", "auto"],
+            vec!["--mode", "auto", "--remote-control"],
         ),
     ] {
         let store = MemStore::default();
