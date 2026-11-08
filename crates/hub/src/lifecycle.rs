@@ -183,6 +183,33 @@ impl<'a> LifecycleEnv<'a> {
             workspace_root: None,
         }
     }
+
+    /// Resolve the vendor CLI adapter for `vendor` via the adapter registry, allowing callers
+    /// to interact with vendor-specific launch and startup rules through the [`fl_wire::vendor_adapter::VendorCliAdapter`] contract.
+    pub fn vendor_adapter(
+        &self,
+        vendor: &str,
+    ) -> Option<std::sync::Arc<dyn fl_wire::vendor_adapter::VendorCliAdapter>> {
+        fl_wire::vendor_adapter::HostVendorAdapterRegistry::global().lookup(vendor)
+    }
+
+    /// Adapter-layer launch options (including `remote_control`, enabled by default unless
+    /// `FL_WIRE_REMOTE_CONTROL=0` or `false`).
+    pub fn vendor_launch_options(&self) -> fl_wire::vendor_adapter::VendorLaunchOptions {
+        let remote_control =
+            parse_remote_control_env(std::env::var("FL_WIRE_REMOTE_CONTROL").ok().as_deref());
+        fl_wire::vendor_adapter::VendorLaunchOptions { remote_control }
+    }
+}
+
+pub(crate) fn parse_remote_control_env(raw: Option<&str>) -> bool {
+    raw.map(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+    .unwrap_or(true)
 }
 
 /// Whether an API vendor's key is provisioned on this host. Only the presence is asked: no
@@ -476,8 +503,15 @@ fn launch_spec_for(
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let adapter = fl_wire::vendor_adapter::lookup_vendor_cli_adapter(vendor)?;
-    Some(adapter.build_launch_spec(persona, model, thinking_level, prompt, home.as_deref()))
+    let adapter = env.vendor_adapter(vendor)?;
+    Some(adapter.build_launch_spec_with_options(
+        persona,
+        model,
+        thinking_level,
+        prompt,
+        home.as_deref(),
+        env.vendor_launch_options(),
+    ))
 }
 
 #[cfg(test)]
@@ -5426,7 +5460,7 @@ mod tests {
     #[test]
     fn antigravity_launch_maps_the_model_to_an_effort_suffixed_id() {
         let want = |model: &[&str]| {
-            let mut args = vec!["--mode", "auto"];
+            let mut args = vec!["--mode", "auto", "--remote-control"];
             args.extend_from_slice(model);
             args.extend(["--prompt-interactive", "hello"]);
             strings(&args)
@@ -5454,6 +5488,7 @@ mod tests {
         assert_eq!(
             launch_args("claude", Some("claude-sonnet-5-5")),
             strings(&[
+                "--remote-control",
                 "--enable-auto-mode",
                 "--model",
                 "claude-sonnet-5-5",
@@ -5462,11 +5497,18 @@ mod tests {
         );
         assert_eq!(
             launch_args("claude", None),
-            strings(&["--enable-auto-mode", "hello"])
+            strings(&["--remote-control", "--enable-auto-mode", "hello"])
         );
         assert_eq!(
             launch_args("codex", Some("gpt-6-sol")),
-            strings(&["--yolo", "--model", "gpt-6-sol", "hello"])
+            strings(&[
+                "--yolo",
+                "--remote",
+                "unix://",
+                "--model",
+                "gpt-6-sol",
+                "hello"
+            ])
         );
         assert_eq!(
             launch_args("grok", Some("grok-5")),
@@ -5476,6 +5518,13 @@ mod tests {
             launch_args("muse", Some("muse-2")),
             strings(&["--model", "muse-2", "hello"])
         );
+        assert!(parse_remote_control_env(None));
+        for on in ["", "1", "true", " TRUE ", "yes", "on"] {
+            assert!(parse_remote_control_env(Some(on)), "{on:?}");
+        }
+        for off in ["0", "false", " FALSE ", "off", "no"] {
+            assert!(!parse_remote_control_env(Some(off)), "{off:?}");
+        }
     }
 
     fn req(persona: &str, role: &str, vendor: &str) -> SpinUpRequest {
@@ -6679,6 +6728,32 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|call| call == "send-keys Ada:claude Escape")
+        );
+    }
+
+    #[test]
+    fn antigravity_spin_up_accepts_the_project_trust_prompt() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.panes.borrow_mut().insert(
+            "Ada:antigravity".into(),
+            "Do you trust the contents of this project?\n● 1. Trust this project\n  2. Trust parent folder".into(),
+        );
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "send-keys Ada:antigravity Enter")
         );
     }
 

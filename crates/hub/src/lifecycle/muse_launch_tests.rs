@@ -279,8 +279,8 @@ fn a_claude_model_id_keeps_its_window_tag_through_spin_up_and_restart() {
         )
         .unwrap();
         let spun = first.launches.borrow()[0].1.clone().unwrap().argv;
-        assert_eq!(&spun[2..4], ["--model", model], "spin-up {model}");
-        assert_eq!(spun[1], "--enable-auto-mode");
+        assert_eq!(&spun[3..5], ["--model", model], "spin-up {model}");
+        assert_eq!(&spun[1..3], ["--remote-control", "--enable-auto-mode"]);
         assert_eq!(out.model.as_deref(), Some(model));
         let record = find_hosted_session(&store, &["claude:ada"])
             .unwrap()
@@ -290,7 +290,7 @@ fn a_claude_model_id_keeps_its_window_tag_through_spin_up_and_restart() {
         let second = FakeRuntime::default();
         restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner").unwrap();
         let restarted = second.launches.borrow()[0].1.clone().unwrap().argv;
-        assert_eq!(&restarted[2..4], ["--model", model], "restart {model}");
+        assert_eq!(&restarted[3..5], ["--model", model], "restart {model}");
     }
 }
 
@@ -556,9 +556,14 @@ fn built_in_vendors_launch_with_their_prompt() {
             "claude",
             "claude",
             "FL_WIRE_CLAUDE_BIN",
-            vec!["--enable-auto-mode"],
+            vec!["--remote-control", "--enable-auto-mode"],
         ),
-        ("codex", "codex", "FL_WIRE_CODEX_BIN", vec!["--yolo"]),
+        (
+            "codex",
+            "codex",
+            "FL_WIRE_CODEX_BIN",
+            vec!["--yolo", "--remote", "unix://"],
+        ),
         (
             "grok",
             "grok",
@@ -569,7 +574,7 @@ fn built_in_vendors_launch_with_their_prompt() {
             "antigravity",
             "agy",
             "FL_WIRE_AGY_BIN",
-            vec!["--mode", "auto", "--prompt-interactive"],
+            vec!["--mode", "auto", "--remote-control", "--prompt-interactive"],
         ),
     ] {
         let store = MemStore::default();
@@ -625,9 +630,14 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             "claude",
             "claude",
             "FL_WIRE_CLAUDE_BIN",
-            vec!["--enable-auto-mode"],
+            vec!["--remote-control", "--enable-auto-mode"],
         ),
-        ("codex", "codex", "FL_WIRE_CODEX_BIN", vec!["--yolo"]),
+        (
+            "codex",
+            "codex",
+            "FL_WIRE_CODEX_BIN",
+            vec!["--yolo", "--remote", "unix://"],
+        ),
         (
             "grok",
             "grok",
@@ -638,7 +648,7 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             "antigravity",
             "agy",
             "FL_WIRE_AGY_BIN",
-            vec!["--mode", "auto"],
+            vec!["--mode", "auto", "--remote-control"],
         ),
     ] {
         let store = MemStore::default();
