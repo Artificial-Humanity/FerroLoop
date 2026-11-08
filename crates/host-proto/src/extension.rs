@@ -483,6 +483,8 @@ pub enum ReliableKind {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionFrame {
     ReliablePart {
+        #[serde(default = "default_terminated", skip_serializing_if = "is_terminated")]
+        terminated: bool,
         seq: u64,
         kind: ReliableKind,
         more: bool,
@@ -493,11 +495,33 @@ pub enum ExtensionFrame {
     },
 }
 
+fn default_terminated() -> bool {
+    true
+}
+fn is_terminated(value: &bool) -> bool {
+    *value
+}
+fn validate_termination(minor: u16, event: &ExtensionFrame) -> Result<(), HostError> {
+    if let ExtensionFrame::ReliablePart {
+        terminated: false,
+        kind,
+        ..
+    } = event
+        && (minor < 2 || *kind != ReliableKind::Line)
+    {
+        return Err(HostError::Protocol(
+            "stdout fragments require minor two and line kind".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn encode_extension_frame(
     minor: u16,
     event: &ExtensionFrame,
 ) -> Result<crate::Frame, HostError> {
     require_minor(minor)?;
+    validate_termination(minor, event)?;
     let payload = serde_json::to_vec(event).map_err(|e| HostError::Protocol(e.to_string()))?;
     if payload.len() > crate::MAX_FRAME_PAYLOAD {
         return Err(HostError::FrameLength);
@@ -520,6 +544,7 @@ pub fn decode_extension_frame(
     }
     let event: ExtensionFrame =
         serde_json::from_slice(&frame.payload).map_err(|e| HostError::Protocol(e.to_string()))?;
+    validate_termination(minor, &event)?;
     let encoded_bytes = match &event {
         ExtensionFrame::ReliablePart { bytes, .. } => bytes.as_slice().len().div_ceil(3) * 4,
         ExtensionFrame::Notice { .. } => 0,
@@ -541,6 +566,7 @@ pub(crate) fn require_minor(minor: u16) -> Result<(), HostError> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReliableEvent {
+    pub terminated: bool,
     pub seq: u64,
     pub kind: ReliableKind,
     pub bytes: Vec<u8>,
@@ -550,7 +576,7 @@ pub struct ReliableEvent {
 pub struct ReliableReassembler {
     after: u64,
     stream: Option<StreamId>,
-    open: Option<(u64, ReliableKind, usize, Vec<u8>)>,
+    open: Option<(u64, ReliableKind, bool, usize, Vec<u8>)>,
 }
 impl ReliableReassembler {
     pub fn new(after: u64) -> Self {
@@ -581,6 +607,7 @@ impl ReliableReassembler {
         let ExtensionFrame::ReliablePart {
             seq,
             kind,
+            terminated,
             more,
             bytes,
         } = part
@@ -601,8 +628,8 @@ impl ReliableReassembler {
         if bytes.as_slice().is_empty() && *more {
             return Err(HostError::Protocol("empty continuing fragment".into()));
         }
-        if let Some((open_seq, open_kind, count, body)) = &mut self.open {
-            if *open_seq != *seq || open_kind != kind {
+        if let Some((open_seq, open_kind, open_terminated, count, body)) = &mut self.open {
+            if *open_seq != *seq || open_kind != kind || open_terminated != terminated {
                 return Err(HostError::Protocol("interleaved reliable event".into()));
             }
             let total = body
@@ -627,12 +654,12 @@ impl ReliableReassembler {
             body.try_reserve_exact(bytes.as_slice().len())
                 .map_err(|_| HostError::EventTooLarge)?;
             body.extend_from_slice(bytes.as_slice());
-            self.open = Some((*seq, *kind, 1, body));
+            self.open = Some((*seq, *kind, *terminated, 1, body));
         }
         if *more {
             return Ok(None);
         }
-        let (_, kind, _, body) = self.open.take().expect("open fragment");
+        let (_, kind, terminated, _, body) = self.open.take().expect("open fragment");
         if kind == ReliableKind::Lifecycle {
             let event: ControlEvent =
                 serde_json::from_slice(&body).map_err(|e| HostError::Protocol(e.to_string()))?;
@@ -678,6 +705,7 @@ impl ReliableReassembler {
         }
         self.after = *seq;
         Ok(Some(ReliableEvent {
+            terminated,
             seq: *seq,
             kind,
             bytes: body,

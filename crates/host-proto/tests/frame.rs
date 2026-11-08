@@ -94,7 +94,9 @@ fn event_fragments_round_trip_at_max_line() {
             session_epoch,
             seq,
             bytes,
+            terminated,
         } => {
+            assert!(terminated);
             assert_eq!(session.as_str(), "line-1");
             assert_eq!(session_epoch, SessionEpoch(7));
             assert_eq!(seq, 3);
@@ -728,6 +730,7 @@ fn extension_reassembly_requires_complete() {
     };
     fn part(seq: u64, more: bool, bytes: Vec<u8>) -> ExtensionFrame {
         ExtensionFrame::ReliablePart {
+            terminated: true,
             seq,
             kind: ReliableKind::Line,
             more,
@@ -806,6 +809,7 @@ fn extension_lifecycle_reassembly_checks_bound_stream() {
     .unwrap();
     assert!(
         r.push(&ExtensionFrame::ReliablePart {
+            terminated: true,
             seq: 1,
             kind: ReliableKind::Lifecycle,
             more: false,
@@ -838,6 +842,7 @@ fn extension_completed_tiny_event_does_not_retain_maximum_line_allocation() {
     use fl_host_proto::{BoundedBytes, ExtensionFrame, ReliableKind, ReliableReassembler};
     let event = ReliableReassembler::new(0)
         .push(&ExtensionFrame::ReliablePart {
+            terminated: true,
             seq: 1,
             kind: ReliableKind::Line,
             more: false,

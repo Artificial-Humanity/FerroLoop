@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use fl_host_proto::{
     ChildExit, ControlEvent, Frame, FrameKind, HostedChild, LINE_HEADER_LEN, MAX_EVENT_ENVELOPE,
     MAX_FRAME_PAYLOAD, MAX_STDOUT_BACKLOG, MAX_STDOUT_LINE, MAX_SUBSCRIBERS, SessionEpoch,
-    SessionId, ShutdownSwitch, fragment_line,
+    SessionId, ShutdownSwitch, fragment_line_with_termination,
 };
 
 use crate::input::{Barrier, hold_dir, poll_barrier};
@@ -54,6 +54,8 @@ struct Track {
 }
 
 struct Logical {
+    terminated: bool,
+    exposed: AtomicBool,
     index: u64,
     seq: u64,
     epoch: u64,
@@ -118,9 +120,7 @@ pub struct OutputSession {
 
 struct OutInner {
     events: Vec<Arc<Logical>>,
-    partial: Vec<u8>,
     staging: Vec<u8>,
-    failed: bool,
     eof: bool,
 }
 
@@ -297,6 +297,7 @@ fn assign(sub: &mut Sub, event: &Arc<Logical>, preexisting: bool) -> Assign {
             track.delivered.remove(&sub.id);
             return Assign::Overflow;
         }
+        event.exposed.store(true, Ordering::SeqCst);
         track.holders = track.holders.saturating_add(1);
         sub.terminals
             .insert(event.session.clone(), Arc::clone(event));
@@ -310,6 +311,7 @@ fn assign(sub: &mut Sub, event: &Arc<Logical>, preexisting: bool) -> Assign {
             Assign::Overflow
         };
     }
+    event.exposed.store(true, Ordering::SeqCst);
     track.holders = track.holders.saturating_add(1);
     sub.queued_bytes = sub.queued_bytes.saturating_add(bytes);
     sub.queue.push_back(Arc::clone(event));
@@ -488,9 +490,7 @@ impl OutputSession {
             hub: Arc::clone(&hub),
             inner: Mutex::new(OutInner {
                 events: Vec::new(),
-                partial: Vec::new(),
                 staging: Vec::new(),
-                failed: false,
                 eof: false,
             }),
             cv: Condvar::new(),
@@ -542,14 +542,23 @@ impl OutputSession {
         });
     }
 
+    #[cfg(test)]
     fn emit_line(&self, raw: Vec<u8>) {
+        self.emit_fragment(raw, true);
+    }
+
+    #[cfg(test)]
+    fn emit_fragment(&self, raw: Vec<u8>, terminated: bool) {
         let started = Instant::now();
         while self.hub.all_backlogged() && started.elapsed() < Duration::from_millis(20) {
             std::thread::sleep(Duration::from_millis(1));
         }
         let raw_len = raw.len();
         let envelope = line_envelope(raw_len);
-        self.publish_with(raw_len, false, move |_seq| (Body::Line(raw), envelope));
+        let _order = self.lock_order();
+        self.publish_locked(raw_len, false, terminated, move |_seq| {
+            (Body::Line(raw), envelope)
+        });
     }
 
     pub fn request_stop(&self) {
@@ -577,10 +586,22 @@ impl OutputSession {
     /// `seq` and the fanout index are allocated under `order`, which is held through admit.
     fn publish_with(&self, raw_len: usize, exited: bool, build: impl FnOnce(u64) -> (Body, usize)) {
         let _order = self.lock_order();
+        self.publish_locked(raw_len, exited, true, build);
+    }
+
+    fn publish_locked(
+        &self,
+        raw_len: usize,
+        exited: bool,
+        terminated: bool,
+        build: impl FnOnce(u64) -> (Body, usize),
+    ) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let index = self.hub.index.fetch_add(1, Ordering::SeqCst);
         let (body, envelope) = build(seq);
         let event = Arc::new(Logical {
+            terminated,
+            exposed: AtomicBool::new(false),
             index,
             seq,
             epoch: self.session.epoch,
@@ -643,7 +664,6 @@ impl OutputSession {
         let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         inner.eof
             && inner.events.is_empty()
-            && inner.partial.is_empty()
             && inner.staging.is_empty()
             && self
                 .session
@@ -652,12 +672,8 @@ impl OutputSession {
     }
 
     fn charge(inner: &OutInner) -> Charge {
-        let mut raw = inner.partial.len().saturating_add(inner.staging.len());
-        let mut envelope = if inner.partial.is_empty() {
-            0
-        } else {
-            line_envelope(inner.partial.len())
-        };
+        let mut raw = inner.staging.len();
+        let mut envelope: usize = 0;
         for event in &inner.events {
             raw = raw.saturating_add(event.raw_len);
             envelope = envelope.saturating_add(event.envelope);
@@ -669,82 +685,13 @@ impl OutputSession {
         }
     }
 
-    fn fail_overflow(&self) {
-        let first = {
-            let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-            if inner.failed {
-                false
-            } else {
-                inner.failed = true;
-                inner.partial.clear();
-                inner.staging.clear();
-                true
-            }
-        };
-        if !first {
-            return;
-        }
-        let session = self.session.session.clone();
-        let epoch = self.session.epoch;
-        self.publish_with(0, false, move |seq| {
-            let event = ControlEvent::ProtocolFailure {
-                session,
-                session_epoch: SessionEpoch(epoch),
-                seq,
-                reason: "stdout line exceeds 1 MiB".into(),
-            };
-            let envelope = control_len(&event);
-            (Body::Control(event), envelope)
-        });
-        if let Some(fence) = self
-            .fence
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-        {
-            fence();
-        }
-        let _ = self.session.request_cleanup();
-        self.cv.notify_all();
-    }
-
-    fn drain(inner: &mut OutInner) -> Parsed {
-        if inner.failed || inner.staging.is_empty() {
-            return Parsed::Need;
-        }
-        if inner.partial.is_empty() && inner.events.len() >= MAX_EVENTS {
-            return Parsed::Need;
-        }
-        if inner.partial.len() > MAX_STDOUT_LINE {
-            return Parsed::Fail;
-        }
-        if inner.partial.len() == MAX_STDOUT_LINE {
-            if inner.staging[0] == b'\n' {
-                inner.staging.remove(0);
-                return Parsed::Line(std::mem::take(&mut inner.partial));
-            }
-            return Parsed::Fail;
-        }
-        if let Some(pos) = inner.staging.iter().position(|byte| *byte == b'\n') {
-            let mut line = std::mem::take(&mut inner.partial);
-            line.extend_from_slice(&inner.staging[..pos]);
-            inner.staging.drain(..=pos);
-            if line.len() > MAX_STDOUT_LINE {
-                return Parsed::Fail;
-            }
-            return Parsed::Line(line);
-        }
-        let room = MAX_STDOUT_LINE.saturating_sub(inner.partial.len());
-        if room == 0 {
-            return Parsed::Fail;
-        }
-        let take = room.min(inner.staging.len());
-        let extra: Vec<u8> = inner.staging.drain(..take).collect();
-        inner.partial.extend(extra);
-        if inner.partial.len() > MAX_STDOUT_LINE {
-            return Parsed::Fail;
-        }
-        Parsed::Need
+    fn coalescible(inner: &OutInner) -> bool {
+        inner.events.last().is_some_and(|tail| {
+            !tail.terminated
+                && !tail.exposed.load(Ordering::SeqCst)
+                && Arc::strong_count(tail) == 1
+                && matches!(&tail.body, Body::Line(raw) if raw.len() < MAX_STDOUT_LINE)
+        })
     }
 
     fn note_stall(&self) {
@@ -759,12 +706,6 @@ impl OutputSession {
     }
 }
 
-enum Parsed {
-    Line(Vec<u8>),
-    Fail,
-    Need,
-}
-
 impl StdoutSink for OutputSession {
     fn reliable(&self) -> Option<&Arc<crate::reliable::ReliableJournal>> {
         self.reliable.as_ref()
@@ -773,10 +714,7 @@ impl StdoutSink for OutputSession {
         if self.reliable.is_some() {
             return 0;
         }
-        if self.flush_out() {
-            self.fail_overflow();
-            return 0;
-        }
+        self.flush_out();
         self.space()
     }
 
@@ -786,18 +724,11 @@ impl StdoutSink for OutputSession {
         }
         {
             let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-            if inner.failed {
-                return false;
-            }
             if !bytes.is_empty() {
                 inner.staging.extend_from_slice(bytes);
             }
         }
-        let overflow = self.flush_out();
-        if overflow {
-            self.fail_overflow();
-            return false;
-        }
+        self.flush_out();
         if self.space() == 0 {
             self.note_stall();
         } else if !self.stop.load(Ordering::SeqCst) {
@@ -810,58 +741,11 @@ impl StdoutSink for OutputSession {
     fn eof(&self) {
         if let Some(journal) = &self.reliable {
             journal.eof();
-            if journal.failed() {
-                let _ = journal.lifecycle(ControlEvent::ProtocolFailure {
-                    session: self.session.session.clone(),
-                    session_epoch: SessionEpoch(self.session.epoch),
-                    seq: 0,
-                    reason: "stdout line exceeds 1 MiB".into(),
-                });
-                if let Some(fence) = self
-                    .fence
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
-                    fence();
-                }
-                let _ = self.session.request_cleanup();
-            }
-            self.cv.notify_all();
-            return;
+        } else {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).eof = true;
+            self.flush_out();
         }
-        if self.flush_out() {
-            self.fail_overflow();
-        }
-        let tail = {
-            let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-            if inner.failed {
-                inner.eof = true;
-                None
-            } else {
-                let len = inner.partial.len().saturating_add(inner.staging.len());
-                if len > MAX_STDOUT_LINE {
-                    Some(Err(()))
-                } else if len == 0 {
-                    inner.eof = true;
-                    None
-                } else {
-                    let mut tail = std::mem::take(&mut inner.partial);
-                    tail.append(&mut inner.staging);
-                    inner.eof = true;
-                    Some(Ok(tail))
-                }
-            }
-        };
-        match tail {
-            None => self.cv.notify_all(),
-            Some(Err(())) => {
-                self.fail_overflow();
-                self.inner.lock().unwrap_or_else(|err| err.into_inner()).eof = true;
-                self.cv.notify_all();
-            }
-            Some(Ok(tail)) => self.release_tail(tail),
-        }
+        self.cv.notify_all();
     }
 
     fn wait(&self, timeout: Duration) {
@@ -936,57 +820,76 @@ impl StdoutSink for OutputSession {
 }
 
 impl OutputSession {
-    /// Emit `tail` without adding an LF. A leftover newline is a separator, not payload.
-    fn release_tail(&self, mut tail: Vec<u8>) {
-        while let Some(pos) = tail.iter().position(|byte| *byte == b'\n') {
-            let mut rest = tail.split_off(pos);
-            let line = std::mem::take(&mut tail);
-            rest.remove(0);
-            tail = rest;
-            if line.len() > MAX_STDOUT_LINE {
-                self.fail_overflow();
+    fn flush_out(&self) {
+        let _order = self.lock_order();
+        loop {
+            let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+            if inner.staging.is_empty() {
                 return;
             }
-            self.emit_line(line);
-        }
-        if tail.len() > MAX_STDOUT_LINE {
-            self.fail_overflow();
-            return;
-        }
-        if !tail.is_empty() {
-            self.emit_line(tail);
-        }
-    }
-
-    fn flush_out(&self) -> bool {
-        loop {
-            let next = {
-                let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-                if inner.failed {
-                    return true;
-                }
-                match Self::drain(&mut inner) {
-                    Parsed::Line(line) => Some(line),
-                    Parsed::Fail => return true,
-                    Parsed::Need => None,
-                }
+            let coalesce = Self::coalescible(&inner);
+            if inner.events.len() >= MAX_EVENTS && !coalesce {
+                return;
+            }
+            let room = if coalesce {
+                MAX_STDOUT_LINE - inner.events.last().expect("tail").raw_len
+            } else {
+                MAX_STDOUT_LINE
             };
-            let Some(line) = next else {
-                return false;
-            };
-            self.emit_line(line);
+            let newline = inner.staging.iter().position(|b| *b == b'\n');
+            let take = newline.unwrap_or(inner.staging.len()).min(room);
+            let terminated = newline == Some(take);
+            if coalesce {
+                let new_len = inner.events.last().expect("tail").raw_len + take;
+                let envelope = line_envelope(new_len);
+                let old_envelope = inner.events.last().expect("tail").envelope;
+                if Self::charge(&inner)
+                    .charge
+                    .saturating_add(envelope.saturating_sub(old_envelope))
+                    > MAX_STDOUT_BACKLOG
+                {
+                    return;
+                }
+                let OutInner {
+                    events, staging, ..
+                } = &mut *inner;
+                let tail = Arc::get_mut(events.last_mut().expect("tail")).expect("unexposed tail");
+                let Body::Line(raw) = &mut tail.body else {
+                    unreachable!()
+                };
+                if raw.try_reserve_exact(take).is_err() {
+                    return;
+                }
+                raw.extend_from_slice(&staging[..take]);
+                staging.drain(..take + usize::from(terminated));
+                tail.raw_len = raw.len();
+                tail.envelope = envelope;
+                tail.terminated = terminated;
+                drop(inner);
+                continue;
+            }
+            let envelope = line_envelope(take);
+            if Self::charge(&inner).charge.saturating_add(envelope) > MAX_STDOUT_BACKLOG {
+                return;
+            }
+            let raw = inner.staging[..take].to_vec();
+            inner.staging.drain(..take + usize::from(terminated));
+            drop(inner);
+            self.publish_locked(raw.len(), false, terminated, move |_| {
+                (Body::Line(raw), envelope)
+            });
         }
     }
 
     fn space(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if inner.failed || inner.eof || self.stop.load(Ordering::SeqCst) {
+        if inner.eof || self.stop.load(Ordering::SeqCst) {
             return 0;
         }
         if !inner.staging.is_empty() {
             return 0;
         }
-        if inner.events.len() >= MAX_EVENTS && inner.partial.is_empty() {
+        if inner.events.len() >= MAX_EVENTS && !Self::coalescible(&inner) {
             return 0;
         }
         let charge = Self::charge(&inner);
@@ -995,8 +898,7 @@ impl OutputSession {
         if budget == 0 {
             return 0;
         }
-        let line_left = (MAX_STDOUT_LINE + 1).saturating_sub(inner.partial.len());
-        budget.min(line_left).min(64 * 1024)
+        budget.min(64 * 1024)
     }
 }
 
@@ -1008,6 +910,7 @@ impl Subscriber {
     pub fn run(
         self,
         hub: Arc<Hub>,
+        minor: u16,
         mut write: impl FnMut(Frame) -> Result<(), ()> + Send,
         mut closed: impl FnMut() -> bool + Send,
     ) {
@@ -1065,6 +968,10 @@ impl Subscriber {
             // A closed peer must not count as a finished write. The kernel can
             // accept a small frame after the reader is gone.
             if closed() {
+                self.finish_drop(&hub);
+                break;
+            }
+            if !event.terminated && minor < 2 {
                 self.finish_drop(&hub);
                 break;
             }
@@ -1194,7 +1101,14 @@ fn frames_of(event: &Logical) -> Vec<Frame> {
             let Ok(session) = SessionId::new(&event.session) else {
                 return Vec::new();
             };
-            fragment_line(&session, SessionEpoch(event.epoch), event.seq, raw).unwrap_or_default()
+            fragment_line_with_termination(
+                &session,
+                SessionEpoch(event.epoch),
+                event.seq,
+                event.terminated,
+                raw,
+            )
+            .unwrap_or_default()
         }
         Body::Control(control) => {
             let payload = serde_json::to_vec(control).unwrap_or_default();

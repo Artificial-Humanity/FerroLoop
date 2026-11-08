@@ -26,8 +26,8 @@ pub use frame::{
     EventSeq, Frame, FrameKind, LineReassembler, ResponseCorrelator, checked_frame_len,
     checked_unauth_len, decode_request, decode_request_for_minor, decode_response,
     decode_response_for_minor, encode_request, encode_request_for_minor, encode_response,
-    encode_response_for_minor, fragment_line, frame_total_len, line_fragment, read_frame,
-    write_frame,
+    encode_response_for_minor, fragment_line, fragment_line_with_termination, frame_total_len,
+    line_fragment, line_fragment_with_termination, read_frame, write_frame,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use transport::interpret_ucred;

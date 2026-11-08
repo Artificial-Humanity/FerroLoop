@@ -629,7 +629,7 @@ impl HostEventStream {
                 }
             };
             if frame.kind == crate::FrameKind::Line {
-                match self.lines.push_frame(&frame) {
+                match self.lines.push_frame_for_minor(self.client.minor, &frame) {
                     Ok(Some(event)) => return Ok(event),
                     Ok(None) => continue,
                     Err(err) => {

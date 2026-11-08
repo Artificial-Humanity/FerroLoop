@@ -388,7 +388,7 @@ fn fragmented_disconnect_and_watermark_recovery_apply_complete_events_once() {
             .unwrap()
     });
     assert!(
-        matches!(&frame,ExtensionFrame::ReliablePart{seq:3,kind:ReliableKind::Line,more:true,bytes} if bytes.as_slice().len()==32*1024)
+        matches!(&frame,ExtensionFrame::ReliablePart{seq:3,kind:ReliableKind::Line,more:true,bytes,..} if bytes.as_slice().len()==32*1024)
     );
     assert!(partial.push(&frame).unwrap().is_none());
     f.at("reliable-after-part");

@@ -486,12 +486,14 @@ async fn begin_events(
             let handle = host.handle.clone();
             let hub = Arc::clone(&host.hub);
             let host_for_thread = Arc::clone(&host);
+            let minor = conn.negotiated_minor();
             host.spawn_thread(move || {
                 let conn = std::sync::Mutex::new(conn);
                 let writing = std::sync::Arc::new(conn);
                 let probing = std::sync::Arc::clone(&writing);
                 sub.run(
                     hub,
+                    minor,
                     move |frame| {
                         let mut conn = writing.lock().unwrap_or_else(|err| err.into_inner());
                         handle.block_on(conn.write_frame(&frame)).map_err(|_| ())
@@ -858,16 +860,22 @@ async fn run_extension(
             break;
         };
         let lifecycle;
-        let (kind, bytes) = match &record.body {
-            crate::reliable::ReliableBody::Line(bytes) => {
-                (fl_host_proto::ReliableKind::Line, bytes.as_slice())
-            }
+        let (kind, bytes, terminated) = match &record.body {
+            crate::reliable::ReliableBody::Line(bytes) => (
+                fl_host_proto::ReliableKind::Line,
+                bytes.as_slice(),
+                bytes.terminated,
+            ),
             crate::reliable::ReliableBody::Lifecycle(event, _) => {
                 lifecycle = match serde_json::to_vec(event) {
                     Ok(bytes) => bytes,
                     Err(_) => break,
                 };
-                (fl_host_proto::ReliableKind::Lifecycle, lifecycle.as_slice())
+                (
+                    fl_host_proto::ReliableKind::Lifecycle,
+                    lifecycle.as_slice(),
+                    true,
+                )
             }
         };
         let parts = bytes
@@ -891,6 +899,7 @@ async fn run_extension(
             let frame = match fl_host_proto::encode_extension_frame(
                 conn.negotiated_minor(),
                 &fl_host_proto::ExtensionFrame::ReliablePart {
+                    terminated,
                     seq: record.seq,
                     kind,
                     more: index + 1 < parts,

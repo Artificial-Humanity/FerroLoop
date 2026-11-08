@@ -15,6 +15,7 @@ const ARC_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
 const RECORD_METADATA: usize = std::mem::size_of::<ReliableRecord>() + ARC_OVERHEAD;
 
 pub(crate) struct ChargedBytes {
+    pub(crate) terminated: bool,
     bytes: Box<[u8]>,
     len: usize,
     reservation: Reservation,
@@ -22,6 +23,7 @@ pub(crate) struct ChargedBytes {
 impl ChargedBytes {
     pub(crate) fn from_reservation(reservation: Reservation, len: usize) -> Self {
         Self {
+            terminated: true,
             bytes: vec![0; len].into_boxed_slice(),
             len,
             reservation,
@@ -43,6 +45,7 @@ pub(crate) enum ReliableBody {
     Lifecycle(ControlEvent, Reservation),
 }
 pub(crate) struct ReliableRecord {
+    exposed: bool,
     pub(crate) seq: u64,
     pub(crate) body: ReliableBody,
     _metadata: Reservation,
@@ -213,7 +216,8 @@ impl ReliableJournal {
         if state.eof
             || state.failed
             || state.pending.is_some()
-            || self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS
+            || (self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS
+                && !self.coalescible(&state))
         {
             return Err(ExtensionRefusal::ResourceLimit);
         }
@@ -297,6 +301,34 @@ impl ReliableJournal {
                 Some(kind)
             }
         };
+        if kind.is_none() && self.coalescible(state) {
+            let incoming = match body.as_ref().expect("body") {
+                ReliableBody::Line(b) => b,
+                _ => unreachable!(),
+            };
+            let idx = (state.head + state.len - 1) % SLOTS;
+            let old = state.records[idx].as_ref().expect("tail");
+            let ReliableBody::Line(previous) = &old.body else {
+                unreachable!()
+            };
+            if let Some(len) = previous
+                .len
+                .checked_add(incoming.len)
+                .filter(|n| *n <= MAX_STDOUT_LINE)
+            {
+                let mut combined = self.allocate(len)?;
+                combined.terminated = incoming.terminated;
+                combined.as_mut_slice()[..previous.len].copy_from_slice(previous.as_slice());
+                combined.as_mut_slice()[previous.len..].copy_from_slice(incoming.as_slice());
+                let envelope = self.line_envelope(&combined)?;
+                let tail = Arc::get_mut(state.records[idx].as_mut().expect("tail"))
+                    .expect("unexposed tail");
+                tail.body = ReliableBody::Line(combined);
+                tail._envelope = Some(envelope);
+                body.take();
+                return Ok(tail.seq);
+            }
+        }
         let (count, limit) = if kind.is_some() {
             (&self.counts.lifecycle, MAX_LIFECYCLE_RECORDS)
         } else {
@@ -313,35 +345,18 @@ impl ReliableJournal {
         } else {
             reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)?
         };
-        let envelope =
-            if let ReliableBody::Line(bytes) = body.as_ref().expect("owned admission body") {
-                let fragments = bytes.len.max(1).div_ceil(fl_host_proto::MAX_EXTENSION_PART);
-                // The actual minor-1 JSON part header is counted with the largest seq;
-                // payload storage itself is shared, and wire copies belong to Task 3.
-                let part = fl_host_proto::ExtensionFrame::ReliablePart {
-                    seq: u64::MAX,
-                    kind: fl_host_proto::ReliableKind::Line,
-                    more: false,
-                    bytes: fl_host_proto::BoundedBytes::new(Vec::new()).expect("empty part"),
-                };
-                let mut counter = BoundedCounter(0);
-                if serde_json::to_writer(&mut counter, &part).is_err() {
-                    return Err(ExtensionRefusal::ResourceLimit);
-                }
-                let bytes = match fragments.checked_mul(counter.0) {
-                    Some(v) => v,
-                    None => return Err(ExtensionRefusal::ResourceLimit),
-                };
-                Some(reserve(&self.budget, ChargeKind::ReliableData, bytes)?)
-            } else {
-                None
-            };
+        let envelope = if let ReliableBody::Line(bytes) = body.as_ref().expect("body") {
+            Some(self.line_envelope(bytes)?)
+        } else {
+            None
+        };
         if let ReliableBody::Lifecycle(event, _) = body.as_mut().expect("owned admission body") {
             set_seq(event, state.next);
         }
         let seq = state.next;
         count.fetch_add(1, Ordering::SeqCst);
         let record = Arc::new(ReliableRecord {
+            exposed: false,
             seq,
             body: body.take().expect("admitted body"),
             _metadata: metadata,
@@ -360,45 +375,62 @@ impl ReliableJournal {
         }
         Ok(seq)
     }
+    fn coalescible(&self, state: &State) -> bool {
+        if state.len == 0 {
+            return false;
+        }
+        let tail = state.records[(state.head + state.len - 1) % SLOTS]
+            .as_ref()
+            .expect("tail");
+        !tail.exposed
+            && Arc::strong_count(tail) == 1
+            && matches!(&tail.body, ReliableBody::Line(b) if !b.terminated && b.len < MAX_STDOUT_LINE)
+    }
+    fn line_envelope(&self, bytes: &ChargedBytes) -> Result<Reservation, ExtensionRefusal> {
+        let fragments = bytes.len.max(1).div_ceil(fl_host_proto::MAX_EXTENSION_PART);
+        let part = fl_host_proto::ExtensionFrame::ReliablePart {
+            terminated: bytes.terminated,
+            seq: u64::MAX,
+            kind: fl_host_proto::ReliableKind::Line,
+            more: false,
+            bytes: fl_host_proto::BoundedBytes::new(Vec::new()).expect("empty"),
+        };
+        let mut counter = BoundedCounter(0);
+        serde_json::to_writer(&mut counter, &part).map_err(|_| ExtensionRefusal::ResourceLimit)?;
+        reserve(
+            &self.budget,
+            ChargeKind::ReliableData,
+            fragments
+                .checked_mul(counter.0)
+                .ok_or(ExtensionRefusal::ResourceLimit)?,
+        )
+    }
     fn drain(&self, state: &mut State) -> Result<(), ExtensionRefusal> {
         loop {
-            if state.partial_complete {
+            if state.partial.is_some() {
                 self.publish_partial(state)?;
-            }
-            if self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS {
-                return Err(ExtensionRefusal::ResourceLimit);
             }
             let Some(pending) = state.pending.as_ref() else {
                 break;
             };
             let remaining = &pending.bytes.as_slice()[pending.offset..];
-            let newline = remaining.iter().position(|b| *b == b'\n');
-            let take = newline.unwrap_or(remaining.len());
-            let old_len = state.partial.as_ref().map_or(0, |p| p.len);
-            let len = old_len
-                .checked_add(take)
-                .filter(|n| *n <= MAX_STDOUT_LINE)
-                .ok_or_else(|| {
-                    state.failed = true;
-                    ExtensionRefusal::Io
-                })?;
-            let mut combined = self.allocate(len)?;
-            if let Some(partial) = &state.partial {
-                combined.as_mut_slice()[..old_len].copy_from_slice(partial.as_slice());
+            if remaining.is_empty() {
+                state.pending = None;
+                continue;
             }
-            combined.as_mut_slice()[old_len..].copy_from_slice(&remaining[..take]);
-            state.partial = Some(combined);
+            let newline = remaining.iter().position(|b| *b == b'\n');
+            let take = newline.unwrap_or(remaining.len()).min(MAX_STDOUT_LINE);
+            let terminated = newline == Some(take);
+            let mut fragment = self.allocate(take)?;
+            fragment.terminated = terminated;
+            fragment.as_mut_slice().copy_from_slice(&remaining[..take]);
+            state.partial = Some(fragment);
+            state.partial_complete = terminated;
             let pending = state.pending.as_mut().expect("pending");
-            pending.offset += take + usize::from(newline.is_some());
+            pending.offset += take + usize::from(terminated);
             if pending.offset == pending.bytes.len {
                 state.pending = None;
             }
-            if newline.is_some() {
-                state.partial_complete = true;
-                self.publish_partial(state)?;
-            }
-        }
-        if state.eof && state.partial.is_some() {
             self.publish_partial(state)?;
         }
         Ok(())
@@ -539,7 +571,11 @@ impl ReplayCursor {
         }
         let offset = usize::try_from(self.next - state.acked - 1)
             .map_err(|_| ExtensionRefusal::ResourceLimit)?;
-        let record = state.records[(state.head + offset) % SLOTS]
+        let index = (state.head + offset) % SLOTS;
+        if let Some(record) = state.records[index].as_mut().and_then(Arc::get_mut) {
+            record.exposed = true;
+        }
+        let record = state.records[index]
             .as_ref()
             .ok_or(ExtensionRefusal::CursorExpired)?;
         if self.journal.counts.references.load(Ordering::SeqCst)
@@ -642,6 +678,27 @@ mod tests {
         );
         (session, output)
     }
+    #[test]
+    fn arbitrarily_long_unterminated_output_is_not_a_protocol_failure() {
+        let j = journal();
+        for _ in 0..513 {
+            let mut bytes = j.prepare_read().unwrap();
+            bytes.as_mut_slice().fill(b'x');
+            assert_eq!(j.accept_read(bytes), Ok(()));
+            assert!(!j.failed());
+        }
+        j.eof();
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        let mut count = 0;
+        while let Some(record) = cursor.next().unwrap() {
+            if let ReliableBody::Line(bytes) = &record.body {
+                count += bytes.as_slice().len();
+                assert!(bytes.as_slice().iter().all(|b| *b == b'x'));
+            }
+        }
+        assert_eq!(count, 513 * 4096);
+    }
+
     #[test]
     fn real_sink_driver_retains_pending_read_at_saturation_and_stop() {
         let j = journal();
