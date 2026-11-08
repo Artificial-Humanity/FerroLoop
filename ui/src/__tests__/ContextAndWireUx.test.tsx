@@ -2,11 +2,15 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
 import {
+  activeSessionStillCurrent,
   App,
   computeUnreadByAgent,
   countUnseenAssistantTurns,
   isUserDirectedAssistantTurn,
   LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY,
+  OPTIMISTIC_PROMPT_BUSY_MAX_MS,
+  OPTIMISTIC_PROMPT_TTL_MS,
+  pruneOptimisticPrompts,
   preserveOptimisticTurn,
   THEME_STORAGE_KEY,
   transcriptPollIntervalMs,
@@ -470,7 +474,7 @@ describe("optimistic prompt preservation", () => {
     expect(merged[1]).toMatchObject({ role: "user", content: "Ship it" });
   });
 
-  it("drops the optimistic turn once it reaches the disk tail or ages out past 60s", () => {
+  it("drops the optimistic turn once it reaches the disk tail or ages out past 5 minutes", () => {
     const onDisk = [
       ...diskTurns,
       turn({ index: 8, role: "user", content: "Ship it" }),
@@ -483,6 +487,9 @@ describe("optimistic prompt preservation", () => {
     ).toHaveLength(2);
     expect(
       preserveOptimisticTurn(diskTurns, { content: "Ship it", sentAt: 1_000 }, 62_000),
+    ).toHaveLength(2);
+    expect(
+      preserveOptimisticTurn(diskTurns, { content: "Ship it", sentAt: 1_000 }, 302_000),
     ).toBe(diskTurns);
     expect(preserveOptimisticTurn(diskTurns, null, 3_000)).toBe(diskTurns);
   });
@@ -510,6 +517,54 @@ describe("optimistic prompt preservation", () => {
     const prompt = { content: "private to A", sentAt: 1_000, agentKey: "ferris", sessionId: "session-a" };
     expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", "session-b")).toBe(diskTurns);
     expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", "session-a")).toHaveLength(2);
+  });
+
+  it("carries a prompt recorded before the session id resolved to the resolved id", () => {
+    const resolved = "72e7cfb2-13cc-4e34-8b49-ee789472fdc6";
+    for (const sessionId of [undefined, "claude-felix-2027881"]) {
+      const prompt = { content: "Hello", sentAt: 1_000, agentKey: "felix", sessionId };
+      expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "felix", resolved)).toHaveLength(2);
+      // Another agent, or a canonical id of another session, still does not inherit it.
+      expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", resolved)).toBe(diskTurns);
+      const kept = pruneOptimisticPrompts([prompt], diskTurns, 3_000, "felix", resolved);
+      expect(kept).toHaveLength(1);
+      expect(kept[0].sessionId).toBe(resolved);
+    }
+    const canonical = { content: "Hello", sentAt: 1_000, agentKey: "felix", sessionId: resolved };
+    expect(
+      preserveOptimisticTurn(diskTurns, canonical, 3_000, "felix", "11111111-2222-4333-8444-555555555555"),
+    ).toBe(diskTurns);
+  });
+
+  it("does not restamp another agent's unresolved prompt to the active agent's session id", () => {
+    const resolved = "72e7cfb2-13cc-4e34-8b49-ee789472fdc6";
+    const other = { content: "for ferris", sentAt: 1_000, agentKey: "ferris", sessionId: undefined };
+    const kept = pruneOptimisticPrompts([other], diskTurns, 3_000, "felix", resolved);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].sessionId).toBeUndefined();
+    const own = { content: "for felix", sentAt: 1_000, agentKey: "felix", sessionId: undefined };
+    expect(pruneOptimisticPrompts([own], diskTurns, 3_000, "felix", resolved)[0].sessionId).toBe(resolved);
+  });
+
+  it("keeps recording a send whose active session id resolved mid-flight, not one that switched", () => {
+    const resolved = "72e7cfb2-13cc-4e34-8b49-ee789472fdc6";
+    expect(activeSessionStillCurrent(null, resolved, "felix")).toBe(true);
+    expect(activeSessionStillCurrent("claude-felix-2027881", resolved, resolved)).toBe(true);
+    expect(activeSessionStillCurrent(resolved, resolved, resolved)).toBe(true);
+    expect(activeSessionStillCurrent(resolved, "11111111-2222-4333-8444-555555555555", resolved)).toBe(false);
+    expect(activeSessionStillCurrent(resolved, null, resolved)).toBe(false);
+    expect(activeSessionStillCurrent(resolved, resolved, "other-target")).toBe(false);
+  });
+
+  it("keeps an expired optimistic prompt while the session is busy, up to a hard cap", () => {
+    const prompt = { content: "Still working", sentAt: 1_000, agentKey: "felix" };
+    const late = 1_000 + OPTIMISTIC_PROMPT_TTL_MS + 1;
+    expect(preserveOptimisticTurn(diskTurns, prompt, late, "felix")).toBe(diskTurns);
+    expect(preserveOptimisticTurn(diskTurns, prompt, late, "felix", undefined, true)).toHaveLength(2);
+    expect(pruneOptimisticPrompts([prompt], diskTurns, late, "felix", undefined, true)).toHaveLength(1);
+    expect(pruneOptimisticPrompts([prompt], diskTurns, late, "felix", undefined, false)).toHaveLength(0);
+    const beyondCap = 1_000 + OPTIMISTIC_PROMPT_BUSY_MAX_MS + 1;
+    expect(preserveOptimisticTurn(diskTurns, prompt, beyondCap, "felix", undefined, true)).toBe(diskTurns);
   });
 
   it("recognizes an on-disk user turn that wraps the prompt via substring match", () => {
