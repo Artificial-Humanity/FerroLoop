@@ -93,7 +93,8 @@ pub enum AgentCmd {
         #[arg(long)]
         model: Option<String>,
         /// Vendor-native thinking level (`--effort` for Claude, reasoning effort for Codex, the
-        /// model id suffix for Antigravity); other vendors ignore it.
+        /// model id suffix for Antigravity). Other vendors reject it. Antigravity takes only
+        /// `low`, `medium` or `high` and needs `--model`.
         #[arg(long = "thinking-level", visible_alias = "effort")]
         thinking_level: Option<String>,
         /// Node the session runs on (default `ai-lab-0`).

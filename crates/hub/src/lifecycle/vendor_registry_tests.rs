@@ -929,7 +929,7 @@ fn record_after_spin(store: &MemStore) -> HostedSessionRecord {
 }
 
 #[test]
-fn set_hosted_session_model_persists_a_thinking_level_only_when_given() {
+fn set_hosted_session_model_persists_a_given_level_and_clears_a_stale_one() {
     let store = MemStore::default();
     record_after_spin(&store);
     let rec = set_hosted_session_model(&store, &["claude:ada"], "opus", Some("max"), "owner")
@@ -940,5 +940,131 @@ fn set_hosted_session_model_persists_a_thinking_level_only_when_given() {
         .unwrap()
         .unwrap();
     assert_eq!(rec.model.as_deref(), Some("sonnet"));
-    assert_eq!(rec.thinking_level.as_deref(), Some("max"));
+    assert_eq!(
+        rec.thinking_level, None,
+        "a model-only switch clears the stale level"
+    );
+}
+
+#[test]
+fn thinking_level_is_rejected_for_hostile_values_on_every_vendor() {
+    for bad in [
+        "high; rm",
+        "hi\"gh",
+        "high\nlow",
+        "--model",
+        "a b",
+        "",
+        "'x'",
+    ] {
+        for vendor in ["claude", "codex", "antigravity"] {
+            let r = SpinUpRequest {
+                model: Some("opus".into()),
+                thinking_level: Some(bad.into()),
+                ..req("ada", vendor)
+            };
+            // An empty level is "not given" (trimmed to None); the rest must be refused.
+            if bad.is_empty() {
+                assert_eq!(r.validate().unwrap().thinking_level, None);
+            } else {
+                assert!(
+                    matches!(r.validate(), Err(LifecycleError::Invalid(_))),
+                    "{vendor} {bad:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn antigravity_accepts_only_low_medium_high_and_needs_a_model() {
+    for level in ["low", "medium", "HIGH"] {
+        let r = SpinUpRequest {
+            model: Some("gemini-3-pro".into()),
+            thinking_level: Some(level.into()),
+            ..req("ada", "antigravity")
+        };
+        assert!(r.validate().is_ok(), "{level}");
+    }
+    let max = SpinUpRequest {
+        model: Some("gemini-3-pro".into()),
+        thinking_level: Some("max".into()),
+        ..req("ada", "antigravity")
+    };
+    let err = max.validate().unwrap_err().to_string();
+    assert!(err.contains("low, medium or high"), "{err}");
+    let no_model = SpinUpRequest {
+        thinking_level: Some("high".into()),
+        ..req("ada", "antigravity")
+    };
+    let err = no_model.validate().unwrap_err().to_string();
+    assert!(err.contains("pass a model"), "{err}");
+    let oss_high = SpinUpRequest {
+        model: Some("gpt-oss-120b".into()),
+        thinking_level: Some("high".into()),
+        ..req("ada", "antigravity")
+    };
+    assert!(oss_high.validate().is_err());
+    let oss_medium = SpinUpRequest {
+        model: Some("gpt-oss-120b".into()),
+        thinking_level: Some("medium".into()),
+        ..req("ada", "antigravity")
+    };
+    assert!(oss_medium.validate().is_ok());
+}
+
+#[test]
+fn vendors_that_ignore_the_level_reject_it() {
+    for vendor in ["grok", "muse", "lemonade", "ollama"] {
+        let r = SpinUpRequest {
+            thinking_level: Some("high".into()),
+            ..req("ada", vendor)
+        };
+        let err = r.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("does not support thinking_level"),
+            "{vendor}: {err}"
+        );
+    }
+}
+
+#[test]
+fn claude_and_codex_accept_a_level_without_a_model() {
+    for vendor in ["claude", "codex"] {
+        let r = SpinUpRequest {
+            thinking_level: Some("high".into()),
+            ..req("ada", vendor)
+        };
+        assert_eq!(
+            r.validate().unwrap().thinking_level.as_deref(),
+            Some("high")
+        );
+    }
+}
+
+#[test]
+fn restart_after_a_model_only_switch_relaunches_without_the_stale_effort() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = env_with(&home, &fake, &ProvisionedKeys);
+    let request = SpinUpRequest {
+        model: Some("opus".into()),
+        thinking_level: Some("high".into()),
+        ..req("ada", "claude")
+    };
+    spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+    set_hosted_session_model(&store, &["claude:ada"], "sonnet", None, "owner").unwrap();
+    // The first window died, so the restart opens a new one.
+    fake.live.borrow_mut().clear();
+    let before = fake.launches.borrow().len();
+    restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+    let launches = fake.launches.borrow();
+    assert_eq!(launches.len(), before + 1, "restart relaunched");
+    let argv = &launches.last().unwrap().1.as_ref().unwrap().argv;
+    assert!(
+        argv.windows(2).any(|w| w == ["--model", "sonnet"]),
+        "{argv:?}"
+    );
+    assert!(!argv.iter().any(|a| a == "--effort"), "{argv:?}");
 }

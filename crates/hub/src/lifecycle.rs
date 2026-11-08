@@ -1405,6 +1405,18 @@ impl SpinUpRequest {
                     "must be letters, digits, '.', '_' or '-' (at most 64 characters)",
                 ));
             }
+            // The adapter owns what its CLI can apply; no adapter (a prompt-delivery vendor)
+            // means nothing applies the level.
+            match fl_wire::vendor_adapter::lookup_vendor_cli_adapter(&vendor) {
+                Some(adapter) => adapter
+                    .check_thinking_level(model.as_deref(), level)
+                    .map_err(|msg| LifecycleError::Invalid(format!("thinking_level: {msg}")))?,
+                None => {
+                    return Err(LifecycleError::Invalid(format!(
+                        "thinking_level: vendor `{vendor}` does not support thinking_level; omit it"
+                    )));
+                }
+            }
         }
         let node_id = trimmed_opt(&self.node_id).unwrap_or_else(|| DEFAULT_NODE_ID.to_string());
         if !node_id
@@ -1610,9 +1622,9 @@ pub fn set_hosted_session_model<S: StateStore>(
         return Ok(None);
     };
     record.model = Some(model.to_string());
-    if let Some(level) = thinking_level {
-        record.thinking_level = Some(level.to_string());
-    }
+    // The API always sends the full model/level pair, so `None` means "no level": a stale one
+    // (Claude `--effort high`, then a switch to `sonnet`) must not be relaunched on restart.
+    record.thinking_level = thinking_level.map(str::to_string);
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
     Ok(Some(record))

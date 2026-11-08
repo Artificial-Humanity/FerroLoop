@@ -63,6 +63,16 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
         home: Option<&Path>,
     ) -> LaunchSpec;
 
+    /// Whether a launch with `thinking_level` (already a plain token) can honour it. The default
+    /// refuses: a vendor with no launch option for it must not report a level it never applied.
+    /// An `Err` is an actionable message for the operator.
+    fn check_thinking_level(&self, _model: Option<&str>, _level: &str) -> Result<(), String> {
+        Err(format!(
+            "vendor `{}` does not support thinking_level; omit it",
+            self.vendor_id()
+        ))
+    }
+
     /// Interactive startup prompts to poll and answer right after spawning.
     fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
         &[]
@@ -306,6 +316,12 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         normalize_plain_model(requested)
     }
 
+    /// Any plain token is passed through (`--effort` / reasoning effort); it applies with or
+    /// without `--model`.
+    fn check_thinking_level(&self, _model: Option<&str>, _level: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn build_launch_spec(
         &self,
         persona: &str,
@@ -355,6 +371,12 @@ impl VendorCliAdapter for CodexCliAdapter {
 
     fn normalize_model(&self, requested: Option<&str>) -> Option<String> {
         normalize_plain_model(requested).filter(|m| split_window_tag(m).is_none())
+    }
+
+    /// Any plain token is passed through (`--effort` / reasoning effort); it applies with or
+    /// without `--model`.
+    fn check_thinking_level(&self, _model: Option<&str>, _level: &str) -> Result<(), String> {
+        Ok(())
     }
 
     fn build_launch_spec(
@@ -408,6 +430,30 @@ impl VendorCliAdapter for AntigravityCliAdapter {
             .map(|m| agy_cli_model_id(m, None))
             .and_then(|m| normalize_plain_model(Some(&m)))
             .filter(|m| split_window_tag(m).is_none())
+    }
+
+    /// Antigravity takes its level only as the `-low|-medium|-high` suffix of the model id, so
+    /// the level needs a model and must be one of those three; `gpt-oss-120b` only runs at medium.
+    fn check_thinking_level(&self, model: Option<&str>, level: &str) -> Result<(), String> {
+        let level = level.trim().to_ascii_lowercase();
+        if !matches!(level.as_str(), "low" | "medium" | "high") {
+            return Err(format!(
+                "antigravity supports thinking_level low, medium or high, not `{level}`"
+            ));
+        }
+        let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+            return Err(
+                "antigravity applies thinking_level only through the model id: pass a model too"
+                    .to_string(),
+            );
+        };
+        let (base, _) = split_agy_thinking_suffix(&model.to_ascii_lowercase());
+        if base == "gpt-oss-120b" && level != "medium" {
+            return Err(format!(
+                "model gpt-oss-120b only runs at thinking_level medium, not `{level}`"
+            ));
+        }
+        Ok(())
     }
 
     fn build_launch_spec(
