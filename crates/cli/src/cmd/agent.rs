@@ -937,11 +937,14 @@ mod tests {
     #[test]
     fn spin_up_and_remodel_parse_thinking_level_and_its_effort_alias() {
         use clap::Parser;
+        let parse = |args: &[&str]| {
+            let mut full = vec!["fl"];
+            full.extend_from_slice(args);
+            AgentTestCli::try_parse_from(full).unwrap().cmd
+        };
         for flag in ["--thinking-level", "--effort"] {
-            let cli = AgentTestCli::try_parse_from([
-                "fl",
+            let AgentCmd::SpinUp { thinking_level, .. } = parse(&[
                 "spin-up",
-                "--persona",
                 "ada",
                 "--project",
                 "p",
@@ -949,28 +952,25 @@ mod tests {
                 "assistant",
                 "--vendor",
                 "claude",
+                "--by",
+                "x",
+                "--json",
                 flag,
                 "high",
-            ])
-            .unwrap();
-            let AgentCmd::SpinUp { thinking_level, .. } = cli.cmd else {
+            ]) else {
                 panic!("not spin-up");
             };
             assert_eq!(thinking_level.as_deref(), Some("high"), "{flag}");
 
-            let cli = AgentTestCli::try_parse_from([
-                "fl", "remodel", "ada", "--vendor", "codex", flag, "xhigh",
-            ])
-            .unwrap();
-            let AgentCmd::Remodel { thinking_level, .. } = cli.cmd else {
+            let AgentCmd::Remodel { thinking_level, .. } = parse(&[
+                "remodel", "ada", "--vendor", "codex", "--by", "x", "--json", flag, "xhigh",
+            ]) else {
                 panic!("not remodel");
             };
             assert_eq!(thinking_level.as_deref(), Some("xhigh"), "{flag}");
         }
-        let cli = AgentTestCli::try_parse_from([
-            "fl",
+        let AgentCmd::SpinUp { thinking_level, .. } = parse(&[
             "spin-up",
-            "--persona",
             "ada",
             "--project",
             "p",
@@ -978,9 +978,10 @@ mod tests {
             "assistant",
             "--vendor",
             "claude",
-        ])
-        .unwrap();
-        let AgentCmd::SpinUp { thinking_level, .. } = cli.cmd else {
+            "--by",
+            "x",
+            "--json",
+        ]) else {
             panic!("not spin-up");
         };
         assert!(thinking_level.is_none());

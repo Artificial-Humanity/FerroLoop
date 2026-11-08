@@ -2023,12 +2023,7 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
                             .map_err(|e| format!("fl-host signal_session Interrupt failed: {e}"))?;
                     }
                     other => {
-                        let outcome = client
-                            .send_line(stream, grant.lease, other.to_string())
-                            .map_err(|e| format!("fl-host send_line {other} failed: {e}"))?;
-                        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-                            return Err(format!("fl-host send_line {other} returned {outcome:?}"));
-                        }
+                        host_write_text_then_enter(&mut client, stream, grant.lease, other)?;
                     }
                 }
                 return Ok(());
@@ -2211,6 +2206,34 @@ fn tmux_target_alive(target: &str) -> bool {
 
 fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
     deliver_via_tmux_paste_opts(target, text, false)
+}
+
+/// Write `text` to a raw-mode `fl-host` session, then press Enter as its own 1-byte `\r` write
+/// after [`TMUX_PASTE_SETTLE_DELAY`]. A raw-mode TUI reads a `\n` that trails its text as part of
+/// a paste, not as Enter, so `send_line` would leave the text unsent. Empty `text` writes only the
+/// Enter.
+pub fn host_write_text_then_enter(
+    client: &mut fl_host_proto::BlockingHostClient,
+    stream: fl_host_proto::StreamId,
+    lease: fl_host_proto::ControllerLease,
+    text: &str,
+) -> Result<(), String> {
+    if !text.is_empty() {
+        let outcome = client
+            .write_raw(stream.clone(), lease, text.as_bytes().to_vec())
+            .map_err(|e| format!("fl-host write_raw {text} failed: {e}"))?;
+        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+            return Err(format!("fl-host write_raw {text} returned {outcome:?}"));
+        }
+    }
+    std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
+    let outcome = client
+        .write_raw(stream, lease, b"\r".to_vec())
+        .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
+    if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+        return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
+    }
+    Ok(())
 }
 
 /// Pause around the Enter key so the terminal can receive the paste and show its state.
@@ -7050,6 +7073,116 @@ exit 1"#,
             "expected Escape interrupt write to Fay.lemonade, got: {writes:?}"
         );
 
+        drop(server_thread);
+    }
+
+    #[test]
+    fn fl_host_custom_interrupt_key_is_raw_text_then_a_separate_carriage_return() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Fay.lemonade").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([1u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let writes_srv = Arc::clone(&writes);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    writes.lock().unwrap().push(bytes.into_vec());
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let plan = InterruptPlan::TmuxKey {
+            targets: vec!["Fay.lemonade".to_string()],
+            key: "/stop",
+        };
+        run_interrupt(&plan).unwrap();
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![b"/stop".to_vec(), b"\r".to_vec()]
+        );
         drop(server_thread);
     }
 

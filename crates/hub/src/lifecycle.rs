@@ -720,10 +720,15 @@ impl SessionRuntime for HostRuntime {
                 client.write_raw(summary.stream.clone(), grant.lease, b"\r".to_vec()),
                 Ok(fl_host_proto::SendOutcome::Written)
             ),
-            other => matches!(
-                client.send_line(summary.stream.clone(), grant.lease, other.to_string()),
-                Ok(fl_host_proto::SendOutcome::Written)
-            ),
+            // Text then Enter as separate raw writes: a raw-mode TUI would take a `send_line`
+            // newline as part of the text and never submit it.
+            other => fl_wire::dispatcher::host_write_text_then_enter(
+                &mut client,
+                summary.stream.clone(),
+                grant.lease,
+                other,
+            )
+            .is_ok(),
         }
     }
 
@@ -5033,6 +5038,125 @@ mod tests {
             reforge_role_label(&AgentRole::Custom("reviewer".into())),
             "reviewer"
         );
+    }
+
+    #[test]
+    fn host_runtime_send_keys_writes_text_then_a_separate_carriage_return() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        let _lock = crate::TMUX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Fay.lemonade").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([1u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let writes_srv = Arc::clone(&writes);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    writes.lock().unwrap().push(bytes.into_vec());
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let prev_sock = std::env::var_os("FL_HOST_SOCK");
+        let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
+        // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
+        unsafe {
+            std::env::set_var("FL_HOST_SOCK", &sock_path);
+            std::env::remove_var("FL_WIRE_TMUX_BIN");
+        }
+        let sent = SessionRuntime::send_keys(&HostRuntime, "Fay.lemonade", "/model opus");
+        let seen = writes.lock().unwrap().clone();
+        // SAFETY: see above.
+        unsafe {
+            match prev_sock {
+                Some(v) => std::env::set_var("FL_HOST_SOCK", v),
+                None => std::env::remove_var("FL_HOST_SOCK"),
+            }
+            if let Some(v) = prev_tmux {
+                std::env::set_var("FL_WIRE_TMUX_BIN", v);
+            }
+        }
+        assert!(sent);
+        assert_eq!(seen, vec![b"/model opus".to_vec(), b"\r".to_vec()]);
+        drop(server_thread);
     }
 
     #[test]
