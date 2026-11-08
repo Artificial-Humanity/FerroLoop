@@ -1550,6 +1550,14 @@ fn a_virtual_scope_defaults_to_the_workspace_root_and_a_directory_project_is_unc
     // A name no area has yet: spin-up makes it as a virtual area.
     let fresh = request("brand-new", None).with_default_cwd(&ws, root);
     assert_eq!(fresh.cwd.as_deref(), Some(root.to_str().unwrap()));
+    // A virtual scope named like a directory under the workspace root starts in that directory.
+    std::fs::create_dir_all(root.join("Studio")).unwrap();
+    fx.virtual_group("studio");
+    let named = request("studio", None).with_default_cwd(&ws, root);
+    assert_eq!(
+        named.cwd.as_deref(),
+        Some(root.join("Studio").to_str().unwrap())
+    );
     // A directory-backed project: no default, and its path is not used.
     let dir = request("alpha", None).with_default_cwd(&ws, root);
     assert_eq!(dir.cwd, None);
