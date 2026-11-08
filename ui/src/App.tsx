@@ -222,7 +222,51 @@ export interface OptimisticPrompt {
   authEpoch?: number;
 }
 
-export const OPTIMISTIC_PROMPT_TTL_MS = 60_000;
+export const OPTIMISTIC_PROMPT_TTL_MS = 300_000;
+/** Hard ceiling for an optimistic prompt kept alive only because its session is still busy. */
+export const OPTIMISTIC_PROMPT_BUSY_MAX_MS = 1_800_000;
+
+/** `claude-felix-2027881`: the placeholder id used before a session's canonical id resolves. */
+function isSyntheticSessionId(id: string): boolean {
+  return /^[a-z]+-[a-z0-9_.]+(?:-[a-z0-9_.]+)*-\d+$/i.test(id);
+}
+
+/**
+ * Whether a send that began with `submitted` as the active session may still record its result
+ * once the POST returns. The active id can resolve for the same agent while the request is in
+ * flight (no id or a synthetic placeholder to the canonical id), which is not a switch; a move
+ * between canonical ids, or a send aimed at another session, is.
+ */
+export function activeSessionStillCurrent(
+  submitted: string | null,
+  current: string | null,
+  targetId: string,
+): boolean {
+  if (submitted === null || isSyntheticSessionId(submitted)) return true;
+  return current === submitted && submitted === targetId;
+}
+
+function optimisticPromptExpired(sentAt: number, nowMs: number, sessionBusy: boolean): boolean {
+  const age = nowMs - sentAt;
+  if (age <= OPTIMISTIC_PROMPT_TTL_MS) return false;
+  return !(sessionBusy && age <= OPTIMISTIC_PROMPT_BUSY_MAX_MS);
+}
+
+/**
+ * Whether a prompt recorded under `itemSessionId` belongs to `currentSessionId`. An exact match
+ * does. So does a prompt recorded before the agent's session id resolved (no id, or a synthetic
+ * placeholder) once the same agent's id is known. A prompt recorded under one canonical id never
+ * follows the agent to another: that is an explicit session switch.
+ */
+function optimisticSessionMatches(
+  itemSessionId: string | null | undefined,
+  currentSessionId: string | null | undefined,
+  sameAgent: boolean,
+): boolean {
+  if (currentSessionId === undefined) return true;
+  if ((itemSessionId ?? null) === currentSessionId) return true;
+  return sameAgent && (!itemSessionId || isSyntheticSessionId(itemSessionId));
+}
 
 function isPromptOnDisk(turns: TranscriptTurn[], content: string): boolean {
   const trimmed = content.trim();
@@ -243,19 +287,27 @@ export function pruneOptimisticPrompts(
   nowMs: number = Date.now(),
   currentAgentKey?: string | null,
   currentSessionId?: string | null,
+  sessionBusy: boolean = false,
 ): OptimisticPrompt[] {
   const activeKey = (currentAgentKey ?? "").trim().toLowerCase();
-  return prompts.filter((p) => {
+  const kept = prompts.filter((p) => {
     if (!p || !p.content?.trim()) return false;
-    if (nowMs - p.sentAt > OPTIMISTIC_PROMPT_TTL_MS) return false;
+    if (optimisticPromptExpired(p.sentAt, nowMs, sessionBusy)) return false;
     const promptKey = (p.agentKey ?? "").trim().toLowerCase();
     const matchesActive = (!activeKey || !promptKey || promptKey === activeKey) &&
-      (currentSessionId === undefined || (p.sessionId ?? null) === currentSessionId);
+      optimisticSessionMatches(p.sessionId, currentSessionId, !!activeKey && promptKey === activeKey);
     if (matchesActive && isPromptOnDisk(turns, p.content)) {
       return false;
     }
     return true;
   });
+  // A prompt recorded before the session id resolved now belongs to the resolved id.
+  return kept.map((p) =>
+    typeof currentSessionId === "string" && (p.sessionId ?? null) !== currentSessionId
+      && optimisticSessionMatches(p.sessionId, currentSessionId, true)
+      ? { ...p, sessionId: currentSessionId }
+      : p,
+  );
 }
 
 /**
@@ -270,6 +322,7 @@ export function preserveOptimisticTurn(
   nowMs: number = Date.now(),
   currentAgentKey?: string | null,
   currentSessionId?: string | null,
+  sessionBusy: boolean = false,
 ): TranscriptTurn[] {
   const rawList: OptimisticPrompt[] = Array.isArray(optimistic)
     ? optimistic
@@ -283,9 +336,9 @@ export function preserveOptimisticTurn(
   const pending: OptimisticPrompt[] = [];
   for (const item of rawList) {
     if (!item || !item.content?.trim()) continue;
-    if (nowMs - item.sentAt > OPTIMISTIC_PROMPT_TTL_MS) continue;
+    if (optimisticPromptExpired(item.sentAt, nowMs, sessionBusy)) continue;
     const itemKey = (item.agentKey ?? "").trim().toLowerCase();
-    if (currentSessionId !== undefined && (item.sessionId ?? null) !== currentSessionId) continue;
+    if (!optimisticSessionMatches(item.sessionId, currentSessionId, !!activeKey && itemKey === activeKey)) continue;
     if (activeKey && itemKey && itemKey !== activeKey) {
       continue;
     }
@@ -1022,6 +1075,8 @@ export const App: React.FC<AppProps> = ({
   }; }, [transcriptGuard]);
   const [rawSessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
   const [rawIsSessionBusy, setIsSessionBusy] = useState<boolean>(false);
+  /** Latest busy-or-unconfirmed flag, for callbacks that keep optimistic prompts alive. */
+  const sessionBusyRef = useRef<boolean>(false);
   const [unconfirmedBySession, setUnconfirmedBySession] = useState<Record<string, boolean>>({});
   const [rawSessionContextUsage, setSessionContextUsage] =
     useState<SessionContextUsage | null>(null);
@@ -1185,6 +1240,7 @@ export const App: React.FC<AppProps> = ({
       nowMs,
       activeKey,
       activeSessionIdRef.current,
+      sessionBusyRef.current,
     );
     setTranscriptTurns(turns);
   }, []);
@@ -1830,13 +1886,15 @@ export const App: React.FC<AppProps> = ({
     transcriptRefreshState !== "denied";
   const sessionQueue = metadataMatches ? rawSessionQueue : [];
   const isSessionBusy = metadataMatches ? rawIsSessionBusy : false;
+  sessionBusyRef.current = isSessionBusy ||
+    (!!ownerRef.current.sessionId && !!unconfirmedBySession[ownerRef.current.sessionId]);
   const sessionContextUsage = metadataMatches ? rawSessionContextUsage : null;
   const sessionQuotaUsage = metadataMatches ? rawSessionQuotaUsage : null;
   const transcriptTurns = preserveOptimisticTurn(
     snapshotMatches ? transcriptSnapshot.turns : [],
     loggedOutRef.current || transcriptRefreshState === "denied" ? [] : optimisticPromptRef.current.filter(
       (prompt) => prompt.authEpoch === ownerRef.current.authEpoch),
-    Date.now(), ownerRef.current.agentKey, ownerRef.current.sessionId,
+    Date.now(), ownerRef.current.agentKey, ownerRef.current.sessionId, sessionBusyRef.current,
   );
 
   const activeAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
@@ -2073,8 +2131,7 @@ export const App: React.FC<AppProps> = ({
       (!res.queued && res.status !== "queued" && isPromptDeliveryFailure(res)) ||
       selectedAgentNameRef.current !== submittedAgent ||
       selectedSessionIdRef.current !== submittedSession ||
-      activeSessionIdRef.current !== submittedActiveSession ||
-      (submittedActiveSession !== null && submittedActiveSession !== targetId)
+      !activeSessionStillCurrent(submittedActiveSession, activeSessionIdRef.current, targetId)
     ) {
       return res;
     }
@@ -2088,7 +2145,7 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey, Date.now(), submittedActiveSession);
+      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
       refreshOptimisticView((previous) => previous + 1);
     }
     void refreshSessionsAndTranscript(targetId);
