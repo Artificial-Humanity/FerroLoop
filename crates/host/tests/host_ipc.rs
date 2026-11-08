@@ -4615,37 +4615,98 @@ fn rendered_capture_and_resize_are_unsupported_without_unix_backend() {
 }
 
 #[cfg(unix)]
-fn wait_rendered_fixture(path: &Path) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(bytes) = text.parse()
-        {
-            return bytes;
+mod rendered_deadline {
+    use super::*;
+
+    pub(super) fn run<T>(deadline: Instant, context: &str, work: impl FnOnce() -> T) -> T {
+        assert!(Instant::now() < deadline, "rendered deadline: {context}");
+        let value = work();
+        assert!(Instant::now() < deadline, "rendered deadline: {context}");
+        value
+    }
+
+    pub(super) fn wait<T>(
+        deadline: Instant,
+        context: &str,
+        mut poll: impl FnMut() -> Option<T>,
+    ) -> T {
+        loop {
+            if let Some(value) = run(deadline, context, &mut poll) {
+                return value;
+            }
+            thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            Instant::now() < deadline,
-            "fixture checkpoint {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(5));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::Cell;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        #[test]
+        fn expired_deadline_refuses_to_start_work() {
+            let called = Cell::new(false);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run(Instant::now() - Duration::from_millis(1), "expired", || {
+                    called.set(true);
+                });
+            }));
+            assert!(result.is_err());
+            assert!(!called.get());
+        }
+
+        #[test]
+        fn wait_rejects_success_returned_after_deadline() {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let called = Cell::new(false);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                wait(deadline, "late successful checkpoint or RPC", || {
+                    called.set(true);
+                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    Some(())
+                });
+            }));
+            assert!(called.get(), "late-return scenario must run its callback");
+            assert!(result.is_err(), "a late successful result must be refused");
+        }
     }
 }
 
 #[cfg(unix)]
+fn wait_rendered_fixture(path: &Path) -> u64 {
+    wait_rendered_fixture_until(path, Instant::now() + Duration::from_secs(30))
+}
+
+#[cfg(unix)]
+fn wait_rendered_fixture_until(path: &Path, deadline: Instant) -> u64 {
+    rendered_deadline::wait(
+        deadline,
+        &format!("fixture checkpoint {}", path.display()),
+        || std::fs::read_to_string(path).ok()?.parse().ok(),
+    )
+}
+
+#[cfg(unix)]
 fn rendered_through(rpc: &mut Rpc, stream: &StreamId, bytes: u64) -> fl_host_proto::RenderedScreen {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
-        if screen.output_bytes >= bytes {
-            return screen;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "projection drain deadline: {screen:?}"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    rendered_through_until(rpc, stream, bytes, Instant::now() + Duration::from_secs(30))
+}
+
+#[cfg(unix)]
+fn rendered_through_until(
+    rpc: &mut Rpc,
+    stream: &StreamId,
+    bytes: u64,
+    deadline: Instant,
+) -> fl_host_proto::RenderedScreen {
+    rendered_deadline::wait(
+        deadline,
+        &format!("projection drain through {bytes} bytes"),
+        || {
+            let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+            (screen.output_bytes >= bytes).then_some(screen)
+        },
+    )
 }
 
 #[cfg(unix)]
@@ -4670,6 +4731,8 @@ fn rendered_fixture_spawn(rpc: &mut Rpc, name: &str, mode: &str, root: &Path) ->
 #[cfg(unix)]
 #[test]
 fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consumers() {
+    use rendered_deadline::{run, wait};
+
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let root = tempfile::tempdir().unwrap();
     let mut rpc = Rpc::connect(&daemon.paths.endpoint);
@@ -4706,25 +4769,38 @@ fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consu
         XResp::Subscription { ticket, .. } => ticket,
         other => panic!("stalled ticket {other:?}"),
     };
-    let (_stalled_rt, stalled) = event_socket(&daemon.paths.endpoint, stalled_ticket);
-    wait_at(&daemon.paths.subscriber, "reliable-before-part");
+    // reliable_hold expires after five seconds. Start one shorter deadline
+    // before opening the event socket can begin that hold, and keep every
+    // checkpoint and blocking result inside it so expiry cannot create a pass.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let (_stalled_rt, stalled) = run(deadline, "open held subscriber", || {
+        event_socket(&daemon.paths.endpoint, stalled_ticket)
+    });
+    wait(deadline, "subscriber reached reliable-before-part", || {
+        daemon
+            .paths
+            .subscriber
+            .join("at-reliable-before-part")
+            .exists()
+            .then_some(())
+    });
     std::fs::write(root.path().join("run"), b"1").unwrap();
 
-    let escape_bytes = wait_rendered_fixture(&root.path().join("escape-ready"));
+    let escape_bytes = wait_rendered_fixture_until(&root.path().join("escape-ready"), deadline);
     assert!(escape_bytes > 8 * 1024 * 1024);
-    let escape = rendered_through(&mut rpc, &stream, escape_bytes);
+    let escape = rendered_through_until(&mut rpc, &stream, escape_bytes, deadline);
     assert!(escape.contents.starts_with("ALTSEED"));
     assert!(!escape.contents.contains("hidden"));
     assert!(escape.generation > initial.generation);
     std::fs::write(root.path().join("escape-go"), b"1").unwrap();
 
-    let utf8_bytes = wait_rendered_fixture(&root.path().join("utf8-ready"));
-    let utf8 = rendered_through(&mut rpc, &stream, utf8_bytes);
+    let utf8_bytes = wait_rendered_fixture_until(&root.path().join("utf8-ready"), deadline);
+    let utf8 = rendered_through_until(&mut rpc, &stream, utf8_bytes, deadline);
     assert_eq!(utf8.contents, "PRIMARY\nFINAL ");
     assert_eq!((utf8.cursor_row, utf8.cursor_col), (1, 6));
     std::fs::write(root.path().join("utf8-go"), b"1").unwrap();
-    let done_bytes = wait_rendered_fixture(&root.path().join("done"));
-    let final_screen = rendered_through(&mut rpc, &stream, done_bytes);
+    let done_bytes = wait_rendered_fixture_until(&root.path().join("done"), deadline);
+    let final_screen = rendered_through_until(&mut rpc, &stream, done_bytes, deadline);
     assert_eq!(final_screen.contents, "PRIMARY\nFINAL ✓");
     assert_eq!((final_screen.cursor_row, final_screen.cursor_col), (1, 7));
     assert_eq!((final_screen.rows, final_screen.cols), (6, 32));
@@ -4733,42 +4809,53 @@ fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consu
     assert!(final_screen.generation > utf8.generation);
     assert!(final_screen.output_seq >= escape.output_seq);
     assert_eq!(
-        rpc.inner.capture_rendered(stream.clone()).unwrap(),
+        run(deadline, "repeat coherent capture", || {
+            rpc.inner.capture_rendered(stream.clone()).unwrap()
+        }),
         final_screen
     );
-    let raw = rpc
-        .inner
-        .capture_output(stream.session.clone(), 64 * 1024)
-        .unwrap();
+    let raw = run(deadline, "raw retained tail", || {
+        rpc.inner
+            .capture_output(stream.session.clone(), 64 * 1024)
+            .unwrap()
+    });
     assert_eq!(raw.len(), 64 * 1024);
     assert!(
         !raw.contains("PRIMARY"),
         "primary cells must predate the retained raw tail"
     );
     assert!(raw.ends_with("FINAL ✓"));
-    let summary = rpc
-        .inner
-        .list_sessions()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.stream == stream)
-        .unwrap();
+    let summary = run(deadline, "session state while subscriber held", || {
+        rpc.inner.list_sessions().unwrap()
+    })
+    .into_iter()
+    .find(|s| s.stream == stream)
+    .unwrap();
     assert!(!record(&summary.state).consumer_stalled);
 
     // The unopened ticket resumes with an explicit gap. This proves early
     // state really was evicted while its coherent screen remained available.
-    let (rt, mut replay) = event_socket(&daemon.paths.endpoint, unread_ticket);
-    let gap = rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), replay.next_frame())
+    let (rt, mut replay) = run(deadline, "open unread observer", || {
+        event_socket(&daemon.paths.endpoint, unread_ticket)
+    });
+    let gap = run(deadline, "eviction gap while subscriber held", || {
+        rt.block_on(async {
+            tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                replay.next_frame(),
+            )
             .await
             .unwrap()
             .unwrap()
+        })
     });
     assert!(
         matches!(gap, fl_host_proto::ExtensionFrame::Gap { from_seq: 2, next_seq } if next_seq > 2),
         "expected eviction gap, got {gap:?}"
     );
-    release(&daemon.paths.subscriber, "reliable-before-part");
+    run(deadline, "release subscriber before hold expires", || {
+        release(&daemon.paths.subscriber, "reliable-before-part");
+    });
     drop(replay);
     drop(stalled);
     rpc.inner.kill_session(stream, lease).unwrap();
