@@ -228,6 +228,9 @@ export const OPTIMISTIC_PROMPT_BUSY_MAX_MS = 1_800_000;
 
 /** `claude-felix-2027881`: the placeholder id used before a session's canonical id resolves. */
 function isSyntheticSessionId(id: string): boolean {
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return false;
+  }
   return /^[a-z]+-[a-z0-9_.]+(?:-[a-z0-9_.]+)*-\d+$/i.test(id);
 }
 
@@ -292,10 +295,10 @@ export function pruneOptimisticPrompts(
   const activeKey = (currentAgentKey ?? "").trim().toLowerCase();
   const kept = prompts.filter((p) => {
     if (!p || !p.content?.trim()) return false;
-    if (optimisticPromptExpired(p.sentAt, nowMs, sessionBusy)) return false;
     const promptKey = (p.agentKey ?? "").trim().toLowerCase();
     const matchesActive = (!activeKey || !promptKey || promptKey === activeKey) &&
       optimisticSessionMatches(p.sessionId, currentSessionId, !!activeKey && promptKey === activeKey);
+    if (optimisticPromptExpired(p.sentAt, nowMs, sessionBusy && matchesActive)) return false;
     if (matchesActive && isPromptOnDisk(turns, p.content)) {
       return false;
     }
@@ -1887,15 +1890,18 @@ export const App: React.FC<AppProps> = ({
     transcriptRefreshState !== "denied";
   const sessionQueue = metadataMatches ? rawSessionQueue : [];
   const isSessionBusy = metadataMatches ? rawIsSessionBusy : false;
-  sessionBusyRef.current = isSessionBusy ||
+  const activeSessionBusy = isSessionBusy ||
     (!!ownerRef.current.sessionId && !!unconfirmedBySession[ownerRef.current.sessionId]);
+  useEffect(() => {
+    sessionBusyRef.current = activeSessionBusy;
+  }, [activeSessionBusy]);
   const sessionContextUsage = metadataMatches ? rawSessionContextUsage : null;
   const sessionQuotaUsage = metadataMatches ? rawSessionQuotaUsage : null;
   const transcriptTurns = preserveOptimisticTurn(
     snapshotMatches ? transcriptSnapshot.turns : [],
     loggedOutRef.current || transcriptRefreshState === "denied" ? [] : optimisticPromptRef.current.filter(
       (prompt) => prompt.authEpoch === ownerRef.current.authEpoch),
-    Date.now(), ownerRef.current.agentKey, ownerRef.current.sessionId, sessionBusyRef.current,
+    Date.now(), ownerRef.current.agentKey, ownerRef.current.sessionId, activeSessionBusy,
   );
 
   const activeAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
