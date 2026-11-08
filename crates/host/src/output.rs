@@ -232,15 +232,14 @@ impl Hub {
         }
     }
 
-    fn all_backlogged(&self, key: &StreamKey) -> bool {
+    fn any_backlogged(&self, key: &StreamKey) -> bool {
         let fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        let mut live = fanout
-            .subs
-            .iter()
-            .filter(|sub| !sub.dropped && !sub.slow && sub.wants_key(key))
-            .peekable();
-        live.peek().is_some()
-            && live.all(|sub| sub.queue.len() >= SUB_QUEUE / 2 || sub.queued_bytes >= SUB_BYTES / 2)
+        fanout.subs.iter().any(|sub| {
+            !sub.dropped
+                && !sub.slow
+                && sub.wants_key(key)
+                && (sub.queue.len() >= SUB_QUEUE / 2 || sub.queued_bytes >= SUB_BYTES / 2)
+        })
     }
 
     fn note_status(&self, charge: Charge) {
@@ -635,11 +634,11 @@ impl OutputSession {
         let _order = self.lock_order();
         let key = (self.session.session.as_str().to_owned(), self.session.epoch);
         // EOF can leave an admitted read parked behind the record cap. Help by
-        // at most one record, but yield immediately when writers are backlogged:
+        // at most one record, but yield immediately when any writer is backlogged:
         // each publication fans out to all of them, not just this writer.
         // Keep the pressure check under `order` so concurrent catchup cannot
         // each publish against the same available capacity.
-        if !self.hub.all_backlogged(&key) {
+        if !self.hub.any_backlogged(&key) {
             self.flush_one_locked();
         }
         let (pending, next_seq) = {
@@ -832,10 +831,10 @@ impl OutputSession {
     fn flush_out(&self) {
         let key = (self.session.session.as_str().to_owned(), self.session.epoch);
         loop {
-            // Let healthy writers drain a burst, without holding publication
-            // order or allowing a slow subscriber to stall the producer forever.
+            // Give every backlogged writer bounded time to drain a burst without
+            // holding order or letting a slow subscriber stall the producer forever.
             let started = std::time::Instant::now();
-            while self.hub.all_backlogged(&key) && started.elapsed() < Duration::from_millis(20) {
+            while self.hub.any_backlogged(&key) && started.elapsed() < Duration::from_millis(20) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             if !self.flush_one() {
@@ -1280,6 +1279,58 @@ mod tests {
                 sub.pop_sent(&hub, &event);
                 settle(&event, true);
                 hub.pull_preexisting();
+            }
+        }
+        for (sub, bytes) in [first, second].into_iter().zip(received) {
+            assert_eq!(bytes, expected);
+            assert!(!sub.want_slow(&hub));
+            assert!(sub.next_event(&hub).is_none());
+            sub.abandon(&hub);
+        }
+        assert!(out.inner.lock().unwrap().staging.is_empty());
+        assert!(out.inner.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn unequal_healthy_subscribers_drain_buffered_burst_without_overflow() {
+        let hub = Arc::new(Hub::new());
+        let out = fixture(1, &hub);
+        let first = hub.subscribe(None, None).ok().unwrap();
+        let second = hub.subscribe(None, None).ok().unwrap();
+        let expected: Vec<u8> = (0..256)
+            .flat_map(|i| format!("L{i:03}\n").into_bytes())
+            .collect();
+        out.inner.lock().unwrap().staging = expected.clone();
+        for _ in 0..SUB_QUEUE / 2 {
+            assert!(out.flush_one());
+        }
+        let mut received = [Vec::new(), Vec::new()];
+        let mut counts = [0_u64; 2];
+        // Offer one writer four scheduling slots for each slot of its peer.
+        // A fast catchup must not publish past the other writer's room.
+        for _ in 0..256 {
+            for (index, (sub, slots)) in [(&first, 4), (&second, 1)].into_iter().enumerate() {
+                for _ in 0..slots {
+                    assert!(
+                        !sub.want_slow(&hub),
+                        "progressing subscriber {index} marked slow after {} writes",
+                        counts[index]
+                    );
+                    let Some(event) = sub.next_event(&hub) else {
+                        break;
+                    };
+                    counts[index] += 1;
+                    assert_eq!(event.seq, counts[index]);
+                    let Body::Line(raw) = &event.body else {
+                        panic!("expected stdout");
+                    };
+                    assert!(event.terminated);
+                    received[index].extend_from_slice(raw);
+                    received[index].push(b'\n');
+                    sub.pop_sent(&hub, &event);
+                    settle(&event, true);
+                    hub.pull_preexisting();
+                }
             }
         }
         for (sub, bytes) in [first, second].into_iter().zip(received) {
