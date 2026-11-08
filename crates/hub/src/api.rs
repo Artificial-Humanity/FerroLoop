@@ -7344,13 +7344,13 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
          3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
          4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state handoff get --scope {scope} --key {name_lower}` for your own latest handoff (if it reports none, `fl state handoff get --scope {scope}` reads the shared `current` handoff), and `fl state search \"<query>\"` to look up anything specific.\n\
          5. Optional legacy reference: if `Notes/{project}/STATE.md` exists, skim it; FerroState wins wherever the two disagree. Do not require it.\n\
-         6. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
+         6. Re-register your active session route so FerroWire and FerroDeck track this fresh session:\n\
             ```bash\n\
-            AGENT_PERSONA={name_lower} agent-msg register {name} --project {project} --role {role} --replace\n\
+            AGENT_PERSONA={name_lower} fl wire register {name} --project {project} --role {role} --replace\n\
             ```\n\
-         7. Check and acknowledge any pending NATS messages:\n\
+         7. Check and acknowledge any pending FerroWire messages:\n\
             ```bash\n\
-            AGENT_PERSONA={name_lower} agent-msg read --ack\n\
+            AGENT_PERSONA={name_lower} fl wire read --ack\n\
             ```\n\
          \n\
          Identity summary: `{name}` | Co-author trailer: `Co-authored-by: {name} <{name_lower}@artificialhumanity.io>`"
@@ -7384,7 +7384,7 @@ pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &s
             ```\n\
          4. Acknowledge the remaining inbox messages:\n\
             ```bash\n\
-            AGENT_PERSONA={name_lower} agent-msg read --ack\n\
+            AGENT_PERSONA={name_lower} fl wire read --ack\n\
             ```\n\
          \n\
          Reply `decommission-ready` when all four steps are done. Identity summary: `{name}` | Project: `{project}` | Role: `{role}`"

@@ -6091,7 +6091,7 @@ mod tests {
             "fl state checkpoint --scope project:ferroloop",
             "worktrees",
             "fl wire send <lead> \"Felicity decommission handoff\"",
-            "agent-msg read --ack",
+            "fl wire read --ack",
             "decommission-ready",
             "Lead",
         ] {
@@ -6193,10 +6193,10 @@ mod tests {
         // Registration and inbox steps stay.
         assert!(p.contains("fl agent roster"), "{p}");
         assert!(!p.contains("REGISTRY.md"), "{p}");
-        assert!(p.contains(
-            "agent-msg register Felicity --project FerroLoop --role assistant --replace"
-        ));
-        assert!(p.contains("AGENT_PERSONA=felicity agent-msg read --ack"));
+        assert!(
+            p.contains("fl wire register Felicity --project FerroLoop --role assistant --replace")
+        );
+        assert!(p.contains("AGENT_PERSONA=felicity fl wire read --ack"));
     }
 
     /// Every `--scope <token>` in the generated prompts must be a token the `fl state` parser

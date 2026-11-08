@@ -4335,7 +4335,7 @@ mod tests {
         assert_eq!(out["unregistered"], false);
         assert_eq!(out["runtime_stopped"], false);
         let prompt = out["prompt"].as_str().unwrap();
-        assert!(prompt.contains("fl state handoff set") && prompt.contains("agent-msg read --ack"));
+        assert!(prompt.contains("fl state handoff set") && prompt.contains("fl wire read --ack"));
         let delivered: Value = serde_json::from_str(&lines.join().unwrap()[0]).unwrap();
         assert_eq!(delivered["kind"], "operator_prompt");
         assert_eq!(delivered["body"], prompt);
@@ -5101,7 +5101,7 @@ mod tests {
             "reviewer"
         );
         let expected = api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant");
-        assert!(expected.contains("AGENT_PERSONA=felicia agent-msg register Felicia --project ferroloop --role assistant --replace"));
+        assert!(expected.contains("AGENT_PERSONA=felicia fl wire register Felicia --project ferroloop --role assistant --replace"));
         assert!(expected.contains("Co-authored-by: Felicia <felicia@artificialhumanity.io>"));
         assert!(
             api::canonical_reforge_prompt("Journalist", "ferroloop", "journalist")
