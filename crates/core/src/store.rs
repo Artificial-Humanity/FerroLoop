@@ -599,6 +599,10 @@ pub trait Ledger {
 pub trait Handles {
     fn handle_of(&self, kind: Kind, id: &Iri) -> Result<Option<u64>, StoreError>;
     fn resolve_handle(&self, kind: Kind, handle: u64) -> Result<Option<Iri>, StoreError>;
+    /// Every project in this store, for resolving a project slug at the CLI edge.
+    fn projects_for_slug(&self) -> Result<Vec<Project>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Binds each role to the store that backs it (spec §3.3). A store is the
@@ -740,6 +744,9 @@ impl Handles for KindRouted<'_> {
     }
     fn resolve_handle(&self, kind: Kind, handle: u64) -> Result<Option<Iri>, StoreError> {
         self.owner(kind).resolve_handle(kind, handle)
+    }
+    fn projects_for_slug(&self) -> Result<Vec<Project>, StoreError> {
+        self.owner(Kind::Project).projects_for_slug()
     }
 }
 

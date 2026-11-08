@@ -95,6 +95,9 @@ impl Ctx<'_> {
                      ones that exist."
                 ),
             },
+            Ref::Slug(s) => bail!(
+                "`{s}` is neither a handle (a number such as `3`) nor an IRI (such as `urn:uuid:…`)"
+            ),
         }
     }
 

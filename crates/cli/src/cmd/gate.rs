@@ -115,6 +115,16 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::Add(args) => Some(&args.project),
+            Cmd::List { project } => Some(project),
+            Cmd::Show { .. } | Cmd::Affirm { .. } | Cmd::Run { .. } | Cmd::SetProgram { .. } => {
+                None
+            }
+        }
+    }
 }
 
 /// The gate `id` names, or a refusal that echoes what was typed.

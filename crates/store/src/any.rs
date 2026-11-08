@@ -1206,6 +1206,7 @@ delegate! {
     Handles {
         fn handle_of(&self, kind: Kind, id: &Iri) -> Result<Option<u64>, StoreError>;
         fn resolve_handle(&self, kind: Kind, handle: u64) -> Result<Option<Iri>, StoreError>;
+        fn projects_for_slug(&self) -> Result<Vec<Project>, StoreError>;
     }
     Bindings {
         fn bound_node_id(&self, repo: &str) -> Result<Option<String>, StoreError>;

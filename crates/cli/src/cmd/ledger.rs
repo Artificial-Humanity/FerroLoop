@@ -264,6 +264,9 @@ fn comment(ctx: &Ctx<'_>, gl: &GithubLedger<'_>, item: &Ref) -> Result<i32> {
             iri
         }
         Ref::Iri(i) => i.clone(),
+        Ref::Slug(s) => bail!(
+            "`{s}` is neither a handle (a number such as `3`) nor an IRI (such as `urn:uuid:…`)"
+        ),
     };
     let at = gl.issue_at(&iri)?;
     // ⚠ GitHub redirects a transferred issue, so it is followed and said.

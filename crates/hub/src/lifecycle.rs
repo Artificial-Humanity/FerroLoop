@@ -856,6 +856,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) owns_calls: std::cell::Cell<u32>,
     /// Pane text [`SessionRuntime::capture`] returns, by runtime unit or tmux target.
     pub(crate) panes: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    /// Cross-thread event log for ordering assertions in tests.
+    pub(crate) shared_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
 
 #[cfg(test)]
@@ -1061,6 +1063,9 @@ impl SessionRuntime for FakeRuntime {
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
+        if let Some(events) = &self.shared_events {
+            events.lock().unwrap().push("runtime_kill");
+        }
         self.calls.borrow_mut().push(format!("kill {unit}"));
         if !is_killable_unit(unit) {
             return false;
@@ -1077,6 +1082,9 @@ impl SessionRuntime for FakeRuntime {
     }
 
     fn kill_owner(&self, unit: &str, _hosted_id: &str) -> bool {
+        if let Some(events) = &self.shared_events {
+            events.lock().unwrap().push("runtime_kill");
+        }
         self.calls.borrow_mut().push(format!("kill-owner {unit}"));
         if !is_killable_unit(unit) {
             return false;
@@ -3635,6 +3643,175 @@ fn push_tombstone(ids: &mut Vec<String>, id: &str) {
     ids.push(id.to_string());
 }
 
+const AGY_DELETE_CASCADE_PATH: &str =
+    "/exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory";
+const AGY_DELETE_CASCADE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const AGY_DELETE_CASCADE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Issue `POST /exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory` with
+/// `{"cascadeId": "<cascade_id>"}` against the Antigravity session's loopback language server.
+#[cfg(test)]
+fn post_agy_delete_cascade_trajectory(
+    ls_address: &str,
+    csrf_token: Option<&str>,
+    cascade_id: &str,
+) -> Result<(), String> {
+    post_agy_delete_cascade_trajectory_with_timeout(
+        ls_address,
+        csrf_token,
+        cascade_id,
+        AGY_DELETE_CASCADE_TIMEOUT,
+    )
+}
+
+/// Issue `POST /exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory` with
+/// `{"cascadeId": "<cascade_id>"}` against the Antigravity session's loopback language server.
+fn post_agy_delete_cascade_trajectory_with_timeout(
+    ls_address: &str,
+    csrf_token: Option<&str>,
+    cascade_id: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let Some(port) = fl_wire::identity::agy_ls_port(ls_address) else {
+        return Err("non-loopback language-server address".to_string());
+    };
+    let url = format!("http://127.0.0.1:{port}{AGY_DELETE_CASCADE_PATH}");
+    let body = serde_json::json!({ "cascadeId": cascade_id }).to_string();
+    let cfg = ureq::config::Config::builder()
+        .proxy(None)
+        .max_redirects(0)
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build();
+    let agent: ureq::Agent = cfg.into();
+    let mut req = agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1");
+    if let Some(token) = csrf_token.map(str::trim).filter(|t| !t.is_empty()) {
+        req = req.header("x-codeium-csrf-token", token);
+    }
+    let resp = req.send(body.as_bytes()).map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    Ok(())
+}
+
+/// Best-effort `DeleteCascadeTrajectory` RPC for an Antigravity session during teardown, invoked
+/// before routes are removed and before the runtime process is stopped. When the language server
+/// is missing or unreachable, logs a diagnostic to stderr and continues so teardown never aborts
+/// or fails silently.
+fn delete_agy_cascade_trajectories(
+    home_override: Option<&Path>,
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+    tombstone_ids: &[String],
+) {
+    let mut route_ls_addr: Option<String> = None;
+    let mut route_csrf: Option<String> = None;
+    let mut cascade_ids: Vec<String> = Vec::new();
+    let mut found_agy_route = false;
+
+    for path in route_table_paths(home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        let Some(VendorRoute::Agy {
+            conversation_id,
+            ls_address,
+            csrf_token,
+            ..
+        }) = route_for_teardown(&table, record, target)
+        else {
+            continue;
+        };
+        found_agy_route = true;
+        push_tombstone(&mut cascade_ids, &conversation_id);
+        if route_ls_addr.is_none()
+            && let Some(addr) = ls_address
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+        {
+            route_ls_addr = Some(addr);
+            route_csrf = csrf_token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
+        }
+    }
+
+    let is_agy = found_agy_route || record.vendor.eq_ignore_ascii_case("antigravity");
+    if !is_agy {
+        return;
+    }
+    for id in tombstone_ids {
+        push_tombstone(&mut cascade_ids, id);
+    }
+    if cascade_ids.is_empty() {
+        return;
+    }
+
+    let (ls_addr, csrf) = match route_ls_addr {
+        Some(addr) => (Some(addr), route_csrf),
+        None if crate::discovery::agy_env_fallback_allowed(home_override) => {
+            let env_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS")
+                .ok()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty());
+            let env_csrf = env_addr.as_ref().and_then(|_| {
+                std::env::var("ANTIGRAVITY_CSRF_TOKEN")
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            });
+            (env_addr, env_csrf)
+        }
+        None => (None, None),
+    };
+
+    let Some(addr) = ls_addr else {
+        eprintln!(
+            "fl-hub: Antigravity DeleteCascadeTrajectory skipped for session `{}` (cascades {:?}): \
+             no language-server address recorded on route or environment; continuing teardown",
+            record.session_id, cascade_ids
+        );
+        return;
+    };
+
+    let deadline = std::time::Instant::now() + AGY_DELETE_CASCADE_DEADLINE;
+    for cascade_id in &cascade_ids {
+        let Some(remaining) = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+        else {
+            eprintln!(
+                "fl-hub: Antigravity DeleteCascadeTrajectory deadline elapsed for session `{}` \
+                 (skipping cascade `{cascade_id}` at `{addr}`); continuing teardown",
+                record.session_id
+            );
+            break;
+        };
+        let timeout = remaining.min(AGY_DELETE_CASCADE_TIMEOUT);
+        if let Err(reason) = post_agy_delete_cascade_trajectory_with_timeout(
+            &addr,
+            csrf.as_deref(),
+            cascade_id,
+            timeout,
+        ) {
+            eprintln!(
+                "fl-hub: Antigravity DeleteCascadeTrajectory failed for session `{}` \
+                 (cascade `{cascade_id}` at `{addr}`): {reason}; continuing teardown",
+                record.session_id
+            );
+            if !reason.starts_with("HTTP ") {
+                break;
+            }
+        }
+    }
+}
+
 /// Native session ids discovery should treat as gone. Loaded from the route
 /// files before they are pruned. A persona-derived id is not recorded, even
 /// when the record or the target still stores one.
@@ -3995,6 +4172,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             push_tombstone(&mut tombstone_ids, tid);
         }
     }
+    delete_agy_cascade_trajectories(env.home_override, &record, target, &tombstone_ids);
     if persona_still_running {
         remove_routes(env.home_override, &[], &session_ids);
     } else {
@@ -5198,6 +5376,13 @@ mod tests {
             ("claude-sonnet-5-5", None, "claude-sonnet-5-5-medium"),
             ("claude-sonnet-5-5", Some("high"), "claude-sonnet-5-5-high"),
             ("gemini-4-argon", Some("low"), "gemini-4-argon-low"),
+            // Argon shorthand aliases normalize to `gemini-4-argon` before appending effort.
+            ("argon-4.0", None, "gemini-4-argon-medium"),
+            ("argon-4.0", Some("high"), "gemini-4-argon-high"),
+            ("argon-4.0-low", None, "gemini-4-argon-low"),
+            ("argon-4", None, "gemini-4-argon-medium"),
+            ("argon", Some("low"), "gemini-4-argon-low"),
+            ("gemini-4.0-argon", None, "gemini-4-argon-medium"),
             // The effort is read without case or surrounding space; anything else is ignored.
             ("gemini-4-argon", Some("HIGH"), "gemini-4-argon-high"),
             ("gemini-4-argon", Some(" Low "), "gemini-4-argon-low"),
@@ -8441,5 +8626,387 @@ mod tests {
             !discovered.iter().any(|s| s.id == "conv-orphan-tombstone"),
             "discovery must skip pre-existing sidecar tombstone: {discovered:?}"
         );
+    }
+
+    #[test]
+    fn teardown_of_agy_route_issues_delete_cascade_trajectory_against_language_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let fake = FakeRuntime {
+            shared_events: Some(Arc::clone(&events)),
+            ..FakeRuntime::default()
+        };
+        let fake_env = fake.env(home.path());
+        spin_up(
+            &store,
+            &fake_env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ls_addr = listener.local_addr().unwrap().to_string();
+        let captured_req = Arc::new(Mutex::new(String::new()));
+        let captured_srv = Arc::clone(&captured_req);
+        let events_srv = Arc::clone(&events);
+        let server_handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
+                let mut buf = [0u8; 4096];
+                let mut raw = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            raw.extend_from_slice(&buf[..n]);
+                            if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&raw[..hdr_end]);
+                                let content_len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.trim()
+                                            .eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                if raw.len() >= hdr_end + 4 + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                events_srv.lock().unwrap().push("delete_rpc");
+                *captured_srv.lock().unwrap() = String::from_utf8_lossy(&raw).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-ada-cascade-159".into(),
+                ls_pid: None,
+                ls_address: Some(ls_addr),
+                csrf_token: Some("csrf-secret-159".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(10),
+        );
+        let rpath = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&rpath)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        let out =
+            teardown_session(&store, &fake_env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(out.status, "decommissioned");
+        assert!(out.runtime_stopped);
+        server_handle.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["delete_rpc", "runtime_kill"],
+            "DeleteCascadeTrajectory RPC must run before the runtime process is killed"
+        );
+
+        let raw_http = captured_req.lock().unwrap().clone();
+        assert!(
+            raw_http.starts_with(
+                "POST /exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory HTTP/1.1"
+            ),
+            "expected DeleteCascadeTrajectory POST, got: {raw_http:?}"
+        );
+        let lower_http = raw_http.to_ascii_lowercase();
+        assert!(lower_http.contains("connect-protocol-version: 1"));
+        assert!(lower_http.contains("content-type: application/json"));
+        assert!(
+            lower_http.contains("x-codeium-csrf-token: csrf-secret-159"),
+            "expected CSRF token header in request: {raw_http:?}"
+        );
+        let body = raw_http
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
+        assert_eq!(
+            parsed.get("cascadeId").and_then(|v| v.as_str()),
+            Some("conv-ada-cascade-159")
+        );
+    }
+
+    #[test]
+    fn teardown_of_agy_route_logs_and_continues_when_language_server_is_missing_or_unreachable() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+
+        let dead_addr = "127.0.0.1:1".to_string();
+
+        let err =
+            post_agy_delete_cascade_trajectory(&dead_addr, Some("csrf-dead"), "conv-ada-dead-159")
+                .expect_err("unreachable language server must return error for logging");
+        assert!(!err.is_empty());
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-ada-dead-159".into(),
+                ls_pid: None,
+                ls_address: Some(dead_addr),
+                csrf_token: Some("csrf-dead".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(10),
+        );
+        let rpath = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&rpath)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(out.status, "decommissioned");
+        assert!(RouteTable::load(Some(&rpath)).get("ada").is_none());
+        let tombstones = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(tombstones.contains("conv-ada-dead-159"));
+    }
+
+    #[test]
+    fn teardown_of_antigravity_session_delete_cascade_trajectory_refuses_non_loopback_addresses() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        for bad_addr in [
+            "10.0.0.5:1234".to_string(),
+            format!("10.0.0.5:{port}"),
+            "https://127.0.0.1:1234".to_string(),
+            format!("https://127.0.0.1:{port}"),
+            "https://localhost:1234".to_string(),
+            format!("https://localhost:{port}"),
+        ] {
+            let err = post_agy_delete_cascade_trajectory(
+                &bad_addr,
+                Some("csrf-secret-159"),
+                "conv-ada-non-loopback-159",
+            )
+            .expect_err("non-loopback or scheme-prefixed address must be refused");
+            assert!(
+                err.contains("non-loopback language-server address"),
+                "unexpected error for {bad_addr:?}: {err:?}"
+            );
+            assert!(
+                listener.accept().is_err(),
+                "no TCP request should be sent for {bad_addr:?}"
+            );
+        }
+
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-ada-non-loopback-159".into(),
+                ls_pid: None,
+                ls_address: Some(format!("https://127.0.0.1:{port}")),
+                csrf_token: Some("csrf-secret-159".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(10),
+        );
+        let rpath = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&rpath)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(out.status, "decommissioned");
+        assert!(
+            listener.accept().is_err(),
+            "teardown must not dial non-loopback or scheme-prefixed LS address"
+        );
+    }
+
+    #[test]
+    fn teardown_of_antigravity_session_bounds_delete_cascade_trajectory_loop_when_ls_stalls() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+
+        let mut rec = find_hosted_session(&store, &["antigravity:ada"])
+            .unwrap()
+            .unwrap();
+        rec.tombstone_ids = vec![
+            "conv-ada-stall-2".into(),
+            "conv-ada-stall-3".into(),
+            "conv-ada-stall-4".into(),
+        ];
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let ls_addr = listener.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = Arc::clone(&accepted);
+        let server_handle = std::thread::spawn(move || {
+            let mut held_streams = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                if let Ok((stream, _)) = listener.accept() {
+                    accepted_srv.fetch_add(1, Ordering::Relaxed);
+                    held_streams.push(stream);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-ada-stall-1".into(),
+                ls_pid: None,
+                ls_address: Some(ls_addr),
+                csrf_token: Some("csrf-stall-159".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(10),
+        );
+        let rpath = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&rpath)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        let started = std::time::Instant::now();
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        server_handle.join().unwrap();
+
+        assert_eq!(out.status, "decommissioned");
+        assert!(
+            elapsed < std::time::Duration::from_millis(3500),
+            "expected stalled LS teardown within 3.5s overall deadline, took {elapsed:?}"
+        );
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "loop must stop after the first stalled transport timeout"
+        );
+    }
+
+    #[test]
+    fn teardown_of_agy_route_with_home_override_ignores_env_language_server() {
+        struct RestoreAgyEnv {
+            addr: Option<std::ffi::OsString>,
+            csrf: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestoreAgyEnv {
+            fn drop(&mut self) {
+                // SAFETY: caller holds `with_probe_lock`.
+                unsafe {
+                    match &self.addr {
+                        Some(v) => std::env::set_var("ANTIGRAVITY_LS_ADDRESS", v),
+                        None => std::env::remove_var("ANTIGRAVITY_LS_ADDRESS"),
+                    }
+                    match &self.csrf {
+                        Some(v) => std::env::set_var("ANTIGRAVITY_CSRF_TOKEN", v),
+                        None => std::env::remove_var("ANTIGRAVITY_CSRF_TOKEN"),
+                    }
+                }
+            }
+        }
+
+        crate::direct_quota::with_probe_lock(|| {
+            let _restore = RestoreAgyEnv {
+                addr: std::env::var_os("ANTIGRAVITY_LS_ADDRESS"),
+                csrf: std::env::var_os("ANTIGRAVITY_CSRF_TOKEN"),
+            };
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let env_addr = listener.local_addr().unwrap().to_string();
+            // SAFETY: serialized by `with_probe_lock` and restored on drop.
+            unsafe {
+                std::env::set_var("ANTIGRAVITY_LS_ADDRESS", &env_addr);
+                std::env::set_var("ANTIGRAVITY_CSRF_TOKEN", "csrf-env-159");
+            }
+
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let env = env(&home);
+            spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "antigravity"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Agy {
+                    conversation_id: "conv-ada-no-addr-159".into(),
+                    ls_pid: None,
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                },
+                At::from_unix_millis(10),
+            );
+            let rpath = home.path().join(".cache/agent-bus/routes.json");
+            routes.save(Some(&rpath)).unwrap();
+
+            let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+            let out =
+                teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+            assert_eq!(out.status, "decommissioned");
+            assert!(
+                listener.accept().is_err(),
+                "home_override must not fall back to ANTIGRAVITY_LS_ADDRESS"
+            );
+        });
     }
 }

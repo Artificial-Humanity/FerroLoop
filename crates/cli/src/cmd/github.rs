@@ -81,6 +81,9 @@ pub fn run(
             let iri = match &id {
                 Ref::Handle(n) | Ref::Issue(n) => gh.issue_url(*n),
                 Ref::Iri(i) => i.clone(),
+                Ref::Slug(s) => bail!(
+                    "`{s}` is neither a handle (a number such as `3`) nor an IRI (such as `urn:uuid:…`)"
+                ),
             };
             let done = gh.repair(&iri, &by)?;
             let word = if done.changed {
