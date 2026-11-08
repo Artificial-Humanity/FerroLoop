@@ -109,6 +109,18 @@ fn main() {
             std::fs::write(rest.get(1).expect("EOF marker"), b"eof").expect("EOF marker");
             park();
         }
+        "gated-line-burst" => {
+            ready();
+            let gate = std::path::Path::new(rest.first().expect("burst gate"));
+            while !gate.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // One small, pipe-atomic write: no per-line flush or consumer pacing.
+            let burst: String = (0..256).map(|i| format!("L{i:03}\n")).collect();
+            io::stdout().write_all(burst.as_bytes()).expect("burst");
+            io::stdout().flush().expect("burst flush");
+            echo();
+        }
         "gated-lines" => {
             ready();
             for (index, marker) in rest.iter().take(2).enumerate() {

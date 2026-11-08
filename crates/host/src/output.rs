@@ -232,6 +232,17 @@ impl Hub {
         }
     }
 
+    fn all_backlogged(&self, key: &StreamKey) -> bool {
+        let fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        let mut live = fanout
+            .subs
+            .iter()
+            .filter(|sub| !sub.dropped && !sub.slow && sub.wants_key(key))
+            .peekable();
+        live.peek().is_some()
+            && live.all(|sub| sub.queue.len() >= SUB_QUEUE / 2 || sub.queued_bytes >= SUB_BYTES / 2)
+    }
+
     fn note_status(&self, charge: Charge) {
         let Some(path) = &self.status else {
             return;
@@ -621,8 +632,9 @@ impl OutputSession {
     }
 
     fn deliver_pending(&self) {
-        // EOF can leave an admitted read parked behind the record cap.
-        self.flush_out();
+        // EOF can leave an admitted read parked behind the record cap. Retry
+        // only one record here so the subscriber can return to socket writes.
+        self.flush_one();
         let _order = self.lock_order();
         let key = (self.session.session.as_str().to_owned(), self.session.epoch);
         let (pending, next_seq) = {
@@ -813,64 +825,80 @@ impl StdoutSink for OutputSession {
 
 impl OutputSession {
     fn flush_out(&self) {
-        let _order = self.lock_order();
+        let key = (self.session.session.as_str().to_owned(), self.session.epoch);
         loop {
-            let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-            if inner.staging.is_empty() {
+            // Let healthy writers drain a burst, without holding publication
+            // order or allowing a slow subscriber to stall the producer forever.
+            let started = std::time::Instant::now();
+            while self.hub.all_backlogged(&key) && started.elapsed() < Duration::from_millis(20) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !self.flush_one() {
                 return;
             }
-            let coalesce = Self::coalescible(&inner);
-            if inner.events.len() >= MAX_EVENTS && !coalesce {
-                return;
-            }
-            let room = if coalesce {
-                MAX_STDOUT_LINE - inner.events.last().expect("tail").raw_len
-            } else {
-                MAX_STDOUT_LINE
-            };
-            let newline = inner.staging.iter().position(|b| *b == b'\n');
-            let take = newline.unwrap_or(inner.staging.len()).min(room);
-            let terminated = newline == Some(take);
-            if coalesce {
-                let new_len = inner.events.last().expect("tail").raw_len + take;
-                let envelope = line_envelope(new_len);
-                let old_envelope = inner.events.last().expect("tail").envelope;
-                if Self::charge(&inner)
-                    .charge
-                    .saturating_add(envelope.saturating_sub(old_envelope))
-                    > MAX_STDOUT_BACKLOG
-                {
-                    return;
-                }
-                let OutInner {
-                    events, staging, ..
-                } = &mut *inner;
-                let tail = Arc::get_mut(events.last_mut().expect("tail")).expect("unexposed tail");
-                let Body::Line(raw) = &mut tail.body else {
-                    unreachable!()
-                };
-                if raw.try_reserve_exact(take).is_err() {
-                    return;
-                }
-                raw.extend_from_slice(&staging[..take]);
-                staging.drain(..take + usize::from(terminated));
-                tail.raw_len = raw.len();
-                tail.envelope = envelope;
-                tail.terminated = terminated;
-                drop(inner);
-                continue;
-            }
-            let envelope = line_envelope(take);
-            if Self::charge(&inner).charge.saturating_add(envelope) > MAX_STDOUT_BACKLOG {
-                return;
-            }
-            let raw = inner.staging[..take].to_vec();
-            inner.staging.drain(..take + usize::from(terminated));
-            drop(inner);
-            self.publish_locked(raw.len(), false, terminated, move |_| {
-                (Body::Line(raw), envelope)
-            });
         }
+    }
+
+    /// Parse, assign the sequence and admit one record atomically. Both the
+    /// producer and catch-up workers can help drain parked bytes between writes.
+    fn flush_one(&self) -> bool {
+        let _order = self.lock_order();
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if inner.staging.is_empty() {
+            return false;
+        }
+        let coalesce = Self::coalescible(&inner);
+        if inner.events.len() >= MAX_EVENTS && !coalesce {
+            return false;
+        }
+        let room = if coalesce {
+            MAX_STDOUT_LINE - inner.events.last().expect("tail").raw_len
+        } else {
+            MAX_STDOUT_LINE
+        };
+        let newline = inner.staging.iter().position(|b| *b == b'\n');
+        let take = newline.unwrap_or(inner.staging.len()).min(room);
+        let terminated = newline == Some(take);
+        if coalesce {
+            let new_len = inner.events.last().expect("tail").raw_len + take;
+            let envelope = line_envelope(new_len);
+            let old_envelope = inner.events.last().expect("tail").envelope;
+            if Self::charge(&inner)
+                .charge
+                .saturating_add(envelope.saturating_sub(old_envelope))
+                > MAX_STDOUT_BACKLOG
+            {
+                return false;
+            }
+            let OutInner {
+                events, staging, ..
+            } = &mut *inner;
+            let tail = Arc::get_mut(events.last_mut().expect("tail")).expect("unexposed tail");
+            let Body::Line(raw) = &mut tail.body else {
+                unreachable!()
+            };
+            if raw.try_reserve_exact(take).is_err() {
+                return false;
+            }
+            raw.extend_from_slice(&staging[..take]);
+            staging.drain(..take + usize::from(terminated));
+            tail.raw_len = raw.len();
+            tail.envelope = envelope;
+            tail.terminated = terminated;
+            drop(inner);
+            return true;
+        }
+        let envelope = line_envelope(take);
+        if Self::charge(&inner).charge.saturating_add(envelope) > MAX_STDOUT_BACKLOG {
+            return false;
+        }
+        let raw = inner.staging[..take].to_vec();
+        inner.staging.drain(..take + usize::from(terminated));
+        drop(inner);
+        self.publish_locked(raw.len(), false, terminated, move |_| {
+            (Body::Line(raw), envelope)
+        });
+        true
     }
 
     fn space(&self) -> usize {

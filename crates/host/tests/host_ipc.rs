@@ -1188,6 +1188,53 @@ fn status_field(text: &str, key: &str) -> usize {
 }
 
 #[test]
+fn healthy_subscriber_receives_single_buffered_line_burst() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let endpoint = &daemon.paths.endpoint;
+    let events = EventLog::subscribe(endpoint, Some("burst"));
+    let mut rpc = Rpc::connect(endpoint);
+    let gate = daemon.paths.barrier.join("burst");
+    let child = rpc.spawn("burst", &["gated-line-burst", gate.to_str().unwrap()]);
+    events.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "burst").contains(&b"READY".to_vec())
+    });
+    std::fs::write(gate, b"go").unwrap();
+    let received = events.wait_until(Duration::from_secs(3), |events| {
+        let lines = line_bytes(events, "burst");
+        lines.iter().any(|line| line == b"L255")
+            || events
+                .iter()
+                .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+    });
+    assert!(
+        !received
+            .iter()
+            .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+    );
+    let actual: Vec<_> = line_bytes(&received, "burst")
+        .into_iter()
+        .filter(|line| line.starts_with(b"L"))
+        .collect();
+    let expected: Vec<_> = (0..256).map(|i| format!("L{i:03}").into_bytes()).collect();
+    assert_eq!(actual, expected);
+    // A subsequent echo proves the same subscription remains attached.
+    let epoch = epoch_of(&child);
+    let lease = rpc.claim("burst", epoch).expect("lease");
+    assert_eq!(
+        rpc.send("burst", epoch, lease, "AFTER"),
+        SendOutcome::Written
+    );
+    let received = events.wait_until(Duration::from_secs(3), |events| {
+        line_bytes(events, "burst").contains(&b"AFTER".to_vec())
+    });
+    assert!(
+        !received
+            .iter()
+            .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+    );
+}
+
+#[test]
 fn slow_subscriber_dropped_not_blocking() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let endpoint = &daemon.paths.endpoint;
@@ -2934,6 +2981,9 @@ fn closed_stream_replacement_waits_for_authority_settlement() {
     let t = ticket(&mut rpc, &stream, lease, 0);
     let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
     assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    // The server completes seq 1 before it can emit seq 2. Receiving seq 1
+    // alone can race peer-close against completion and legitimately lose credit.
+    assert_eq!(event_seq(&rt, &mut events, 1), 2);
     arm(&daemon.paths.subscriber, "reliable-settle");
     drop(events);
     wait_at(&daemon.paths.subscriber, "reliable-settle");

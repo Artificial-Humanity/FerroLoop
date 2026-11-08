@@ -580,6 +580,16 @@ pub(crate) fn begin_replay(
     let next = after
         .checked_add(1)
         .ok_or(ExtensionRefusal::ResourceLimit)?;
+    // An admitted cursor must never miss future bytes coalesced behind `next`.
+    // Cursors that still include the tail can retain the usual coalescing benefit.
+    if j.coalescible(&state) {
+        let index = (state.head + state.len - 1) % SLOTS;
+        let tail =
+            Arc::get_mut(state.records[index].as_mut().expect("tail")).expect("unexposed tail");
+        if tail.seq <= after {
+            tail.exposed = true;
+        }
+    }
     j.counts.cursors.fetch_add(1, Ordering::SeqCst);
     Ok((
         watermark,
@@ -763,6 +773,51 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(matches!(&last.body, ReliableBody::Line(b) if b.as_slice()==b"tailmore"));
+    }
+
+    #[test]
+    fn cursor_after_tail_receives_future_bytes_and_lf() {
+        for observe_before_lf in [false, true] {
+            let j = journal();
+            admit(&j, b"a");
+            let (watermark, mut cursor) = begin_replay(&j, 1).unwrap();
+            assert_eq!(watermark, 1);
+            admit(&j, b"b");
+            let mut got = Vec::new();
+            if observe_before_lf {
+                let record = cursor.next().unwrap().expect("new bytes after attach");
+                assert_eq!(record.seq, 2);
+                let ReliableBody::Line(bytes) = &record.body else {
+                    panic!("line")
+                };
+                assert!(!bytes.terminated);
+                got.extend_from_slice(bytes.as_slice());
+            }
+            admit(&j, b"\n");
+            while let Some(record) = cursor.next().unwrap() {
+                let ReliableBody::Line(bytes) = &record.body else {
+                    panic!("line")
+                };
+                got.extend_from_slice(bytes.as_slice());
+                if bytes.terminated {
+                    got.push(b'\n');
+                }
+            }
+            assert_eq!(got, b"b\n");
+        }
+    }
+
+    #[test]
+    fn cursor_before_unobserved_tail_preserves_coalescing() {
+        let j = journal();
+        admit(&j, b"a");
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        admit(&j, b"b\n");
+        let record = cursor.next().unwrap().unwrap();
+        assert_eq!(record.seq, 1);
+        assert!(matches!(&record.body, ReliableBody::Line(b)
+            if b.as_slice() == b"ab" && b.terminated));
+        assert!(cursor.next().unwrap().is_none());
     }
 
     #[test]
