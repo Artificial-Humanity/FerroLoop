@@ -20,6 +20,22 @@ pub struct LaunchSpec {
     pub argv: Vec<String>,
 }
 
+/// Per-session launch options interpreted by the vendor's [`VendorCliAdapter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VendorLaunchOptions {
+    /// Whether the session should start with the vendor's remote-control / remote-interface
+    /// bridge enabled when supported by the vendor CLI (`true` by default).
+    pub remote_control: bool,
+}
+
+impl Default for VendorLaunchOptions {
+    fn default() -> Self {
+        Self {
+            remote_control: true,
+        }
+    }
+}
+
 /// Interactive startup modal or trust prompt that the host supervisor dismisses or accepts on
 /// first launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +67,19 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
     /// argument should be passed.
     fn normalize_model(&self, requested: Option<&str>) -> Option<String>;
 
-    /// Build the full `LaunchSpec` (`env` + `argv`) for spawning a hosted session.
+    /// Whether this vendor CLI supports starting sessions under remote control.
+    fn supports_remote_control(&self) -> bool {
+        false
+    }
+
+    /// CLI arguments that enable remote control for this session when [`VendorLaunchOptions::remote_control`]
+    /// is `true`. Handled strictly at the adapter layer.
+    fn remote_control_args(&self, _persona: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Build the full `LaunchSpec` (`env` + `argv`) for spawning a hosted session with default
+    /// [`VendorLaunchOptions`] (`remote_control: true`).
     /// `thinking_level` is the vendor-native effort the operator chose; a vendor with no such
     /// launch option ignores it, and a value that is not a plain token never reaches argv.
     fn build_launch_spec(
@@ -61,6 +89,26 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
         thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+    ) -> LaunchSpec {
+        self.build_launch_spec_with_options(
+            persona,
+            model,
+            thinking_level,
+            prompt,
+            home,
+            VendorLaunchOptions::default(),
+        )
+    }
+
+    /// Build the full `LaunchSpec` (`env` + `argv`) with explicit [`VendorLaunchOptions`].
+    fn build_launch_spec_with_options(
+        &self,
+        persona: &str,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        prompt: &str,
+        home: Option<&Path>,
+        options: VendorLaunchOptions,
     ) -> LaunchSpec;
 
     /// Whether a launch with `thinking_level` (already a plain token) can honour it. The default
@@ -329,21 +377,38 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         normalize_plain_model(requested)
     }
 
+    fn supports_remote_control(&self) -> bool {
+        true
+    }
+
+    fn remote_control_args(&self, _persona: &str) -> Vec<String> {
+        vec!["--remote-control".to_string()]
+    }
+
     /// Any plain token is passed through (`--effort` / reasoning effort); it applies with or
     /// without `--model`.
     fn check_thinking_level(&self, _model: Option<&str>, _level: &str) -> Result<(), String> {
         Ok(())
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        options: VendorLaunchOptions,
     ) -> LaunchSpec {
-        let mut argv = vec![self.resolve_binary(home), "--enable-auto-mode".to_string()];
+        // Place `--remote-control` before `--enable-auto-mode` so `--remote-control [name]`
+        // (which accepts an optional name in Commander.js) is always followed by a `--` flag
+        // and never consumes the trailing positional `<prompt>` when `model` and
+        // `thinking_level` are both `None`.
+        let mut argv = vec![self.resolve_binary(home)];
+        if options.remote_control {
+            argv.extend(self.remote_control_args(persona));
+        }
+        argv.push("--enable-auto-mode".to_string());
         if let Some(m) = self.normalize_model(model) {
             argv.extend(["--model".to_string(), m]);
         }
@@ -386,21 +451,33 @@ impl VendorCliAdapter for CodexCliAdapter {
         normalize_plain_model(requested).filter(|m| split_window_tag(m).is_none())
     }
 
+    fn supports_remote_control(&self) -> bool {
+        true
+    }
+
+    fn remote_control_args(&self, _persona: &str) -> Vec<String> {
+        vec!["--remote".to_string(), "unix://".to_string()]
+    }
+
     /// Any plain token is passed through (`--effort` / reasoning effort); it applies with or
     /// without `--model`.
     fn check_thinking_level(&self, _model: Option<&str>, _level: &str) -> Result<(), String> {
         Ok(())
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        options: VendorLaunchOptions,
     ) -> LaunchSpec {
         let mut argv = vec![self.resolve_binary(home), "--yolo".to_string()];
+        if options.remote_control {
+            argv.extend(self.remote_control_args(persona));
+        }
         if let Some(m) = self.normalize_model(model) {
             argv.extend(["--model".to_string(), m]);
         }
@@ -445,6 +522,14 @@ impl VendorCliAdapter for AntigravityCliAdapter {
             .filter(|m| split_window_tag(m).is_none())
     }
 
+    fn supports_remote_control(&self) -> bool {
+        true
+    }
+
+    fn remote_control_args(&self, _persona: &str) -> Vec<String> {
+        vec!["--remote-control".to_string()]
+    }
+
     /// Antigravity takes its level only as the `-low|-medium|-high` suffix of the model id, so
     /// the level needs a model and must be one of those three; `gpt-oss-120b` only runs at medium.
     fn check_thinking_level(&self, model: Option<&str>, level: &str) -> Result<(), String> {
@@ -469,20 +554,23 @@ impl VendorCliAdapter for AntigravityCliAdapter {
         Ok(())
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        options: VendorLaunchOptions,
     ) -> LaunchSpec {
         let mut argv = vec![
             self.resolve_binary(home),
             "--mode".to_string(),
             "auto".to_string(),
-            "--remote-control".to_string(),
         ];
+        if options.remote_control {
+            argv.extend(self.remote_control_args(persona));
+        }
         let cli_model = model
             .map(|m| agy_cli_model_id(m, thinking_level))
             .and_then(|m| normalize_plain_model(Some(&m)))
@@ -523,13 +611,14 @@ impl VendorCliAdapter for GrokCliAdapter {
         normalize_plain_model(requested).filter(|m| split_window_tag(m).is_none())
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        _options: VendorLaunchOptions,
     ) -> LaunchSpec {
         let mut argv = vec![
             self.resolve_binary(home),
@@ -571,13 +660,14 @@ impl VendorCliAdapter for MuseCliAdapter {
         Some(normalize_muse_model(requested))
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        _options: VendorLaunchOptions,
     ) -> LaunchSpec {
         let argv = vec![
             self.resolve_binary(home),
@@ -618,13 +708,14 @@ impl VendorCliAdapter for LemonadeCliAdapter {
             .or_else(|| Some(LEMONADE_DEFAULT_CLI_MODEL.to_string()))
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        _options: VendorLaunchOptions,
     ) -> LaunchSpec {
         let host = std::env::var("FL_LEMONADE_HOST")
             .ok()
@@ -698,13 +789,14 @@ impl VendorCliAdapter for OllamaCliAdapter {
             .or_else(|| Some(OLLAMA_DEFAULT_CLI_MODEL.to_string()))
     }
 
-    fn build_launch_spec(
+    fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
         _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
+        _options: VendorLaunchOptions,
     ) -> LaunchSpec {
         let mut argv = vec![
             self.resolve_binary(home),
@@ -941,6 +1033,7 @@ mod tests {
         assert_eq!(
             &spec.argv[1..],
             &[
+                "--remote-control",
                 "--enable-auto-mode",
                 "--model",
                 "opus",
@@ -952,7 +1045,21 @@ mod tests {
         let spec = claude.build_launch_spec("ada", None, Some(" max "), "Hi", None);
         assert_eq!(
             &spec.argv[1..],
-            &["--enable-auto-mode", "--effort", "max", "Hi"]
+            &[
+                "--remote-control",
+                "--enable-auto-mode",
+                "--effort",
+                "max",
+                "Hi"
+            ]
+        );
+        // When both model and thinking_level are None, `--enable-auto-mode` must still sit
+        // between `--remote-control` and the positional prompt so Commander.js (`--remote-control [name]`)
+        // never swallows the prompt as the session name.
+        let spec = claude.build_launch_spec("ada", None, None, "Hi", None);
+        assert_eq!(
+            &spec.argv[1..],
+            &["--remote-control", "--enable-auto-mode", "Hi"]
         );
 
         let codex = lookup_vendor_cli_adapter("codex").unwrap();
@@ -961,6 +1068,8 @@ mod tests {
             &spec.argv[1..],
             &[
                 "--yolo",
+                "--remote",
+                "unix://",
                 "--model",
                 "gpt-5",
                 "-c",
@@ -995,6 +1104,49 @@ mod tests {
     }
 
     #[test]
+    fn remote_control_is_configurable_at_the_adapter_layer() {
+        let off = VendorLaunchOptions {
+            remote_control: false,
+        };
+        let claude = lookup_vendor_cli_adapter("claude").unwrap();
+        assert!(claude.supports_remote_control());
+        let spec_off =
+            claude.build_launch_spec_with_options("ada", Some("opus"), None, "Hi", None, off);
+        assert_eq!(
+            &spec_off.argv[1..],
+            &["--enable-auto-mode", "--model", "opus", "Hi"]
+        );
+
+        let codex = lookup_vendor_cli_adapter("codex").unwrap();
+        assert!(codex.supports_remote_control());
+        let spec_off =
+            codex.build_launch_spec_with_options("ada", Some("gpt-5"), None, "Hi", None, off);
+        assert_eq!(&spec_off.argv[1..], &["--yolo", "--model", "gpt-5", "Hi"]);
+
+        let agy = lookup_vendor_cli_adapter("antigravity").unwrap();
+        assert!(agy.supports_remote_control());
+        let spec_off = agy.build_launch_spec_with_options(
+            "ada",
+            Some("claude-sonnet-5-5"),
+            None,
+            "Hi",
+            None,
+            off,
+        );
+        assert_eq!(
+            &spec_off.argv[1..],
+            &[
+                "--mode",
+                "auto",
+                "--model",
+                "claude-sonnet-5-5-medium",
+                "--prompt-interactive",
+                "Hi"
+            ]
+        );
+    }
+
+    #[test]
     fn hostile_or_empty_thinking_levels_never_reach_argv() {
         for bad in [
             "",
@@ -1024,7 +1176,13 @@ mod tests {
         let spec = claude.build_launch_spec("ada", Some("opus[1m]"), None, "Hello", None);
         assert_eq!(
             &spec.argv[1..],
-            &["--enable-auto-mode", "--model", "opus[1m]", "Hello"]
+            &[
+                "--remote-control",
+                "--enable-auto-mode",
+                "--model",
+                "opus[1m]",
+                "Hello"
+            ]
         );
         assert_eq!(claude.interrupt_key(), "Escape");
         assert_eq!(claude.reset_command(), "/clear");
@@ -1032,7 +1190,10 @@ mod tests {
 
         let codex = lookup_vendor_cli_adapter("codex").unwrap();
         let spec = codex.build_launch_spec("ada", Some("gpt-5"), None, "Hello", None);
-        assert_eq!(&spec.argv[1..], &["--yolo", "--model", "gpt-5", "Hello"]);
+        assert_eq!(
+            &spec.argv[1..],
+            &["--yolo", "--remote", "unix://", "--model", "gpt-5", "Hello"]
+        );
         assert!(spec.env.iter().all(|(k, _)| k != "AGENT_PERSONA"));
         assert_eq!(codex.interrupt_key(), "Escape");
 
