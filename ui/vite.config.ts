@@ -8,6 +8,7 @@ function emitBuildInfoPlugin(): Plugin {
   let outDir = "dist";
   return {
     name: "ferrodeck-emit-build-info",
+    apply: "build",
     configResolved(config) {
       outDir = config.build.outDir || "dist";
     },
