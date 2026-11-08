@@ -59,7 +59,7 @@ export const HELP_TOPICS: HelpTopicDoc[] = [
     tier: "Agent",
     title: "FerroWire Inter-Agent Mail & Broadcasts",
     summary:
-      "Durable NATS JetStream and Hub-routed messaging between project Leads, Assisting Engineers, and the Lab Manager.",
+      "Durable FerroWire and Hub-routed messaging between project Leads, Assisting Engineers, and the Lab Manager.",
     bullets: [
       "Agent & Broadcast Addressing: Send point-to-point messages to any registered persona (e.g. ferris, jarvis, kayla) or broadcast to all active agents.",
       "Delivery Receipts & Acknowledgment: Track pending, delivered, and acknowledged receipts per message and acknowledge unread inbox items directly from the cockpit.",

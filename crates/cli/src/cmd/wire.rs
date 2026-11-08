@@ -139,6 +139,18 @@ pub enum WireCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Register an agent in the workspace store and record the caller's live FerroWire route.
+    Register {
+        name: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "assistant")]
+        role: String,
+        #[arg(long = "extra-areas")]
+        extra_areas: Option<String>,
+        #[arg(long)]
+        replace: bool,
+    },
     /// Prune acknowledged or expired transient messages older than `--older-than-days`.
     Prune {
         #[arg(long)]
@@ -1173,6 +1185,13 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             }
             Ok(2)
         }
+        WireCmd::Register {
+            name,
+            project,
+            role,
+            extra_areas,
+            replace,
+        } => execute_register(env, name, project, role, extra_areas, replace),
         WireCmd::Prune {
             older_than_days,
             json,
@@ -1615,74 +1634,16 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             role,
             extra_areas,
             replace,
-        } => {
-            let parsed_role = parse_role_selector(&role).map_err(|e| (1, e.to_string()))?;
-            let extras: Vec<String> = extra_areas
-                .as_deref()
-                .map(|csv| {
-                    csv.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let by = name.trim().to_ascii_lowercase();
-            let store = env
-                .open_for_scope(Some(&StateScope::Workspace))
-                .map_err(|e| (1, e))?;
-            let existing = if replace {
-                store.agent_by_name(&by).map_err(|e| (1, e.to_string()))?
-            } else {
-                None
-            };
-            let (parsed_role, extras) = preserve_on_replace(
-                existing.as_ref(),
-                replace,
-                parsed_role,
-                extras,
-                extra_areas.is_some(),
-            );
-            match store.register_agent(RegisterAgentArgs {
-                display_name: name,
-                email: None,
+        } => run(
+            env,
+            WireCmd::Register {
+                name,
                 project,
-                role: parsed_role,
-                extra_areas: extras,
-                create_area: true,
+                role,
+                extra_areas,
                 replace,
-                at: now_at(),
-                by,
-            }) {
-                Ok(rec) => {
-                    sync_store_retired_personas(&store);
-                    if let Some(route) = capture_current_env_route() {
-                        record_caller_route_with_provenance(env, &rec.name_key, route, true)
-                            .map_err(|error| {
-                                (
-                                    1,
-                                    format!("agent registered but route update failed: {error}"),
-                                )
-                            })?;
-                    }
-                    let all_active = store.list_agents(None, false).unwrap_or_default();
-                    let mgr = reports_to(&rec, &all_active);
-                    println!(
-                        "Registered {} ({}) as {} in {} (reports to {})",
-                        rec.display_name,
-                        rec.id,
-                        rec.role.as_wire(),
-                        rec.project,
-                        mgr
-                    );
-                    Ok(0)
-                }
-                Err(e @ (StoreError::AgentCollision { .. } | StoreError::LeadTaken { .. })) => {
-                    Err((2, e.to_string()))
-                }
-                Err(e) => Err((1, e.to_string())),
-            }
-        }
+            },
+        ),
         AgentMsgCmd::Unregister { name } => {
             let store = env
                 .open_for_scope(Some(&StateScope::Workspace))
@@ -1726,6 +1687,83 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             )
             .map(|()| 0)
         }
+    }
+}
+
+fn execute_register(
+    env: &StateEnv<'_>,
+    name: String,
+    project: String,
+    role: String,
+    extra_areas: Option<String>,
+    replace: bool,
+) -> Result<i32, (i32, String)> {
+    let parsed_role = parse_role_selector(&role).map_err(|e| (1, e.to_string()))?;
+    let extras: Vec<String> = extra_areas
+        .as_deref()
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let by = name.trim().to_ascii_lowercase();
+    let store = env
+        .open_for_scope(Some(&StateScope::Workspace))
+        .map_err(|e| (1, e))?;
+    let existing = if replace {
+        store.agent_by_name(&by).map_err(|e| (1, e.to_string()))?
+    } else {
+        None
+    };
+    let (parsed_role, extras) = preserve_on_replace(
+        existing.as_ref(),
+        replace,
+        parsed_role,
+        extras,
+        extra_areas.is_some(),
+    );
+    match store.register_agent(RegisterAgentArgs {
+        display_name: name,
+        email: None,
+        project,
+        role: parsed_role,
+        extra_areas: extras,
+        create_area: true,
+        replace,
+        at: now_at(),
+        by,
+    }) {
+        Ok(rec) => {
+            sync_store_retired_personas(&store);
+            if let Some(route) = capture_current_env_route() {
+                record_caller_route_with_provenance(env, &rec.name_key, route, true).map_err(
+                    |error| {
+                        (
+                            1,
+                            format!("agent registered but route update failed: {error}"),
+                        )
+                    },
+                )?;
+            }
+            let all_active = store.list_agents(None, false).unwrap_or_default();
+            let mgr = reports_to(&rec, &all_active);
+            println!(
+                "Registered {} ({}) as {} in {} (reports to {})",
+                rec.display_name,
+                rec.id,
+                rec.role.as_wire(),
+                rec.project,
+                mgr
+            );
+            Ok(0)
+        }
+        Err(e @ (StoreError::AgentCollision { .. } | StoreError::LeadTaken { .. })) => {
+            Err((2, e.to_string()))
+        }
+        Err(e) => Err((1, e.to_string())),
     }
 }
 
@@ -2949,5 +2987,121 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(unread_kacey.is_empty());
+    }
+
+    #[test]
+    fn fl_wire_register_registers_agent_and_records_live_route_while_env_override_read_preserves_route()
+     {
+        #[derive(Parser)]
+        struct WireTestCli {
+            #[command(subcommand)]
+            cmd: WireCmd,
+        }
+
+        let rig = HookRig::new(None);
+        let dir = &rig.dir;
+        let db = dir.path().join("fl.redb");
+        let sock = dir.path().join("wire.sock");
+        let cfg = Config {
+            wire: Some(WireConfig {
+                socket: Some(sock),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = StateEnv {
+            explicit_db: Some(&db),
+            default_store: &db,
+            cfg: &cfg,
+            cwd: dir.path(),
+        };
+
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores these variables on drop.
+        unsafe {
+            std::env::set_var("CODEX_THREAD_ID", "thread-feira-1");
+        }
+
+        let parsed = WireTestCli::parse_from([
+            "fl-wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--extra-areas",
+            "agents,notes",
+        ]);
+        assert_eq!(run(&env, parsed.cmd).unwrap(), 0);
+
+        // Collision without `--replace` exits 2 via `WireCmd::Register` as well as `agent-msg`.
+        let dup = WireTestCli::parse_from([
+            "fl-wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+        ]);
+        assert_eq!(run(&env, dup.cmd).unwrap_err().0, 2);
+
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        let rec = store.agent_by_name("feira").unwrap().expect("registered");
+        assert_eq!(rec.display_name, "Feira");
+        assert_eq!(rec.project, "ferroloop");
+        assert_eq!(rec.role, AgentRole::Assistant);
+        assert_eq!(rec.extra_areas, vec!["agents", "notes"]);
+        drop(store);
+
+        let table = RouteTable::load(Some(&rig.routes_path()));
+        let entry = table.get("feira").expect("route recorded");
+        assert!(entry.explicit);
+        assert!(matches!(
+            &entry.route,
+            VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-1"
+        ));
+
+        // Verify that `AGENT_PERSONA=feira fl wire read --ack` from another agent's shell does NOT
+        // overwrite `feira`'s route with the caller's thread_id (`has_env_persona_override` guard).
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores these variables on drop.
+        unsafe {
+            std::env::set_var("AGENT_PERSONA", "feira");
+            std::env::set_var("CODEX_THREAD_ID", "thread-other-agent");
+        }
+        let read_cmd = WireTestCli::parse_from(["fl-wire", "read", "--ack"]);
+        assert_eq!(run(&env, read_cmd.cmd).unwrap(), 0);
+
+        let after_read = RouteTable::load(Some(&rig.routes_path()));
+        let after_read_entry = after_read.get("feira").expect("route preserved");
+        assert!(matches!(
+            &after_read_entry.route,
+            VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-1"
+        ));
+
+        // Verify that `fl wire register Feira ... --replace` updates the route to the new session.
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores these variables on drop.
+        unsafe {
+            std::env::set_var("CODEX_THREAD_ID", "thread-feira-2");
+        }
+        let replace_cmd = WireTestCli::parse_from([
+            "fl-wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ]);
+        assert_eq!(run(&env, replace_cmd.cmd).unwrap(), 0);
+
+        let replaced = RouteTable::load(Some(&rig.routes_path()));
+        let replaced_entry = replaced.get("feira").expect("route updated");
+        assert!(replaced_entry.explicit);
+        assert!(matches!(
+            &replaced_entry.route,
+            VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-2"
+        ));
     }
 }
