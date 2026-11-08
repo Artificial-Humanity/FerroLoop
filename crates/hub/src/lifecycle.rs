@@ -469,6 +469,7 @@ fn launch_spec_for(
     vendor: &str,
     persona: &str,
     model: Option<&str>,
+    thinking_level: Option<&str>,
     prompt: &str,
 ) -> Option<LaunchSpec> {
     let home = env
@@ -476,7 +477,7 @@ fn launch_spec_for(
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     let adapter = fl_wire::vendor_adapter::lookup_vendor_cli_adapter(vendor)?;
-    Some(adapter.build_launch_spec(persona, model, prompt, home.as_deref()))
+    Some(adapter.build_launch_spec(persona, model, thinking_level, prompt, home.as_deref()))
 }
 
 #[cfg(test)]
@@ -719,10 +720,15 @@ impl SessionRuntime for HostRuntime {
                 client.write_raw(summary.stream.clone(), grant.lease, b"\r".to_vec()),
                 Ok(fl_host_proto::SendOutcome::Written)
             ),
-            other => matches!(
-                client.send_line(summary.stream.clone(), grant.lease, other.to_string()),
-                Ok(fl_host_proto::SendOutcome::Written)
-            ),
+            // Text then Enter as separate raw writes: a raw-mode TUI would take a `send_line`
+            // newline as part of the text and never submit it.
+            other => fl_wire::dispatcher::host_write_text_then_enter(
+                &mut client,
+                summary.stream.clone(),
+                grant.lease,
+                other,
+            )
+            .is_ok(),
         }
     }
 
@@ -1138,6 +1144,10 @@ pub struct SpinUpRequest {
     pub vendor: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// The vendor-native thinking level (`--effort` for Claude, `model_reasoning_effort` for
+    /// Codex, the model id suffix for Antigravity). Applied at launch; ignored by other vendors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     #[serde(default)]
     pub node_id: Option<String>,
     #[serde(default)]
@@ -1203,6 +1213,7 @@ struct ValidSpinUp {
     role: String,
     vendor: String,
     model: Option<String>,
+    thinking_level: Option<String>,
     node_id: String,
     hosted: bool,
     cwd: Option<String>,
@@ -1385,6 +1396,28 @@ impl SpinUpRequest {
         if let Some(model) = &model {
             check_text("model", model)?;
         }
+        let thinking_level = trimmed_opt(&self.thinking_level);
+        if let Some(level) = &thinking_level {
+            check_text("thinking_level", level)?;
+            if !fl_wire::vendor_adapter::is_plain_model_id(level) {
+                return Err(invalid_field(
+                    "thinking_level",
+                    "must be letters, digits, '.', '_' or '-' (at most 64 characters)",
+                ));
+            }
+            // The adapter owns what its CLI can apply; no adapter (a prompt-delivery vendor)
+            // means nothing applies the level.
+            match fl_wire::vendor_adapter::lookup_vendor_cli_adapter(&vendor) {
+                Some(adapter) => adapter
+                    .check_thinking_level(model.as_deref(), level)
+                    .map_err(|msg| LifecycleError::Invalid(format!("thinking_level: {msg}")))?,
+                None => {
+                    return Err(LifecycleError::Invalid(format!(
+                        "thinking_level: vendor `{vendor}` does not support thinking_level; omit it"
+                    )));
+                }
+            }
+        }
         let node_id = trimmed_opt(&self.node_id).unwrap_or_else(|| DEFAULT_NODE_ID.to_string());
         if !node_id
             .bytes()
@@ -1406,6 +1439,7 @@ impl SpinUpRequest {
             role,
             vendor,
             model,
+            thinking_level,
             node_id,
             hosted: self.hosted.unwrap_or(true),
             cwd,
@@ -1423,6 +1457,9 @@ pub struct SpinUpResponse {
     pub role: String,
     pub vendor: String,
     pub model: Option<String>,
+    /// The thinking level the session was started with, when one was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     pub node_id: String,
     pub hosted: bool,
     pub status: String,
@@ -1448,6 +1485,10 @@ pub struct HostedSessionRecord {
     pub role: String,
     pub vendor: String,
     pub model: Option<String>,
+    /// The thinking level chosen for the session; a restart launches with it. Absent when none
+    /// was chosen (records written before the field existed deserialize to none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     pub node_id: String,
     pub hosted: bool,
     /// `running`, `decommissioning`, `decommissioned`, or `stopped`.
@@ -1574,12 +1615,16 @@ pub fn set_hosted_session_model<S: StateStore>(
     store: &S,
     keys: &[&str],
     model: &str,
+    thinking_level: Option<&str>,
     by: &str,
 ) -> Result<Option<HostedSessionRecord>, LifecycleError> {
     let Some(mut record) = find_hosted_session(store, keys)? else {
         return Ok(None);
     };
     record.model = Some(model.to_string());
+    // The API always sends the full model/level pair, so `None` means "no level": a stale one
+    // (Claude `--effort high`, then a switch to `sonnet`) must not be relaunched on restart.
+    record.thinking_level = thinking_level.map(str::to_string);
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
     Ok(Some(record))
@@ -3010,6 +3055,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         role: v.role.clone(),
         vendor: v.vendor.clone(),
         model: v.model.clone(),
+        thinking_level: v.thinking_level.clone(),
         node_id: v.node_id.clone(),
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
@@ -3043,7 +3089,14 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     // A route left by another vendor would take the hydration prompt.
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
-    let launch = launch_spec_for(env, &v.vendor, &v.persona, v.model.as_deref(), &prompt);
+    let launch = launch_spec_for(
+        env,
+        &v.vendor,
+        &v.persona,
+        v.model.as_deref(),
+        v.thinking_level.as_deref(),
+        &prompt,
+    );
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
     let spawned = has_runtime
         && v.hosted
@@ -3091,6 +3144,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         role: v.role,
         vendor: v.vendor,
         model: v.model,
+        thinking_level: v.thinking_level,
         node_id: v.node_id,
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
@@ -3269,6 +3323,7 @@ fn record_for_target<S: AgentRegistry>(
         role,
         vendor: vendor_of_session_id(&target.session_id).unwrap_or_else(|| "unknown".to_string()),
         model: None,
+        thinking_level: None,
         node_id: DEFAULT_NODE_ID.to_string(),
         hosted: false,
         status: STATUS_RUNNING.to_string(),
@@ -4106,6 +4161,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         &record.vendor,
         &record.persona,
         record.model.as_deref(),
+        record.thinking_level.as_deref(),
         &prompt,
     );
     // A stale `<Display>:muse` record whose old session still runs: that one Muse is the agent.
@@ -4214,6 +4270,9 @@ pub struct RemodelRequest {
     pub vendor: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Thinking level for the new session (see [`SpinUpRequest::thinking_level`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     /// `prepare` or `execute` (the default).
     #[serde(default)]
     pub mode: Option<String>,
@@ -4238,6 +4297,9 @@ pub struct RemodelResponse {
     pub from_vendor: String,
     pub vendor: String,
     pub model: Option<String>,
+    /// The thinking level the new session was given, when one was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     pub node_id: String,
     pub hosted: bool,
     pub cwd: Option<String>,
@@ -4284,6 +4346,7 @@ impl RemodelPlan {
             role: self.to.role.clone(),
             vendor: self.to.vendor.clone(),
             model: self.to.model.clone(),
+            thinking_level: self.to.thinking_level.clone(),
             node_id: Some(self.to.node_id.clone()),
             hosted: Some(self.to.hosted),
             cwd: self.to.cwd.clone(),
@@ -4426,12 +4489,14 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
     let old_node = old.map_or_else(|| DEFAULT_NODE_ID.to_string(), |r| r.node_id.clone());
     let old_cwd = old.and_then(|r| r.cwd.clone());
     let from_model = old.and_then(|r| r.model.clone());
+    let from_thinking_level = old.and_then(|r| r.thinking_level.clone());
     let to = SpinUpRequest {
         persona: target.persona.clone(),
         project: project.clone(),
         role: role.clone(),
         vendor: req.vendor.clone(),
         model: req.model.clone(),
+        thinking_level: req.thinking_level.clone(),
         node_id: req.node_id.clone().or_else(|| Some(old_node.clone())),
         // The new session keeps the old one's `hosted`; with no record, spin-up's default.
         hosted: req.hosted.or(old.map(|r| r.hosted)),
@@ -4462,6 +4527,7 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
             role,
             vendor: from_vendor.clone(),
             model: from_model.clone(),
+            thinking_level: from_thinking_level,
             node_id: Some(old_node),
             hosted: Some(old.is_some_and(|r| r.hosted)),
             cwd: old_cwd,
@@ -4717,6 +4783,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
             from_vendor: plan.from_vendor.clone(),
             vendor: to.vendor.clone(),
             model: to.model.clone(),
+            thinking_level: to.thinking_level.clone(),
             node_id: to.node_id.clone(),
             hosted: to.hosted,
             cwd: to.cwd.clone(),
@@ -4786,6 +4853,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
                 from_vendor: plan.from_vendor.clone(),
                 vendor: out.vendor,
                 model: out.model,
+                thinking_level: out.thinking_level,
                 node_id: out.node_id,
                 hosted: out.hosted,
                 cwd: to.cwd.clone(),
@@ -4985,6 +5053,125 @@ mod tests {
     }
 
     #[test]
+    fn host_runtime_send_keys_writes_text_then_a_separate_carriage_return() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        let _lock = crate::TMUX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Fay.lemonade").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([1u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let writes_srv = Arc::clone(&writes);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    writes.lock().unwrap().push(bytes.into_vec());
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let prev_sock = std::env::var_os("FL_HOST_SOCK");
+        let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
+        // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
+        unsafe {
+            std::env::set_var("FL_HOST_SOCK", &sock_path);
+            std::env::remove_var("FL_WIRE_TMUX_BIN");
+        }
+        let sent = SessionRuntime::send_keys(&HostRuntime, "Fay.lemonade", "/model opus");
+        let seen = writes.lock().unwrap().clone();
+        // SAFETY: see above.
+        unsafe {
+            match prev_sock {
+                Some(v) => std::env::set_var("FL_HOST_SOCK", v),
+                None => std::env::remove_var("FL_HOST_SOCK"),
+            }
+            if let Some(v) = prev_tmux {
+                std::env::set_var("FL_WIRE_TMUX_BIN", v);
+            }
+        }
+        assert!(sent);
+        assert_eq!(seen, vec![b"/model opus".to_vec(), b"\r".to_vec()]);
+        drop(server_thread);
+    }
+
+    #[test]
     fn agy_cli_model_id_maps_to_an_effort_suffixed_id() {
         for (model, level, want) in [
             // A suffix on the model is kept.
@@ -5034,7 +5221,7 @@ mod tests {
     fn launch_args(vendor: &str, model: Option<&str>) -> Vec<String> {
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        let spec = launch_spec_for(&env, vendor, "ada", model, "hello").unwrap();
+        let spec = launch_spec_for(&env, vendor, "ada", model, None, "hello").unwrap();
         spec.argv[1..].to_vec()
     }
 
@@ -6796,8 +6983,15 @@ mod tests {
     #[test]
     fn launch_path_prepends_the_user_local_bin_once() {
         let home = TempDir::new().unwrap();
-        let spec =
-            launch_spec_for(&env(&home), "codex", "felicia", None, "Take up residence.").unwrap();
+        let spec = launch_spec_for(
+            &env(&home),
+            "codex",
+            "felicia",
+            None,
+            None,
+            "Take up residence.",
+        )
+        .unwrap();
         let path = spec
             .env
             .iter()
@@ -7828,6 +8022,7 @@ mod tests {
             role: "assistant".into(),
             vendor: vendor.into(),
             model: None,
+            thinking_level: None,
             node_id: DEFAULT_NODE_ID.into(),
             hosted: true,
             status: status.into(),

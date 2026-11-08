@@ -324,7 +324,7 @@ fn a_bracket_model_id_reaches_tmux_as_one_unquoted_argument_after_the_separator(
     let home = TempDir::new().unwrap();
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
-    let spec = launch_spec_for(&env, "claude", "ada", Some("opus[1m]"), "hi").unwrap();
+    let spec = launch_spec_for(&env, "claude", "ada", Some("opus[1m]"), None, "hi").unwrap();
     let args = tmux_new_session_args("Ada", "claude", None, Some(&spec));
     let separator = args.iter().position(|a| a == "--").unwrap();
     let command = &args[separator + 1..];

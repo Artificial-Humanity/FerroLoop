@@ -1261,6 +1261,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             role: "assistant".into(),
             vendor: "codex".into(),
             model: None,
+            thinking_level: None,
             node_id: "local".into(),
             hosted: true,
             status: crate::lifecycle::STATUS_DECOMMISSIONED.into(),
