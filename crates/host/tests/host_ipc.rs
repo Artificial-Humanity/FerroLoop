@@ -3780,3 +3780,365 @@ fn non_reliable_eof_preserves_exact_unterminated_tail() {
             .any(|e| matches!(e, ControlEvent::ProtocolFailure { .. }))
     );
 }
+
+#[test]
+fn host_build_identity_is_opt_in() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    // A strict old reader only knows these variants/fields. Advertising a bit is
+    // compatible; adding build fields to either old response would fail here.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    enum LegacyResponse {
+        Capabilities {
+            host: fl_host_proto::HostInstance,
+            features: u64,
+            limits: fl_host_proto::ExtensionLimits,
+        },
+        Sessions {
+            records: Vec<fl_host_proto::SessionSummary>,
+        },
+    }
+    let caps = extended(&mut rpc, XReq::Capabilities);
+    let value = serde_json::to_value(&caps).unwrap();
+    let legacy: LegacyResponse = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+    let sessions = serde_json::to_value(extended(&mut rpc, XReq::ListSessions)).unwrap();
+    let legacy: LegacyResponse = serde_json::from_value(sessions.clone()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), sessions);
+    let XResp::Capabilities { features, .. } = caps else {
+        panic!("capabilities")
+    };
+    assert_ne!(
+        features & fl_host_proto::HOST_STATUS_FEATURE,
+        0,
+        "host must advertise opt-in build identity"
+    );
+    let expected = fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE;
+    #[cfg(unix)]
+    let expected = expected | fl_host_proto::PTY_FEATURE;
+    assert_eq!(features, expected);
+    let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
+    let status = serde_json::to_value(extended(&mut rpc, request)).unwrap();
+    assert_eq!(status["op"], "host_status");
+    assert_eq!(
+        status["build"],
+        serde_json::to_value(fl_host::build_info()).unwrap()
+    );
+    assert_eq!(
+        rpc.inner.host_status().unwrap(),
+        Some(fl_host::build_info())
+    );
+}
+
+#[test]
+fn pipe_modes_report_current_device_truth() {
+    use fl_host_proto::SessionMode;
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut client = Rpc::connect(&daemon.paths.endpoint).inner;
+    for mode in [SessionMode::LegacyPipe, SessionMode::ReliablePipe] {
+        for env_pty in [false, true] {
+            let name = format!("device-{mode:?}-{env_pty}");
+            let mut spec = spec(&name, &["report"]);
+            if env_pty {
+                spec.env.insert("FL_HOST_PTY".into(), "1".into());
+                spec.env_allow.insert("FL_HOST_PTY".into());
+            }
+            let response = client
+                .extension_request(XReq::SpawnSession {
+                    spec,
+                    mode,
+                    pty: None,
+                })
+                .unwrap();
+            let XResp::Session { stream, state } = response else {
+                panic!("spawn: {response:?}")
+            };
+            assert_eq!(record(&state).kind, SpawnKind::Pipe);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let report = loop {
+                let output = client.capture_output(stream.session.clone(), 8192).unwrap();
+                if let Some(report) = output
+                    .lines()
+                    .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                {
+                    break report;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "missing terminal report: {output:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            // Record 183 characterizes the mismatch: the Unix env opt-in uses a real
+            // PTY while reporting Pipe. Explicit PTY sessions below report their device truth.
+            assert_eq!(
+                report["isatty"],
+                cfg!(unix) && env_pty,
+                "{mode:?}, env PTY={env_pty}"
+            );
+            let summary = client
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.stream == stream)
+                .unwrap();
+            assert_eq!(summary.mode, mode);
+            assert_eq!(record(&summary.state).kind, SpawnKind::Pipe);
+        }
+    }
+    let mut pty = spec("first-class-pty", &["report"]);
+    pty.kind = SpawnKind::Pty;
+    let response = client
+        .extension_request(XReq::SpawnSession {
+            spec: pty,
+            mode: SessionMode::Pty,
+            pty: None,
+        })
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let XResp::Session { stream, state } = response else {
+            panic!("PTY spawn: {response:?}")
+        };
+        assert_eq!(record(&state).kind, SpawnKind::Pty);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            let output = client.capture_output(stream.session.clone(), 8192).unwrap();
+            if let Some(report) = output
+                .lines()
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "missing PTY report: {output:?}");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(report["isatty"], true);
+        let summary = client
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.stream == stream)
+            .unwrap();
+        assert_eq!(summary.mode, SessionMode::Pty);
+        assert_eq!(record(&summary.state).kind, SpawnKind::Pty);
+    }
+    #[cfg(not(unix))]
+    assert_eq!(
+        response,
+        XResp::Refused {
+            code: Refuse::Unsupported
+        }
+    );
+    let mut pty = spec("kind-pty", &["report"]);
+    pty.kind = SpawnKind::Pty;
+    assert!(
+        client
+            .extension_request(XReq::SpawnSession {
+                spec: pty,
+                mode: SessionMode::LegacyPipe,
+                pty: None,
+            })
+            .is_err()
+    );
+}
+
+#[path = "support/flood.rs"]
+mod safety_flood;
+
+fn safety_flood_bounds(daemon: &Daemon) {
+    let status = backlog_status::wait_record(
+        &daemon.paths.status,
+        0,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(status_field(&status, "events") <= 4096, "{status}");
+    assert!(
+        status_field(&status, "charge") <= 8 * 1024 * 1024,
+        "{status}"
+    );
+    assert!(status_field(&status, "raw") > 7 * 1024 * 1024, "{status}");
+    #[cfg(target_os = "linux")]
+    {
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", daemon.child.id())).unwrap();
+        let kb: usize = status
+            .lines()
+            .find_map(|s| s.strip_prefix("VmRSS:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(kb < 128 * 1024, "daemon RSS {kb} KiB");
+    }
+}
+
+fn wait_safety_stall(rpc: &mut Rpc) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let children = rpc.list();
+        let state = &find(&children, "safety-flood").state;
+        assert!(matches!(state, ChildState::Running(_)));
+        if record(state).consumer_stalled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "producer never reached bounded stall"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let gate = daemon.paths.barrier.join("produce");
+    let done = daemon.paths.barrier.join("flushed");
+    let fragment_gate = daemon.paths.barrier.join("finish-fragment");
+    rpc.spawn(
+        "safety-flood",
+        &[
+            "safety-flood",
+            gate.to_str().unwrap(),
+            done.to_str().unwrap(),
+            fragment_gate.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(&gate, b"go").unwrap();
+    wait_safety_stall(&mut rpc);
+    safety_flood_bounds(&daemon);
+    assert!(
+        !done.exists(),
+        "lossless unattended producer should be backpressured"
+    );
+    assert!(
+        !BlockingHostClient::connect(&daemon.paths.endpoint)
+            .unwrap()
+            .capture_output(sid("safety-flood"), 4096)
+            .unwrap()
+            .contains(safety_flood::FINAL)
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut events = fl_host_proto::events(&daemon.paths.endpoint, Some(sid("safety-flood")))
+            .await
+            .unwrap();
+        let mut count = 0;
+        let mut bytes = 0;
+        let mut pending_line = Vec::new();
+        let mut saw_ready = false;
+        let mut saw_fragment = false;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.next().await.unwrap() {
+                    HostEvent::Line {
+                        bytes: fragment,
+                        terminated,
+                        ..
+                    } => {
+                        // Pipe reads can split a logical line into multiple events.
+                        pending_line.extend_from_slice(&fragment);
+                        if !terminated {
+                            if count == safety_flood::LINES - 1 && pending_line.len() == 1174 {
+                                // Release only after observing the gated prefix: no timing
+                                // assumption can let this test skip fragmented delivery.
+                                assert_eq!(pending_line, safety_flood::line(count)[..1174]);
+                                assert!(!saw_fragment);
+                                saw_fragment = true;
+                                std::fs::write(&fragment_gate, b"go").unwrap();
+                            }
+                            continue;
+                        }
+                        let line = std::mem::take(&mut pending_line);
+                        if !saw_ready {
+                            assert_eq!(line, b"READY");
+                            saw_ready = true;
+                        } else if line == safety_flood::FINAL.as_bytes() {
+                            break;
+                        } else {
+                            assert_eq!(line, safety_flood::line(count), "record {count}");
+                            bytes += line.len();
+                            count += 1;
+                        }
+                    }
+                    HostEvent::Control(ControlEvent::SlowSubscriber { .. }) => {
+                        panic!("draining subscriber was shed after {count} records ({bytes} bytes)")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("drain final marker");
+        assert!(saw_ready);
+        assert!(saw_fragment);
+        assert!(pending_line.is_empty());
+        assert_eq!(count, safety_flood::LINES);
+        assert_eq!(bytes, safety_flood::LINES * safety_flood::LINE_BYTES);
+        assert!(bytes > 8 * 1024 * 1024);
+    });
+    wait_file(&done, |b| b == b"flushed");
+    let tail = BlockingHostClient::connect(&daemon.paths.endpoint)
+        .unwrap()
+        .capture_output(sid("safety-flood"), 4096)
+        .unwrap();
+    assert!(tail.ends_with(&format!("{}\n", safety_flood::FINAL)));
+    assert!(!record(&find(&rpc.list(), "safety-flood").state).consumer_stalled);
+}
+
+#[test]
+fn safety_flood_legacy_held_subscriber_preserves_control_and_cleanup() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    arm(&daemon.paths.subscriber, "before-send-1");
+    let events = EventLog::subscribe(&daemon.paths.endpoint, Some("safety-flood"));
+    wait_file(&daemon.paths.subscriber.join("subscribed-1"), |b| b == b"1");
+    let gate = daemon.paths.barrier.join("produce");
+    let done = daemon.paths.barrier.join("flushed");
+    let child = rpc.spawn(
+        "safety-flood",
+        &[
+            "safety-flood",
+            gate.to_str().unwrap(),
+            done.to_str().unwrap(),
+        ],
+    );
+    wait_at(&daemon.paths.subscriber, "before-send-1");
+    std::fs::write(&gate, b"go").unwrap();
+    wait_safety_stall(&mut rpc);
+    safety_flood_bounds(&daemon);
+    assert!(!done.exists());
+    assert!(
+        !BlockingHostClient::connect(&daemon.paths.endpoint)
+            .unwrap()
+            .capture_output(sid("safety-flood"), 4096)
+            .unwrap()
+            .contains(safety_flood::FINAL)
+    );
+    let lease = rpc.claim("safety-flood", epoch_of(&child)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    rpc.kill("safety-flood", epoch_of(&child), Some(lease))
+        .unwrap();
+    loop {
+        let children = rpc.list();
+        assert!(
+            Instant::now() < deadline,
+            "cleanup blocked behind held subscriber"
+        );
+        if matches!(
+            find(&children, "safety-flood").state,
+            ChildState::CleanupComplete(_)
+        ) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    release(&daemon.paths.subscriber, "before-send-1");
+    drop(events);
+}

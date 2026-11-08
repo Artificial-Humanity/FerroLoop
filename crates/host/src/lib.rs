@@ -92,6 +92,7 @@ impl std::fmt::Debug for Host {
 type ThreadJoin = (Option<(String, u64)>, JoinHandle<()>);
 
 pub(crate) struct HostInner {
+    build_info: fl_host_proto::HostBuildInfo,
     endpoint: HostEndpoint,
     path: PathBuf,
     registry: Mutex<Registry>,
@@ -116,10 +117,32 @@ pub(crate) struct HostInner {
     crash: Mutex<Option<CrashPoint>>,
 }
 
+/// Standalone host build stamp. Embedding binaries must pass their own stamp to
+/// `serve_with_build_info` so all of their compiled sources determine dirty state.
+pub fn build_info() -> fl_host_proto::HostBuildInfo {
+    fl_host_proto::HostBuildInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
+        commit: env!("FL_BUILD_COMMIT").into(),
+        dirty: match env!("FL_BUILD_DIRTY") {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        build_time_unix: env!("FL_BUILD_TIME").parse().ok(),
+    }
+}
+
 pub fn serve(config: HostConfig) -> Result<(), HostError> {
+    serve_with_build_info(config, build_info())
+}
+
+pub fn serve_with_build_info(
+    config: HostConfig,
+    build_info: fl_host_proto::HostBuildInfo,
+) -> Result<(), HostError> {
     try_backstop();
     block_stop_signals();
-    let host = Host::open(OpenOptions::new(config))?;
+    let host = Host::open_with_build_info(OpenOptions::new(config), build_info)?;
     host.inner
         .handle
         .spawn(daemon::accept_loop(Arc::clone(&host.inner)));
@@ -302,6 +325,14 @@ fn phase_name(phase: Option<SessionPhase>) -> &'static str {
 
 impl Host {
     pub fn open(opts: OpenOptions) -> Result<Self, HostError> {
+        Self::open_with_build_info(opts, build_info())
+    }
+
+    fn open_with_build_info(
+        opts: OpenOptions,
+        build_info: fl_host_proto::HostBuildInfo,
+    ) -> Result<Self, HostError> {
+        build_info.validate()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -331,6 +362,7 @@ impl Host {
         let host = Self {
             runtime: Some(runtime),
             inner: Arc::new(HostInner {
+                build_info,
                 reliable_budget,
                 authority,
                 endpoint,
