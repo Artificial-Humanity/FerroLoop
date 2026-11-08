@@ -6514,6 +6514,7 @@ fn handle_post_session_model(
                     &*store,
                     &[trimmed, &canonical_id],
                     cli_model.as_deref().unwrap_or(&model),
+                    thinking_level.as_deref(),
                     authority.actor_name(),
                 );
             }
@@ -6888,6 +6889,19 @@ fn handle_post_session_spin_up(
             // A new run has its own model: drop what the operator chose for an earlier one.
             state.clear_session_model_override(&out.session_id);
             state.clear_session_model_override(&out.persona);
+            // Show the chosen model and level before the first transcript turn reports them.
+            // The override needs a model: a level alone has nothing to overlay.
+            if let Some(model) = &out.model {
+                for key in [out.persona.to_ascii_lowercase(), out.session_id.clone()] {
+                    state.set_session_model_override(
+                        &key,
+                        session_actions::ModelOverride::new(
+                            model.clone(),
+                            out.thinking_level.clone(),
+                        ),
+                    );
+                }
+            }
             let data = serde_json::to_value(&out).unwrap_or_default();
             state.broadcast("sessions", "session.spun_up", data.clone());
             HttpResponse::json(200, data)
@@ -7172,7 +7186,10 @@ pub(crate) fn run_remodel(
                 // Keyed by the persona (and the hosted id): discovery does not know the new
                 // vendor session's id yet, and `apply_model_overrides` matches the persona.
                 for key in [out.persona.to_ascii_lowercase(), out.session_id.clone()] {
-                    state.set_session_model_override(&key, ModelOverride::new(model.clone(), None));
+                    state.set_session_model_override(
+                        &key,
+                        ModelOverride::new(model.clone(), out.thinking_level.clone()),
+                    );
                 }
             }
         }

@@ -92,6 +92,10 @@ pub enum AgentCmd {
         vendor: String,
         #[arg(long)]
         model: Option<String>,
+        /// Vendor-native thinking level (`--effort` for Claude, reasoning effort for Codex, the
+        /// model id suffix for Antigravity); other vendors ignore it.
+        #[arg(long = "thinking-level", visible_alias = "effort")]
+        thinking_level: Option<String>,
         /// Node the session runs on (default `ai-lab-0`).
         #[arg(long = "node-id")]
         node_id: Option<String>,
@@ -131,6 +135,9 @@ pub enum AgentCmd {
         /// Model on the new vendor (default: the vendor's own default, never the old model).
         #[arg(long)]
         model: Option<String>,
+        /// Vendor-native thinking level on the new vendor (see `spin-up --thinking-level`).
+        #[arg(long = "thinking-level", visible_alias = "effort")]
+        thinking_level: Option<String>,
         /// `prepare` (handoff prompt, status `decommissioning`) or `execute`.
         #[arg(long)]
         mode: Option<String>,
@@ -592,6 +599,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             role,
             vendor,
             model,
+            thinking_level,
             node_id,
             hosted,
             cwd,
@@ -604,6 +612,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 role,
                 vendor,
                 model,
+                thinking_level,
                 node_id,
                 hosted: Some(hosted),
                 cwd,
@@ -689,6 +698,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             session,
             vendor,
             model,
+            thinking_level,
             mode,
             cwd,
             node_id,
@@ -699,6 +709,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let req = RemodelRequest {
                 vendor,
                 model,
+                thinking_level,
                 mode,
                 cwd,
                 node_id,
@@ -916,6 +927,64 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
 mod tests {
     use super::*;
     use fl_core::MemStore;
+
+    #[derive(clap::Parser)]
+    struct AgentTestCli {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    }
+
+    #[test]
+    fn spin_up_and_remodel_parse_thinking_level_and_its_effort_alias() {
+        use clap::Parser;
+        for flag in ["--thinking-level", "--effort"] {
+            let cli = AgentTestCli::try_parse_from([
+                "fl",
+                "spin-up",
+                "--persona",
+                "ada",
+                "--project",
+                "p",
+                "--role",
+                "assistant",
+                "--vendor",
+                "claude",
+                flag,
+                "high",
+            ])
+            .unwrap();
+            let AgentCmd::SpinUp { thinking_level, .. } = cli.cmd else {
+                panic!("not spin-up");
+            };
+            assert_eq!(thinking_level.as_deref(), Some("high"), "{flag}");
+
+            let cli = AgentTestCli::try_parse_from([
+                "fl", "remodel", "ada", "--vendor", "codex", flag, "xhigh",
+            ])
+            .unwrap();
+            let AgentCmd::Remodel { thinking_level, .. } = cli.cmd else {
+                panic!("not remodel");
+            };
+            assert_eq!(thinking_level.as_deref(), Some("xhigh"), "{flag}");
+        }
+        let cli = AgentTestCli::try_parse_from([
+            "fl",
+            "spin-up",
+            "--persona",
+            "ada",
+            "--project",
+            "p",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+        ])
+        .unwrap();
+        let AgentCmd::SpinUp { thinking_level, .. } = cli.cmd else {
+            panic!("not spin-up");
+        };
+        assert!(thinking_level.is_none());
+    }
 
     #[test]
     fn test_write_atomic_non_symlink_refuses_symlinks() {

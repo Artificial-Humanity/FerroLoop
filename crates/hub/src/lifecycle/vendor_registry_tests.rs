@@ -684,6 +684,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         role: "assistant".into(),
         vendor: vendor.into(),
         model: None,
+        thinking_level: None,
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_RUNNING.into(),
@@ -852,4 +853,92 @@ fn the_restore_after_a_failed_remodel_does_not_need_the_old_vendors_key() {
     // A plain spin-up still checks the key.
     let err = spin(&store, &env, "bob", &old).unwrap_err();
     assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
+}
+
+// ------------------------------------------------------------------- thinking level
+
+#[test]
+fn thinking_level_is_validated_trimmed_and_must_be_a_plain_token() {
+    let ok = SpinUpRequest {
+        thinking_level: Some("  high ".into()),
+        ..req("ada", "claude")
+    };
+    assert_eq!(
+        ok.validate().unwrap().thinking_level.as_deref(),
+        Some("high")
+    );
+    let blank = SpinUpRequest {
+        thinking_level: Some("   ".into()),
+        ..req("ada", "claude")
+    };
+    assert_eq!(blank.validate().unwrap().thinking_level, None);
+    for bad in ["high; rm", "hi\"gh", "high\nlow", "--model", "a b"] {
+        let r = SpinUpRequest {
+            thinking_level: Some(bad.into()),
+            ..req("ada", "claude")
+        };
+        assert!(
+            matches!(r.validate(), Err(LifecycleError::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn spin_up_launches_records_and_reports_the_thinking_level() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = env_with(&home, &fake, &ProvisionedKeys);
+    let request = SpinUpRequest {
+        model: Some("opus".into()),
+        thinking_level: Some("high".into()),
+        ..req("ada", "claude")
+    };
+    let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+    assert_eq!(out.thinking_level.as_deref(), Some("high"));
+    assert_eq!(
+        record(&store, "claude:ada").thinking_level.as_deref(),
+        Some("high")
+    );
+    let launches = fake.launches.borrow();
+    let argv = &launches[0].1.as_ref().unwrap().argv;
+    assert!(
+        argv.windows(2).any(|w| w == ["--effort", "high"]),
+        "{argv:?}"
+    );
+}
+
+#[test]
+fn a_hosted_record_without_thinking_level_still_deserializes() {
+    let store = MemStore::default();
+    let rec = record_after_spin(&store);
+    let mut value = serde_json::to_value(&rec).unwrap();
+    assert!(value.get("thinking_level").is_none(), "none is not written");
+    value.as_object_mut().unwrap().remove("thinking_level");
+    let back: HostedSessionRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(back.thinking_level, None);
+}
+
+fn record_after_spin(store: &MemStore) -> HostedSessionRecord {
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = env_with(&home, &fake, &ProvisionedKeys);
+    let out = spin(store, &env, "ada", "claude").unwrap();
+    record(store, &out.session_id)
+}
+
+#[test]
+fn set_hosted_session_model_persists_a_thinking_level_only_when_given() {
+    let store = MemStore::default();
+    record_after_spin(&store);
+    let rec = set_hosted_session_model(&store, &["claude:ada"], "opus", Some("max"), "owner")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.thinking_level.as_deref(), Some("max"));
+    let rec = set_hosted_session_model(&store, &["claude:ada"], "sonnet", None, "owner")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.model.as_deref(), Some("sonnet"));
+    assert_eq!(rec.thinking_level.as_deref(), Some("max"));
 }

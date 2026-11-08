@@ -52,10 +52,13 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
     fn normalize_model(&self, requested: Option<&str>) -> Option<String>;
 
     /// Build the full `LaunchSpec` (`env` + `argv`) for spawning a hosted session.
+    /// `thinking_level` is the vendor-native effort the operator chose; a vendor with no such
+    /// launch option ignores it, and a value that is not a plain token never reaches argv.
     fn build_launch_spec(
         &self,
         persona: &str,
         model: Option<&str>,
+        thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec;
@@ -208,6 +211,13 @@ pub fn agy_cli_model_id(model: &str, thinking_level: Option<&str>) -> String {
     format!("{base}-{effort}")
 }
 
+/// `level` trimmed, when it is a plain token ([`is_plain_model_id`]) that is safe as one argv
+/// element or one config value. Empty and non-plain values (quotes, spaces, `;`, newlines) are
+/// dropped, never escaped.
+pub fn plain_thinking_level(level: Option<&str>) -> Option<&str> {
+    level.map(str::trim).filter(|l| is_plain_model_id(l))
+}
+
 /// The prompt as a positional CLI argument. A prompt starting with `-` is given a neutral
 /// leading word so it cannot be read as a flag.
 pub fn muse_prompt_argument(prompt: &str) -> String {
@@ -300,12 +310,16 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
         let mut argv = vec![self.resolve_binary(home), "--enable-auto-mode".to_string()];
         if let Some(m) = self.normalize_model(model) {
             argv.extend(["--model".to_string(), m]);
+        }
+        if let Some(level) = plain_thinking_level(thinking_level) {
+            argv.extend(["--effort".to_string(), level.to_string()]);
         }
         argv.push(muse_prompt_argument(prompt));
         LaunchSpec {
@@ -347,12 +361,19 @@ impl VendorCliAdapter for CodexCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
         let mut argv = vec![self.resolve_binary(home), "--yolo".to_string()];
         if let Some(m) = self.normalize_model(model) {
             argv.extend(["--model".to_string(), m]);
+        }
+        if let Some(level) = plain_thinking_level(thinking_level) {
+            argv.extend([
+                "-c".to_string(),
+                format!("model_reasoning_effort=\"{level}\""),
+            ]);
         }
         argv.push(muse_prompt_argument(prompt));
         LaunchSpec {
@@ -393,6 +414,7 @@ impl VendorCliAdapter for AntigravityCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
@@ -401,7 +423,11 @@ impl VendorCliAdapter for AntigravityCliAdapter {
             "--mode".to_string(),
             "auto".to_string(),
         ];
-        if let Some(m) = self.normalize_model(model) {
+        let cli_model = model
+            .map(|m| agy_cli_model_id(m, thinking_level))
+            .and_then(|m| normalize_plain_model(Some(&m)))
+            .filter(|m| split_window_tag(m).is_none());
+        if let Some(m) = cli_model {
             argv.extend(["--model".to_string(), m]);
         }
         argv.push("--prompt-interactive".to_string());
@@ -437,6 +463,7 @@ impl VendorCliAdapter for GrokCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
@@ -484,6 +511,7 @@ impl VendorCliAdapter for MuseCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
@@ -530,6 +558,7 @@ impl VendorCliAdapter for LemonadeCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
@@ -609,6 +638,7 @@ impl VendorCliAdapter for OllamaCliAdapter {
         &self,
         persona: &str,
         model: Option<&str>,
+        _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
     ) -> LaunchSpec {
@@ -841,9 +871,93 @@ mod tests {
     }
 
     #[test]
+    fn thinking_level_reaches_claude_codex_and_agy_launch_argv() {
+        let claude = lookup_vendor_cli_adapter("claude").unwrap();
+        let spec = claude.build_launch_spec("ada", Some("opus"), Some("high"), "Hi", None);
+        assert_eq!(
+            &spec.argv[1..],
+            &[
+                "--enable-auto-mode",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "Hi"
+            ]
+        );
+        let spec = claude.build_launch_spec("ada", None, Some(" max "), "Hi", None);
+        assert_eq!(
+            &spec.argv[1..],
+            &["--enable-auto-mode", "--effort", "max", "Hi"]
+        );
+
+        let codex = lookup_vendor_cli_adapter("codex").unwrap();
+        let spec = codex.build_launch_spec("ada", Some("gpt-5"), Some("xhigh"), "Hi", None);
+        assert_eq!(
+            &spec.argv[1..],
+            &[
+                "--yolo",
+                "--model",
+                "gpt-5",
+                "-c",
+                "model_reasoning_effort=\"xhigh\"",
+                "Hi"
+            ]
+        );
+
+        let agy = lookup_vendor_cli_adapter("antigravity").unwrap();
+        let spec = agy.build_launch_spec(
+            "ada",
+            Some("claude-opus-4-6-thinking"),
+            Some("high"),
+            "Hi",
+            None,
+        );
+        assert!(
+            spec.argv
+                .windows(2)
+                .any(|w| w == ["--model", "claude-opus-4-6-thinking-high"]),
+            "{:?}",
+            spec.argv
+        );
+
+        // Vendors with no launch option for it ignore the level.
+        for vendor in ["grok", "muse", "lemonade", "ollama"] {
+            let a = lookup_vendor_cli_adapter(vendor).unwrap();
+            let with = a.build_launch_spec("ada", None, Some("high"), "Hi", None);
+            let without = a.build_launch_spec("ada", None, None, "Hi", None);
+            assert_eq!(with.argv, without.argv, "{vendor}");
+        }
+    }
+
+    #[test]
+    fn hostile_or_empty_thinking_levels_never_reach_argv() {
+        for bad in [
+            "",
+            "   ",
+            "high; rm -rf /",
+            "hi\"gh",
+            "hi'gh",
+            "high\nlow",
+            "--model",
+            "high low",
+            "$(id)",
+        ] {
+            for vendor in ["claude", "codex", "antigravity"] {
+                let a = lookup_vendor_cli_adapter(vendor).unwrap();
+                let with = a.build_launch_spec("ada", Some("opus"), Some(bad), "Hi", None);
+                let without = a.build_launch_spec("ada", Some("opus"), None, "Hi", None);
+                assert_eq!(with.argv, without.argv, "{vendor} {bad:?}");
+            }
+        }
+        assert_eq!(plain_thinking_level(Some("high")), Some("high"));
+        assert_eq!(plain_thinking_level(Some("-x")), None);
+    }
+
+    #[test]
     fn seven_vendor_launch_specs_and_controls_match_contracts() {
         let claude = lookup_vendor_cli_adapter("claude").unwrap();
-        let spec = claude.build_launch_spec("ada", Some("opus[1m]"), "Hello", None);
+        let spec = claude.build_launch_spec("ada", Some("opus[1m]"), None, "Hello", None);
         assert_eq!(
             &spec.argv[1..],
             &["--enable-auto-mode", "--model", "opus[1m]", "Hello"]
@@ -853,13 +967,13 @@ mod tests {
         assert_eq!(claude.startup_prompt_rules().len(), 1);
 
         let codex = lookup_vendor_cli_adapter("codex").unwrap();
-        let spec = codex.build_launch_spec("ada", Some("gpt-5"), "Hello", None);
+        let spec = codex.build_launch_spec("ada", Some("gpt-5"), None, "Hello", None);
         assert_eq!(&spec.argv[1..], &["--yolo", "--model", "gpt-5", "Hello"]);
         assert!(spec.env.iter().all(|(k, _)| k != "AGENT_PERSONA"));
         assert_eq!(codex.interrupt_key(), "Escape");
 
         let agy = lookup_vendor_cli_adapter("antigravity").unwrap();
-        let spec = agy.build_launch_spec("ada", Some("claude-sonnet-5-5"), "Hello", None);
+        let spec = agy.build_launch_spec("ada", Some("claude-sonnet-5-5"), None, "Hello", None);
         assert_eq!(
             &spec.argv[1..],
             &[
@@ -874,7 +988,7 @@ mod tests {
         assert_eq!(agy.interrupt_key(), "C-c");
 
         let grok = lookup_vendor_cli_adapter("grok").unwrap();
-        let spec = grok.build_launch_spec("ada", Some("grok-4"), "-start", None);
+        let spec = grok.build_launch_spec("ada", Some("grok-4"), None, "-start", None);
         assert_eq!(
             &spec.argv[1..],
             &[
@@ -889,12 +1003,12 @@ mod tests {
         assert!(grok.startup_prompt_rules()[0].warn_on_miss);
 
         let muse = lookup_vendor_cli_adapter("muse").unwrap();
-        let spec = muse.build_launch_spec("ada", None, "Hello", None);
+        let spec = muse.build_launch_spec("ada", None, None, "Hello", None);
         assert_eq!(&spec.argv[1..], &["--model", MUSE_DEFAULT_MODEL, "Hello"]);
         assert_eq!(muse.reset_command(), "/new");
 
         let lemonade = lookup_vendor_cli_adapter("lemonade").unwrap();
-        let spec = lemonade.build_launch_spec("ada", None, "System prompt", None);
+        let spec = lemonade.build_launch_spec("ada", None, None, "System prompt", None);
         assert_eq!(
             &spec.argv[1..],
             &[
@@ -911,7 +1025,7 @@ mod tests {
         );
 
         let ollama = lookup_vendor_cli_adapter("ollama").unwrap();
-        let spec = ollama.build_launch_spec("ada", None, "Hello ollama", None);
+        let spec = ollama.build_launch_spec("ada", None, None, "Hello ollama", None);
         assert_eq!(
             &spec.argv[1..],
             &["run", OLLAMA_DEFAULT_CLI_MODEL, "Hello ollama"]
