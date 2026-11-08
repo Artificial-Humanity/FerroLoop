@@ -338,8 +338,11 @@ pub fn resolve_caller_with_source(
     let rpath = resolve_routes_path_for(env);
     let (persona, source) =
         resolve_persona_with_source(explicit, transcript, env.cwd, reg, rpath.as_deref());
+    let has_env_persona_override =
+        std::env::var_os("AGENT_PERSONA").is_some() || std::env::var_os("AGENT_NAME").is_some();
     let allow_route_capture = env.explicit_db.is_none() || resolve_routes_path().is_some();
     if explicit.is_none()
+        && !has_env_persona_override
         && allow_route_capture
         && persona != "unknown"
         && let Some(route) = capture_current_env_route()
@@ -2987,7 +2990,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fl_wire_register_registers_agent_and_records_live_route_and_agent_persona_read_refreshes_route()
+    fn fl_wire_register_registers_agent_and_records_live_route_while_env_override_read_preserves_route()
      {
         #[derive(Parser)]
         struct WireTestCli {
@@ -3059,20 +3062,45 @@ pub(crate) mod tests {
             VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-1"
         ));
 
-        // Now verify that `AGENT_PERSONA=feira fl wire read --ack` refreshes the caller's live route.
+        // Verify that `AGENT_PERSONA=feira fl wire read --ack` from another agent's shell does NOT
+        // overwrite `feira`'s route with the caller's thread_id (`has_env_persona_override` guard).
         // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores these variables on drop.
         unsafe {
             std::env::set_var("AGENT_PERSONA", "feira");
-            std::env::set_var("CODEX_THREAD_ID", "thread-feira-2");
+            std::env::set_var("CODEX_THREAD_ID", "thread-other-agent");
         }
         let read_cmd = WireTestCli::parse_from(["fl-wire", "read", "--ack"]);
         assert_eq!(run(&env, read_cmd.cmd).unwrap(), 0);
 
-        let refreshed = RouteTable::load(Some(&rig.routes_path()));
-        let refreshed_entry = refreshed.get("feira").expect("route refreshed");
-        assert!(refreshed_entry.explicit);
+        let after_read = RouteTable::load(Some(&rig.routes_path()));
+        let after_read_entry = after_read.get("feira").expect("route preserved");
         assert!(matches!(
-            &refreshed_entry.route,
+            &after_read_entry.route,
+            VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-1"
+        ));
+
+        // Verify that `fl wire register Feira ... --replace` updates the route to the new session.
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores these variables on drop.
+        unsafe {
+            std::env::set_var("CODEX_THREAD_ID", "thread-feira-2");
+        }
+        let replace_cmd = WireTestCli::parse_from([
+            "fl-wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ]);
+        assert_eq!(run(&env, replace_cmd.cmd).unwrap(), 0);
+
+        let replaced = RouteTable::load(Some(&rig.routes_path()));
+        let replaced_entry = replaced.get("feira").expect("route updated");
+        assert!(replaced_entry.explicit);
+        assert!(matches!(
+            &replaced_entry.route,
             VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-2"
         ));
     }
