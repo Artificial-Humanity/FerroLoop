@@ -617,6 +617,13 @@ impl SessionRuntime for HostRuntime {
         }
         env_allow.insert("FL_HOST_PTY".to_string());
         env_map.insert("FL_HOST_PTY".to_string(), "1".to_string());
+        // Interactive CLIs pick their color depth from these; a launch spec's own value wins.
+        for (key, default) in [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")] {
+            env_allow.insert(key.to_string());
+            env_map
+                .entry(key.to_string())
+                .or_insert_with(|| default.to_string());
+        }
         if !hosted_id.is_empty() {
             env_allow.insert("FL_HOSTED_ID".to_string());
             env_map.insert("FL_HOSTED_ID".to_string(), hosted_id.to_string());
@@ -5713,6 +5720,19 @@ mod tests {
         assert!(other.contains("to the FerroLoop Lead"), "{other}");
         assert!(other.contains("fl wire send <lead> \"Felicity decommission handoff\""));
         assert!(!other.contains("jarvis"));
+    }
+
+    #[test]
+    fn reforge_prompt_maps_web_and_mobile_roles_to_ui_developer_file() {
+        for role in ["web-developer", "mobile-developer"] {
+            let p = canonical_reforge_prompt("Ada", "FerroLoop", role);
+            assert!(p.contains("`.agents/roles/ui-developer.md`"), "{p}");
+            assert!(!p.contains(&format!("`.agents/roles/{role}.md`")), "{p}");
+            assert!(p.contains(&format!("as the {role}.")), "{p}");
+            assert!(p.contains(&format!("--role {role} --replace")), "{p}");
+        }
+        let p = canonical_reforge_prompt("Ada", "FerroLoop", "tester");
+        assert!(p.contains("`.agents/roles/tester.md`"), "{p}");
     }
 
     #[test]

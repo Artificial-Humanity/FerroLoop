@@ -1857,10 +1857,17 @@ fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
             return Err(format!("fl-host write_raw C-u returned {outcome:?}"));
         }
         let outcome = client
-            .send_line(stream, grant.lease, slash.to_string())
-            .map_err(|e| format!("fl-host send_line {slash} failed: {e}"))?;
+            .write_raw(stream.clone(), grant.lease, slash.as_bytes().to_vec())
+            .map_err(|e| format!("fl-host write_raw {slash} failed: {e}"))?;
         if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host send_line {slash} returned {outcome:?}"));
+            return Err(format!("fl-host write_raw {slash} returned {outcome:?}"));
+        }
+        std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
+        let outcome = client
+            .write_raw(stream, grant.lease, b"\r".to_vec())
+            .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
+        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+            return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
         }
         return Ok(());
     }
@@ -2221,48 +2228,35 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
         let grant = client
             .claim_controller(stream.clone())
             .map_err(|e| format!("failed to claim fl-host controller for {target}: {e}"))?;
-        if bracketed {
-            let pasted = format!("\x1b[200~{}\x1b[201~", text.trim()).into_bytes();
-            let outcome = client
-                .write_raw(stream.clone(), grant.lease, pasted)
-                .map_err(|e| format!("fl-host write_raw bracketed paste failed: {e}"))?;
-            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-                return Err(format!("fl-host write_raw paste returned {outcome:?}"));
-            }
-            std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
-            let outcome = client
-                .write_raw(stream.clone(), grant.lease, b"\r".to_vec())
-                .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
-            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-                return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
-            }
-            let session_cap = stream.session.clone();
-            let saw_paste = poll_for_pasted_content(
-                6,
-                || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
-                || client.capture_output(session_cap.clone(), 4096).ok(),
-            );
-            if saw_paste {
-                let _ = client.write_raw(stream, grant.lease, b"\r".to_vec());
-            }
+        let trimmed = text.trim();
+        let payload: Vec<u8> = if bracketed {
+            format!("\x1b[200~{trimmed}\x1b[201~").into_bytes()
         } else {
-            let trimmed = text.trim();
-            if trimmed.contains('\n') {
-                let raw = format!("{trimmed}\r").into_bytes();
-                let outcome = client
-                    .write_raw(stream, grant.lease, raw)
-                    .map_err(|e| format!("fl-host write_raw multiline failed: {e}"))?;
-                if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-                    return Err(format!("fl-host write_raw multiline returned {outcome:?}"));
-                }
-            } else {
-                let outcome = client
-                    .send_line(stream, grant.lease, trimmed.to_string())
-                    .map_err(|e| format!("fl-host send_line failed: {e}"))?;
-                if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-                    return Err(format!("fl-host send_line returned {outcome:?}"));
-                }
+            trimmed.as_bytes().to_vec()
+        };
+        if bracketed || !trimmed.is_empty() {
+            let outcome = client
+                .write_raw(stream.clone(), grant.lease, payload)
+                .map_err(|e| format!("fl-host write_raw payload failed: {e}"))?;
+            if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+                return Err(format!("fl-host write_raw payload returned {outcome:?}"));
             }
+        }
+        std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
+        let outcome = client
+            .write_raw(stream.clone(), grant.lease, b"\r".to_vec())
+            .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
+        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
+            return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
+        }
+        let session_cap = stream.session.clone();
+        let saw_paste = poll_for_pasted_content(
+            6,
+            || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
+            || client.capture_output(session_cap.clone(), 4096).ok(),
+        );
+        if saw_paste {
+            let _ = client.write_raw(stream, grant.lease, b"\r".to_vec());
         }
         return Ok(());
     }
@@ -7009,13 +7003,18 @@ exit 1"#,
         let plan = plan_interrupt(&fay_route, None).unwrap();
         run_interrupt(&plan).unwrap();
 
-        let lines = recorded_lines.lock().unwrap().clone();
-        assert!(
-            lines.iter().any(|(s, l)| s == "Dee.grok" && l == "/new"),
-            "expected grok /new reset line, got: {lines:?}"
-        );
-
         let writes = recorded_writes.lock().unwrap().clone();
+        // The reset is raw writes (C-u, the command, then a separate CR), not `send_line`.
+        let dee: Vec<&[u8]> = writes
+            .iter()
+            .filter(|(s, _)| s == "Dee.grok")
+            .map(|(_, b)| b.as_slice())
+            .collect();
+        let expected: [&[u8]; 3] = [b"\x15", b"/new", b"\r"];
+        assert!(
+            dee.windows(3).any(|w| w == expected),
+            "expected grok C-u, /new, CR raw writes, got: {dee:?}"
+        );
         let writes_str: Vec<(String, String)> = writes
             .iter()
             .map(|(s, b)| (s.clone(), String::from_utf8_lossy(b).into_owned()))
@@ -7051,6 +7050,144 @@ exit 1"#,
             "expected Escape interrupt write to Fay.lemonade, got: {writes:?}"
         );
 
+        drop(server_thread);
+    }
+
+    #[test]
+    fn fl_host_paste_writes_payload_then_a_separate_carriage_return() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Fay.lemonade").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([1u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let show_paste = Arc::new(AtomicBool::new(false));
+        let writes_srv = Arc::clone(&writes);
+        let paste_srv = Arc::clone(&show_paste);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    let paste = Arc::clone(&paste_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    writes.lock().unwrap().push(bytes.into_vec());
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: if paste.load(Ordering::SeqCst) {
+                                            "[Pasted Content 12 chars]".to_string()
+                                        } else {
+                                            String::new()
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let run = |text: &str, bracketed: bool| -> Vec<Vec<u8>> {
+            writes.lock().unwrap().clear();
+            deliver_via_tmux_paste_opts("Fay.lemonade", text, bracketed).unwrap();
+            writes.lock().unwrap().clone()
+        };
+        assert_eq!(
+            run("  hi\nthere  ", true),
+            vec![b"\x1b[200~hi\nthere\x1b[201~".to_vec(), b"\r".to_vec()]
+        );
+        assert_eq!(
+            run("/effort high", false),
+            vec![b"/effort high".to_vec(), b"\r".to_vec()]
+        );
+        assert_eq!(run("   ", false), vec![b"\r".to_vec()]);
+        // A paste placeholder still on screen after Enter earns a second CR.
+        show_paste.store(true, Ordering::SeqCst);
+        assert_eq!(
+            run("long", true),
+            vec![
+                b"\x1b[200~long\x1b[201~".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec()
+            ]
+        );
         drop(server_thread);
     }
 }
