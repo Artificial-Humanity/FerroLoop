@@ -15,20 +15,12 @@ pub(crate) const METADATA: usize = 8 * 1024 * 1024;
 pub(crate) enum ChargeKind {
     ReliableData,
     Lifecycle,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Approved PTY stage consumes this category")
-    )]
     Projection,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "Approved PTY stage consumes this category")
     )]
     Ring,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Approved PTY stage consumes this category")
-    )]
     Snapshot,
     Viewer,
     Metadata,
@@ -150,6 +142,13 @@ fn release(usage: &mut Usage, kind: ChargeKind, bytes: usize) {
     }
 }
 impl Reservation {
+    /// Transfer an admitted increment without allocating a list of reservations.
+    pub(crate) fn merge(&mut self, mut other: Self) {
+        assert!(Arc::ptr_eq(&self.budget, &other.budget) && self.kind == other.kind);
+        self.bytes = self.bytes.checked_add(other.bytes).expect("admitted total");
+        other.bytes = 0;
+    }
+
     pub(crate) fn allocate_bytes(self, len: usize) -> Result<ChargedBytes, ExtensionRefusal> {
         if len > self.bytes {
             return Err(ExtensionRefusal::ResourceLimit);

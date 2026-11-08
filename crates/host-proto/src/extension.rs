@@ -149,6 +149,31 @@ pub struct PtyOptions {
     pub rows: u16,
     pub scrollback_rows: u16,
 }
+pub const MAX_PTY_ROWS: u16 = 128;
+pub const MAX_PTY_COLS: u16 = 256;
+pub const MAX_PTY_CELLS: usize = 8192;
+pub const MAX_PTY_SCROLLBACK_ROWS: u16 = 512;
+
+pub fn validate_pty_geometry(cols: u16, rows: u16) -> Result<(), HostError> {
+    if rows == 0
+        || cols == 0
+        || rows > MAX_PTY_ROWS
+        || cols > MAX_PTY_COLS
+        || usize::from(rows) * usize::from(cols) > MAX_PTY_CELLS
+    {
+        return Err(HostError::Protocol("invalid pty dimensions".into()));
+    }
+    Ok(())
+}
+impl PtyOptions {
+    pub fn validate(&self) -> Result<(), HostError> {
+        validate_pty_geometry(self.cols, self.rows)?;
+        if self.scrollback_rows > MAX_PTY_SCROLLBACK_ROWS {
+            return Err(HostError::Protocol("invalid pty scrollback".into()));
+        }
+        Ok(())
+    }
+}
 impl Default for PtyOptions {
     fn default() -> Self {
         Self {
@@ -361,10 +386,8 @@ impl ExtensionRequest {
                         false,
                     ) => {}
                     (SessionMode::Pty, SpawnKind::Pty, _) => {
-                        if let Some(opts) = pty
-                            && (opts.cols == 0 || opts.rows == 0)
-                        {
-                            return Err(HostError::Protocol("invalid pty dimensions".into()));
+                        if let Some(opts) = pty {
+                            opts.validate()?;
                         }
                     }
                     _ => {

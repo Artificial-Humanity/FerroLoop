@@ -14,6 +14,7 @@ mod identity;
 mod input;
 mod limits;
 mod output;
+mod projection;
 #[cfg(unix)]
 mod protocol;
 mod refusal;
@@ -609,10 +610,8 @@ impl Host {
                     return Err(HostError::Unsupported { subject: "pty" });
                 }
                 #[cfg(unix)]
-                if let Some(opts) = pty
-                    && (opts.cols == 0 || opts.rows == 0)
-                {
-                    return Err(HostError::Protocol("invalid pty dimensions".into()));
+                if let Some(opts) = pty {
+                    opts.validate()?;
                 }
             }
             _ => {
@@ -728,6 +727,18 @@ impl Host {
         epoch: u64,
         admission: Option<authority::PreparedEpoch>,
     ) -> Result<SessionHandle, HostError> {
+        // The epoch owns all parser storage before any child exists. Failure
+        // simply drops admission; it never needs post-spawn cleanup.
+        let projection = match admission.as_ref().filter(|a| a.journal.pty_mode()) {
+            Some(admission) => Some(
+                projection::Projection::new(
+                    Arc::clone(admission.journal.budget()),
+                    pty.unwrap_or_default(),
+                )
+                .map_err(|_| HostError::Protocol("projection capacity".into()))?,
+            ),
+            None => None,
+        };
         let host = Arc::clone(this);
         let crash = host
             .crash
@@ -790,9 +801,18 @@ impl Host {
             control: Some(supervised.control),
             stdin: Some(supervised.stdin),
         };
-        let session = Arc::new(match admission.as_ref() {
-            Some(admission) => Session::with_reliable(parts, Some(Arc::clone(&admission.journal))),
-            None => Session::new(parts),
+        let session = Arc::new(match (admission.as_ref(), projection) {
+            (Some(admission), Some(projection)) => Session::with_projection(
+                parts,
+                Arc::clone(&admission.journal),
+                projection,
+                supervised.resize_master,
+            ),
+            (Some(admission), None) => {
+                Session::with_reliable(parts, Some(Arc::clone(&admission.journal)))
+            }
+            (None, None) => Session::new(parts),
+            (None, Some(_)) => unreachable!("projection requires an epoch journal"),
         });
         session.set_supervisor(supervised.child);
         this.sessions
