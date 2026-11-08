@@ -283,3 +283,24 @@ fn after_landed(ctx: &Ctx<'_>, record: &Record, to: State, shown: &str) {
         crate::cmd::escalate::after_landed_move(ctx, record, shown);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_project_ref_accepts_project_slug_and_resolves_against_store() {
+        let s = fl_core::MemStore::default();
+        let p = s.add_project("/workspace/FerroLoop").unwrap();
+        let slug: Ref = "ferroloop".parse().unwrap();
+        let cmd = Cmd::List {
+            project: slug,
+            tier: None,
+        };
+        assert_eq!(cmd.project_ref().and_then(Ref::as_slug), Some("ferroloop"));
+        assert!(!cmd.has_handle());
+        let resolved = refs::resolve(&s, "memory", Kind::Project, cmd.project_ref().unwrap())
+            .expect("project slug resolves");
+        assert_eq!(ProjectId(resolved), p);
+    }
+}

@@ -337,4 +337,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn routing_show_accepts_project_slug_and_resolves_project() {
+        let s = fl_core::MemStore::default();
+        let p = s.add_project("/workspace/FerroLoop").unwrap();
+        let slug: Ref = "ferroloop".parse().unwrap();
+        let cmd = Cmd::Show { project: slug };
+        assert_eq!(cmd.project_ref().and_then(Ref::as_slug), Some("ferroloop"));
+        assert!(!cmd.has_handle());
+        let resolved = refs::resolve(&s, "memory", Kind::Project, cmd.project_ref().unwrap())
+            .expect("project slug resolves");
+        assert_eq!(ProjectId(resolved), p);
+    }
 }

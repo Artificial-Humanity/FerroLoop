@@ -5198,6 +5198,13 @@ mod tests {
             ("claude-sonnet-5-5", None, "claude-sonnet-5-5-medium"),
             ("claude-sonnet-5-5", Some("high"), "claude-sonnet-5-5-high"),
             ("gemini-4-argon", Some("low"), "gemini-4-argon-low"),
+            // Argon shorthand aliases normalize to `gemini-4-argon` before appending effort.
+            ("argon-4.0", None, "gemini-4-argon-medium"),
+            ("argon-4.0", Some("high"), "gemini-4-argon-high"),
+            ("argon-4.0-low", None, "gemini-4-argon-low"),
+            ("argon-4", None, "gemini-4-argon-medium"),
+            ("argon", Some("low"), "gemini-4-argon-low"),
+            ("gemini-4.0-argon", None, "gemini-4-argon-medium"),
             // The effort is read without case or surrounding space; anything else is ignored.
             ("gemini-4-argon", Some("HIGH"), "gemini-4-argon-high"),
             ("gemini-4-argon", Some(" Low "), "gemini-4-argon-low"),
