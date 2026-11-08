@@ -321,11 +321,7 @@ impl Session {
     }
 
     pub fn push_stdout(&self, chunk: &[u8]) {
-        let mut buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
-        let room = MAX_STDOUT_BACKLOG.saturating_sub(buf.bytes.len());
-        let take = room.min(chunk.len());
-        buf.bytes.extend_from_slice(&chunk[..take]);
-        self.stdout_cv.notify_all();
+        self.push_stdout_tail(chunk, MAX_STDOUT_BACKLOG);
     }
 
     pub fn push_stdout_tail(&self, chunk: &[u8], max_cap: usize) {
@@ -968,5 +964,130 @@ mod pipe_poll_tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts() -> SessionParts {
+        SessionParts {
+            session: SessionId::new("capture").unwrap(),
+            epoch: 1,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }
+    }
+
+    #[test]
+    fn stdout_capture_keeps_recent_bytes_across_repeated_overflow() {
+        let session = Session::new(parts());
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..9 {
+            session.push_stdout(&chunk);
+        }
+        for marker in [b"recent-one".as_slice(), b"newest-two".as_slice()] {
+            session.push_stdout(marker);
+            assert_eq!(session.stdout_tail(marker.len()).as_bytes(), marker);
+            let capture = session.read_stdout_until(marker, Duration::ZERO).unwrap();
+            assert_eq!(capture.len(), 8 * 1024 * 1024);
+            assert!(capture.ends_with(marker));
+        }
+        assert_eq!(session.stdout_tail(0), "");
+    }
+
+    #[test]
+    fn stdout_capture_keeps_suffix_of_single_oversized_write() {
+        let session = Session::new(parts());
+        session.push_stdout(b"obsolete-prefix");
+        let mut chunk = vec![b'x'; 9 * 1024 * 1024];
+        chunk[1024 * 1024 + 10..1024 * 1024 + 15].copy_from_slice(b"start");
+        chunk.extend_from_slice(b"newest-end");
+        session.push_stdout(&chunk);
+        assert_eq!(session.stdout_tail(10), "newest-end");
+        session.stdout_eof();
+        let capture = session.read_stdout_until(b"", Duration::ZERO).unwrap();
+        assert_eq!(capture.len(), 8 * 1024 * 1024);
+        assert_eq!(&capture[..5], b"start");
+        assert_eq!(capture.as_slice(), &chunk[chunk.len() - 8 * 1024 * 1024..]);
+    }
+
+    #[test]
+    fn stdout_capture_public_tail_respects_limit_after_lossy_utf8() {
+        let session = Session::new(parts());
+        session.push_stdout(&vec![0xff; 128 * 1024]);
+        session.push_stdout(b"latest");
+        let tail = session.stdout_tail(usize::MAX);
+        assert!(tail.len() <= fl_host_proto::MAX_RAW_INPUT);
+        assert!(tail.ends_with("latest"));
+        assert_eq!(session.stdout_tail(6), "latest");
+    }
+
+    // Regular files exercise the actual Unix pump read path without scheduling
+    // a subprocess or pipe writer. Windows pumps require named-pipe handles.
+    #[cfg(unix)]
+    fn flood_file() -> File {
+        use std::io::{Seek, SeekFrom};
+        let mut file = tempfile::tempfile().unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..9 {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(b"\r\x1b[0mnewest-pump-marker\n").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sinkless_stdout_pump_retains_fresh_bounded_capture_after_flood() {
+        let session = Arc::new(Session::new(parts()));
+        pump_stdout(flood_file(), Arc::clone(&session));
+        assert_eq!(session.stdout_tail(19), "newest-pump-marker\n");
+        let capture = session.read_stdout_until(b"", Duration::ZERO).unwrap();
+        assert_eq!(capture.len(), 8 * 1024 * 1024);
+        assert!(capture.ends_with(b"\r\x1b[0mnewest-pump-marker\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliable_stdout_pump_retains_fresh_bounded_capture_after_flood() {
+        use crate::output::{Hub, OutputSession};
+        use crate::reliable::ReliableJournal;
+        use crate::slice_budget::SliceBudget;
+        use fl_host_proto::{HostInstance, StreamId};
+
+        let parts = parts();
+        let journal = ReliableJournal::new(
+            SliceBudget::new(),
+            StreamId {
+                host: HostInstance::new([1; 16]),
+                session: parts.session.clone(),
+                epoch: SessionEpoch(parts.epoch),
+            },
+        )
+        .unwrap();
+        let session = Arc::new(Session::with_reliable(parts, Some(Arc::clone(&journal))));
+        let output = OutputSession::open(Arc::clone(&session), Arc::new(Hub::new()));
+        let sink: Arc<dyn StdoutSink> = output;
+        session.set_sink(Arc::downgrade(&sink));
+        pump_stdout(flood_file(), Arc::clone(&session));
+        assert_eq!(session.stdout_tail(19), "newest-pump-marker\n");
+        let capture = session.read_stdout_until(b"", Duration::ZERO).unwrap();
+        assert_eq!(capture.len(), 64 * 1024);
+        assert!(capture.ends_with(b"\r\x1b[0mnewest-pump-marker\n"));
+        assert!(journal.is_eof());
+        assert_eq!(
+            journal.position().0,
+            0,
+            "capture must not acknowledge delivery"
+        );
     }
 }
