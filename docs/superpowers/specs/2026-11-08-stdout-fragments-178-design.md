@@ -1,6 +1,6 @@
 # Bounded stdout fragments — Record 178
 
-Status: proposed to the project Lead; compatibility adjustment awaiting approval.
+Status: approved by Ferris with the retention amendment below.
 
 ## Problem and outcome
 
@@ -45,6 +45,34 @@ frames to an old connection. New readers accept old frames as terminated records
 - A cap-only flush delays interactive output until 1 MiB; read-boundary flush is
   simpler than introducing an idle timer and provides prompt output.
 - A byte-stream/PTY protocol redesign exceeds this repair's scope.
+
+## Unattended retention and coalescing
+
+Reliable records retire only through `acknowledge` in `crates/host/src/reliable.rs`;
+an absent subscriber does not ACK. Non-reliable records retire after a completed
+subscriber write and satisfaction of outstanding holders/cursors (`settle_locked`
+in `crates/host/src/output.rs`). An absent subscriber does not retire data there
+either. Preserve these guarantees; never introduce silent eviction or implicit ACK.
+
+Append newly read unterminated bytes to the latest unterminated data record, up to
+1 MiB, if it has never been exposed to a reader. Preserve its sequence. Freeze a
+reliable record permanently before `ReplayCursor::next` exposes it, even if the
+reference is later dropped without ACK. For non-reliable output, freeze before
+subscriber admission; never mutate queued records or their byte-accounting values.
+Use existing journal and fanout/order locking to prevent races with subscription.
+Precharge replacement bytes and changed envelopes before allocation/mutation.
+Coalescing must remain possible at the record cap when the tail is eligible.
+Do not coalesce across an intervening lifecycle record or LF-terminated record.
+Readers already attached still receive promptly flushed immutable records.
+
+Test 100,000 one-byte read admissions with an LF-terminated read every 1,000 reads,
+without a subscriber. This keeps total bytes and true line count within existing
+caps while independently exceeding the read count cap. Both paths must remain
+unstalled, within budget, and reconstruct exactly for a later minor-2 reader.
+Also exercise a no-LF stream across multiple 1 MiB record boundaries. Finite
+retention still backpressures when actual byte/line limits are exhausted: arbitrary
+unacknowledged output or more than 4096 distinct LF records cannot be retained
+indefinitely under the existing contract. This change does not promise otherwise.
 
 ## Validation and boundaries
 
