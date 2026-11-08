@@ -1367,6 +1367,7 @@ fn a_peers_failed_remodel_restores_exactly_the_session_it_tore_down() {
     assert_eq!(
         HostedSessionRecord {
             updated_at_ms: before.updated_at_ms,
+            vendor_session_id: before.vendor_session_id.clone(),
             ..after
         },
         before
@@ -1637,6 +1638,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         hydration_dispatched: false,
         runtime_spawned: false,
         tombstone_ids: vec!["gs-old".into()],
+        vendor_session_id: None,
         created_at_ms: 1,
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,
@@ -1696,10 +1698,17 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("spin-up on grok failed"), "{err}");
+    let claude_sid = record(&store.inner, "claude:ada")
+        .vendor_session_id
+        .expect("claude record has vendor_session_id");
     let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
     assert_eq!(
         banned,
-        std::collections::BTreeSet::from(["gs-old".to_string(), "sess-claude".to_string()]),
+        std::collections::BTreeSet::from([
+            "gs-old".to_string(),
+            "sess-claude".to_string(),
+            claude_sid,
+        ]),
         "{banned:?}"
     );
     assert!(!banned.contains("grok:ada"));
@@ -1831,4 +1840,99 @@ fn recast_metadata_write_failure_leaves_registry_and_previous_binding_unchanged(
     let mut other_assignment = moved.clone();
     other_assignment.project = "not-staged".into();
     assert!(!recast_guidance_required(&store, &other_assignment).unwrap());
+}
+
+#[test]
+fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_workspace_root() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let ws = TempDir::new().unwrap();
+    let proj_dir = ws.path().join("Kaggle-Gemma4");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let custom_worktree = TempDir::new().unwrap();
+
+    let fake = FakeRuntime::default();
+    let mut env_no_ws = fake.env(home.path());
+    env_no_ws.workspace_root = None;
+
+    // 1. Spin up kayla with `old_cwd == None` (because workspace_root was None on spin-up).
+    spin_up(
+        &store,
+        &env_no_ws,
+        &SpinUpRequest {
+            persona: "kayla".into(),
+            project: "kaggle-gemma4".into(),
+            role: "lead".into(),
+            vendor: "antigravity".into(),
+            ..SpinUpRequest::default()
+        },
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(record(&store, "antigravity:kayla").cwd, None);
+
+    // Remodel with `env.workspace_root = Some(ws.path())` and `req.cwd = None` resolves to `Kaggle-Gemma4`.
+    let mut env_ws = fake.env(home.path());
+    env_ws.workspace_root = Some(ws.path());
+    let plan = plan_remodel(
+        &store,
+        &env_ws,
+        &target(&store, "antigravity:kayla"),
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap();
+    let want_proj = proj_dir.display().to_string();
+    assert_eq!(plan.to.cwd.as_deref(), Some(want_proj.as_str()));
+
+    let out = remodel(
+        &store,
+        &env_ws,
+        "antigravity:kayla",
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.cwd.as_deref(), Some(want_proj.as_str()));
+    assert_eq!(
+        record(&store, "claude:kayla").cwd.as_deref(),
+        Some(want_proj.as_str())
+    );
+
+    // 2. When `old_cwd` equals `env.workspace_root` (e.g. a virtual area defaulted to workspace root),
+    // remodeling with `req.cwd = None` upgrades `cwd` to the resolved project subdirectory.
+    let mut rec = record(&store, "claude:kayla");
+    rec.cwd = Some(ws.path().display().to_string());
+    persist_hosted_session(&store, &rec, "owner").unwrap();
+
+    let out2 = remodel(
+        &store,
+        &env_ws,
+        "claude:kayla",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out2.cwd.as_deref(), Some(want_proj.as_str()));
+    assert_eq!(
+        record(&store, "codex:kayla").cwd.as_deref(),
+        Some(want_proj.as_str())
+    );
+
+    // 3. When `old_cwd` is a specific worktree different from `env.workspace_root`, keep `old_cwd`.
+    let wt_str = custom_worktree.path().display().to_string();
+    let mut rec3 = record(&store, "codex:kayla");
+    rec3.cwd = Some(wt_str.clone());
+    persist_hosted_session(&store, &rec3, "owner").unwrap();
+
+    let plan3 = plan_remodel(
+        &store,
+        &env_ws,
+        &target(&store, "codex:kayla"),
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(plan3.to.cwd.as_deref(), Some(wt_str.as_str()));
 }

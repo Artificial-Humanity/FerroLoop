@@ -1273,6 +1273,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             hydration_dispatched: false,
             runtime_spawned: false,
             tombstone_ids: vec![native_id.into()],
+            vendor_session_id: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,

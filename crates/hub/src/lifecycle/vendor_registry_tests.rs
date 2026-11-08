@@ -696,6 +696,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         hydration_dispatched: false,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
+        vendor_session_id: None,
         created_at_ms: 1,
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,

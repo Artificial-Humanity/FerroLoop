@@ -751,6 +751,8 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             by,
             json,
         } => {
+            let ws_root =
+                fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
             let req = SpinUpRequest {
                 persona,
                 project,
@@ -763,12 +765,10 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 cwd,
                 context_window: None,
             }
-            .with_default_cwd(
-                store,
-                &fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default()),
-            );
+            .with_default_cwd(store, &ws_root);
             let _ = composed_vendor_host_adapters();
-            let env = LifecycleEnv::new(None);
+            let mut env = LifecycleEnv::new(None);
+            env.workspace_root = Some(&ws_root);
             let out = lifecycle::spin_up(store, &env, &req, &by, lifecycle::Caller::Owner)
                 .map_err(lifecycle_failure)?;
             if json {
@@ -792,7 +792,10 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
         } => {
             let mode = DecommissionMode::parse(&mode).map_err(lifecycle_failure)?;
             let _ = composed_vendor_host_adapters();
-            let env = LifecycleEnv::new(None);
+            let ws_root =
+                fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
+            let mut env = LifecycleEnv::new(None);
+            env.workspace_root = Some(&ws_root);
             let target =
                 SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
             // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
@@ -861,7 +864,10 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
             // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
             let _ = composed_vendor_host_adapters();
-            let env = LifecycleEnv::new(None);
+            let ws_root =
+                fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
+            let mut env = LifecycleEnv::new(None);
+            env.workspace_root = Some(&ws_root);
             let out = lifecycle::remodel_session(
                 store,
                 &env,
@@ -1521,5 +1527,129 @@ mod tests {
         let claude = reg.lookup("claude").expect("claude host adapter composed");
         assert_eq!(claude.vendor_id(), "claude");
         assert_eq!(claude.default_binary(), "claude");
+    }
+
+    #[test]
+    fn spin_up_and_teardown_with_composed_claude_host_adapter_binds_and_archives_session_uuid() {
+        #[derive(Debug, Default)]
+        struct RecordingRuntime {
+            live: std::cell::RefCell<std::collections::BTreeSet<String>>,
+            launches: std::cell::RefCell<Vec<fl_hub::lifecycle::LaunchSpec>>,
+        }
+        impl fl_hub::lifecycle::SessionRuntime for RecordingRuntime {
+            fn spawn(
+                &self,
+                session: &str,
+                _window: &str,
+                _cwd: Option<&str>,
+                launch: Option<&fl_hub::lifecycle::LaunchSpec>,
+                _hosted_id: &str,
+            ) -> bool {
+                self.live.borrow_mut().insert(session.to_string());
+                if let Some(spec) = launch {
+                    self.launches.borrow_mut().push(spec.clone());
+                }
+                true
+            }
+            fn kill(&self, unit: &str, _hosted_id: &str) -> bool {
+                self.live.borrow_mut().remove(unit);
+                true
+            }
+            fn exists(&self, unit: &str) -> bool {
+                self.live.borrow().contains(unit)
+            }
+            fn owns(&self, unit: &str, _hosted_id: &str) -> bool {
+                self.live.borrow().contains(unit)
+            }
+        }
+
+        let _ = composed_vendor_host_adapters();
+        let store = MemStore::default();
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let proj_dir = ws.path().join("Kaggle-Gemma4");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        let runtime = RecordingRuntime::default();
+        let mut env = LifecycleEnv::new(Some(home.path()));
+        env.spawn_runtime = true;
+        env.runtime = &runtime;
+        env.workspace_root = Some(ws.path());
+
+        let req = SpinUpRequest {
+            persona: "kayla".into(),
+            project: "kaggle-gemma4".into(),
+            role: "lead".into(),
+            vendor: "claude".into(),
+            ..SpinUpRequest::default()
+        };
+        let out = lifecycle::spin_up(&store, &env, &req, "owner", lifecycle::Caller::Owner)
+            .expect("claude spin-up succeeds");
+        assert!(out.runtime_spawned);
+
+        let rec = lifecycle::find_hosted_session(&store, &["claude:kayla"])
+            .unwrap()
+            .expect("hosted record persisted");
+        assert_eq!(
+            rec.cwd.as_deref(),
+            Some(proj_dir.to_string_lossy().as_ref())
+        );
+        let sid = rec
+            .vendor_session_id
+            .clone()
+            .expect("vendor_session_id persisted on HostedSessionRecord");
+
+        let launches = runtime.launches.borrow();
+        assert_eq!(launches.len(), 1);
+        let argv = &launches[0].argv;
+        assert!(
+            argv.len() >= 7,
+            "expected claude launch argv with session-id and name, got {argv:?}"
+        );
+        assert_eq!(
+            &argv[1..7],
+            &[
+                "--remote-control".to_string(),
+                "--enable-auto-mode".to_string(),
+                "--session-id".to_string(),
+                sid.clone(),
+                "--name".to_string(),
+                "Kayla".to_string(),
+            ]
+        );
+
+        // Create a transcript file for this exact session UUID and verify teardown archives it.
+        let transcript_dir = home
+            .path()
+            .join(".claude/projects/-workspace-kaggle-gemma4");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{sid}.jsonl"));
+        std::fs::write(&transcript_path, "{\"type\":\"user\"}\n").unwrap();
+
+        let target = SessionTarget::resolve(&store, "claude:kayla", None).unwrap();
+        let torn = lifecycle::teardown_session(
+            &store,
+            &env,
+            &target,
+            "owner",
+            lifecycle::Caller::Owner,
+            |_| {},
+        )
+        .expect("teardown succeeds");
+        assert_eq!(torn.status, lifecycle::STATUS_DECOMMISSIONED);
+
+        let after_rec = lifecycle::find_hosted_session(&store, &["claude:kayla"])
+            .unwrap()
+            .unwrap();
+        assert!(after_rec.tombstone_ids.contains(&sid));
+        let archived_path = home
+            .path()
+            .join(".claude/archived/-workspace-kaggle-gemma4")
+            .join(format!("{sid}.jsonl"));
+        assert!(
+            archived_path.is_file(),
+            "ClaudeHostAdapter::archive must move transcript to archived path"
+        );
+        assert!(!transcript_path.exists());
     }
 }
