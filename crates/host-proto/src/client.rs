@@ -331,6 +331,26 @@ impl AsyncHostClient {
         }
     }
 
+    pub async fn spawn_pty_session(
+        &mut self,
+        spec: crate::SpawnSpec,
+        pty: Option<crate::PtyOptions>,
+    ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
+        match self
+            .extension_request(crate::ExtensionRequest::SpawnSession {
+                spec,
+                mode: crate::SessionMode::Pty,
+                pty,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::Session { stream, state } => Ok((stream, state)),
+            other => Err(HostError::Protocol(format!(
+                "spawn_pty_session refused: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn send_line(
         &mut self,
         stream: crate::StreamId,
@@ -544,6 +564,15 @@ impl BlockingHostClient {
     ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
         self.runtime
             .block_on(self.inner.spawn_reliable_session(spec))
+    }
+
+    pub fn spawn_pty_session(
+        &mut self,
+        spec: crate::SpawnSpec,
+        pty: Option<crate::PtyOptions>,
+    ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
+        self.runtime
+            .block_on(self.inner.spawn_pty_session(spec, pty))
     }
 
     pub fn claim_controller(

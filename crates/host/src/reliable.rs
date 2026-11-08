@@ -93,6 +93,7 @@ struct State {
 pub(crate) struct ReliableJournal {
     self_ref: Weak<ReliableJournal>,
     stream: StreamId,
+    pty_mode: bool,
     budget: Arc<SliceBudget>,
     counts: Arc<Counts>,
     state: Mutex<State>,
@@ -129,9 +130,18 @@ impl Drop for ReplayCursor {
     }
 }
 impl ReliableJournal {
+    #[cfg(test)]
     pub(crate) fn new(
         shared: Arc<SliceBudget>,
         stream: StreamId,
+    ) -> Result<Arc<Self>, ExtensionRefusal> {
+        Self::new_with_mode(shared, stream, false)
+    }
+
+    pub(crate) fn new_with_mode(
+        shared: Arc<SliceBudget>,
+        stream: StreamId,
+        pty_mode: bool,
     ) -> Result<Arc<Self>, ExtensionRefusal> {
         let budget = SliceBudget::epoch(&shared)?;
         // Fixed queue capacity has no hidden VecDeque growth. Every lifecycle kind
@@ -155,6 +165,7 @@ impl ReliableJournal {
         Ok(Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
             stream,
+            pty_mode,
             budget,
             counts: Arc::new(Counts::default()),
             _metadata: metadata,
@@ -175,6 +186,15 @@ impl ReliableJournal {
                 eof: false,
             }),
         }))
+    }
+    pub(crate) fn pty_mode(&self) -> bool {
+        self.pty_mode
+    }
+    pub(crate) fn drop_pty_unadmitted(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.partial = None;
+        state.pending = None;
+        state.next = state.next.saturating_add(1);
     }
     pub(crate) fn position(&self) -> (u64, u64) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -407,10 +427,13 @@ impl ReliableJournal {
                 .ok_or(ExtensionRefusal::ResourceLimit)?,
         )
     }
-    /// Only unattended data is disposable. Lifecycle records and ACK state remain authoritative.
+    /// In ReliablePipe mode, only unattended data is disposable. In Pty mode, interactive
+    /// output is unconditionally non-blocking and evicts oldest Line records even when
+    /// observers or subscribers hold active cursors; lifecycle records remain preserved.
     fn evict_oldest_data(&self, state: &mut State) -> bool {
-        if self.counts.cursors.load(Ordering::SeqCst) != 0
-            || self.counts.references.load(Ordering::SeqCst) != 0
+        if !self.pty_mode
+            && (self.counts.cursors.load(Ordering::SeqCst) != 0
+                || self.counts.references.load(Ordering::SeqCst) != 0)
         {
             return false;
         }
@@ -440,6 +463,14 @@ impl ReliableJournal {
         loop {
             match self.drain_once(state) {
                 Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(state) => continue,
+                Err(ExtensionRefusal::ResourceLimit)
+                    if self.pty_mode && (state.partial.is_some() || state.pending.is_some()) =>
+                {
+                    state.partial = None;
+                    state.pending = None;
+                    state.next = state.next.saturating_add(1);
+                    return Ok(());
+                }
                 result => return result,
             }
         }
@@ -623,7 +654,12 @@ impl ReplayCursor {
         &mut self,
         gap: fl_host_proto::ReliableGap,
     ) -> Result<(), ExtensionRefusal> {
-        if self.gap() != Some(gap) {
+        let current = self.gap();
+        if current != Some(gap)
+            && !(self.journal.pty_mode
+                && current
+                    .is_some_and(|c| c.from_seq == gap.from_seq && c.next_seq >= gap.next_seq))
+        {
             return Err(ExtensionRefusal::CursorExpired);
         }
         self.next = gap.next_seq;
@@ -1218,5 +1254,71 @@ mod tests {
             append(&j, line(&j, b"x")),
             Err(ExtensionRefusal::ResourceLimit)
         );
+    }
+    #[test]
+    fn pty_mode_never_blocks_with_stalled_cursor_and_reports_exact_gap() {
+        let j = ReliableJournal::new_with_mode(SliceBudget::new(), stream(), true).unwrap();
+        assert!(j.pty_mode());
+        let spawned = ControlEvent::Spawned {
+            session: stream().session,
+            session_epoch: stream().epoch,
+            child: fl_host_proto::HostedChild {
+                state: fl_host_proto::ChildState::Running(fl_host_proto::ChildRecord {
+                    session: stream().session,
+                    session_epoch: stream().epoch,
+                    kind: fl_host_proto::SpawnKind::Pty,
+                    pid: 42,
+                    input: fl_host_proto::InputState::Writable,
+                    started_at_ms: 1,
+                    exit: None,
+                    consumer_stalled: false,
+                }),
+            },
+            seq: 0,
+        };
+        assert_eq!(j.lifecycle(spawned).unwrap(), 1);
+        let (_, mut stalled) = begin_replay(&j, 0).unwrap();
+        let first = stalled.next().unwrap().unwrap();
+        assert_eq!(first.seq, 1);
+
+        // 1. Flood > MAX_DATA_RECORDS lines while `stalled` cursor is open and holding `first`.
+        for i in 0..10_000 {
+            let line = format!("line-{i}\n");
+            let mut buf = j
+                .prepare_read()
+                .expect("pty_mode never stalls on record count");
+            buf.as_mut_slice()[..line.len()].copy_from_slice(line.as_bytes());
+            buf.truncate(line.len());
+            j.accept_read(buf).unwrap();
+        }
+        assert!(j.live_data_records() <= MAX_DATA_RECORDS);
+        assert!(j.budget.used(ChargeKind::ReliableData) <= EPOCH_DATA);
+
+        // 2. Flood > 8 MiB of unterminated > 1 MiB output while `stalled` cursor remains open.
+        for _ in 0..2200 {
+            let mut buf = j
+                .prepare_read()
+                .expect("pty_mode never stalls on byte budget");
+            buf.as_mut_slice().fill(b'p');
+            j.accept_read(buf).unwrap();
+        }
+        let mut tail = j.prepare_read().unwrap();
+        tail.as_mut_slice()[..5].copy_from_slice(b"\ndone");
+        tail.truncate(5);
+        j.accept_read(tail).unwrap();
+
+        let gap = stalled.gap().expect("evicted data must produce gap");
+        assert_eq!(gap.from_seq, 2);
+        assert!(gap.next_seq > 10_000);
+        stalled.advance_gap(gap).unwrap();
+        let mut last = None;
+        while let Some(rec) = stalled.next().unwrap() {
+            last = Some(rec);
+        }
+        let last = last.expect("retained tail record");
+        assert!(matches!(
+            &last.body,
+            ReliableBody::Line(bytes) if !bytes.terminated && bytes.as_slice() == b"done"
+        ));
     }
 }

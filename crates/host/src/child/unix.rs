@@ -36,6 +36,8 @@ pub struct Supervised {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_supervised(
     bin: &Path,
+    kind: fl_host_proto::SpawnKind,
+    pty: Option<fl_host_proto::PtyOptions>,
     argv: Vec<String>,
     cwd: &Path,
     env: Vec<(String, String)>,
@@ -47,15 +49,19 @@ pub fn spawn_supervised(
     block_sigpipe();
     let (control_r, control_w) = pipe_cloexec()?;
     let (status_r, status_w) = pipe_cloexec()?;
-    let use_pty = env.iter().any(|(k, v)| k == "FL_HOST_PTY" && v == "1");
+    let use_pty = kind == fl_host_proto::SpawnKind::Pty
+        || env.iter().any(|(k, v)| k == "FL_HOST_PTY" && v == "1");
     let (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w) = if use_pty {
+        let pty_opts = pty.unwrap_or_default();
+        let ws_row = pty_opts.rows.max(1);
+        let ws_col = pty_opts.cols.max(1);
         let mut master_raw = -1;
         let mut slave_raw = -1;
         #[cfg(target_os = "macos")]
         let openpty_rc = {
             let mut winsize = libc::winsize {
-                ws_row: 40,
-                ws_col: 120,
+                ws_row,
+                ws_col,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
@@ -72,8 +78,8 @@ pub fn spawn_supervised(
         #[cfg(not(target_os = "macos"))]
         let openpty_rc = {
             let winsize = libc::winsize {
-                ws_row: 40,
-                ws_col: 120,
+                ws_row,
+                ws_col,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };

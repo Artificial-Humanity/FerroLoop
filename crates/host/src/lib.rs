@@ -520,7 +520,21 @@ impl Host {
         spec: &SpawnSpec,
         reliable: bool,
     ) -> Result<SessionHandle, HostError> {
-        Self::admit_spawn(this, || Self::spawn_admitted(this, spec, reliable))
+        let mode = if reliable {
+            fl_host_proto::SessionMode::ReliablePipe
+        } else {
+            fl_host_proto::SessionMode::LegacyPipe
+        };
+        Self::spawn_session_mode(this, spec, mode, None)
+    }
+
+    pub(crate) fn spawn_session_mode(
+        this: &Arc<HostInner>,
+        spec: &SpawnSpec,
+        mode: fl_host_proto::SessionMode,
+        pty: Option<fl_host_proto::PtyOptions>,
+    ) -> Result<SessionHandle, HostError> {
+        Self::admit_spawn(this, || Self::spawn_admitted(this, spec, mode, pty))
     }
 
     fn admit_spawn<T>(
@@ -540,11 +554,40 @@ impl Host {
     fn spawn_admitted(
         this: &Arc<HostInner>,
         spec: &SpawnSpec,
-        reliable: bool,
+        mode: fl_host_proto::SessionMode,
+        pty: Option<fl_host_proto::PtyOptions>,
     ) -> Result<SessionHandle, HostError> {
-        spec.validate()?;
-        if spec.kind == fl_host_proto::SpawnKind::Pty {
-            return Err(HostError::Unsupported { subject: "pty" });
+        spec.validate_fields()?;
+        match (mode, spec.kind, pty) {
+            (
+                fl_host_proto::SessionMode::LegacyPipe | fl_host_proto::SessionMode::ReliablePipe,
+                fl_host_proto::SpawnKind::Pipe,
+                None,
+            ) => {}
+            (
+                fl_host_proto::SessionMode::LegacyPipe | fl_host_proto::SessionMode::ReliablePipe,
+                fl_host_proto::SpawnKind::Pty,
+                _,
+            ) => {
+                return Err(HostError::Unsupported { subject: "pty" });
+            }
+            (fl_host_proto::SessionMode::Pty, fl_host_proto::SpawnKind::Pty, _) => {
+                #[cfg(not(unix))]
+                {
+                    return Err(HostError::Unsupported { subject: "pty" });
+                }
+                #[cfg(unix)]
+                if let Some(opts) = pty
+                    && (opts.cols == 0 || opts.rows == 0)
+                {
+                    return Err(HostError::Protocol("invalid pty dimensions".into()));
+                }
+            }
+            _ => {
+                return Err(HostError::Protocol(
+                    "contradictory session mode/options".into(),
+                ));
+            }
         }
         let _ = this.endpoint.pipe_name();
         #[cfg(target_os = "linux")]
@@ -611,14 +654,14 @@ impl Host {
             }
             registry.alloc_epoch()?
         };
-        let admission = if reliable {
+        let admission = if mode != fl_host_proto::SessionMode::LegacyPipe {
             let stream = fl_host_proto::StreamId {
                 host: this.authority.instance().clone(),
                 session: spec.session.clone(),
                 epoch: fl_host_proto::SessionEpoch(epoch),
             };
             let journal = this
-                .reserve_reliable_journal(stream)
+                .reserve_reliable_journal_with_mode(stream, mode == fl_host_proto::SessionMode::Pty)
                 .map_err(|_| HostError::Protocol("reliable capacity".into()))?;
             Some(
                 this.authority
@@ -630,15 +673,16 @@ impl Host {
         };
         #[cfg(unix)]
         {
-            Self::spawn_unix(this, spec, env, epoch, admission)
+            Self::spawn_unix(this, spec, pty, env, epoch, admission)
         }
         #[cfg(windows)]
         {
+            let _ = pty;
             Self::spawn_windows(this, spec, env, epoch, admission)
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (this, spec, env, epoch);
+            let _ = (this, spec, pty, env, epoch);
             Err(HostError::Unsupported { subject: "spawn" })
         }
     }
@@ -647,6 +691,7 @@ impl Host {
     fn spawn_unix(
         this: &Arc<HostInner>,
         spec: &SpawnSpec,
+        pty: Option<fl_host_proto::PtyOptions>,
         env: Vec<(String, String)>,
         epoch: u64,
         admission: Option<authority::PreparedEpoch>,
@@ -661,6 +706,8 @@ impl Host {
         let fail_after_publish = host.fail_handshake_after_publish;
         let supervised = child::unix::spawn_supervised(
             &host.supervisor_bin,
+            spec.kind,
+            pty,
             spec.argv.clone(),
             &spec.cwd,
             env,
@@ -867,11 +914,24 @@ impl Host {
 }
 
 impl HostInner {
+    #[cfg(test)]
     fn reserve_reliable_journal(
         &self,
         stream: fl_host_proto::StreamId,
     ) -> Result<Arc<reliable::ReliableJournal>, fl_host_proto::ExtensionRefusal> {
-        reliable::ReliableJournal::new(Arc::clone(&self.reliable_budget), stream)
+        self.reserve_reliable_journal_with_mode(stream, false)
+    }
+
+    fn reserve_reliable_journal_with_mode(
+        &self,
+        stream: fl_host_proto::StreamId,
+        pty_mode: bool,
+    ) -> Result<Arc<reliable::ReliableJournal>, fl_host_proto::ExtensionRefusal> {
+        reliable::ReliableJournal::new_with_mode(
+            Arc::clone(&self.reliable_budget),
+            stream,
+            pty_mode,
+        )
     }
 
     fn reap_threads(&self) {

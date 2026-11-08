@@ -650,8 +650,6 @@ impl SessionRuntime for HostRuntime {
                 env_map.insert(k.clone(), v.clone());
             }
         }
-        env_allow.insert("FL_HOST_PTY".to_string());
-        env_map.insert("FL_HOST_PTY".to_string(), "1".to_string());
         // Interactive CLIs pick their color depth from these; a launch spec's own value wins.
         for (key, default) in [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")] {
             env_allow.insert(key.to_string());
@@ -663,7 +661,29 @@ impl SessionRuntime for HostRuntime {
             env_allow.insert("FL_HOSTED_ID".to_string());
             env_map.insert("FL_HOSTED_ID".to_string(), hosted_id.to_string());
         }
-        let spec = fl_host_proto::SpawnSpec {
+        let use_pty_mode = cfg!(unix)
+            && std::env::var_os("FL_HOST_DISABLE_PTY_MODE")
+                .is_none_or(|v| v != "1" && !v.eq_ignore_ascii_case("true"));
+        if use_pty_mode {
+            let pty_spec = fl_host_proto::SpawnSpec {
+                session: session_id.clone(),
+                kind: fl_host_proto::SpawnKind::Pty,
+                argv: argv.clone(),
+                cwd: cwd_path.clone(),
+                env: env_map.clone(),
+                env_allow: env_allow.clone(),
+            };
+            match client.spawn_pty_session(pty_spec, None) {
+                Ok(_) => return true,
+                Err(err)
+                    if matches!(err, fl_host_proto::HostError::Unsupported { .. })
+                        || err.to_string().contains("Unsupported") => {}
+                Err(_) => return false,
+            }
+        }
+        env_allow.insert("FL_HOST_PTY".to_string());
+        env_map.insert("FL_HOST_PTY".to_string(), "1".to_string());
+        let pipe_spec = fl_host_proto::SpawnSpec {
             session: session_id,
             kind: fl_host_proto::SpawnKind::Pipe,
             argv,
@@ -671,7 +691,7 @@ impl SessionRuntime for HostRuntime {
             env: env_map,
             env_allow,
         };
-        client.spawn_reliable_session(spec).is_ok()
+        client.spawn_reliable_session(pipe_spec).is_ok()
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
