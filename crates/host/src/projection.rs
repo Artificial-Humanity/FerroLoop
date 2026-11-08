@@ -89,7 +89,8 @@ impl Projection {
         if bytes.is_empty() {
             return;
         }
-        self.filter.process(&mut self.parser, bytes);
+        self.filter
+            .process(bytes, |chunk| self.parser.process(chunk));
         self.generation = self.generation.saturating_add(1);
         self.output_bytes = self.output_bytes.saturating_add(bytes.len() as u64);
     }
@@ -160,6 +161,7 @@ impl Projection {
 /// continuations (including inside discarded strings).
 #[derive(Default)]
 struct StringFilter {
+    // Tracks downstream Escape; the ESC itself has already been emitted.
     escape: bool,
     string: Option<bool>, // true for OSC, which also terminates at BEL
     string_escape: bool,
@@ -193,12 +195,12 @@ impl StringFilter {
         };
         false
     }
-    fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
+    fn process(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
         let mut output = [0u8; 4096];
         let mut len = 0;
         for &byte in bytes {
-            if len + 2 > output.len() {
-                parser.process(&output[..len]);
+            if len == output.len() {
+                emit(&output[..len]);
                 len = 0;
             }
             let continuation = self.continuation(byte);
@@ -216,8 +218,8 @@ impl StringFilter {
                 continue;
             }
             if self.escape {
-                self.escape = false;
                 if matches!(byte, b']' | b'P' | b'X' | b'^' | b'_') {
+                    self.escape = false;
                     self.string = Some(byte == b']');
                     self.string_escape = false;
                     // Cancel any partial CSI/ESC in the downstream parser.
@@ -225,22 +227,26 @@ impl StringFilter {
                     len += 1;
                     continue;
                 }
-                output[len] = 0x1b;
-                len += 1;
+                // Match pinned vte 0.15 advance_esc: executable C0 controls,
+                // repeated ESC, DEL and high bytes retain Escape. CAN/SUB
+                // cancel it; intermediates and printable bytes leave it.
+                self.escape = !matches!(byte, 0x18 | 0x1a | 0x20..=0x7e);
             }
             if !continuation && matches!(byte, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f) {
+                self.escape = false;
                 self.string = Some(byte == 0x9d);
                 self.string_escape = false;
                 output[len] = 0x18;
                 len += 1;
-            } else if byte == 0x1b {
-                self.escape = true;
             } else {
+                if byte == 0x1b {
+                    self.escape = true;
+                }
                 output[len] = byte;
                 len += 1;
             }
         }
-        parser.process(&output[..len]);
+        emit(&output[..len]);
     }
 }
 
@@ -299,6 +305,89 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn interleaved_string_introducers_never_reach_parser_across_splits() {
+        // These bytes leave pinned vte 0.15 in Escape. Standalone C1 string
+        // introducers are covered separately: they start a filtered string.
+        for ignored in (0x00..=0x17)
+            .chain([0x19, 0x1b])
+            .chain(0x1c..=0x1f)
+            .chain(0x7f..=0xff)
+            .filter(|b| !matches!(b, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f))
+        {
+            for introducer in *b"]PX^_" {
+                let mut input = vec![0x1b, ignored, introducer];
+                input.extend_from_slice(b"hidden\x1b\\visible");
+                for split in 0..=input.len() {
+                    let mut filter = StringFilter::default();
+                    let mut sanitized = Vec::new();
+                    filter.process(&input[..split], |chunk| sanitized.extend_from_slice(chunk));
+                    filter.process(&input[split..], |chunk| sanitized.extend_from_slice(chunk));
+                    assert!(
+                        !sanitized.contains(&introducer),
+                        "string introducer reached parser: {input:?}, split {split}: {sanitized:?}"
+                    );
+                    assert!(sanitized.ends_with(b"visible"));
+                    assert!(!sanitized.windows(6).any(|bytes| bytes == b"hidden"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_osc_flood_never_reaches_parser() {
+        for (prefix, expected) in [
+            (b"\x1b\0]".as_slice(), "safe visible"),
+            (b"\x1b\x7f]", "safe visible"),
+            (b"\x1b\xff]", "safe visible"),
+            // The interleaved tab still executes, advancing to column eight.
+            (b"\x1b\0\x1b\t\x7f\xc3\x9c]", "safe     visible"),
+        ] {
+            let mut filter = StringFilter::default();
+            let mut p = projection();
+            p.process(b"safe");
+            // Inspect the actual parser input, not SliceBudget counters: an
+            // admitted OSC payload would allocate in vte outside that budget.
+            for byte in prefix {
+                filter.process(std::slice::from_ref(byte), |chunk| {
+                    assert!(!chunk.contains(&b']'), "OSC admitted for {prefix:?}");
+                    p.parser.process(chunk);
+                });
+            }
+            let payload = [b'x'; 4096];
+            for _ in 0..2300 {
+                filter.process(&payload, |chunk| {
+                    assert!(chunk.is_empty(), "OSC payload reached parser");
+                    p.parser.process(chunk);
+                });
+            }
+            filter.process(b"\x07 visible", |chunk| p.parser.process(chunk));
+            assert_eq!(p.snapshot().unwrap().contents, expected);
+        }
+    }
+
+    #[test]
+    fn escape_controls_cancellation_and_intermediates_are_preserved() {
+        for input in [
+            b"a\x1b\t\x08\r\n[2Cb".as_slice(),
+            b"\x1b\0\x7f[?1049halt\x1b[?1049l",
+            b"\x1b\x18]visible",
+            b"\x1b\x1a]visible",
+            b"\x1b(]visible",
+            b"\x1b\xff[2Cvisible",
+            "café ÜÝÞß".as_bytes(),
+        ] {
+            let mut filter = StringFilter::default();
+            let mut sanitized = Vec::new();
+            for byte in input {
+                filter.process(std::slice::from_ref(byte), |chunk| {
+                    sanitized.extend_from_slice(chunk)
+                });
+            }
+            assert_eq!(sanitized, input);
+        }
+    }
+
     #[test]
     fn unterminated_strings_remain_bounded_and_recover() {
         let budget = SliceBudget::new();
