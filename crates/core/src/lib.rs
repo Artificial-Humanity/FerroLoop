@@ -54,6 +54,7 @@ pub mod tiered;
 pub mod token_count;
 pub mod ui_bundle;
 pub mod vendor;
+pub mod vendor_adapter;
 pub mod verdict;
 pub mod wire_delivery;
 pub use wire_delivery::WireDeliveryStore;
@@ -218,6 +219,13 @@ pub use token_count::{CountUnit, count_unit, counted_tokens};
 pub use vendor::{
     ApiDialect, VendorDescriptor, VendorError, VendorRegistry, VendorTransport,
     ensure_vendor_registered, lookup_vendor, register_vendor, validate_api_base_url,
+};
+pub use vendor_adapter::{
+    AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
+    ConfigEffectiveScope, NormalizedSessionTurn, RuntimePort, TeardownOutcome, TeardownTarget,
+    TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError,
+    VendorConfigSpec, VendorHostAdapter, VendorHostAdapterRegistry, VendorLaunchPlan,
+    VendorLaunchRequest, VendorStartupPromptRule,
 };
 pub use verdict::{FailReason, Population, Verdict};
 pub use workflow::{

@@ -614,6 +614,20 @@ fn install_manifest_matches_the_code() {
         problems.join("\n")
     );
 
+    let scan = fl_hub::discovery::scan_workspace_for_arch(&repo).unwrap();
+    let pkg_problems = fl_core::install::check_package_dependency_isolation(&scan.package_deps);
+    assert!(
+        pkg_problems.is_empty(),
+        "forbidden package dependency on fl-vendor-adapters:\n{}",
+        pkg_problems.join("\n")
+    );
+    let mod_problems = fl_core::install::check_legacy_vendor_module_allowlist(&scan.repo_files);
+    assert!(
+        mod_problems.is_empty(),
+        "unallowed legacy vendor module in hub/wire/host:\n{}",
+        mod_problems.join("\n")
+    );
+
     // compat data is the range `fl --version --json` reports, read from the same constants
     let formats = fl_store::formats::store_formats();
     assert_eq!(
