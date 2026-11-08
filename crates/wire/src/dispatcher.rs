@@ -2559,11 +2559,14 @@ fn read_claude_key(
     socket_path: &Path,
     key_path: Option<&Path>,
 ) -> Result<(PathBuf, serde_json::Value), String> {
-    let resolved_key = key_path.map(Path::to_path_buf).or_else(|| {
-        std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
-            resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, socket_path)
-        })
-    });
+    let resolved_key = key_path
+        .filter(|p| p.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+                resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, socket_path)
+            })
+        });
     let Some(kpath) = resolved_key else {
         return Err(format!(
             "missing claude session key file for pid {pid} ({})",
@@ -2625,9 +2628,10 @@ pub fn dispatch_operator_prompt_to_route(
                             .filter(|id| resolve_live_host_session(id).is_some())
                             .or_else(|| (*pid != 0).then(|| tmux_pane_for_pid(*pid)).flatten());
                         if let Some(target) = host_target {
-                            return deliver_via_tmux_paste(
+                            return deliver_via_tmux_paste_opts(
                                 &target,
-                                &prefixed_operator_body(sender_name, body),
+                                &sanitize_for_paste(&prefixed_operator_body(sender_name, body)),
+                                true,
                             );
                         }
                     }
@@ -2646,7 +2650,11 @@ pub fn dispatch_operator_prompt_to_route(
                     || Some(key_json.clone()),
                 )
             {
-                return deliver_via_tmux_paste(&pane, &prefixed_operator_body(sender_name, body));
+                return deliver_via_tmux_paste_opts(
+                    &pane,
+                    &sanitize_for_paste(&prefixed_operator_body(sender_name, body)),
+                    true,
+                );
             }
             let peer_token = key_json
                 .get("peerToken")
@@ -7684,5 +7692,55 @@ exit 1"#,
         );
 
         drop(server_thread);
+    }
+
+    #[test]
+    fn read_claude_key_ignores_missing_key_path_and_falls_back_to_sessions_dir() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sessions_dir = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let sock_path = sessions_dir.join("7777.sock");
+        fs::write(&sock_path, "").unwrap();
+        let fallback_key = sessions_dir.join("7777.fallback.key");
+        fs::write(&fallback_key, r#"{"peerToken":"fallback-secret"}"#).unwrap();
+
+        let stale_key = home.join("deleted.key");
+        let _home_env = EnvGuard::set("HOME", home);
+
+        let (resolved_path, json) =
+            read_claude_key(7777, &sock_path, Some(&stale_key)).expect("fallback key resolved");
+        assert_eq!(resolved_path, fallback_key);
+        assert_eq!(json["peerToken"], "fallback-secret");
+    }
+
+    #[test]
+    fn claude_owner_prompt_uses_bracketed_paste_for_multiline_body() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        dispatch_operator_prompt_to_route(
+            &route,
+            "owner",
+            "First paragraph\n\nSecond paragraph\x1b[201~",
+        )
+        .unwrap();
+
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("paste-buffer -d -b"), "{cmds}");
+        assert!(
+            cmds.contains(" -p "),
+            "multiline operator prompt must use bracketed paste (-p): {cmds}"
+        );
+        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+        assert_eq!(
+            pasted.trim(),
+            "[Operator Prompt via FerroDeck — from owner]\n\nFirst paragraph\n\nSecond paragraph[201~"
+        );
+        assert!(socket_frames(&listener).is_none());
     }
 }

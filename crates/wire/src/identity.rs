@@ -369,6 +369,29 @@ pub fn legacy_routes_path() -> Option<PathBuf> {
 fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &VendorRoute) {
     match (target_route, fallback_route) {
         (
+            VendorRoute::Claude {
+                pid: dst_pid,
+                session_id: dst_sid,
+                key_path: dst_key,
+                ..
+            },
+            VendorRoute::Claude {
+                pid: src_pid,
+                session_id: src_sid,
+                key_path: src_key,
+                ..
+            },
+        ) if *dst_pid == *src_pid || *dst_pid == 0 || *src_pid == 0 => {
+            if dst_sid.trim().is_empty() && !src_sid.trim().is_empty() {
+                *dst_sid = src_sid.clone();
+            }
+            if dst_key.as_ref().is_none_or(|p| !p.is_file())
+                && src_key.as_ref().is_some_and(|p| p.is_file())
+            {
+                *dst_key = src_key.clone();
+            }
+        }
+        (
             VendorRoute::Agy {
                 ls_pid: dst_pid,
                 ls_address: dst_addr,
@@ -3241,8 +3264,20 @@ fn capture_env_route_from(
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(std::process::id);
-        let session_id = get_str("CLAUDE_SESSION_ID").unwrap_or_default();
-        let key_path = get_env("HOME").map(PathBuf::from).and_then(|h| {
+        let home = get_env("HOME").map(PathBuf::from);
+        let session_id = set("CLAUDE_SESSION_ID")
+            .or_else(|| {
+                let sessions_dir = home.as_ref()?.join(".claude").join("sessions");
+                let raw = fs::read_to_string(sessions_dir.join(format!("{pid}.json"))).ok()?;
+                let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+                val.get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let key_path = home.and_then(|h| {
             resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path)
         });
         return Some(VendorRoute::Claude {
@@ -7955,5 +7990,90 @@ mod tests {
             load_retired_personas(Some(&home)),
             BTreeSet::from(["ada".to_string()])
         );
+    }
+
+    #[test]
+    fn capture_env_route_reads_claude_session_id_from_pid_json_and_upsert_preserves_it() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sessions_dir = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let sock_path = sessions_dir.join("4242.sock");
+        fs::write(&sock_path, "").unwrap();
+        let key_file = sessions_dir.join("4242.abc.key");
+        fs::write(&key_file, r#"{"peerToken":"tok-4242"}"#).unwrap();
+        fs::write(
+            sessions_dir.join("4242.json"),
+            serde_json::json!({
+                "pid": 4242,
+                "sessionId": "claude-native-session-uuid",
+                "messagingSocketPath": sock_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let home_str = home.to_str().unwrap();
+        let sock_str = sock_path.to_str().unwrap();
+        for env_sid in [None, Some(""), Some("   ")] {
+            let mut pairs = vec![
+                ("HOME", home_str),
+                ("CLAUDE_CODE_MESSAGING_SOCKET", sock_str),
+            ];
+            if let Some(s) = env_sid {
+                pairs.push(("CLAUDE_SESSION_ID", s));
+            }
+            let route = capture_env_route_from(&env_of(&pairs)).expect("claude route");
+            match route {
+                VendorRoute::Claude {
+                    pid,
+                    session_id,
+                    key_path,
+                    ..
+                } => {
+                    assert_eq!(pid, 4242);
+                    assert_eq!(session_id, "claude-native-session-uuid");
+                    assert_eq!(key_path.as_deref(), Some(key_file.as_path()));
+                }
+                other => panic!("expected Claude route, got {other:?}"),
+            }
+        }
+
+        // Upserting a Claude route with an empty session_id or missing key_path preserves the
+        // existing non-empty session_id and valid key_path for the same PID.
+        let mut table = RouteTable::default();
+        table.upsert_explicit(
+            "sonya",
+            VendorRoute::Claude {
+                pid: 4242,
+                session_id: "claude-native-session-uuid".into(),
+                socket_path: sock_path.clone(),
+                key_path: Some(key_file.clone()),
+            },
+            At::from_unix_millis(100),
+        );
+        table.upsert_explicit(
+            "sonya",
+            VendorRoute::Claude {
+                pid: 4242,
+                session_id: String::new(),
+                socket_path: sock_path,
+                key_path: None,
+            },
+            At::from_unix_millis(200),
+        );
+        match &table.get("sonya").expect("sonya route").route {
+            VendorRoute::Claude {
+                pid,
+                session_id,
+                key_path,
+                ..
+            } => {
+                assert_eq!(*pid, 4242);
+                assert_eq!(session_id, "claude-native-session-uuid");
+                assert_eq!(key_path.as_deref(), Some(key_file.as_path()));
+            }
+            other => panic!("expected Claude route, got {other:?}"),
+        }
     }
 }
