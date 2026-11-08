@@ -3816,7 +3816,7 @@ fn host_build_identity_is_opt_in() {
     );
     let expected = fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE;
     #[cfg(unix)]
-    let expected = expected | fl_host_proto::PTY_FEATURE;
+    let expected = expected | fl_host_proto::PTY_FEATURE | fl_host_proto::RENDERED_PTY_FEATURE;
     assert_eq!(features, expected);
     let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
     let status = serde_json::to_value(extended(&mut rpc, request)).unwrap();
@@ -4141,4 +4141,475 @@ fn safety_flood_legacy_held_subscriber_preserves_control_and_cleanup() {
     }
     release(&daemon.paths.subscriber, "before-send-1");
     drop(events);
+}
+
+#[cfg(unix)]
+fn rendered_spawn(rpc: &mut Rpc, name: &str) -> StreamId {
+    let mut child = spec(name, &[]);
+    child.kind = SpawnKind::Pty;
+    child.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r"stty -echo; printf '\033[2J\033[Hready'; while read line; do stty size; done".into(),
+    ];
+    match extended(
+        rpc,
+        XReq::SpawnSession {
+            spec: child,
+            mode: Mode::Pty,
+            pty: None,
+        },
+    ) {
+        XResp::Session { stream, .. } => stream,
+        other => panic!("PTY spawn {other:?}"),
+    }
+}
+
+// Catches missing opt-in host support, name-based identity fallback and ioctl/parser divergence.
+#[cfg(unix)]
+#[test]
+fn rendered_capture_resize_identity_and_kernel_geometry() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut rpc, "rendered");
+    let lease = controller(&mut rpc, &stream);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let initial = loop {
+        let screen = rpc
+            .inner
+            .capture_rendered(stream.clone())
+            .expect("rendered capability and capture");
+        if screen.contents == "ready" {
+            break screen;
+        }
+        assert!(Instant::now() < deadline, "screen: {screen:?}");
+        thread::yield_now();
+    };
+    assert_eq!(
+        (
+            initial.schema,
+            initial.rows,
+            initial.cols,
+            initial.cursor_row,
+            initial.cursor_col
+        ),
+        (1, 40, 120, 0, 5)
+    );
+    assert_eq!(initial.stream, stream);
+    assert!(initial.output_bytes >= 12);
+    let generation = rpc
+        .inner
+        .resize_session(stream.clone(), lease, 160, 50)
+        .unwrap();
+    let resized = rpc.inner.capture_rendered(stream.clone()).unwrap();
+    assert_eq!(
+        (resized.rows, resized.cols, resized.generation),
+        (50, 160, generation)
+    );
+    assert!(generation > initial.generation);
+    assert_eq!(
+        (resized.output_bytes, resized.output_seq),
+        (initial.output_bytes, initial.output_seq)
+    );
+    assert!(
+        rpc.inner
+            .resize_session(stream.clone(), lease, 0, 50)
+            .is_err()
+    );
+    assert_eq!(rpc.inner.capture_rendered(stream.clone()).unwrap(), resized);
+    rpc.inner
+        .write_raw(stream.clone(), lease, b"size\n".to_vec())
+        .unwrap();
+    loop {
+        let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        if screen.contents.contains("50 160") {
+            assert!(screen.generation > generation);
+            assert!(screen.output_bytes > resized.output_bytes);
+            assert!(screen.output_seq >= resized.output_seq);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kernel size not observed: {screen:?}"
+        );
+        thread::yield_now();
+    }
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut wrong = stream.clone();
+    wrong.host = fl_host_proto::HostInstance::new([99; 16]);
+    assert_eq!(
+        extended(&mut rpc, XReq::CaptureRendered { stream: wrong }),
+        XResp::Refused {
+            code: Refuse::WrongInstance
+        }
+    );
+    let mut wrong = stream.clone();
+    wrong.epoch.0 += 1;
+    assert_eq!(
+        extended(&mut rpc, XReq::CaptureRendered { stream: wrong }),
+        XResp::Refused {
+            code: Refuse::StaleEpoch
+        }
+    );
+    let pipe = reliable_spawn(&mut rpc, "rendered-pipe", &["echo"]);
+    let pipe_lease = controller(&mut rpc, &pipe);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::CaptureRendered {
+                stream: pipe.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::WrongMode
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::Resize {
+                stream: pipe,
+                lease: pipe_lease,
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::WrongMode
+        }
+    );
+    assert!(
+        rpc.inner
+            .extension_request(XReq::Attach {
+                stream,
+                resume: None
+            })
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+fn rendered_screen(rpc: &mut Rpc, stream: &StreamId) -> fl_host_proto::RenderedScreen {
+    match extended(
+        rpc,
+        XReq::CaptureRendered {
+            stream: stream.clone(),
+        },
+    ) {
+        XResp::RenderedCapture { screen } => screen,
+        other => panic!("snapshot {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn rendered_ready(rpc: &mut Rpc, stream: &StreamId) -> fl_host_proto::RenderedScreen {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = rendered_screen(rpc, stream);
+        if screen.contents == "ready" {
+            return screen;
+        }
+        assert!(Instant::now() < deadline, "not ready: {screen:?}");
+        thread::yield_now();
+    }
+}
+
+// Catches checking only the writer lease while a takeover has invalidated actual authority.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_takeover_before_claim_enqueue_refuses_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut owner, "resize-takeover");
+    let lease = controller(&mut owner, &stream);
+    let before = rendered_ready(&mut owner, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    arm(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    let mut claimant = Rpc::connect(&daemon.paths.endpoint);
+    claimant.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::ClaimController {
+            stream: stream.clone(),
+        },
+    });
+    wait_at(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    release(&daemon.paths.barrier, "before-resize");
+    assert!(matches!(
+        owner.pull(),
+        HostResponse::Extended {
+            response: XResp::Refused {
+                code: Refuse::StaleLease
+            },
+            ..
+        }
+    ));
+    let mut observer = Rpc::connect(&daemon.paths.endpoint);
+    assert_eq!(rendered_screen(&mut observer, &stream), before);
+    release(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    assert!(matches!(
+        claimant.pull(),
+        HostResponse::Extended {
+            response: XResp::Controller { .. },
+            ..
+        }
+    ));
+}
+
+// Catches stale queued mutation after RPC disconnect, even before writer revocation settles.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_disconnect_refuses_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut owner, "resize-disconnect");
+    let lease = controller(&mut owner, &stream);
+    let before = rendered_ready(&mut owner, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    drop(owner);
+    wait_file(&daemon.paths.barrier.join("revoked"), |b| !b.is_empty());
+    release(&daemon.paths.barrier, "before-resize");
+    let mut observer = Rpc::connect(&daemon.paths.endpoint);
+    let fresh = controller(&mut observer, &stream); // worker passed the old job before this fence completes
+    assert_eq!(rendered_screen(&mut observer, &stream), before);
+    assert!(matches!(
+        extended(
+            &mut observer,
+            XReq::Resize {
+                stream: stream.clone(),
+                lease: fresh,
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Resized {
+            cols: 80,
+            rows: 24,
+            ..
+        }
+    ));
+    let after = rendered_screen(&mut observer, &stream);
+    assert_eq!(
+        (after.rows, after.cols, after.generation),
+        (24, 80, before.generation + 1)
+    );
+}
+
+// Catches selecting the replacement by name for an old epoch's capture or resize.
+#[cfg(unix)]
+#[test]
+fn rendered_old_epoch_never_selects_respawned_session() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let old = rendered_spawn(&mut rpc, "rendered-respawn");
+    let lease = controller(&mut rpc, &old);
+    let before = rendered_ready(&mut rpc, &old);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::KillSession {
+                stream: old.clone(),
+                lease
+            }
+        ),
+        XResp::Controlled
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let XResp::Sessions { records } = extended(&mut rpc, XReq::ListSessions) else {
+            panic!("list")
+        };
+        if records
+            .iter()
+            .any(|r| r.stream == old && matches!(r.state, ChildState::CleanupComplete(_)))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let new = rendered_spawn(&mut rpc, "rendered-respawn");
+    assert_ne!(old.epoch, new.epoch);
+    assert_eq!(rendered_ready(&mut rpc, &new).stream, new);
+    let historical = rendered_screen(&mut rpc, &old);
+    assert_eq!(historical.stream, old);
+    assert_eq!(
+        (historical.rows, historical.cols),
+        (before.rows, before.cols)
+    );
+    assert!(matches!(
+        extended(
+            &mut rpc,
+            XReq::Resize {
+                stream: old,
+                lease,
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::SessionFenced
+        }
+    ));
+    assert_eq!(
+        (
+            rendered_screen(&mut rpc, &new).rows,
+            rendered_screen(&mut rpc, &new).cols
+        ),
+        (40, 120)
+    );
+}
+
+// Catches deadline renewal while a queued resize waits for execution.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_held_past_deadline_refuses_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut rpc, "resize-deadline");
+    let lease = controller(&mut rpc, &stream);
+    let before = rendered_ready(&mut rpc, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    assert!(matches!(
+        rpc.pull(),
+        HostResponse::Extended {
+            response: XResp::Refused { code: Refuse::Busy },
+            ..
+        }
+    ));
+    release(&daemon.paths.barrier, "before-resize");
+    assert_eq!(rendered_screen(&mut rpc, &stream), before);
+}
+
+// Catches reordering of queued geometry changes or returning a later generation.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_queue_preserves_geometry_and_generation_order() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut rpc, "resize-order");
+    let lease = controller(&mut rpc, &stream);
+    let before = rendered_ready(&mut rpc, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    let first = rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    let second = rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 80,
+            rows: 24,
+        },
+    });
+    wait_file(&daemon.paths.barrier.join("queued-resize-80-24"), |b| {
+        !b.is_empty()
+    });
+    release(&daemon.paths.barrier, "before-resize");
+    let mut revisions = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let HostResponse::Extended {
+            id,
+            response:
+                XResp::Resized {
+                    cols,
+                    rows,
+                    projection_revision,
+                },
+        } = rpc.pull()
+        else {
+            panic!("resize")
+        };
+        revisions.insert(id.0, (cols, rows, projection_revision));
+    }
+    assert_eq!(revisions[&first.0], (160, 50, before.generation + 1));
+    assert_eq!(revisions[&second.0], (80, 24, before.generation + 2));
+    let after = rendered_screen(&mut rpc, &stream);
+    assert_eq!(
+        (after.cols, after.rows, after.generation),
+        (80, 24, before.generation + 2)
+    );
+}
+
+// Native Windows coverage: valid new requests explicitly refuse without advertising bit 8.
+#[cfg(not(unix))]
+#[test]
+fn rendered_capture_and_resize_are_unsupported_without_unix_backend() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let XResp::Capabilities { features, .. } = extended(&mut rpc, XReq::Capabilities) else {
+        panic!("capabilities")
+    };
+    assert_eq!(features & fl_host_proto::RENDERED_PTY_FEATURE, 0);
+    let stream = reliable_spawn(&mut rpc, "unsupported-screen", &["echo"]);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::CaptureRendered {
+                stream: stream.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::Unsupported
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::Resize {
+                stream: stream.clone(),
+                lease: ControllerLease(1),
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::Unsupported
+        }
+    );
+    assert!(matches!(
+        rpc.inner.capture_rendered(stream.clone()),
+        Err(HostError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        rpc.inner.resize_session(stream, ControllerLease(1), 80, 24),
+        Err(HostError::Unsupported { .. })
+    ));
 }

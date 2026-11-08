@@ -10,12 +10,7 @@ use std::sync::Arc;
 /// one extra quote/backslash escape. 8192 * 23 + 4 * 128 escaped newline
 /// bytes + 4096 envelope bytes = 193024, below the 256 KiB frame limit.
 /// The response writer must still reserve and check its actual envelope.
-pub const MAX_RENDERED_TEXT: usize = 196_608;
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Rendered protocol fields are consumed in Task 2")
-)]
+pub use fl_host_proto::MAX_RENDERED_TEXT;
 pub(crate) struct ProjectionSnapshot {
     pub contents: String,
     pub cursor_row: u16,

@@ -97,11 +97,6 @@ impl Session {
         session.resize_master = master;
         session
     }
-
-    #[cfg_attr(
-        any(not(test), not(unix)),
-        expect(dead_code, reason = "Rendered protocol caller is added in Task 2")
-    )]
     pub(crate) fn capture_screen(
         &self,
     ) -> Result<crate::projection::ProjectionSnapshot, fl_host_proto::ExtensionRefusal> {
@@ -115,11 +110,6 @@ impl Session {
             .ok_or(fl_host_proto::ExtensionRefusal::WrongMode)?
             .snapshot()
     }
-
-    #[cfg_attr(
-        any(not(test), not(unix)),
-        expect(dead_code, reason = "Ordered control worker caller is added in Task 2")
-    )]
     pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> Result<u64, HostError> {
         #[cfg(unix)]
         {

@@ -1965,6 +1965,7 @@ mod deadline_tests {
                 &host.inner,
                 ConnId(71),
                 fl_host_proto::ExtensionRequest::ListSessions,
+                &mut None,
             ))
             .unwrap();
         let fl_host_proto::ExtensionResponse::Sessions { records } = rows else {

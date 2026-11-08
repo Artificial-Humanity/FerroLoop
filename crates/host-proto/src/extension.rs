@@ -1,5 +1,4 @@
-//! Opt-in minor-one messages and bounded reliable framing. PTY payload codecs
-//! remain unavailable until the separately reviewed snapshot-schema gate.
+//! Opt-in messages, bounded reliable framing, and rendered PTY snapshots.
 use std::fmt;
 
 use base64::Engine;
@@ -16,6 +15,8 @@ pub const RELIABLE_FEATURE: u64 = 1;
 pub const PTY_FEATURE: u64 = 2;
 /// Opt-in daemon build telemetry; does not change existing response shapes.
 pub const HOST_STATUS_FEATURE: u64 = 4;
+pub const RENDERED_PTY_FEATURE: u64 = 8;
+pub const MAX_RENDERED_TEXT: usize = 196_608;
 pub const MAX_BUILD_FIELD_BYTES: usize = 128;
 
 /// Identity compiled into the serving binary, never the querying client.
@@ -121,6 +122,70 @@ pub struct StreamId {
     pub host: HostInstance,
     pub session: SessionId,
     pub epoch: SessionEpoch,
+}
+/// One coherent screen and progress watermark. Cursor coordinates are zero based.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedScreen {
+    pub schema: u16,
+    pub stream: StreamId,
+    #[serde(deserialize_with = "bounded_rendered_text")]
+    pub contents: String,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub rows: u16,
+    pub cols: u16,
+    pub generation: u64,
+    pub output_seq: u64,
+    pub output_bytes: u64,
+}
+impl RenderedScreen {
+    pub fn validate(&self) -> Result<(), HostError> {
+        if self.schema != 1 {
+            return Err(HostError::Protocol("unsupported rendered schema".into()));
+        }
+        validate_pty_geometry(self.cols, self.rows)?;
+        if self.cursor_row >= self.rows || self.cursor_col >= self.cols {
+            return Err(HostError::Protocol("rendered cursor outside screen".into()));
+        }
+        if self.contents.len() > MAX_RENDERED_TEXT {
+            return Err(HostError::EventTooLarge);
+        }
+        // Escaping may expand an arbitrary submitted string sixfold. Bound
+        // the actual escaped length without allocating; reserve 4096 bytes for
+        // all metadata and the outer response (including u64 request id).
+        let escaped = self
+            .contents
+            .bytes()
+            .try_fold(0usize, |n, b| {
+                n.checked_add(match b {
+                    b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                    0..=31 => 6,
+                    _ => 1,
+                })
+            })
+            .ok_or(HostError::EventTooLarge)?;
+        if escaped > crate::MAX_FRAME_PAYLOAD - 4096 {
+            return Err(HostError::EventTooLarge);
+        }
+        Ok(())
+    }
+}
+fn bounded_rendered_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Visitor;
+    impl de::Visitor<'_> for Visitor {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX_RENDERED_TEXT} rendered bytes")
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            if value.len() > MAX_RENDERED_TEXT {
+                return Err(E::custom("rendered text too long"));
+            }
+            Ok(value.to_owned())
+        }
+    }
+    d.deserialize_str(Visitor)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -364,6 +429,9 @@ pub enum ExtensionRequest {
         session: SessionId,
         max_bytes: u32,
     },
+    CaptureRendered {
+        stream: StreamId,
+    },
     Resize {
         stream: StreamId,
         lease: ControllerLease,
@@ -407,7 +475,8 @@ impl ExtensionRequest {
             Self::CaptureOutput { max_bytes, .. } if *max_bytes as usize > MAX_RAW_INPUT => {
                 return Err(HostError::EventTooLarge);
             }
-            Self::Resize { .. } | Self::Attach { .. } => {
+            Self::Resize { cols, rows, .. } => validate_pty_geometry(*cols, *rows)?,
+            Self::Attach { .. } => {
                 return Err(HostError::Unsupported {
                     subject: "PTY backend/schema",
                 });
@@ -520,6 +589,9 @@ pub enum ExtensionResponse {
     CapturedOutput {
         text: String,
     },
+    RenderedCapture {
+        screen: RenderedScreen,
+    },
     Resized {
         cols: u16,
         rows: u16,
@@ -542,7 +614,9 @@ impl ExtensionResponse {
             Self::CapturedOutput { text } if text.len() > MAX_RAW_INPUT => {
                 Err(HostError::EventTooLarge)
             }
-            Self::Attachment { .. } | Self::Resized { .. } => Err(HostError::Unsupported {
+            Self::RenderedCapture { screen } => screen.validate(),
+            Self::Resized { cols, rows, .. } => validate_pty_geometry(*cols, *rows),
+            Self::Attachment { .. } => Err(HostError::Unsupported {
                 subject: "PTY backend/schema",
             }),
             _ => Ok(()),
@@ -845,6 +919,101 @@ impl ReliableReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Catches absent opt-in codecs, permissive snapshot fields and invalid geometry/schema.
+    #[test]
+    fn rendered_snapshot_roundtrip_is_strict_and_bounded() {
+        let stream = serde_json::json!({"host":"00000000000000000000000000000000","session":"screen","epoch":1});
+        let screen = serde_json::json!({"schema":1,"stream":stream,"contents":"hi\n世界","cursor_row":1,"cursor_col":2,"rows":40,"cols":120,"generation":7,"output_seq":3,"output_bytes":19});
+        let value = serde_json::json!({"op":"rendered_capture","screen":screen});
+        let response: ExtensionResponse =
+            serde_json::from_value(value.clone()).expect("rendered snapshot codec");
+        response.validate().unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), value);
+        for (field, invalid) in [
+            ("schema", serde_json::json!(2)),
+            ("rows", serde_json::json!(0)),
+            ("cols", serde_json::json!(257)),
+            ("cursor_row", serde_json::json!(40)),
+            ("cursor_col", serde_json::json!(120)),
+            ("contents", serde_json::json!("x".repeat(196609))),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut bad = value.clone();
+            bad["screen"][field] = invalid;
+            let decoded = serde_json::from_value::<ExtensionResponse>(bad);
+            assert!(
+                decoded.is_err() || decoded.unwrap().validate().is_err(),
+                "accepted {field}"
+            );
+        }
+        let capture = serde_json::json!({"op":"capture_rendered","stream":stream});
+        let request: ExtensionRequest = serde_json::from_value(capture.clone()).unwrap();
+        request.validate().unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), capture);
+        let resize: ExtensionRequest = serde_json::from_value(
+            serde_json::json!({"op":"resize","stream":stream,"lease":4,"cols":160,"rows":50}),
+        )
+        .unwrap();
+        resize.validate().expect("reserved resize is now enabled");
+        assert!(
+            ExtensionResponse::Resized {
+                cols: 160,
+                rows: 50,
+                projection_revision: 8
+            }
+            .validate()
+            .is_ok()
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionResponse::CapturedOutput { text: "raw".into() }).unwrap(),
+            serde_json::json!({"op":"captured_output","text":"raw"})
+        );
+    }
+    // Catches checking only unescaped text bytes, growing JSON above the wire
+    // ceiling, and silently truncating an oversized coherent snapshot.
+    #[test]
+    fn rendered_json_escaping_is_bounded_before_encoding_without_truncation() {
+        let mut screen = RenderedScreen {
+            schema: 1,
+            stream: StreamId {
+                host: HostInstance::new([0; 16]),
+                session: SessionId::new("screen").unwrap(),
+                epoch: SessionEpoch(1),
+            },
+            contents: "\\".repeat(128000),
+            cursor_row: 0,
+            cursor_col: 0,
+            rows: 32,
+            cols: 256,
+            generation: u64::MAX,
+            output_seq: u64::MAX,
+            output_bytes: u64::MAX,
+        };
+        let response = crate::HostResponse::Extended {
+            id: crate::RequestId(u64::MAX),
+            response: ExtensionResponse::RenderedCapture {
+                screen: screen.clone(),
+            },
+        };
+        let frame = crate::encode_response_for_minor(1, &response).unwrap();
+        assert_eq!(frame.payload.capacity(), 262144);
+        assert!(frame.payload.len() < 262144);
+        assert_eq!(
+            crate::decode_response_for_minor(1, &frame).unwrap(),
+            response
+        );
+        screen.contents = "\0".repeat(50000);
+        assert!(matches!(screen.validate(), Err(HostError::EventTooLarge)));
+        let response = crate::HostResponse::Extended {
+            id: crate::RequestId(1),
+            response: ExtensionResponse::RenderedCapture { screen },
+        };
+        assert!(matches!(
+            crate::encode_response_for_minor(1, &response),
+            Err(HostError::EventTooLarge)
+        ));
+    }
+
     fn part(terminated: bool, more: bool) -> ExtensionFrame {
         ExtensionFrame::ReliablePart {
             seq: 1,

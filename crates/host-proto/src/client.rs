@@ -453,6 +453,71 @@ impl AsyncHostClient {
         }
     }
 
+    async fn require_rendered_pty(&mut self) -> Result<(), HostError> {
+        if self.minor < 1 {
+            return Err(HostError::Unsupported {
+                subject: "rendered PTY",
+            });
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::Capabilities)
+            .await?
+        {
+            crate::ExtensionResponse::Capabilities { features, .. }
+                if features & crate::RENDERED_PTY_FEATURE != 0 =>
+            {
+                Ok(())
+            }
+            crate::ExtensionResponse::Capabilities { .. } => Err(HostError::Unsupported {
+                subject: "rendered PTY",
+            }),
+            _ => Err(HostError::Protocol("capabilities response required".into())),
+        }
+    }
+
+    pub async fn capture_rendered(
+        &mut self,
+        stream: crate::StreamId,
+    ) -> Result<crate::RenderedScreen, HostError> {
+        self.require_rendered_pty().await?;
+        match self
+            .extension_request(crate::ExtensionRequest::CaptureRendered { stream })
+            .await?
+        {
+            crate::ExtensionResponse::RenderedCapture { screen } => Ok(screen),
+            other => Err(HostError::Protocol(format!(
+                "capture_rendered refused: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn resize_session(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        cols: u16,
+        rows: u16,
+    ) -> Result<u64, HostError> {
+        self.require_rendered_pty().await?;
+        match self
+            .extension_request(crate::ExtensionRequest::Resize {
+                stream,
+                lease,
+                cols,
+                rows,
+            })
+            .await?
+        {
+            crate::ExtensionResponse::Resized {
+                projection_revision,
+                ..
+            } => Ok(projection_revision),
+            other => Err(HostError::Protocol(format!(
+                "resize_session refused: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn capture_output(
         &mut self,
         session: crate::SessionId,
@@ -654,6 +719,24 @@ impl BlockingHostClient {
     ) -> Result<(), HostError> {
         self.runtime
             .block_on(self.inner.kill_session(stream, lease))
+    }
+
+    pub fn capture_rendered(
+        &mut self,
+        stream: crate::StreamId,
+    ) -> Result<crate::RenderedScreen, HostError> {
+        self.runtime.block_on(self.inner.capture_rendered(stream))
+    }
+
+    pub fn resize_session(
+        &mut self,
+        stream: crate::StreamId,
+        lease: crate::ControllerLease,
+        cols: u16,
+        rows: u16,
+    ) -> Result<u64, HostError> {
+        self.runtime
+            .block_on(self.inner.resize_session(stream, lease, cols, rows))
     }
 
     pub fn capture_output(
@@ -898,6 +981,85 @@ mod tests {
         let (mut events, server) = memory_stream();
         events.client.mode = SessionMode::Rpc;
         (events.client, server)
+    }
+
+    // Catches sending new operations to an old daemon, including minor-zero peers.
+    #[tokio::test]
+    async fn old_daemon_receives_no_rendered_or_resize_request_without_capability() {
+        for minor in [0, 1] {
+            let (mut client, mut server) = memory_rpc();
+            client.minor = minor;
+            let stream = crate::StreamId {
+                host: crate::HostInstance::new([0; 16]),
+                session: crate::SessionId::new("old").unwrap(),
+                epoch: crate::SessionEpoch(1),
+            };
+            let caller = async {
+                assert!(matches!(
+                    client.capture_rendered(stream.clone()).await,
+                    Err(HostError::Unsupported { .. })
+                ));
+                assert!(matches!(
+                    client
+                        .resize_session(stream, crate::ControllerLease(1), 80, 24)
+                        .await,
+                    Err(HostError::Unsupported { .. })
+                ));
+                // A following legacy request is a deterministic sentinel. Unknown
+                // requests cannot be silently left unread in the mock socket.
+                let id = if minor == 0 { 1 } else { 3 };
+                assert!(matches!(
+                    client.request(list(id)).await.unwrap(),
+                    HostResponse::Listed { .. }
+                ));
+            };
+            let daemon = async {
+                for index in 0..if minor == 0 { 1 } else { 3 } {
+                    let frame = auth::read_frame_async(
+                        &mut server,
+                        Instant::now() + Duration::from_secs(2),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    let request = crate::decode_request_for_minor(minor, &frame).unwrap();
+                    let response = if minor == 1 && index < 2 {
+                        let HostRequest::Extended {
+                            id,
+                            request: crate::ExtensionRequest::Capabilities,
+                        } = request
+                        else {
+                            panic!("unknown request reached old daemon: {request:?}")
+                        };
+                        HostResponse::Extended {
+                            id,
+                            response: crate::ExtensionResponse::Capabilities {
+                                host: crate::HostInstance::new([0; 16]),
+                                features: crate::RELIABLE_FEATURE | crate::PTY_FEATURE,
+                                limits: crate::ExtensionLimits::default(),
+                            },
+                        }
+                    } else {
+                        let HostRequest::List { id } = request else {
+                            panic!("unknown request reached old daemon: {request:?}")
+                        };
+                        HostResponse::Listed {
+                            id,
+                            children: vec![],
+                        }
+                    };
+                    let frame = crate::encode_response_for_minor(minor, &response).unwrap();
+                    auth::write_frame_async(
+                        &mut server,
+                        &frame,
+                        Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                }
+            };
+            tokio::join!(caller, daemon);
+        }
     }
 
     fn list(id: u64) -> HostRequest {

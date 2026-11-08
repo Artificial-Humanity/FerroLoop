@@ -434,6 +434,39 @@ impl AuthorityRegistry {
             owner.writer_lease.ok_or(Refusal::SessionFenced)?,
         ))
     }
+    pub(crate) fn rendered_session(
+        &self,
+        conn: ConnId,
+        stream: &StreamId,
+    ) -> Result<Arc<Session>, Refusal> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::live(&state, conn)?;
+        self.epoch(&mut state, stream)?
+            .session
+            .upgrade()
+            .ok_or(Refusal::StaleEpoch)
+    }
+
+    /// Keep the actual registry owner fenced throughout a bounded mutation.
+    /// Callers may acquire writer state here; the reverse order is forbidden.
+    pub(crate) fn with_mutation_fence<T>(
+        &self,
+        conn: ConnId,
+        stream: &StreamId,
+        lease: ControllerLease,
+        apply: impl FnOnce() -> Result<T, Refusal>,
+    ) -> Result<T, Refusal> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::live(&state, conn)?;
+        let epoch = self.epoch(&mut state, stream)?;
+        valid_owner(epoch, conn, lease)?;
+        let session = epoch.session.upgrade().ok_or(Refusal::StaleEpoch)?;
+        if session.cleanup_report().is_some() {
+            return Err(Refusal::SessionFenced);
+        }
+        apply()
+    }
+
     pub(crate) fn subscription_cursor(
         &self,
         conn: ConnId,

@@ -187,7 +187,8 @@ async fn serve_conn(host: Arc<HostInner>, mut conn: HostConn) {
                             let host=Arc::clone(&host);let tx=extended_tx.clone();
                             let task_budget=Arc::clone(&host.reliable_budget);
                             let operation=async move {
-                                let response=extended(&host,ConnId(conn_id),request).await.unwrap_or_else(|code|XResp::Refused{code});
+                                let mut snapshot=None;
+                                let response=extended(&host,ConnId(conn_id),request,&mut snapshot).await.unwrap_or_else(|code|XResp::Refused{code});
                                 if let Some(dir)=crate::input::hold_dir(){
                                     let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
                                     while matches!(crate::input::poll_barrier(&dir,"reliable-operation",Some(deadline)),crate::input::Barrier::Waiting) {
@@ -195,7 +196,7 @@ async fn serve_conn(host: Arc<HostInner>, mut conn: HostConn) {
                                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                                     }
                                 }
-                                let _=tx.send(ExtendedReply{response:HostResponse::Extended{id,response},_permit:permit});
+                                let _=tx.send(ExtendedReply{response:HostResponse::Extended{id,response},_permit:permit,_snapshot:snapshot});
                             };
                             match budgeted_operation(operation, &task_budget) {
                                 Ok(operation)=>{tokio::spawn(operation);}
@@ -516,6 +517,7 @@ pub(super) async fn extended(
     host: &Arc<HostInner>,
     conn: ConnId,
     request: XReq,
+    snapshot_reservation: &mut Option<crate::slice_budget::Reservation>,
 ) -> Result<XResp, Refusal> {
     match request {
         XReq::Capabilities => Ok(XResp::Capabilities {
@@ -523,6 +525,7 @@ pub(super) async fn extended(
             #[cfg(unix)]
             features: fl_host_proto::RELIABLE_FEATURE
                 | fl_host_proto::PTY_FEATURE
+                | fl_host_proto::RENDERED_PTY_FEATURE
                 | fl_host_proto::HOST_STATUS_FEATURE,
             #[cfg(not(unix))]
             features: fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE,
@@ -718,6 +721,57 @@ pub(super) async fn extended(
                 Err(outcome) => outcome,
             };
             Ok(XResp::Input { outcome })
+        }
+        XReq::CaptureRendered { stream } => {
+            if !cfg!(unix) {
+                return Err(Refusal::Unsupported);
+            }
+            let session = host.authority.rendered_session(conn, &stream)?;
+            let snapshot = session.capture_screen()?;
+            let screen = fl_host_proto::RenderedScreen {
+                schema: 1,
+                stream,
+                contents: snapshot.contents,
+                cursor_row: snapshot.cursor_row,
+                cursor_col: snapshot.cursor_col,
+                rows: snapshot.rows,
+                cols: snapshot.cols,
+                generation: snapshot.generation,
+                output_seq: snapshot.output_seq,
+                output_bytes: snapshot.output_bytes,
+            };
+            screen.validate().map_err(|_| Refusal::ResourceLimit)?;
+            *snapshot_reservation = Some(snapshot._reservation);
+            Ok(XResp::RenderedCapture { screen })
+        }
+        XReq::Resize {
+            stream,
+            lease,
+            cols,
+            rows,
+        } => {
+            if !cfg!(unix) {
+                return Err(Refusal::Unsupported);
+            }
+            fl_host_proto::validate_pty_geometry(cols, rows).map_err(|_| Refusal::ResourceLimit)?;
+            let (writer, writer_lease) = host.authority.mutation(conn, &stream, lease)?;
+            let revision = writer
+                .resize(
+                    conn,
+                    stream,
+                    (lease, writer_lease),
+                    (cols, rows),
+                    &host.authority,
+                    &host.reliable_budget,
+                )?
+                .await
+                .map_err(|_| Refusal::SessionFenced)?
+                .map_err(|reason| crate::input::control_refusal(&reason))?;
+            Ok(XResp::Resized {
+                cols,
+                rows,
+                projection_revision: revision,
+            })
         }
         XReq::CaptureOutput { session, max_bytes } => {
             let found = host
@@ -1094,6 +1148,7 @@ impl Drop for ExtendedPermit {
 struct ExtendedReply {
     response: HostResponse,
     _permit: ExtendedPermit,
+    _snapshot: Option<crate::slice_budget::Reservation>,
 }
 // ListSessions owns two SessionId strings per summary (Session::state and
 // StreamId), an explicitly sized record vector, and both response buffers during
@@ -1144,6 +1199,7 @@ fn admit_extension(
         // Two bounded strings plus JSON (including worst-case escaping and Vec
         // growth) and the wire buffer. The permit lives through the socket write.
         XReq::HostStatus => 8192 + 2 * fl_host_proto::MAX_BUILD_FIELD_BYTES,
+        XReq::CaptureRendered { .. } => 2 * fl_host_proto::MAX_FRAME_PAYLOAD + 5 + 4096,
         XReq::ListSessions => list_response_storage_bound().ok_or(Refusal::ResourceLimit)?,
         XReq::CaptureOutput { max_bytes, .. } => {
             (*max_bytes as usize).min(fl_host_proto::MAX_RAW_INPUT) + 4096
@@ -1217,6 +1273,176 @@ mod list_response_tests {
         (dir, host)
     }
 
+    fn rendered_fixture() -> (tempfile::TempDir, Host, fl_host_proto::StreamId) {
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = HostConfig::new(HostEndpoint::unix(dir.path().join("screen.sock")).unwrap());
+        let host = Host::open(OpenOptions::new(config)).unwrap();
+        let stream = fl_host_proto::StreamId {
+            host: host.inner.authority.instance().clone(),
+            session: SessionId::new("screen").unwrap(),
+            epoch: fl_host_proto::SessionEpoch(1),
+        };
+        let journal = crate::reliable::ReliableJournal::new_with_mode(
+            Arc::clone(&host.inner.reliable_budget),
+            stream.clone(),
+            true,
+        )
+        .unwrap();
+        let mut projection = crate::projection::Projection::new(
+            Arc::clone(journal.budget()),
+            fl_host_proto::PtyOptions {
+                cols: 256,
+                rows: 32,
+                scrollback_rows: 0,
+            },
+        )
+        .unwrap();
+        projection.process(&[b'\\'; 8000]);
+        let session = Arc::new(Session::with_projection(
+            SessionParts {
+                session: stream.session.clone(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            },
+            Arc::clone(&journal),
+            projection,
+            None,
+        ));
+        let writer = WriterHandle::start(Arc::clone(&session), None);
+        host.inner.authority.connect(ConnId(1)).unwrap();
+        host.inner.authority.register(
+            host.inner.authority.prepare_epoch(journal).unwrap(),
+            &session,
+            &writer,
+        );
+        host.inner
+            .writers
+            .lock()
+            .unwrap()
+            .insert("screen".into(), writer);
+        host.inner.outputs.lock().unwrap().insert(
+            ("screen".into(), 1),
+            OutputSession::open(session, Arc::clone(&host.inner.hub)),
+        );
+        (dir, host, stream)
+    }
+
+    // Catches unbounded pending response admission and count/metadata leaks on refusal.
+    #[test]
+    fn rendered_pending_admission_and_resize_control_queue_are_bounded() {
+        let (_dir, host, stream) = rendered_fixture();
+        let budget = &host.inner.reliable_budget;
+        let baseline = budget.used(ChargeKind::Metadata);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request = XReq::CaptureRendered {
+            stream: stream.clone(),
+        };
+        let mut permits = Vec::new();
+        loop {
+            match admit_extension(&host.inner, &count, &request) {
+                Ok(permit) => permits.push(permit),
+                Err(Refusal::ResourceLimit) => break,
+                other => panic!("admission: {}", other.is_ok()),
+            }
+            assert!(permits.len() <= 16);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), permits.len());
+        drop(permits);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.used(ChargeKind::Metadata), baseline);
+        let writer = host
+            .inner
+            .writers
+            .lock()
+            .unwrap()
+            .get("screen")
+            .unwrap()
+            .clone();
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            replies.push(
+                writer
+                    .resize(
+                        ConnId(1),
+                        stream.clone(),
+                        (ControllerLease(1), ControllerLease(1)),
+                        (80, 24),
+                        &host.inner.authority,
+                        budget,
+                    )
+                    .unwrap(),
+            );
+        }
+        let queued = budget.used(ChargeKind::Metadata);
+        assert!(queued > baseline);
+        assert!(matches!(
+            writer.resize(
+                ConnId(1),
+                stream,
+                (ControllerLease(1), ControllerLease(1)),
+                (80, 24),
+                &host.inner.authority,
+                budget
+            ),
+            Err(Refusal::Busy)
+        ));
+        assert_eq!(budget.used(ChargeKind::Metadata), queued);
+        writer.shutdown();
+        drop(replies);
+        assert_eq!(budget.used(ChargeKind::Metadata), baseline);
+    }
+
+    // Catches allocating snapshot/serialization bodies without their separate admission.
+    #[test]
+    fn rendered_capture_refuses_exhausted_snapshot_or_metadata_before_allocation() {
+        let (_dir, host, stream) = rendered_fixture();
+        let budget = &host.inner.reliable_budget;
+        let base = budget.used(ChargeKind::Metadata);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let filler = reserve(budget, ChargeKind::Metadata, METADATA - base - 70_000).unwrap();
+        assert!(matches!(
+            admit_extension(
+                &host.inner,
+                &count,
+                &XReq::CaptureRendered {
+                    stream: stream.clone()
+                }
+            ),
+            Err(Refusal::ResourceLimit)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(filler);
+        let _filler = reserve(budget, ChargeKind::Snapshot, 32 * 1024 * 1024).unwrap();
+        let mut reservation = None;
+        assert_eq!(
+            host.inner.handle.block_on(extended(
+                &host.inner,
+                ConnId(1),
+                XReq::CaptureRendered { stream },
+                &mut reservation
+            )),
+            Err(Refusal::ResourceLimit)
+        );
+        assert!(reservation.is_none());
+        assert_eq!(budget.used(ChargeKind::Snapshot), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rendered_snapshot_and_buffers_survive_pending_write_until_retirement() {
+        for retirement in ["cancel", "closed", "complete"] {
+            pending_write_retirement(retirement, true);
+        }
+    }
+
     // Catches accepting the old 64-KiB allowance when concurrent response storage cannot fit.
     #[test]
     fn list_response_refuses_before_uncovered_allocation_near_metadata_limit() {
@@ -1240,12 +1466,18 @@ mod list_response_tests {
     #[test]
     fn list_response_charge_survives_allocated_pending_socket_write() {
         for retirement in ["cancel", "closed", "complete"] {
-            pending_write_retirement(retirement);
+            pending_write_retirement(retirement, false);
         }
     }
 
-    fn pending_write_retirement(retirement: &str) {
-        let (_dir, host) = fixture();
+    fn pending_write_retirement(retirement: &str, rendered: bool) {
+        let (_dir, host, stream) = if rendered {
+            let (dir, host, stream) = rendered_fixture();
+            (dir, host, Some(stream))
+        } else {
+            let (dir, host) = fixture();
+            (dir, host, None)
+        };
         host.inner.handle.block_on(async {
             let endpoint = host.endpoint();
             let HostEndpoint::Unix(path) = endpoint else { unreachable!() };
@@ -1262,17 +1494,28 @@ mod list_response_tests {
             let used = budget.used(ChargeKind::Metadata);
             let _filler = reserve(budget, ChargeKind::Metadata, METADATA - used - 600_000).unwrap();
             let baseline = budget.used(ChargeKind::Metadata);
+            let snapshot_baseline = budget.used(ChargeKind::Snapshot);
             let mut parked = false;
             let mut wire_bytes = 0;
             // The peer never reads. Completed writes fill the native socket; the next
             // manual poll must stop inside the actual response write, after encoding.
             for id in 1..=128 {
-                let permit = admit_extension(&host.inner, &count, &XReq::ListSessions).unwrap();
-                let response = HostResponse::Extended { id: RequestId(id), response: extended(&host.inner, ConnId(1), XReq::ListSessions).await.unwrap() };
-                let HostResponse::Extended { response: XResp::Sessions { records }, .. } = &response else { unreachable!() };
-                assert_eq!(records.len(), 64);
-                assert!(records.iter().all(|r| r.stream.session.as_str().len() == 64));
-                let owned_records = records.capacity() * std::mem::size_of::<fl_host_proto::SessionSummary>() + 64 * 128;
+                let request = stream.as_ref().map(|stream|XReq::CaptureRendered{stream:stream.clone()}).unwrap_or(XReq::ListSessions);
+                let permit = admit_extension(&host.inner, &count, &request).unwrap();
+                let mut snapshot = None;
+                let response = HostResponse::Extended { id: RequestId(id), response: extended(&host.inner, ConnId(1), request, &mut snapshot).await.unwrap() };
+                let owned_records = match &response {
+                    HostResponse::Extended {response:XResp::Sessions{records},..} => {
+                        assert_eq!(records.len(),64);
+                        records.capacity()*std::mem::size_of::<fl_host_proto::SessionSummary>()+64*128
+                    }
+                    HostResponse::Extended {response:XResp::RenderedCapture{screen},..} => {
+                        assert_eq!(screen.contents.len(),8000);
+                        assert!(snapshot.is_some());
+                        screen.contents.capacity()
+                    }
+                    _ => unreachable!(),
+                };
                 let encoded = fl_host_proto::encode_response_for_minor(1, &response).unwrap();
                 wire_bytes += encoded.payload.len() + 5;
                 let concurrent_storage = owned_records + encoded.payload.capacity() + encoded.payload.len() + 5
@@ -1281,7 +1524,7 @@ mod list_response_tests {
                     + std::mem::size_of::<Vec<u8>>();
                 drop(encoded);
                 let charged = budget.used(ChargeKind::Metadata) - baseline;
-                let mut write = Box::pin(write_extended_reply(&mut conn, ExtendedReply { response, _permit: permit }));
+                let mut write = Box::pin(write_extended_reply(&mut conn, ExtendedReply { response, _permit: permit, _snapshot: snapshot }));
                 let mut cx = Context::from_waker(Waker::noop());
                 match write.as_mut().poll(&mut cx) {
                     Poll::Ready(result) => { result.unwrap(); drop(write); assert_eq!(budget.used(ChargeKind::Metadata), baseline); }
@@ -1290,7 +1533,9 @@ mod list_response_tests {
                         eprintln!("{retirement}: parked allocated response {id}, charged={charged}, concurrent_storage={concurrent_storage}");
                         assert_eq!(count.load(Ordering::SeqCst), 1);
                         assert_eq!(budget.used(ChargeKind::Metadata), baseline + charged);
-                        assert!(charged >= concurrent_storage, "parked response owns at least {concurrent_storage} bytes but charges only {charged}");
+                        let snapshot_charge = budget.used(ChargeKind::Snapshot) - snapshot_baseline;
+                        assert_eq!(snapshot_charge > 0, rendered);
+                        assert!(charged + snapshot_charge >= concurrent_storage, "parked response owns at least {concurrent_storage} bytes but charges only {charged}");
                         match retirement {
                             "cancel" => drop(write),
                             "closed" => {
@@ -1313,13 +1558,18 @@ mod list_response_tests {
                                 let mut bytes = std::io::Cursor::new(received);
                                 for _ in 0..id {
                                     let frame = fl_host_proto::read_frame(&mut bytes).unwrap();
-                                    assert!(matches!(fl_host_proto::decode_response_for_minor(1, &frame).unwrap(), HostResponse::Extended { response: XResp::Sessions { records }, .. } if records.len() == 64));
+                                    match fl_host_proto::decode_response_for_minor(1,&frame).unwrap() {
+                                        HostResponse::Extended {response:XResp::Sessions{records},..} => assert_eq!(records.len(),64),
+                                        HostResponse::Extended {response:XResp::RenderedCapture{screen},..} => assert_eq!(screen.contents.len(),8000),
+                                        other => panic!("response {other:?}"),
+                                    }
                                 }
                             }
                             _ => unreachable!(),
                         }
                         assert_eq!(count.load(Ordering::SeqCst), 0);
                         assert_eq!(budget.used(ChargeKind::Metadata), baseline);
+                        assert_eq!(budget.used(ChargeKind::Snapshot), snapshot_baseline);
                         break;
                     }
                 }
