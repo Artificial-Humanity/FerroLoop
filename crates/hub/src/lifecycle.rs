@@ -174,6 +174,12 @@ pub struct LifecycleEnv<'a> {
 static HOST_ADAPTER_REGISTRY: std::sync::OnceLock<fl_core::VendorHostAdapterRegistry> =
     std::sync::OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_HOST_ADAPTER_REGISTRY: std::cell::RefCell<Option<fl_core::VendorHostAdapterRegistry>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Install the concrete [`fl_core::VendorHostAdapterRegistry`] composed at `fl-cli` into `fl-hub`.
 pub fn set_global_vendor_host_adapters(
     registry: fl_core::VendorHostAdapterRegistry,
@@ -200,6 +206,12 @@ impl<'a> LifecycleEnv<'a> {
         &self,
         vendor: &str,
     ) -> Option<std::sync::Arc<dyn fl_core::VendorHostAdapter>> {
+        #[cfg(test)]
+        if let Some(found) = TEST_HOST_ADAPTER_REGISTRY
+            .with(|slot| slot.borrow().as_ref().and_then(|reg| reg.lookup(vendor)))
+        {
+            return Some(found);
+        }
         HOST_ADAPTER_REGISTRY
             .get()
             .and_then(|reg| reg.lookup(vendor))
@@ -512,6 +524,7 @@ pub(crate) use fl_wire::vendor_adapter::{
 };
 
 /// Build a launch command for built-in CLI vendors; custom vendors use prompt delivery.
+#[cfg(test)]
 fn launch_spec_for(
     env: &LifecycleEnv<'_>,
     vendor: &str,
@@ -520,10 +533,60 @@ fn launch_spec_for(
     thinking_level: Option<&str>,
     prompt: &str,
 ) -> Option<LaunchSpec> {
+    launch_spec_for_with_session(
+        env,
+        vendor,
+        persona,
+        model,
+        thinking_level,
+        prompt,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_spec_for_with_session(
+    env: &LifecycleEnv<'_>,
+    vendor: &str,
+    persona: &str,
+    model: Option<&str>,
+    thinking_level: Option<&str>,
+    prompt: &str,
+    cwd: Option<&str>,
+    vendor_session_id: Option<&str>,
+) -> Option<LaunchSpec> {
     let home = env
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    if let Some(host_adapter) = env.host_vendor_adapter(vendor) {
+        let mut binding = fl_core::AdapterIdentityBinding::new(
+            format!("{vendor}:{persona}"),
+            1,
+            hosted_tmux_target(vendor, persona),
+            None,
+        );
+        if let Some(sid) = vendor_session_id {
+            binding = binding.with_vendor_session_id(sid);
+        }
+        let req = fl_core::VendorLaunchRequest {
+            binding,
+            persona: persona.to_string(),
+            model: model.map(str::to_string),
+            thinking_effort: thinking_level.map(str::to_string),
+            initial_prompt: prompt.to_string(),
+            cwd: cwd.map(PathBuf::from),
+            home_dir: home.clone(),
+            remote_control: env.vendor_launch_options().remote_control,
+        };
+        if let Ok(plan) = host_adapter.prepare_launch(&req) {
+            return Some(LaunchSpec {
+                env: plan.env,
+                argv: plan.argv,
+            });
+        }
+    }
     let adapter = env.vendor_adapter(vendor)?;
     Some(adapter.build_launch_spec_with_options(
         persona,
@@ -736,18 +799,25 @@ impl SessionRuntime for HostRuntime {
         let Some(mut client) = connect_host_client() else {
             return String::new();
         };
-        let target_id = client
-            .list_sessions()
-            .ok()
-            .and_then(|sessions| {
-                fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit)
-                    .into_iter()
-                    .next()
-            })
+        let sessions = client.list_sessions().ok().unwrap_or_default();
+        let target_id = fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit)
+            .into_iter()
+            .next()
             .or_else(|| fl_wire::vendor_adapter::unit_to_host_session_id(unit));
         let Some(id) = target_id else {
             return String::new();
         };
+        if let Some(summary) = sessions
+            .iter()
+            .find(|s| {
+                s.stream.session == id && matches!(s.state, fl_host_proto::ChildState::Running(_))
+            })
+            .or_else(|| sessions.iter().find(|s| s.stream.session == id))
+            && summary.mode == fl_host_proto::SessionMode::Pty
+            && let Ok(screen) = client.capture_rendered(summary.stream.clone())
+        {
+            return screen.contents;
+        }
         client.capture_output(id, 16_384).unwrap_or_default()
     }
 
@@ -1606,6 +1676,9 @@ pub struct HostedSessionRecord {
     /// Empty on a running record, including one that replaced a decommissioned record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tombstone_ids: Vec<String>,
+    /// Vendor-native session identifier (e.g., Claude `--session-id <uuid>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_session_id: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
@@ -3140,6 +3213,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     let unit = tmux_target.as_deref().map_or("", runtime_unit).to_string();
 
     let now = now_ms();
+    let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
     let mut record = HostedSessionRecord {
         session_id: session_id.clone(),
         persona: v.persona.clone(),
@@ -3158,6 +3232,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         context_window: v.context_window,
         hydration_dispatched: false,
         tombstone_ids: Vec::new(),
+        vendor_session_id,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
         // Only when the record named this same target: a runtime under another name (an older
@@ -3181,13 +3256,15 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     // A route left by another vendor would take the hydration prompt.
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
-    let launch = launch_spec_for(
+    let launch = launch_spec_for_with_session(
         env,
         &v.vendor,
         &v.persona,
         v.model.as_deref(),
         v.thinking_level.as_deref(),
         &prompt,
+        v.cwd.as_deref(),
+        record.vendor_session_id.as_deref(),
     );
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
     let spawned = has_runtime
@@ -3428,6 +3505,7 @@ fn record_for_target<S: AgentRegistry>(
         hydration_dispatched: false,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
+        vendor_session_id: None,
         created_at_ms: now,
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
@@ -3904,6 +3982,9 @@ fn teardown_route_ids(
     ] {
         push_tombstone(&mut ids, id);
     }
+    if let Some(sid) = record.vendor_session_id.as_deref() {
+        push_tombstone(&mut ids, sid);
+    }
     for path in route_table_paths(home_override) {
         if !path.is_file() {
             continue;
@@ -3970,6 +4051,7 @@ pub(crate) fn record_native_ids(record: &HostedSessionRecord) -> Vec<String> {
     }
     let mut ids = Vec::new();
     for id in std::iter::once(record.session_id.as_str())
+        .chain(record.vendor_session_id.as_deref())
         .chain(record.tombstone_ids.iter().map(String::as_str))
     {
         push_tombstone(&mut ids, id);
@@ -4243,6 +4325,9 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     let mut tombstone_ids = teardown_route_ids(env.home_override, &record, target);
     for sib in &same_vendor_siblings {
         push_tombstone(&mut tombstone_ids, &sib.session_id);
+        if let Some(sid) = sib.vendor_session_id.as_deref() {
+            push_tombstone(&mut tombstone_ids, sid);
+        }
         for tid in &sib.tombstone_ids {
             push_tombstone(&mut tombstone_ids, tid);
         }
@@ -4433,13 +4518,23 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = runtime_unit(&want_target).to_string();
-    let launch = launch_spec_for(
+    if record.vendor == "claude"
+        && record
+            .vendor_session_id
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        record.vendor_session_id = Some(uuid::Uuid::now_v7().to_string());
+    }
+    let launch = launch_spec_for_with_session(
         env,
         &record.vendor,
         &record.persona,
         record.model.as_deref(),
         record.thinking_level.as_deref(),
         &prompt,
+        record.cwd.as_deref(),
+        record.vendor_session_id.as_deref(),
     );
     // A stale `<Display>:muse` record whose old session still runs: that one Muse is the agent.
     // No second Muse is opened beside it; the prompt goes to it by delivery and the ownership
@@ -4720,7 +4815,7 @@ fn check_old_runtime_stoppable<S: StateStore>(
 /// nothing done: the same checks, error texts and statuses (see `plan_remodel`, whose result this
 /// drops, so the two cannot drift). It only reads: the store, the runtime directory, the key
 /// probe and, when runtime calls are on, whether a tmux session of the persona's name runs.
-pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore>(
+pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -4736,7 +4831,7 @@ pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore>(
 /// checks spin-up makes with the persona's own agent counted as retired (409), a non-Owner
 /// remodel that could not be restored (409), and an old runtime the teardown cannot stop (409).
 /// It has no side effect: [`remodel_precheck`] is this, with the plan dropped.
-fn plan_remodel<S: AgentRegistry + StateStore>(
+fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -4767,6 +4862,19 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
     let old_cwd = old.and_then(|r| r.cwd.clone());
     let from_model = old.and_then(|r| r.model.clone());
     let from_thinking_level = old.and_then(|r| r.thinking_level.clone());
+    let resolved_cwd = if trimmed_opt(&req.cwd).is_some() {
+        req.cwd.clone()
+    } else {
+        let old_is_ws_root = match (old_cwd.as_deref(), env.workspace_root) {
+            (Some(old_path), Some(ws_root)) => Path::new(old_path.trim()) == ws_root,
+            _ => false,
+        };
+        if old_cwd.is_none() || old_is_ws_root {
+            resolve_project_cwd(store, &project, env.workspace_root).or_else(|| old_cwd.clone())
+        } else {
+            old_cwd.clone()
+        }
+    };
     let to = SpinUpRequest {
         persona: target.persona.clone(),
         project: project.clone(),
@@ -4777,7 +4885,7 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         node_id: req.node_id.clone().or_else(|| Some(old_node.clone())),
         // The new session keeps the old one's `hosted`; with no record, spin-up's default.
         hosted: req.hosted.or(old.map(|r| r.hosted)),
-        cwd: req.cwd.clone().or_else(|| old_cwd.clone()),
+        cwd: resolved_cwd,
         context_window: None,
     }
     .validate()?;
@@ -8359,6 +8467,7 @@ mod tests {
             hydration_dispatched: false,
             runtime_spawned: spawned,
             tombstone_ids: Vec::new(),
+            vendor_session_id: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,
@@ -9139,5 +9248,353 @@ mod tests {
                 "home_override must not fall back to ANTIGRAVITY_LS_ADDRESS"
             );
         });
+    }
+
+    #[test]
+    fn claude_spin_up_restart_and_teardown_route_through_vendor_host_adapter_with_session_uuid() {
+        use fl_core::vendor_adapter::{
+            AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest, ConfigEffectiveScope,
+            TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
+            TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorHostAdapter,
+            VendorHostAdapterRegistry, VendorLaunchPlan, VendorLaunchRequest,
+            VendorStartupPromptRule,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Default)]
+        struct StubClaudeHostAdapter {
+            archived: Mutex<Vec<Option<String>>>,
+        }
+
+        impl VendorHostAdapter for StubClaudeHostAdapter {
+            fn vendor_id(&self) -> &str {
+                "claude"
+            }
+            fn default_binary(&self) -> &str {
+                "claude"
+            }
+            fn binary_env_var(&self) -> Option<&str> {
+                Some("FL_WIRE_CLAUDE_BIN")
+            }
+            fn probe_readiness(
+                &self,
+                _binding: &fl_core::AdapterIdentityBinding,
+                _vendor_session_id: Option<&str>,
+                _control_endpoint: Option<&str>,
+            ) -> Result<AdapterReadiness, VendorAdapterError> {
+                Ok(AdapterReadiness::ReadyIdle)
+            }
+            fn prepare_launch(
+                &self,
+                req: &VendorLaunchRequest,
+            ) -> Result<VendorLaunchPlan, VendorAdapterError> {
+                let sid = req.binding.vendor_session_id.clone().ok_or_else(|| {
+                    VendorAdapterError::MissingSessionIdentity {
+                        vendor: "claude".into(),
+                        reason: "missing session id".into(),
+                    }
+                })?;
+                let display = capitalize(&req.persona);
+                let mut argv = vec![
+                    "claude".to_string(),
+                    "--remote-control".to_string(),
+                    "--enable-auto-mode".to_string(),
+                    "--session-id".to_string(),
+                    sid,
+                    "--name".to_string(),
+                    display,
+                ];
+                if !req.initial_prompt.is_empty() {
+                    argv.push(req.initial_prompt.clone());
+                }
+                Ok(VendorLaunchPlan {
+                    vendor_id: "claude".into(),
+                    binary: "claude".into(),
+                    argv,
+                    env: vec![("AGENT_PERSONA".into(), req.persona.clone())],
+                    cwd: req.cwd.clone(),
+                    remote_control: req.remote_control,
+                    startup_rules: Vec::<VendorStartupPromptRule>::new(),
+                })
+            }
+            fn validate_config(
+                &self,
+                model: Option<&str>,
+                thinking_effort: Option<&str>,
+            ) -> Result<VendorConfigSpec, VendorAdapterError> {
+                Ok(VendorConfigSpec {
+                    normalized_model: model.map(str::to_string),
+                    normalized_thinking_effort: thinking_effort.map(str::to_string),
+                    model_scope: ConfigEffectiveScope::NextLaunch,
+                    thinking_effort_scope: ConfigEffectiveScope::NextLaunch,
+                })
+            }
+            fn attach_or_resume(
+                &self,
+                _req: &AttachOrResumeRequest,
+            ) -> Result<AttachOrResumeOutcome, VendorAdapterError> {
+                unreachable!()
+            }
+            fn submit_turn(&self, _req: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+                unreachable!()
+            }
+            fn steer_turn(&self, _req: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+                unreachable!()
+            }
+            fn cancel_turn(&self, _req: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+                unreachable!()
+            }
+            fn normalize_transcript(
+                &self,
+                _raw_jsonl: &str,
+                _after_cursor: Option<&str>,
+            ) -> Result<TranscriptNormalizeReport, VendorAdapterError> {
+                unreachable!()
+            }
+            fn stop(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                Ok(TeardownOutcome::Completed)
+            }
+            fn detach(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                Ok(TeardownOutcome::Completed)
+            }
+            fn archive(
+                &self,
+                target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                self.archived
+                    .lock()
+                    .unwrap()
+                    .push(target.vendor_session_id.clone());
+                Ok(TeardownOutcome::Completed)
+            }
+            fn delete(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                unreachable!()
+            }
+        }
+
+        struct ResetRegistry;
+        impl Drop for ResetRegistry {
+            fn drop(&mut self) {
+                TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+
+        let stub = Arc::new(StubClaudeHostAdapter::default());
+        let reg = VendorHostAdapterRegistry::new();
+        reg.register(stub.clone());
+        TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg));
+        let _reset = ResetRegistry;
+
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+
+        let out = spin_up(
+            &store,
+            &env,
+            &req("kayla", "lead", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(out.runtime_spawned);
+
+        let rec = find_hosted_session(&store, &["claude:kayla"])
+            .unwrap()
+            .unwrap();
+        let sid = rec
+            .vendor_session_id
+            .clone()
+            .expect("claude spin_up must persist vendor_session_id");
+        assert!(uuid::Uuid::parse_str(&sid).is_ok(), "invalid uuid: {sid}");
+
+        let launches = fake.launches.borrow().clone();
+        assert_eq!(launches.len(), 1);
+        let spec = launches[0].1.as_ref().expect("launch spec present");
+        assert_eq!(
+            &spec.argv[..7],
+            &[
+                "claude".to_string(),
+                "--remote-control".to_string(),
+                "--enable-auto-mode".to_string(),
+                "--session-id".to_string(),
+                sid.clone(),
+                "--name".to_string(),
+                "Kayla".to_string(),
+            ]
+        );
+
+        // Restart reuses the existing vendor_session_id.
+        fake.clear();
+        let restarted = restart_hosted_session(&store, &env, "claude:kayla", "owner").unwrap();
+        assert_eq!(
+            restarted.record.vendor_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+
+        // Teardown includes vendor_session_id in tombstones, record_native_ids, and archive()
+        // even when no route file exists.
+        let target = SessionTarget::resolve(&store, "claude:kayla", None).unwrap();
+        let torn = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(torn.status, STATUS_DECOMMISSIONED);
+
+        let after_rec = find_hosted_session(&store, &["claude:kayla"])
+            .unwrap()
+            .unwrap();
+        assert!(after_rec.tombstone_ids.contains(&sid));
+        assert!(record_native_ids(&after_rec).contains(&sid));
+        let archived = stub.archived.lock().unwrap().clone();
+        assert!(
+            archived.contains(&Some(sid)),
+            "expected archive called with vendor_session_id, got {archived:?}"
+        );
+    }
+
+    #[test]
+    fn host_runtime_capture_prefers_capture_rendered_for_pty_and_falls_back_on_err() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ExtensionRequest, ExtensionResponse, HostConfig, HostEndpoint,
+            HostInstance, HostListener, HostRequest, HostResponse, InputState, RenderedScreen,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _lock = crate::TMUX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host-cap.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Kayla.claude").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([2u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let fail_rendered = Arc::new(AtomicBool::new(false));
+        let fail_srv = Arc::clone(&fail_rendered);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let fail_srv = Arc::clone(&fail_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: HostInstance::new([2u8; 16]),
+                                    limits: fl_host_proto::ExtensionLimits::default(),
+                                    features: if fail_srv.load(Ordering::Relaxed) {
+                                        0
+                                    } else {
+                                        fl_host_proto::RENDERED_PTY_FEATURE
+                                    },
+                                },
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: "Teach auto mode about your environment"
+                                                .into(),
+                                            cursor_row: 0,
+                                            cursor_col: 0,
+                                            rows: 24,
+                                            cols: 80,
+                                            generation: 1,
+                                            output_seq: 1,
+                                            output_bytes: 1,
+                                        },
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: "fallback raw output".into(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let prev_sock = std::env::var_os("FL_HOST_SOCK");
+        let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
+        // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
+        unsafe {
+            std::env::set_var("FL_HOST_SOCK", &sock_path);
+            std::env::remove_var("FL_WIRE_TMUX_BIN");
+        }
+        let rendered_out = SessionRuntime::capture(&HostRuntime, "Kayla:claude");
+        fail_rendered.store(true, Ordering::Relaxed);
+        let fallback_out = SessionRuntime::capture(&HostRuntime, "Kayla:claude");
+        // SAFETY: see above.
+        unsafe {
+            match prev_sock {
+                Some(v) => std::env::set_var("FL_HOST_SOCK", v),
+                None => std::env::remove_var("FL_HOST_SOCK"),
+            }
+            if let Some(v) = prev_tmux {
+                std::env::set_var("FL_WIRE_TMUX_BIN", v);
+            }
+        }
+        assert_eq!(rendered_out, "Teach auto mode about your environment");
+        assert_eq!(fallback_out, "fallback raw output");
+        drop(server_thread);
     }
 }
