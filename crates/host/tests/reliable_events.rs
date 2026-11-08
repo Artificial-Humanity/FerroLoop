@@ -1376,9 +1376,22 @@ fn safety_flood_reliable_unattended_finishes_with_gap_and_no_ack_credit() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let summary = rpc.summary(&stream);
+    // Capture is updated before journal admission; wait for the final record too.
+    let expected_latest = safety_flood::LINES as u64 + 3;
+    let summary = loop {
+        let summary = rpc.summary(&stream);
+        assert!(
+            Instant::now() < deadline,
+            "journal never reached final marker"
+        );
+        assert!(summary.latest <= expected_latest);
+        if summary.latest == expected_latest {
+            break summary;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
     assert_eq!(summary.acked, 0);
-    assert_eq!(summary.latest, safety_flood::LINES as u64 + 3);
+    assert_eq!(summary.latest, expected_latest);
     assert!(!record(&summary.state).consumer_stalled);
     safety_flood_rss(&f);
     runtime().block_on(async {
@@ -1476,6 +1489,8 @@ fn safety_flood_reliable_held_subscriber_recovers_losslessly() {
     let mut reassembly = fl_host_proto::ReliableReassembler::for_stream(stream.clone(), 0);
     let mut count = 0;
     let mut bytes = 0;
+    let mut pending_line = Vec::new();
+    let mut saw_ready = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(Instant::now() < deadline, "lossless replay deadline");
@@ -1488,13 +1503,23 @@ fn safety_flood_reliable_held_subscriber_recovers_losslessly() {
             .unwrap()
         });
         assert_ne!(event.kind, ReliableKind::Gap);
-        let final_marker =
-            event.kind == ReliableKind::Line && event.bytes == safety_flood::FINAL.as_bytes();
-        if event.kind == ReliableKind::Line && event.bytes != b"READY" && !final_marker {
-            assert!(event.terminated);
-            assert_eq!(event.bytes, safety_flood::line(count));
-            count += 1;
-            bytes += event.bytes.len();
+        let mut final_marker = false;
+        if event.kind == ReliableKind::Line {
+            // A complete reliable event can still be only part of a logical line.
+            pending_line.extend_from_slice(&event.bytes);
+            if event.terminated {
+                if !saw_ready {
+                    assert_eq!(pending_line, b"READY");
+                    saw_ready = true;
+                } else if pending_line == safety_flood::FINAL.as_bytes() {
+                    final_marker = true;
+                } else {
+                    assert_eq!(pending_line, safety_flood::line(count));
+                    count += 1;
+                    bytes += pending_line.len();
+                }
+                pending_line.clear();
+            }
         }
         assert!(matches!(
             rpc.call(Req::Ack {
@@ -1506,10 +1531,13 @@ fn safety_flood_reliable_held_subscriber_recovers_losslessly() {
             }),
             Resp::Acked { .. }
         ));
+        assert!(Instant::now() < deadline, "lossless replay deadline");
         if final_marker {
             break;
         }
     }
+    assert!(saw_ready);
+    assert!(pending_line.is_empty());
     assert_eq!(count, safety_flood::LINES);
     assert_eq!(bytes, safety_flood::LINES * safety_flood::LINE_BYTES);
     assert!(bytes > 8 * 1024 * 1024);
@@ -1522,6 +1550,7 @@ fn safety_flood_reliable_held_subscriber_recovers_losslessly() {
             .ends_with(&format!("{}\n", safety_flood::FINAL))
     );
     assert!(!record(&rpc.summary(&stream).state).consumer_stalled);
+    let deadline = Instant::now() + Duration::from_secs(5);
     assert_eq!(
         rpc.call(Req::KillSession {
             stream: stream.clone(),
@@ -1529,9 +1558,12 @@ fn safety_flood_reliable_held_subscriber_recovers_losslessly() {
         }),
         Resp::Controlled
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !matches!(rpc.summary(&stream).state, ChildState::CleanupComplete(_)) {
+    loop {
+        let summary = rpc.summary(&stream);
         assert!(Instant::now() < deadline, "cleanup after recovery");
+        if matches!(summary.state, ChildState::CleanupComplete(_)) {
+            break;
+        }
         thread::sleep(Duration::from_millis(5));
     }
 }

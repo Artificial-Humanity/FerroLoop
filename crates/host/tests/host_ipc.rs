@@ -4059,14 +4059,18 @@ fn safety_flood_legacy_held_subscriber_preserves_control_and_cleanup() {
     let deadline = Instant::now() + Duration::from_secs(5);
     rpc.kill("safety-flood", epoch_of(&child), Some(lease))
         .unwrap();
-    while !matches!(
-        find(&rpc.list(), "safety-flood").state,
-        ChildState::CleanupComplete(_)
-    ) {
+    loop {
+        let children = rpc.list();
         assert!(
             Instant::now() < deadline,
             "cleanup blocked behind held subscriber"
         );
+        if matches!(
+            find(&children, "safety-flood").state,
+            ChildState::CleanupComplete(_)
+        ) {
+            break;
+        }
         thread::sleep(Duration::from_millis(5));
     }
     release(&daemon.paths.subscriber, "before-send-1");
