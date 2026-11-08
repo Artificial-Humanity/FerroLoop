@@ -4248,7 +4248,9 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         }
     }
     delete_agy_cascade_trajectories(env.home_override, &record, target, &tombstone_ids);
-    if let Some(adapter) = env.host_vendor_adapter(&record.vendor) {
+    if (env.spawn_runtime || env.home_override.is_some())
+        && let Some(adapter) = env.host_vendor_adapter(&record.vendor)
+    {
         let host_session = record.tmux_target.as_deref().unwrap_or(&record.session_id);
         let binding =
             fl_core::AdapterIdentityBinding::new(record.session_id.clone(), 1, host_session, None);

@@ -10,13 +10,18 @@
 //! lock-file deletions occur in this adapter.
 
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
+#[cfg(unix)]
 use base64::Engine;
+#[cfg(unix)]
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fl_core::vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
@@ -25,31 +30,47 @@ use fl_core::vendor_adapter::{
     VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
     VendorStartupPromptRule,
 };
+#[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(unix)]
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 
 /// Default overall timeout for a Codex app-server control socket RPC sequence.
 pub const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest a single socket read may block.
+#[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest WebSocket frame or reassembled text message accepted from the server.
+#[cfg(unix)]
 const MAX_MESSAGE: usize = 1024 * 1024;
 /// Raw turn input text and thread ID must each fit within this bound before any copying.
+#[cfg(unix)]
 const MAX_TURN_INPUT: usize = 1024 * 1024;
 /// Largest encoded JSON-RPC request payload (WebSocket framing adds at most 14 bytes).
+#[cfg(unix)]
 const MAX_RPC_REQUEST: usize = 1024 * 1024;
 /// Longest RPC error text carried into a rejection or error string.
+#[cfg(unix)]
 const MAX_ERROR_TEXT: usize = 300;
 /// Control socket relative to `CODEX_HOME` or `~/.codex`.
 pub const CODEX_CONTROL_SOCKET_REL: &str = "app-server-control/app-server-control.sock";
 
+#[cfg(unix)]
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+#[cfg(unix)]
 const OP_CONTINUATION: u8 = 0x0;
+#[cfg(unix)]
 const OP_TEXT: u8 = 0x1;
+#[cfg(unix)]
 const OP_BINARY: u8 = 0x2;
+#[cfg(unix)]
 const OP_CLOSE: u8 = 0x8;
+#[cfg(unix)]
 const OP_PING: u8 = 0x9;
+#[cfg(unix)]
 const OP_PONG: u8 = 0xA;
 
 /// Supported reasoning effort tokens for Codex (`-c model_reasoning_effort="<level>"`).
@@ -103,7 +124,8 @@ impl CodexHostAdapter {
     }
 
     /// Resolve the Codex `app-server` Unix control socket path from an explicit endpoint,
-    /// `FL_WIRE_CODEX_CONTROL_SOCK`, `CODEX_HOME`, or `home_dir` / `HOME`.
+    /// an explicit `home_dir` override, or ambient `FL_WIRE_CODEX_CONTROL_SOCK`, `CODEX_HOME`,
+    /// or `HOME`.
     pub fn resolve_control_socket_path(
         &self,
         explicit_endpoint: Option<&str>,
@@ -113,13 +135,16 @@ impl CodexHostAdapter {
             let stripped = ep.strip_prefix("unix://").unwrap_or(ep);
             return Ok(PathBuf::from(stripped));
         }
+        if let Some(h) = home_dir.filter(|p| !p.as_os_str().is_empty()) {
+            return Ok(h.join(".codex").join(CODEX_CONTROL_SOCKET_REL));
+        }
         let env_sock = std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK");
         let env_codex_home = std::env::var_os("CODEX_HOME");
         let env_home = std::env::var_os("HOME");
         resolve_codex_control_socket(
             env_sock.as_deref(),
             env_codex_home.as_deref(),
-            home_dir.map(Path::as_os_str).or(env_home.as_deref()),
+            env_home.as_deref(),
         )
     }
 }
@@ -224,7 +249,14 @@ impl VendorHostAdapter for CodexHostAdapter {
                 format!("model_reasoning_effort=\"{level}\""),
             ]);
         }
-        argv.push(request.initial_prompt.clone());
+        if !request.initial_prompt.trim().is_empty() {
+            let prompt = if request.initial_prompt.starts_with('-') {
+                format!("Prompt: {}", request.initial_prompt)
+            } else {
+                request.initial_prompt.clone()
+            };
+            argv.push(prompt);
+        }
 
         Ok(VendorLaunchPlan {
             vendor_id: self.vendor_id().to_string(),
@@ -523,6 +555,76 @@ impl VendorHostAdapter for CodexHostAdapter {
 // Single Codex app-server Unix WebSocket (RFC 6455) JSON-RPC writer
 // ---------------------------------------------------------------------------
 
+#[cfg(not(unix))]
+const NON_UNIX_CONTROL_SOCKET_REASON: &str = "codex unix:// control socket requires a Unix host";
+
+/// Probe `thread/read` over the Codex app-server control socket and map `thread.status.type`
+/// into [`AdapterReadiness`].
+#[cfg(not(unix))]
+pub fn probe_codex_thread_readiness(
+    _sock: &Path,
+    _thread_id: &str,
+    _timeout: Duration,
+) -> Result<AdapterReadiness, String> {
+    Err(NON_UNIX_CONTROL_SOCKET_REASON.to_string())
+}
+
+/// Submit a turn (or `/compact` via `thread/compact/start`) over the Codex app-server control
+/// socket.
+#[cfg(not(unix))]
+pub fn submit_codex_turn(
+    _sock: &Path,
+    _thread_id: &str,
+    _text: &str,
+    _timeout: Duration,
+) -> TurnDeliveryOutcome {
+    TurnDeliveryOutcome::Rejected {
+        reason: NON_UNIX_CONTROL_SOCKET_REASON.to_string(),
+    }
+}
+
+/// Steer an active turn over the Codex app-server control socket using `expectedTurnId`.
+#[cfg(not(unix))]
+pub fn steer_codex_turn(
+    _sock: &Path,
+    _thread_id: &str,
+    _expected_turn_id: Option<&str>,
+    _text: &str,
+    _timeout: Duration,
+) -> TurnDeliveryOutcome {
+    TurnDeliveryOutcome::Rejected {
+        reason: NON_UNIX_CONTROL_SOCKET_REASON.to_string(),
+    }
+}
+
+/// Interrupt an active turn on `thread_id` via `turn/interrupt` over the Codex app-server control socket.
+#[cfg(not(unix))]
+pub fn interrupt_codex_turn(
+    _sock: &Path,
+    _thread_id: &str,
+    _turn_id: Option<&str>,
+    _timeout: Duration,
+) -> TurnDeliveryOutcome {
+    TurnDeliveryOutcome::Rejected {
+        reason: NON_UNIX_CONTROL_SOCKET_REASON.to_string(),
+    }
+}
+
+/// Archive `thread_id` using the native `thread/archive` JSON-RPC method over the Codex
+/// app-server control socket, scoped strictly to `thread_id`.
+#[cfg(not(unix))]
+pub fn archive_codex_thread(
+    _sock: &Path,
+    _thread_id: &str,
+    _timeout: Duration,
+) -> Result<TeardownOutcome, VendorAdapterError> {
+    Err(VendorAdapterError::Transport {
+        vendor: "codex".into(),
+        reason: NON_UNIX_CONTROL_SOCKET_REASON.to_string(),
+    })
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcStage {
     Connect,
@@ -537,6 +639,7 @@ enum RpcStage {
     ThreadArchive,
 }
 
+#[cfg(unix)]
 impl RpcStage {
     const fn as_str(self) -> &'static str {
         match self {
@@ -563,6 +666,7 @@ impl RpcStage {
 
 /// Probe `thread/read` over the Codex app-server control socket and map `thread.status.type`
 /// into [`AdapterReadiness`].
+#[cfg(unix)]
 pub fn probe_codex_thread_readiness(
     sock: &Path,
     thread_id: &str,
@@ -600,6 +704,7 @@ pub fn probe_codex_thread_readiness(
 /// `canAcceptDirectInput == true` before writing `turn/start`. Any failure before the mutating
 /// write returns [`TurnDeliveryOutcome::Rejected`]; any transport or unverified error after the
 /// mutating write begins returns [`TurnDeliveryOutcome::OutcomeUnknown`].
+#[cfg(unix)]
 pub fn submit_codex_turn(
     sock: &Path,
     thread_id: &str,
@@ -732,6 +837,7 @@ pub fn submit_codex_turn(
 /// Preflights via `thread/read` (`status.type == "active"` and `canAcceptDirectInput == true`)
 /// and `thread/turns/list` (`status == "inProgress"`). When `expected_turn_id` is supplied by
 /// the caller, verifies that the server's active turn matches it before sending `turn/steer`.
+#[cfg(unix)]
 pub fn steer_codex_turn(
     sock: &Path,
     thread_id: &str,
@@ -887,6 +993,7 @@ pub fn steer_codex_turn(
 }
 
 /// Interrupt an active turn on `thread_id` via `turn/interrupt` over the Codex app-server control socket.
+#[cfg(unix)]
 pub fn interrupt_codex_turn(
     sock: &Path,
     thread_id: &str,
@@ -933,6 +1040,7 @@ pub fn interrupt_codex_turn(
 
 /// Archive `thread_id` using the native `thread/archive` JSON-RPC method over the Codex
 /// app-server control socket, scoped strictly to `thread_id`.
+#[cfg(unix)]
 pub fn archive_codex_thread(
     sock: &Path,
     thread_id: &str,
@@ -979,17 +1087,20 @@ pub fn archive_codex_thread(
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutcomeClass {
     Rejected,
     Unknown,
 }
 
+#[cfg(unix)]
 struct BoundedWriter<W> {
     inner: W,
     left: usize,
 }
 
+#[cfg(unix)]
 impl<W: Write> Write for BoundedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() > self.left {
@@ -1005,6 +1116,7 @@ impl<W: Write> Write for BoundedWriter<W> {
     }
 }
 
+#[cfg(unix)]
 fn encode_turn_start_request(
     writer: impl Write,
     id: u8,
@@ -1048,6 +1160,7 @@ fn encode_turn_start_request(
     .map_err(|_| format!("Codex turn/start request exceeds {MAX_RPC_REQUEST} bytes"))
 }
 
+#[cfg(unix)]
 fn encode_compact_request(writer: impl Write, id: u8, thread_id: &str) -> Result<(), String> {
     #[derive(Serialize)]
     struct Request<'a> {
@@ -1074,6 +1187,7 @@ fn encode_compact_request(writer: impl Write, id: u8, thread_id: &str) -> Result
     .map_err(|_| format!("Codex thread/compact/start request exceeds {MAX_RPC_REQUEST} bytes"))
 }
 
+#[cfg(unix)]
 fn encode_turn_steer_request(
     writer: impl Write,
     id: u8,
@@ -1438,6 +1552,7 @@ impl Conn {
     }
 }
 
+#[cfg(unix)]
 fn read_http_headers<R: Read>(reader: &mut R) -> Result<String, String> {
     let mut buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
@@ -1463,6 +1578,7 @@ fn read_http_headers<R: Read>(reader: &mut R) -> Result<String, String> {
     Err("Codex app-server WebSocket handshake failed: HTTP headers exceeded 16 KB".to_string())
 }
 
+#[cfg(unix)]
 pub(crate) fn compute_accept_key(sec_key: &str) -> String {
     let mut input = Vec::with_capacity(sec_key.len() + WS_GUID.len());
     input.extend_from_slice(sec_key.trim().as_bytes());
@@ -1472,6 +1588,7 @@ pub(crate) fn compute_accept_key(sec_key: &str) -> String {
 }
 
 /// Compact RFC 3174 SHA-1 implementation used solely for RFC 6455 `Sec-WebSocket-Accept`.
+#[cfg(unix)]
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
     let mut h0: u32 = 0x67452301;
     let mut h1: u32 = 0xEFCDAB89;
@@ -1538,6 +1655,7 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     out
 }
 
+#[cfg(unix)]
 fn describe_rpc_error(error: &Value) -> String {
     let message: Option<String> = error
         .get("message")
@@ -1553,6 +1671,7 @@ fn describe_rpc_error(error: &Value) -> String {
     truncate(&text, MAX_ERROR_TEXT)
 }
 
+#[cfg(unix)]
 fn close_error(payload: &[u8]) -> String {
     match payload {
         [hi, lo, ..] => format!(
@@ -1563,6 +1682,7 @@ fn close_error(payload: &[u8]) -> String {
     }
 }
 
+#[cfg(unix)]
 fn truncate(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).collect();
     if text.chars().count() > max_chars {
@@ -1571,10 +1691,12 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
+#[cfg(unix)]
 fn timed_out() -> String {
     "timed out waiting for the Codex app-server".to_string()
 }
 
+#[cfg(unix)]
 fn io_failure(doing: &str, e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => timed_out(),
@@ -1582,6 +1704,7 @@ fn io_failure(doing: &str, e: &io::Error) -> String {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 struct Frame {
     fin: bool,
@@ -1589,6 +1712,7 @@ struct Frame {
     payload: Vec<u8>,
 }
 
+#[cfg(unix)]
 fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(14 + payload.len());
     out.push(0x80 | opcode);
@@ -1607,6 +1731,7 @@ fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
     out
 }
 
+#[cfg(unix)]
 fn decode_server_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, String> {
     if buf.len() < 2 {
         return Ok(None);
@@ -1869,6 +1994,25 @@ mod tests {
         assert!(
             plan.env.iter().all(|(k, _)| k != "AGENT_PERSONA"),
             "shared codex app-server must never receive AGENT_PERSONA"
+        );
+
+        let dash_req = VendorLaunchRequest {
+            initial_prompt: "-m injected".into(),
+            ..req
+        };
+        let dash_plan = adapter.prepare_launch(&dash_req).unwrap();
+        assert_eq!(dash_plan.argv.last().unwrap(), "Prompt: -m injected");
+    }
+
+    #[test]
+    fn resolve_control_socket_path_prefers_hermetic_home_dir_over_ambient_env() {
+        let adapter = CodexHostAdapter::new();
+        let sock = adapter
+            .resolve_control_socket_path(None, Some(Path::new("/tmp/hermetic-home")))
+            .expect("hermetic home_dir resolves control socket path");
+        assert_eq!(
+            sock,
+            PathBuf::from("/tmp/hermetic-home/.codex/app-server-control/app-server-control.sock")
         );
     }
 
