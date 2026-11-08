@@ -2951,34 +2951,62 @@ fn partial_event_cannot_advance_emitted_ceiling() {
     let stream = reliable_spawn(&mut rpc, "partial", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = ticket(&mut rpc, &stream, lease, 0);
+
+    // Keep the event socket unopened so stdout reads can coalesce into one
+    // unexposed record. An active replay could expose a short unterminated read.
+    for line in ["x".repeat(60 * 1024), "sentinel".into()] {
+        assert_eq!(
+            extended(
+                &mut rpc,
+                XReq::SendLine {
+                    stream: stream.clone(),
+                    lease,
+                    line
+                }
+            ),
+            XResp::Input {
+                outcome: SendOutcome::Written
+            }
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let XResp::Sessions { records } = extended(&mut rpc, XReq::ListSessions) else {
+            panic!("list")
+        };
+        // Seq 1 is Spawned, seq 2 is READY. The sentinel at seq 4 proves
+        // the newline ending the 60 KiB record at seq 3 has been consumed.
+        if records.iter().any(|r| r.stream == stream && r.latest >= 4) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "large record and sentinel not retained for {stream:?}: {records:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    arm(&daemon.paths.subscriber, "reliable-after-part");
     let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
     assert_eq!(event_seq(&rt, &mut events, 0), 1);
     assert_eq!(event_seq(&rt, &mut events, 1), 2);
-    arm(&daemon.paths.subscriber, "reliable-after-part");
-    let text = "x".repeat(60 * 1024);
-    assert_eq!(
-        extended(
-            &mut rpc,
-            XReq::SendLine {
-                stream: stream.clone(),
-                lease,
-                line: text
+    let frame = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), events.next_frame())
+            .await
+            .expect("first fragment deadline")
+            .expect("first fragment")
+    });
+    assert!(
+        matches!(
+            &frame,
+            fl_host_proto::ExtensionFrame::ReliablePart {
+                terminated: true,
+                seq: 3,
+                more: true,
+                ..
             }
         ),
-        XResp::Input {
-            outcome: SendOutcome::Written
-        }
+        "expected first nonfinal part of terminated seq 3; actual frame: {frame:?}"
     );
-    let frame = rt.block_on(events.next_frame()).expect("first fragment");
-    assert!(matches!(
-        frame,
-        fl_host_proto::ExtensionFrame::ReliablePart {
-            terminated: true,
-            seq: 3,
-            more: true,
-            ..
-        }
-    ));
     wait_at(&daemon.paths.subscriber, "reliable-after-part");
     assert_eq!(
         ack(&mut rpc, &stream, lease, 3),
