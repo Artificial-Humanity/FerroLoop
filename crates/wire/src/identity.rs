@@ -369,6 +369,39 @@ pub fn legacy_routes_path() -> Option<PathBuf> {
 fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &VendorRoute) {
     match (target_route, fallback_route) {
         (
+            VendorRoute::Agy {
+                ls_pid: dst_pid,
+                ls_address: dst_addr,
+                csrf_token: dst_csrf,
+                agentapi_exe: dst_exe,
+                ..
+            },
+            VendorRoute::Agy {
+                ls_pid: src_pid,
+                ls_address: src_addr,
+                csrf_token: src_csrf,
+                agentapi_exe: src_exe,
+                ..
+            },
+        ) => {
+            let dst_has_live_pair = dst_addr.as_deref().is_some_and(agy_ls_address_listening)
+                && dst_csrf.as_deref().is_some_and(|t| !t.trim().is_empty());
+            let src_has_live_pair = src_addr.as_deref().is_some_and(agy_ls_address_listening)
+                && src_csrf.as_deref().is_some_and(|t| !t.trim().is_empty());
+            if !dst_has_live_pair && src_has_live_pair {
+                *dst_addr = src_addr.clone();
+                *dst_csrf = src_csrf.clone();
+                if dst_pid.is_none() {
+                    *dst_pid = *src_pid;
+                }
+            }
+            if dst_exe.as_ref().is_none_or(|path| !agy_exe_is_usable(path))
+                && src_exe.as_ref().is_some_and(|path| agy_exe_is_usable(path))
+            {
+                *dst_exe = src_exe.clone();
+            }
+        }
+        (
             VendorRoute::Muse {
                 tmux_target: dst_target,
                 tmux_pane: dst_pane,
@@ -503,35 +536,62 @@ pub fn agy_ls_address_listening(addr: &str) -> bool {
 }
 
 /// Read one `/proc/<pid>/environ` blob. A language-server address is kept only
-/// when its port is listening, and an `agentapi` path is kept only when the
-/// file is usable. Dead `bwrap` ports and unlinked `.old` binaries are skipped
-/// so a later process can still supply the live values.
+/// when its port is listening, a CSRF token is kept only as a pair with a live
+/// listening language-server address from that same process, and an `agentapi`
+/// path is kept only when the file is usable. Dead `bwrap` ports and unlinked
+/// `.old` binaries are skipped so a later process can still supply the live values.
 fn note_agy_proc_env(
     env_bytes: &[u8],
     shared_csrf: &mut Option<String>,
     shared_ls_addr: &mut Option<String>,
     shared_exe: &mut Option<PathBuf>,
 ) {
+    let mut proc_csrf: Option<&str> = None;
+    let mut proc_ls_addr: Option<&str> = None;
+    let mut proc_exe: Option<&str> = None;
     for kv in env_bytes.split(|&b| b == 0) {
         let Ok(kv_str) = std::str::from_utf8(kv) else {
             continue;
         };
-        if shared_csrf.is_none()
+        if proc_csrf.is_none()
             && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_CSRF_TOKEN=")
-            && !val.is_empty()
+            && !val.trim().is_empty()
         {
-            *shared_csrf = Some(val.to_string());
-        } else if shared_ls_addr.is_none()
+            proc_csrf = Some(val);
+        } else if proc_ls_addr.is_none()
             && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_LS_ADDRESS=")
-            && !val.is_empty()
+            && !val.trim().is_empty()
             && agy_ls_address_listening(val)
         {
-            *shared_ls_addr = Some(val.to_string());
-        } else if shared_exe.is_none()
+            proc_ls_addr = Some(val);
+        } else if proc_exe.is_none()
             && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_AGENTAPI_EXE=")
             && agy_exe_is_usable(Path::new(val))
         {
-            *shared_exe = Some(PathBuf::from(val));
+            proc_exe = Some(val);
+        }
+    }
+    if shared_exe.is_none()
+        && let Some(exe) = proc_exe
+    {
+        *shared_exe = Some(PathBuf::from(exe));
+    }
+    if let Some(addr) = proc_ls_addr {
+        if let Some(existing_addr) = shared_ls_addr.as_deref() {
+            if shared_csrf.is_none()
+                && let Some(csrf) = proc_csrf
+                && agy_ls_port(existing_addr).is_some()
+                && agy_ls_port(existing_addr) == agy_ls_port(addr)
+            {
+                *shared_csrf = Some(csrf.to_string());
+            }
+        } else {
+            *shared_ls_addr = Some(addr.to_string());
+            if shared_csrf.is_none()
+                && let Some(csrf) = proc_csrf
+            {
+                *shared_csrf = Some(csrf.to_string());
+            }
         }
     }
 }
@@ -1207,6 +1267,8 @@ impl RouteTable {
         }
 
         // 3. Fall back to existing Agy entries ordered from newest updated_at to oldest.
+        // Keep `(ls_address, csrf_token)` paired to the same endpoint so a `cli.log` port from one
+        // process is never mixed with a CSRF token from a different session's language server.
         let mut agy_entries: Vec<&RouteEntry> = self
             .entries
             .values()
@@ -1221,15 +1283,24 @@ impl RouteTable {
                 ..
             } = &entry.route
             {
-                if shared_ls_addr.is_none()
-                    && let Some(addr) = ls_address
-                        .as_ref()
-                        .filter(|addr| !check_proc || agy_ls_address_listening(addr))
+                let live_addr = ls_address.as_ref().filter(|addr| {
+                    !addr.trim().is_empty() && (!check_proc || agy_ls_address_listening(addr))
+                });
+                let valid_csrf = csrf_token.as_ref().filter(|t| !t.trim().is_empty());
+                if shared_ls_addr.is_none() {
+                    if let Some(addr) = live_addr {
+                        shared_ls_addr = Some(addr.clone());
+                        if shared_csrf.is_none() {
+                            shared_csrf = valid_csrf.cloned();
+                        }
+                    }
+                } else if shared_csrf.is_none()
+                    && let (Some(current_addr), Some(entry_addr), Some(csrf)) =
+                        (shared_ls_addr.as_deref(), live_addr, valid_csrf)
+                    && agy_ls_port(current_addr).is_some()
+                    && agy_ls_port(current_addr) == agy_ls_port(entry_addr)
                 {
-                    shared_ls_addr = Some(addr.clone());
-                }
-                if shared_csrf.is_none() {
-                    shared_csrf = csrf_token.clone();
+                    shared_csrf = Some(csrf.clone());
                 }
                 if shared_exe.is_none()
                     && let Some(exe) = agentapi_exe.as_ref().filter(|path| agy_exe_is_usable(path))
@@ -1239,8 +1310,10 @@ impl RouteTable {
             }
         }
 
-        // 4. Propagate the live/newest shared ls_address and csrf_token across all Agy routes
-        // so pre-reboot entries do not retain stale language-server ports or CSRF tokens.
+        // 4. Propagate the live/newest shared ls_address and csrf_token across Agy routes that do
+        // not already hold a live listening `(ls_address, csrf_token)` pair of their own, so
+        // pre-reboot entries do not retain stale language-server ports or CSRF tokens while live
+        // standalone `fl-host` Antigravity sessions keep their own paired endpoint.
         // Replace a missing or `.old` agentapi binary. A usable exe already on the route stays.
         // Host `ANTIGRAVITY_AGENTAPI_EXE` is consulted only for live `/proc` discovery so a
         // temp-home unit test does not pick up the machine's binary.
@@ -1261,17 +1334,28 @@ impl RouteTable {
             } = &mut entry.route
             {
                 let before = (ls_address.clone(), csrf_token.clone(), agentapi_exe.clone());
-                if shared_ls_addr.is_some() {
-                    *ls_address = shared_ls_addr.clone();
-                } else if check_proc
-                    && ls_address
-                        .as_deref()
-                        .is_some_and(|addr| !agy_ls_address_listening(addr))
-                {
-                    *ls_address = None;
-                }
-                if shared_csrf.is_some() {
-                    *csrf_token = shared_csrf.clone();
+                let has_live_paired_endpoint =
+                    ls_address.as_deref().is_some_and(agy_ls_address_listening)
+                        && csrf_token
+                            .as_deref()
+                            .is_some_and(|token| !token.trim().is_empty());
+                if !has_live_paired_endpoint {
+                    if shared_ls_addr.is_some() {
+                        *ls_address = shared_ls_addr.clone();
+                    } else if check_proc
+                        && ls_address
+                            .as_deref()
+                            .is_some_and(|addr| !agy_ls_address_listening(addr))
+                    {
+                        *ls_address = None;
+                    }
+                    if shared_csrf.is_some() {
+                        *csrf_token = shared_csrf.clone();
+                    } else if before.0.as_deref().and_then(agy_ls_port)
+                        != ls_address.as_deref().and_then(agy_ls_port)
+                    {
+                        *csrf_token = None;
+                    }
                 }
                 if agentapi_exe
                     .as_ref()
@@ -5373,20 +5457,169 @@ mod tests {
             old.display()
         );
         note_agy_proc_env(dead_env.as_bytes(), &mut csrf, &mut addr, &mut exe);
-        assert_eq!(csrf.as_deref(), Some("csrf-1"));
+        assert!(
+            csrf.is_none(),
+            "csrf token from a process with a dead port must not be kept"
+        );
         assert!(addr.is_none());
         assert!(exe.is_none());
 
         let live_env = format!(
-            "ANTIGRAVITY_LS_ADDRESS=127.0.0.1:{live_port}\0ANTIGRAVITY_AGENTAPI_EXE={}\0",
+            "ANTIGRAVITY_CSRF_TOKEN=csrf-live\0ANTIGRAVITY_LS_ADDRESS=127.0.0.1:{live_port}\0ANTIGRAVITY_AGENTAPI_EXE={}\0",
             good.display()
         );
         note_agy_proc_env(live_env.as_bytes(), &mut csrf, &mut addr, &mut exe);
+        assert_eq!(csrf.as_deref(), Some("csrf-live"));
         assert_eq!(
             addr.as_deref(),
             Some(format!("127.0.0.1:{live_port}").as_str())
         );
         assert_eq!(exe.as_deref(), Some(good.as_path()));
+    }
+
+    #[test]
+    fn note_agy_proc_env_never_mixes_cli_log_address_with_unpaired_csrf_token() {
+        let live1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port1 = live1.local_addr().unwrap().port();
+        let live2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = live2.local_addr().unwrap().port();
+
+        // Start with an unpaired address from cli.log.
+        let mut addr = Some(format!("127.0.0.1:{port1}"));
+        let mut csrf = None;
+        let mut exe = None;
+
+        // A process with only ANTIGRAVITY_CSRF_TOKEN (no ANTIGRAVITY_LS_ADDRESS) must not
+        // attach its CSRF token to the unrelated cli.log address.
+        note_agy_proc_env(
+            b"ANTIGRAVITY_CSRF_TOKEN=orphan-csrf\0",
+            &mut csrf,
+            &mut addr,
+            &mut exe,
+        );
+        assert!(csrf.is_none());
+        assert_eq!(addr.as_deref(), Some(format!("127.0.0.1:{port1}").as_str()));
+
+        // A process on a different port (port2) must not mix its CSRF token with port1.
+        let other_port_env =
+            format!("ANTIGRAVITY_LS_ADDRESS=127.0.0.1:{port2}\0ANTIGRAVITY_CSRF_TOKEN=csrf-p2\0");
+        note_agy_proc_env(other_port_env.as_bytes(), &mut csrf, &mut addr, &mut exe);
+        assert_eq!(addr.as_deref(), Some(format!("127.0.0.1:{port1}").as_str()));
+        assert!(csrf.is_none());
+
+        // A process whose ANTIGRAVITY_LS_ADDRESS matches port1 supplies its paired CSRF token.
+        let matching_port_env =
+            format!("ANTIGRAVITY_LS_ADDRESS=localhost:{port1}\0ANTIGRAVITY_CSRF_TOKEN=csrf-p1\0");
+        note_agy_proc_env(matching_port_env.as_bytes(), &mut csrf, &mut addr, &mut exe);
+        assert_eq!(addr.as_deref(), Some(format!("127.0.0.1:{port1}").as_str()));
+        assert_eq!(csrf.as_deref(), Some("csrf-p1"));
+    }
+
+    #[test]
+    fn discover_agy_routes_preserves_live_listening_route_pair_and_never_mixes_endpoints() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        fs::create_dir_all(agy_dir.join("brain")).unwrap();
+
+        let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let daemon_port = daemon_listener.local_addr().unwrap().port();
+        let feira_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let feira_port = feira_listener.local_addr().unwrap().port();
+
+        fs::write(
+            agy_dir.join("cli.log"),
+            format!("Language server listening on random port at {daemon_port} for HTTP\n"),
+        )
+        .unwrap();
+
+        let feira_addr = format!("127.0.0.1:{feira_port}");
+        let mut table = RouteTable::default();
+        // Feira has her own standalone live language server and CSRF token.
+        table.upsert_explicit(
+            "feira",
+            VendorRoute::Agy {
+                conversation_id: "conv-feira".into(),
+                ls_pid: Some(4242),
+                ls_address: Some(feira_addr.clone()),
+                csrf_token: Some("csrf-feira-live".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(200),
+        );
+        // Kayla has a dead port and stale CSRF token.
+        table.upsert_explicit(
+            "kayla",
+            VendorRoute::Agy {
+                conversation_id: "conv-kayla".into(),
+                ls_pid: None,
+                ls_address: Some("127.0.0.1:1".into()),
+                csrf_token: Some("csrf-kayla-dead".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(100),
+        );
+
+        table.discover_agy_routes(home, false, &At::from_unix_millis(300));
+
+        // Feira's live listening (ls_address, csrf_token) pair is preserved untouched.
+        match &table.get("feira").expect("feira route").route {
+            VendorRoute::Agy {
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(ls_address.as_deref(), Some(feira_addr.as_str()));
+                assert_eq!(csrf_token.as_deref(), Some("csrf-feira-live"));
+            }
+            other => panic!("expected Agy route for feira, got {other:?}"),
+        }
+
+        // Kayla gets the cli.log daemon port, and must NOT steal Feira's CSRF token or retain
+        // her own dead-port CSRF token.
+        match &table.get("kayla").expect("kayla route").route {
+            VendorRoute::Agy {
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(
+                    ls_address.as_deref(),
+                    Some(format!("127.0.0.1:{daemon_port}").as_str())
+                );
+                assert!(
+                    csrf_token.is_none(),
+                    "must not mix daemon cli.log port with another process's csrf_token, got {csrf_token:?}"
+                );
+            }
+            other => panic!("expected Agy route for kayla, got {other:?}"),
+        }
+
+        // Upserting Feira with empty ls_address/csrf_token preserves her live listening pair.
+        table.upsert(
+            "feira",
+            VendorRoute::Agy {
+                conversation_id: "conv-feira".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(400),
+        );
+        match &table.get("feira").expect("feira route after upsert").route {
+            VendorRoute::Agy {
+                ls_address,
+                csrf_token,
+                ls_pid,
+                ..
+            } => {
+                assert_eq!(ls_address.as_deref(), Some(feira_addr.as_str()));
+                assert_eq!(csrf_token.as_deref(), Some("csrf-feira-live"));
+                assert_eq!(*ls_pid, Some(4242));
+            }
+            other => panic!("expected Agy route for feira, got {other:?}"),
+        }
     }
 
     #[test]
