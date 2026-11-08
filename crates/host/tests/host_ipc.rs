@@ -1189,49 +1189,66 @@ fn status_field(text: &str, key: &str) -> usize {
 
 #[test]
 fn healthy_subscriber_receives_single_buffered_line_burst() {
+    healthy_subscribers_receive_buffered_line_burst(1);
+}
+
+#[test]
+fn two_healthy_subscribers_receive_single_buffered_line_burst() {
+    healthy_subscribers_receive_buffered_line_burst(2);
+}
+
+fn healthy_subscribers_receive_buffered_line_burst(subscriber_count: usize) {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let endpoint = &daemon.paths.endpoint;
-    let events = EventLog::subscribe(endpoint, Some("burst"));
+    let subscribers: Vec<_> = (0..subscriber_count)
+        .map(|_| EventLog::subscribe(endpoint, Some("burst")))
+        .collect();
     let mut rpc = Rpc::connect(endpoint);
     let gate = daemon.paths.barrier.join("burst");
     let child = rpc.spawn("burst", &["gated-line-burst", gate.to_str().unwrap()]);
-    events.wait_until(Duration::from_secs(3), |events| {
-        line_bytes(events, "burst").contains(&b"READY".to_vec())
-    });
+    for events in &subscribers {
+        events.wait_until(Duration::from_secs(3), |events| {
+            line_bytes(events, "burst").contains(&b"READY".to_vec())
+        });
+    }
     std::fs::write(gate, b"go").unwrap();
-    let received = events.wait_until(Duration::from_secs(3), |events| {
-        let lines = line_bytes(events, "burst");
-        lines.iter().any(|line| line == b"L255")
-            || events
+    for events in &subscribers {
+        let received = events.wait_until(Duration::from_secs(3), |events| {
+            let lines = line_bytes(events, "burst");
+            lines.iter().any(|line| line == b"L255")
+                || events
+                    .iter()
+                    .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+        });
+        assert!(
+            !received
                 .iter()
                 .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
-    });
-    assert!(
-        !received
-            .iter()
-            .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
-    );
-    let actual: Vec<_> = line_bytes(&received, "burst")
-        .into_iter()
-        .filter(|line| line.starts_with(b"L"))
-        .collect();
-    let expected: Vec<_> = (0..256).map(|i| format!("L{i:03}").into_bytes()).collect();
-    assert_eq!(actual, expected);
-    // A subsequent echo proves the same subscription remains attached.
+        );
+        let actual: Vec<_> = line_bytes(&received, "burst")
+            .into_iter()
+            .filter(|line| line.starts_with(b"L"))
+            .collect();
+        let expected: Vec<_> = (0..256).map(|i| format!("L{i:03}").into_bytes()).collect();
+        assert_eq!(actual, expected);
+    }
+    // A subsequent echo proves every subscription remains attached.
     let epoch = epoch_of(&child);
     let lease = rpc.claim("burst", epoch).expect("lease");
     assert_eq!(
         rpc.send("burst", epoch, lease, "AFTER"),
         SendOutcome::Written
     );
-    let received = events.wait_until(Duration::from_secs(3), |events| {
-        line_bytes(events, "burst").contains(&b"AFTER".to_vec())
-    });
-    assert!(
-        !received
-            .iter()
-            .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
-    );
+    for events in &subscribers {
+        let received = events.wait_until(Duration::from_secs(3), |events| {
+            line_bytes(events, "burst").contains(&b"AFTER".to_vec())
+        });
+        assert!(
+            !received
+                .iter()
+                .any(|e| matches!(e, HostEvent::Control(ControlEvent::SlowSubscriber { .. })))
+        );
+    }
 }
 
 #[test]

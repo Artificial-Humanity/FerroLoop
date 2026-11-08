@@ -632,11 +632,16 @@ impl OutputSession {
     }
 
     fn deliver_pending(&self) {
-        // EOF can leave an admitted read parked behind the record cap. Retry
-        // only one record here so the subscriber can return to socket writes.
-        self.flush_one();
         let _order = self.lock_order();
         let key = (self.session.session.as_str().to_owned(), self.session.epoch);
+        // EOF can leave an admitted read parked behind the record cap. Help by
+        // at most one record, but yield immediately when writers are backlogged:
+        // each publication fans out to all of them, not just this writer.
+        // Keep the pressure check under `order` so concurrent catchup cannot
+        // each publish against the same available capacity.
+        if !self.hub.all_backlogged(&key) {
+            self.flush_one_locked();
+        }
         let (pending, next_seq) = {
             let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
             (inner.events.clone(), self.seq.load(Ordering::SeqCst))
@@ -843,6 +848,11 @@ impl OutputSession {
     /// producer and catch-up workers can help drain parked bytes between writes.
     fn flush_one(&self) -> bool {
         let _order = self.lock_order();
+        self.flush_one_locked()
+    }
+
+    /// Caller holds `order` through parsing and publication.
+    fn flush_one_locked(&self) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         if inner.staging.is_empty() {
             return false;
@@ -1235,6 +1245,51 @@ mod tests {
         assert_eq!(got.len(), (MAX_EVENTS - 1) * 2 + 3);
         assert!(got.ends_with(b"a\nb"));
         sub.abandon(&hub);
+    }
+
+    #[test]
+    fn healthy_subscribers_drain_buffered_burst_without_catchup_amplification() {
+        let hub = Arc::new(Hub::new());
+        let out = fixture(1, &hub);
+        let first = hub.subscribe(None, None).ok().unwrap();
+        let second = hub.subscribe(None, None).ok().unwrap();
+        let expected: Vec<u8> = (0..256)
+            .flat_map(|i| format!("L{i:03}\n").into_bytes())
+            .collect();
+        out.inner.lock().unwrap().staging = expected.clone();
+        // Pause the producer where it yields to backlogged subscribers. Every
+        // subsequent step is one successful write followed by normal catchup.
+        for _ in 0..SUB_QUEUE / 2 {
+            assert!(out.flush_one());
+        }
+        let mut received = [Vec::new(), Vec::new()];
+        for seq in 1..=256 {
+            for (sub, bytes) in [&first, &second].into_iter().zip(&mut received) {
+                assert!(
+                    !sub.want_slow(&hub),
+                    "healthy subscriber marked slow at {seq}"
+                );
+                let event = sub.next_event(&hub).expect("buffered line");
+                assert_eq!(event.seq, seq);
+                let Body::Line(raw) = &event.body else {
+                    panic!("expected stdout");
+                };
+                assert!(event.terminated);
+                bytes.extend_from_slice(raw);
+                bytes.push(b'\n');
+                sub.pop_sent(&hub, &event);
+                settle(&event, true);
+                hub.pull_preexisting();
+            }
+        }
+        for (sub, bytes) in [first, second].into_iter().zip(received) {
+            assert_eq!(bytes, expected);
+            assert!(!sub.want_slow(&hub));
+            assert!(sub.next_event(&hub).is_none());
+            sub.abandon(&hub);
+        }
+        assert!(out.inner.lock().unwrap().staging.is_empty());
+        assert!(out.inner.lock().unwrap().events.is_empty());
     }
 
     #[test]
