@@ -4,12 +4,34 @@
 use std::io::{self, Read, Write};
 use std::process::exit;
 
+#[path = "../../tests/support/flood.rs"]
+mod safety_flood;
+
 fn main() {
     let mut args = std::env::args();
     let _argv0 = args.next();
     let mode = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
     match mode.as_str() {
+        "safety-flood" => {
+            ready();
+            let gate = std::path::Path::new(rest.first().expect("producer gate"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !gate.exists() {
+                assert!(std::time::Instant::now() < deadline, "producer gate");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut out = io::stdout().lock();
+            for index in 0..safety_flood::LINES {
+                out.write_all(&safety_flood::line(index))
+                    .expect("flood line");
+                out.write_all(b"\n").expect("flood newline");
+            }
+            writeln!(out, "{}", safety_flood::FINAL).expect("final marker");
+            out.flush().expect("flood flush");
+            std::fs::write(rest.get(1).expect("completion file"), b"flushed").unwrap();
+            park();
+        }
         "reliable-controller" => reliable_controller(rest.first().expect("controller config")),
         "reliable-gated-maxline" => {
             ready();

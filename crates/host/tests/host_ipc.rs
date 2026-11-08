@@ -3904,3 +3904,171 @@ fn pipe_modes_report_current_device_truth() {
             .is_err()
     );
 }
+
+#[path = "support/flood.rs"]
+mod safety_flood;
+
+fn safety_flood_bounds(daemon: &Daemon) {
+    let status = backlog_status::wait_record(
+        &daemon.paths.status,
+        0,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(status_field(&status, "events") <= 4096, "{status}");
+    assert!(
+        status_field(&status, "charge") <= 8 * 1024 * 1024,
+        "{status}"
+    );
+    assert!(status_field(&status, "raw") > 7 * 1024 * 1024, "{status}");
+    #[cfg(target_os = "linux")]
+    {
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", daemon.child.id())).unwrap();
+        let kb: usize = status
+            .lines()
+            .find_map(|s| s.strip_prefix("VmRSS:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(kb < 128 * 1024, "daemon RSS {kb} KiB");
+    }
+}
+
+fn wait_safety_stall(rpc: &mut Rpc) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let children = rpc.list();
+        let state = &find(&children, "safety-flood").state;
+        assert!(matches!(state, ChildState::Running(_)));
+        if record(state).consumer_stalled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "producer never reached bounded stall"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let gate = daemon.paths.barrier.join("produce");
+    let done = daemon.paths.barrier.join("flushed");
+    rpc.spawn(
+        "safety-flood",
+        &[
+            "safety-flood",
+            gate.to_str().unwrap(),
+            done.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(&gate, b"go").unwrap();
+    wait_safety_stall(&mut rpc);
+    safety_flood_bounds(&daemon);
+    assert!(
+        !done.exists(),
+        "lossless unattended producer should be backpressured"
+    );
+    assert!(
+        !BlockingHostClient::connect(&daemon.paths.endpoint)
+            .unwrap()
+            .capture_output(sid("safety-flood"), 4096)
+            .unwrap()
+            .contains(safety_flood::FINAL)
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut events = fl_host_proto::events(&daemon.paths.endpoint, Some(sid("safety-flood")))
+            .await
+            .unwrap();
+        let mut count = 0;
+        let mut bytes = 0;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.next().await.unwrap() {
+                    HostEvent::Line { bytes: line, .. }
+                        if line == safety_flood::FINAL.as_bytes() =>
+                    {
+                        break;
+                    }
+                    HostEvent::Line { bytes: line, .. } if line == b"READY" => {}
+                    HostEvent::Line { bytes: line, .. } => {
+                        assert_eq!(line, safety_flood::line(count), "record {count}");
+                        bytes += line.len();
+                        count += 1;
+                    }
+                    HostEvent::Control(ControlEvent::SlowSubscriber { .. }) => {
+                        panic!("draining subscriber was shed after {count} records ({bytes} bytes)")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("drain final marker");
+        assert_eq!(count, safety_flood::LINES);
+        assert_eq!(bytes, safety_flood::LINES * safety_flood::LINE_BYTES);
+        assert!(bytes > 8 * 1024 * 1024);
+    });
+    wait_file(&done, |b| b == b"flushed");
+    let tail = BlockingHostClient::connect(&daemon.paths.endpoint)
+        .unwrap()
+        .capture_output(sid("safety-flood"), 4096)
+        .unwrap();
+    assert!(tail.ends_with(&format!("{}\n", safety_flood::FINAL)));
+    assert!(!record(&find(&rpc.list(), "safety-flood").state).consumer_stalled);
+}
+
+#[test]
+fn safety_flood_legacy_held_subscriber_preserves_control_and_cleanup() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    arm(&daemon.paths.subscriber, "before-send-1");
+    let events = EventLog::subscribe(&daemon.paths.endpoint, Some("safety-flood"));
+    wait_file(&daemon.paths.subscriber.join("subscribed-1"), |b| b == b"1");
+    let gate = daemon.paths.barrier.join("produce");
+    let done = daemon.paths.barrier.join("flushed");
+    let child = rpc.spawn(
+        "safety-flood",
+        &[
+            "safety-flood",
+            gate.to_str().unwrap(),
+            done.to_str().unwrap(),
+        ],
+    );
+    wait_at(&daemon.paths.subscriber, "before-send-1");
+    std::fs::write(&gate, b"go").unwrap();
+    wait_safety_stall(&mut rpc);
+    safety_flood_bounds(&daemon);
+    assert!(!done.exists());
+    assert!(
+        !BlockingHostClient::connect(&daemon.paths.endpoint)
+            .unwrap()
+            .capture_output(sid("safety-flood"), 4096)
+            .unwrap()
+            .contains(safety_flood::FINAL)
+    );
+    let lease = rpc.claim("safety-flood", epoch_of(&child)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    rpc.kill("safety-flood", epoch_of(&child), Some(lease))
+        .unwrap();
+    while !matches!(
+        find(&rpc.list(), "safety-flood").state,
+        ChildState::CleanupComplete(_)
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "cleanup blocked behind held subscriber"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    release(&daemon.paths.subscriber, "before-send-1");
+    drop(events);
+}

@@ -211,14 +211,20 @@ impl Hub {
     }
 
     /// Caller holds the session `order` lock. Enqueue only the next per-epoch `seq`.
-    fn admit(&self, pending: &[Arc<Logical>], key: &StreamKey, next_seq: u64) {
+    fn admit(
+        &self,
+        pending: &[Arc<Logical>],
+        key: &StreamKey,
+        next_seq: u64,
+        fresh_index: Option<u64>,
+    ) {
         let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
         for sub in fanout.subs.iter_mut() {
             if sub.dropped || !sub.wants_key(key) {
                 continue;
             }
             prime_cursor(sub, key, pending, next_seq);
-            drive_cursor(sub, key, pending, next_seq);
+            drive_cursor(sub, key, pending, next_seq, fresh_index);
         }
         for sub in &fanout.subs {
             sub.wake.notify_all();
@@ -349,7 +355,13 @@ fn prime_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
 }
 
 /// Queue a prefix of this epoch. Stop when the next `seq` is missing or the budget is full.
-fn drive_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_seq: u64) {
+fn drive_cursor(
+    sub: &mut Sub,
+    key: &StreamKey,
+    pending: &[Arc<Logical>],
+    next_seq: u64,
+    fresh_index: Option<u64>,
+) {
     loop {
         if sub.dropped {
             return;
@@ -371,15 +383,24 @@ fn drive_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
             }
             return;
         };
-        if !offer(sub, key, cursor, &event) {
+        if !offer(sub, key, cursor, &event, fresh_index) {
             return;
         }
     }
 }
 
 /// `true` when the cursor advanced.
-fn offer(sub: &mut Sub, key: &StreamKey, cursor: u64, event: &Arc<Logical>) -> bool {
-    let preexisting = event.index < sub.subscribed_at;
+fn offer(
+    sub: &mut Sub,
+    key: &StreamKey,
+    cursor: u64,
+    event: &Arc<Logical>,
+    fresh_index: Option<u64>,
+) -> bool {
+    // Only fresh publication can establish live overflow. A record published
+    // while a subscriber was catching up remains bounded catchup on later
+    // passes, even when its index is newer than the subscription watermark.
+    let preexisting = event.index < sub.subscribed_at || fresh_index != Some(event.index);
     match assign(sub, event, preexisting) {
         Assign::Queued => {
             let Some(next) = cursor.checked_add(1) else {
@@ -626,7 +647,7 @@ impl OutputSession {
             (pending, self.seq.load(Ordering::SeqCst))
         };
         // Drop `inner` before admit takes subscriber track locks. `order` still covers publish.
-        self.hub.admit(&pending, &key, next_seq);
+        self.hub.admit(&pending, &key, next_seq, Some(index));
         self.cv.notify_all();
     }
 
@@ -645,7 +666,7 @@ impl OutputSession {
             let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
             (inner.events.clone(), self.seq.load(Ordering::SeqCst))
         };
-        self.hub.admit(&pending, &key, next_seq);
+        self.hub.admit(&pending, &key, next_seq, None);
         let fanout = self
             .hub
             .fanout
@@ -1193,6 +1214,38 @@ mod tests {
             })),
             Arc::clone(hub),
         )
+    }
+
+    #[test]
+    fn catchup_crosses_subscription_watermark_without_shedding_progressing_reader() {
+        let hub = Arc::new(Hub::new());
+        let out = fixture(1, &hub);
+        for _ in 0..128 {
+            out.emit_line(b"old".to_vec());
+        }
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        // A new publication stays behind the bounded preexisting queue.
+        out.emit_line(b"new".to_vec());
+        for expected in 1..=129 {
+            assert!(
+                !sub.want_slow(&hub),
+                "catchup marked slow before {expected}"
+            );
+            let event = sub.next_event(&hub).expect("retained record");
+            assert_eq!(event.seq, expected);
+            sub.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+            assert!(hub.fanout.lock().unwrap().subs[0].queue.len() <= SUB_QUEUE);
+        }
+        assert!(!sub.want_slow(&hub));
+        assert!(out.inner.lock().unwrap().events.is_empty());
+        // Once caught up, an actually full live queue still sheds the reader.
+        for _ in 0..=SUB_QUEUE {
+            out.emit_line(b"live".to_vec());
+        }
+        assert!(sub.want_slow(&hub));
+        sub.abandon(&hub);
     }
 
     #[test]

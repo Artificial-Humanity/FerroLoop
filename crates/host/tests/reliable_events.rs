@@ -1324,3 +1324,214 @@ fn first_class_pty_mode_reports_truthful_kind_delivers_input_and_survives_stalle
             .unwrap();
     });
 }
+
+#[path = "support/flood.rs"]
+mod safety_flood;
+
+fn safety_flood_rss(f: &Fixture) {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", f.daemon.id())).unwrap();
+        let kb: usize = status
+            .lines()
+            .find_map(|s| s.strip_prefix("VmRSS:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(kb < 128 * 1024, "daemon RSS {kb} KiB");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = f;
+}
+
+#[test]
+fn safety_flood_reliable_unattended_finishes_with_gap_and_no_ack_credit() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    let gate = f.root.path().join("produce");
+    let done = f.root.path().join("flushed");
+    let (stream, _) = rpc.spawn(
+        "safety-flood",
+        &[
+            "safety-flood",
+            gate.to_str().unwrap(),
+            done.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(gate, b"go").unwrap();
+    wait_file(&done);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !BlockingHostClient::connect(&f.endpoint)
+        .unwrap()
+        .capture_output(stream.session.clone(), 4096)
+        .unwrap()
+        .ends_with(&format!("{}\n", safety_flood::FINAL))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "capture never reached final marker"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let summary = rpc.summary(&stream);
+    assert_eq!(summary.acked, 0);
+    assert_eq!(summary.latest, safety_flood::LINES as u64 + 3);
+    assert!(!record(&summary.state).consumer_stalled);
+    safety_flood_rss(&f);
+    runtime().block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client
+            .subscribe_reliable(stream.clone(), grant.lease, Some(0))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let first = events.next_event().await.unwrap();
+            assert_eq!(first.kind, ReliableKind::Lifecycle);
+            assert!(matches!(
+                serde_json::from_slice::<fl_host_proto::ControlEvent>(&first.bytes).unwrap(),
+                fl_host_proto::ControlEvent::Spawned { .. }
+            ));
+            let gap = events.next_event().await.unwrap();
+            assert_eq!(gap.kind, ReliableKind::Gap);
+            let gap = gap.gap.unwrap();
+            assert_eq!(gap.from_seq, 2);
+            assert!(gap.next_seq > 3);
+            assert_eq!(events.cursor().seq, 1, "gap cannot earn ACK credit");
+            let mut retained = 0;
+            let mut bytes = 0;
+            for seq in gap.next_seq..=summary.latest {
+                let event = events.next_event().await.unwrap();
+                assert_eq!(event.seq, seq);
+                assert_eq!(event.kind, ReliableKind::Line);
+                assert!(event.terminated);
+                if seq == summary.latest {
+                    assert_eq!(event.bytes, safety_flood::FINAL.as_bytes());
+                } else {
+                    assert_eq!(event.bytes, safety_flood::line((seq - 3) as usize));
+                }
+                retained += 1;
+                bytes += event.bytes.len();
+            }
+            assert!(retained <= 4096);
+            assert!(bytes <= 8 * 1024 * 1024);
+            assert!(bytes > 7 * 1024 * 1024);
+        })
+        .await
+        .expect("retained replay deadline");
+    });
+    assert_eq!(rpc.summary(&stream).acked, 0);
+}
+
+#[test]
+fn safety_flood_reliable_held_subscriber_recovers_losslessly() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    let gate = f.root.path().join("produce");
+    let done = f.root.path().join("flushed");
+    let (stream, _) = rpc.spawn(
+        "safety-flood",
+        &[
+            "safety-flood",
+            gate.to_str().unwrap(),
+            done.to_str().unwrap(),
+        ],
+    );
+    let lease = rpc.claim(&stream);
+    f.arm("reliable-before-part");
+    let (ticket, _) = rpc.ticket(&stream, lease, 0);
+    let rt = runtime();
+    let mut events = rt.block_on(async {
+        AsyncHostClient::connect(&f.endpoint)
+            .await
+            .unwrap()
+            .open_extension_stream(ticket)
+            .await
+            .unwrap()
+    });
+    f.at("reliable-before-part");
+    std::fs::write(gate, b"go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !record(&rpc.summary(&stream).state).consumer_stalled {
+        assert!(
+            Instant::now() < deadline,
+            "active cursor did not backpressure producer"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!done.exists());
+    assert_eq!(rpc.summary(&stream).acked, 0);
+    assert!(
+        !BlockingHostClient::connect(&f.endpoint)
+            .unwrap()
+            .capture_output(stream.session.clone(), 4096)
+            .unwrap()
+            .contains(safety_flood::FINAL)
+    );
+    safety_flood_rss(&f);
+    f.release("reliable-before-part");
+    let mut reassembly = fl_host_proto::ReliableReassembler::for_stream(stream.clone(), 0);
+    let mut count = 0;
+    let mut bytes = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "lossless replay deadline");
+        let event = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                next_complete_event(&mut events, &mut reassembly),
+            )
+            .await
+            .unwrap()
+        });
+        assert_ne!(event.kind, ReliableKind::Gap);
+        let final_marker =
+            event.kind == ReliableKind::Line && event.bytes == safety_flood::FINAL.as_bytes();
+        if event.kind == ReliableKind::Line && event.bytes != b"READY" && !final_marker {
+            assert!(event.terminated);
+            assert_eq!(event.bytes, safety_flood::line(count));
+            count += 1;
+            bytes += event.bytes.len();
+        }
+        assert!(matches!(
+            rpc.call(Req::Ack {
+                cursor: Cursor {
+                    stream: stream.clone(),
+                    seq: event.seq
+                },
+                lease
+            }),
+            Resp::Acked { .. }
+        ));
+        if final_marker {
+            break;
+        }
+    }
+    assert_eq!(count, safety_flood::LINES);
+    assert_eq!(bytes, safety_flood::LINES * safety_flood::LINE_BYTES);
+    assert!(bytes > 8 * 1024 * 1024);
+    wait_file(&done);
+    assert!(
+        BlockingHostClient::connect(&f.endpoint)
+            .unwrap()
+            .capture_output(stream.session.clone(), 4096)
+            .unwrap()
+            .ends_with(&format!("{}\n", safety_flood::FINAL))
+    );
+    assert!(!record(&rpc.summary(&stream).state).consumer_stalled);
+    assert_eq!(
+        rpc.call(Req::KillSession {
+            stream: stream.clone(),
+            lease
+        }),
+        Resp::Controlled
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(rpc.summary(&stream).state, ChildState::CleanupComplete(_)) {
+        assert!(Instant::now() < deadline, "cleanup after recovery");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
