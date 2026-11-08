@@ -103,7 +103,7 @@ pub enum SessionMode {
     ReliablePipe,
     Pty,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PtyOptions {
     pub cols: u16,
@@ -314,17 +314,26 @@ impl ExtensionRequest {
     pub fn validate(&self) -> Result<(), HostError> {
         match self {
             Self::SpawnSession { spec, mode, pty } => {
-                if *mode == SessionMode::Pty {
-                    return Err(HostError::Unsupported {
-                        subject: "PTY backend/schema",
-                    });
+                match (*mode, spec.kind, pty.is_some()) {
+                    (
+                        SessionMode::LegacyPipe | SessionMode::ReliablePipe,
+                        SpawnKind::Pipe,
+                        false,
+                    ) => {}
+                    (SessionMode::Pty, SpawnKind::Pty, _) => {
+                        if let Some(opts) = pty
+                            && (opts.cols == 0 || opts.rows == 0)
+                        {
+                            return Err(HostError::Protocol("invalid pty dimensions".into()));
+                        }
+                    }
+                    _ => {
+                        return Err(HostError::Protocol(
+                            "contradictory session mode/options".into(),
+                        ));
+                    }
                 }
-                if spec.kind != SpawnKind::Pipe || pty.is_some() {
-                    return Err(HostError::Protocol(
-                        "contradictory session mode/options".into(),
-                    ));
-                }
-                spec.validate()?;
+                spec.validate_fields()?;
             }
             Self::SendLine { line, .. } if line.len() > MAX_RAW_INPUT => {
                 return Err(HostError::EventTooLarge);
@@ -878,5 +887,78 @@ mod tests {
         let mut r = ReliableReassembler::new(0);
         r.push(&part(true, true)).unwrap();
         assert!(r.push(&gap).is_err());
+    }
+    #[test]
+    fn spawn_session_validates_pty_and_pipe_combinations() {
+        let pipe_spec = SpawnSpec {
+            session: SessionId::new("pipe-ok").unwrap(),
+            kind: SpawnKind::Pipe,
+            argv: vec!["/bin/sh".into()],
+            cwd: std::path::PathBuf::from("/tmp"),
+            env: Default::default(),
+            env_allow: Default::default(),
+        };
+        let mut pty_spec = pipe_spec.clone();
+        pty_spec.session = SessionId::new("pty-ok").unwrap();
+        pty_spec.kind = SpawnKind::Pty;
+
+        assert!(
+            ExtensionRequest::SpawnSession {
+                spec: pty_spec.clone(),
+                mode: SessionMode::Pty,
+                pty: None,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ExtensionRequest::SpawnSession {
+                spec: pty_spec.clone(),
+                mode: SessionMode::Pty,
+                pty: Some(PtyOptions::default()),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ExtensionRequest::SpawnSession {
+                spec: pty_spec.clone(),
+                mode: SessionMode::Pty,
+                pty: Some(PtyOptions {
+                    cols: 0,
+                    rows: 40,
+                    scrollback_rows: 512,
+                }),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ExtensionRequest::SpawnSession {
+                spec: pty_spec,
+                mode: SessionMode::ReliablePipe,
+                pty: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ExtensionRequest::SpawnSession {
+                spec: pipe_spec.clone(),
+                mode: SessionMode::Pty,
+                pty: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ExtensionRequest::SpawnSession {
+                spec: pipe_spec,
+                mode: SessionMode::ReliablePipe,
+                pty: Some(PtyOptions::default()),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

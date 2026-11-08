@@ -22,7 +22,7 @@ pub fn baseline_names() -> &'static [&'static str] {
 
 /// Build the vendor environment from nothing. Overrides win over the parent value.
 pub fn scrubbed_env(spec: &SpawnSpec) -> Result<Vec<(OsString, OsString)>, HostError> {
-    spec.validate()?;
+    spec.validate_fields()?;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for name in baseline_names() {
         if let Some(value) = parent_value(name)? {

@@ -1154,3 +1154,173 @@ fn reliable_eof_preserves_unterminated_tail_without_lf() {
         assert_eq!(got, expected);
     });
 }
+
+#[cfg(unix)]
+#[test]
+fn first_class_pty_mode_reports_truthful_kind_delivers_input_and_survives_stalled_observer_flood() {
+    let f = Fixture::new();
+    let mut rpc = f.rpc();
+    match rpc.call(Req::Capabilities) {
+        Resp::Capabilities { features, .. } => {
+            assert_ne!(features & fl_host_proto::RELIABLE_FEATURE, 0);
+            assert_ne!(features & fl_host_proto::PTY_FEATURE, 0);
+        }
+        other => panic!("capabilities {other:?}"),
+    }
+
+    let rt = runtime();
+    rt.block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let pty_spec = SpawnSpec {
+            session: SessionId::new("pty-interactive").unwrap(),
+            kind: SpawnKind::Pty,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "test -t 0 && test -t 1 && printf 'TTY_READY\\n' && IFS= read -r l1 && printf 'L1:%s\\n' \"$l1\" && IFS= read -r l2 && printf 'L2:%s\\n' \"$l2\"".into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: Default::default(),
+            env_allow: Default::default(),
+        };
+        let (stream, state) = client
+            .spawn_pty_session(
+                pty_spec,
+                Some(fl_host_proto::PtyOptions {
+                    cols: 132,
+                    rows: 43,
+                    scrollback_rows: 512,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(record(&state).kind, SpawnKind::Pty);
+
+        let sessions = client.list_sessions().await.unwrap();
+        let summary = sessions.iter().find(|s| s.stream == stream).unwrap();
+        assert_eq!(summary.mode, SessionMode::Pty);
+        assert_eq!(record(&summary.state).kind, SpawnKind::Pty);
+
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client
+            .subscribe_reliable(stream.clone(), grant.lease, Some(0))
+            .await
+            .unwrap();
+        let spawned = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(spawned.kind, ReliableKind::Lifecycle);
+        let ready = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.bytes.trim_ascii_end(), b"TTY_READY");
+
+        assert_eq!(
+            client
+                .send_line(stream.clone(), grant.lease, "alpha".into())
+                .await
+                .unwrap(),
+            SendOutcome::Written
+        );
+        let l1 = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(l1.bytes.trim_ascii_end(), b"L1:alpha");
+
+        assert_eq!(
+            client
+                .write_raw(stream.clone(), grant.lease, b"beta\n".to_vec())
+                .await
+                .unwrap(),
+            SendOutcome::Written
+        );
+        let l2 = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(l2.bytes.trim_ascii_end(), b"L2:beta");
+
+        client
+            .kill_session(stream.clone(), grant.lease)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = client
+                .list_sessions()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.stream == stream)
+                .unwrap();
+            assert_eq!(s.mode, SessionMode::Pty);
+            assert_eq!(record(&s.state).kind, SpawnKind::Pty);
+            if matches!(s.state, ChildState::CleanupComplete(_)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pty cleanup did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Spawn a second Pty session that floods > 100,000 lines while an observer is open and stalled.
+        let done = f.root.path().join("pty-flood-done");
+        let mut flood_spec = spec(
+            "pty-flood",
+            &["stdout-fragments", "lines", done.to_str().unwrap()],
+        );
+        flood_spec.kind = SpawnKind::Pty;
+        let (flood_stream, flood_state) = client.spawn_pty_session(flood_spec, None).await.unwrap();
+        assert_eq!(record(&flood_state).kind, SpawnKind::Pty);
+        let flood_grant = client.claim_controller(flood_stream.clone()).await.unwrap();
+        let mut stalled_events = client
+            .subscribe_reliable(flood_stream.clone(), flood_grant.lease, Some(0))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), stalled_events.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.kind, ReliableKind::Lifecycle);
+
+        // Wait for child to finish flooding all 100,000 lines while `stalled_events` is not being read.
+        wait_file(&done);
+        let flood_summary = client
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.stream == flood_stream)
+            .unwrap();
+        assert_eq!(flood_summary.mode, SessionMode::Pty);
+        assert!(!record(&flood_summary.state).consumer_stalled);
+        assert!(matches!(flood_summary.state, ChildState::Running(_)));
+
+        // Resume reading from the stalled observer: it must receive a Gap and then the retained tail.
+        let mut saw_gap = false;
+        let mut saw_tail = false;
+        let read_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < read_deadline {
+            let ev = tokio::time::timeout(Duration::from_secs(5), stalled_events.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            if ev.kind == ReliableKind::Gap {
+                saw_gap = true;
+            } else if ev.kind == ReliableKind::Line
+                && ev.bytes.trim_ascii_end() == b"99999"
+            {
+                saw_tail = true;
+                break;
+            }
+        }
+        assert!(saw_gap, "stalled PTY observer must observe an explicit Gap");
+        assert!(saw_tail, "stalled PTY observer must observe retained tail");
+        client
+            .kill_session(flood_stream, flood_grant.lease)
+            .await
+            .unwrap();
+    });
+}

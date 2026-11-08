@@ -71,10 +71,10 @@ pub(crate) struct SessionParts {
 
 impl Session {
     pub(crate) fn mode(&self) -> fl_host_proto::SessionMode {
-        if self.reliable.is_some() {
-            fl_host_proto::SessionMode::ReliablePipe
-        } else {
-            fl_host_proto::SessionMode::LegacyPipe
+        match &self.reliable {
+            Some(journal) if journal.pty_mode() => fl_host_proto::SessionMode::Pty,
+            Some(_) => fl_host_proto::SessionMode::ReliablePipe,
+            None => fl_host_proto::SessionMode::LegacyPipe,
         }
     }
     pub(crate) fn reliable(&self) -> Option<&Arc<crate::reliable::ReliableJournal>> {
@@ -524,7 +524,11 @@ impl Session {
         let record = ChildRecord {
             session: self.session.clone(),
             session_epoch: SessionEpoch(self.epoch),
-            kind: SpawnKind::Pipe,
+            kind: if self.mode() == fl_host_proto::SessionMode::Pty {
+                SpawnKind::Pty
+            } else {
+                SpawnKind::Pipe
+            },
             pid: self.vendor_pid,
             input,
             started_at_ms: self.started_at_ms,
@@ -664,6 +668,17 @@ pub(crate) fn pump_reliable_stdout_with(
         }
         let mut buffer = match journal.prepare_read() {
             Ok(buffer) => buffer,
+            Err(_) if journal.pty_mode() => {
+                let mut scratch = [0u8; 4096];
+                match read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(len) => {
+                        session.push_stdout_tail(&scratch[..len], 64 * 1024);
+                        journal.drop_pty_unadmitted();
+                        continue;
+                    }
+                }
+            }
             Err(_) => {
                 session.set_stalled(true);
                 sink.wait(Duration::from_millis(50));

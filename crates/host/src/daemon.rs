@@ -520,6 +520,9 @@ pub(super) async fn extended(
     match request {
         XReq::Capabilities => Ok(XResp::Capabilities {
             host: host.authority.instance().clone(),
+            #[cfg(unix)]
+            features: fl_host_proto::RELIABLE_FEATURE | fl_host_proto::PTY_FEATURE,
+            #[cfg(not(unix))]
             features: fl_host_proto::RELIABLE_FEATURE,
             limits: fl_host_proto::ExtensionLimits::default(),
         }),
@@ -555,15 +558,27 @@ pub(super) async fn extended(
             Ok(XResp::Sessions { records })
         }
         XReq::SpawnSession { spec, mode, pty } => {
-            if mode == SessionMode::Pty {
+            #[cfg(not(unix))]
+            if mode == SessionMode::Pty || spec.kind == fl_host_proto::SpawnKind::Pty {
                 return Err(Refusal::Unsupported);
             }
-            if pty.is_some() || spec.kind != fl_host_proto::SpawnKind::Pipe {
-                return Err(Refusal::WrongMode);
+            match (mode, spec.kind, pty) {
+                (
+                    SessionMode::LegacyPipe | SessionMode::ReliablePipe,
+                    fl_host_proto::SpawnKind::Pipe,
+                    None,
+                ) => {}
+                (SessionMode::Pty, fl_host_proto::SpawnKind::Pty, Some(opts))
+                    if opts.cols == 0 || opts.rows == 0 =>
+                {
+                    return Err(Refusal::WrongMode);
+                }
+                (SessionMode::Pty, fl_host_proto::SpawnKind::Pty, _) => {}
+                _ => return Err(Refusal::WrongMode),
             }
             let host2 = Arc::clone(host);
             let child = tokio::task::spawn_blocking(move || {
-                Host::spawn_mode(&host2, &spec, mode == SessionMode::ReliablePipe)
+                Host::spawn_session_mode(&host2, &spec, mode, pty)
             })
             .await
             .map_err(|_| Refusal::Io)?
@@ -865,6 +880,9 @@ async fn run_extension(
             Ok(Some(record)) => record,
             Ok(None) => {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+            Err(fl_host_proto::ExtensionRefusal::CursorExpired) if active.gap().is_some() => {
                 continue;
             }
             Err(code) => {

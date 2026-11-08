@@ -177,6 +177,10 @@ impl SpawnSpec {
         if self.kind == SpawnKind::Pty {
             return Err(HostError::Unsupported { subject: "pty" });
         }
+        self.validate_fields()
+    }
+
+    pub fn validate_fields(&self) -> Result<(), HostError> {
         if self.argv.is_empty() || self.argv.len() > MAX_ARGV {
             return Err(HostError::Protocol("argv count".into()));
         }
