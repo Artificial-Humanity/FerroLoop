@@ -13,6 +13,14 @@ fn main() {
     let mode = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
     match mode.as_str() {
+        #[cfg(unix)]
+        "rendered-resize" => rendered_resize(std::path::Path::new(
+            rest.first().expect("resize fixture directory"),
+        )),
+        #[cfg(unix)]
+        "rendered-tui" => rendered_tui(std::path::Path::new(
+            rest.first().expect("rendered fixture directory"),
+        )),
         "safety-flood" => {
             ready();
             let gate = std::path::Path::new(rest.first().expect("producer gate"));
@@ -868,4 +876,91 @@ fn export_pipe_writers(args: &[String]) {
     let mut ack = [0u8];
     stream.read_exact(&mut ack).expect("receiver ready");
     assert_eq!(ack, [1]);
+}
+
+// Finite redraw producer. Gates split actual PTY writes at escape and UTF-8
+// boundaries; checkpoints count original bytes independently of the host parser.
+#[cfg(unix)]
+fn rendered_gate(root: &std::path::Path, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !root.join(name).exists() {
+        assert!(std::time::Instant::now() < deadline, "rendered gate {name}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(unix)]
+fn rendered_emit(out: &mut impl Write, total: &mut u64, bytes: &[u8]) {
+    out.write_all(bytes).expect("rendered output");
+    *total += bytes.len() as u64;
+}
+
+#[cfg(unix)]
+fn rendered_checkpoint(out: &mut impl Write, total: u64, root: &std::path::Path, name: &str) {
+    out.flush().expect("rendered flush");
+    std::fs::write(root.join(name), total.to_string()).expect("rendered checkpoint");
+}
+
+#[cfg(unix)]
+fn rendered_tui(root: &std::path::Path) {
+    let mut out = io::stdout().lock();
+    let mut total = 0;
+    // PRIMARY is never emitted again. Reconstructing the last replay bytes
+    // cannot restore this cell or the saved primary-screen state.
+    rendered_emit(
+        &mut out,
+        &mut total,
+        b"\x1b[2J\x1b[HPRIMARY\x1b[?1049h\x1b[2J\x1b[HALTSEED",
+    );
+    rendered_checkpoint(&mut out, total, root, "ready");
+    rendered_gate(root, "run");
+    let redraws = b"\r\x1b[3;1H\x1b[32mchanging frame\x1b[0m".repeat(128);
+    for _ in 0..1024 {
+        rendered_emit(&mut out, &mut total, &redraws);
+    }
+    // Neither payload is allowed to accumulate in the screen projection.
+    let hidden = [b'x'; 4096];
+    rendered_emit(&mut out, &mut total, b"\x1b]52;c;hidden");
+    for _ in 0..768 {
+        rendered_emit(&mut out, &mut total, &hidden);
+    }
+    rendered_emit(&mut out, &mut total, b"\x07\x1bPhidden");
+    for _ in 0..768 {
+        rendered_emit(&mut out, &mut total, &hidden);
+    }
+    rendered_emit(&mut out, &mut total, b"\x1b\\\x1b");
+    rendered_checkpoint(&mut out, total, root, "escape-ready");
+    rendered_gate(root, "escape-go");
+    rendered_emit(&mut out, &mut total, b"[?1049l\x1b[2;1HFINAL \xe2");
+    rendered_checkpoint(&mut out, total, root, "utf8-ready");
+    rendered_gate(root, "utf8-go");
+    // U+2713 includes 0x9c, which must not be misclassified as a C1 ST.
+    rendered_emit(&mut out, &mut total, b"\x9c\x93");
+    rendered_checkpoint(&mut out, total, root, "done");
+    park();
+}
+
+#[cfg(unix)]
+fn rendered_resize(root: &std::path::Path) {
+    let mut out = io::stdout().lock();
+    let mut total = 0;
+    for step in 0..=2 {
+        if step > 0 {
+            rendered_gate(root, &format!("report-{step}"));
+        }
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        let text = format!("\x1b[2J\x1b[HSIZE {} {}", size.ws_row, size.ws_col);
+        rendered_emit(&mut out, &mut total, text.as_bytes());
+        let checkpoint = if step == 0 {
+            "ready".to_string()
+        } else {
+            format!("reported-{step}")
+        };
+        rendered_checkpoint(&mut out, total, root, &checkpoint);
+    }
+    park();
 }

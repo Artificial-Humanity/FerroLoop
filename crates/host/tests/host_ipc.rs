@@ -4613,3 +4613,209 @@ fn rendered_capture_and_resize_are_unsupported_without_unix_backend() {
         Err(HostError::Unsupported { .. })
     ));
 }
+
+#[cfg(unix)]
+fn wait_rendered_fixture(path: &Path) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(bytes) = text.parse()
+        {
+            return bytes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture checkpoint {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn rendered_through(rpc: &mut Rpc, stream: &StreamId, bytes: u64) -> fl_host_proto::RenderedScreen {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        if screen.output_bytes >= bytes {
+            return screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "projection drain deadline: {screen:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn rendered_fixture_spawn(rpc: &mut Rpc, name: &str, mode: &str, root: &Path) -> StreamId {
+    let mut child = spec(name, &[mode, root.to_str().unwrap()]);
+    child.kind = SpawnKind::Pty;
+    rpc.inner
+        .spawn_pty_session(
+            child,
+            Some(fl_host_proto::PtyOptions {
+                rows: 6,
+                cols: 32,
+                scrollback_rows: 0,
+            }),
+        )
+        .unwrap()
+        .0
+}
+
+// Catches reconstructing from the retained tail, parser starvation behind replay,
+// loss of alternate-screen state and buffering control strings or split UTF-8.
+#[cfg(unix)]
+#[test]
+fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consumers() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let root = tempfile::tempdir().unwrap();
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_fixture_spawn(&mut rpc, "rendered-tui", "rendered-tui", root.path());
+    let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+    let initial_bytes = wait_rendered_fixture(&root.path().join("ready"));
+    let initial = rendered_through(&mut rpc, &stream, initial_bytes);
+    assert_eq!(initial.contents, "ALTSEED");
+    assert_eq!((initial.rows, initial.cols), (6, 32));
+
+    // One ticket stays unopened. A second consumer pins a record before its
+    // first write, without depending on socket-buffer capacity or scheduling.
+    let mut unread = Rpc::connect(&daemon.paths.endpoint);
+    let unread_ticket = match extended(
+        &mut unread,
+        XReq::Observe {
+            stream: stream.clone(),
+            after_seq: Some(1),
+        },
+    ) {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("unread observer {other:?}"),
+    };
+    arm(&daemon.paths.subscriber, "reliable-before-part");
+    let stalled_ticket = match rpc
+        .inner
+        .extension_request(XReq::SubscribeReliable {
+            stream: stream.clone(),
+            lease,
+            after_seq: Some(0),
+        })
+        .unwrap()
+    {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("stalled ticket {other:?}"),
+    };
+    let (_stalled_rt, stalled) = event_socket(&daemon.paths.endpoint, stalled_ticket);
+    wait_at(&daemon.paths.subscriber, "reliable-before-part");
+    std::fs::write(root.path().join("run"), b"1").unwrap();
+
+    let escape_bytes = wait_rendered_fixture(&root.path().join("escape-ready"));
+    assert!(escape_bytes > 8 * 1024 * 1024);
+    let escape = rendered_through(&mut rpc, &stream, escape_bytes);
+    assert!(escape.contents.starts_with("ALTSEED"));
+    assert!(!escape.contents.contains("hidden"));
+    assert!(escape.generation > initial.generation);
+    std::fs::write(root.path().join("escape-go"), b"1").unwrap();
+
+    let utf8_bytes = wait_rendered_fixture(&root.path().join("utf8-ready"));
+    let utf8 = rendered_through(&mut rpc, &stream, utf8_bytes);
+    assert_eq!(utf8.contents, "PRIMARY\nFINAL ");
+    assert_eq!((utf8.cursor_row, utf8.cursor_col), (1, 6));
+    std::fs::write(root.path().join("utf8-go"), b"1").unwrap();
+    let done_bytes = wait_rendered_fixture(&root.path().join("done"));
+    let final_screen = rendered_through(&mut rpc, &stream, done_bytes);
+    assert_eq!(final_screen.contents, "PRIMARY\nFINAL ✓");
+    assert_eq!((final_screen.cursor_row, final_screen.cursor_col), (1, 7));
+    assert_eq!((final_screen.rows, final_screen.cols), (6, 32));
+    assert_eq!(final_screen.output_bytes, done_bytes);
+    assert_eq!(final_screen.stream, stream);
+    assert!(final_screen.generation > utf8.generation);
+    assert!(final_screen.output_seq >= escape.output_seq);
+    assert_eq!(
+        rpc.inner.capture_rendered(stream.clone()).unwrap(),
+        final_screen
+    );
+    let raw = rpc
+        .inner
+        .capture_output(stream.session.clone(), 64 * 1024)
+        .unwrap();
+    assert_eq!(raw.len(), 64 * 1024);
+    assert!(
+        !raw.contains("PRIMARY"),
+        "primary cells must predate the retained raw tail"
+    );
+    assert!(raw.ends_with("FINAL ✓"));
+    let summary = rpc
+        .inner
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.stream == stream)
+        .unwrap();
+    assert!(!record(&summary.state).consumer_stalled);
+
+    // The unopened ticket resumes with an explicit gap. This proves early
+    // state really was evicted while its coherent screen remained available.
+    let (rt, mut replay) = event_socket(&daemon.paths.endpoint, unread_ticket);
+    let gap = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), replay.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    assert!(
+        matches!(gap, fl_host_proto::ExtensionFrame::Gap { from_seq: 2, next_seq } if next_seq > 2),
+        "expected eviction gap, got {gap:?}"
+    );
+    release(&daemon.paths.subscriber, "reliable-before-part");
+    drop(replay);
+    drop(stalled);
+    rpc.inner.kill_session(stream, lease).unwrap();
+}
+
+// Catches applying parser resize before the ioctl, losing output/resize order,
+// or returning a generation unrelated to the geometry linearization point.
+#[cfg(unix)]
+#[test]
+fn rendered_child_winsize_matches_ordered_resize_generation_and_output() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let root = tempfile::tempdir().unwrap();
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_fixture_spawn(
+        &mut rpc,
+        "rendered-resize-child",
+        "rendered-resize",
+        root.path(),
+    );
+    let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+    let ready_bytes = wait_rendered_fixture(&root.path().join("ready"));
+    let initial = rendered_through(&mut rpc, &stream, ready_bytes);
+    assert_eq!(initial.contents, "SIZE 6 32");
+    for (step, cols, rows) in [(1, 80, 24), (2, 40, 12)] {
+        let before = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        let generation = rpc
+            .inner
+            .resize_session(stream.clone(), lease, cols, rows)
+            .unwrap();
+        let resized = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        assert_eq!(
+            (resized.rows, resized.cols, resized.generation),
+            (rows, cols, generation)
+        );
+        assert!(generation > before.generation);
+        assert_eq!(
+            (resized.output_bytes, resized.output_seq),
+            (before.output_bytes, before.output_seq)
+        );
+        std::fs::write(root.path().join(format!("report-{step}")), b"1").unwrap();
+        let bytes = wait_rendered_fixture(&root.path().join(format!("reported-{step}")));
+        let after = rendered_through(&mut rpc, &stream, bytes);
+        assert_eq!(after.contents, format!("SIZE {rows} {cols}"));
+        assert_eq!((after.rows, after.cols), (rows, cols));
+        assert!(after.generation > generation);
+        assert!(after.output_bytes > resized.output_bytes);
+        assert!(after.output_seq >= resized.output_seq);
+    }
+    rpc.inner.kill_session(stream, lease).unwrap();
+}
