@@ -265,11 +265,12 @@ impl VendorHostAdapter for CodexHostAdapter {
             env: build_codex_launch_env(request.home_dir.as_deref()),
             cwd: request.cwd.clone(),
             remote_control: request.remote_control,
-            startup_rules: vec![VendorStartupPromptRule {
-                pattern: "positional_prompt".to_string(),
-                description: "Codex accepts the initial prompt as its trailing positional argument"
-                    .to_string(),
-            }],
+            startup_rules: vec![VendorStartupPromptRule::new(
+                "positional_prompt",
+                "",
+                false,
+                "Codex accepts the initial prompt as its trailing positional argument",
+            )],
         })
     }
 

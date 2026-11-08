@@ -28,13 +28,16 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 
 /// Exact session-identity binding pinning an adapter operation to a specific agent generation,
-/// host session, and optional OS `(pid, start_time_ticks)` birth tuple.
+/// host session, optional OS `(pid, start_time_ticks)` birth tuple, and optional explicit vendor
+/// session ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterIdentityBinding {
     pub agent_id: String,
     pub generation: u64,
     pub host_session: String,
     pub pid_birth: Option<(u32, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_session_id: Option<String>,
 }
 
 impl AdapterIdentityBinding {
@@ -49,7 +52,17 @@ impl AdapterIdentityBinding {
             generation,
             host_session: host_session.into(),
             pid_birth,
+            vendor_session_id: None,
         }
+    }
+
+    pub fn with_vendor_session_id(mut self, vendor_session_id: impl Into<String>) -> Self {
+        self.vendor_session_id = Some(vendor_session_id.into());
+        self
+    }
+
+    pub fn host_session_name(&self) -> &str {
+        &self.host_session
     }
 }
 
@@ -66,11 +79,36 @@ pub enum AdapterReadiness {
     Exited,
 }
 
-/// Startup prompt rule describing how a vendor CLI behaves when given a startup prompt.
+/// Startup prompt rule describing how a vendor CLI behaves when given a startup prompt or
+/// interactive first-launch modal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VendorStartupPromptRule {
     pub pattern: String,
+    #[serde(default)]
+    pub response_keys: String,
+    #[serde(default)]
+    pub warn_on_miss: bool,
     pub description: String,
+}
+
+impl VendorStartupPromptRule {
+    pub fn new(
+        pattern: impl Into<String>,
+        response_keys: impl Into<String>,
+        warn_on_miss: bool,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            pattern: pattern.into(),
+            response_keys: response_keys.into(),
+            warn_on_miss,
+            description: description.into(),
+        }
+    }
+}
+
+fn default_remote_control() -> bool {
+    true
 }
 
 /// Input parameters for preparing a vendor CLI launch plan.
@@ -106,6 +144,30 @@ pub struct AttachOrResumeRequest {
     pub control_endpoint: Option<String>,
     pub cwd: Option<PathBuf>,
     pub home_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<String>,
+    #[serde(default = "default_remote_control")]
+    pub remote_control: bool,
+}
+
+impl AttachOrResumeRequest {
+    pub fn new(binding: AdapterIdentityBinding, vendor_session_id: impl Into<String>) -> Self {
+        Self {
+            binding,
+            vendor_session_id: vendor_session_id.into(),
+            control_endpoint: None,
+            cwd: None,
+            home_dir: None,
+            persona: None,
+            model: None,
+            thinking_effort: None,
+            remote_control: true,
+        }
+    }
 }
 
 /// Outcome of attaching to or resuming an existing vendor session.
@@ -171,6 +233,7 @@ impl TurnDeliveryOutcome {
 pub enum ConfigEffectiveScope {
     Immediate,
     NextTurn,
+    NextLaunch,
     RestartRequired,
     Unsupported,
 }
@@ -301,6 +364,22 @@ pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
         request: &VendorLaunchRequest,
     ) -> Result<VendorLaunchPlan, VendorAdapterError>;
 
+    /// Build a deterministic resume launch plan (`argv`, `env`, `cwd`, `remote_control`) for
+    /// resuming an existing session identified by `request.vendor_session_id`.
+    fn prepare_resume(
+        &self,
+        _request: &AttachOrResumeRequest,
+    ) -> Result<VendorLaunchPlan, VendorAdapterError> {
+        Err(VendorAdapterError::Unsupported {
+            vendor: self.vendor_id().to_string(),
+            operation: "prepare_resume".to_string(),
+            reason: format!(
+                "vendor `{}` does not support CLI resume launch plans",
+                self.vendor_id()
+            ),
+        })
+    }
+
     /// Attach to or resume an existing vendor session scoped strictly to `request.binding` and
     /// `request.vendor_session_id`.
     fn attach_or_resume(
@@ -328,6 +407,11 @@ pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
 
     /// Cancel/interrupt an in-progress turn on the vendor session.
     fn cancel_turn(&self, request: &TurnDeliveryRequest) -> TurnDeliveryOutcome;
+
+    /// Alias for [`Self::cancel_turn`] matching vendor interrupt terminology.
+    fn interrupt_turn(&self, request: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+        self.cancel_turn(request)
+    }
 
     // --- 3. Configuration --------------------------------------------------
 
