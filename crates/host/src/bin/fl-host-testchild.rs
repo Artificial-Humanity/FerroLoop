@@ -36,14 +36,20 @@ fn main() {
         "stdout-fragments" => {
             let mut out = io::stdout();
             if rest.first().is_some_and(|s| s == "lines") {
-                for i in 0..100_000 { writeln!(out, "{i}").unwrap(); }
+                for i in 0..100_000 {
+                    writeln!(out, "{i}").unwrap();
+                }
             } else {
-                for _ in 0..513 { out.write_all(&[b'z'; 4096]).unwrap(); }
+                for _ in 0..513 {
+                    out.write_all(&[b'z'; 4096]).unwrap();
+                }
                 out.write_all(b"\n\r\x1b[0m\0\xfftail").unwrap();
             }
             out.flush().unwrap();
             std::fs::write(rest.get(1).expect("done marker"), b"done").unwrap();
-            if !rest.iter().any(|s| s == "eof") { park(); }
+            if !rest.iter().any(|s| s == "eof") {
+                park();
+            }
         }
         "echo" => echo(),
         #[cfg(unix)]
@@ -127,10 +133,19 @@ fn main() {
             }
             park();
         }
-        "lines" => lines(
-            rest.first().and_then(|text| text.parse().ok()).unwrap_or(1),
-            rest.get(1).map(String::as_str),
-        ),
+        "lines" => {
+            if let Some(gate) = rest.get(2) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !std::path::Path::new(gate).exists() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            lines(
+                rest.first().and_then(|text| text.parse().ok()).unwrap_or(1),
+                rest.get(1).map(String::as_str),
+            )
+        }
         "flood-stdout" => flood_stdout(),
         "flood-empty" => flood_empty(),
         "overflow" => overflow_line(),

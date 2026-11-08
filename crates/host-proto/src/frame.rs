@@ -593,7 +593,11 @@ mod allocation_tests {
         let session = SessionId::new("fragment").unwrap();
         let mut frame = line_fragment(&session, SessionEpoch(1), 1, false, b"tail").unwrap();
         frame.payload[81] = 2;
-        assert!(LineReassembler::new().push_frame_for_minor(1, &frame).is_err());
+        assert!(
+            LineReassembler::new()
+                .push_frame_for_minor(1, &frame)
+                .is_err()
+        );
         assert!(LineReassembler::new().push_frame(&frame).unwrap().is_some());
         let mut first = line_fragment(&session, SessionEpoch(1), 2, true, b"first").unwrap();
         first.payload[81] = 3;

@@ -484,7 +484,10 @@ pub enum ReliableKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionFrame {
-    Gap { from_seq: u64, next_seq: u64 },
+    Gap {
+        from_seq: u64,
+        next_seq: u64,
+    },
     ReliablePart {
         #[serde(default = "default_terminated", skip_serializing_if = "is_terminated")]
         terminated: bool,
@@ -512,8 +515,17 @@ fn is_terminated(value: &bool) -> bool {
 }
 fn validate_termination(minor: u16, event: &ExtensionFrame) -> Result<(), HostError> {
     match event {
-        ExtensionFrame::Gap { from_seq, next_seq } if minor < 2 || *from_seq == 0 || next_seq <= from_seq => return Err(HostError::Protocol("invalid or unnegotiated retention gap".into())),
-        ExtensionFrame::ReliablePart { kind: ReliableKind::Gap, .. } => return Err(HostError::Protocol("gap cannot be a reliable part".into())),
+        ExtensionFrame::Gap { from_seq, next_seq }
+            if minor < 2 || *from_seq == 0 || next_seq <= from_seq =>
+        {
+            return Err(HostError::Protocol(
+                "invalid or unnegotiated retention gap".into(),
+            ));
+        }
+        ExtensionFrame::ReliablePart {
+            kind: ReliableKind::Gap,
+            ..
+        } => return Err(HostError::Protocol("gap cannot be a reliable part".into())),
         _ => {}
     }
     if let ExtensionFrame::ReliablePart {
@@ -621,13 +633,24 @@ impl ReliableReassembler {
     fn push_inner(&mut self, part: &ExtensionFrame) -> Result<Option<ReliableEvent>, HostError> {
         validate_termination(crate::PROTO_MINOR, part)?;
         if let ExtensionFrame::Gap { from_seq, next_seq } = part {
-            if self.open.is_some() || self.after.checked_add(1) != Some(*from_seq) || next_seq <= from_seq {
-                return Err(HostError::Protocol("invalid or interleaved retention gap".into()));
+            if self.open.is_some()
+                || self.after.checked_add(1) != Some(*from_seq)
+                || next_seq <= from_seq
+            {
+                return Err(HostError::Protocol(
+                    "invalid or interleaved retention gap".into(),
+                ));
             }
             self.after = next_seq - 1;
             return Ok(Some(ReliableEvent {
-                seq: self.after, kind: ReliableKind::Gap, terminated: false, bytes: Vec::new(),
-                gap: Some(ReliableGap { from_seq: *from_seq, next_seq: *next_seq }),
+                seq: self.after,
+                kind: ReliableKind::Gap,
+                terminated: false,
+                bytes: Vec::new(),
+                gap: Some(ReliableGap {
+                    from_seq: *from_seq,
+                    next_seq: *next_seq,
+                }),
             }));
         }
         let ExtensionFrame::ReliablePart {
@@ -648,7 +671,9 @@ impl ReliableReassembler {
             ));
         }
         let limit = match kind {
-            ReliableKind::Gap => return Err(HostError::Protocol("gap cannot be a reliable part".into())),
+            ReliableKind::Gap => {
+                return Err(HostError::Protocol("gap cannot be a reliable part".into()));
+            }
             ReliableKind::Line => crate::MAX_LINE_BYTES,
             ReliableKind::Lifecycle => crate::MAX_EVENT_ENVELOPE,
         };
@@ -745,18 +770,45 @@ impl ReliableReassembler {
 mod tests {
     use super::*;
     fn part(terminated: bool, more: bool) -> ExtensionFrame {
-        ExtensionFrame::ReliablePart { seq: 1, kind: ReliableKind::Line, more, terminated, bytes: BoundedBytes::new(b"x".to_vec()).unwrap() }
+        ExtensionFrame::ReliablePart {
+            seq: 1,
+            kind: ReliableKind::Line,
+            more,
+            terminated,
+            bytes: BoundedBytes::new(b"x".to_vec()).unwrap(),
+        }
     }
     #[test]
     fn terminated_json_is_legacy_identical_and_unterminated_requires_minor_two() {
         let frame = encode_extension_frame(1, &part(true, false)).unwrap();
-        assert_eq!(frame.payload, br#"{"op":"reliable_part","seq":1,"kind":"line","more":false,"bytes":"eA=="}"#);
+        assert_eq!(
+            frame.payload,
+            br#"{"op":"reliable_part","seq":1,"kind":"line","more":false,"bytes":"eA=="}"#
+        );
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct OldPart { op: String, seq: u64, kind: String, more: bool, bytes: String }
+        struct OldPart {
+            op: String,
+            seq: u64,
+            kind: String,
+            more: bool,
+            bytes: String,
+        }
         let old: OldPart = serde_json::from_slice(&frame.payload).unwrap();
-        assert_eq!((old.op.as_str(), old.seq, old.kind.as_str(), old.more, old.bytes.as_str()), ("reliable_part", 1, "line", false, "eA=="));
-        assert_eq!(decode_extension_frame(2, &frame).unwrap(), part(true, false));
+        assert_eq!(
+            (
+                old.op.as_str(),
+                old.seq,
+                old.kind.as_str(),
+                old.more,
+                old.bytes.as_str()
+            ),
+            ("reliable_part", 1, "line", false, "eA==")
+        );
+        assert_eq!(
+            decode_extension_frame(2, &frame).unwrap(),
+            part(true, false)
+        );
         assert!(encode_extension_frame(1, &part(false, false)).is_err());
         let new = encode_extension_frame(2, &part(false, false)).unwrap();
         assert!(serde_json::from_slice::<OldPart>(&new.payload).is_err());
@@ -770,25 +822,61 @@ mod tests {
         assert!(r.push(&part(true, false)).is_err());
         let mut r = ReliableReassembler::new(0);
         let event = r.push(&part(false, false)).unwrap().unwrap();
-        assert!(!event.terminated); assert_eq!(event.bytes, b"x");
-        let bad = ExtensionFrame::ReliablePart { seq: 1, kind: ReliableKind::Gap, more: false, terminated: true, bytes: BoundedBytes::new(Vec::new()).unwrap() };
+        assert!(!event.terminated);
+        assert_eq!(event.bytes, b"x");
+        let bad = ExtensionFrame::ReliablePart {
+            seq: 1,
+            kind: ReliableKind::Gap,
+            more: false,
+            terminated: true,
+            bytes: BoundedBytes::new(Vec::new()).unwrap(),
+        };
         assert!(encode_extension_frame(2, &bad).is_err());
         assert!(ReliableReassembler::new(0).push(&bad).is_err());
     }
     #[test]
     fn gap_is_explicit_bounded_and_cannot_interrupt_record() {
-        let gap = ExtensionFrame::Gap { from_seq: 1, next_seq: 5 };
+        let gap = ExtensionFrame::Gap {
+            from_seq: 1,
+            next_seq: 5,
+        };
         assert!(encode_extension_frame(1, &gap).is_err());
         let frame = encode_extension_frame(2, &gap).unwrap();
         assert!(decode_extension_frame(1, &frame).is_err());
         assert_eq!(decode_extension_frame(2, &frame).unwrap(), gap);
         let mut r = ReliableReassembler::new(0);
         let event = r.push(&gap).unwrap().unwrap();
-        assert_eq!(event.kind, ReliableKind::Gap); assert_eq!(event.gap, Some(ReliableGap { from_seq: 1, next_seq: 5 }));
-        let next = ExtensionFrame::ReliablePart { seq: 5, kind: ReliableKind::Line, more: false, terminated: true, bytes: BoundedBytes::new(b"kept".to_vec()).unwrap() };
+        assert_eq!(event.kind, ReliableKind::Gap);
+        assert_eq!(
+            event.gap,
+            Some(ReliableGap {
+                from_seq: 1,
+                next_seq: 5
+            })
+        );
+        let next = ExtensionFrame::ReliablePart {
+            seq: 5,
+            kind: ReliableKind::Line,
+            more: false,
+            terminated: true,
+            bytes: BoundedBytes::new(b"kept".to_vec()).unwrap(),
+        };
         assert_eq!(r.push(&next).unwrap().unwrap().bytes, b"kept");
         assert!(r.push(&gap).is_err());
-        for bad in [ExtensionFrame::Gap { from_seq: 1, next_seq: 1 }, ExtensionFrame::Gap { from_seq: 0, next_seq: 1 }] { assert!(encode_extension_frame(2, &bad).is_err()); }
-        let mut r = ReliableReassembler::new(0); r.push(&part(true, true)).unwrap(); assert!(r.push(&gap).is_err());
+        for bad in [
+            ExtensionFrame::Gap {
+                from_seq: 1,
+                next_seq: 1,
+            },
+            ExtensionFrame::Gap {
+                from_seq: 0,
+                next_seq: 1,
+            },
+        ] {
+            assert!(encode_extension_frame(2, &bad).is_err());
+        }
+        let mut r = ReliableReassembler::new(0);
+        r.push(&part(true, true)).unwrap();
+        assert!(r.push(&gap).is_err());
     }
 }

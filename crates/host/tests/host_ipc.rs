@@ -420,7 +420,17 @@ impl EventLog {
                 return events;
             }
             if Instant::now() >= deadline {
-                panic!("events {events:?}");
+                panic!(
+                    "timed out after {} events ({} line bytes)",
+                    events.len(),
+                    events
+                        .iter()
+                        .map(|e| match e {
+                            HostEvent::Line { bytes, .. } => bytes.len(),
+                            _ => 0,
+                        })
+                        .sum::<usize>()
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -437,15 +447,26 @@ impl Drop for EventLog {
 }
 
 fn line_bytes(events: &[HostEvent], session: &str) -> Vec<Vec<u8>> {
-    let mut lines = Vec::new(); let mut tail = Vec::new();
+    let mut lines = Vec::new();
+    let mut tail = Vec::new();
     for event in events {
-        if let HostEvent::Line { session: id, bytes, terminated, .. } = event
-            && id.as_str() == session {
+        if let HostEvent::Line {
+            session: id,
+            bytes,
+            terminated,
+            ..
+        } = event
+            && id.as_str() == session
+        {
             tail.extend_from_slice(bytes);
-            if *terminated { lines.push(std::mem::take(&mut tail)); }
+            if *terminated {
+                lines.push(std::mem::take(&mut tail));
+            }
         }
     }
-    if !tail.is_empty() { lines.push(tail); }
+    if !tail.is_empty() {
+        lines.push(tail);
+    }
     lines
 }
 
@@ -745,19 +766,40 @@ fn stdout_fragments_preserve_large_binary_stream_and_keep_child_alive() {
     let mut rpc = Rpc::connect(&daemon.paths.endpoint);
     let done = daemon.paths.transcript.with_extension("done");
     rpc.spawn("big", &["stdout-fragments", "tail", done.to_str().unwrap()]);
-    let mut expected = vec![b'z'; 513 * 4096]; expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+    let mut expected = vec![b'z'; 513 * 4096];
+    expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
     let reconstruct = |events: &[HostEvent]| {
         let mut bytes = Vec::new();
         for event in events {
-            if let HostEvent::Line { bytes: raw, terminated, .. } = event { bytes.extend_from_slice(raw); if *terminated { bytes.push(b'\n'); } }
+            if let HostEvent::Line {
+                bytes: raw,
+                terminated,
+                ..
+            } = event
+            {
+                bytes.extend_from_slice(raw);
+                if *terminated {
+                    bytes.push(b'\n');
+                }
+            }
         }
         bytes
     };
-    log.wait_until(Duration::from_secs(5), |events| reconstruct(events).len() == expected.len());
+    log.wait_until(Duration::from_secs(5), |events| {
+        reconstruct(events).len() == expected.len()
+    });
     let events = log.snapshot();
     assert_eq!(reconstruct(&events), expected);
-    assert!(!controls(&events).iter().any(|e| matches!(e, ControlEvent::ProtocolFailure { .. })));
-    assert!(rpc.list().iter().any(|c| matches!(&c.state, ChildState::Running(r) if r.session.as_str()=="big")));
+    assert!(
+        !controls(&events)
+            .iter()
+            .any(|e| matches!(e, ControlEvent::ProtocolFailure { .. }))
+    );
+    assert!(
+        rpc.list()
+            .iter()
+            .any(|c| matches!(&c.state, ChildState::Running(r) if r.session.as_str()=="big"))
+    );
 }
 
 #[test]
@@ -3630,4 +3672,44 @@ fn pty_reliable_session_supports_capture_output_and_write_raw() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn non_reliable_eof_preserves_exact_unterminated_tail() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let log = EventLog::subscribe(&daemon.paths.endpoint, Some("eof-tail"));
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let done = daemon.paths.transcript.with_extension("done");
+    rpc.spawn(
+        "eof-tail",
+        &["stdout-fragments", "tail", done.to_str().unwrap(), "eof"],
+    );
+    let mut expected = vec![b'z'; 513 * 4096];
+    expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+    let reconstruct = |events: &[HostEvent]| {
+        let mut bytes = Vec::new();
+        for event in events {
+            if let HostEvent::Line {
+                bytes: raw,
+                terminated,
+                ..
+            } = event
+            {
+                bytes.extend_from_slice(raw);
+                if *terminated {
+                    bytes.push(b'\n');
+                }
+            }
+        }
+        bytes
+    };
+    let events = log.wait_until(Duration::from_secs(5), |events| {
+        reconstruct(events).len() >= expected.len()
+    });
+    assert_eq!(reconstruct(&events), expected);
+    assert!(
+        !controls(&events)
+            .iter()
+            .any(|e| matches!(e, ControlEvent::ProtocolFailure { .. }))
+    );
 }

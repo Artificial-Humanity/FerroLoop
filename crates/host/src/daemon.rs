@@ -832,13 +832,33 @@ async fn run_extension(
             break;
         }
         if let Some(gap) = active.gap() {
-            let Ok(_wire) = crate::slice_budget::reserve(journal.budget(), crate::slice_budget::ChargeKind::Viewer, 256 * 1024) else { break; };
+            let Ok(_wire) = crate::slice_budget::reserve(
+                journal.budget(),
+                crate::slice_budget::ChargeKind::Viewer,
+                256 * 1024,
+            ) else {
+                break;
+            };
             let notice = if conn.negotiated_minor() < 2 {
-                fl_host_proto::ExtensionFrame::Notice { code: fl_host_proto::ExtensionRefusal::Unsupported }
-            } else { fl_host_proto::ExtensionFrame::Gap { from_seq: gap.from_seq, next_seq: gap.next_seq } };
-            let Ok(frame) = fl_host_proto::encode_extension_frame(conn.negotiated_minor(), &notice) else { break; };
-            if conn.write_frame(&frame).await.is_err() || conn.negotiated_minor() < 2 { break; }
-            if active.advance_gap(gap).is_err() { break; }
+                fl_host_proto::ExtensionFrame::Notice {
+                    code: fl_host_proto::ExtensionRefusal::Unsupported,
+                }
+            } else {
+                fl_host_proto::ExtensionFrame::Gap {
+                    from_seq: gap.from_seq,
+                    next_seq: gap.next_seq,
+                }
+            };
+            let Ok(frame) = fl_host_proto::encode_extension_frame(conn.negotiated_minor(), &notice)
+            else {
+                break;
+            };
+            if conn.write_frame(&frame).await.is_err() || conn.negotiated_minor() < 2 {
+                break;
+            }
+            if active.advance_gap(gap).is_err() {
+                break;
+            }
             continue;
         }
         let record = match active.next() {
@@ -889,7 +909,12 @@ async fn run_extension(
             }
         };
         if !terminated && conn.negotiated_minor() < 2 {
-            if let Ok(frame) = fl_host_proto::encode_extension_frame(conn.negotiated_minor(), &fl_host_proto::ExtensionFrame::Notice { code: fl_host_proto::ExtensionRefusal::Unsupported }) {
+            if let Ok(frame) = fl_host_proto::encode_extension_frame(
+                conn.negotiated_minor(),
+                &fl_host_proto::ExtensionFrame::Notice {
+                    code: fl_host_proto::ExtensionRefusal::Unsupported,
+                },
+            ) {
                 let _ = conn.write_frame(&frame).await;
             }
             break;

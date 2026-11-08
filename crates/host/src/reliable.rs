@@ -87,10 +87,8 @@ struct State {
     lifecycle_bytes: [Option<Reservation>; 4],
     lifecycle_metadata: [Option<Reservation>; 4],
     partial: Option<ChargedBytes>,
-    partial_complete: bool,
     pending: Option<Pending>,
     eof: bool,
-    failed: bool,
 }
 pub(crate) struct ReliableJournal {
     self_ref: Weak<ReliableJournal>,
@@ -173,10 +171,8 @@ impl ReliableJournal {
                 lifecycle_bytes,
                 lifecycle_metadata,
                 partial: None,
-                partial_complete: false,
                 pending: None,
                 eof: false,
-                failed: false,
             }),
         }))
     }
@@ -213,16 +209,22 @@ impl ReliableJournal {
     pub(crate) fn prepare_read(&self) -> Result<ChargedBytes, ExtensionRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.drain(&mut state)?;
-        if state.eof || state.failed || state.pending.is_some() { return Err(ExtensionRefusal::ResourceLimit); }
+        if state.eof || state.pending.is_some() {
+            return Err(ExtensionRefusal::ResourceLimit);
+        }
         loop {
-            let admission = if self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS && !self.coalescible(&state) {
+            let admission = if self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS
+                && !self.coalescible(&state)
+            {
                 Err(ExtensionRefusal::ResourceLimit)
             } else {
                 reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)
                     .and_then(|_admission| self.allocate(READ_BYTES))
             };
             match admission {
-                Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(&mut state) => continue,
+                Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(&mut state) => {
+                    continue;
+                }
                 result => return result,
             }
         }
@@ -246,9 +248,6 @@ impl ReliableJournal {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.eof = true;
         let _ = self.drain(&mut state); // quota saturation retains partial/pending bytes
-    }
-    pub(crate) fn failed(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).failed
     }
     pub(crate) fn lifecycle(&self, event: ControlEvent) -> Result<u64, ExtensionRefusal> {
         let kind = lifecycle_kind(&event)?;
@@ -410,8 +409,21 @@ impl ReliableJournal {
     }
     /// Only unattended data is disposable. Lifecycle records and ACK state remain authoritative.
     fn evict_oldest_data(&self, state: &mut State) -> bool {
-        if self.counts.cursors.load(Ordering::SeqCst) != 0 || self.counts.references.load(Ordering::SeqCst) != 0 { return false; }
-        let Some(offset) = (0..state.len).find(|offset| matches!(state.records[(state.head + offset) % SLOTS].as_ref().map(|r| &r.body), Some(ReliableBody::Line(_)))) else { return false; };
+        if self.counts.cursors.load(Ordering::SeqCst) != 0
+            || self.counts.references.load(Ordering::SeqCst) != 0
+        {
+            return false;
+        }
+        let Some(offset) = (0..state.len).find(|offset| {
+            matches!(
+                state.records[(state.head + offset) % SLOTS]
+                    .as_ref()
+                    .map(|r| &r.body),
+                Some(ReliableBody::Line(_))
+            )
+        }) else {
+            return false;
+        };
         let index = (state.head + offset) % SLOTS;
         state.records[index] = None;
         // Move only the lifecycle prefix, at most MAX_LIFECYCLE_RECORDS slots.
@@ -452,7 +464,6 @@ impl ReliableJournal {
             fragment.terminated = terminated;
             fragment.as_mut_slice().copy_from_slice(&remaining[..take]);
             state.partial = Some(fragment);
-            state.partial_complete = terminated;
             let pending = state.pending.as_mut().expect("pending");
             pending.offset += take + usize::from(terminated);
             if pending.offset == pending.bytes.len {
@@ -472,9 +483,6 @@ impl ReliableJournal {
             && let Some(ReliableBody::Line(bytes)) = body
         {
             state.partial = Some(bytes);
-        }
-        if result.is_ok() {
-            state.partial_complete = false;
         }
         result.map(|_| ())
     }
@@ -589,13 +597,25 @@ impl ReplayCursor {
     }
     pub(crate) fn gap(&self) -> Option<fl_host_proto::ReliableGap> {
         let state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.next <= state.acked || self.next >= state.next { return None; }
-        let next_seq = (0..state.len).filter_map(|offset| state.records[(state.head + offset) % SLOTS].as_ref())
-            .find(|record| record.seq >= self.next).map_or(state.next, |record| record.seq);
-        (next_seq > self.next).then_some(fl_host_proto::ReliableGap { from_seq: self.next, next_seq })
+        if self.next <= state.acked || self.next >= state.next {
+            return None;
+        }
+        let next_seq = (0..state.len)
+            .filter_map(|offset| state.records[(state.head + offset) % SLOTS].as_ref())
+            .find(|record| record.seq >= self.next)
+            .map_or(state.next, |record| record.seq);
+        (next_seq > self.next).then_some(fl_host_proto::ReliableGap {
+            from_seq: self.next,
+            next_seq,
+        })
     }
-    pub(crate) fn advance_gap(&mut self, gap: fl_host_proto::ReliableGap) -> Result<(), ExtensionRefusal> {
-        if self.gap() != Some(gap) { return Err(ExtensionRefusal::CursorExpired); }
+    pub(crate) fn advance_gap(
+        &mut self,
+        gap: fl_host_proto::ReliableGap,
+    ) -> Result<(), ExtensionRefusal> {
+        if self.gap() != Some(gap) {
+            return Err(ExtensionRefusal::CursorExpired);
+        }
         self.next = gap.next_seq;
         Ok(())
     }
@@ -608,8 +628,13 @@ impl ReplayCursor {
         if self.next >= state.next {
             return Ok(None);
         }
-        let index = (0..state.len).map(|offset| (state.head + offset) % SLOTS)
-            .find(|index| state.records[*index].as_ref().is_some_and(|r| r.seq == self.next))
+        let index = (0..state.len)
+            .map(|offset| (state.head + offset) % SLOTS)
+            .find(|index| {
+                state.records[*index]
+                    .as_ref()
+                    .is_some_and(|r| r.seq == self.next)
+            })
             .ok_or(ExtensionRefusal::CursorExpired)?;
         if let Some(record) = state.records[index].as_mut().and_then(Arc::get_mut) {
             record.exposed = true;
@@ -724,6 +749,23 @@ mod tests {
         j.accept_read(bytes).unwrap();
     }
     #[test]
+    fn coalescing_remains_available_at_record_cap_with_live_cursor() {
+        let j = journal();
+        let (_, _cursor) = begin_replay(&j, 0).unwrap();
+        for _ in 0..MAX_DATA_RECORDS - 1 {
+            admit(&j, b"x\n");
+        }
+        admit(&j, b"tail");
+        admit(&j, b"more");
+        assert_eq!(j.live_data_records(), MAX_DATA_RECORDS);
+        let state = j.state.lock().unwrap();
+        let last = state.records[(state.head + state.len - 1) % SLOTS]
+            .as_ref()
+            .unwrap();
+        assert!(matches!(&last.body, ReliableBody::Line(b) if b.as_slice()==b"tailmore"));
+    }
+
+    #[test]
     fn tiny_reads_coalesce_and_exposed_tail_never_changes() {
         let j = journal();
         let mut expected = Vec::new();
@@ -736,9 +778,13 @@ mod tests {
         let (_, mut cursor) = begin_replay(&j, 0).unwrap();
         let mut got = Vec::new();
         while let Some(record) = cursor.next().unwrap() {
-            let ReliableBody::Line(bytes) = &record.body else { panic!("line") };
+            let ReliableBody::Line(bytes) = &record.body else {
+                panic!("line")
+            };
             got.extend_from_slice(bytes.as_slice());
-            if bytes.terminated { got.push(b'\n'); }
+            if bytes.terminated {
+                got.push(b'\n');
+            }
         }
         assert_eq!(got, expected);
         drop(cursor);
@@ -749,44 +795,71 @@ mod tests {
         drop(cursor);
         admit(&k, b"b");
         let (_, mut cursor) = begin_replay(&k, 0).unwrap();
-        assert!(matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"a"));
-        assert!(matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"b"));
+        assert!(
+            matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"a")
+        );
+        assert!(
+            matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"b")
+        );
     }
     #[test]
     fn unattended_eviction_preserves_lifecycle_and_reports_exact_gap() {
         let j = journal();
-        j.lifecycle(ControlEvent::CleanupComplete { session: stream().session, session_epoch: stream().epoch, seq: 0 }).unwrap();
-        for i in 0..100_000 { admit(&j, format!("{i}\n").as_bytes()); }
+        j.lifecycle(ControlEvent::CleanupComplete {
+            session: stream().session,
+            session_epoch: stream().epoch,
+            seq: 0,
+        })
+        .unwrap();
+        for i in 0..100_000 {
+            admit(&j, format!("{i}\n").as_bytes());
+        }
         assert_eq!(j.position().0, 0);
         let (_, mut cursor) = begin_replay(&j, 0).unwrap();
         assert!(cursor.gap().is_none());
-        assert!(matches!(cursor.next().unwrap().unwrap().body, ReliableBody::Lifecycle(..)));
+        assert!(matches!(
+            cursor.next().unwrap().unwrap().body,
+            ReliableBody::Lifecycle(..)
+        ));
         let gap = cursor.gap().expect("data loss notice");
         assert_eq!(gap.from_seq, 2);
         assert_eq!(gap.next_seq, 100_002 - MAX_DATA_RECORDS as u64);
-        assert_eq!(cursor.gap(), Some(gap), "notice is not consumed before write success");
+        assert_eq!(
+            cursor.gap(),
+            Some(gap),
+            "notice is not consumed before write success"
+        );
         cursor.advance_gap(gap).unwrap();
         for i in 100_000 - MAX_DATA_RECORDS..100_000 {
             let r = cursor.next().unwrap().unwrap();
-            assert!(matches!(&r.body, ReliableBody::Line(b) if b.terminated && b.as_slice()==i.to_string().as_bytes()));
+            assert!(
+                matches!(&r.body, ReliableBody::Line(b) if b.terminated && b.as_slice()==i.to_string().as_bytes())
+            );
         }
         assert!(cursor.next().unwrap().is_none());
     }
     #[test]
     fn unattended_byte_pressure_and_live_cursor_backpressure_are_distinct() {
         let j = journal();
-        for _ in 0..100_000 { admit(&j, &[b'z'; 128]); }
+        for _ in 0..100_000 {
+            admit(&j, &[b'z'; 128]);
+        }
         assert!(j.budget.used(ChargeKind::ReliableData) <= EPOCH_DATA);
         assert_eq!(j.position().0, 0);
         let (_, mut cursor) = begin_replay(&j, 0).unwrap();
         assert!(cursor.gap().is_some());
-        let gap = cursor.gap().unwrap(); cursor.advance_gap(gap).unwrap();
+        let gap = cursor.gap().unwrap();
+        cursor.advance_gap(gap).unwrap();
         while let Some(r) = cursor.next().unwrap() {
-            assert!(matches!(&r.body, ReliableBody::Line(b) if !b.terminated && b.as_slice().iter().all(|x| *x==b'z')));
+            assert!(
+                matches!(&r.body, ReliableBody::Line(b) if !b.terminated && b.as_slice().iter().all(|x| *x==b'z'))
+            );
         }
         let k = journal();
         let (_, _live) = begin_replay(&k, 0).unwrap();
-        for _ in 0..MAX_DATA_RECORDS { admit(&k, b"x\n"); }
+        for _ in 0..MAX_DATA_RECORDS {
+            admit(&k, b"x\n");
+        }
         assert!(k.prepare_read().is_err());
         assert_eq!(k.live_data_records(), MAX_DATA_RECORDS);
         assert_eq!(k.position(), (0, MAX_DATA_RECORDS as u64));
@@ -813,7 +886,6 @@ mod tests {
             let mut bytes = j.prepare_read().unwrap();
             bytes.as_mut_slice().fill(b'x');
             assert_eq!(j.accept_read(bytes), Ok(()));
-            assert!(!j.failed());
         }
         j.eof();
         let (_, mut cursor) = begin_replay(&j, 0).unwrap();
@@ -920,7 +992,6 @@ mod tests {
         let mut state = j.state.lock().unwrap();
         state.partial = Some(j.allocate(1).unwrap());
         state.partial.as_mut().unwrap().as_mut_slice()[0] = b'a';
-        state.partial_complete = true;
         let mut bytes = j.allocate(2).unwrap();
         bytes.as_mut_slice().copy_from_slice(b"b\n");
         state.pending = Some(Pending { bytes, offset: 0 });
