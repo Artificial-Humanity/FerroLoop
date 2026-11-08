@@ -1,8 +1,8 @@
 # Host safety baseline
 
 Record 183 characterizes capture, delivery pressure, build identity, and current
-child devices. It preserves the existing delivery contracts. First-class PTY
-support and its nonblocking I/O design belong to Record 184.
+child devices. It preserves the existing delivery contracts. After integration with Record 184,
+first-class Unix PTY support retains its nonblocking I/O design.
 
 ## Delivery pressure
 
@@ -61,5 +61,8 @@ stdio. On Unix, the existing `FL_HOST_PTY=1` opt-in uses an actual PTY while the
 reported kind remains Pipe and the mode remains the requested pipe mode. The
 child `IsTerminal` probe in `pipe_modes_report_current_device_truth` exposes this
 mismatch. Windows does not implement that environment-selected PTY behavior;
-this baseline does not claim ConPTY support. Explicit `SpawnKind::Pty` and
-`SessionMode::Pty` remain refused at this milestone.
+this baseline does not claim ConPTY support. Explicit `SpawnKind::Pty` with
+`SessionMode::Pty` succeeds on Unix, reports kind and mode as Pty, and passes the
+child terminal probe. Non-Unix hosts refuse that request with `Unsupported`.
+Capabilities advertise reliable delivery and host status on both platforms, plus
+PTY support on Unix.

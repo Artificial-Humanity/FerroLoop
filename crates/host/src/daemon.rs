@@ -521,9 +521,11 @@ pub(super) async fn extended(
         XReq::Capabilities => Ok(XResp::Capabilities {
             host: host.authority.instance().clone(),
             #[cfg(unix)]
-            features: fl_host_proto::RELIABLE_FEATURE | fl_host_proto::PTY_FEATURE,
+            features: fl_host_proto::RELIABLE_FEATURE
+                | fl_host_proto::PTY_FEATURE
+                | fl_host_proto::HOST_STATUS_FEATURE,
             #[cfg(not(unix))]
-            features: fl_host_proto::RELIABLE_FEATURE,
+            features: fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE,
             limits: fl_host_proto::ExtensionLimits::default(),
         }),
         XReq::HostStatus => Ok(XResp::HostStatus {

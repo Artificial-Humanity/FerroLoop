@@ -10,6 +10,8 @@
 
 **Spec:** Council-reconciled architecture plan, Milestone 1 / Record 183. The assigned scope is capture freshness, unattended/stalled LegacyPipe and ReliablePipe flood behavior, build identity, and current platform device truth. First-class PTY implementation belongs to Record 184.
 
+**Integration note (2026-11-08):** The task checklists below record the original Record 183 milestone. After rebasing onto Record 184, explicit Unix PTY requests succeed and report kind/mode Pty with terminal stdio; non-Unix still returns Unsupported. The current acceptance test and `docs/host-safety-baseline.md` reflect that integration.
+
 ## Global Constraints
 
 - Preserve existing protocol wire compatibility and ReliablePipe acknowledgment/lifecycle guarantees.

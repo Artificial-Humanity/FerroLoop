@@ -3814,6 +3814,10 @@ fn host_build_identity_is_opt_in() {
         0,
         "host must advertise opt-in build identity"
     );
+    let expected = fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE;
+    #[cfg(unix)]
+    let expected = expected | fl_host_proto::PTY_FEATURE;
+    assert_eq!(features, expected);
     let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
     let status = serde_json::to_value(extended(&mut rpc, request)).unwrap();
     assert_eq!(status["op"], "host_status");
@@ -3867,7 +3871,7 @@ fn pipe_modes_report_current_device_truth() {
                 thread::sleep(Duration::from_millis(10));
             };
             // Record 183 characterizes the mismatch: the Unix env opt-in uses a real
-            // PTY while reporting Pipe. First-class PTY correction belongs to Record 184.
+            // PTY while reporting Pipe. Explicit PTY sessions below report their device truth.
             assert_eq!(
                 report["isatty"],
                 cfg!(unix) && env_pty,
@@ -3883,14 +3887,49 @@ fn pipe_modes_report_current_device_truth() {
             assert_eq!(record(&summary.state).kind, SpawnKind::Pipe);
         }
     }
-    assert!(
-        client
-            .extension_request(XReq::SpawnSession {
-                spec: spec("first-class-pty", &["report"]),
-                mode: SessionMode::Pty,
-                pty: None,
-            })
-            .is_err()
+    let mut pty = spec("first-class-pty", &["report"]);
+    pty.kind = SpawnKind::Pty;
+    let response = client
+        .extension_request(XReq::SpawnSession {
+            spec: pty,
+            mode: SessionMode::Pty,
+            pty: None,
+        })
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let XResp::Session { stream, state } = response else {
+            panic!("PTY spawn: {response:?}")
+        };
+        assert_eq!(record(&state).kind, SpawnKind::Pty);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            let output = client.capture_output(stream.session.clone(), 8192).unwrap();
+            if let Some(report) = output
+                .lines()
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "missing PTY report: {output:?}");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(report["isatty"], true);
+        let summary = client
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.stream == stream)
+            .unwrap();
+        assert_eq!(summary.mode, SessionMode::Pty);
+        assert_eq!(record(&summary.state).kind, SpawnKind::Pty);
+    }
+    #[cfg(not(unix))]
+    assert_eq!(
+        response,
+        XResp::Refused {
+            code: Refuse::Unsupported
+        }
     );
     let mut pty = spec("kind-pty", &["report"]);
     pty.kind = SpawnKind::Pty;
