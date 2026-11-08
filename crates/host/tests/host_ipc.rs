@@ -3780,3 +3780,127 @@ fn non_reliable_eof_preserves_exact_unterminated_tail() {
             .any(|e| matches!(e, ControlEvent::ProtocolFailure { .. }))
     );
 }
+
+#[test]
+fn host_build_identity_is_opt_in() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    // A strict old reader only knows these variants/fields. Advertising a bit is
+    // compatible; adding build fields to either old response would fail here.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    enum LegacyResponse {
+        Capabilities {
+            host: fl_host_proto::HostInstance,
+            features: u64,
+            limits: fl_host_proto::ExtensionLimits,
+        },
+        Sessions {
+            records: Vec<fl_host_proto::SessionSummary>,
+        },
+    }
+    let caps = extended(&mut rpc, XReq::Capabilities);
+    let value = serde_json::to_value(&caps).unwrap();
+    let legacy: LegacyResponse = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+    let sessions = serde_json::to_value(extended(&mut rpc, XReq::ListSessions)).unwrap();
+    let legacy: LegacyResponse = serde_json::from_value(sessions.clone()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), sessions);
+    let XResp::Capabilities { features, .. } = caps else {
+        panic!("capabilities")
+    };
+    assert_ne!(
+        features & fl_host_proto::HOST_STATUS_FEATURE,
+        0,
+        "host must advertise opt-in build identity"
+    );
+    let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
+    let status = serde_json::to_value(extended(&mut rpc, request)).unwrap();
+    assert_eq!(status["op"], "host_status");
+    assert_eq!(
+        status["build"],
+        serde_json::to_value(fl_host::build_info()).unwrap()
+    );
+    assert_eq!(
+        rpc.inner.host_status().unwrap(),
+        Some(fl_host::build_info())
+    );
+}
+
+#[test]
+fn pipe_modes_report_current_device_truth() {
+    use fl_host_proto::SessionMode;
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut client = Rpc::connect(&daemon.paths.endpoint).inner;
+    for mode in [SessionMode::LegacyPipe, SessionMode::ReliablePipe] {
+        for env_pty in [false, true] {
+            let name = format!("device-{mode:?}-{env_pty}");
+            let mut spec = spec(&name, &["report"]);
+            if env_pty {
+                spec.env.insert("FL_HOST_PTY".into(), "1".into());
+                spec.env_allow.insert("FL_HOST_PTY".into());
+            }
+            let response = client
+                .extension_request(XReq::SpawnSession {
+                    spec,
+                    mode,
+                    pty: None,
+                })
+                .unwrap();
+            let XResp::Session { stream, state } = response else {
+                panic!("spawn: {response:?}")
+            };
+            assert_eq!(record(&state).kind, SpawnKind::Pipe);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let report = loop {
+                let output = client.capture_output(stream.session.clone(), 8192).unwrap();
+                if let Some(report) = output
+                    .lines()
+                    .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                {
+                    break report;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "missing terminal report: {output:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            // Record 183 characterizes the mismatch: the Unix env opt-in uses a real
+            // PTY while reporting Pipe. First-class PTY correction belongs to Record 184.
+            assert_eq!(
+                report["isatty"],
+                cfg!(unix) && env_pty,
+                "{mode:?}, env PTY={env_pty}"
+            );
+            let summary = client
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.stream == stream)
+                .unwrap();
+            assert_eq!(summary.mode, mode);
+            assert_eq!(record(&summary.state).kind, SpawnKind::Pipe);
+        }
+    }
+    assert!(
+        client
+            .extension_request(XReq::SpawnSession {
+                spec: spec("first-class-pty", &["report"]),
+                mode: SessionMode::Pty,
+                pty: None,
+            })
+            .is_err()
+    );
+    let mut pty = spec("kind-pty", &["report"]);
+    pty.kind = SpawnKind::Pty;
+    assert!(
+        client
+            .extension_request(XReq::SpawnSession {
+                spec: pty,
+                mode: SessionMode::LegacyPipe,
+                pty: None,
+            })
+            .is_err()
+    );
+}

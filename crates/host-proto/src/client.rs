@@ -221,6 +221,32 @@ impl AsyncHostClient {
             _ => Err(HostError::Protocol("extension response required".into())),
         }
     }
+    /// Query the serving binary. None explicitly means identity is unavailable on
+    /// this older host; never synthesize it from this client's compiled version.
+    pub async fn host_status(&mut self) -> Result<Option<crate::HostBuildInfo>, HostError> {
+        if self.minor < 1 {
+            return Ok(None);
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::Capabilities)
+            .await?
+        {
+            crate::ExtensionResponse::Capabilities { features, .. } => {
+                if features & crate::HOST_STATUS_FEATURE == 0 {
+                    return Ok(None);
+                }
+            }
+            _ => return Err(HostError::Protocol("capabilities response required".into())),
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::HostStatus)
+            .await?
+        {
+            crate::ExtensionResponse::HostStatus { build } => Ok(Some(build)),
+            _ => Err(HostError::Protocol("host status response required".into())),
+        }
+    }
+
     pub async fn claim_controller(
         &mut self,
         stream: crate::StreamId,
@@ -535,6 +561,10 @@ impl BlockingHostClient {
         Ok(Self { inner, runtime })
     }
 
+    pub fn negotiated(&self) -> (u16, u16) {
+        self.inner.negotiated()
+    }
+
     pub fn request(&mut self, request: HostRequest) -> Result<HostResponse, HostError> {
         self.runtime.block_on(self.inner.request(request))
     }
@@ -552,6 +582,11 @@ impl BlockingHostClient {
         request: crate::ExtensionRequest,
     ) -> Result<crate::ExtensionResponse, HostError> {
         self.runtime.block_on(self.inner.extension_request(request))
+    }
+
+    /// None means the daemon does not support build identity telemetry.
+    pub fn host_status(&mut self) -> Result<Option<crate::HostBuildInfo>, HostError> {
+        self.runtime.block_on(self.inner.host_status())
     }
 
     pub fn list_sessions(&mut self) -> Result<Vec<crate::SessionSummary>, HostError> {

@@ -1233,3 +1233,59 @@ mod extension_transport {
         f.listener.shutdown().await.unwrap();
     }
 }
+
+// Simulate both pre-extension hosts and minor-one hosts without the status feature.
+// The next actual request must remain List: sending HostStatus breaks old daemons.
+#[cfg(unix)]
+#[tokio::test]
+async fn host_status_old_hosts_receive_no_unsupported_request() {
+    use fl_host_proto::{ExtensionRequest as Req, ExtensionResponse as Resp};
+    for minor in [0, 1] {
+        let dir = Tmp::new();
+        let mut cfg = config(dir.path());
+        cfg.minor = minor;
+        let mut listener = HostListener::bind(cfg).await.unwrap();
+        let endpoint = listener.endpoint().clone();
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            if minor > 0 {
+                let HostRequest::Extended {
+                    id,
+                    request: Req::Capabilities,
+                } = conn.recv().await.unwrap()
+                else {
+                    panic!("capability negotiation required")
+                };
+                conn.respond(&HostResponse::Extended {
+                    id,
+                    response: Resp::Capabilities {
+                        host: fl_host_proto::HostInstance::new([1; 16]),
+                        features: fl_host_proto::RELIABLE_FEATURE,
+                        limits: Default::default(),
+                    },
+                })
+                .await
+                .unwrap();
+            }
+            let HostRequest::List { id } = conn.recv().await.unwrap() else {
+                panic!("unsupported request sent to old host")
+            };
+            conn.respond(&HostResponse::Listed {
+                id,
+                children: vec![],
+            })
+            .await
+            .unwrap();
+        });
+        let mut client = AsyncHostClient::connect(&endpoint).await.unwrap();
+        assert_eq!(client.host_status().await.unwrap(), None);
+        assert!(matches!(
+            client
+                .request(HostRequest::List { id: RequestId(100) })
+                .await
+                .unwrap(),
+            HostResponse::Listed { .. }
+        ));
+        server.await.unwrap();
+    }
+}

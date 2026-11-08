@@ -520,14 +520,8 @@ fn json_escape(text: &str) -> String {
 }
 
 fn stdout_is_tty() -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::isatty(1) == 1 }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    use std::io::IsTerminal;
+    io::stdout().is_terminal()
 }
 
 #[cfg(unix)]

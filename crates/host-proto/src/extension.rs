@@ -14,6 +14,45 @@ pub const MAX_EXTENSION_PART: usize = 32 * 1024;
 pub const MAX_RAW_INPUT: usize = 64 * 1024;
 pub const RELIABLE_FEATURE: u64 = 1;
 pub const PTY_FEATURE: u64 = 2;
+/// Opt-in daemon build telemetry; does not change existing response shapes.
+pub const HOST_STATUS_FEATURE: u64 = 4;
+pub const MAX_BUILD_FIELD_BYTES: usize = 128;
+
+/// Identity compiled into the serving binary, never the querying client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostBuildInfo {
+    #[serde(deserialize_with = "bounded_build_field")]
+    pub version: String,
+    #[serde(deserialize_with = "bounded_build_field")]
+    pub commit: String,
+    pub dirty: Option<bool>,
+    pub build_time_unix: Option<u64>,
+}
+impl HostBuildInfo {
+    pub fn validate(&self) -> Result<(), HostError> {
+        if self.version.len() > MAX_BUILD_FIELD_BYTES || self.commit.len() > MAX_BUILD_FIELD_BYTES {
+            return Err(HostError::EventTooLarge);
+        }
+        Ok(())
+    }
+}
+fn bounded_build_field<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Visitor;
+    impl de::Visitor<'_> for Visitor {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX_BUILD_FIELD_BYTES} bytes of build metadata")
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            if value.len() > MAX_BUILD_FIELD_BYTES {
+                return Err(E::custom("build metadata field too long"));
+            }
+            Ok(value.to_owned())
+        }
+    }
+    d.deserialize_str(Visitor)
+}
 
 macro_rules! fixed_hex {
     ($name:ident,$n:expr) => {
@@ -251,6 +290,7 @@ bounded_bytes!(RawInput, MAX_RAW_INPUT);
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionRequest {
     Capabilities,
+    HostStatus,
     ListSessions,
     SpawnSession {
         spec: SpawnSpec,
@@ -418,6 +458,9 @@ fn bounded_sessions<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SessionSummar
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionResponse {
+    HostStatus {
+        build: HostBuildInfo,
+    },
     Capabilities {
         host: HostInstance,
         features: u64,
@@ -471,6 +514,7 @@ pub enum ExtensionResponse {
 impl ExtensionResponse {
     pub(crate) fn validate(&self) -> Result<(), HostError> {
         match self {
+            Self::HostStatus { build } => build.validate(),
             Self::Sessions { records } if records.len() > 64 => Err(HostError::EventTooLarge),
             Self::CapturedOutput { text } if text.len() > MAX_RAW_INPUT => {
                 Err(HostError::EventTooLarge)
@@ -787,6 +831,51 @@ mod tests {
             bytes: BoundedBytes::new(b"x".to_vec()).unwrap(),
         }
     }
+    #[test]
+    fn host_status_is_bounded_and_legacy_response_shapes_stay_strict() {
+        let caps = ExtensionResponse::Capabilities {
+            host: HostInstance::new([0; 16]),
+            features: RELIABLE_FEATURE,
+            limits: ExtensionLimits::default(),
+        };
+        let mut value = serde_json::to_value(caps).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 4);
+        value["build"] = serde_json::json!({});
+        assert!(serde_json::from_value::<ExtensionResponse>(value).is_err());
+        let sessions =
+            serde_json::to_value(ExtensionResponse::Sessions { records: vec![] }).unwrap();
+        assert_eq!(
+            sessions,
+            serde_json::json!({"op": "sessions", "records": []})
+        );
+        let mut status = serde_json::json!({"op": "host_status", "build": {
+            "version": "0.1.0", "commit": "unknown", "dirty": null, "build_time_unix": null
+        }});
+        assert!(serde_json::from_value::<ExtensionResponse>(status.clone()).is_ok());
+        for field in ["version", "commit"] {
+            let mut invalid = status.clone();
+            invalid["build"][field] = "v".repeat(129).into();
+            assert!(serde_json::from_value::<ExtensionResponse>(invalid).is_err());
+        }
+        status["build"]["version"] = "v".repeat(128).into();
+        let valid: ExtensionResponse = serde_json::from_value(status).unwrap();
+        assert!(valid.validate().is_ok());
+        let ExtensionResponse::HostStatus { mut build } = valid else {
+            panic!("status")
+        };
+        build.version.push('v');
+        assert!(
+            crate::encode_response_for_minor(
+                1,
+                &crate::HostResponse::Extended {
+                    id: crate::RequestId(1),
+                    response: ExtensionResponse::HostStatus { build },
+                }
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn terminated_json_is_legacy_identical_and_unterminated_requires_minor_two() {
         let frame = encode_extension_frame(1, &part(true, false)).unwrap();

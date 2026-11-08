@@ -1,5 +1,5 @@
 //! Runs the tests of `build/stamp.rs`, the std-only source every `build.rs` that stamps a
-//! binary (`fl-cli`, `fl-store`, `fl-hub`) includes by path. `fl-core` itself stays free of
+//! binary (`fl-cli`, `fl-store`, `fl-hub`, `fl-host`) includes by path. `fl-core` itself stays free of
 //! IO: the stamping code is not part of its library.
 
 #[path = "../build/stamp.rs"]
@@ -294,7 +294,7 @@ mod closure {
 
     #[test]
     fn each_build_script_names_its_whole_path_dependency_closure() {
-        for krate in ["cli", "store", "hub"] {
+        for krate in ["cli", "store", "hub", "host"] {
             let want = closure(krate);
             assert!(want.len() > 1, "{krate}: {want:?}");
             assert_eq!(listed(krate), want, "crates/{krate}/build.rs");
@@ -307,6 +307,10 @@ mod closure {
         assert_eq!(
             closure("store"),
             BTreeSet::from(["store".into(), "core".into()])
+        );
+        assert_eq!(
+            closure("host"),
+            BTreeSet::from(["host".into(), "host-proto".into()])
         );
         assert!(closure("cli").contains("hub") && closure("hub").contains("store"));
     }

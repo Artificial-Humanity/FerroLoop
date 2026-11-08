@@ -133,7 +133,17 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     .context("invalid --socket path for fl-host")?,
                 None => HostEndpoint::discover().context("failed to discover fl-host endpoint")?,
             };
-            fl_host::serve(HostConfig::new(endpoint)).context("fl-host daemon exited with error")
+            let build = crate::version::build_info();
+            fl_host::serve_with_build_info(
+                HostConfig::new(endpoint),
+                fl_host_proto::HostBuildInfo {
+                    version: build.version,
+                    commit: build.commit,
+                    dirty: build.dirty,
+                    build_time_unix: build.build_time_unix,
+                },
+            )
+            .context("fl-host daemon exited with error")
         }
         HostCmd::Status { json } => {
             let endpoint =
@@ -144,26 +154,71 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     endpoint.socket_path().display()
                 )
             })?;
-            let sessions = dedup_session_summaries(
-                client
-                    .list_sessions()
-                    .context("failed to list fl-host sessions")?,
-            );
-            let active = sessions
-                .iter()
-                .filter(|s| matches!(s.state, ChildState::Running(_)))
-                .count();
-            let total = sessions.len();
+            let build = client
+                .host_status()
+                .context("failed to query fl-host build identity")?;
+            let (active, total) = if client.negotiated().1 == 0 {
+                // host_status sends no request at minor zero, so this remains the
+                // first request. These hosts cannot decode ListSessions either.
+                let response = client
+                    .request(fl_host_proto::HostRequest::List {
+                        id: fl_host_proto::RequestId(1),
+                    })
+                    .context("failed to list fl-host sessions")?;
+                let fl_host_proto::HostResponse::Listed { children, .. } = response else {
+                    bail!("unexpected fl-host session response");
+                };
+                (
+                    children
+                        .iter()
+                        .filter(|s| matches!(s.state, ChildState::Running(_)))
+                        .count(),
+                    children.len(),
+                )
+            } else {
+                let sessions = dedup_session_summaries(
+                    client
+                        .list_sessions()
+                        .context("failed to list fl-host sessions")?,
+                );
+                (
+                    sessions
+                        .iter()
+                        .filter(|s| matches!(s.state, ChildState::Running(_)))
+                        .count(),
+                    sessions.len(),
+                )
+            };
             if json {
                 let payload = serde_json::json!({
                     "socket": endpoint.socket_path().display().to_string(),
                     "active_sessions": active,
                     "total_sessions": total,
+                    "build_identity": if build.is_some() { "available" } else { "unavailable" },
+                    "build": build,
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 println!("fl-host: {}", endpoint.socket_path().display());
                 println!("sessions: {active} active / {total} total");
+                match build {
+                    Some(build) => {
+                        println!("build: {} ({})", build.version, build.commit);
+                        println!(
+                            "dirty: {}",
+                            build
+                                .dirty
+                                .map_or_else(|| "unknown".into(), |v| v.to_string())
+                        );
+                        println!(
+                            "build time (unix): {}",
+                            build
+                                .build_time_unix
+                                .map_or_else(|| "unknown".into(), |v| v.to_string())
+                        );
+                    }
+                    None => println!("build identity: unavailable (older daemon)"),
+                }
             }
             Ok(())
         }

@@ -526,6 +526,9 @@ pub(super) async fn extended(
             features: fl_host_proto::RELIABLE_FEATURE,
             limits: fl_host_proto::ExtensionLimits::default(),
         }),
+        XReq::HostStatus => Ok(XResp::HostStatus {
+            build: host.build_info.clone(),
+        }),
         XReq::ListSessions => {
             let outputs = host.outputs.lock().unwrap_or_else(|e| e.into_inner());
             if outputs.len() > fl_host_proto::DEFAULT_MAX_SESSIONS {
@@ -1136,6 +1139,9 @@ fn admit_extension(
         _ => 64,
     };
     let response = match request {
+        // Two bounded strings plus JSON (including worst-case escaping and Vec
+        // growth) and the wire buffer. The permit lives through the socket write.
+        XReq::HostStatus => 8192 + 2 * fl_host_proto::MAX_BUILD_FIELD_BYTES,
         XReq::ListSessions => list_response_storage_bound().ok_or(Refusal::ResourceLimit)?,
         XReq::CaptureOutput { max_bytes, .. } => {
             (*max_bytes as usize).min(fl_host_proto::MAX_RAW_INPUT) + 4096
