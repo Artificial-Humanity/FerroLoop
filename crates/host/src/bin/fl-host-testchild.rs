@@ -33,6 +33,18 @@ fn main() {
             out.flush().expect("tail flush");
             park();
         }
+        "stdout-fragments" => {
+            let mut out = io::stdout();
+            if rest.first().is_some_and(|s| s == "lines") {
+                for i in 0..100_000 { writeln!(out, "{i}").unwrap(); }
+            } else {
+                for _ in 0..513 { out.write_all(&[b'z'; 4096]).unwrap(); }
+                out.write_all(b"\n\r\x1b[0m\0\xfftail").unwrap();
+            }
+            out.flush().unwrap();
+            std::fs::write(rest.get(1).expect("done marker"), b"done").unwrap();
+            if !rest.iter().any(|s| s == "eof") { park(); }
+        }
         "echo" => echo(),
         #[cfg(unix)]
         "export-pipe-writers" => export_pipe_writers(&rest),

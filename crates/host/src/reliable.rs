@@ -213,16 +213,19 @@ impl ReliableJournal {
     pub(crate) fn prepare_read(&self) -> Result<ChargedBytes, ExtensionRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.drain(&mut state)?;
-        if state.eof
-            || state.failed
-            || state.pending.is_some()
-            || (self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS
-                && !self.coalescible(&state))
-        {
-            return Err(ExtensionRefusal::ResourceLimit);
+        if state.eof || state.failed || state.pending.is_some() { return Err(ExtensionRefusal::ResourceLimit); }
+        loop {
+            let admission = if self.counts.data.load(Ordering::SeqCst) >= MAX_DATA_RECORDS && !self.coalescible(&state) {
+                Err(ExtensionRefusal::ResourceLimit)
+            } else {
+                reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)
+                    .and_then(|_admission| self.allocate(READ_BYTES))
+            };
+            match admission {
+                Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(&mut state) => continue,
+                result => return result,
+            }
         }
-        let _admission = reserve(&self.budget, ChargeKind::Metadata, RECORD_METADATA)?;
-        self.allocate(READ_BYTES)
     }
     pub(crate) fn accept_read(&self, bytes: ChargedBytes) -> Result<(), ExtensionRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -405,7 +408,31 @@ impl ReliableJournal {
                 .ok_or(ExtensionRefusal::ResourceLimit)?,
         )
     }
+    /// Only unattended data is disposable. Lifecycle records and ACK state remain authoritative.
+    fn evict_oldest_data(&self, state: &mut State) -> bool {
+        if self.counts.cursors.load(Ordering::SeqCst) != 0 || self.counts.references.load(Ordering::SeqCst) != 0 { return false; }
+        let Some(offset) = (0..state.len).find(|offset| matches!(state.records[(state.head + offset) % SLOTS].as_ref().map(|r| &r.body), Some(ReliableBody::Line(_)))) else { return false; };
+        let index = (state.head + offset) % SLOTS;
+        state.records[index] = None;
+        // Move only the lifecycle prefix, at most MAX_LIFECYCLE_RECORDS slots.
+        for prefix in (0..offset).rev() {
+            let from = (state.head + prefix) % SLOTS;
+            let to = (from + 1) % SLOTS;
+            state.records[to] = state.records[from].take();
+        }
+        state.head = (state.head + 1) % SLOTS;
+        state.len -= 1;
+        true
+    }
     fn drain(&self, state: &mut State) -> Result<(), ExtensionRefusal> {
+        loop {
+            match self.drain_once(state) {
+                Err(ExtensionRefusal::ResourceLimit) if self.evict_oldest_data(state) => continue,
+                result => return result,
+            }
+        }
+    }
+    fn drain_once(&self, state: &mut State) -> Result<(), ExtensionRefusal> {
         loop {
             if state.partial.is_some() {
                 self.publish_partial(state)?;
@@ -560,6 +587,18 @@ impl ReplayCursor {
     pub(crate) fn journal(&self) -> Arc<ReliableJournal> {
         Arc::clone(&self.journal)
     }
+    pub(crate) fn gap(&self) -> Option<fl_host_proto::ReliableGap> {
+        let state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.next <= state.acked || self.next >= state.next { return None; }
+        let next_seq = (0..state.len).filter_map(|offset| state.records[(state.head + offset) % SLOTS].as_ref())
+            .find(|record| record.seq >= self.next).map_or(state.next, |record| record.seq);
+        (next_seq > self.next).then_some(fl_host_proto::ReliableGap { from_seq: self.next, next_seq })
+    }
+    pub(crate) fn advance_gap(&mut self, gap: fl_host_proto::ReliableGap) -> Result<(), ExtensionRefusal> {
+        if self.gap() != Some(gap) { return Err(ExtensionRefusal::CursorExpired); }
+        self.next = gap.next_seq;
+        Ok(())
+    }
     pub(crate) fn next(&mut self) -> Result<Option<RecordReference>, ExtensionRefusal> {
         let mut state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.journal.drain(&mut state);
@@ -569,9 +608,9 @@ impl ReplayCursor {
         if self.next >= state.next {
             return Ok(None);
         }
-        let offset = usize::try_from(self.next - state.acked - 1)
-            .map_err(|_| ExtensionRefusal::ResourceLimit)?;
-        let index = (state.head + offset) % SLOTS;
+        let index = (0..state.len).map(|offset| (state.head + offset) % SLOTS)
+            .find(|index| state.records[*index].as_ref().is_some_and(|r| r.seq == self.next))
+            .ok_or(ExtensionRefusal::CursorExpired)?;
         if let Some(record) = state.records[index].as_mut().and_then(Arc::get_mut) {
             record.exposed = true;
         }
@@ -678,6 +717,95 @@ mod tests {
         );
         (session, output)
     }
+    fn admit(j: &ReliableJournal, raw: &[u8]) {
+        let mut bytes = j.prepare_read().unwrap();
+        bytes.as_mut_slice()[..raw.len()].copy_from_slice(raw);
+        bytes.truncate(raw.len());
+        j.accept_read(bytes).unwrap();
+    }
+    #[test]
+    fn tiny_reads_coalesce_and_exposed_tail_never_changes() {
+        let j = journal();
+        let mut expected = Vec::new();
+        for i in 0..100_000 {
+            let raw: &[u8] = if i % 1000 == 999 { b"x\n" } else { b"x" };
+            admit(&j, raw);
+            expected.extend_from_slice(raw);
+        }
+        assert_eq!(j.live_data_records(), 100);
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        let mut got = Vec::new();
+        while let Some(record) = cursor.next().unwrap() {
+            let ReliableBody::Line(bytes) = &record.body else { panic!("line") };
+            got.extend_from_slice(bytes.as_slice());
+            if bytes.terminated { got.push(b'\n'); }
+        }
+        assert_eq!(got, expected);
+        drop(cursor);
+        let k = journal();
+        admit(&k, b"a");
+        let (_, mut cursor) = begin_replay(&k, 0).unwrap();
+        drop(cursor.next().unwrap().unwrap());
+        drop(cursor);
+        admit(&k, b"b");
+        let (_, mut cursor) = begin_replay(&k, 0).unwrap();
+        assert!(matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"a"));
+        assert!(matches!(&cursor.next().unwrap().unwrap().body, ReliableBody::Line(b) if b.as_slice()==b"b"));
+    }
+    #[test]
+    fn unattended_eviction_preserves_lifecycle_and_reports_exact_gap() {
+        let j = journal();
+        j.lifecycle(ControlEvent::CleanupComplete { session: stream().session, session_epoch: stream().epoch, seq: 0 }).unwrap();
+        for i in 0..100_000 { admit(&j, format!("{i}\n").as_bytes()); }
+        assert_eq!(j.position().0, 0);
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        assert!(cursor.gap().is_none());
+        assert!(matches!(cursor.next().unwrap().unwrap().body, ReliableBody::Lifecycle(..)));
+        let gap = cursor.gap().expect("data loss notice");
+        assert_eq!(gap.from_seq, 2);
+        assert_eq!(gap.next_seq, 100_002 - MAX_DATA_RECORDS as u64);
+        assert_eq!(cursor.gap(), Some(gap), "notice is not consumed before write success");
+        cursor.advance_gap(gap).unwrap();
+        for i in 100_000 - MAX_DATA_RECORDS..100_000 {
+            let r = cursor.next().unwrap().unwrap();
+            assert!(matches!(&r.body, ReliableBody::Line(b) if b.terminated && b.as_slice()==i.to_string().as_bytes()));
+        }
+        assert!(cursor.next().unwrap().is_none());
+    }
+    #[test]
+    fn unattended_byte_pressure_and_live_cursor_backpressure_are_distinct() {
+        let j = journal();
+        for _ in 0..100_000 { admit(&j, &[b'z'; 128]); }
+        assert!(j.budget.used(ChargeKind::ReliableData) <= EPOCH_DATA);
+        assert_eq!(j.position().0, 0);
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        assert!(cursor.gap().is_some());
+        let gap = cursor.gap().unwrap(); cursor.advance_gap(gap).unwrap();
+        while let Some(r) = cursor.next().unwrap() {
+            assert!(matches!(&r.body, ReliableBody::Line(b) if !b.terminated && b.as_slice().iter().all(|x| *x==b'z')));
+        }
+        let k = journal();
+        let (_, _live) = begin_replay(&k, 0).unwrap();
+        for _ in 0..MAX_DATA_RECORDS { admit(&k, b"x\n"); }
+        assert!(k.prepare_read().is_err());
+        assert_eq!(k.live_data_records(), MAX_DATA_RECORDS);
+        assert_eq!(k.position(), (0, MAX_DATA_RECORDS as u64));
+    }
+
+    #[test]
+    fn unattended_record_pressure_drops_oldest_without_ack() {
+        let j = journal();
+        for _ in 0..100_000 {
+            let mut bytes = j.prepare_read().expect("unattended producer remains live");
+            bytes.as_mut_slice()[..2].copy_from_slice(b"x\n");
+            bytes.truncate(2);
+            j.accept_read(bytes).unwrap();
+        }
+        assert_eq!(j.position().0, 0, "eviction is not acknowledgement");
+        assert!(j.live_data_records() <= MAX_DATA_RECORDS);
+        assert!(j.budget.used(ChargeKind::ReliableData) <= EPOCH_DATA);
+    }
+
     #[test]
     fn arbitrarily_long_unterminated_output_is_not_a_protocol_failure() {
         let j = journal();
@@ -702,6 +830,7 @@ mod tests {
     #[test]
     fn real_sink_driver_retains_pending_read_at_saturation_and_stop() {
         let j = journal();
+        let (_watermark, _active) = begin_replay(&j, 0).unwrap();
         for _ in 0..MAX_DATA_RECORDS - 1 {
             append(&j, line(&j, b"previous")).unwrap();
         }
@@ -716,7 +845,7 @@ mod tests {
         });
         assert!(j.is_eof());
         assert_eq!(j.retained(), MAX_DATA_RECORDS);
-        assert!(j.state.lock().unwrap().pending.is_some());
+        assert!(j.state.lock().unwrap().partial.is_some());
         acknowledge(&j, MAX_DATA_RECORDS as u64).unwrap();
         let (_, mut cursor) = begin_replay(&j, MAX_DATA_RECORDS as u64).unwrap();
         let record = cursor.next().unwrap().unwrap();
@@ -944,12 +1073,13 @@ mod tests {
     #[test]
     fn journal_limits_checked_before_read() {
         let j = journal();
+        let (_watermark, _active) = begin_replay(&j, 0).unwrap();
         for _ in 0..MAX_DATA_RECORDS {
             append(&j, line(&j, b"x")).unwrap();
         }
         assert!(j.prepare_read().is_err());
         let mut cursors = Vec::new();
-        for _ in 0..MAX_CURSORS {
+        for _ in 1..MAX_CURSORS {
             cursors.push(begin_replay(&j, 0).unwrap().1);
         }
         assert!(matches!(

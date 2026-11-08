@@ -437,15 +437,16 @@ impl Drop for EventLog {
 }
 
 fn line_bytes(events: &[HostEvent], session: &str) -> Vec<Vec<u8>> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            HostEvent::Line {
-                session: id, bytes, ..
-            } if id.as_str() == session => Some(bytes.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut lines = Vec::new(); let mut tail = Vec::new();
+    for event in events {
+        if let HostEvent::Line { session: id, bytes, terminated, .. } = event
+            && id.as_str() == session {
+            tail.extend_from_slice(bytes);
+            if *terminated { lines.push(std::mem::take(&mut tail)); }
+        }
+    }
+    if !tail.is_empty() { lines.push(tail); }
+    lines
 }
 
 fn controls(events: &[HostEvent]) -> Vec<ControlEvent> {
@@ -738,41 +739,25 @@ fn daemon_restart_never_reuses_session_epoch() {
 }
 
 #[test]
-fn stdout_line_overflow_fails_session() {
+fn stdout_fragments_preserve_large_binary_stream_and_keep_child_alive() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("big"));
     let mut rpc = Rpc::connect(&daemon.paths.endpoint);
-    let child = rpc.spawn("big", &["overflow"]);
-    let epoch = epoch_of(&child);
-    log.wait_until(Duration::from_secs(3), |events| {
-        controls(events).iter().any(|event| {
-            matches!(
-                event,
-                ControlEvent::ProtocolFailure { session, session_epoch, .. }
-                    if session.as_str() == "big" && session_epoch.0 == epoch
-            )
-        })
-    });
-    assert!(
-        line_bytes(&log.snapshot(), "big")
-            .iter()
-            .all(|line| line.len() <= 1024 * 1024 && line != &vec![b'z'; 1024 * 1024])
-    );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let listed = rpc.list();
-        if let Some(child) = listed
-            .iter()
-            .find(|child| record(&child.state).session.as_str() == "big")
-            && !matches!(child.state, ChildState::Running(_))
-        {
-            break;
+    let done = daemon.paths.transcript.with_extension("done");
+    rpc.spawn("big", &["stdout-fragments", "tail", done.to_str().unwrap()]);
+    let mut expected = vec![b'z'; 513 * 4096]; expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+    let reconstruct = |events: &[HostEvent]| {
+        let mut bytes = Vec::new();
+        for event in events {
+            if let HostEvent::Line { bytes: raw, terminated, .. } = event { bytes.extend_from_slice(raw); if *terminated { bytes.push(b'\n'); } }
         }
-        if Instant::now() >= deadline {
-            panic!("overflow did not fail the session");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+        bytes
+    };
+    log.wait_until(Duration::from_secs(5), |events| reconstruct(events).len() == expected.len());
+    let events = log.snapshot();
+    assert_eq!(reconstruct(&events), expected);
+    assert!(!controls(&events).iter().any(|e| matches!(e, ControlEvent::ProtocolFailure { .. })));
+    assert!(rpc.list().iter().any(|c| matches!(&c.state, ChildState::Running(r) if r.session.as_str()=="big")));
 }
 
 #[test]
@@ -2882,6 +2867,7 @@ fn partial_event_cannot_advance_emitted_ceiling() {
     assert!(matches!(
         frame,
         fl_host_proto::ExtensionFrame::ReliablePart {
+            terminated: true,
             seq: 3,
             more: true,
             ..

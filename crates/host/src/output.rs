@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fl_host_proto::{
     ChildExit, ControlEvent, Frame, FrameKind, HostedChild, LINE_HEADER_LEN, MAX_EVENT_ENVELOPE,
@@ -232,11 +232,7 @@ impl Hub {
         }
     }
 
-    pub fn all_backlogged(&self) -> bool {
-        let fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        let live: Vec<_> = fanout.subs.iter().filter(|sub| !sub.dropped).collect();
-        !live.is_empty() && live.iter().all(|sub| sub.queue.len() >= 32)
-    }
+
 
     fn note_status(&self, charge: Charge) {
         let Some(path) = &self.status else {
@@ -549,10 +545,6 @@ impl OutputSession {
 
     #[cfg(test)]
     fn emit_fragment(&self, raw: Vec<u8>, terminated: bool) {
-        let started = Instant::now();
-        while self.hub.all_backlogged() && started.elapsed() < Duration::from_millis(20) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
         let raw_len = raw.len();
         let envelope = line_envelope(raw_len);
         let _order = self.lock_order();
@@ -1164,6 +1156,37 @@ mod tests {
             })),
             Arc::clone(hub),
         )
+    }
+
+    #[test]
+    fn tiny_unattended_reads_coalesce_and_reconstruct_exact_bytes() {
+        let hub = Arc::new(Hub::new()); let out = fixture(1, &hub);
+        let mut expected = Vec::new();
+        for i in 0..100_000 {
+            let raw: &[u8] = if i % 1000 == 999 { b"x\n" } else { b"x" };
+            assert!(out.room() >= raw.len()); assert!(out.push(raw)); expected.extend_from_slice(raw);
+        }
+        assert_eq!(out.inner.lock().unwrap().events.len(), 100);
+        let sub = hub.subscribe(None, None).ok().unwrap(); let mut got = Vec::new();
+        while let Some(event) = sub.next_event(&hub) {
+            if let Body::Line(raw) = &event.body { got.extend_from_slice(raw); if event.terminated { got.push(b'\n'); } }
+            sub.pop_sent(&hub, &event); settle(&event, true); hub.pull_preexisting();
+        }
+        assert_eq!(got, expected);
+        sub.abandon(&hub);
+    }
+    #[test]
+    fn bounded_fragments_preserve_binary_lf_boundary_and_eof() {
+        let hub = Arc::new(Hub::new()); let out = fixture(1, &hub);
+        let mut expected = vec![b'z'; 2 * MAX_STDOUT_LINE]; expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+        for raw in expected.chunks(4096) { assert!(out.push(raw)); }
+        out.eof();
+        let inner = out.inner.lock().unwrap(); let mut got = Vec::new();
+        for event in &inner.events {
+            if let Body::Line(raw) = &event.body { assert!(raw.len() <= MAX_STDOUT_LINE); got.extend_from_slice(raw); if event.terminated { got.push(b'\n'); } }
+            else { panic!("no protocol failure"); }
+        }
+        assert_eq!(got, expected);
     }
 
     #[test]

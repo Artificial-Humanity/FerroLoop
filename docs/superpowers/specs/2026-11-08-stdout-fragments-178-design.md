@@ -79,34 +79,24 @@ caps while independently exceeding the read count cap. Both paths must remain
 unstalled, within budget, and reconstruct exactly for a later minor-2 reader.
 Also exercise a no-LF stream across multiple 1 MiB record boundaries.
 
-## Bounded unattended reliable eviction
+### Approved unattended reliable eviction amendment
 
-Coalescing alone cannot keep an unattended production session running indefinitely.
-When no reliable subscriber holds a live cursor on the stream, and admitting the
-next record would exhaust the data-record cap or byte budget, retire the oldest
-unacknowledged data records until bounded admission can proceed. Never evict a
-lifecycle record, advance the acknowledged watermark, or claim delivery of evicted
-data. Preserve lifecycle records even when retained data sequence numbers have gaps;
-do not assume the retained journal remains contiguous after eviction.
+Production sessions currently use reliable pipes without a subscriber. When no
+live replay cursor or held record reference exists, admit stdout by dropping the
+oldest unacknowledged data records as needed for byte/record capacity. Never drop
+lifecycle records or advance `acked`. Cursor admission and eviction share the
+journal lock. Replay finds retained records by actual sequence, not an ACK offset.
+At each missing range, emit minor-2 `Gap { from_seq, next_seq }` before the next
+retained record. A failed gap write never advances the cursor. Older surviving
+lifecycle records precede their following gaps. The high-level client surfaces a
+typed Gap event and does not grant ACK cursor credit for it. Old peers receive
+Unsupported and close only their subscription. Live cursors preserve lossless
+backpressure; a stalled live subscriber remains a documented risk. Non-reliable
+output keeps existing backpressure with no eviction.
 
-Record the loss explicitly. A later subscriber must receive a gap/notice naming
-the first sequence it can still receive, before replaying retained data. The reader
-must be able to resume at that sequence and reconstruct the retained bytes exactly.
-Do not turn a gap into a silent cursor jump or acknowledge data on the reader's
-behalf. Protocol changes needed for this notice belong to negotiated minor 2.
-
-While any live reliable cursor exists, preserve lossless backpressure and do not
-evict data. Cursor admission, release, eviction, and record exposure must be
-serialized so a newly attached reader cannot race eviction. A stalled live reader
-can still stall the producer; this is a known risk deliberately outside this fix.
-
-Hard gates: no subscriber and 100,000 LF-terminated plus unterminated admissions
-must never stall the reliable producer while record count and byte charges stay
-bounded; a later subscriber receives a gap then exact retained bytes; a live
-subscriber still receives lossless backpressure. Exercise both record and byte
-pressure, preserved lifecycle records, and unchanged ACK state after eviction.
-The non-reliable path retains its existing delivery guarantees and the coalescing
-and 100,000-read tests above; this eviction policy applies to the reliable journal.
+Test 100,000 LF-terminated admissions and 100,000 unterminated admissions with no
+subscriber; both stay live within budget. Attach later and verify each gap plus
+exact retained bytes. Separately prove active-cursor saturation retains all data.
 
 ## Validation and boundaries
 

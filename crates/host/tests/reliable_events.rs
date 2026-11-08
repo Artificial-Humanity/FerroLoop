@@ -563,6 +563,7 @@ fn saturated_old_epoch_replays_every_line_after_kill_and_same_name_replacement()
         });
         assert_eq!(event.seq, seq);
         match event.kind {
+            ReliableKind::Gap => panic!("unexpected gap {event:?}"),
             ReliableKind::Line if event.bytes == b"READY" => {
                 assert!(!saw_ready);
                 saw_ready = true;
@@ -927,4 +928,59 @@ fn guessed_pending_final_write_cancellation_retires_no_output() {
     );
     let _rpc = ack.join().unwrap();
     assert_eq!(f.rpc().summary(&check_stream).acked, 0);
+}
+
+#[test]
+fn reliable_large_unterminated_stream_is_exact_and_child_remains_running() {
+    let f = Fixture::new(); let mut rpc = f.rpc();
+    let done = f.root.path().join("output-done");
+    let (stream, _) = rpc.spawn("large-tail", &["stdout-fragments", "tail", done.to_str().unwrap()]);
+    wait_file(&done);
+    let rt = runtime();
+    rt.block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client.subscribe_reliable(stream.clone(), grant.lease, Some(0)).await.unwrap();
+        let mut expected = vec![b'z'; 513 * 4096]; expected.extend_from_slice(b"\n\r\x1b[0m\0\xfftail");
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next_event()).await.unwrap().unwrap();
+            match event.kind {
+                ReliableKind::Line => { got.extend_from_slice(&event.bytes); if event.terminated { got.push(b'\n'); } }
+                ReliableKind::Lifecycle => { assert!(!matches!(serde_json::from_slice::<fl_host_proto::ControlEvent>(&event.bytes).unwrap(), fl_host_proto::ControlEvent::ProtocolFailure { .. })); }
+                ReliableKind::Gap => panic!("unexpected gap"),
+            }
+            client.ack(events.cursor(), grant.lease).await.unwrap();
+        }
+        assert_eq!(got, expected);
+    });
+    assert!(matches!(rpc.summary(&stream).state, ChildState::Running(_)));
+}
+
+#[test]
+fn unattended_daemon_sends_gap_then_retained_data_without_ack_credit() {
+    let f = Fixture::new(); let mut rpc = f.rpc();
+    let done = f.root.path().join("output-done");
+    let (stream, _) = rpc.spawn("pressure", &["stdout-fragments", "lines", done.to_str().unwrap()]);
+    wait_file(&done);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rpc.summary(&stream).latest < 100_001 { assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(5)); }
+    assert_eq!(rpc.summary(&stream).acked, 0);
+    let rt = runtime();
+    rt.block_on(async {
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let grant = client.claim_controller(stream.clone()).await.unwrap();
+        let mut events = client.subscribe_reliable(stream.clone(), grant.lease, Some(0)).await.unwrap();
+        let lifecycle = events.next_event().await.unwrap(); assert_eq!(lifecycle.kind, ReliableKind::Lifecycle); assert_eq!(lifecycle.seq, 1);
+        let notice = events.next_event().await.unwrap(); assert_eq!(notice.kind, ReliableKind::Gap);
+        let gap = notice.gap.unwrap(); assert_eq!(gap.from_seq, 2); assert!(gap.next_seq > 2);
+        assert_eq!(events.cursor().seq, 1, "gap must not create ACK cursor credit");
+        for expected_seq in gap.next_seq..=100_001 {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next_event()).await.unwrap().unwrap();
+            assert_eq!(event.seq, expected_seq); assert_eq!(event.kind, ReliableKind::Line);
+            assert!(event.terminated); assert_eq!(event.bytes, (expected_seq - 2).to_string().as_bytes());
+        }
+    });
+    assert_eq!(rpc.summary(&stream).acked, 0);
+    assert!(matches!(rpc.summary(&stream).state, ChildState::Running(_)));
 }

@@ -1102,7 +1102,7 @@ impl ReliableEventStream {
             };
             match self.reassembly.push(&frame) {
                 Ok(Some(event)) => {
-                    self.cursor.seq = event.seq;
+                    if event.kind != crate::ReliableKind::Gap { self.cursor.seq = event.seq; }
                     return Ok(event);
                 }
                 Ok(None) => {}

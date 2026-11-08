@@ -96,14 +96,26 @@ retires, even after Ack removes the journal entry. Pending operations retain the
 permit through queued and in-flight response retirement. Admission may refuse
 earlier when an aggregate category is full.
 
-Reliable stdout pauses at capacity and reports consumer_stalled. It neither evicts
-unacknowledged events nor blocks another session's control. Finite lifecycle
-reservation allows Exited and CleanupComplete to progress independently of data
-occupancy. Exited precedes successful CleanupComplete; cleanup and process death
-remain distinct observations. Kill is not permission to discard unread output.
-Old output may therefore remain replayable after kill and same-name replacement.
-No abandonment TTL or silent journal eviction exists. An absent controller can
-consume retained capacity indefinitely and make new spawn fail before child effects.
+Stdout records contain at most 1 MiB and flush at each read boundary. Protocol
+minor 2 carries `terminated`: append LF only when true. Missing JSON metadata and
+old binary frames mean true. A minor 0/1 subscriber closes at an unterminated
+record; the child and unconsumed record survive under normal retention rules.
+
+With a live reliable replay cursor, stdout pauses at capacity and reports
+consumer_stalled. A stalled live subscriber can still backpressure its producer.
+With no live replay cursor or held record reference, admission evicts the oldest
+unacknowledged **data** record as needed for record or byte capacity. Lifecycle
+records remain retained, and eviction never advances Ack. A later minor-2 reader
+receives explicit `Gap { from_seq, next_seq }` notices before missing ranges,
+interleaved with surviving lifecycle records in sequence order, followed by exact
+retained bytes. The high-level client surfaces a Gap event without advancing its
+ACK cursor. Minor-1 readers receive Unsupported and disconnect at a gap.
+
+Finite lifecycle reservation allows Exited and CleanupComplete to progress
+independently of data occupancy. Exited precedes successful CleanupComplete;
+cleanup and process death remain distinct observations. Kill is not permission
+to discard lifecycle records. No abandonment TTL exists. Non-reliable output
+retains its existing backpressure policy and never uses unattended eviction.
 
 ## Recovery boundary and evidence
 

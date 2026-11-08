@@ -82,6 +82,16 @@ that information through the client replay path without pretending it was ACKed.
 - [ ] Coordinator verifies commits and dispatches fresh read-only code review;
   accepted findings go to a fresh fixer followed by scoped re-review (max 3 rounds).
 
+## Approved eviction amendment
+
+- [ ] Reliable journal drops oldest DATA only when no live cursor/reference exists;
+  lifecycle records and explicit ACK state remain untouched.
+- [ ] Replay surfaces minor-2 gaps with exact missing range and next retained seq;
+  no gap write creates final-write/ACK credit. Preserve lifecycle ordering.
+- [ ] Verify 100,000 LF records and 100,000 unterminated admissions, bounded memory,
+  later exact replay with gaps, and active-cursor lossless backpressure.
+- [ ] Update public protocol/retention documentation and test old-peer refusal.
+
 ## Final verification and publication
 
 - [ ] `cargo fmt --all -- --check`
