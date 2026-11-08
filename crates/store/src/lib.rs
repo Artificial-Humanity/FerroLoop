@@ -2051,6 +2051,10 @@ impl Handles for RedbStore {
         };
         Iri::parse(v.value()).map(Some).map_err(decode)
     }
+
+    fn projects_for_slug(&self) -> Result<Vec<Project>, StoreError> {
+        self.list_projects()
+    }
 }
 
 impl Bindings for RedbStore {

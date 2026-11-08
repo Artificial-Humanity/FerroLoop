@@ -52,6 +52,10 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        Some(&self.project)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]

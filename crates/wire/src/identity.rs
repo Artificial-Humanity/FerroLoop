@@ -393,30 +393,46 @@ fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &Ve
         }
         (
             VendorRoute::Agy {
+                conversation_id: dst_conv,
                 ls_pid: dst_pid,
                 ls_address: dst_addr,
                 csrf_token: dst_csrf,
                 agentapi_exe: dst_exe,
-                ..
             },
             VendorRoute::Agy {
+                conversation_id: src_conv,
                 ls_pid: src_pid,
                 ls_address: src_addr,
                 csrf_token: src_csrf,
                 agentapi_exe: src_exe,
-                ..
             },
         ) => {
+            let same_or_placeholder_conv = dst_conv == src_conv
+                || !is_native_session_id(dst_conv)
+                || !is_native_session_id(src_conv);
+            let port_compatible = match (
+                dst_addr.as_deref().and_then(agy_ls_port),
+                src_addr.as_deref().and_then(agy_ls_port),
+            ) {
+                (Some(dp), Some(sp)) => dp == sp,
+                _ => true,
+            };
             let dst_has_live_pair = dst_addr.as_deref().is_some_and(agy_ls_address_listening)
                 && dst_csrf.as_deref().is_some_and(|t| !t.trim().is_empty());
             let src_has_live_pair = src_addr.as_deref().is_some_and(agy_ls_address_listening)
                 && src_csrf.as_deref().is_some_and(|t| !t.trim().is_empty());
-            if !dst_has_live_pair && src_has_live_pair {
+            if same_or_placeholder_conv
+                && port_compatible
+                && !dst_has_live_pair
+                && src_has_live_pair
+            {
                 *dst_addr = src_addr.clone();
                 *dst_csrf = src_csrf.clone();
                 if dst_pid.is_none() {
                     *dst_pid = *src_pid;
                 }
+            } else if same_or_placeholder_conv && dst_pid.is_none() {
+                *dst_pid = *src_pid;
             }
             if dst_exe.as_ref().is_none_or(|path| !agy_exe_is_usable(path))
                 && src_exe.as_ref().is_some_and(|path| agy_exe_is_usable(path))
@@ -1424,7 +1440,6 @@ impl RouteTable {
         candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for (file_ms, conv_id, transcript) in candidates {
             if let Some(persona) = scan_transcript_for_persona(&transcript, 50)
-                && !self.entries.contains_key(&persona)
                 && !self.entries.values().any(|existing| {
                     matches!(
                         &existing.route,
@@ -1435,18 +1450,55 @@ impl RouteTable {
                     )
                 })
             {
-                self.upsert_discovered(
-                    &persona,
-                    VendorRoute::Agy {
-                        conversation_id: conv_id,
-                        ls_pid: None,
-                        ls_address: shared_ls_addr.clone(),
-                        csrf_token: shared_csrf.clone(),
-                        agentapi_exe: Some(resolved_shared.clone()),
+                let placeholder = match self.entries.get(&persona) {
+                    None => Some((None, None, None, None, false)),
+                    Some(entry) => match &entry.route {
+                        VendorRoute::Agy {
+                            conversation_id,
+                            ls_pid,
+                            ls_address,
+                            csrf_token,
+                            agentapi_exe,
+                        } if !is_native_session_id(conversation_id) => Some((
+                            *ls_pid,
+                            ls_address.clone(),
+                            csrf_token.clone(),
+                            agentapi_exe.clone(),
+                            entry.explicit,
+                        )),
+                        _ => None,
                     },
-                    file_ms,
-                    at,
-                );
+                };
+                let Some((
+                    existing_pid,
+                    existing_addr,
+                    existing_csrf,
+                    existing_exe,
+                    explicit_placeholder,
+                )) = placeholder
+                else {
+                    continue;
+                };
+                if !explicit_placeholder && self.entries.contains_key(&persona) {
+                    self.entries.remove(&persona);
+                }
+                let route = VendorRoute::Agy {
+                    conversation_id: conv_id,
+                    ls_pid: existing_pid,
+                    ls_address: existing_addr.or_else(|| shared_ls_addr.clone()),
+                    csrf_token: existing_csrf.or_else(|| shared_csrf.clone()),
+                    agentapi_exe: existing_exe.or_else(|| Some(resolved_shared.clone())),
+                };
+                if explicit_placeholder {
+                    let file_at = if file_ms > 0 {
+                        At::from_unix_millis(file_ms)
+                    } else {
+                        at.clone()
+                    };
+                    self.upsert_passive(&persona, route, file_at);
+                } else {
+                    self.upsert_discovered(&persona, route, file_ms, at);
+                }
             }
         }
     }
@@ -2050,6 +2102,12 @@ impl RouteTable {
                         if tmux_pane.is_none() {
                             *tmux_pane = Some(pane);
                         }
+                    }
+                    (VendorRoute::Agy { ls_pid, .. }, "antigravity" | "agy")
+                        if ls_pid
+                            .is_none_or(|pid| !Path::new(&format!("/proc/{pid}")).exists()) =>
+                    {
+                        *ls_pid = Some(rec.pid);
                     }
                     _ => {}
                 }
@@ -5654,6 +5712,182 @@ mod tests {
                 assert_eq!(*ls_pid, Some(4242));
             }
             other => panic!("expected Agy route for feira, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spinning_up_second_agy_session_does_not_rewrite_existing_agy_route_ls_address_or_csrf() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        let brain_dir = agy_dir.join("brain");
+        fs::create_dir_all(&brain_dir).unwrap();
+
+        // Bind three independent local listeners:
+        // 1. Remote-control daemon (33047 in live repro) with csrf `f5174f82`
+        // 2. Feira's agy session (39643 in live repro) with csrf `6f09f521`
+        // 3. Felix's newly spun-up agy session (42959 in live repro) with csrf `felix-csrf-42959`
+        let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let daemon_port = daemon_listener.local_addr().unwrap().port();
+        let daemon_addr = format!("127.0.0.1:{daemon_port}");
+
+        let feira_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let feira_port = feira_listener.local_addr().unwrap().port();
+        let feira_addr = format!("127.0.0.1:{feira_port}");
+
+        let felix_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let felix_port = felix_listener.local_addr().unwrap().port();
+        let felix_addr = format!("127.0.0.1:{felix_port}");
+
+        let mut table = RouteTable::default();
+        table.upsert_explicit(
+            "jarvis",
+            VendorRoute::Agy {
+                conversation_id: "conv-jarvis-daemon".into(),
+                ls_pid: Some(7701),
+                ls_address: Some(daemon_addr.clone()),
+                csrf_token: Some("f5174f82".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(100),
+        );
+        table.upsert_explicit(
+            "feira",
+            VendorRoute::Agy {
+                conversation_id: "05729f07-2e25-43d9-a1af-90d5a5907788".into(),
+                ls_pid: Some(2270049),
+                ls_address: Some(feira_addr.clone()),
+                csrf_token: Some("6f09f521".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(200),
+        );
+
+        // `fl agent spin-up --vendor antigravity --session Felix` registers an explicit
+        // placeholder route for felix, and Felix's new agy process rotates `cli.log` to its
+        // own port (42959) and creates its brain transcript.
+        table.upsert_explicit(
+            "felix",
+            VendorRoute::Agy {
+                conversation_id: "antigravity:felix".into(),
+                ls_pid: Some(2667475),
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(300),
+        );
+        fs::write(
+            agy_dir.join("cli.log"),
+            format!("Language server listening on random port at {felix_port} for HTTP\n"),
+        )
+        .unwrap();
+        let felix_transcript = brain_dir
+            .join("conv-felix-new")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(felix_transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &felix_transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"Take the name of Felix and take up residence in ferroloop/ as the web-developer.\"}\n",
+        )
+        .unwrap();
+        set_mtime(&felix_transcript, 350);
+
+        // Discovery runs before Felix executes `agent-msg register Felix`.
+        table.discover_agy_routes(home, false, &At::from_unix_millis(400));
+
+        // 1. Feira's ls_address and csrf_token must NOT be overwritten by Felix's cli.log port
+        // or Jarvis's daemon csrf_token.
+        match &table.get("feira").expect("feira route").route {
+            VendorRoute::Agy {
+                conversation_id,
+                ls_pid,
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(conversation_id, "05729f07-2e25-43d9-a1af-90d5a5907788");
+                assert_eq!(*ls_pid, Some(2270049));
+                assert_eq!(ls_address.as_deref(), Some(feira_addr.as_str()));
+                assert_eq!(csrf_token.as_deref(), Some("6f09f521"));
+            }
+            other => panic!("expected Agy route for feira, got {other:?}"),
+        }
+
+        // 2. Jarvis's daemon route must also remain untouched.
+        match &table.get("jarvis").expect("jarvis route").route {
+            VendorRoute::Agy {
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(ls_address.as_deref(), Some(daemon_addr.as_str()));
+                assert_eq!(csrf_token.as_deref(), Some("f5174f82"));
+            }
+            other => panic!("expected Agy route for jarvis, got {other:?}"),
+        }
+
+        // 3. Felix's placeholder route is upgraded to `conv-felix-new` with `felix_addr` and
+        // preserves `ls_pid`, without attaching Jarvis's `f5174f82` CSRF token from port 33047.
+        match &table.get("felix").expect("felix route").route {
+            VendorRoute::Agy {
+                conversation_id,
+                ls_pid,
+                ls_address,
+                csrf_token,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-felix-new");
+                assert_eq!(*ls_pid, Some(2667475));
+                assert_eq!(ls_address.as_deref(), Some(felix_addr.as_str()));
+                assert!(
+                    csrf_token.is_none(),
+                    "felix must not inherit jarvis's daemon csrf f5174f82 on a different port, got {csrf_token:?}"
+                );
+            }
+            other => panic!("expected Agy route for felix, got {other:?}"),
+        }
+
+        // 4. Felix then runs `agent-msg register Felix`, recording his own paired endpoint,
+        // and a subsequent discovery pass preserves all three sessions' distinct pairs.
+        table.upsert_explicit(
+            "felix",
+            VendorRoute::Agy {
+                conversation_id: "conv-felix-new".into(),
+                ls_pid: None,
+                ls_address: Some(felix_addr.clone()),
+                csrf_token: Some("felix-csrf-42959".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(450),
+        );
+        table.discover_agy_routes(home, false, &At::from_unix_millis(500));
+
+        for (persona, expected_addr, expected_csrf, expected_pid) in [
+            ("jarvis", daemon_addr.as_str(), "f5174f82", Some(7701)),
+            ("feira", feira_addr.as_str(), "6f09f521", Some(2270049)),
+            (
+                "felix",
+                felix_addr.as_str(),
+                "felix-csrf-42959",
+                Some(2667475),
+            ),
+        ] {
+            match &table.get(persona).expect(persona).route {
+                VendorRoute::Agy {
+                    ls_address,
+                    csrf_token,
+                    ls_pid,
+                    ..
+                } => {
+                    assert_eq!(ls_address.as_deref(), Some(expected_addr), "{persona}");
+                    assert_eq!(csrf_token.as_deref(), Some(expected_csrf), "{persona}");
+                    assert_eq!(*ls_pid, expected_pid, "{persona}");
+                }
+                other => panic!("expected Agy route for {persona}, got {other:?}"),
+            }
         }
     }
 

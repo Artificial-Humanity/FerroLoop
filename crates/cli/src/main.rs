@@ -188,6 +188,42 @@ impl Command {
         }
     }
 
+    /// The project slug when `--project <slug>` was passed, so a command run
+    /// from outside the project's directory still binds its config entry.
+    fn project_slug(&self) -> Option<&str> {
+        let project_ref = match self {
+            Command::Gate(c) => c.project_ref(),
+            Command::Transition(c) => c.project_ref(),
+            Command::Record(c) => c.project_ref(),
+            Command::Check(c) => c.project_ref(),
+            Command::Finding(c) => c.project_ref(),
+            Command::Stats(c) => c.project_ref(),
+            Command::Manifest(c) => c.project_ref(),
+            Command::Routing(c) => c.project_ref(),
+            Command::Flow(c) => c.project_ref(),
+            Command::Project(_)
+            | Command::Attempt(_)
+            | Command::Github(_)
+            | Command::Mcp(_)
+            | Command::Agent { .. }
+            | Command::State { .. }
+            | Command::Role { .. }
+            | Command::Wire { .. }
+            | Command::Arch { .. }
+            | Command::Hub { .. }
+            | Command::Host { .. }
+            | Command::Store { .. }
+            | Command::Vault { .. }
+            | Command::Auth { .. }
+            | Command::Watch { .. }
+            | Command::Browse(_)
+            | Command::Version { .. }
+            | Command::Install(_)
+            | Command::Doctor(_) => None,
+        };
+        project_ref.and_then(|r| r.as_slug())
+    }
+
     /// Whether the chosen subcommand names any item by handle rather than
     /// IRI, dispatched to its own `has_handle()`.
     fn has_handle(&self) -> bool {
@@ -1217,9 +1253,16 @@ fn run(cli: Cli) -> Result<i32> {
         cli => cli,
     };
     let entries = &cfg.projects;
+    let slug_entry = cli
+        .command
+        .project_slug()
+        .and_then(|slug| entries.iter().find(|e| e.matches_slug(slug)).cloned());
     let locus = match cli.command.project_root() {
         Some(root) => cwd.join(root),
-        None => cwd.clone(),
+        None => match &slug_entry {
+            Some(e) => e.root.clone(),
+            None => cwd.clone(),
+        },
     };
     let needs_tracker = cli.command.needs_tracker();
     let is_stats = matches!(cli.command, Command::Stats(_));
@@ -1232,7 +1275,10 @@ fn run(cli: Cli) -> Result<i32> {
     // refused, because it cannot know its tracker.
     let entry_read = explicit.is_none() || needs_tracker;
     let entry = if entry_read {
-        config::bound_entry(entries, &locus)?
+        match slug_entry {
+            Some(e) => Some(e),
+            None => config::bound_entry(entries, &locus)?,
+        }
     } else {
         None
     };

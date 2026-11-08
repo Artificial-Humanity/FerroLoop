@@ -774,14 +774,16 @@ pub fn resolve_state_in_store<S: StateStore + Handles>(
     scope: Option<&StateScope>,
     concern: Option<StateConcern>,
 ) -> Result<StateEntry, String> {
-    if let Ok(r) = id_or_key.parse::<Ref>() {
+    if let Ok(r) = id_or_key.parse::<Ref>()
+        && !matches!(r, Ref::Slug(_))
+    {
         let iri = match r {
             Ref::Iri(iri) => iri,
             Ref::Handle(h) => store
                 .resolve_handle(Kind::State, h)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("no state entry with handle {h} in this store"))?,
-            Ref::Issue(_) => {
+            Ref::Issue(_) | Ref::Slug(_) => {
                 return Err(format!(
                     "`{id_or_key}` is an issue reference, not a state handle, IRI, or key"
                 ));

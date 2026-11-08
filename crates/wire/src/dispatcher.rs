@@ -1279,20 +1279,43 @@ fn deliver_to_agy_route(
     let accept = |addr: &str| {
         !addr.is_empty() && (trust_unverified || crate::identity::agy_ls_address_listening(addr))
     };
-    let addr = ls_address
+    let route_addr = ls_address
         .as_deref()
         .filter(|addr| accept(addr))
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::var("ANTIGRAVITY_LS_ADDRESS")
-                .ok()
-                .filter(|addr| accept(addr))
-        })
-        .unwrap_or_default();
-    let csrf = csrf_token
-        .clone()
-        .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
-        .unwrap_or_default();
+        .map(str::to_string);
+    let env_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS")
+        .ok()
+        .filter(|addr| accept(addr));
+    let env_csrf = std::env::var("ANTIGRAVITY_CSRF_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let (addr, csrf) = if let Some(r_addr) = route_addr {
+        let r_csrf = csrf_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                let same_port = match (
+                    crate::identity::agy_ls_port(&r_addr),
+                    env_addr.as_deref().and_then(crate::identity::agy_ls_port),
+                ) {
+                    (Some(rp), Some(ep)) => rp == ep,
+                    (None, None) => env_addr.as_deref() == Some(r_addr.as_str()),
+                    _ => false,
+                };
+                same_port.then(|| env_csrf.clone()).flatten()
+            })
+            .unwrap_or_default();
+        (r_addr, r_csrf)
+    } else if let Some(e_addr) = env_addr {
+        (e_addr, env_csrf.unwrap_or_default())
+    } else {
+        let r_csrf = csrf_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .or(env_csrf)
+            .unwrap_or_default();
+        (String::new(), r_csrf)
+    };
 
     let mut cmd = Command::new(&exe);
     // `agy agentapi send-message [--title=<title>] <recipient_id> <content>`: a bare title

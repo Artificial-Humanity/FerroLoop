@@ -93,6 +93,14 @@ impl Cmd {
         refs::has_handle(&self.refs())
     }
 
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::Set { project, .. } | Cmd::Remove { project, .. } | Cmd::Show { project } => {
+                Some(project)
+            }
+        }
+    }
+
     /// Whether this command writes a routing map.
     pub fn sets_routing(&self) -> bool {
         matches!(self, Cmd::Set { .. })

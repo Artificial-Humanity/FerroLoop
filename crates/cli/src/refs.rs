@@ -14,6 +14,9 @@ pub enum Ref {
     /// bare number, as GitHub writes one.
     Issue(u64),
     Iri(Iri),
+    /// A lowercase project slug (such as `ferroloop`), resolved only when
+    /// `Kind::Project` is asked for.
+    Slug(String),
 }
 
 impl std::str::FromStr for Ref {
@@ -60,11 +63,17 @@ impl std::str::FromStr for Ref {
                 .map(Ref::Handle)
                 .map_err(|_| format!("`{s}` is too large to be a handle"));
         }
-        Iri::parse(s).map(Ref::Iri).map_err(|e| {
-            format!(
-                "`{s}` is neither a handle (a number such as `3`) nor an IRI (such as `urn:uuid:…`): {e}"
-            )
-        })
+        match Iri::parse(s) {
+            Ok(iri) => Ok(Ref::Iri(iri)),
+            Err(e) => {
+                if let Ok(slug) = fl_core::state::validate_slug(s) {
+                    return Ok(Ref::Slug(slug));
+                }
+                Err(format!(
+                    "`{s}` is neither a handle (a number such as `3`) nor an IRI (such as `urn:uuid:…`): {e}"
+                ))
+            }
+        }
     }
 }
 
@@ -76,6 +85,17 @@ impl std::fmt::Display for Ref {
             Ref::Handle(n) => write!(f, "{n}"),
             Ref::Issue(n) => write!(f, "#{n}"),
             Ref::Iri(i) => write!(f, "{i}"),
+            Ref::Slug(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl Ref {
+    /// The project slug when `self` is `Ref::Slug`.
+    pub fn as_slug(&self) -> Option<&str> {
+        match self {
+            Ref::Slug(s) => Some(s.as_str()),
+            Ref::Handle(_) | Ref::Issue(_) | Ref::Iri(_) => None,
         }
     }
 }
@@ -92,7 +112,46 @@ pub fn resolve(store: &dyn Handles, label: &str, kind: Kind, r: &Ref) -> Result<
                 kind.as_wire()
             ),
         },
+        Ref::Slug(slug) => {
+            if kind != Kind::Project {
+                bail!(
+                    "`{slug}` is neither a handle (a number such as `3`) nor an IRI (such as `urn:uuid:…`)"
+                );
+            }
+            resolve_project_slug(store, label, slug)
+        }
     }
+}
+
+fn resolve_project_slug(store: &dyn Handles, label: &str, slug: &str) -> Result<Iri> {
+    let projects = store.projects_for_slug()?;
+    for p in &projects {
+        let trimmed = p.root.trim_end_matches(['/', '\\']);
+        if std::path::Path::new(trimmed)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|base| base.eq_ignore_ascii_case(slug))
+        {
+            return Ok(p.id.0.clone());
+        }
+    }
+    if let Some(cfg_path) = crate::config::path()
+        && let Ok(cfg) = crate::config::load(Some(&cfg_path))
+        && let Some(entry) = cfg.projects.iter().find(|e| e.matches_slug(slug))
+    {
+        let entry_canon = entry.root.canonicalize().ok();
+        for p in &projects {
+            let p_path = std::path::Path::new(&p.root);
+            if p_path == entry.root
+                || (entry_canon.is_some() && p_path.canonicalize().ok() == entry_canon)
+            {
+                return Ok(p.id.0.clone());
+            }
+        }
+    }
+    bail!(
+        "there is no project `{slug}` in the store at {label}. List them to see the ones that exist."
+    )
 }
 
 /// How a person reads an id: its handle, or the full IRI if it has none here.
@@ -110,7 +169,7 @@ pub fn iris(refs: &[&Ref]) -> Vec<Iri> {
     refs.iter()
         .filter_map(|r| match r {
             Ref::Iri(i) => Some(i.clone()),
-            Ref::Handle(_) | Ref::Issue(_) => None,
+            Ref::Handle(_) | Ref::Issue(_) | Ref::Slug(_) => None,
         })
         .collect()
 }
@@ -190,5 +249,38 @@ mod tests {
             Ok(Ref::Iri(i)) => assert_eq!(i.as_str(), "tag:acme/widgets#1"),
             other => panic!("expected the IRI as typed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_slug_resolves_for_project_and_refuses_other_kinds() {
+        use fl_core::store::Catalog;
+        let s = fl_core::MemStore::default();
+        let p = s.add_project("/workspace/FerroLoop").unwrap();
+        let slug_ref = parse("ferroloop").expect("slug parses as Ref");
+        assert_eq!(slug_ref.as_slug(), Some("ferroloop"));
+        assert_eq!(slug_ref.to_string(), "ferroloop");
+        assert!(!has_handle(&[&slug_ref]));
+        assert!(iris(&[&slug_ref]).is_empty());
+
+        assert_eq!(
+            resolve(&s, "memory", Kind::Project, &slug_ref).unwrap(),
+            p.0
+        );
+
+        let missing = parse("unknown-proj").unwrap();
+        let err = resolve(&s, "memory", Kind::Project, &missing).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("there is no project `unknown-proj` in the store at memory"),
+            "unexpected error: {err}"
+        );
+
+        let wrong_kind = resolve(&s, "memory", Kind::Record, &slug_ref).unwrap_err();
+        assert!(
+            wrong_kind
+                .to_string()
+                .contains("`ferroloop` is neither a handle"),
+            "unexpected error: {wrong_kind}"
+        );
     }
 }
