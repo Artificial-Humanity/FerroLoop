@@ -2213,6 +2213,9 @@ export class HubApiClient {
     if (payload.model && payload.model.trim()) {
       body.model = payload.model.trim();
     }
+    if (payload.posture) {
+      body.posture = payload.posture;
+    }
     if (payload.mode) {
       body.mode = payload.mode;
     }

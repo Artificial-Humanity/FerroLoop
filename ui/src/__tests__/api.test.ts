@@ -471,6 +471,35 @@ describe("HubApiClient", () => {
         );
       }
 
+      if (url.includes("/remodel") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            mode: body.mode ?? "execute",
+            session_id: "codex:kacey",
+            previous_session_id: "sess-kacey-01",
+            persona: "kacey",
+            project: "kaggle-gemma4",
+            role: "assistant",
+            from_vendor: "claude",
+            vendor: body.vendor,
+            model: body.model ?? null,
+            posture: body.posture,
+            node_id: "ai-lab-0",
+            hosted: true,
+            cwd: null,
+            status: "running",
+            handshake_dispatched: true,
+            hydration_dispatched: true,
+            runtime_stopped: true,
+            tmux_target: "kacey:0.0",
+            prompt: null,
+            handoff: null,
+            warnings: [],
+          }),
+          { status: 200 },
+        );
+      }
+
       return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
     });
 
@@ -484,6 +513,7 @@ describe("HubApiClient", () => {
       role: "assistant",
       vendor: "claude",
       model: "claude-sonnet-4-6",
+      posture: "auto",
       node_id: "ai-lab-0",
       hosted: true,
     });
@@ -500,6 +530,14 @@ describe("HubApiClient", () => {
     expect(tearRes.unregistered).toBe(true);
     expect(tearRes.runtime_stopped).toBe(true);
 
+    const remodelRes = await client.remodelSession("sess-kacey-01", {
+      vendor: "codex",
+      model: "gpt-5.4",
+      posture: "plan",
+      mode: "execute",
+    });
+    expect(remodelRes.posture).toBe("plan");
+
     expect(calls).toEqual([
       {
         url: "/api/v1/sessions/spin-up",
@@ -510,6 +548,7 @@ describe("HubApiClient", () => {
           role: "assistant",
           vendor: "claude",
           model: "claude-sonnet-4-6",
+          posture: "auto",
           node_id: "ai-lab-0",
           hosted: true,
         },
@@ -523,6 +562,16 @@ describe("HubApiClient", () => {
         url: "/api/v1/sessions/sess%2Fkacey%2001/decommission",
         method: "POST",
         body: { mode: "teardown" },
+      },
+      {
+        url: "/api/v1/sessions/sess-kacey-01/remodel",
+        method: "POST",
+        body: {
+          vendor: "codex",
+          model: "gpt-5.4",
+          posture: "plan",
+          mode: "execute",
+        },
       },
     ]);
   });
