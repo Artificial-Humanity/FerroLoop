@@ -75,6 +75,13 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::Add { project, .. } | Cmd::List { project, .. } => Some(project),
+            Cmd::Move { .. } | Cmd::Escalate { .. } => None,
+        }
+    }
 }
 
 pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
@@ -274,5 +281,26 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
 fn after_landed(ctx: &Ctx<'_>, record: &Record, to: State, shown: &str) {
     if to == State::NeedsHuman {
         crate::cmd::escalate::after_landed_move(ctx, record, shown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_project_ref_accepts_project_slug_and_resolves_against_store() {
+        let s = fl_core::MemStore::default();
+        let p = s.add_project("/workspace/FerroLoop").unwrap();
+        let slug: Ref = "ferroloop".parse().unwrap();
+        let cmd = Cmd::List {
+            project: slug,
+            tier: None,
+        };
+        assert_eq!(cmd.project_ref().and_then(Ref::as_slug), Some("ferroloop"));
+        assert!(!cmd.has_handle());
+        let resolved = refs::resolve(&s, "memory", Kind::Project, cmd.project_ref().unwrap())
+            .expect("project slug resolves");
+        assert_eq!(ProjectId(resolved), p);
     }
 }

@@ -45,6 +45,12 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::Export { project } | Cmd::Check { project } => Some(project),
+            Cmd::Import { .. } => None,
+        }
+    }
     /// `Import` works on the store bound to the root it imports into.
     pub fn root(&self) -> Option<&Path> {
         match self {

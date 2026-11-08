@@ -2190,4 +2190,25 @@ mod tests {
         assert!(parse_batch_queries(&too_many).is_err());
         assert!(parse_code_kind("bogus").is_err());
     }
+
+    #[test]
+    fn resolve_optional_project_filter_resolves_known_slug_and_rejects_unknown_slug() {
+        let store = AnyStore::in_memory();
+        let p = store.add_project("/workspace/FerroLoop").unwrap();
+        assert_eq!(resolve_optional_project_filter(&store, None).unwrap(), None);
+        assert_eq!(
+            resolve_optional_project_filter(&store, Some("   ")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_optional_project_filter(&store, Some("ferroloop")).unwrap(),
+            Some(p)
+        );
+        let err = resolve_optional_project_filter(&store, Some("unknown-slug"))
+            .expect_err("unknown project slug must return Err");
+        assert!(
+            err.contains("there is no project `unknown-slug`"),
+            "unexpected error: {err}"
+        );
+    }
 }

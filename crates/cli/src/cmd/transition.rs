@@ -57,6 +57,12 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+
+    pub(crate) fn project_ref(&self) -> Option<&Ref> {
+        match self {
+            Cmd::Add { project, .. } | Cmd::Show { project, .. } => Some(project),
+        }
+    }
 }
 
 pub fn run(store: &AnyStore, cmd: Cmd) -> Result<i32> {

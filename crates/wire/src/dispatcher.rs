@@ -79,7 +79,12 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             } else {
                 format_push_message(msg)
             };
+            let persona = match &msg.to {
+                fl_core::ferrowire::WireAddress::AgentName(name) => Some(name.as_str()),
+                _ => None,
+            };
             deliver_to_agy_route(
+                persona,
                 conversation_id,
                 ls_address,
                 csrf_token,
@@ -666,6 +671,11 @@ fn run_vendor_cli_captured(
     kind: CliKind,
 ) -> std::io::Result<CapturedRun> {
     cmd.env_clear().envs(vendor_child_env(vendor, extra));
+    if vendor == AdapterKind::Antigravity {
+        cmd.env_remove("ANTIGRAVITY_PROJECT_ID")
+            .env_remove("ANTIGRAVITY_TRAJECTORY_ID")
+            .env_remove("ANTIGRAVITY_SOURCE_METADATA");
+    }
     run_captured_with_timeout(cmd, cli_timeout(kind))
 }
 
@@ -1158,7 +1168,101 @@ fn grok_session_missing(run: &CapturedRun) -> bool {
         || said.contains("failed to restore session")
 }
 
+fn resolve_agy_host_fallback_target(
+    persona: Option<&str>,
+    conversation_id: &str,
+) -> Option<String> {
+    fn push_persona(personas: &mut Vec<String>, raw: &str) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty()
+            && !personas
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            personas.push(trimmed.to_string());
+        }
+    }
+    let mut personas: Vec<String> = Vec::new();
+    if let Some(p) = persona {
+        push_persona(&mut personas, p);
+    }
+    if let Some((first, second)) = conversation_id.trim().split_once(['.', ':']) {
+        if second.eq_ignore_ascii_case("antigravity") || second.eq_ignore_ascii_case("agy") {
+            push_persona(&mut personas, first);
+        } else if first.eq_ignore_ascii_case("antigravity") || first.eq_ignore_ascii_case("agy") {
+            push_persona(&mut personas, second);
+        }
+    } else if let Some(rest) = conversation_id.trim().strip_prefix("agy-") {
+        push_persona(&mut personas, rest);
+    }
+    if personas.is_empty() {
+        #[cfg(not(test))]
+        let route_path = std::env::var_os("FL_WIRE_ROUTES")
+            .map(PathBuf::from)
+            .or_else(|| Some(crate::identity::default_routes_path()));
+        #[cfg(test)]
+        let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
+        if let Some(path) = route_path {
+            let table = RouteTable::load(Some(&path));
+            for entry in table.entries.values() {
+                if matches!(
+                    &entry.route,
+                    VendorRoute::Agy {
+                        conversation_id: cid,
+                        ..
+                    } if cid == conversation_id
+                ) {
+                    push_persona(&mut personas, &entry.persona);
+                }
+            }
+        }
+    }
+    if personas.is_empty()
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        let transcript = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conversation_id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        if transcript.is_file()
+            && let Some(found) = crate::identity::scan_transcript_for_persona(&transcript, 50)
+        {
+            push_persona(&mut personas, &found);
+        }
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push_candidate = |c: String| {
+        if !c.is_empty() && !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    };
+    for p in &personas {
+        let lower = p.to_ascii_lowercase();
+        let mut titled = lower.clone();
+        if let Some(first) = titled.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+        push_candidate(format!("{titled}.antigravity"));
+        push_candidate(format!("{lower}.antigravity"));
+        push_candidate(titled);
+        push_candidate(lower);
+    }
+
+    for candidate in &candidates {
+        if let Some((_client, stream)) = resolve_live_host_session(candidate) {
+            return Some(stream.session.as_str().to_string());
+        }
+    }
+    None
+}
+
 fn deliver_to_agy_route(
+    persona: Option<&str>,
     conversation_id: &str,
     ls_address: &Option<String>,
     csrf_token: &Option<String>,
@@ -1175,20 +1279,43 @@ fn deliver_to_agy_route(
     let accept = |addr: &str| {
         !addr.is_empty() && (trust_unverified || crate::identity::agy_ls_address_listening(addr))
     };
-    let addr = ls_address
+    let route_addr = ls_address
         .as_deref()
         .filter(|addr| accept(addr))
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::var("ANTIGRAVITY_LS_ADDRESS")
-                .ok()
-                .filter(|addr| accept(addr))
-        })
-        .unwrap_or_default();
-    let csrf = csrf_token
-        .clone()
-        .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
-        .unwrap_or_default();
+        .map(str::to_string);
+    let env_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS")
+        .ok()
+        .filter(|addr| accept(addr));
+    let env_csrf = std::env::var("ANTIGRAVITY_CSRF_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let (addr, csrf) = if let Some(r_addr) = route_addr {
+        let r_csrf = csrf_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                let same_port = match (
+                    crate::identity::agy_ls_port(&r_addr),
+                    env_addr.as_deref().and_then(crate::identity::agy_ls_port),
+                ) {
+                    (Some(rp), Some(ep)) => rp == ep,
+                    (None, None) => env_addr.as_deref() == Some(r_addr.as_str()),
+                    _ => false,
+                };
+                same_port.then(|| env_csrf.clone()).flatten()
+            })
+            .unwrap_or_default();
+        (r_addr, r_csrf)
+    } else if let Some(e_addr) = env_addr {
+        (e_addr, env_csrf.unwrap_or_default())
+    } else {
+        let r_csrf = csrf_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .or(env_csrf)
+            .unwrap_or_default();
+        (String::new(), r_csrf)
+    };
 
     let mut cmd = Command::new(&exe);
     // `agy agentapi send-message [--title=<title>] <recipient_id> <content>`: a bare title
@@ -1196,7 +1323,10 @@ fn deliver_to_agy_route(
     let clean_title = title.strip_prefix("--title=").unwrap_or(title);
     cmd.args(["agentapi", "send-message"])
         .arg(format!("--title={clean_title}"))
-        .args([conversation_id, body]);
+        .args([conversation_id, body])
+        .env_remove("ANTIGRAVITY_PROJECT_ID")
+        .env_remove("ANTIGRAVITY_TRAJECTORY_ID")
+        .env_remove("ANTIGRAVITY_SOURCE_METADATA");
     let mut extra = vec![
         (
             OsString::from("ANTIGRAVITY_CONVERSATION_ID"),
@@ -1225,10 +1355,11 @@ fn deliver_to_agy_route(
             Ok(run) => run,
             Err(e) => {
                 if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
-                    && resolve_live_host_session(conversation_id).is_some()
+                    && let Some(host_target) =
+                        resolve_agy_host_fallback_target(persona, conversation_id)
                 {
                     return deliver_via_tmux_paste_opts(
-                        conversation_id,
+                        &host_target,
                         &sanitize_for_paste(body),
                         true,
                     );
@@ -1238,9 +1369,9 @@ fn deliver_to_agy_route(
         };
     if !run.status.success() {
         if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
-            && resolve_live_host_session(conversation_id).is_some()
+            && let Some(host_target) = resolve_agy_host_fallback_target(persona, conversation_id)
         {
-            return deliver_via_tmux_paste_opts(conversation_id, &sanitize_for_paste(body), true);
+            return deliver_via_tmux_paste_opts(&host_target, &sanitize_for_paste(body), true);
         }
         return Err(failure_with_output("agy send-message", &run));
     }
@@ -2451,11 +2582,14 @@ fn read_claude_key(
     socket_path: &Path,
     key_path: Option<&Path>,
 ) -> Result<(PathBuf, serde_json::Value), String> {
-    let resolved_key = key_path.map(Path::to_path_buf).or_else(|| {
-        std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
-            resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, socket_path)
-        })
-    });
+    let resolved_key = key_path
+        .filter(|p| p.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+                resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, socket_path)
+            })
+        });
     let Some(kpath) = resolved_key else {
         return Err(format!(
             "missing claude session key file for pid {pid} ({})",
@@ -2517,9 +2651,10 @@ pub fn dispatch_operator_prompt_to_route(
                             .filter(|id| resolve_live_host_session(id).is_some())
                             .or_else(|| (*pid != 0).then(|| tmux_pane_for_pid(*pid)).flatten());
                         if let Some(target) = host_target {
-                            return deliver_via_tmux_paste(
+                            return deliver_via_tmux_paste_opts(
                                 &target,
-                                &prefixed_operator_body(sender_name, body),
+                                &sanitize_for_paste(&prefixed_operator_body(sender_name, body)),
+                                true,
                             );
                         }
                     }
@@ -2538,7 +2673,11 @@ pub fn dispatch_operator_prompt_to_route(
                     || Some(key_json.clone()),
                 )
             {
-                return deliver_via_tmux_paste(&pane, &prefixed_operator_body(sender_name, body));
+                return deliver_via_tmux_paste_opts(
+                    &pane,
+                    &sanitize_for_paste(&prefixed_operator_body(sender_name, body)),
+                    true,
+                );
             }
             let peer_token = key_json
                 .get("peerToken")
@@ -2592,6 +2731,7 @@ pub fn dispatch_operator_prompt_to_route(
                 format!("[Operator Prompt via FerroDeck — from {sender_name}]\n\n{body}")
             };
             deliver_to_agy_route(
+                None,
                 conversation_id,
                 ls_address,
                 csrf_token,
@@ -5335,7 +5475,16 @@ mod tests {
         let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let ls_address = Some("127.0.0.1:1".to_string());
         let exe = Some(bin.clone());
-        deliver_to_agy_route("conv-felicia", &ls_address, &None, &exe, "title", "body").unwrap();
+        deliver_to_agy_route(
+            None,
+            "conv-felicia",
+            &ls_address,
+            &None,
+            &exe,
+            "title",
+            "body",
+        )
+        .unwrap();
 
         let recorded = fs::read_to_string(&out).unwrap();
         assert!(
@@ -5346,7 +5495,16 @@ mod tests {
         // SAFETY: restores FL_WIRE_AGY_BIN when the guard drops. A set mock
         // binary may forward a language-server address that is not listening.
         let _env = EnvGuard::set("FL_WIRE_AGY_BIN", &bin);
-        deliver_to_agy_route("conv-felicia", &ls_address, &None, &exe, "title", "body").unwrap();
+        deliver_to_agy_route(
+            None,
+            "conv-felicia",
+            &ls_address,
+            &None,
+            &exe,
+            "title",
+            "body",
+        )
+        .unwrap();
         drop(_env);
 
         let recorded = fs::read_to_string(&out).unwrap();
@@ -6539,6 +6697,7 @@ mod tests {
             },
             |bin| {
                 deliver_to_agy_route(
+                    None,
                     "conv-9",
                     &Some("127.0.0.1:1".to_string()),
                     &Some("route-csrf-token".to_string()),
@@ -6565,7 +6724,16 @@ mod tests {
         let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
         let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
         let _no_exe = EnvGuard::remove("ANTIGRAVITY_AGENTAPI_EXE");
-        deliver_to_agy_route("conv-1", &None, &None, &Some(script.clone()), "t", "b").unwrap();
+        deliver_to_agy_route(
+            None,
+            "conv-1",
+            &None,
+            &None,
+            &Some(script.clone()),
+            "t",
+            "b",
+        )
+        .unwrap();
         let text = fs::read_to_string(&dump).unwrap();
         assert!(
             text.lines()
@@ -6591,6 +6759,7 @@ mod tests {
         let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
         let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
         deliver_to_agy_route(
+            None,
             "conv-7",
             &None,
             &None,
@@ -6616,6 +6785,7 @@ mod tests {
         );
 
         deliver_to_agy_route(
+            None,
             "conv-7",
             &None,
             &None,
@@ -6655,14 +6825,15 @@ mod tests {
 echo 'line two' >&2
 exit 1"#,
         );
-        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(rpc), "t", "b").unwrap_err();
+        let err =
+            deliver_to_agy_route(None, "conv-1", &None, &None, &Some(rpc), "t", "b").unwrap_err();
         assert!(err.starts_with("agy send-message exited with"), "{err}");
         assert!(err.contains("invalid CSRF token"), "{err}");
         assert!(err.contains("line two"), "{err}");
 
         let silent = write_script(tmp.path(), "silent-agy.sh", "exit 1");
-        let err =
-            deliver_to_agy_route("conv-1", &None, &None, &Some(silent), "t", "b").unwrap_err();
+        let err = deliver_to_agy_route(None, "conv-1", &None, &None, &Some(silent), "t", "b")
+            .unwrap_err();
         assert_eq!(err, "agy send-message exited with exit status: 1");
 
         let noisy = write_script(
@@ -6670,7 +6841,8 @@ exit 1"#,
             "noisy-agy.sh",
             "i=0; while [ $i -lt 400 ]; do echo \"word   $i\"; i=$((i+1)); done; exit 2",
         );
-        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(noisy), "t", "b").unwrap_err();
+        let err =
+            deliver_to_agy_route(None, "conv-1", &None, &None, &Some(noisy), "t", "b").unwrap_err();
         assert!(err.ends_with("..."), "{err}");
         assert!(!err.contains("  "), "whitespace collapsed: {err}");
         assert!(
@@ -6751,7 +6923,8 @@ exit 1"#,
             "echo 'rpc refused: bad token' >&2\nsleep 10 &\nexit 1",
         );
         let started = Instant::now();
-        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(bin), "t", "b").unwrap_err();
+        let err =
+            deliver_to_agy_route(None, "conv-1", &None, &None, &Some(bin), "t", "b").unwrap_err();
         let took = started.elapsed();
         assert!(err.contains("rpc refused: bad token"), "{err}");
         assert!(took < Duration::from_secs(5), "bounded: {took:?}");
@@ -7322,5 +7495,275 @@ exit 1"#,
             ]
         );
         drop(server_thread);
+    }
+
+    #[test]
+    fn deliver_to_agy_route_strips_project_trajectory_and_source_metadata_env_vars() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let dump = tmp.path().join("env.dump");
+        let script = write_script(
+            tmp.path(),
+            "fake-agy.sh",
+            &format!("env > \"{}\"", dump.display()),
+        );
+        let _proj = EnvGuard::set("ANTIGRAVITY_PROJECT_ID", Path::new("foreign-project-id"));
+        let _traj = EnvGuard::set(
+            "ANTIGRAVITY_TRAJECTORY_ID",
+            Path::new("foreign-trajectory-id"),
+        );
+        let _meta = EnvGuard::set(
+            "ANTIGRAVITY_SOURCE_METADATA",
+            Path::new("foreign-source-metadata"),
+        );
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+
+        deliver_to_agy_route(
+            Some("feira"),
+            "conv-feira-123",
+            &None,
+            &None,
+            &Some(script),
+            "title",
+            "body",
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(&dump).unwrap();
+        assert!(
+            !text.contains("ANTIGRAVITY_PROJECT_ID="),
+            "ANTIGRAVITY_PROJECT_ID must be stripped: {text}"
+        );
+        assert!(
+            !text.contains("ANTIGRAVITY_TRAJECTORY_ID="),
+            "ANTIGRAVITY_TRAJECTORY_ID must be stripped: {text}"
+        );
+        assert!(
+            !text.contains("ANTIGRAVITY_SOURCE_METADATA="),
+            "ANTIGRAVITY_SOURCE_METADATA must be stripped: {text}"
+        );
+        assert!(
+            text.contains("ANTIGRAVITY_CONVERSATION_ID=conv-feira-123"),
+            "ANTIGRAVITY_CONVERSATION_ID must still be forwarded: {text}"
+        );
+    }
+
+    #[test]
+    fn deliver_to_agy_route_falls_back_to_fl_host_pty_by_persona_instead_of_uuid() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Feira.antigravity").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([2u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let writes_srv = Arc::clone(&writes);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { stream, bytes, .. } => {
+                                    writes.lock().unwrap().push((
+                                        stream.session.as_str().to_string(),
+                                        bytes.into_vec(),
+                                    ));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: String::new(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let failing_agy = write_script(tmp.path(), "failing-agy.sh", "exit 1");
+        let routes_path = tmp.path().join("routes.json");
+        let conv_uuid = "05729f07-2e25-43d9-a1af-90d5a5907788";
+        let route = VendorRoute::Agy {
+            conversation_id: conv_uuid.to_string(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: Some(failing_agy.clone()),
+        };
+        let mut table = RouteTable::default();
+        table.upsert_explicit("feira", route.clone(), At::from_unix_millis(100));
+        table.save(Some(&routes_path)).unwrap();
+
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+        let _routes = EnvGuard::set("FL_WIRE_ROUTES", &routes_path);
+
+        // 1. Direct deliver_to_agy_route with persona and UUID conversation_id falls back to Feira.antigravity.
+        deliver_to_agy_route(
+            Some("feira"),
+            conv_uuid,
+            &None,
+            &None,
+            &Some(failing_agy),
+            "title",
+            "hello feira",
+        )
+        .unwrap();
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    "Feira.antigravity".to_string(),
+                    b"\x1b[200~hello feira\x1b[201~".to_vec()
+                ),
+                ("Feira.antigravity".to_string(), b"\r".to_vec()),
+            ]
+        );
+
+        // 2. dispatch_operator_prompt_to_route (where persona is resolved from the route table)
+        // also falls back to Feira.antigravity rather than the UUID conversation_id.
+        writes.lock().unwrap().clear();
+        dispatch_operator_prompt_to_route(&route, "owner", "prompt from deck").unwrap();
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "Feira.antigravity");
+        assert!(
+            String::from_utf8_lossy(&recorded[0].1).contains("prompt from deck"),
+            "got {:?}",
+            recorded[0].1
+        );
+        assert_eq!(
+            recorded[1],
+            ("Feira.antigravity".to_string(), b"\r".to_vec())
+        );
+
+        drop(server_thread);
+    }
+
+    #[test]
+    fn read_claude_key_ignores_missing_key_path_and_falls_back_to_sessions_dir() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sessions_dir = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let sock_path = sessions_dir.join("7777.sock");
+        fs::write(&sock_path, "").unwrap();
+        let fallback_key = sessions_dir.join("7777.fallback.key");
+        fs::write(&fallback_key, r#"{"peerToken":"fallback-secret"}"#).unwrap();
+
+        let stale_key = home.join("deleted.key");
+        let _home_env = EnvGuard::set("HOME", home);
+
+        let (resolved_path, json) =
+            read_claude_key(7777, &sock_path, Some(&stale_key)).expect("fallback key resolved");
+        assert_eq!(resolved_path, fallback_key);
+        assert_eq!(json["peerToken"], "fallback-secret");
+    }
+
+    #[test]
+    fn claude_owner_prompt_uses_bracketed_paste_for_multiline_body() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        dispatch_operator_prompt_to_route(
+            &route,
+            "owner",
+            "First paragraph\n\nSecond paragraph\x1b[201~",
+        )
+        .unwrap();
+
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("paste-buffer -d -b"), "{cmds}");
+        assert!(
+            cmds.contains(" -p "),
+            "multiline operator prompt must use bracketed paste (-p): {cmds}"
+        );
+        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+        assert_eq!(
+            pasted.trim(),
+            "[Operator Prompt via FerroDeck — from owner]\n\nFirst paragraph\n\nSecond paragraph[201~"
+        );
+        assert!(socket_frames(&listener).is_none());
     }
 }
