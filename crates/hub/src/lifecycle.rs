@@ -4089,6 +4089,9 @@ pub(crate) fn refresh_decommission_tombstones_dropping<S: AgentRegistry + StateS
     for record in &records {
         if !record.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONED) {
             ids.remove(&record.session_id);
+            if let Some(sid) = record.vendor_session_id.as_deref() {
+                ids.remove(sid);
+            }
         }
     }
     for record in records {
@@ -4336,6 +4339,10 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     if (env.spawn_runtime || env.home_override.is_some())
         && let Some(adapter) = env.host_vendor_adapter(&record.vendor)
     {
+        let home_dir = env
+            .home_override
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
         let host_session = record.tmux_target.as_deref().unwrap_or(&record.session_id);
         let binding =
             fl_core::AdapterIdentityBinding::new(record.session_id.clone(), 1, host_session, None);
@@ -4344,7 +4351,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
                 binding: binding.clone(),
                 vendor_session_id: Some(tid.clone()),
                 control_endpoint: None,
-                home_dir: env.home_override.map(Path::to_path_buf),
+                home_dir: home_dir.clone(),
             });
         }
     }
@@ -9263,7 +9270,7 @@ mod tests {
 
         #[derive(Debug, Default)]
         struct StubClaudeHostAdapter {
-            archived: Mutex<Vec<Option<String>>>,
+            archived: Mutex<Vec<(Option<String>, Option<PathBuf>)>>,
         }
 
         impl VendorHostAdapter for StubClaudeHostAdapter {
@@ -9370,7 +9377,7 @@ mod tests {
                 self.archived
                     .lock()
                     .unwrap()
-                    .push(target.vendor_session_id.clone());
+                    .push((target.vendor_session_id.clone(), target.home_dir.clone()));
                 Ok(TeardownOutcome::Completed)
             }
             fn delete(
@@ -9442,6 +9449,21 @@ mod tests {
             Some(sid.as_str())
         );
 
+        // Active running record removes its vendor_session_id from the decommission sidecar
+        // even when refresh_decommission_tombstones_dropping is called with dropped_ids = &[].
+        let seeded_ids = BTreeSet::from([sid.clone()]);
+        fl_wire::identity::save_decommissioned_tombstones(
+            Some(home.path()),
+            &seeded_ids,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        refresh_decommission_tombstones_dropping(&store, Some(home.path()), &[]);
+        assert!(
+            !fl_wire::identity::load_decommissioned_session_ids(Some(home.path())).contains(&sid),
+            "running record vendor_session_id must be removed from tombstones"
+        );
+
         // Teardown includes vendor_session_id in tombstones, record_native_ids, and archive()
         // even when no route file exists.
         let target = SessionTarget::resolve(&store, "claude:kayla", None).unwrap();
@@ -9455,9 +9477,59 @@ mod tests {
         assert!(record_native_ids(&after_rec).contains(&sid));
         let archived = stub.archived.lock().unwrap().clone();
         assert!(
-            archived.contains(&Some(sid)),
-            "expected archive called with vendor_session_id, got {archived:?}"
+            archived.contains(&(Some(sid), Some(home.path().to_path_buf()))),
+            "expected archive called with vendor_session_id and home_override, got {archived:?}"
         );
+
+        // When env.home_override is None and env.spawn_runtime is true (production path),
+        // teardown_session resolves home_dir from $HOME and passes it to adapter.archive().
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                // SAFETY: serialized by with_probe_lock and TMUX_ENV_LOCK.
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        crate::direct_quota::with_probe_lock(|| {
+            let _tmux_lock = crate::TMUX_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _restore_home = RestoreHome(std::env::var_os("HOME"));
+            // SAFETY: serialized by with_probe_lock and TMUX_ENV_LOCK; restored by _restore_home.
+            unsafe {
+                std::env::set_var("HOME", home.path());
+            }
+            spin_up(
+                &store,
+                &env,
+                &req("kacey", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let kacey_sid = find_hosted_session(&store, &["claude:kacey"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            stub.archived.lock().unwrap().clear();
+            let prod_env = LifecycleEnv {
+                home_override: None,
+                ..env
+            };
+            let target = SessionTarget::resolve(&store, "claude:kacey", None).unwrap();
+            teardown_session(&store, &prod_env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+            let archived = stub.archived.lock().unwrap().clone();
+            assert!(
+                archived.contains(&(Some(kacey_sid), Some(home.path().to_path_buf()))),
+                "expected archive called with $HOME fallback when home_override is None, got {archived:?}"
+            );
+        });
     }
 
     #[test]
