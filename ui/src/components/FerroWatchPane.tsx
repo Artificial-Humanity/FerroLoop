@@ -8,6 +8,7 @@ import {
   type AgentRecord,
   type DiscoveredSessionSummary,
   type HubAuthority,
+  type PermissionPosture,
   type RemodelMode,
   type RemodelSessionResponse,
   type WatchAgentHealth,
@@ -703,6 +704,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
   const [remodelTarget, setRemodelTarget] = useState<string>("");
   const [remodelVendor, setRemodelVendor] = useState<string>("codex");
   const [remodelModel, setRemodelModel] = useState<string>("");
+  const [remodelPosture, setRemodelPosture] = useState<PermissionPosture>("auto");
   const [remodelMode, setRemodelMode] = useState<RemodelMode>("execute");
   const [remodeling, setRemodeling] = useState<boolean>(false);
   const [remodelStatus, setRemodelStatus] = useState<string | null>(null);
@@ -1041,6 +1043,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       const res = await apiClient.remodelSession(remodelTarget.trim(), {
         vendor: remodelVendor,
         model: remodelModel.trim() || undefined,
+        posture: remodelPosture,
         mode: remodelMode,
       });
       setRemodelStatus(
@@ -2166,6 +2169,36 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                       onChange={(e) => setRemodelModel(e.target.value)}
                       style={{ fontSize: "12px", padding: "4px 6px" }}
                     />
+                  </label>
+
+                  <label
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "3px",
+                      fontSize: "11px",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span>Permission Posture</span>
+                    <select
+                      id="fd-watch-remodel-posture"
+                      name="posture"
+                      aria-label="Permission Posture"
+                      className="fd-input"
+                      data-testid="watch-remodel-posture-select"
+                      value={remodelPosture}
+                      onChange={(e) =>
+                        setRemodelPosture(e.target.value as PermissionPosture)
+                      }
+                      style={{ fontSize: "12px", padding: "4px 6px" }}
+                    >
+                      <option value="ask">ask</option>
+                      <option value="accept-edits">accept-edits</option>
+                      <option value="auto">auto (default)</option>
+                      <option value="plan">plan</option>
+                      <option value="bypass">bypass (skip prompts)</option>
+                    </select>
                   </label>
 
                   <label

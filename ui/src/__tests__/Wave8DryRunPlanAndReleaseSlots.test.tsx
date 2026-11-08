@@ -226,7 +226,7 @@ describe("Wave 8 & Wave 9 (Record #103): Universal Agent Permission 3-Layer Mode
     expect(screen.getByTestId("spin-up-permissions-section")).toBeTruthy();
     expect(
       (screen.getByTestId("spin-up-posture-select") as HTMLSelectElement).value,
-    ).toBe("ask");
+    ).toBe("auto");
     expect(
       (screen.getByTestId("spin-up-sandbox-select") as HTMLSelectElement).value,
     ).toBe("vendor-default");
