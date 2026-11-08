@@ -23,7 +23,11 @@ mod receipt;
 mod txn;
 mod unit_template;
 
-pub use arch_check::{ArchitectureCheck, RUNTIME_ONLY, SHARED_COMPONENTS};
+pub use arch_check::{
+    ArchitectureCheck, FORBIDDEN_VENDOR_ADAPTER_CONSUMERS, LEGACY_VENDOR_MODULE_ALLOWLIST,
+    RUNTIME_ONLY, SHARED_COMPONENTS, VENDOR_ADAPTER_COMPONENT, VENDOR_ADAPTER_PACKAGE,
+    check_legacy_vendor_module_allowlist, check_package_dependency_isolation,
+};
 pub use defaults::default_manifest;
 pub use manifest::{
     ActionKind, ActionSpec, Artifact, BuildProvenance, Compat, FileKind, MAX_ARTIFACT_BYTES,

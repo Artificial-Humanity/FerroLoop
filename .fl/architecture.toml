@@ -107,6 +107,14 @@ package = "fl-host"
 paths = ["crates/host/**"]
 
 [[components]]
+id = "fl_vendor_adapters"
+title = "Vendor Host Adapters"
+kind = "crate"
+description = "Concrete VendorHostAdapter implementations composed at fl-cli"
+package = "fl-vendor-adapters"
+paths = ["crates/vendor-adapters/**"]
+
+[[components]]
 id = "fl_cli"
 title = "FerroLoop CLI"
 kind = "crate"
@@ -295,4 +303,15 @@ label = "runs fl host serve and internal supervisor/containment worker entrypoin
 from = "fl_cli"
 to = "fl_host_proto"
 label = "connects to fl-host for status, list, capture, send, and kill CLI subcommands"
+
+[[edges]]
+from = "fl_vendor_adapters"
+to = "fl_core"
+label = "implements VendorHostAdapter and RuntimePort domain contracts"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_vendor_adapters"
+label = "composes concrete vendor host adapters into the runtime registry"
+
 

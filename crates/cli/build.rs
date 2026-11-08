@@ -22,6 +22,7 @@ fn main() {
         "../install",
         "../mcp",
         "../store",
+        "../vendor-adapters",
         "../watch",
         "../wire",
     ]);

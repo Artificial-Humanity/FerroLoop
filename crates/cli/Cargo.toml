@@ -23,6 +23,7 @@ fl-watch = { path = "../watch" }
 fl-browse = { path = "../browse" }
 fl-host = { path = "../host" }
 fl-host-proto = { path = "../host-proto" }
+fl-vendor-adapters = { path = "../vendor-adapters" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

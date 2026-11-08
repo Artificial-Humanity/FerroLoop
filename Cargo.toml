@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/store", "crates/exec", "crates/cli", "crates/github", "crates/mcp", "crates/wire", "crates/hub", "crates/gate", "crates/watch", "crates/install", "crates/browse", "crates/host-proto", "crates/host"]
+members = ["crates/core", "crates/store", "crates/exec", "crates/cli", "crates/github", "crates/mcp", "crates/wire", "crates/hub", "crates/gate", "crates/watch", "crates/install", "crates/browse", "crates/host-proto", "crates/host", "crates/vendor-adapters"]
 # Standalone repositories mounted as git submodules; optional, never built from here.
 exclude = ["submodules"]
 resolver = "3"
