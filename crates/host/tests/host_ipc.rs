@@ -2951,34 +2951,62 @@ fn partial_event_cannot_advance_emitted_ceiling() {
     let stream = reliable_spawn(&mut rpc, "partial", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = ticket(&mut rpc, &stream, lease, 0);
+
+    // Keep the event socket unopened so stdout reads can coalesce into one
+    // unexposed record. An active replay could expose a short unterminated read.
+    for line in ["x".repeat(60 * 1024), "sentinel".into()] {
+        assert_eq!(
+            extended(
+                &mut rpc,
+                XReq::SendLine {
+                    stream: stream.clone(),
+                    lease,
+                    line
+                }
+            ),
+            XResp::Input {
+                outcome: SendOutcome::Written
+            }
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let XResp::Sessions { records } = extended(&mut rpc, XReq::ListSessions) else {
+            panic!("list")
+        };
+        // Seq 1 is Spawned, seq 2 is READY. The sentinel at seq 4 proves
+        // the newline ending the 60 KiB record at seq 3 has been consumed.
+        if records.iter().any(|r| r.stream == stream && r.latest >= 4) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "large record and sentinel not retained for {stream:?}: {records:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    arm(&daemon.paths.subscriber, "reliable-after-part");
     let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
     assert_eq!(event_seq(&rt, &mut events, 0), 1);
     assert_eq!(event_seq(&rt, &mut events, 1), 2);
-    arm(&daemon.paths.subscriber, "reliable-after-part");
-    let text = "x".repeat(60 * 1024);
-    assert_eq!(
-        extended(
-            &mut rpc,
-            XReq::SendLine {
-                stream: stream.clone(),
-                lease,
-                line: text
+    let frame = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), events.next_frame())
+            .await
+            .expect("first fragment deadline")
+            .expect("first fragment")
+    });
+    assert!(
+        matches!(
+            &frame,
+            fl_host_proto::ExtensionFrame::ReliablePart {
+                terminated: true,
+                seq: 3,
+                more: true,
+                ..
             }
         ),
-        XResp::Input {
-            outcome: SendOutcome::Written
-        }
+        "expected first nonfinal part of terminated seq 3; actual frame: {frame:?}"
     );
-    let frame = rt.block_on(events.next_frame()).expect("first fragment");
-    assert!(matches!(
-        frame,
-        fl_host_proto::ExtensionFrame::ReliablePart {
-            terminated: true,
-            seq: 3,
-            more: true,
-            ..
-        }
-    ));
     wait_at(&daemon.paths.subscriber, "reliable-after-part");
     assert_eq!(
         ack(&mut rpc, &stream, lease, 3),
@@ -3816,7 +3844,7 @@ fn host_build_identity_is_opt_in() {
     );
     let expected = fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE;
     #[cfg(unix)]
-    let expected = expected | fl_host_proto::PTY_FEATURE;
+    let expected = expected | fl_host_proto::PTY_FEATURE | fl_host_proto::RENDERED_PTY_FEATURE;
     assert_eq!(features, expected);
     let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
     let status = serde_json::to_value(extended(&mut rpc, request)).unwrap();
@@ -4141,4 +4169,768 @@ fn safety_flood_legacy_held_subscriber_preserves_control_and_cleanup() {
     }
     release(&daemon.paths.subscriber, "before-send-1");
     drop(events);
+}
+
+#[cfg(unix)]
+fn rendered_spawn(rpc: &mut Rpc, name: &str) -> StreamId {
+    let mut child = spec(name, &[]);
+    child.kind = SpawnKind::Pty;
+    child.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r"stty -echo; printf '\033[2J\033[Hready'; while read line; do stty size; done".into(),
+    ];
+    match extended(
+        rpc,
+        XReq::SpawnSession {
+            spec: child,
+            mode: Mode::Pty,
+            pty: None,
+        },
+    ) {
+        XResp::Session { stream, .. } => stream,
+        other => panic!("PTY spawn {other:?}"),
+    }
+}
+
+// Catches missing opt-in host support, name-based identity fallback and ioctl/parser divergence.
+#[cfg(unix)]
+#[test]
+fn rendered_capture_resize_identity_and_kernel_geometry() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut rpc, "rendered");
+    let lease = controller(&mut rpc, &stream);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let initial = loop {
+        let screen = rpc
+            .inner
+            .capture_rendered(stream.clone())
+            .expect("rendered capability and capture");
+        if screen.contents == "ready" {
+            break screen;
+        }
+        assert!(Instant::now() < deadline, "screen: {screen:?}");
+        thread::yield_now();
+    };
+    assert_eq!(
+        (
+            initial.schema,
+            initial.rows,
+            initial.cols,
+            initial.cursor_row,
+            initial.cursor_col
+        ),
+        (1, 40, 120, 0, 5)
+    );
+    assert_eq!(initial.stream, stream);
+    assert!(initial.output_bytes >= 12);
+    let generation = rpc
+        .inner
+        .resize_session(stream.clone(), lease, 160, 50)
+        .unwrap();
+    let resized = rpc.inner.capture_rendered(stream.clone()).unwrap();
+    assert_eq!(
+        (resized.rows, resized.cols, resized.generation),
+        (50, 160, generation)
+    );
+    assert!(generation > initial.generation);
+    assert_eq!(
+        (resized.output_bytes, resized.output_seq),
+        (initial.output_bytes, initial.output_seq)
+    );
+    assert!(
+        rpc.inner
+            .resize_session(stream.clone(), lease, 0, 50)
+            .is_err()
+    );
+    assert_eq!(rpc.inner.capture_rendered(stream.clone()).unwrap(), resized);
+    rpc.inner
+        .write_raw(stream.clone(), lease, b"size\n".to_vec())
+        .unwrap();
+    loop {
+        let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        if screen.contents.contains("50 160") {
+            assert!(screen.generation > generation);
+            assert!(screen.output_bytes > resized.output_bytes);
+            assert!(screen.output_seq >= resized.output_seq);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kernel size not observed: {screen:?}"
+        );
+        thread::yield_now();
+    }
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut wrong = stream.clone();
+    wrong.host = fl_host_proto::HostInstance::new([99; 16]);
+    assert_eq!(
+        extended(&mut rpc, XReq::CaptureRendered { stream: wrong }),
+        XResp::Refused {
+            code: Refuse::WrongInstance
+        }
+    );
+    let mut wrong = stream.clone();
+    wrong.epoch.0 += 1;
+    assert_eq!(
+        extended(&mut rpc, XReq::CaptureRendered { stream: wrong }),
+        XResp::Refused {
+            code: Refuse::StaleEpoch
+        }
+    );
+    let pipe = reliable_spawn(&mut rpc, "rendered-pipe", &["echo"]);
+    let pipe_lease = controller(&mut rpc, &pipe);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::CaptureRendered {
+                stream: pipe.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::WrongMode
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::Resize {
+                stream: pipe,
+                lease: pipe_lease,
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::WrongMode
+        }
+    );
+    assert!(
+        rpc.inner
+            .extension_request(XReq::Attach {
+                stream,
+                resume: None
+            })
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+fn rendered_screen(rpc: &mut Rpc, stream: &StreamId) -> fl_host_proto::RenderedScreen {
+    match extended(
+        rpc,
+        XReq::CaptureRendered {
+            stream: stream.clone(),
+        },
+    ) {
+        XResp::RenderedCapture { screen } => screen,
+        other => panic!("snapshot {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn rendered_ready(rpc: &mut Rpc, stream: &StreamId) -> fl_host_proto::RenderedScreen {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = rendered_screen(rpc, stream);
+        if screen.contents == "ready" {
+            return screen;
+        }
+        assert!(Instant::now() < deadline, "not ready: {screen:?}");
+        thread::yield_now();
+    }
+}
+
+// Catches checking only the writer lease while a takeover has invalidated actual authority.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_takeover_before_claim_enqueue_refuses_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut owner, "resize-takeover");
+    let lease = controller(&mut owner, &stream);
+    let before = rendered_ready(&mut owner, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    arm(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    let mut claimant = Rpc::connect(&daemon.paths.endpoint);
+    claimant.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::ClaimController {
+            stream: stream.clone(),
+        },
+    });
+    wait_at(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    release(&daemon.paths.barrier, "before-resize");
+    assert!(matches!(
+        owner.pull(),
+        HostResponse::Extended {
+            response: XResp::Refused {
+                code: Refuse::StaleLease
+            },
+            ..
+        }
+    ));
+    let mut observer = Rpc::connect(&daemon.paths.endpoint);
+    assert_eq!(rendered_screen(&mut observer, &stream), before);
+    release(&daemon.paths.subscriber, "reliable-pre-enqueue");
+    assert!(matches!(
+        claimant.pull(),
+        HostResponse::Extended {
+            response: XResp::Controller { .. },
+            ..
+        }
+    ));
+}
+
+// Catches stale queued mutation after RPC disconnect, even before writer revocation settles.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_disconnect_refuses_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut owner, "resize-disconnect");
+    let lease = controller(&mut owner, &stream);
+    let before = rendered_ready(&mut owner, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    owner.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    drop(owner);
+    wait_file(&daemon.paths.barrier.join("revoked"), |b| !b.is_empty());
+    release(&daemon.paths.barrier, "before-resize");
+    let mut observer = Rpc::connect(&daemon.paths.endpoint);
+    let fresh = controller(&mut observer, &stream); // worker passed the old job before this fence completes
+    assert_eq!(rendered_screen(&mut observer, &stream), before);
+    assert!(matches!(
+        extended(
+            &mut observer,
+            XReq::Resize {
+                stream: stream.clone(),
+                lease: fresh,
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Resized {
+            cols: 80,
+            rows: 24,
+            ..
+        }
+    ));
+    let after = rendered_screen(&mut observer, &stream);
+    assert_eq!(
+        (after.rows, after.cols, after.generation),
+        (24, 80, before.generation + 1)
+    );
+}
+
+// Catches selecting the replacement by name for an old epoch's capture or resize.
+#[cfg(unix)]
+#[test]
+fn rendered_old_epoch_never_selects_respawned_session() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let old = rendered_spawn(&mut rpc, "rendered-respawn");
+    let lease = controller(&mut rpc, &old);
+    let before = rendered_ready(&mut rpc, &old);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::KillSession {
+                stream: old.clone(),
+                lease
+            }
+        ),
+        XResp::Controlled
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let XResp::Sessions { records } = extended(&mut rpc, XReq::ListSessions) else {
+            panic!("list")
+        };
+        if records
+            .iter()
+            .any(|r| r.stream == old && matches!(r.state, ChildState::CleanupComplete(_)))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let new = rendered_spawn(&mut rpc, "rendered-respawn");
+    assert_ne!(old.epoch, new.epoch);
+    assert_eq!(rendered_ready(&mut rpc, &new).stream, new);
+    let historical = rendered_screen(&mut rpc, &old);
+    assert_eq!(historical.stream, old);
+    assert_eq!(
+        (historical.rows, historical.cols),
+        (before.rows, before.cols)
+    );
+    assert!(matches!(
+        extended(
+            &mut rpc,
+            XReq::Resize {
+                stream: old,
+                lease,
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::SessionFenced
+        }
+    ));
+    assert_eq!(
+        (
+            rendered_screen(&mut rpc, &new).rows,
+            rendered_screen(&mut rpc, &new).cols
+        ),
+        (40, 120)
+    );
+}
+
+// Catches deadline renewal while a queued resize waits for execution.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_held_past_deadline_refuses_without_mutation() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut rpc, "resize-deadline");
+    let lease = controller(&mut rpc, &stream);
+    let before = rendered_ready(&mut rpc, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    assert!(matches!(
+        rpc.pull(),
+        HostResponse::Extended {
+            response: XResp::Refused { code: Refuse::Busy },
+            ..
+        }
+    ));
+    release(&daemon.paths.barrier, "before-resize");
+    assert_eq!(rendered_screen(&mut rpc, &stream), before);
+}
+
+// Catches reordering of queued geometry changes or returning a later generation.
+#[cfg(unix)]
+#[test]
+fn rendered_resize_queue_preserves_geometry_and_generation_order() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_spawn(&mut rpc, "resize-order");
+    let lease = controller(&mut rpc, &stream);
+    let before = rendered_ready(&mut rpc, &stream);
+    arm(&daemon.paths.barrier, "before-resize");
+    let first = rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 160,
+            rows: 50,
+        },
+    });
+    wait_at(&daemon.paths.barrier, "before-resize");
+    let second = rpc.push(|id| HostRequest::Extended {
+        id,
+        request: XReq::Resize {
+            stream: stream.clone(),
+            lease,
+            cols: 80,
+            rows: 24,
+        },
+    });
+    wait_file(&daemon.paths.barrier.join("queued-resize-80-24"), |b| {
+        !b.is_empty()
+    });
+    release(&daemon.paths.barrier, "before-resize");
+    let mut revisions = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let HostResponse::Extended {
+            id,
+            response:
+                XResp::Resized {
+                    cols,
+                    rows,
+                    projection_revision,
+                },
+        } = rpc.pull()
+        else {
+            panic!("resize")
+        };
+        revisions.insert(id.0, (cols, rows, projection_revision));
+    }
+    assert_eq!(revisions[&first.0], (160, 50, before.generation + 1));
+    assert_eq!(revisions[&second.0], (80, 24, before.generation + 2));
+    let after = rendered_screen(&mut rpc, &stream);
+    assert_eq!(
+        (after.cols, after.rows, after.generation),
+        (80, 24, before.generation + 2)
+    );
+}
+
+// Native Windows coverage: valid new requests explicitly refuse without advertising bit 8.
+#[cfg(not(unix))]
+#[test]
+fn rendered_capture_and_resize_are_unsupported_without_unix_backend() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let XResp::Capabilities { features, .. } = extended(&mut rpc, XReq::Capabilities) else {
+        panic!("capabilities")
+    };
+    assert_eq!(features & fl_host_proto::RENDERED_PTY_FEATURE, 0);
+    let stream = reliable_spawn(&mut rpc, "unsupported-screen", &["echo"]);
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::CaptureRendered {
+                stream: stream.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::Unsupported
+        }
+    );
+    assert_eq!(
+        extended(
+            &mut rpc,
+            XReq::Resize {
+                stream: stream.clone(),
+                lease: ControllerLease(1),
+                cols: 80,
+                rows: 24
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::Unsupported
+        }
+    );
+    assert!(matches!(
+        rpc.inner.capture_rendered(stream.clone()),
+        Err(HostError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        rpc.inner.resize_session(stream, ControllerLease(1), 80, 24),
+        Err(HostError::Unsupported { .. })
+    ));
+}
+
+#[cfg(unix)]
+mod rendered_deadline {
+    use super::*;
+
+    pub(super) fn run<T>(deadline: Instant, context: &str, work: impl FnOnce() -> T) -> T {
+        assert!(Instant::now() < deadline, "rendered deadline: {context}");
+        let value = work();
+        assert!(Instant::now() < deadline, "rendered deadline: {context}");
+        value
+    }
+
+    pub(super) fn wait<T>(
+        deadline: Instant,
+        context: &str,
+        mut poll: impl FnMut() -> Option<T>,
+    ) -> T {
+        loop {
+            if let Some(value) = run(deadline, context, &mut poll) {
+                return value;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::Cell;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        #[test]
+        fn expired_deadline_refuses_to_start_work() {
+            let called = Cell::new(false);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run(Instant::now() - Duration::from_millis(1), "expired", || {
+                    called.set(true);
+                });
+            }));
+            assert!(result.is_err());
+            assert!(!called.get());
+        }
+
+        #[test]
+        fn wait_rejects_success_returned_after_deadline() {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let called = Cell::new(false);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                wait(deadline, "late successful checkpoint or RPC", || {
+                    called.set(true);
+                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    Some(())
+                });
+            }));
+            assert!(called.get(), "late-return scenario must run its callback");
+            assert!(result.is_err(), "a late successful result must be refused");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_rendered_fixture(path: &Path) -> u64 {
+    wait_rendered_fixture_until(path, Instant::now() + Duration::from_secs(30))
+}
+
+#[cfg(unix)]
+fn wait_rendered_fixture_until(path: &Path, deadline: Instant) -> u64 {
+    rendered_deadline::wait(
+        deadline,
+        &format!("fixture checkpoint {}", path.display()),
+        || std::fs::read_to_string(path).ok()?.parse().ok(),
+    )
+}
+
+#[cfg(unix)]
+fn rendered_through(rpc: &mut Rpc, stream: &StreamId, bytes: u64) -> fl_host_proto::RenderedScreen {
+    rendered_through_until(rpc, stream, bytes, Instant::now() + Duration::from_secs(30))
+}
+
+#[cfg(unix)]
+fn rendered_through_until(
+    rpc: &mut Rpc,
+    stream: &StreamId,
+    bytes: u64,
+    deadline: Instant,
+) -> fl_host_proto::RenderedScreen {
+    rendered_deadline::wait(
+        deadline,
+        &format!("projection drain through {bytes} bytes"),
+        || {
+            let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+            (screen.output_bytes >= bytes).then_some(screen)
+        },
+    )
+}
+
+#[cfg(unix)]
+fn rendered_fixture_spawn(rpc: &mut Rpc, name: &str, mode: &str, root: &Path) -> StreamId {
+    let mut child = spec(name, &[mode, root.to_str().unwrap()]);
+    child.kind = SpawnKind::Pty;
+    rpc.inner
+        .spawn_pty_session(
+            child,
+            Some(fl_host_proto::PtyOptions {
+                rows: 6,
+                cols: 32,
+                scrollback_rows: 0,
+            }),
+        )
+        .unwrap()
+        .0
+}
+
+// Catches reconstructing from the retained tail, parser starvation behind replay,
+// loss of alternate-screen state and buffering control strings or split UTF-8.
+#[cfg(unix)]
+#[test]
+fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consumers() {
+    use rendered_deadline::{run, wait};
+
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let root = tempfile::tempdir().unwrap();
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_fixture_spawn(&mut rpc, "rendered-tui", "rendered-tui", root.path());
+    let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+    let initial_bytes = wait_rendered_fixture(&root.path().join("ready"));
+    let initial = rendered_through(&mut rpc, &stream, initial_bytes);
+    assert_eq!(initial.contents, "ALTSEED");
+    assert_eq!((initial.rows, initial.cols), (6, 32));
+
+    // One ticket stays unopened. A second consumer pins a record before its
+    // first write, without depending on socket-buffer capacity or scheduling.
+    let mut unread = Rpc::connect(&daemon.paths.endpoint);
+    let unread_ticket = match extended(
+        &mut unread,
+        XReq::Observe {
+            stream: stream.clone(),
+            after_seq: Some(1),
+        },
+    ) {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("unread observer {other:?}"),
+    };
+    arm(&daemon.paths.subscriber, "reliable-before-part");
+    let stalled_ticket = match rpc
+        .inner
+        .extension_request(XReq::SubscribeReliable {
+            stream: stream.clone(),
+            lease,
+            after_seq: Some(0),
+        })
+        .unwrap()
+    {
+        XResp::Subscription { ticket, .. } => ticket,
+        other => panic!("stalled ticket {other:?}"),
+    };
+    // reliable_hold expires after five seconds. Start one shorter deadline
+    // before opening the event socket can begin that hold, and keep every
+    // checkpoint and blocking result inside it so expiry cannot create a pass.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let (_stalled_rt, stalled) = run(deadline, "open held subscriber", || {
+        event_socket(&daemon.paths.endpoint, stalled_ticket)
+    });
+    wait(deadline, "subscriber reached reliable-before-part", || {
+        daemon
+            .paths
+            .subscriber
+            .join("at-reliable-before-part")
+            .exists()
+            .then_some(())
+    });
+    std::fs::write(root.path().join("run"), b"1").unwrap();
+
+    let escape_bytes = wait_rendered_fixture_until(&root.path().join("escape-ready"), deadline);
+    assert!(escape_bytes > 8 * 1024 * 1024);
+    let escape = rendered_through_until(&mut rpc, &stream, escape_bytes, deadline);
+    assert!(escape.contents.starts_with("ALTSEED"));
+    assert!(!escape.contents.contains("hidden"));
+    assert!(escape.generation > initial.generation);
+    std::fs::write(root.path().join("escape-go"), b"1").unwrap();
+
+    let utf8_bytes = wait_rendered_fixture_until(&root.path().join("utf8-ready"), deadline);
+    let utf8 = rendered_through_until(&mut rpc, &stream, utf8_bytes, deadline);
+    assert_eq!(utf8.contents, "PRIMARY\nFINAL ");
+    assert_eq!((utf8.cursor_row, utf8.cursor_col), (1, 6));
+    std::fs::write(root.path().join("utf8-go"), b"1").unwrap();
+    let done_bytes = wait_rendered_fixture_until(&root.path().join("done"), deadline);
+    let final_screen = rendered_through_until(&mut rpc, &stream, done_bytes, deadline);
+    assert_eq!(final_screen.contents, "PRIMARY\nFINAL ✓");
+    assert_eq!((final_screen.cursor_row, final_screen.cursor_col), (1, 7));
+    assert_eq!((final_screen.rows, final_screen.cols), (6, 32));
+    assert_eq!(final_screen.output_bytes, done_bytes);
+    assert_eq!(final_screen.stream, stream);
+    assert!(final_screen.generation > utf8.generation);
+    assert!(final_screen.output_seq >= escape.output_seq);
+    assert_eq!(
+        run(deadline, "repeat coherent capture", || {
+            rpc.inner.capture_rendered(stream.clone()).unwrap()
+        }),
+        final_screen
+    );
+    let raw = run(deadline, "raw retained tail", || {
+        rpc.inner
+            .capture_output(stream.session.clone(), 64 * 1024)
+            .unwrap()
+    });
+    assert_eq!(raw.len(), 64 * 1024);
+    assert!(
+        !raw.contains("PRIMARY"),
+        "primary cells must predate the retained raw tail"
+    );
+    assert!(raw.ends_with("FINAL ✓"));
+    let summary = run(deadline, "session state while subscriber held", || {
+        rpc.inner.list_sessions().unwrap()
+    })
+    .into_iter()
+    .find(|s| s.stream == stream)
+    .unwrap();
+    assert!(!record(&summary.state).consumer_stalled);
+
+    // The unopened ticket resumes with an explicit gap. This proves early
+    // state really was evicted while its coherent screen remained available.
+    let (rt, mut replay) = run(deadline, "open unread observer", || {
+        event_socket(&daemon.paths.endpoint, unread_ticket)
+    });
+    let gap = run(deadline, "eviction gap while subscriber held", || {
+        rt.block_on(async {
+            tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                replay.next_frame(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        })
+    });
+    assert!(
+        matches!(gap, fl_host_proto::ExtensionFrame::Gap { from_seq: 2, next_seq } if next_seq > 2),
+        "expected eviction gap, got {gap:?}"
+    );
+    run(deadline, "release subscriber before hold expires", || {
+        release(&daemon.paths.subscriber, "reliable-before-part");
+    });
+    drop(replay);
+    drop(stalled);
+    rpc.inner.kill_session(stream, lease).unwrap();
+}
+
+// Catches applying parser resize before the ioctl, losing output/resize order,
+// or returning a generation unrelated to the geometry linearization point.
+#[cfg(unix)]
+#[test]
+fn rendered_child_winsize_matches_ordered_resize_generation_and_output() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let root = tempfile::tempdir().unwrap();
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let stream = rendered_fixture_spawn(
+        &mut rpc,
+        "rendered-resize-child",
+        "rendered-resize",
+        root.path(),
+    );
+    let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+    let ready_bytes = wait_rendered_fixture(&root.path().join("ready"));
+    let initial = rendered_through(&mut rpc, &stream, ready_bytes);
+    assert_eq!(initial.contents, "SIZE 6 32");
+    for (step, cols, rows) in [(1, 80, 24), (2, 40, 12)] {
+        let before = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        let generation = rpc
+            .inner
+            .resize_session(stream.clone(), lease, cols, rows)
+            .unwrap();
+        let resized = rpc.inner.capture_rendered(stream.clone()).unwrap();
+        assert_eq!(
+            (resized.rows, resized.cols, resized.generation),
+            (rows, cols, generation)
+        );
+        assert!(generation > before.generation);
+        assert_eq!(
+            (resized.output_bytes, resized.output_seq),
+            (before.output_bytes, before.output_seq)
+        );
+        std::fs::write(root.path().join(format!("report-{step}")), b"1").unwrap();
+        let bytes = wait_rendered_fixture(&root.path().join(format!("reported-{step}")));
+        let after = rendered_through(&mut rpc, &stream, bytes);
+        assert_eq!(after.contents, format!("SIZE {rows} {cols}"));
+        assert_eq!((after.rows, after.cols), (rows, cols));
+        assert!(after.generation > generation);
+        assert!(after.output_bytes > resized.output_bytes);
+        assert!(after.output_seq >= resized.output_seq);
+    }
+    rpc.inner.kill_session(stream, lease).unwrap();
 }

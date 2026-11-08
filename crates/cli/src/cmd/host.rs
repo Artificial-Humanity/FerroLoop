@@ -35,9 +35,18 @@ pub enum HostCmd {
     Capture {
         /// Session id or `session:window` unit target.
         session: String,
-        /// Maximum trailing bytes to capture.
-        #[arg(long, default_value_t = 16384)]
+        /// Maximum trailing bytes to capture (raw mode only).
+        #[arg(long, default_value_t = 16384, conflicts_with = "rendered")]
         max_bytes: usize,
+        /// Capture the recent raw terminal bytes (the default).
+        #[arg(long, conflicts_with = "rendered")]
+        raw: bool,
+        /// Capture the coherent visible PTY screen.
+        #[arg(long)]
+        rendered: bool,
+        /// Emit the full rendered snapshot and metadata as JSON.
+        #[arg(long, requires = "rendered")]
+        json: bool,
     },
     /// Send a line or raw bytes to a live session.
     Send {
@@ -269,7 +278,13 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
             }
             Ok(())
         }
-        HostCmd::Capture { session, max_bytes } => {
+        HostCmd::Capture {
+            session,
+            max_bytes,
+            raw: _,
+            rendered,
+            json,
+        } => {
             let endpoint =
                 HostEndpoint::discover().context("failed to discover fl-host endpoint")?;
             let mut client = BlockingHostClient::connect(&endpoint).with_context(|| {
@@ -284,13 +299,26 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     .context("failed to list fl-host sessions")?,
             );
             let summary = resolve_target_session(&sessions, &session)?;
-            let limit = u32::try_from(max_bytes)
-                .unwrap_or(u32::MAX)
-                .min(fl_host_proto::MAX_RAW_INPUT as u32);
-            let output = client
-                .capture_output(summary.stream.session.clone(), limit)
-                .with_context(|| format!("failed to capture output from `{session}`"))?;
-            print!("{output}");
+            if rendered {
+                let screen = client
+                    .capture_rendered(summary.stream.clone())
+                    .with_context(|| {
+                        format!("failed to capture rendered screen from `{session}`")
+                    })?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&screen)?);
+                } else {
+                    print!("{}", screen.contents);
+                }
+            } else {
+                let limit = u32::try_from(max_bytes)
+                    .unwrap_or(u32::MAX)
+                    .min(fl_host_proto::MAX_RAW_INPUT as u32);
+                let output = client
+                    .capture_output(summary.stream.session.clone(), limit)
+                    .with_context(|| format!("failed to capture output from `{session}`"))?;
+                print!("{output}");
+            }
             Ok(())
         }
         HostCmd::Send { session, text, raw } => {

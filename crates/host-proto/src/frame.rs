@@ -176,7 +176,8 @@ pub fn encode_response_for_minor(minor: u16, response: &HostResponse) -> Result<
     let payload = if matches!(
         response,
         HostResponse::Extended {
-            response: crate::ExtensionResponse::Sessions { .. },
+            response: crate::ExtensionResponse::Sessions { .. }
+                | crate::ExtensionResponse::RenderedCapture { .. },
             ..
         }
     ) {

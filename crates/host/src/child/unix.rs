@@ -27,6 +27,7 @@ pub struct Supervised {
     pub control_inode: u64,
     pub control: File,
     pub stdin: File,
+    pub resize_master: Option<File>,
     pub stdout: File,
     pub stderr: File,
     pub status: File,
@@ -125,6 +126,13 @@ pub fn spawn_supervised(
         let stderr_w = elevate(stderr_w)?;
         (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w)
     };
+    // Admit the dedicated master descriptor before launching the supervisor;
+    // a failed duplicate cannot orphan an already running child.
+    let resize_master = if kind == fl_host_proto::SpawnKind::Pty {
+        Some(File::from(stdin_w.try_clone()?))
+    } else {
+        None
+    };
     let control_r = elevate(control_r)?;
     let status_w = elevate(status_w)?;
     let fds = [
@@ -200,6 +208,7 @@ pub fn spawn_supervised(
             control_inode,
             control,
             stdin: File::from(stdin_w),
+            resize_master,
             stdout: File::from(stdout_r),
             stderr: File::from(stderr_r),
             status,

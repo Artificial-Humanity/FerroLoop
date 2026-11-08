@@ -43,6 +43,9 @@ pub struct Session {
     stalled: AtomicBool,
     sink: Mutex<Option<Weak<dyn StdoutSink>>>,
     reliable: Option<Arc<crate::reliable::ReliableJournal>>,
+    projection: Mutex<Option<crate::projection::Projection>>,
+    #[cfg(unix)]
+    resize_master: Option<File>,
     #[cfg(unix)]
     supervisor: Mutex<Option<std::process::Child>>,
     #[cfg(windows)]
@@ -79,6 +82,97 @@ impl Session {
     }
     pub(crate) fn reliable(&self) -> Option<&Arc<crate::reliable::ReliableJournal>> {
         self.reliable.as_ref()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_projection(
+        parts: SessionParts,
+        journal: Arc<crate::reliable::ReliableJournal>,
+        projection: crate::projection::Projection,
+        master: Option<File>,
+    ) -> Self {
+        assert!(journal.pty_mode());
+        let mut session = Self::with_reliable(parts, Some(journal));
+        session.projection = Mutex::new(Some(projection));
+        session.resize_master = master;
+        session
+    }
+    pub(crate) fn capture_screen(
+        &self,
+    ) -> Result<crate::projection::ProjectionSnapshot, fl_host_proto::ExtensionRefusal> {
+        if cfg!(windows) {
+            return Err(fl_host_proto::ExtensionRefusal::Unsupported);
+        }
+        self.projection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .ok_or(fl_host_proto::ExtensionRefusal::WrongMode)?
+            .snapshot()
+    }
+    pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> Result<u64, HostError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
+            let projection = projection
+                .as_mut()
+                .ok_or_else(|| HostError::Protocol("wrong session mode".into()))?;
+            projection.resize(cols, rows, || {
+                let master = self
+                    .resize_master
+                    .as_ref()
+                    .ok_or_else(|| HostError::Io("PTY master unavailable".into()))?;
+                let size = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                // Dedicated live duplicate, independent of the stdin writer's ownership.
+                if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
+                    return Err(HostError::Io(std::io::Error::last_os_error().to_string()));
+                }
+                Ok(())
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (cols, rows);
+            Err(HostError::Unsupported {
+                subject: "pty resize",
+            })
+        }
+    }
+
+    // The projection lock covers every byte's parser update, raw tail, journal
+    // admission/drop and watermark. Reads, polls and waits occur outside it.
+    fn accept_output(
+        &self,
+        journal: &crate::reliable::ReliableJournal,
+        bytes: crate::reliable::ChargedBytes,
+    ) -> Result<(), fl_host_proto::ExtensionRefusal> {
+        let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(projection) = projection.as_mut() {
+            projection.process(bytes.as_slice());
+        }
+        self.push_stdout_tail(bytes.as_slice(), 64 * 1024);
+        let result = journal.accept_read(bytes);
+        if let Some(projection) = projection.as_mut() {
+            projection.set_output_seq(journal.position().1);
+        }
+        result
+    }
+    fn drop_pty_output(&self, journal: &crate::reliable::ReliableJournal, bytes: &[u8]) {
+        let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(projection) = projection.as_mut() {
+            projection.process(bytes);
+        }
+        self.push_stdout_tail(bytes, 64 * 1024);
+        journal.drop_pty_unadmitted();
+        if let Some(projection) = projection.as_mut() {
+            projection.set_output_seq(journal.position().1);
+        }
     }
 
     pub fn new(parts: SessionParts) -> Self {
@@ -150,6 +244,9 @@ impl Session {
             stalled: AtomicBool::new(false),
             sink: Mutex::new(None),
             reliable,
+            projection: Mutex::new(None),
+            #[cfg(unix)]
+            resize_master: None,
             #[cfg(unix)]
             supervisor: Mutex::new(None),
             #[cfg(windows)]
@@ -669,8 +766,7 @@ pub(crate) fn pump_reliable_stdout_with(
                 match read(&mut scratch) {
                     Ok(0) | Err(_) => break,
                     Ok(len) => {
-                        session.push_stdout_tail(&scratch[..len], 64 * 1024);
-                        journal.drop_pty_unadmitted();
+                        session.drop_pty_output(journal, &scratch[..len]);
                         continue;
                     }
                 }
@@ -686,8 +782,7 @@ pub(crate) fn pump_reliable_stdout_with(
             Ok(0) | Err(_) => break,
             Ok(len) => {
                 buffer.truncate(len);
-                session.push_stdout_tail(buffer.as_slice(), 64 * 1024);
-                if journal.accept_read(buffer).is_err() {
+                if session.accept_output(journal, buffer).is_err() {
                     break;
                 }
             }
@@ -1089,5 +1184,146 @@ mod tests {
             0,
             "capture must not acknowledge delivery"
         );
+    }
+    #[cfg(unix)]
+    fn pty_fixture() -> (
+        Arc<Session>,
+        Arc<crate::reliable::ReliableJournal>,
+        Arc<dyn StdoutSink>,
+    ) {
+        let parts = parts();
+        let journal = crate::reliable::ReliableJournal::new_with_mode(
+            crate::slice_budget::SliceBudget::new(),
+            fl_host_proto::StreamId {
+                host: fl_host_proto::HostInstance::new([1; 16]),
+                session: parts.session.clone(),
+                epoch: SessionEpoch(parts.epoch),
+            },
+            true,
+        )
+        .unwrap();
+        let projection = crate::projection::Projection::new(
+            Arc::clone(journal.budget()),
+            fl_host_proto::PtyOptions::default(),
+        )
+        .unwrap();
+        let session = Arc::new(Session::with_projection(
+            parts,
+            Arc::clone(&journal),
+            projection,
+            None,
+        ));
+        let sink: Arc<dyn StdoutSink> = crate::output::OutputSession::open(
+            Arc::clone(&session),
+            Arc::new(crate::output::Hub::new()),
+        );
+        (session, journal, sink)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pty_projection_precedes_forced_unadmitted_drop_and_retains_raw_bytes() {
+        use crate::slice_budget::{ChargeKind, EPOCH_DATA, reserve};
+        let (session, journal, sink) = pty_fixture();
+        let held = reserve(journal.budget(), ChargeKind::ReliableData, EPOCH_DATA).unwrap();
+        assert!(journal.prepare_read().is_err());
+        let raw = b"visible\x1b]secret\x07";
+        let mut read = false;
+        pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
+            if read {
+                let s = session.capture_screen().unwrap();
+                assert_eq!(s.contents, "visible");
+                assert_eq!(
+                    (s.generation, s.output_seq, s.output_bytes),
+                    (1, 1, raw.len() as u64)
+                );
+                assert_eq!(session.stdout_tail(100).as_bytes(), raw);
+                assert_eq!(journal.position(), (0, 1));
+                Ok(0)
+            } else {
+                read = true;
+                buf[..raw.len()].copy_from_slice(raw);
+                Ok(raw.len())
+            }
+        });
+        drop(held);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pty_admitted_chunks_have_coherent_screen_and_watermark() {
+        let (session, journal, sink) = pty_fixture();
+        let chunks = [b"old\r\x1b[2".as_slice(), b"Knew\n"];
+        let mut next = 0;
+        pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
+            let s = session.capture_screen().unwrap();
+            assert_eq!(s.generation, next as u64);
+            assert_eq!(s.output_seq, journal.position().1);
+            assert_eq!(
+                s.output_bytes,
+                chunks[..next].iter().map(|b| b.len() as u64).sum::<u64>()
+            );
+            if next == chunks.len() {
+                assert_eq!(s.contents, "new");
+                return Ok(0);
+            }
+            let chunk = chunks[next];
+            next += 1;
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        });
+        assert_eq!(journal.position().0, 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn projection_refuses_pipe_and_failed_session_ioctl_preserves_screen() {
+        assert!(matches!(
+            Session::new(parts()).capture_screen(),
+            Err(fl_host_proto::ExtensionRefusal::WrongMode)
+        ));
+        let (_, journal, _) = pty_fixture();
+        let projection = crate::projection::Projection::new(
+            Arc::clone(journal.budget()),
+            fl_host_proto::PtyOptions::default(),
+        )
+        .unwrap();
+        // A regular file gives a real ENOTTY, after growth admission but before
+        // any parser mutation; no subprocess or timing-dependent failure.
+        let session = Session::with_projection(
+            parts(),
+            journal,
+            projection,
+            Some(tempfile::tempfile().unwrap()),
+        );
+        assert!(session.resize_pty(160, 50).is_err());
+        let s = session.capture_screen().unwrap();
+        assert_eq!((s.cols, s.rows, s.generation), (120, 40, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_snapshots_never_mix_projection_and_byte_counters() {
+        let (session, journal, _sink) = pty_fixture();
+        std::thread::scope(|scope| {
+            let session = &session;
+            let journal = &journal;
+            let writer = scope.spawn(move || {
+                for _ in 0..1000 {
+                    let mut bytes = journal.prepare_read().unwrap();
+                    bytes.as_mut_slice()[..3].copy_from_slice(b"\rx\n");
+                    bytes.truncate(3);
+                    session.accept_output(journal, bytes).unwrap();
+                }
+            });
+            loop {
+                let s = session.capture_screen().unwrap();
+                assert_eq!(s.output_bytes, s.generation * 3);
+                assert!(s.output_seq >= s.generation);
+                if s.generation == 1000 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(journal.position().0, 0);
     }
 }

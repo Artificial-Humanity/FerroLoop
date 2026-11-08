@@ -100,7 +100,17 @@ impl std::ops::Deref for InputBytes {
     }
 }
 
+struct ResizeControl {
+    authority: std::sync::Weak<crate::authority::AuthorityRegistry>,
+    stream: fl_host_proto::StreamId,
+    lease: ControllerLease,
+    cols: u16,
+    rows: u16,
+    _metadata: crate::slice_budget::Reservation,
+}
+
 enum CtrlKind {
+    Resize(ResizeControl),
     Claim,
     Signal(SignalKind),
     Kill { lease: Option<ControllerLease> },
@@ -305,6 +315,55 @@ impl WriterHandle {
         epoch: u64,
     ) -> Result<oneshot::Receiver<Result<u64, String>>, String> {
         self.enqueue_ctrl(conn, epoch, 0, CtrlKind::Claim, true)
+    }
+
+    pub(crate) fn resize(
+        &self,
+        conn: fl_host_proto::ConnId,
+        stream: fl_host_proto::StreamId,
+        leases: (ControllerLease, ControllerLease),
+        geometry: (u16, u16),
+        authority: &Arc<crate::authority::AuthorityRegistry>,
+        budget: &Arc<crate::slice_budget::SliceBudget>,
+    ) -> Result<oneshot::Receiver<Result<u64, String>>, fl_host_proto::ExtensionRefusal> {
+        use fl_host_proto::ExtensionRefusal as Refusal;
+        let (cols, rows) = geometry;
+        let (authority_lease, writer_lease) = leases;
+        fl_host_proto::validate_pty_geometry(cols, rows).map_err(|_| Refusal::ResourceLimit)?;
+        if !cfg!(unix) {
+            return Err(Refusal::Unsupported);
+        }
+        if self.mode() != fl_host_proto::SessionMode::Pty {
+            return Err(Refusal::WrongMode);
+        }
+        // Bound queue growth, the control payload and oneshot allocation before enqueue.
+        // This reservation remains in the job until execution/cancellation completes.
+        let metadata = crate::slice_budget::reserve(
+            budget,
+            crate::slice_budget::ChargeKind::Metadata,
+            4 * std::mem::size_of::<CtrlJob>() + 1024,
+        )?;
+        let epoch = stream.epoch.0;
+        let rx = self
+            .enqueue_ctrl(
+                conn.0,
+                epoch,
+                writer_lease.0,
+                CtrlKind::Resize(ResizeControl {
+                    authority: Arc::downgrade(authority),
+                    stream,
+                    lease: authority_lease,
+                    cols,
+                    rows,
+                    _metadata: metadata,
+                }),
+                false,
+            )
+            .map_err(|reason| control_refusal(&reason))?;
+        if let Some(dir) = self.barrier.as_ref() {
+            let _ = std::fs::write(dir.join(format!("queued-resize-{cols}-{rows}")), b"1");
+        }
+        Ok(rx)
     }
 
     pub fn signal(
@@ -547,11 +606,72 @@ impl WriterHandle {
     }
 
     fn run_ctrl(&self, job: CtrlJob) {
+        if let CtrlKind::Resize(ref resize) = job.kind {
+            let result = self.run_resize(&job, resize);
+            let _ = job.reply.send(result.map_err(|code| code.to_string()));
+            return;
+        }
         match job.kind {
+            CtrlKind::Resize(_) => unreachable!("handled above"),
             CtrlKind::Claim => self.run_claim(job),
             CtrlKind::Signal(signal) => self.run_signal(job, signal),
             CtrlKind::Kill { lease } => self.run_kill(job, lease),
         }
+    }
+
+    fn run_resize(
+        &self,
+        job: &CtrlJob,
+        resize: &ResizeControl,
+    ) -> Result<u64, fl_host_proto::ExtensionRefusal> {
+        use fl_host_proto::ExtensionRefusal as Refusal;
+        let deadline = job.admitted + STDIN_WRITE_TIMEOUT;
+        // Fixture gates release without holding either fence; timeout never renews.
+        while let Some(dir) = self.barrier.as_ref() {
+            if self.lock().stop {
+                return Err(Refusal::SessionFenced);
+            }
+            match poll_barrier(dir, "before-resize", Some(deadline)) {
+                Barrier::Cleared => break,
+                Barrier::Expired => return Err(Refusal::Busy),
+                Barrier::Pulsed | Barrier::Waiting => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let authority = resize.authority.upgrade().ok_or(Refusal::SessionFenced)?;
+        authority.with_mutation_fence(
+            fl_host_proto::ConnId(job.conn),
+            &resize.stream,
+            resize.lease,
+            || {
+                let state = self.lock();
+                if state.stop || state.fenced || self.completed() {
+                    return Err(Refusal::SessionFenced);
+                }
+                if state.revoked.contains(&job.conn) {
+                    return Err(Refusal::WrongConnection);
+                }
+                if job.epoch != self.session.epoch {
+                    return Err(Refusal::StaleEpoch);
+                }
+                if job.lease == 0 || job.lease != state.lease {
+                    return Err(Refusal::StaleLease);
+                }
+                if state.owner != job.conn {
+                    return Err(Refusal::WrongConnection);
+                }
+                if Instant::now() >= deadline {
+                    return Err(Refusal::Busy);
+                }
+                // Registry and writer locks cover both kernel and parser mutation.
+                self.session
+                    .resize_pty(resize.cols, resize.rows)
+                    .map_err(|error| match error {
+                        fl_host_proto::HostError::Unsupported { .. } => Refusal::Unsupported,
+                        fl_host_proto::HostError::Io(_) => Refusal::Io,
+                        _ => Refusal::ResourceLimit,
+                    })
+            },
+        )
     }
 
     fn run_claim(&self, job: CtrlJob) {
@@ -920,6 +1040,22 @@ impl WriterHandle {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+pub(crate) fn control_refusal(reason: &str) -> fl_host_proto::ExtensionRefusal {
+    use fl_host_proto::ExtensionRefusal as Refusal;
+    match reason {
+        "WrongConnection" | "wrong connection" | "disconnected" => Refusal::WrongConnection,
+        "StaleLease" | "stale lease" => Refusal::StaleLease,
+        "StaleEpoch" | "stale epoch" => Refusal::StaleEpoch,
+        "WrongInstance" => Refusal::WrongInstance,
+        "ResourceLimit" => Refusal::ResourceLimit,
+        "WrongMode" => Refusal::WrongMode,
+        "Unsupported" => Refusal::Unsupported,
+        "Busy" | "busy" | "timeout" => Refusal::Busy,
+        "SessionFenced" | "writer stopped" => Refusal::SessionFenced,
+        _ => Refusal::Io,
     }
 }
 

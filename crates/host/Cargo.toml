@@ -15,6 +15,7 @@ name = "fl-host-testchild"
 path = "src/bin/fl-host-testchild.rs"
 
 [dependencies]
+vt100 = "=0.18.1"
 fl-host-proto = { path = "../host-proto" }
 serde.workspace = true
 serde_json.workspace = true
