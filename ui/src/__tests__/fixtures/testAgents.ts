@@ -96,8 +96,8 @@ export const TEST_WORKSPACE_AGENTS: AgentRecord[] = [
 ];
 
 const TEST_PROJECT_NAMES = [
-  "FerroLoop",
   "AI-Lab-AMD",
+  "FerroLoop",
   "Kaggle-Gemma4",
   "Lucida",
   "Prosodia",

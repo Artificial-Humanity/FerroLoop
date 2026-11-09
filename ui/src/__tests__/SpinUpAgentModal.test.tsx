@@ -59,7 +59,7 @@ describe("SpinUpAgentModal", () => {
     const nodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
     const hostedCheckbox = screen.getByTestId("spin-up-hosted-checkbox") as HTMLInputElement;
 
-    expect(projectSelect.value).toBe("ferroloop");
+    expect(projectSelect.value).toBe("ai-lab-amd");
     expect(roleSelect.value).toBe("assistant");
     expect(
       Array.from(roleSelect.options).map((o) => o.value),
@@ -132,7 +132,7 @@ describe("SpinUpAgentModal", () => {
     });
     expect(onSpinUp.mock.calls[0][0]).toEqual({
       persona: "kacey",
-      project: "ferroloop",
+      project: "ai-lab-amd",
       role: "assistant",
       vendor: "claude",
       posture: "auto",
@@ -208,7 +208,7 @@ describe("SpinUpAgentModal", () => {
     });
     expect(onSpinUp.mock.calls[1][0]).toEqual({
       persona: "felix",
-      project: "ferroloop",
+      project: "ai-lab-amd",
       role: "assistant",
       vendor: "claude",
       posture: "auto",
@@ -1446,6 +1446,7 @@ describe("SpinUpAgentModal", () => {
   it("leaves project unselected when projects is empty, maps initialProject to a real slug or unselected, and updates when projects arrives", async () => {
     expect(resolveSpinUpProject(null, [])).toBe("");
     expect(resolveSpinUpProject("ferroloop", [])).toBe("");
+    expect(resolveSpinUpProject(null, TEST_PROJECTS)).toBe("ai-lab-amd");
     expect(resolveSpinUpProject("Sonora", TEST_PROJECTS)).toBe("sonora");
     expect(resolveSpinUpProject("nonexistent-project", TEST_PROJECTS)).toBe("");
 

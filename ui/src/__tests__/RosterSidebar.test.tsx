@@ -1408,6 +1408,7 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
   });
 
   it("leaves selectedAgent last-resort project unset instead of inventing FerroLoop", async () => {
+    const recordsCalls: string[] = [];
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/api/v1/auth/session")) {
@@ -1438,10 +1439,43 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
         });
       }
       if (url.endsWith("/api/v1/projects")) {
-        return new Response(JSON.stringify({ projects: [] }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({
+            projects: [
+              {
+                id: "ferroloop",
+                slug: "ferroloop",
+                name: "FerroLoop",
+                kind: "project",
+                path: "/work/ferroloop",
+                has_git: true,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 0,
+              },
+              {
+                id: "sonora",
+                slug: "sonora",
+                name: "Sonora",
+                kind: "project",
+                path: "/work/sonora",
+                has_git: true,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 0,
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      if (url.includes("/api/v1/records")) {
+        recordsCalls.push(url);
       }
       return new Response(JSON.stringify({}), {
         status: 200,
@@ -1478,7 +1512,16 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     const boardSelect = (await screen.findByTestId(
       "board-project-select",
     )) as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(boardSelect.options).map((o) => o.value)).toEqual([
+        "",
+        "ferroloop",
+        "sonora",
+      ]);
+    });
     expect(boardSelect.value).toBe("");
+    expect(boardSelect.selectedOptions[0]?.textContent).toBe("None");
+    expect(recordsCalls).toEqual([]);
     expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
       "Scope: Project",
     );
