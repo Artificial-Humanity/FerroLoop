@@ -2469,8 +2469,8 @@ const TMUX_ENTER_SETTLE_DELAY: Duration = Duration::from_millis(50);
 /// Maximum polls when no unsubmitted payload is seen in the composer (6 × 50ms = 300ms).
 const MAX_WATCH_POLLS: u32 = 6;
 /// Backoff schedule between retry `Enter` presses while the composer still holds the pasted
-/// payload (100 + 200 + 400 + 600 + 800 + 1000 = 3100ms of backoff; with two consecutive 50ms
-/// confirmation captures per attempt, the bounded retry window is ~3.8s total).
+/// payload (`100 + 200 + 400 + 600 + 800 + 1000 = 3100ms` of backoff plus `400ms` of 50ms
+/// confirmation polls = `3.5s` of sleep, `~3.7s` with overhead).
 const ENTER_RETRY_BACKOFFS: [Duration; 6] = [
     Duration::from_millis(100),
     Duration::from_millis(200),
@@ -2481,6 +2481,7 @@ const ENTER_RETRY_BACKOFFS: [Duration; 6] = [
 ];
 const MAX_ENTER_RETRIES: u32 = ENTER_RETRY_BACKOFFS.len() as u32;
 const MAX_PAYLOAD_PROBE_CHARS: usize = 36;
+const MIN_SUBSTRING_PROBE_CHARS: usize = 8;
 const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2491,10 +2492,12 @@ enum ScreenCapture {
     RawFallback(String),
 }
 
-/// Paste `text` into `target` and press Enter. With `bracketed`, the paste is a tmux bracketed
-/// paste (`paste-buffer -p`), so the pane's application receives the newlines as pasted text
-/// rather than as Enter presses, and a failed Enter clears the prompt line (`C-u`) so a retry
-/// does not paste the message a second time.
+/// Paste `text` into `target` and press Enter. With `bracketed`, the paste is a bracketed paste
+/// (`tmux paste-buffer -p` on the `tmux` branch, or `\x1b[200~...\x1b[201~` on the `fl-host`
+/// branch) so the pane's application receives embedded newlines as pasted text rather than as
+/// Enter presses. On the `tmux` branch, a failed or unconfirmed `Enter` clears the prompt line
+/// (`C-u`) so a retry does not leave the message twice; on the `fl-host` branch, an unconfirmed
+/// `Enter` leaves the text in the composer for operator inspection.
 fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Result<(), String> {
     deliver_via_tmux_paste_with_session(target, text, bracketed, None, false)
 }
@@ -2687,9 +2690,9 @@ fn deliver_via_tmux_paste_with_session(
 /// [`TMUX_ENTER_SETTLE_DELAY`]) must both show the payload (or `[Pasted Content` placeholder)
 /// in the composer region, preventing a double `Enter` when a vendor redraws slightly late.
 /// While the framed composer continues to hold the payload (for example, while a busy vendor
-/// finishes a turn), retry `Enter`s follow [`ENTER_RETRY_BACKOFFS`] (~3.8s total bound).
-/// On raw `CaptureOutput` fallback captures or `[Pasted Content` placeholders, at most one
-/// extra `Enter` is sent and screen text alone never concludes `"unconfirmed"`.
+/// finishes a turn), retry `Enter`s follow [`ENTER_RETRY_BACKOFFS`] (`3.5s` of sleep, `~3.7s`
+/// with overhead). On raw `CaptureOutput` fallback captures or `[Pasted Content` placeholders,
+/// at most one extra `Enter` is sent and screen text alone never concludes `"unconfirmed"`.
 fn confirm_paste_submission(
     trimmed: &str,
     mut wait: impl FnMut(Duration),
@@ -2784,10 +2787,9 @@ fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let probes = payload_probes(trimmed);
-    if probes.is_empty() {
+    let Some(distinctive) = distinctive_payload_probe(trimmed) else {
         return false;
-    }
+    };
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
     let Some((composer_lines, _top_rule)) = composer_region_lines(&lines) else {
@@ -2800,9 +2802,11 @@ fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
             .collect::<Vec<_>>()
             .join(" "),
     );
-    probes
-        .iter()
-        .any(|probe| composer_text.contains(probe.as_str()))
+    if distinctive.chars().count() < MIN_SUBSTRING_PROBE_CHARS {
+        composer_text == distinctive
+    } else {
+        composer_text.contains(&distinctive)
+    }
 }
 
 /// `true` when the bottom composer region shows a `[Pasted Content` bracketed-paste placeholder.
@@ -2835,7 +2839,7 @@ fn composer_shows_pasted_placeholder(screen: &str) -> bool {
 }
 
 /// `true` when `screen` shows an empty framed composer box and the scrollback above that box
-/// already contains `trimmed`.
+/// already contains all probes for `trimmed`.
 fn composer_visibly_submitted(screen: &str, trimmed: &str) -> bool {
     if trimmed.is_empty() || composer_holds_payload(screen, trimmed) {
         return false;
@@ -2859,7 +2863,7 @@ fn composer_visibly_submitted(screen: &str, trimmed: &str) -> bool {
     let scrollback = collapse_whitespace(&lines[..top_rule].join(" "));
     probes
         .iter()
-        .any(|probe| scrollback.contains(probe.as_str()))
+        .all(|probe| scrollback.contains(probe.as_str()))
 }
 
 /// Normalize ANSI escape sequences in `screen` so both `CaptureRendered` and raw `CaptureOutput`
@@ -3025,29 +3029,65 @@ fn strip_delivery_header(trimmed: &str) -> &str {
     trimmed
 }
 
-/// First and last non-empty lines of the message body in `trimmed`, whitespace-collapsed and
-/// capped to [`MAX_PAYLOAD_PROBE_CHARS`] characters so terminal wrapping never splits a probe.
-fn payload_probes(trimmed: &str) -> Vec<String> {
+fn cap_payload_probe(collapsed: &str) -> String {
+    let capped: String = collapsed.chars().take(MAX_PAYLOAD_PROBE_CHARS).collect();
+    capped.trim().to_string()
+}
+
+fn normalized_body_lines(trimmed: &str) -> Vec<String> {
     let source = strip_delivery_header(trimmed);
-    let non_empty: Vec<&str> = source
+    source
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .collect();
-    let Some(&first) = non_empty.first() else {
+        .filter_map(|raw| {
+            let unprompted = strip_composer_prompt_prefix(raw).trim();
+            let candidate = if unprompted.is_empty() {
+                raw
+            } else {
+                unprompted
+            };
+            let collapsed = collapse_whitespace(candidate);
+            (!collapsed.is_empty()).then_some(collapsed)
+        })
+        .collect()
+}
+
+/// Most distinctive non-empty body line of `trimmed` (greatest character count, preferring an
+/// interior line on ties), whitespace-collapsed and capped to [`MAX_PAYLOAD_PROBE_CHARS`].
+fn distinctive_payload_probe(trimmed: &str) -> Option<String> {
+    let lines = normalized_body_lines(trimmed);
+    let len = lines.len();
+    let best = lines
+        .iter()
+        .enumerate()
+        .max_by_key(|(idx, line)| {
+            let is_interior = usize::from(*idx > 0 && *idx + 1 < len);
+            (line.chars().count(), is_interior, std::cmp::Reverse(*idx))
+        })
+        .map(|(_, line)| cap_payload_probe(line))?;
+    (!best.is_empty()).then_some(best)
+}
+
+/// First, distinctive, and last non-empty lines of the message body in `trimmed`,
+/// whitespace-collapsed and capped to [`MAX_PAYLOAD_PROBE_CHARS`] characters so terminal
+/// wrapping never splits a probe.
+fn payload_probes(trimmed: &str) -> Vec<String> {
+    let lines = normalized_body_lines(trimmed);
+    let Some(first) = lines.first() else {
         return Vec::new();
     };
+    let last = lines.last().unwrap_or(first);
+    let distinctive = distinctive_payload_probe(trimmed);
     let mut probes = Vec::new();
-    for raw in [first, *non_empty.last().unwrap_or(&first)] {
-        let unprompted = strip_composer_prompt_prefix(raw).trim();
-        let candidate = if unprompted.is_empty() {
-            raw
-        } else {
-            unprompted
-        };
-        let collapsed = collapse_whitespace(candidate);
-        let capped: String = collapsed.chars().take(MAX_PAYLOAD_PROBE_CHARS).collect();
-        let probe = capped.trim().to_string();
+    for probe in [
+        Some(cap_payload_probe(first)),
+        distinctive,
+        Some(cap_payload_probe(last)),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !probe.is_empty() && !probes.contains(&probe) {
             probes.push(probe);
         }
@@ -3114,7 +3154,7 @@ impl MuseTranscriptTracker {
             let collapsed = collapse_whitespace(&normalized);
             probes
                 .iter()
-                .any(|probe| collapsed.contains(probe.as_str()))
+                .all(|probe| collapsed.contains(probe.as_str()))
         })
     }
 }
@@ -9341,6 +9381,17 @@ exit 1"#,
         assert!(!composer_shows_pasted_placeholder(
             "> [Pasted Content 42 chars]\n⏺ Handled that paste already."
         ));
+
+        // 5. Short payloads (< MIN_SUBSTRING_PROBE_CHARS, e.g. "ok") require exact composer match
+        // so unrelated text like "look at this" is not mistaken for the payload.
+        assert!(composer_holds_payload(
+            &format!("◆ Ready.\n{rule}\n❯ ok\n{rule}\nstatus"),
+            "ok",
+        ));
+        assert!(!composer_holds_payload(
+            &format!("◆ Ready.\n{rule}\n❯ look at this\n{rule}\nstatus"),
+            "ok",
+        ));
     }
 
     #[test]
@@ -9538,6 +9589,105 @@ exit 1"#,
         )
         .unwrap();
         assert!(tracker.confirmed(&formatted2));
+
+        // Multi-line mail with generic greeting ("Hi Melisandre,") and signature ("— Ferris"):
+        // 1. `payload_probes` includes the distinctive interior line in addition to greeting/signature.
+        let mut earlier_mail = mail_to(&store, "melisandre");
+        earlier_mail.sender_name = "ferris".into();
+        earlier_mail.subject = "petition review".into();
+        earlier_mail.body = "Hi Melisandre,\nEarlier unrelated turn\n— Ferris".into();
+        let earlier_formatted = format_push_message(&earlier_mail);
+
+        let mut petition_mail = mail_to(&store, "melisandre");
+        petition_mail.sender_name = "ferris".into();
+        petition_mail.subject = "petition review".into();
+        petition_mail.body =
+            "Hi Melisandre,\nUnique petition P9 architecture review body\n— Ferris".into();
+        let petition_formatted = format_push_message(&petition_mail);
+
+        assert_eq!(
+            distinctive_payload_probe(&petition_formatted),
+            Some("Unique petition P9 architecture revi".to_string())
+        );
+        assert_eq!(
+            payload_probes(&petition_formatted),
+            vec![
+                "Hi Melisandre,".to_string(),
+                "Unique petition P9 architecture revi".to_string(),
+                "— Ferris".to_string(),
+            ]
+        );
+
+        // 2. When Muse is busy (composer empty `❯ `, paste not drawn yet) and scrollback already
+        // contains an earlier message with the same greeting and signature, `composer_visibly_submitted`
+        // returns `false` (does NOT confirm at poll 1 with 0 Enters) until the buffered paste renders
+        // into the composer and is submitted with its distinctive body line.
+        let busy_with_earlier_greeting = format!(
+            "❯ {earlier_formatted}\n◆ Running tool...\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0 · busy"
+        );
+        assert!(
+            !composer_visibly_submitted(&busy_with_earlier_greeting, &petition_formatted),
+            "generic greeting/signature in scrollback must not confirm a new multi-line mail"
+        );
+        let composer_with_buffered_petition = format!(
+            "❯ {earlier_formatted}\n◆ Ready.\n{rule}\n❯ {petition_formatted}\n{rule}\n  muse-wonder-full-1.0 · idle"
+        );
+        let submitted_petition_screen = format!(
+            "❯ {earlier_formatted}\n◆ Ready.\n❯ {petition_formatted}\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0 · busy"
+        );
+        let mut poll_step = 0u32;
+        let mut retry_enters = 0u32;
+        confirm_paste_submission(
+            &petition_formatted,
+            |_| {},
+            || {
+                poll_step += 1;
+                match poll_step {
+                    // Poll 1: Muse is busy, paste not drawn yet, earlier greeting/signature in scrollback.
+                    1 => Some(ScreenCapture::Rendered(busy_with_earlier_greeting.clone())),
+                    // Polls 2..=3: buffered paste draws into the composer; two consecutive polls trigger retry Enter.
+                    2 | 3 => Some(ScreenCapture::Rendered(
+                        composer_with_buffered_petition.clone(),
+                    )),
+                    // Poll 4: retry Enter submitted the petition into scrollback.
+                    _ => Some(ScreenCapture::Rendered(submitted_petition_screen.clone())),
+                }
+            },
+            || false,
+            || {
+                retry_enters += 1;
+                Ok(())
+            },
+        )
+        .expect("buffered multi-line mail must wait for composer draw, retry Enter, and confirm");
+        assert_eq!(
+            retry_enters, 1,
+            "busy screen with earlier greeting/signature must not confirm at poll 1 with 0 Enters"
+        );
+        assert_eq!(poll_step, 4);
+
+        // 3. Appended `runtime.user_intent.accepted` containing the shared greeting and signature
+        // ("Hi Melisandre,\nEarlier unrelated turn\n— Ferris") but NOT the distinctive probe must
+        // not confirm `MuseTranscriptTracker::confirmed`.
+        let tracker2 =
+            MuseTranscriptTracker::capture("muse:melisandre", Some("sid-mail-test"), true);
+        writeln!(
+            f,
+            "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":{:?}}}}}",
+            earlier_formatted
+        )
+        .unwrap();
+        assert!(
+            !tracker2.confirmed(&petition_formatted),
+            "accepted intent matching only greeting and signature must not confirm"
+        );
+        writeln!(
+            f,
+            "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":{:?}}}}}",
+            petition_formatted
+        )
+        .unwrap();
+        assert!(tracker2.confirmed(&petition_formatted));
     }
 
     #[test]
