@@ -15,6 +15,7 @@ import type {
   SpinUpSessionRequest,
   SpinUpSessionResponse,
 } from "../types/api";
+import { TEST_PROJECTS } from "./fixtures/testAgents";
 
 describe("SpinUpAgentModal", () => {
   it("renders all required inputs with defaults and submits spinUpSession payload", async () => {
@@ -35,7 +36,14 @@ describe("SpinUpAgentModal", () => {
     );
     const onClose = vi.fn();
 
-    render(<SpinUpAgentModal isOpen onClose={onClose} onSpinUp={onSpinUp} />);
+    render(
+      <SpinUpAgentModal
+        isOpen
+        onClose={onClose}
+        onSpinUp={onSpinUp}
+        projects={TEST_PROJECTS}
+      />,
+    );
 
     expect(screen.getByTestId("spin-up-agent-modal")).toBeInTheDocument();
 
@@ -409,6 +417,9 @@ describe("SpinUpAgentModal", () => {
           runtime_stopped: true,
         });
       }
+      if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
+      }
       return json({});
     });
 
@@ -482,6 +493,9 @@ describe("SpinUpAgentModal", () => {
           status: "running",
           hydration_dispatched: true,
         });
+      }
+      if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
       }
       return json({});
     });
@@ -589,6 +603,9 @@ describe("SpinUpAgentModal", () => {
             },
           ],
         });
+      }
+      if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
       }
       return json({});
     });
@@ -867,7 +884,10 @@ describe("SpinUpAgentModal", () => {
             hydration_status: spinUpHydrationStatus,
           });
         }
-        return json({});
+        if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
+      }
+      return json({});
       },
     );
 
@@ -987,6 +1007,9 @@ describe("SpinUpAgentModal", () => {
         return json({
           sessions: hostedSessionsResponse,
         });
+      }
+      if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
       }
       return json({});
     });
@@ -1197,7 +1220,10 @@ describe("SpinUpAgentModal", () => {
             hydration_status: "confirmed",
           });
         }
-        return json({});
+        if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
+      }
+      return json({});
       },
     );
 
@@ -1338,7 +1364,10 @@ describe("SpinUpAgentModal", () => {
             hydration_status: "confirmed",
           });
         }
-        return json({});
+        if (url.endsWith("/api/v1/projects")) {
+        return json({ projects: TEST_PROJECTS });
+      }
+      return json({});
       },
     );
 

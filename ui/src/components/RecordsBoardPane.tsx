@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
 import { formatCurrencyFromUsd, useActiveCurrency } from "../lib/currency";
-import { FALLBACK_PROJECTS } from "../hooks/useProjects";
 import type {
   ProjectRecordItem,
   ProjectSummary,
@@ -70,7 +69,7 @@ function computeSummaryFromRecords(
 
 export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   selectedProject,
-  projects = FALLBACK_PROJECTS,
+  projects = [],
   apiClient: providedClient,
 }) => {
   const apiClient = useMemo(

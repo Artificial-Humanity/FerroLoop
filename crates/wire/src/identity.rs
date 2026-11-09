@@ -2624,6 +2624,63 @@ struct MuseTranscript {
 const MUSE_MAX_TRANSCRIPTS: usize = 2000;
 const MUSE_MAX_DEPTH: usize = 5;
 
+/// Locate the transcript file on disk for a Muse session by explicit `session_id` or `persona`.
+///
+/// When a non-empty `session_id` is supplied, only an exact session-id match is returned; it does
+/// not fall back to the newest transcript for `persona`, which may belong to another session. The
+/// `persona` mtime fallback is used only when `session_id` is `None` or empty.
+pub(crate) fn find_muse_transcript_path(
+    home: &Path,
+    session_id: Option<&str>,
+    persona: Option<&str>,
+) -> Option<PathBuf> {
+    let mut dirs = vec![
+        home.join(".local")
+            .join("share")
+            .join("muse")
+            .join("sessions"),
+    ];
+    if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == home)
+        && let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+    {
+        let xdg_dir = PathBuf::from(xdg).join("muse").join("sessions");
+        if !dirs.contains(&xdg_dir) {
+            dirs.push(xdg_dir);
+        }
+    }
+    let mut transcripts: Vec<MuseTranscript> =
+        dirs.iter().flat_map(|dir| muse_transcripts(dir)).collect();
+    if transcripts.is_empty() {
+        return None;
+    }
+    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return transcripts
+            .iter()
+            .find(|t| {
+                t.dir_session_id.as_deref() == Some(sid)
+                    || t.stem == sid
+                    || extract_session_id_and_cwd(&t.path, &t.stem).0 == sid
+            })
+            .map(|t| t.path.clone());
+    }
+    if let Some(norm_persona) = persona.and_then(normalize_persona) {
+        transcripts.sort_by_key(|t| std::cmp::Reverse(mtime_ms(&t.path)));
+        if let Some(found) = transcripts.iter().find(|t| {
+            t.dir_session_id
+                .as_deref()
+                .and_then(normalize_persona)
+                .as_deref()
+                == Some(norm_persona.as_str())
+                || normalize_persona(&t.stem).as_deref() == Some(norm_persona.as_str())
+                || scan_muse_transcript_for_persona(&t.path, 50).as_deref()
+                    == Some(norm_persona.as_str())
+        }) {
+            return Some(found.path.clone());
+        }
+    }
+    None
+}
+
 /// Muse transcripts under `sessions_dir`, newest names first: the flat `<id>.jsonl` form and the
 /// nested `YYYY/MM/DD/<id>/session.jsonl` form. Symlinks are not followed, dot-directories
 /// (`.msp-view-*`) and anything below a `subagent` directory are skipped, and the scan is bounded

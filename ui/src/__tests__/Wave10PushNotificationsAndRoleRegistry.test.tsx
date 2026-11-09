@@ -11,6 +11,7 @@ import {
   DEFAULT_OPERATOR_PUSH_STATE,
   SettingsModal,
 } from "../components/SettingsModal";
+import { TEST_PROJECTS, TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 afterEach(() => {
   cleanup();
@@ -25,7 +26,13 @@ describe("Wave 10 Item 1 (Record #67): FerroDeck+ Operator Push Notifications UI
     expect(DEFAULT_OPERATOR_PUSH_STATE.fcm_android_status).toBe("active");
 
     render(
-      <SettingsModal isOpen={true} onClose={() => {}} initialTab="system" />,
+      <SettingsModal
+        isOpen={true}
+        onClose={() => {}}
+        initialTab="system"
+        projects={TEST_PROJECTS}
+        agents={TEST_WORKSPACE_AGENTS}
+      />,
     );
 
     expect(screen.getByTestId("operator-push-notifications-card")).toBeTruthy();
