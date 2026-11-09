@@ -22,7 +22,10 @@ use fl_core::state::{
 use fl_core::store::{AgentRegistry, Catalog, StateStore, StoreError};
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
 use fl_exec::stamp;
-use fl_wire::dispatcher::{PushError, push_operator_prompt_to_route};
+use fl_wire::dispatcher::{
+    OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome, PushError,
+    push_operator_prompt_with_intent,
+};
 use fl_wire::identity::{
     RouteTable, VendorRoute, default_routes_path, is_native_session_id, legacy_routes_path,
 };
@@ -1979,6 +1982,27 @@ impl SpinUpRequest {
     }
 }
 
+/// Acceptance evidence for the current hydration submission, independent of runtime liveness.
+/// Confirmation means acceptance of this submission, not completion of hydration.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HydrationStatus {
+    Confirmed,
+    #[default]
+    Unconfirmed,
+    Failed,
+}
+
+impl std::fmt::Display for HydrationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Confirmed => "confirmed",
+            Self::Unconfirmed => "unconfirmed",
+            Self::Failed => "failed",
+        })
+    }
+}
+
 /// `POST /api/v1/sessions/spin-up` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpinUpResponse {
@@ -1995,7 +2019,10 @@ pub struct SpinUpResponse {
     pub hosted: bool,
     pub status: String,
     pub tmux_target: Option<String>,
+    /// Whether the prompt was handed to the vendor; this is not acceptance evidence.
     pub hydration_dispatched: bool,
+    #[serde(default)]
+    pub hydration_status: HydrationStatus,
     pub prompt: Option<String>,
     /// The context window recorded for the session, in tokens, when one was chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2043,7 +2070,10 @@ pub struct HostedSessionRecord {
     /// before the field existed deserialize to `auto`.
     #[serde(default)]
     pub posture: fl_core::permissions::Posture,
+    /// Whether the prompt was handed to the vendor; this is not acceptance evidence.
     pub hydration_dispatched: bool,
+    #[serde(default)]
+    pub hydration_status: HydrationStatus,
     /// Whether this lifecycle created the tmux session. Teardown of a runtime it created
     /// uses [`SessionRuntime::kill`]. An owner teardown of one it did not create still
     /// stops the persona's tmux unit ([`SessionRuntime::kill_owner`]).
@@ -3381,20 +3411,61 @@ pub(crate) fn dispatch_once<T>(
     Some(send(&route))
 }
 
-/// Best-effort delivery of `prompt` to a live route for the session; `true` when delivered.
+/// Preserve the handoff result separately from evidence of acceptance.
+struct HydrationOutcome {
+    dispatched: bool,
+    status: HydrationStatus,
+}
+
+impl HydrationOutcome {
+    fn from_launch(survived: bool) -> Self {
+        Self {
+            dispatched: survived,
+            status: if survived {
+                HydrationStatus::Unconfirmed
+            } else {
+                HydrationStatus::Failed
+            },
+        }
+    }
+
+    fn from_delivery(delivery: Option<Result<OperatorPromptOutcome, PushError>>) -> Self {
+        let dispatched = matches!(&delivery, Some(Ok(_)));
+        let status = match delivery {
+            Some(Ok(OperatorPromptOutcome::AppServerAccepted { .. })) => HydrationStatus::Confirmed,
+            Some(Ok(
+                OperatorPromptOutcome::VendorQueued
+                | OperatorPromptOutcome::TransportAccepted
+                | OperatorPromptOutcome::CompactionAccepted,
+            ))
+            | Some(Err(PushError::Failed(_))) => HydrationStatus::Unconfirmed,
+            None | Some(Err(PushError::NotConnected(_))) => HydrationStatus::Failed,
+        };
+        Self { dispatched, status }
+    }
+}
+
+/// Best-effort ordinary delivery. Only proven non-delivery permits rediscovery and retry.
 fn deliver_prompt(
     env: &LifecycleEnv<'_>,
     persona: &str,
     session_id: &str,
     by: &str,
     prompt: &str,
-) -> bool {
-    dispatch_with_rediscovery(
+) -> HydrationOutcome {
+    HydrationOutcome::from_delivery(dispatch_with_rediscovery_typed(
         env.home_override,
         RouteQuery::persona(persona, session_id),
-        |route| push_operator_prompt_to_route(route, by, prompt),
-    )
-    .is_some_and(|delivered| delivered.is_ok())
+        |route| {
+            push_operator_prompt_with_intent(route, by, prompt, OperatorPromptIntent::Ordinary)
+                .map_err(|error| match error {
+                    OperatorPromptError::Push(error) => error,
+                    // Ordinary delivery does not steer. If it ever returns such an error,
+                    // conservatively treat it as ambiguous and never retry another route.
+                    OperatorPromptError::Steer(error) => PushError::Failed(error.to_string()),
+                })
+        },
+    ))
 }
 
 /// Route-table files a teardown prunes: the override, or the default and legacy paths.
@@ -3632,6 +3703,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         context_window: v.context_window,
         posture: v.posture,
         hydration_dispatched: false,
+        hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
         tombstone_ids: Vec::new(),
         vendor_session_id,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
@@ -3671,19 +3743,19 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     if spawned && let Some(target) = tmux_target.as_deref() {
         apply_startup_prompt_rules(env.runtime, &v.vendor, target);
     }
-    // A runtime launched with the prompt as its first input has the prompt already, provided the
-    // command stayed up: one that exited at once took its session with it, and there is nothing
-    // to deliver to.
+    // Argv handed the prompt to the vendor, but survival does not prove acceptance.
+    // A command that exited at once took its session with it: nothing to deliver to.
     let launched = spawned && launch.is_some();
     let survived = !launched || launch_survived(env, &unit, &session_id);
     let spawned = spawned && survived;
-    let hydration_dispatched = if launched {
-        survived
+    let hydration = if launched {
+        HydrationOutcome::from_launch(survived)
     } else {
         deliver_prompt(env, &v.persona, &session_id, by, &prompt)
     };
     record.runtime_spawned = (record.runtime_spawned || spawned) && survived;
-    record.hydration_dispatched = hydration_dispatched;
+    record.hydration_dispatched = hydration.dispatched;
+    record.hydration_status = hydration.status;
     record.updated_at_ms = now_ms();
     // A runtime may have started: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
@@ -3709,7 +3781,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
         tmux_target,
-        hydration_dispatched,
+        hydration_dispatched: hydration.dispatched,
+        hydration_status: hydration.status,
         prompt: Some(prompt),
         context_window: v.context_window,
         posture: v.posture,
@@ -3897,6 +3970,7 @@ fn record_for_target<S: AgentRegistry>(
         context_window: None,
         posture: fl_core::permissions::Posture::Auto,
         hydration_dispatched: false,
+        hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
@@ -3948,7 +4022,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
         &reforge_role_label(&agent_role_from_label(&role)),
     );
     let handshake_dispatched =
-        deliver_prompt(env, &target.persona, &target.session_id, by, &prompt);
+        deliver_prompt(env, &target.persona, &target.session_id, by, &prompt).dispatched;
 
     let now = now_ms();
     let mut record = record_for_target(store, target)?;
@@ -5067,16 +5141,17 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
             record.runtime_spawned = false;
         } else {
             record.runtime_spawned = true;
-            // A runtime launched with the prompt as its first input has the prompt already.
+            // Argv already handed off the prompt; acceptance remains unconfirmed.
             launched_with_prompt = launch.is_some();
         }
     }
-    record.hydration_dispatched = if launch_died {
-        false
+    let hydration = if launch_died || launched_with_prompt {
+        HydrationOutcome::from_launch(!launch_died)
     } else {
-        launched_with_prompt
-            || deliver_prompt(env, &record.persona, &record.session_id, by, &prompt)
+        deliver_prompt(env, &record.persona, &record.session_id, by, &prompt)
     };
+    record.hydration_dispatched = hydration.dispatched;
+    record.hydration_status = hydration.status;
     // A runtime may have reopened: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
@@ -5163,7 +5238,10 @@ pub struct RemodelResponse {
     /// `prepare`: whether a live route took the handoff prompt.
     pub handshake_dispatched: bool,
     /// `execute`: whether a live route took the new session's reforge prompt.
+    /// Whether the prompt was handed to the vendor; this is not acceptance evidence.
     pub hydration_dispatched: bool,
+    #[serde(default)]
+    pub hydration_status: HydrationStatus,
     /// `execute`: whether the old session's runtime is gone.
     pub runtime_stopped: bool,
     pub tmux_target: Option<String>,
@@ -5691,6 +5769,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
             status: out.status,
             handshake_dispatched: out.handshake_dispatched,
             hydration_dispatched: false,
+            hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
             runtime_stopped: false,
             tmux_target: target.hosted.as_ref().and_then(|r| r.tmux_target.clone()),
             prompt: out.prompt,
@@ -5763,6 +5842,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
                 status: out.status,
                 handshake_dispatched: false,
                 hydration_dispatched: out.hydration_dispatched,
+                hydration_status: out.hydration_status,
                 runtime_stopped: torn.runtime_stopped,
                 tmux_target: out.tmux_target,
                 prompt: out.prompt,
@@ -6582,6 +6662,255 @@ mod tests {
         assert_eq!(
             hosted_session_slug("claude:ada"),
             "hosted-session-claude-ada"
+        );
+    }
+
+    #[test]
+    fn hydration_status_typed_evidence_and_ambiguous_failures_do_not_resend() {
+        use fl_wire::dispatcher::OperatorPromptOutcome;
+        let cases = [
+            (
+                Ok(OperatorPromptOutcome::AppServerAccepted {
+                    turn_id: "accepted-turn".into(),
+                }),
+                true,
+                "confirmed",
+            ),
+            (Ok(OperatorPromptOutcome::VendorQueued), true, "unconfirmed"),
+            (
+                Ok(OperatorPromptOutcome::TransportAccepted),
+                true,
+                "unconfirmed",
+            ),
+            (
+                Ok(OperatorPromptOutcome::CompactionAccepted),
+                true,
+                "unconfirmed",
+            ),
+            (
+                Err(PushError::Failed("timeout after write".into())),
+                false,
+                "unconfirmed",
+            ),
+            (
+                Err(PushError::NotConnected("refused before write".into())),
+                false,
+                "failed",
+            ),
+        ];
+        for (delivery, dispatched, status) in cases {
+            let home = TempDir::new().unwrap();
+            webhook_route_file(home.path(), "ada");
+            let _listener =
+                std::os::unix::net::UnixListener::bind(home.path().join("none.sock")).unwrap();
+            crate::discovery::note_route_file_scan(Some(home.path()), Instant::now());
+            let mut sends = 0;
+            let result = dispatch_with_rediscovery_typed(
+                Some(home.path()),
+                RouteQuery::persona("ada", "claude:ada"),
+                |_| {
+                    sends += 1;
+                    delivery.clone()
+                },
+            );
+            let outcome = HydrationOutcome::from_delivery(result);
+            assert_eq!(outcome.dispatched, dispatched);
+            assert_eq!(serde_json::to_value(outcome.status).unwrap(), status);
+            assert_eq!(
+                sends, 1,
+                "accepted or ambiguous input must not be sent again"
+            );
+        }
+        let missing = HydrationOutcome::from_delivery(None);
+        assert!(!missing.dispatched);
+        assert_eq!(serde_json::to_value(missing.status).unwrap(), "failed");
+    }
+
+    #[test]
+    fn hydration_status_webhook_transport_is_unconfirmed_and_no_route_is_failed() {
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let missing = deliver_prompt(&env, "ada", "claude:ada", "owner", "hydrate once");
+        assert!(!missing.dispatched);
+        assert_eq!(serde_json::to_value(missing.status).unwrap(), "failed");
+        webhook_route_file(home.path(), "ada");
+        let listener =
+            std::os::unix::net::UnixListener::bind(home.path().join("none.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        crate::discovery::note_route_file_scan(Some(home.path()), Instant::now());
+        let sent = deliver_prompt(&env, "ada", "claude:ada", "owner", "hydrate once");
+        assert!(sent.dispatched);
+        assert_eq!(serde_json::to_value(sent.status).unwrap(), "unconfirmed");
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut body).unwrap();
+        assert!(body.contains("hydrate once"));
+        assert_eq!(body.lines().count(), 1);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    // Hydration acceptance is independent of the legacy handoff boolean.
+    #[test]
+    fn hydration_status_legacy_default_and_record_round_trip() {
+        for dispatched in [false, true] {
+            let mut json =
+                serde_json::to_value(hosted_record("claude", "ada", "running", false)).unwrap();
+            json["hydration_dispatched"] = dispatched.into();
+            json.as_object_mut().unwrap().remove("hydration_status");
+            let record: HostedSessionRecord = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(record).unwrap()["hydration_status"],
+                "unconfirmed"
+            );
+            for status in ["confirmed", "unconfirmed", "failed"] {
+                json["hydration_status"] = status.into();
+                let record: HostedSessionRecord = serde_json::from_value(json.clone()).unwrap();
+                let encoded = serde_json::to_value(record).unwrap();
+                assert_eq!(encoded["hydration_status"], status);
+                assert_eq!(encoded["hydration_dispatched"], dispatched);
+            }
+        }
+    }
+
+    #[test]
+    fn hydration_status_responses_default_legacy_values_and_round_trip() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let target = SessionTarget::resolve(&store, "ada", None).unwrap();
+        let remodeled = remodel_session(
+            &store,
+            &env,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        for (mut json, spin_response) in [
+            (serde_json::to_value(spun).unwrap(), true),
+            (serde_json::to_value(remodeled).unwrap(), false),
+        ] {
+            json["hydration_dispatched"] = true.into();
+            json.as_object_mut().unwrap().remove("hydration_status");
+            for status in [None, Some("confirmed"), Some("unconfirmed"), Some("failed")] {
+                if let Some(status) = status {
+                    json["hydration_status"] = status.into();
+                }
+                let encoded = if spin_response {
+                    serde_json::to_value(
+                        serde_json::from_value::<SpinUpResponse>(json.clone()).unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::to_value(
+                        serde_json::from_value::<RemodelResponse>(json.clone()).unwrap(),
+                    )
+                    .unwrap()
+                };
+                assert_eq!(encoded["hydration_status"], status.unwrap_or("unconfirmed"));
+            }
+        }
+    }
+
+    #[test]
+    fn hydration_status_restart_and_remodel_replace_previous_confirmation() {
+        for (hosted, spawn) in [(true, true), (true, false), (false, false)] {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let runtime = FakeRuntime::default();
+            let mut env = env(&home);
+            env.runtime = &runtime;
+            let mut request = req("ada", "assistant", "claude");
+            request.hosted = Some(hosted);
+            spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            let confirm_previous = || {
+                let record = find_hosted_session(&store, &["ada"]).unwrap().unwrap();
+                let mut json = serde_json::to_value(record).unwrap();
+                json["hydration_status"] = "confirmed".into();
+                json["hydration_dispatched"] = true.into();
+                persist_hosted_session(&store, &serde_json::from_value(json).unwrap(), "owner")
+                    .unwrap();
+            };
+            confirm_previous();
+            env.spawn_runtime = spawn;
+            let restarted = restart_hosted_session(&store, &env, "ada", "owner").unwrap();
+            let expected = if spawn { "unconfirmed" } else { "failed" };
+            assert_eq!(
+                serde_json::to_value(&restarted).unwrap()["hydration_status"],
+                expected
+            );
+            assert_eq!(restarted.record.hydration_dispatched, spawn);
+            confirm_previous();
+            let target = SessionTarget::resolve(&store, "ada", None).unwrap();
+            let remodeled = remodel_session(
+                &store,
+                &env,
+                &target,
+                &RemodelRequest {
+                    vendor: "muse".into(),
+                    ..Default::default()
+                },
+                "owner",
+                Caller::Owner,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&remodeled).unwrap()["hydration_status"],
+                expected
+            );
+            assert_eq!(remodeled.hydration_dispatched, spawn);
+            let record = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(record).unwrap()["hydration_status"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn hydration_status_immediate_exit_is_failed_on_spin_and_restart() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let runtime = FakeRuntime::default();
+        runtime.vanish_windows.borrow_mut().push("claude".into());
+        let mut env = env(&home);
+        env.runtime = &runtime;
+        env.spawn_runtime = true;
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(!spun.hydration_dispatched);
+        assert_eq!(
+            serde_json::to_value(spun).unwrap()["hydration_status"],
+            "failed"
+        );
+        let restarted = restart_hosted_session(&store, &env, "ada", "owner").unwrap();
+        assert!(!restarted.record.hydration_dispatched);
+        assert_eq!(
+            serde_json::to_value(restarted).unwrap()["hydration_status"],
+            "failed"
         );
     }
 
@@ -9176,6 +9505,7 @@ mod tests {
             cwd: None,
             context_window: None,
             hydration_dispatched: false,
+            hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
             runtime_spawned: spawned,
             tombstone_ids: Vec::new(),
             vendor_session_id: None,

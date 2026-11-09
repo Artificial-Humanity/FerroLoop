@@ -1272,6 +1272,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             cwd: None,
             context_window: None,
             hydration_dispatched: false,
+            hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
             runtime_spawned: false,
             tombstone_ids: vec![native_id.into()],
             vendor_session_id: None,
