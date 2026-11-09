@@ -1,0 +1,55 @@
+// FerroStore architecture model: element and relationship kinds.
+// Evidence for every element and relationship is in README.md beside this file.
+
+specification {
+  element actor {
+    style {
+      shape person
+    }
+  }
+  element system
+  element service {
+    style {
+      shape rectangle
+    }
+  }
+  element caller {
+    style {
+      shape rectangle
+      color secondary
+    }
+  }
+  element module {
+    style {
+      shape component
+      color muted
+    }
+  }
+  element storefile {
+    style {
+      shape storage
+      color amber
+    }
+  }
+
+  relationship embedded {
+    line solid
+    head normal
+  }
+  relationship socket {
+    line dashed
+    head normal
+  }
+  relationship uses {
+    line dotted
+    head open
+  }
+
+  tag served
+  tag unserved
+  tag derived
+  tag legacy
+  tag gap
+  tag today
+  tag target
+}
