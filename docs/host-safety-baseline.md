@@ -50,9 +50,14 @@ slower consumer can still be shed.
 
 The shared 4096-record / 8 MiB limit takes priority over grace. Capacity pressure
 ends affected subscribers' graces immediately; held references stay charged
-until released, and bytes nobody wrote remain retained. Publication does not
-wait for subscriber progress. A shed viewer gets a best-effort `SlowSubscriber`
-notice and disconnect; it does not receive a fabricated complete stream. Notice
+until released, and bytes nobody wrote remain retained. Pressure from one session
+can end an unfiltered subscriber's grace, even when it also follows other sessions.
+The existing LegacyPipe producer pacing remains: each record yields for at most
+20 ms while a subscriber is backlogged, without holding fanout/order locks or
+waiting on socket I/O. Grace applies in addition to this bounded pacing; there is
+no unbounded subscriber wait. A shed viewer gets a best-effort `SlowSubscriber`
+notice and disconnect; the notice can be its first frame, and it does not receive
+a fabricated complete stream. Notice
 and data writes share an absolute cutoff of grace expiry plus the existing
 five-second transport timeout (or pressure-triggered shedding plus that timeout).
 Fragmentation and the notice cannot restart this allowance. Terminal-slot
@@ -61,8 +66,10 @@ unchanged.
 
 Injected-clock module tests cover burst reconstruction, nonrenewing episodes,
 expiry without another publication, both capacity limits, multiple subscribers,
-and the notice/fragment disconnect cutoff. The original unattended flood
-subprocess regression remains unchanged.
+and the notice/fragment disconnect cutoff, including expiry during the final write
+with an empty queue. A deterministic reader-like 16,384-record flood verifies that
+bounded pacing preserves a slower draining subscriber's exact sequence. The
+original unattended flood subprocess regression remains unchanged.
 
 ## Build identity and device truth
 
