@@ -717,7 +717,6 @@ export function getInitialConsoleLayoutMode(): SystemConsoleLayoutMode {
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
-  DEFAULT_WORKSPACE_AGENTS,
   type AutoApproval,
   type RoleRecord,
   type RoleReviewPolicy,
@@ -738,7 +737,6 @@ import {
 } from "../types/api";
 import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import {
-  FALLBACK_PROJECTS,
   findProject,
   projectChoices,
   projectLabel,
@@ -869,10 +867,7 @@ export const ATTACHMENT_RETENTION_OPTIONS = [
   { value: 0, label: "Never (0)" },
 ] as const;
 
-const DEFAULT_PROJECT_OPTIONS: readonly string[] = [
-  ...projectLabels(FALLBACK_PROJECTS),
-  WORKSPACE_PROJECT,
-];
+const DEFAULT_PROJECT_OPTIONS: readonly string[] = [WORKSPACE_PROJECT];
 
 /** The option strings a project list gives the filter and the project dropdowns. */
 function projectOptionLabels(projects: readonly ProjectSummary[]): string[] {
@@ -1328,7 +1323,7 @@ export async function executeScopedBulkSessionAction(
       ? selectedAgentKeys
       : fallbackAgentKeys && fallbackAgentKeys.length > 0
         ? fallbackAgentKeys
-        : DEFAULT_WORKSPACE_AGENTS.map((a) => a.name_key.toLowerCase());
+        : [];
   const results = await Promise.all(
     targetKeys.map(async (sessionId) => {
       try {
@@ -1419,7 +1414,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onLogout,
   onAgentsUpdated,
   onProjectsChanged,
-  projects: sharedProjects = FALLBACK_PROJECTS,
+  projects: sharedProjects = [],
   projectsFromHub = false,
   refreshProjects,
   projectsError,
@@ -1638,7 +1633,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   // Agents Fleet & Re-Cast state
   const [loadedAgents, setLoadedAgents] = useState<AgentRecord[]>(
-    propAgents && propAgents.length > 0 ? propAgents : DEFAULT_WORKSPACE_AGENTS,
+    propAgents ?? [],
   );
   const [recastDrafts, setRecastDrafts] = useState<
     Record<string, { project: string; role: string }>
@@ -1687,7 +1682,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     useState<BulkSessionActionResponse | null>(null);
 
   useEffect(() => {
-    if (propAgents && propAgents.length > 0) {
+    if (propAgents) {
       setLoadedAgents(propAgents);
     }
   }, [propAgents]);
@@ -1832,12 +1827,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     client
       .getAgents()
       .then((res) => {
-        if (!cancelled && Array.isArray(res?.agents) && res.agents.length > 0) {
+        if (!cancelled && Array.isArray(res?.agents)) {
           setLoadedAgents(res.agents);
         }
       })
       .catch(() => {
-        // Keep current loadedAgents / DEFAULT_WORKSPACE_AGENTS
+        // Keep current loadedAgents
       });
 
     client
@@ -1994,7 +1989,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         ? loadedAgents
         : propAgents && propAgents.length > 0
           ? propAgents
-          : DEFAULT_WORKSPACE_AGENTS;
+          : [];
     const seen = new Set<string>();
     const out: AgentRecord[] = [];
     for (const ag of base) {

@@ -76,7 +76,6 @@ import {
   type ThemeMode,
 } from "./lib/accessibility";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   normalizeHydrationStatus,
   normalizeHydrationWarnings,
   type AgentLivenessItem,
@@ -492,6 +491,9 @@ export function transcriptPollIntervalMs(isSessionBusy: boolean): number {
   return isSessionBusy ? 2_000 : 3_500;
 }
 
+/** Background roster and liveness poll cadence while authenticated. */
+export const ROSTER_POLL_INTERVAL_MS = 12_000;
+
 export const LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY =
   "ferrodeck.last_seen_assistant_turn";
 
@@ -640,6 +642,7 @@ export const App: React.FC<AppProps> = ({
     error: projectsError,
     projectManagement,
     refresh: refreshProjects,
+    clear: clearProjects,
   } = useProjects(apiClient);
   const wsClientRef = useRef<HubWsClient | null>(null);
   if (!wsClientRef.current) {
@@ -1135,7 +1138,7 @@ export const App: React.FC<AppProps> = ({
   }, []);
 
   // Data State
-  const [agents, setAgents] = useState<AgentRecord[]>(DEFAULT_WORKSPACE_AGENTS);
+  const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [routes, setRoutes] = useState<DiscoveredSessionSummary[]>([]);
   const [liveness, setLiveness] = useState<AgentLivenessItem[]>([]);
   const [sessions, setSessions] = useState<DiscoveredSessionSummary[]>([]);
@@ -1541,18 +1544,44 @@ export const App: React.FC<AppProps> = ({
     [splitView, secondaryTab, navigatePhone],
   );
 
+  const refreshRosterAndLiveness = useCallback(async () => {
+    if (loggedOutRef.current || !mountedRef.current) return;
+    try {
+      const [agentsRes, livenessRes] = await Promise.all([
+        apiClient.getAgents().catch(() => null),
+        apiClient.getAgentsLiveness().catch(() => null),
+      ]);
+      if (!mountedRef.current || loggedOutRef.current) return;
+      if (agentsRes) {
+        if (Array.isArray(agentsRes.agents)) {
+          setAgents(agentsRes.agents);
+        }
+        if (Array.isArray(agentsRes.routes)) {
+          setRoutes(agentsRes.routes);
+        }
+      }
+      if (livenessRes?.liveness) {
+        setLiveness(livenessRes.liveness);
+      }
+    } catch {
+      // Ignore background refresh errors
+    }
+  }, [apiClient]);
+
   const refreshWireAndRoster = useCallback(async () => {
+    if (loggedOutRef.current || !mountedRef.current) return;
     try {
       const [agentsRes, livenessRes, wireRes] = await Promise.all([
         apiClient.getAgents().catch(() => null),
         apiClient.getAgentsLiveness().catch(() => null),
         apiClient.getWireMessages().catch(() => null),
       ]);
+      if (!mountedRef.current || loggedOutRef.current) return;
       if (agentsRes) {
-        if (agentsRes.agents && agentsRes.agents.length > 0) {
+        if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
-        if (agentsRes.routes) {
+        if (Array.isArray(agentsRes.routes)) {
           setRoutes(agentsRes.routes);
         }
       }
@@ -1721,6 +1750,15 @@ export const App: React.FC<AppProps> = ({
     setLoading(true);
     void refreshHostedSessions();
     try {
+      let sawUnauthorized = false;
+      const catchRosterErr = <T,>(p: Promise<T>): Promise<T | null> =>
+        p.catch((err) => {
+          if (err instanceof HubApiError && err.status === 401) {
+            sawUnauthorized = true;
+          }
+          return null;
+        });
+
       const [
         agentsRes,
         livenessRes,
@@ -1735,9 +1773,9 @@ export const App: React.FC<AppProps> = ({
         nodesRes,
         settingsRes,
       ] = await Promise.all([
-        apiClient.getAgents().catch(() => null),
-        apiClient.getAgentsLiveness().catch(() => null),
-        apiClient.getSessions().catch(() => null),
+        catchRosterErr(apiClient.getAgents()),
+        catchRosterErr(apiClient.getAgentsLiveness()),
+        catchRosterErr(apiClient.getSessions()),
         apiClient.getWorktrees().catch(() => null),
         apiClient.getPrs().catch(() => null),
         apiClient.getWireMessages().catch(() => null),
@@ -1747,9 +1785,20 @@ export const App: React.FC<AppProps> = ({
         apiClient.getStats().catch(() => null),
         apiClient.fetchNodes().catch(() => null),
         apiClient.getSettings().catch(() => null),
+        refreshProjects().catch(() => null),
       ]);
 
       if (!mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(initialOwner, ownerRef.current)) return;
+
+      if (sawUnauthorized && !agentsRes && !livenessRes && !sessionsRes) {
+        setAuthority(null);
+        setPairingOpen(true);
+        setAgents([]);
+        setRoutes([]);
+        setLiveness([]);
+        setSessions([]);
+      }
+
       if (settingsRes?.timezone) {
         setActiveTimeZone(settingsRes.timezone);
       }
@@ -1759,10 +1808,10 @@ export const App: React.FC<AppProps> = ({
       }
 
       if (agentsRes) {
-        if (agentsRes.agents && agentsRes.agents.length > 0) {
+        if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
-        if (agentsRes.routes) {
+        if (Array.isArray(agentsRes.routes)) {
           setRoutes(agentsRes.routes);
         }
       }
@@ -1811,7 +1860,7 @@ export const App: React.FC<AppProps> = ({
     } finally {
       if (mountedRef.current && initialOwner.authEpoch === ownerRef.current.authEpoch) setLoading(false);
     }
-  }, [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection, refreshHostedSessions]);
+  }, [apiClient, refreshProjects, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection, refreshHostedSessions]);
 
   // Startup URL pairing check + Auth session check + initial load
   useEffect(() => {
@@ -2139,18 +2188,83 @@ export const App: React.FC<AppProps> = ({
   }, [apiClient, selectedWorktreeId]);
 
   // Compute active agent and session
-  const selectedAgent = useMemo(() => {
+  const selectedAgent = useMemo<AgentRecord | null>(() => {
     const key = selectedAgentName.trim().toLowerCase();
     if (!key) {
       return null;
     }
-    return (
-      agents.find((a) => a.name_key.toLowerCase() === key) ??
-      DEFAULT_WORKSPACE_AGENTS.find((a) => a.name_key.toLowerCase() === key) ??
-      agents[0] ??
-      null
+    const fromAgents = agents.find((a) => a.name_key.toLowerCase() === key);
+    if (fromAgents) return fromAgents;
+
+    const fromLiveness = liveness.find(
+      (item) => item.agent.trim().toLowerCase() === key,
     );
-  }, [agents, selectedAgentName]);
+    if (fromLiveness) {
+      return {
+        id: `urn:fl:agent:${key}`,
+        name_key: key,
+        display_name:
+          fromLiveness.agent.toLowerCase() === "jarvis"
+            ? "JARVIS"
+            : fromLiveness.agent === fromLiveness.agent.toLowerCase()
+              ? fromLiveness.agent.charAt(0).toUpperCase() +
+                fromLiveness.agent.slice(1)
+              : fromLiveness.agent,
+        project: fromLiveness.project || "Workspace",
+        role: fromLiveness.role || "assistant",
+        status: "active",
+      };
+    }
+
+    const fromSession =
+      sessions.find((s) => (s.persona ?? "").trim().toLowerCase() === key) ??
+      routes.find((r) => (r.persona ?? "").trim().toLowerCase() === key);
+    if (fromSession) {
+      const rawPersona = (fromSession.persona ?? key).trim();
+      const explicitProject = (
+        (fromSession as { project?: string | null }).project ?? ""
+      ).trim();
+      const cwd = (fromSession.cwd ?? "").trim().replace(/\/+$/, "");
+      const cwdProject = cwd ? (cwd.split("/").filter(Boolean).pop() ?? "") : "";
+      return {
+        id: `urn:fl:agent:${key}`,
+        name_key: key,
+        display_name:
+          rawPersona.toLowerCase() === "jarvis"
+            ? "JARVIS"
+            : rawPersona === rawPersona.toLowerCase()
+              ? rawPersona.charAt(0).toUpperCase() + rawPersona.slice(1)
+              : rawPersona,
+        project: explicitProject || cwdProject || "Workspace",
+        role:
+          ((fromSession as { role?: string | null }).role ?? "").trim() ||
+          "assistant",
+        status: "active",
+      };
+    }
+
+    if (agents.length > 0) {
+      return agents[0];
+    }
+
+    if (!authority && pairingOpen) {
+      return null;
+    }
+
+    return {
+      id: `urn:fl:agent:${key}`,
+      name_key: key,
+      display_name:
+        key === "jarvis"
+          ? "JARVIS"
+          : selectedAgentName.trim() === key
+            ? key.charAt(0).toUpperCase() + key.slice(1)
+            : selectedAgentName.trim(),
+      project: key === "jarvis" ? "Workspace" : "FerroLoop",
+      role: "assistant",
+      status: "active",
+    };
+  }, [agents, liveness, sessions, routes, selectedAgentName, authority, pairingOpen]);
 
   const [spunUpByAgent, setSpunUpByAgent] = useState<
     Record<
@@ -2324,7 +2438,22 @@ export const App: React.FC<AppProps> = ({
     return () => clearInterval(intervalId);
   }, [authority, activeTab, splitView, isSessionBusy, refreshSessionsAndTranscript]);
 
-  // Re-fetch /api/v1/sessions and active transcript when returning focus or visibility
+  // Periodically poll /api/v1/agents and /api/v1/agents/liveness while authenticated
+  // so roster membership and liveness stay fresh even without WebSocket wire events.
+  useEffect(() => {
+    if (!authority || pairingOpen) {
+      return;
+    }
+    const intervalId = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
+      void refreshRosterAndLiveness();
+    }, ROSTER_POLL_INTERVAL_MS);
+    return () => clearInterval(intervalId);
+  }, [authority, pairingOpen, refreshRosterAndLiveness]);
+
+  // Re-fetch /api/v1/sessions, roster, liveness, and active transcript when returning focus or visibility
   // to FerroDeck (e.g. after changing model in a vendor CLI or the Claude app).
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2332,10 +2461,12 @@ export const App: React.FC<AppProps> = ({
     }
     const handleWindowFocus = () => {
       void refreshSessionsAndTranscript();
+      void refreshRosterAndLiveness();
     };
     const handleVisibilityChange = () => {
       if (typeof document !== "undefined" && !document.hidden) {
         void refreshSessionsAndTranscript();
+        void refreshRosterAndLiveness();
       }
     };
     window.addEventListener("focus", handleWindowFocus);
@@ -2348,7 +2479,7 @@ export const App: React.FC<AppProps> = ({
         document.removeEventListener("visibilitychange", handleVisibilityChange);
       }
     };
-  }, [refreshSessionsAndTranscript]);
+  }, [refreshSessionsAndTranscript, refreshRosterAndLiveness]);
 
   // Transcripts keyed by owning agent (background scans + recorded active
   // loads). Keying by owner avoids crediting one agent with another's turns
@@ -2454,9 +2585,11 @@ export const App: React.FC<AppProps> = ({
     setUnconfirmedBySession({});
     setSessionContextUsage(null);
     setSessionQuotaUsage(null);
+    setAgents([]);
     setSessions([]);
     setRoutes([]);
     setLiveness([]);
+    clearProjects();
     setWireMessages([]);
     setWorktrees([]);
     setWorktreeDiff(null);
@@ -3447,6 +3580,8 @@ export const App: React.FC<AppProps> = ({
     <RosterSidebar
       projects={projects}
       showEmptyProjects={projectsFromHub}
+      loading={loading}
+      signedOut={!authority && pairingOpen}
       agents={agents}
       routes={mergedRoutes}
       sessions={sessions}

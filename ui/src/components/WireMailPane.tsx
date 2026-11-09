@@ -7,7 +7,6 @@ export { DEFAULT_ROUTED_CI_PR_EVENTS, type RoutedCiPrFeedbackEvent };
 import type { HubApiClient } from "../api/client";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   type AgentRecord,
   type CommitteeVoteVerdict,
   type WireCommitteeMetadata,
@@ -298,10 +297,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   const [localAckedIds, setLocalAckedIds] = useState<Set<string>>(() => new Set());
 
   // Compose Form State
-  const effectiveAgents = useMemo(
-    () => (agents && agents.length > 0 ? agents : DEFAULT_WORKSPACE_AGENTS),
-    [agents],
-  );
+  const effectiveAgents = useMemo(() => agents ?? [], [agents]);
   const [toRecipient, setToRecipient] = useState<string>(
     selectedAgentName?.trim().toLowerCase() || "jarvis",
   );

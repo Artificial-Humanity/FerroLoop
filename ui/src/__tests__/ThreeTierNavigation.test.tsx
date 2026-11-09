@@ -9,8 +9,8 @@ import {
   RightPanelHeader,
   getTabContextTier,
 } from "../components/ContextHeader";
+import { TEST_WORKSPACE_AGENTS as DEFAULT_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   type CockpitTab,
   type DiscoveredSessionSummary,
 } from "../types/api";

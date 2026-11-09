@@ -11,14 +11,28 @@ import {
   mapToPhoneView,
 } from "../components/phone/phoneNavigation";
 import { OPEN_ARTIFACT_EVENT } from "../components/RichMarkdown";
+import { TEST_PROJECTS, TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function makeStubApiClient(): HubApiClient {
-  const fetchImpl = vi.fn(async () =>
-    new Response(JSON.stringify({}), {
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/v1/agents")) {
+      return new Response(
+        JSON.stringify({ agents: TEST_WORKSPACE_AGENTS, routes: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.endsWith("/api/v1/projects")) {
+      return new Response(JSON.stringify({ projects: TEST_PROJECTS }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({}), {
       status: 200,
       headers: { "Content-Type": "application/json" },
-    }),
-  );
+    });
+  });
   return new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
 }
 
@@ -249,10 +263,13 @@ describe("Phone shell (< 768px)", () => {
     expect(more).toHaveFocus();
   });
 
-  it("lands on Chat after selecting an agent from the Agents view", () => {
+  it("lands on Chat after selecting an agent from the Agents view", async () => {
     renderAt(390, 844);
     fireEvent.click(screen.getByTestId("phone-tab-agents"));
     const roster = screen.getByTestId("roster-sidebar");
+    await waitFor(() =>
+      expect(roster.querySelector("[data-testid^='agent-row-']")).not.toBeNull(),
+    );
     const agentRow = roster.querySelector("[data-testid^='agent-row-']") as HTMLElement | null;
     expect(agentRow).not.toBeNull();
     fireEvent.click(agentRow!);
@@ -369,6 +386,11 @@ describe("Phone shell (< 768px)", () => {
     fireEvent.click(screen.getByTestId("phone-tab-more"));
     fireEvent.click(screen.getByTestId("phone-more-action-settings"));
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
+    await waitFor(() =>
+      expect(
+        document.querySelector("[data-testid^='settings-agent-cog-btn-']"),
+      ).not.toBeNull(),
+    );
     const cog = document.querySelector("[data-testid^='settings-agent-cog-btn-']") as HTMLElement | null;
     expect(cog).not.toBeNull();
     await act(async () => {
@@ -388,11 +410,16 @@ describe("Phone shell (< 768px)", () => {
     expect(roster).toHaveAttribute("data-desktop-collapsed", "false");
   });
 
-  it("keeps the roster open state untouched when an agent is chosen in the Agents view", () => {
+  it("keeps the roster open state untouched when an agent is chosen in the Agents view", async () => {
     renderAt(1280, 800);
     fireEvent.click(within(screen.getByTestId("cockpit-tab-bar")).getByRole("tab", { name: "Terminal" }));
     resizeTo(390, 844);
     fireEvent.click(screen.getByTestId("phone-tab-agents"));
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("roster-sidebar").querySelector("[data-testid^='agent-row-']"),
+      ).not.toBeNull(),
+    );
     const agentRow = screen
       .getByTestId("roster-sidebar")
       .querySelector("[data-testid^='agent-row-']") as HTMLElement;
