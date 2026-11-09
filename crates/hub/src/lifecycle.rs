@@ -694,6 +694,25 @@ fn pin_launch_config(launch: &mut Option<LaunchSpec>, config_home: Option<&Path>
     }
 }
 
+fn apply_vendor_launch_env(
+    env_vec: &mut Vec<(String, String)>,
+    vendor: &str,
+    persona: &str,
+    home: Option<&Path>,
+    hydration_generation: Option<&str>,
+) {
+    let vendor_env = fl_wire::vendor_adapter::launch_env_for_vendor_with_generation(
+        vendor,
+        persona,
+        home,
+        hydration_generation,
+    );
+    env_vec.retain(|(k, _)| {
+        k != "AGENT_HYDRATION_GENERATION" && !vendor_env.iter().any(|(vk, _)| vk == k)
+    });
+    env_vec.extend(vendor_env);
+}
+
 #[cfg(test)]
 pub(crate) fn trusted_codex_home(home: &Path, cwd: &Path) -> IsolatedCodexHome {
     std::fs::create_dir_all(home.join(".codex")).unwrap();
@@ -733,6 +752,7 @@ fn launch_spec_for(
         prompt,
         None,
         None,
+        None,
     )
     .ok()
     .flatten()
@@ -749,6 +769,7 @@ fn launch_spec_for_with_session(
     prompt: &str,
     cwd: Option<&str>,
     vendor_session_id: Option<&str>,
+    hydration_generation: Option<&str>,
 ) -> Result<Option<LaunchSpec>, LifecycleError> {
     let home = env
         .home_override
@@ -779,10 +800,18 @@ fn launch_spec_for_with_session(
         };
         match host_adapter.prepare_launch(&req) {
             Ok(plan) => {
-                return Ok(Some(LaunchSpec {
+                let mut spec = LaunchSpec {
                     env: plan.env,
                     argv: plan.argv,
-                }));
+                };
+                apply_vendor_launch_env(
+                    &mut spec.env,
+                    vendor,
+                    persona,
+                    home.as_deref(),
+                    hydration_generation,
+                );
+                return Ok(Some(spec));
             }
             Err(fl_core::VendorAdapterError::PermissionRefused { reason, .. }) => {
                 let detail = reason
@@ -798,7 +827,7 @@ fn launch_spec_for_with_session(
                 let Some(adapter) = env.vendor_adapter(vendor) else {
                     return Err(LifecycleError::Invalid(host_err.to_string()));
                 };
-                let spec = adapter
+                let mut spec = adapter
                     .build_launch_spec_with_options(
                         persona,
                         model,
@@ -808,6 +837,13 @@ fn launch_spec_for_with_session(
                         options,
                     )
                     .map_err(|why| invalid_field("posture", &why))?;
+                apply_vendor_launch_env(
+                    &mut spec.env,
+                    vendor,
+                    persona,
+                    home.as_deref(),
+                    hydration_generation,
+                );
                 return Ok(Some(spec));
             }
         }
@@ -815,7 +851,7 @@ fn launch_spec_for_with_session(
     let Some(adapter) = env.vendor_adapter(vendor) else {
         return Ok(None);
     };
-    let spec = adapter
+    let mut spec = adapter
         .build_launch_spec_with_options(
             persona,
             model,
@@ -825,6 +861,13 @@ fn launch_spec_for_with_session(
             options,
         )
         .map_err(|why| invalid_field("posture", &why))?;
+    apply_vendor_launch_env(
+        &mut spec.env,
+        vendor,
+        persona,
+        home.as_deref(),
+        hydration_generation,
+    );
     Ok(Some(spec))
 }
 
@@ -1091,6 +1134,9 @@ impl SessionRuntime for HostRuntime {
                 env_allow.insert(k.clone());
                 env_map.insert(k.clone(), v.clone());
             }
+        }
+        if !env_map.contains_key("AGENT_HYDRATION_GENERATION") {
+            env_allow.remove("AGENT_HYDRATION_GENERATION");
         }
         // Interactive CLIs pick their color depth from these; a launch spec's own value wins.
         for (key, default) in [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")] {
@@ -2073,6 +2119,9 @@ pub struct SpinUpResponse {
     pub hydration_dispatched: bool,
     #[serde(default)]
     pub hydration_status: HydrationStatus,
+    /// Strictly monotonic launch generation token for fencing initial hydration acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_generation: Option<String>,
     pub prompt: Option<String>,
     /// The context window recorded for the session, in tokens, when one was chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2128,6 +2177,9 @@ pub struct HostedSessionRecord {
     pub hydration_dispatched: bool,
     #[serde(default)]
     pub hydration_status: HydrationStatus,
+    /// Strictly monotonic launch generation token for fencing initial hydration acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_generation: Option<String>,
     /// Whether this lifecycle created the tmux session. Teardown of a runtime it created
     /// uses [`SessionRuntime::kill`]. An owner teardown of one it did not create still
     /// stops the persona's tmux unit ([`SessionRuntime::kill_owner`]).
@@ -2160,6 +2212,287 @@ pub fn hosted_session_slug(session_id: &str) -> String {
     format!("{HOSTED_SLUG_PREFIX}{}", session_id.replace(':', "-"))
 }
 
+/// Prefix of disjoint runtime entries that record generation-fenced hydration acceptance.
+pub const HYDRATION_ACK_SLUG_PREFIX: &str = "hydration-ack-";
+
+/// Slug of the disjoint runtime receipt for a launch `generation`.
+pub fn hydration_ack_slug(generation: &str) -> String {
+    format!("{HYDRATION_ACK_SLUG_PREFIX}{generation}")
+}
+
+/// Disjoint receipt written by `fl wire register ... --replace` when a hosted session
+/// acknowledges its initial hydration prompt for `generation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydrationReceipt {
+    #[serde(default)]
+    pub session_id: String,
+    pub persona: String,
+    pub generation: String,
+    pub accepted_at_ms: u64,
+}
+
+static LAST_HYDRATION_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Mint a strictly monotonic, fixed-width lowercase hex UUIDv7-shaped generation token
+/// (`xxxxxxxx-xxxx-7xxx-8xxx-xxxxxxxxxxxx`) so two tokens minted in the same millisecond satisfy
+/// `g1 < g2` iff `g1` was minted before `g2`.
+pub fn next_hydration_generation() -> String {
+    use std::sync::atomic::Ordering;
+    let now = now_ms() & 0xffff_ffff_ffff;
+    let candidate = now << 16;
+    let mut prev = LAST_HYDRATION_GENERATION.load(Ordering::Relaxed);
+    let packed = loop {
+        let next = if candidate > prev {
+            candidate
+        } else {
+            prev.wrapping_add(1)
+        };
+        match LAST_HYDRATION_GENERATION.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break next,
+            Err(actual) => prev = actual,
+        }
+    };
+    let ms_hi = (packed >> 32) as u32;
+    let ms_lo = ((packed >> 16) & 0xffff) as u16;
+    let seq_hi = 0x7000u16 | (((packed >> 4) & 0x0fff) as u16);
+    let seq_lo = 0x8000u16 | (((packed & 0x0f) as u16) << 8);
+    let rand_tail = (uuid::Uuid::now_v7().as_u128() as u64) & 0xffff_ffff_ffff;
+    format!("{ms_hi:08x}-{ms_lo:04x}-{seq_hi:04x}-{seq_lo:04x}-{rand_tail:012x}")
+}
+
+/// `true` when `s` is a valid 36-character lowercase hex UUIDv7 generation token.
+pub fn is_valid_hydration_generation(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &ch) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if ch != b'-' {
+                    return false;
+                }
+            }
+            14 => {
+                if ch != b'7' {
+                    return false;
+                }
+            }
+            19 => {
+                if !matches!(ch, b'8' | b'9' | b'a' | b'b') {
+                    return false;
+                }
+            }
+            _ => {
+                if !matches!(ch, b'0'..=b'9' | b'a'..=b'f') {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn receipt_matches_record(receipt: &HydrationReceipt, record: &HostedSessionRecord) -> bool {
+    record.hydration_generation.as_deref() == Some(receipt.generation.as_str())
+        && receipt.persona.eq_ignore_ascii_case(&record.persona)
+        && (receipt.session_id.is_empty()
+            || receipt.session_id.eq_ignore_ascii_case(&record.session_id))
+}
+
+fn promote_confirmed_hydration<S: StateStore>(
+    store: &S,
+    record: &mut HostedSessionRecord,
+) -> Result<(), LifecycleError> {
+    if record.hydration_status == HydrationStatus::Unconfirmed
+        && let Some(generation) = record.hydration_generation.as_deref()
+        && is_valid_hydration_generation(generation)
+        && let Some(entry) = store.get_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(generation),
+        )?
+        && let StatePayload::Runtime(rt) = entry.payload
+        && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
+        && receipt_matches_record(&receipt, record)
+    {
+        record.hydration_status = HydrationStatus::Confirmed;
+    }
+    Ok(())
+}
+
+fn prune_stale_hydration_receipts<S: StateStore>(
+    store: &S,
+    persona: &str,
+) -> Result<(), LifecycleError> {
+    let entries = store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))?;
+    let mut active_generations: BTreeSet<String> = BTreeSet::new();
+    let mut receipt_entries: Vec<(String, HydrationReceipt)> = Vec::new();
+    for entry in entries {
+        let StatePayload::Runtime(rt) = entry.payload else {
+            continue;
+        };
+        if entry.slug.starts_with(HOSTED_SLUG_PREFIX) {
+            if let Ok(rec) = serde_json::from_value::<HostedSessionRecord>(rt.value)
+                && rec.persona.eq_ignore_ascii_case(persona)
+                && !matches!(
+                    rec.status.as_str(),
+                    STATUS_DECOMMISSIONING | STATUS_DECOMMISSIONED
+                )
+                && let Some(generation) = rec.hydration_generation
+            {
+                active_generations.insert(generation);
+            }
+        } else if entry.slug.starts_with(HYDRATION_ACK_SLUG_PREFIX)
+            && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
+            && receipt.persona.eq_ignore_ascii_case(persona)
+        {
+            receipt_entries.push((entry.slug, receipt));
+        }
+    }
+    for (slug, receipt) in receipt_entries {
+        if !active_generations.contains(&receipt.generation) {
+            store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `fl wire register` when `caller_generation` is present and superseded by a newer
+/// launch generation or decommission for `persona`.
+pub fn fence_hydration_register<S: StateStore>(
+    store: &S,
+    persona: &str,
+    caller_generation: Option<&str>,
+) -> Result<(), String> {
+    let Some(g_caller) = caller_generation.map(str::trim).filter(|g| !g.is_empty()) else {
+        return Ok(());
+    };
+    if !is_valid_hydration_generation(g_caller) {
+        return Ok(());
+    }
+    let persona_lower = persona.trim().to_ascii_lowercase();
+    let records = list_hosted_sessions(store).map_err(|e| e.to_string())?;
+    let matching: Vec<&HostedSessionRecord> = records
+        .iter()
+        .filter(|r| r.persona.eq_ignore_ascii_case(&persona_lower))
+        .collect();
+    if matching.is_empty() {
+        return Ok(());
+    }
+    let superseded_by_newer = matching.iter().any(|r| {
+        r.hydration_generation
+            .as_deref()
+            .is_some_and(|g_rec| g_caller < g_rec)
+    });
+    let has_matching_live = matching.iter().any(|r| {
+        !matches!(
+            r.status.as_str(),
+            STATUS_DECOMMISSIONING | STATUS_DECOMMISSIONED
+        ) && r.hydration_generation.as_deref() == Some(g_caller)
+    });
+    let all_matching_decommissioned = !has_matching_live
+        && matching.iter().any(|r| {
+            matches!(
+                r.status.as_str(),
+                STATUS_DECOMMISSIONING | STATUS_DECOMMISSIONED
+            )
+        })
+        && !matching.iter().any(|r| {
+            !matches!(
+                r.status.as_str(),
+                STATUS_DECOMMISSIONING | STATUS_DECOMMISSIONED
+            )
+        });
+    if !has_matching_live && (superseded_by_newer || all_matching_decommissioned) {
+        return Err(format!(
+            "registration refused for `{persona_lower}`: session launch generation `{g_caller}` was superseded by a newer launch; this process should exit"
+        ));
+    }
+    Ok(())
+}
+
+/// Record a disjoint `hydration-ack-<G>` receipt when `replace == true`, `caller_generation` is a
+/// valid generation token, and `hosted_id` (if present) matches `persona`. Preserves an existing
+/// receipt for `(persona, G)` without overwriting `accepted_at_ms`.
+pub fn record_hydration_ack<S: StateStore>(
+    store: &S,
+    persona: &str,
+    replace: bool,
+    caller_generation: Option<&str>,
+    hosted_id: Option<&str>,
+) -> Result<bool, LifecycleError> {
+    if !replace {
+        return Ok(false);
+    }
+    let Some(g_caller) = caller_generation.map(str::trim).filter(|g| !g.is_empty()) else {
+        return Ok(false);
+    };
+    if !is_valid_hydration_generation(g_caller) {
+        return Ok(false);
+    }
+    let persona_lower = persona.trim().to_ascii_lowercase();
+    if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((vendor, hid_persona)) = hid.split_once(':') else {
+            return Ok(false);
+        };
+        if vendor.trim().is_empty() || !hid_persona.trim().eq_ignore_ascii_case(&persona_lower) {
+            return Ok(false);
+        }
+    }
+    let slug = hydration_ack_slug(g_caller);
+    if let Some(existing) =
+        store.get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?
+        && let StatePayload::Runtime(rt) = existing.payload
+        && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
+    {
+        if !receipt.persona.eq_ignore_ascii_case(&persona_lower) {
+            eprintln!(
+                "fl-hub: warning: hydration receipt `{slug}` already belongs to persona `{}`; ignoring ack for `{persona_lower}`",
+                receipt.persona
+            );
+        }
+        return Ok(false);
+    }
+    let session_id = if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
+        hid.to_ascii_lowercase()
+    } else {
+        list_hosted_sessions(store)?
+            .into_iter()
+            .find(|r| {
+                r.persona.eq_ignore_ascii_case(&persona_lower)
+                    && r.hydration_generation.as_deref() == Some(g_caller)
+            })
+            .map(|r| r.session_id)
+            .unwrap_or_default()
+    };
+    let receipt = HydrationReceipt {
+        session_id,
+        persona: persona_lower.clone(),
+        generation: g_caller.to_string(),
+        accepted_at_ms: now_ms(),
+    };
+    let value = serde_json::to_value(&receipt).map_err(|e| LifecycleError::Store(e.to_string()))?;
+    store.upsert_state(UpsertStateArgs {
+        scope: StateScope::Workspace,
+        slug,
+        sensitivity: SensitivityPatch::Inherit,
+        payload: StatePayload::Runtime(RuntimeEntry {
+            value,
+            merge_mode: MergeMode::LastWriter,
+        }),
+        at: stamp::now(),
+        by: persona_lower,
+    })?;
+    Ok(true)
+}
+
 pub fn persist_hosted_session<S: StateStore>(
     store: &S,
     record: &HostedSessionRecord,
@@ -2167,6 +2500,12 @@ pub fn persist_hosted_session<S: StateStore>(
 ) -> Result<(), LifecycleError> {
     let mut normalized = record.clone();
     normalized.host_session_id = host_session_id_for_target(normalized.tmux_target.as_deref());
+    if let Err(e) = promote_confirmed_hydration(store, &mut normalized) {
+        eprintln!(
+            "fl-hub: warning: failed to promote hydration receipt for `{}`: {e}",
+            record.session_id
+        );
+    }
     let value =
         serde_json::to_value(&normalized).map_err(|e| LifecycleError::Store(e.to_string()))?;
     // Never replace another session's record (see `check_slug_free`).
@@ -2182,6 +2521,12 @@ pub fn persist_hosted_session<S: StateStore>(
         at: stamp::now(),
         by: by.to_string(),
     })?;
+    if let Err(e) = prune_stale_hydration_receipts(store, &normalized.persona) {
+        eprintln!(
+            "fl-hub: warning: failed to prune stale hydration receipts for `{}`: {e}",
+            normalized.persona
+        );
+    }
     Ok(())
 }
 
@@ -2190,20 +2535,35 @@ pub fn list_hosted_sessions<S: StateStore>(
     store: &S,
 ) -> Result<Vec<HostedSessionRecord>, LifecycleError> {
     let entries = store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))?;
-    let mut records: Vec<HostedSessionRecord> = entries
-        .into_iter()
-        .filter(|e| e.slug.starts_with(HOSTED_SLUG_PREFIX))
-        .filter_map(|e| match e.payload {
-            StatePayload::Runtime(rt) => {
-                let mut rec: HostedSessionRecord = serde_json::from_value(rt.value).ok()?;
+    let mut records: Vec<HostedSessionRecord> = Vec::new();
+    let mut receipts: std::collections::HashMap<String, HydrationReceipt> =
+        std::collections::HashMap::new();
+    for e in entries {
+        let StatePayload::Runtime(rt) = e.payload else {
+            continue;
+        };
+        if e.slug.starts_with(HOSTED_SLUG_PREFIX) {
+            if let Ok(mut rec) = serde_json::from_value::<HostedSessionRecord>(rt.value) {
                 if rec.host_session_id.is_none() {
                     rec.host_session_id = host_session_id_for_target(rec.tmux_target.as_deref());
                 }
-                Some(rec)
+                records.push(rec);
             }
-            _ => None,
-        })
-        .collect();
+        } else if e.slug.starts_with(HYDRATION_ACK_SLUG_PREFIX)
+            && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
+        {
+            receipts.insert(receipt.generation.clone(), receipt);
+        }
+    }
+    for rec in &mut records {
+        if rec.hydration_status == HydrationStatus::Unconfirmed
+            && let Some(generation) = rec.hydration_generation.as_deref()
+            && let Some(receipt) = receipts.get(generation)
+            && receipt_matches_record(receipt, rec)
+        {
+            rec.hydration_status = HydrationStatus::Confirmed;
+        }
+    }
     records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     Ok(records)
 }
@@ -2288,6 +2648,23 @@ pub fn set_hosted_session_context_window<S: StateStore>(
         return Ok(None);
     };
     record.context_window = context_window;
+    record.updated_at_ms = now_ms();
+    persist_hosted_session(store, &record, by)?;
+    Ok(Some(record))
+}
+
+/// Record `posture` on the hosted-session record that `keys` name (same lookup as
+/// [`find_hosted_session`]). Returns the updated record, or `None` when no record matches.
+pub fn set_hosted_session_posture<S: StateStore>(
+    store: &S,
+    keys: &[&str],
+    posture: fl_core::permissions::Posture,
+    by: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let Some(mut record) = find_hosted_session(store, keys)? else {
+        return Ok(None);
+    };
+    record.posture = posture;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
     Ok(Some(record))
@@ -2387,7 +2764,17 @@ impl RegisteredRoleGuidance {
         display: &str,
         project: &str,
     ) -> crate::hydration::HydrationPrompt {
-        use crate::hydration::{RoleGuidance, render};
+        self.render_with_generation(context, display, project, None)
+    }
+
+    pub(crate) fn render_with_generation(
+        &self,
+        context: crate::hydration::Context,
+        display: &str,
+        project: &str,
+        generation: Option<&str>,
+    ) -> crate::hydration::HydrationPrompt {
+        use crate::hydration::{RoleGuidance, render_with_generation};
         let guidance = if self.structural_custom {
             RoleGuidance::StructuralCustom
         } else if let Some(template) = &self.template {
@@ -2395,7 +2782,7 @@ impl RegisteredRoleGuidance {
         } else {
             RoleGuidance::File
         };
-        render(context, display, project, &self.label, guidance)
+        render_with_generation(context, display, project, &self.label, guidance, generation)
     }
 }
 
@@ -2446,6 +2833,18 @@ pub(crate) fn registered_role_prompt<S: StateStore + Catalog>(
     project: &str,
     role: &AgentRole,
 ) -> Result<crate::hydration::HydrationPrompt, LifecycleError> {
+    registered_role_prompt_with_generation(store, env, cwd, display, project, role, None)
+}
+
+pub(crate) fn registered_role_prompt_with_generation<S: StateStore + Catalog>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    cwd: Option<&Path>,
+    display: &str,
+    project: &str,
+    role: &AgentRole,
+    generation: Option<&str>,
+) -> Result<crate::hydration::HydrationPrompt, LifecycleError> {
     let guidance = prepare_registered_role_guidance(store, role)?;
     // workspace_root also supplies legacy runtime cwd defaults. Preserve that hint
     // for launching, but require workspace markers before using it for guidance.
@@ -2457,7 +2856,7 @@ pub(crate) fn registered_role_prompt<S: StateStore + Catalog>(
         cwd,
         project,
     );
-    Ok(guidance.render(context, display, project))
+    Ok(guidance.render_with_generation(context, display, project, generation))
 }
 
 /// Each staged binding has its own key, preserving earlier required guidance if a later
@@ -3807,13 +4206,36 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         OwnerGate::SpinUp,
     )?;
     let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
-    let guidance = registered_role_prompt(
+    let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
+    let host_session_id = host_session_id_for_target(tmux_target.as_deref());
+    let unit = tmux_target
+        .as_deref()
+        .map_or("", |t| env.runtime.unit(t))
+        .to_string();
+    let existing_gen = previous
+        .as_ref()
+        .filter(|r| !is_decommissioned(r))
+        .and_then(|r| r.hydration_generation.clone())
+        .filter(|g| is_valid_hydration_generation(g));
+    let will_spawn = has_runtime
+        && v.hosted
+        && env.spawn_runtime
+        && (existing_gen.is_none() || unit.is_empty() || !env.runtime.exists(&unit));
+    let hydration_generation = if will_spawn {
+        next_hydration_generation()
+    } else {
+        existing_gen
+            .clone()
+            .unwrap_or_else(next_hydration_generation)
+    };
+    let guidance = registered_role_prompt_with_generation(
         store,
         env,
         v.cwd.as_deref().map(Path::new),
         &display,
         &v.project,
         &agent_role_from_label(&v.role),
+        Some(&hydration_generation),
     )?;
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
@@ -3833,19 +4255,13 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             &prompt,
             v.cwd.as_deref(),
             vendor_session_id.as_deref(),
+            Some(&hydration_generation),
         )?
     } else {
         None
     };
     pin_launch_config(&mut launch, config_home.as_deref());
     register_spun_up_agent(store, &v, by)?;
-
-    let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
-    let host_session_id = host_session_id_for_target(tmux_target.as_deref());
-    let unit = tmux_target
-        .as_deref()
-        .map_or("", |t| env.runtime.unit(t))
-        .to_string();
 
     let now = now_ms();
     let mut record = HostedSessionRecord {
@@ -3868,6 +4284,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         posture: v.posture,
         hydration_dispatched: false,
         hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+        hydration_generation: Some(hydration_generation.clone()),
         tombstone_ids: Vec::new(),
         vendor_session_id,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
@@ -3885,6 +4302,13 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
     };
+    if !will_spawn && existing_gen.is_some() {
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(&hydration_generation),
+        );
+    }
     let dropped_ids = previous.as_ref().map(record_native_ids).unwrap_or_default();
     persist_hosted_session(store, &record, by)?;
     // The running record replaced any decommissioned one on this slug. Drop that
@@ -3894,7 +4318,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
-    let spawned = has_runtime
+    let raw_spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
         && env.runtime.spawn(
@@ -3904,14 +4328,25 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             launch.as_ref(),
             &session_id,
         );
-    if spawned && let Some(target) = tmux_target.as_deref() {
+    if will_spawn
+        && !raw_spawned
+        && let Some(prev_g) = existing_gen.as_ref()
+    {
+        record.hydration_generation = Some(prev_g.clone());
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(prev_g),
+        );
+    }
+    if raw_spawned && let Some(target) = tmux_target.as_deref() {
         apply_startup_prompt_rules(env.runtime, &v.vendor, target);
     }
     // Argv handed the prompt to the vendor, but survival does not prove acceptance.
     // A command that exited at once took its session with it: nothing to deliver to.
-    let launched = spawned && launch.is_some();
+    let launched = raw_spawned && launch.is_some();
     let survived = !launched || launch_survived(env, &unit, &session_id);
-    let spawned = spawned && survived;
+    let spawned = raw_spawned && survived;
     let hydration = if launched {
         HydrationOutcome::from_launch(survived)
     } else {
@@ -3920,6 +4355,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     record.runtime_spawned = (record.runtime_spawned || spawned) && survived;
     record.hydration_dispatched = hydration.dispatched;
     record.hydration_status = hydration.status;
+    let _ = promote_confirmed_hydration(store, &mut record);
     record.updated_at_ms = now_ms();
     // A runtime may have started: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
@@ -3948,7 +4384,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         tmux_target,
         host_session_id,
         hydration_dispatched: hydration.dispatched,
-        hydration_status: hydration.status,
+        hydration_status: record.hydration_status,
+        hydration_generation: record.hydration_generation,
         prompt: Some(prompt),
         context_window: v.context_window,
         posture: v.posture,
@@ -4138,6 +4575,7 @@ fn record_for_target<S: AgentRegistry>(
         posture: fl_core::permissions::Posture::Auto,
         hydration_dispatched: false,
         hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+        hydration_generation: None,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
@@ -4200,6 +4638,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
         record.vendor = vendor;
     }
     record.status = STATUS_DECOMMISSIONING.to_string();
+    record.hydration_generation = None;
     record.decommission_prepared_at_ms = Some(now);
     record.updated_at_ms = now;
     persist_hosted_session(store, &record, by)?;
@@ -5118,12 +5557,14 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
 
     let updated_ms = now_ms();
     record.status = STATUS_DECOMMISSIONED.to_string();
+    record.hydration_generation = None;
     record.tombstone_ids = tombstone_ids;
     record.updated_at_ms = updated_ms;
     persist_hosted_session(store, &record, by)?;
     for mut sib in same_vendor_siblings {
         if !is_decommissioned(&sib) {
             sib.status = STATUS_DECOMMISSIONED.to_string();
+            sib.hydration_generation = None;
             sib.runtime_spawned = false;
             for tid in &record.tombstone_ids {
                 push_tombstone(&mut sib.tombstone_ids, tid);
@@ -5219,19 +5660,6 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
         env.runtime.preflight_spawn(&record.session_id)?;
     }
-    let display = capitalize(&record.persona);
-    let guidance = registered_role_prompt(
-        store,
-        env,
-        record.cwd.as_deref().map(Path::new),
-        &display,
-        &record.project,
-        &agent_role_from_label(&record.role),
-    )?;
-    if env.log_hydration_warnings {
-        crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
-    }
-    let prompt = guidance.text;
     fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
         &record.vendor,
         record.posture,
@@ -5283,6 +5711,36 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
         // this point is someone else's.
         record.runtime_spawned = false;
     }
+    let existing_gen = record
+        .hydration_generation
+        .clone()
+        .filter(|g| is_valid_hydration_generation(g));
+    let will_spawn = record.hosted
+        && !adopted_old_session
+        && vendor_has_runtime(&record.vendor)
+        && env.spawn_runtime
+        && (existing_gen.is_none() || !env.runtime.exists(&unit));
+    let hydration_generation = if will_spawn {
+        next_hydration_generation()
+    } else {
+        existing_gen
+            .clone()
+            .unwrap_or_else(next_hydration_generation)
+    };
+    let display = capitalize(&record.persona);
+    let guidance = registered_role_prompt_with_generation(
+        store,
+        env,
+        record.cwd.as_deref().map(Path::new),
+        &display,
+        &record.project,
+        &agent_role_from_label(&record.role),
+        Some(&hydration_generation),
+    )?;
+    if env.log_hydration_warnings {
+        crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
+    }
+    let prompt = guidance.text;
     let mut launch = if record.hosted
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
@@ -5298,14 +5756,28 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
             &prompt,
             record.cwd.as_deref(),
             record.vendor_session_id.as_deref(),
+            Some(&hydration_generation),
         )?
     } else {
         None
     };
     pin_launch_config(&mut launch, config_home.as_deref());
+    if !will_spawn && existing_gen.is_some() {
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(&hydration_generation),
+        );
+    }
+    record.status = STATUS_RUNNING.to_string();
+    record.decommission_prepared_at_ms = None;
+    record.hydration_status = HydrationStatus::Unconfirmed;
+    record.hydration_generation = Some(hydration_generation.clone());
+    record.updated_at_ms = now_ms();
+    persist_hosted_session(store, &record, by)?;
     let mut launched_with_prompt = false;
     let mut launch_died = false;
-    if record.hosted
+    let raw_spawned = record.hosted
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
@@ -5315,8 +5787,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
             record.cwd.as_deref(),
             launch.as_ref(),
             &record.session_id,
-        )
-    {
+        );
+    if raw_spawned {
         if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
             // The command exited at once and took its session with it: nothing to deliver to.
             launch_died = true;
@@ -5326,6 +5798,13 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
             // Argv already handed off the prompt; acceptance remains unconfirmed.
             launched_with_prompt = launch.is_some();
         }
+    } else if will_spawn && let Some(prev_g) = existing_gen.as_ref() {
+        record.hydration_generation = Some(prev_g.clone());
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(prev_g),
+        );
     }
     let hydration = if launch_died || launched_with_prompt {
         HydrationOutcome::from_launch(!launch_died)
@@ -5334,6 +5813,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     };
     record.hydration_dispatched = hydration.dispatched;
     record.hydration_status = hydration.status;
+    let _ = promote_confirmed_hydration(store, &mut record);
     // A runtime may have reopened: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
@@ -5428,6 +5908,9 @@ pub struct RemodelResponse {
     pub hydration_dispatched: bool,
     #[serde(default)]
     pub hydration_status: HydrationStatus,
+    /// Strictly monotonic launch generation token for fencing initial hydration acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_generation: Option<String>,
     /// `execute`: whether the old session's runtime is gone.
     pub runtime_stopped: bool,
     pub tmux_target: Option<String>,
@@ -5981,6 +6464,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
             handshake_dispatched: out.handshake_dispatched,
             hydration_dispatched: false,
             hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+            hydration_generation: None,
             runtime_stopped: false,
             tmux_target,
             host_session_id,
@@ -6056,6 +6540,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
                 handshake_dispatched: false,
                 hydration_dispatched: out.hydration_dispatched,
                 hydration_status: out.hydration_status,
+                hydration_generation: out.hydration_generation,
                 runtime_stopped: torn.runtime_stopped,
                 tmux_target: out.tmux_target,
                 host_session_id: out.host_session_id,
@@ -6183,6 +6668,7 @@ fn undo_new_record<S: AgentRegistry + StateStore>(
         None if is_decommissioned(&now) => false,
         None => {
             now.status = STATUS_DECOMMISSIONED.to_string();
+            now.hydration_generation = None;
             now.updated_at_ms = now_ms();
             persist_hosted_session(store, &now, by)?;
             true
@@ -10007,6 +10493,7 @@ mod tests {
             context_window: None,
             hydration_dispatched: false,
             hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+            hydration_generation: None,
             runtime_spawned: spawned,
             tombstone_ids: Vec::new(),
             vendor_session_id: None,
@@ -11425,6 +11912,7 @@ mod tests {
             "Hydrate",
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err_ask, LifecycleError::Invalid(_)), "{err_ask:?}");
@@ -11472,6 +11960,7 @@ mod tests {
             None,
             Posture::Auto,
             "Hydrate",
+            None,
             None,
             None,
         )
@@ -11802,5 +12291,738 @@ mod tests {
         let listed = list_hosted_sessions(&store).unwrap();
         let backfilled = listed.iter().find(|r| r.session_id == "muse:ada").unwrap();
         assert_eq!(backfilled.host_session_id.as_deref(), Some("muse.ada"));
+    }
+
+    #[test]
+    fn next_hydration_generation_is_strictly_monotonic_even_within_same_millisecond_and_validates_tokens()
+     {
+        let mut prev = next_hydration_generation();
+        assert!(is_valid_hydration_generation(&prev), "{prev}");
+        for _ in 0..512 {
+            let cur = next_hydration_generation();
+            assert!(is_valid_hydration_generation(&cur), "{cur}");
+            assert!(prev < cur, "expected {prev} < {cur}");
+            assert!(
+                validate_slug(&hydration_ack_slug(&cur)).is_ok(),
+                "hydration-ack slug must be valid for {cur}"
+            );
+            prev = cur;
+        }
+        // Force a clock tie/regression by bumping LAST_HYDRATION_GENERATION ahead by 10ms.
+        let future_ms = (now_ms().saturating_add(10) & 0xffff_ffff_ffff) << 16;
+        LAST_HYDRATION_GENERATION.fetch_max(future_ms, std::sync::atomic::Ordering::SeqCst);
+        let g1 = next_hydration_generation();
+        let g2 = next_hydration_generation();
+        let g3 = next_hydration_generation();
+        assert!(is_valid_hydration_generation(&g1));
+        assert!(is_valid_hydration_generation(&g2));
+        assert!(is_valid_hydration_generation(&g3));
+        assert!(g1 < g2 && g2 < g3, "expected {g1} < {g2} < {g3}");
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "019d8f34-89cd-4e43-8a66-31f3b49788b7", // version 4, not 7
+            "019d8f34-89cd-7e43-0a66-31f3b49788b7", // variant 0, not 8..=b
+            "019D8F34-89CD-7E43-8A66-31F3B49788B7", // uppercase
+            "../019d8f34-89cd-7e43-8a66-31f3b49788",
+        ] {
+            assert!(
+                !is_valid_hydration_generation(bad),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_binding_and_codex_prompt_channel_transition_unconfirmed_to_confirmed() {
+        assert!(
+            fl_core::child_env::BASELINE_EXACT.contains(&"AGENT_HYDRATION_GENERATION"),
+            "BASELINE_EXACT must allow AGENT_HYDRATION_GENERATION"
+        );
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+
+        // Static preview without generation keeps Step 6 unchanged.
+        let preview = canonical_reforge_prompt("Ada", "FerroLoop", "assistant");
+        assert!(
+            preview.contains(
+                "AGENT_PERSONA=ada fl wire register Ada --project FerroLoop --role assistant --replace"
+            ),
+            "{preview}"
+        );
+        assert!(
+            !preview.contains("AGENT_HYDRATION_GENERATION="),
+            "static preview must not mint a generation: {preview}"
+        );
+
+        // Per-session CLI vendors receive AGENT_HYDRATION_GENERATION in launch env; codex omits it.
+        let g_sample = next_hydration_generation();
+        let codex_env = fl_wire::vendor_adapter::launch_env_for_vendor_with_generation(
+            "codex",
+            "ada",
+            Some(home.path()),
+            Some(&g_sample),
+        );
+        assert!(
+            codex_env
+                .iter()
+                .all(|(k, _)| k != "AGENT_HYDRATION_GENERATION" && k != "AGENT_PERSONA"),
+            "codex launch env must omit AGENT_HYDRATION_GENERATION: {codex_env:?}"
+        );
+        for vendor in ["claude", "antigravity", "muse", "grok"] {
+            let env_vars = fl_wire::vendor_adapter::launch_env_for_vendor_with_generation(
+                vendor,
+                "ada",
+                Some(home.path()),
+                Some(&g_sample),
+            );
+            assert!(
+                env_vars
+                    .iter()
+                    .any(|(k, v)| k == "AGENT_HYDRATION_GENERATION" && v == &g_sample),
+                "{vendor} launch env must carry AGENT_HYDRATION_GENERATION: {env_vars:?}"
+            );
+        }
+
+        // End-to-end Codex spin_up + Step 6 execution transitions unconfirmed -> confirmed.
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = LifecycleEnv {
+            runtime: &fake,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+        let out = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(out.hydration_status, HydrationStatus::Unconfirmed);
+        let generation = out.hydration_generation.clone().expect("generation minted");
+        assert!(is_valid_hydration_generation(&generation));
+        let launches = fake.launches.borrow();
+        let codex_spec = launches[0].1.as_ref().expect("codex launch spec");
+        assert!(
+            codex_spec
+                .env
+                .iter()
+                .all(|(k, _)| k != "AGENT_HYDRATION_GENERATION"),
+            "spawned codex spec must omit AGENT_HYDRATION_GENERATION: {:?}",
+            codex_spec.env
+        );
+        let prompt = out.prompt.as_deref().expect("prompt");
+        let expected_step6 = format!(
+            "AGENT_PERSONA=ada AGENT_HYDRATION_GENERATION={generation} fl wire register Ada --project FerroLoop --role assistant --replace"
+        );
+        assert!(
+            prompt.contains(&expected_step6),
+            "prompt missing {expected_step6:?}: {prompt}"
+        );
+
+        // Extract AGENT_HYDRATION_GENERATION=<G> from the prompt line and execute registration ack.
+        let extracted_gen = prompt
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("AGENT_HYDRATION_GENERATION="))
+            .expect("generation token in prompt");
+        assert_eq!(extracted_gen, generation);
+        fence_hydration_register(&store, "ada", Some(extracted_gen)).unwrap();
+        assert!(record_hydration_ack(&store, "ada", true, Some(extracted_gen), None).unwrap());
+        let after = find_hosted_session(&store, &["codex:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.hydration_status, HydrationStatus::Confirmed);
+    }
+
+    #[test]
+    fn hydration_ordering_projection_duplicate_idempotence_stale_fencing_and_70_restart_pruning() {
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = LifecycleEnv {
+            runtime: &fake,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+
+        // Case 1: Early acknowledgement before post-spawn persist_hosted_session promotes record.
+        let store1 = MemStore::default();
+        let g_early = next_hydration_generation();
+        assert!(
+            record_hydration_ack(&store1, "ada", true, Some(&g_early), Some("claude:ada"),)
+                .unwrap()
+        );
+        let mut early_rec = hosted_record("claude", "ada", STATUS_RUNNING, true);
+        early_rec.hydration_dispatched = true;
+        early_rec.hydration_status = HydrationStatus::Unconfirmed;
+        early_rec.hydration_generation = Some(g_early.clone());
+        persist_hosted_session(&store1, &early_rec, "owner").unwrap();
+        let raw_entry = store1
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hosted_session_slug("claude:ada"),
+            )
+            .unwrap()
+            .unwrap();
+        let StatePayload::Runtime(rt) = raw_entry.payload else {
+            panic!("expected runtime payload");
+        };
+        let persisted_rec: HostedSessionRecord = serde_json::from_value(rt.value).unwrap();
+        assert_eq!(
+            persisted_rec.hydration_status,
+            HydrationStatus::Confirmed,
+            "Case 1: post-spawn persist_hosted_session must promote status to Confirmed"
+        );
+
+        // Case 2: Normal delayed ack observed across list_hosted_sessions, find_hosted_session,
+        // set_hosted_session_model, and set_hosted_session_posture without another spin_up/restart.
+        let store2 = MemStore::default();
+        let spun = spin_up(
+            &store2,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g1 = spun.hydration_generation.clone().unwrap();
+        assert_eq!(spun.hydration_status, HydrationStatus::Unconfirmed);
+        assert!(record_hydration_ack(&store2, "ada", true, Some(&g1), Some("claude:ada")).unwrap());
+        assert_eq!(
+            list_hosted_sessions(&store2).unwrap()[0].hydration_status,
+            HydrationStatus::Confirmed
+        );
+        assert_eq!(
+            find_hosted_session(&store2, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .hydration_status,
+            HydrationStatus::Confirmed
+        );
+        assert_eq!(
+            set_hosted_session_model(&store2, &["claude:ada"], "opus", Some("high"), "owner")
+                .unwrap()
+                .unwrap()
+                .hydration_status,
+            HydrationStatus::Confirmed
+        );
+        assert_eq!(
+            set_hosted_session_posture(
+                &store2,
+                &["claude:ada"],
+                fl_core::permissions::Posture::Plan,
+                "owner",
+            )
+            .unwrap()
+            .unwrap()
+            .hydration_status,
+            HydrationStatus::Confirmed
+        );
+
+        // Case 3: Duplicate ack is idempotent and preserves accepted_at_ms.
+        let ack_entry_1 = store2
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hydration_ack_slug(&g1),
+            )
+            .unwrap()
+            .unwrap();
+        let StatePayload::Runtime(rt1) = ack_entry_1.payload else {
+            panic!("expected runtime");
+        };
+        let receipt1: HydrationReceipt = serde_json::from_value(rt1.value).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(
+            !record_hydration_ack(&store2, "ada", true, Some(&g1), Some("claude:ada")).unwrap(),
+            "duplicate ack must not rewrite receipt"
+        );
+        let ack_entry_2 = store2
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hydration_ack_slug(&g1),
+            )
+            .unwrap()
+            .unwrap();
+        let StatePayload::Runtime(rt2) = ack_entry_2.payload else {
+            panic!("expected runtime");
+        };
+        let receipt2: HydrationReceipt = serde_json::from_value(rt2.value).unwrap();
+        assert_eq!(receipt1.accepted_at_ms, receipt2.accepted_at_ms);
+
+        // Qualification: replace=false or mismatched FL_HOSTED_ID never writes a receipt.
+        let g_unqual = next_hydration_generation();
+        assert!(!record_hydration_ack(&store2, "ada", false, Some(&g_unqual), None).unwrap());
+        assert!(
+            !record_hydration_ack(&store2, "ada", true, Some(&g_unqual), Some("claude:other"),)
+                .unwrap()
+        );
+        assert!(
+            store2
+                .get_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hydration_ack_slug(&g_unqual),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        // Case 4 & 70-restart pruning across 70 consecutive restart cycles.
+        let mut prev_gen = g1.clone();
+        for _ in 0..70 {
+            fake.clear();
+            let restarted = restart_hosted_session(&store2, &env, "claude:ada", "owner").unwrap();
+            let cur_gen = restarted.record.hydration_generation.clone().unwrap();
+            assert!(prev_gen < cur_gen, "expected {prev_gen} < {cur_gen}");
+            // Stale generationprev_gen is refused with exact message.
+            let err = fence_hydration_register(&store2, "ada", Some(&prev_gen)).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "registration refused for `ada`: session launch generation `{prev_gen}` was superseded by a newer launch; this process should exit"
+                )
+            );
+            // Registration without AGENT_HYDRATION_GENERATION is never refused.
+            assert!(fence_hydration_register(&store2, "ada", None).is_ok());
+            // Current generation succeeds and writes receipt.
+            fence_hydration_register(&store2, "ada", Some(&cur_gen)).unwrap();
+            assert!(
+                record_hydration_ack(&store2, "ada", true, Some(&cur_gen), Some("claude:ada"))
+                    .unwrap()
+            );
+            let ack_count = store2
+                .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
+                .unwrap()
+                .iter()
+                .filter(|e| e.slug.starts_with(HYDRATION_ACK_SLUG_PREFIX))
+                .count();
+            assert!(
+                ack_count <= 1,
+                "expected at most 1 hydration-ack-* entry, found {ack_count}"
+            );
+            prev_gen = cur_gen;
+        }
+
+        // Decommission clears hydration_generation, prunes remaining receipts to 0, and fences stale gen.
+        let target = SessionTarget::resolve(&store2, "claude:ada", None).unwrap();
+        let _ = teardown_session(&store2, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        let decom_rec = find_hosted_session(&store2, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(decom_rec.hydration_generation, None);
+        let remaining_acks = store2
+            .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
+            .unwrap()
+            .iter()
+            .filter(|e| e.slug.starts_with(HYDRATION_ACK_SLUG_PREFIX))
+            .count();
+        assert_eq!(
+            remaining_acks, 0,
+            "decommission must prune all hydration-ack-* entries"
+        );
+        let err = fence_hydration_register(&store2, "ada", Some(&prev_gen)).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "registration refused for `ada`: session launch generation `{prev_gen}` was superseded by a newer launch; this process should exit"
+            )
+        );
+        assert!(fence_hydration_register(&store2, "ada", None).is_ok());
+    }
+
+    #[test]
+    fn hydration_early_spawn_ack_multivendor_reuse_best_effort_and_prepare_clearing() {
+        // 1. Early ack landing *during* `spawn` (Spec Plan 4 bullet 1 + M3 restart from decommissioning).
+        struct EarlyAckRuntime<'a> {
+            inner: FakeRuntime,
+            store: &'a MemStore,
+            persona: &'a str,
+        }
+        impl std::fmt::Debug for EarlyAckRuntime<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("EarlyAckRuntime")
+                    .field("inner", &self.inner)
+                    .field("persona", &self.persona)
+                    .finish()
+            }
+        }
+        impl SessionRuntime for EarlyAckRuntime<'_> {
+            fn spawn(
+                &self,
+                session: &str,
+                window: &str,
+                cwd: Option<&str>,
+                launch: Option<&LaunchSpec>,
+                hosted_id: &str,
+            ) -> bool {
+                let started = self.inner.spawn(session, window, cwd, launch, hosted_id);
+                if started && let Some(spec) = launch {
+                    let g = spec
+                        .env
+                        .iter()
+                        .find_map(|(k, v)| {
+                            (k == "AGENT_HYDRATION_GENERATION").then_some(v.as_str())
+                        })
+                        .expect("AGENT_HYDRATION_GENERATION in launch.env");
+                    fence_hydration_register(self.store, self.persona, Some(g))
+                        .expect("early ack during spawn must not be refused");
+                    assert!(
+                        record_hydration_ack(
+                            self.store,
+                            self.persona,
+                            true,
+                            Some(g),
+                            Some(hosted_id),
+                        )
+                        .unwrap()
+                    );
+                }
+                started
+            }
+            fn kill(&self, unit: &str, hosted_id: &str) -> bool {
+                self.inner.kill(unit, hosted_id)
+            }
+            fn exists(&self, unit: &str) -> bool {
+                self.inner.exists(unit)
+            }
+            fn owns(&self, unit: &str, hosted_id: &str) -> bool {
+                self.inner.owns(unit, hosted_id)
+            }
+        }
+
+        let home = TempDir::new().unwrap();
+        let early_store = MemStore::default();
+        let early_rt = EarlyAckRuntime {
+            inner: FakeRuntime::default(),
+            store: &early_store,
+            persona: "ada",
+        };
+        let early_env = LifecycleEnv {
+            runtime: &early_rt,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+        let spun = spin_up(
+            &early_store,
+            &early_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(spun.runtime_spawned);
+        assert_eq!(spun.hydration_status, HydrationStatus::Confirmed);
+        let stored_after_spin = find_hosted_session(&early_store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_after_spin.hydration_status,
+            HydrationStatus::Confirmed
+        );
+        assert!(stored_after_spin.runtime_spawned);
+
+        // Prepare decommission clears hydration_generation to None and sets status=decommissioning.
+        let target_ada = SessionTarget::resolve(&early_store, "claude:ada", None).unwrap();
+        let prepared = prepare_decommission(
+            &early_store,
+            &early_env,
+            &target_ada,
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(prepared.status, STATUS_DECOMMISSIONING);
+        let decom_prep_rec = find_hosted_session(&early_store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(decom_prep_rec.hydration_generation, None);
+
+        // Restart from `decommissioning` when runtime died: M3 persists running record before spawn
+        // so early ack during `spawn` passes `fence_hydration_register` and promotes RestartResponse.
+        early_rt.inner.clear();
+        let restarted =
+            restart_hosted_session(&early_store, &early_env, "claude:ada", "owner").unwrap();
+        assert!(restarted.record.runtime_spawned);
+        assert_eq!(restarted.record.restart_count, 1);
+        assert_eq!(
+            restarted.record.hydration_status,
+            HydrationStatus::Confirmed
+        );
+        assert_eq!(
+            find_hosted_session(&early_store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .hydration_status,
+            HydrationStatus::Confirmed
+        );
+
+        // 2. I3: Restart when runtime already exists (or spawn_runtime = false) reuses existing
+        // hydration_generation so the live process's env G still passes fence_hydration_register.
+        let i3_home = TempDir::new().unwrap();
+        webhook_route_file(i3_home.path(), "ada");
+        let _i3_listener =
+            std::os::unix::net::UnixListener::bind(i3_home.path().join("none.sock")).unwrap();
+        let i3_store = MemStore::default();
+        let i3_fake = FakeRuntime::default();
+        let i3_env = LifecycleEnv {
+            runtime: &i3_fake,
+            spawn_runtime: true,
+            ..env(&i3_home)
+        };
+        let i3_spun = spin_up(
+            &i3_store,
+            &i3_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g_orig = i3_spun.hydration_generation.clone().unwrap();
+        assert!(
+            record_hydration_ack(&i3_store, "ada", true, Some(&g_orig), Some("claude:ada"))
+                .unwrap()
+        );
+        // Runtime "Ada" is still live in `i3_fake`: restart delivers prompt without spawning a new process.
+        let i3_restarted =
+            restart_hosted_session(&i3_store, &i3_env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            i3_restarted.record.hydration_generation.as_deref(),
+            Some(g_orig.as_str()),
+            "I3: restart without new process spawn must reuse existing hydration_generation"
+        );
+        assert_eq!(
+            i3_restarted.record.hydration_status,
+            HydrationStatus::Unconfirmed,
+            "I3: prior receipt for reused generation must be cleared before redelivery"
+        );
+        fence_hydration_register(&i3_store, "ada", Some(&g_orig)).unwrap();
+        assert!(
+            record_hydration_ack(&i3_store, "ada", true, Some(&g_orig), Some("claude:ada"))
+                .unwrap()
+        );
+        assert_eq!(
+            find_hosted_session(&i3_store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .hydration_status,
+            HydrationStatus::Confirmed
+        );
+
+        // 3. I2: Multi-vendor persona (`claude:ada` on G1 and `codex:ada` on G2 > G1) + M2 collision guard.
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+        let mv_store = MemStore::default();
+        let mv_fake = FakeRuntime::default();
+        let mv_env = LifecycleEnv {
+            runtime: &mv_fake,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+        let claude_spun = spin_up(
+            &mv_store,
+            &mv_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g_claude = claude_spun.hydration_generation.unwrap();
+        mv_fake.clear();
+        let codex_spun = spin_up(
+            &mv_store,
+            &mv_env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g_codex = codex_spun.hydration_generation.unwrap();
+        assert!(g_claude < g_codex);
+        // `claude:ada` is still live on `g_claude`: registering with `g_claude` must NOT be refused!
+        fence_hydration_register(&mv_store, "ada", Some(&g_claude)).unwrap();
+        assert!(
+            record_hydration_ack(&mv_store, "ada", true, Some(&g_claude), Some("claude:ada"))
+                .unwrap()
+        );
+        // M2: another persona attempting to record an ack with `g_claude` does not overwrite `ada`'s receipt.
+        assert!(!record_hydration_ack(&mv_store, "bob", true, Some(&g_claude), None).unwrap());
+        // Tearing down `codex:ada` must preserve `claude:ada`'s receipt for `g_claude`.
+        let codex_target = SessionTarget::resolve(&mv_store, "codex:ada", None).unwrap();
+        let _ = teardown_session(
+            &mv_store,
+            &mv_env,
+            &codex_target,
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            find_hosted_session(&mv_store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .hydration_status,
+            HydrationStatus::Confirmed,
+            "I2: tearing down codex:ada must not prune claude:ada's active receipt"
+        );
+
+        // 4. Remodel Prepare and undo_new_record clear hydration_generation to None.
+        let rem_target = SessionTarget::resolve(&mv_store, "claude:ada", None).unwrap();
+        let rem_prep = remodel_session(
+            &mv_store,
+            &mv_env,
+            &rem_target,
+            &RemodelRequest {
+                vendor: "grok".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(rem_prep.hydration_generation, None);
+        assert_eq!(
+            find_hosted_session(&mv_store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .hydration_generation,
+            None
+        );
+        let mut undo_rec = hosted_record("grok", "ada", STATUS_RUNNING, true);
+        undo_rec.hydration_generation = Some(next_hydration_generation());
+        persist_hosted_session(&mv_store, &undo_rec, "owner").unwrap();
+        undo_new_record(&mv_store, "grok:ada", None, "owner", Some(home.path())).unwrap();
+        let undone = find_hosted_session(&mv_store, &["grok:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(undone.status, STATUS_DECOMMISSIONED);
+        assert_eq!(undone.hydration_generation, None);
+
+        // 5. I4: `persist_hosted_session` succeeds even if receipt promotion or pruning hits a store error.
+        struct FailingReceiptStore {
+            inner: MemStore,
+        }
+        impl StateStore for FailingReceiptStore {
+            fn upsert_state(
+                &self,
+                args: UpsertStateArgs,
+            ) -> Result<fl_core::state::StateEntry, StoreError> {
+                self.inner.upsert_state(args)
+            }
+            fn retire_memory(
+                &self,
+                scope: &StateScope,
+                slug: &str,
+                lifecycle: fl_core::state::MemoryLifecycle,
+                superseded_by: Option<fl_core::ids::StateId>,
+                at: fl_core::At,
+                by: &str,
+            ) -> Result<fl_core::state::StateEntry, StoreError> {
+                self.inner
+                    .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
+            }
+            fn get_state(
+                &self,
+                id: &fl_core::ids::StateId,
+            ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+                self.inner.get_state(id)
+            }
+            fn get_state_by_key(
+                &self,
+                scope: &StateScope,
+                concern: StateConcern,
+                slug: &str,
+            ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+                if slug.starts_with(HYDRATION_ACK_SLUG_PREFIX) {
+                    return Err(StoreError::Credential("injected receipt read error".into()));
+                }
+                self.inner.get_state_by_key(scope, concern, slug)
+            }
+            fn delete_state_by_key(
+                &self,
+                _scope: &StateScope,
+                _concern: StateConcern,
+                _slug: &str,
+            ) -> Result<bool, StoreError> {
+                Err(StoreError::Credential(
+                    "injected receipt delete error".into(),
+                ))
+            }
+            fn list_state(
+                &self,
+                scope: Option<&StateScope>,
+                concern: Option<StateConcern>,
+            ) -> Result<Vec<fl_core::state::StateEntry>, StoreError> {
+                self.inner.list_state(scope, concern)
+            }
+            fn state_revisions(
+                &self,
+                id: &fl_core::ids::StateId,
+            ) -> Result<Vec<fl_core::state::StateRevision>, StoreError> {
+                self.inner.state_revisions(id)
+            }
+            fn list_conflicts(&self) -> Result<Vec<fl_core::state::StateConflict>, StoreError> {
+                self.inner.list_conflicts()
+            }
+            fn resolve_conflict(
+                &self,
+                id: &fl_core::ids::StateId,
+                keep: &fl_core::ids::RevisionId,
+                at: fl_core::At,
+                by: &str,
+            ) -> Result<fl_core::state::StateEntry, StoreError> {
+                self.inner.resolve_conflict(id, keep, at, by)
+            }
+            fn state_revisions_after(
+                &self,
+                after_seq: u64,
+            ) -> Result<Vec<(u64, fl_core::state::StateRevision)>, StoreError> {
+                self.inner.state_revisions_after(after_seq)
+            }
+            fn import_state_revisions(
+                &self,
+                revisions: &[fl_core::state::StateRevision],
+                merge_at: fl_core::At,
+            ) -> Result<(), StoreError> {
+                self.inner.import_state_revisions(revisions, merge_at)
+            }
+            fn sync_cursor(
+                &self,
+                remote: &str,
+            ) -> Result<Option<fl_core::state::StateSyncCursor>, StoreError> {
+                self.inner.sync_cursor(remote)
+            }
+            fn set_sync_cursor(
+                &self,
+                cursor: fl_core::state::StateSyncCursor,
+            ) -> Result<(), StoreError> {
+                self.inner.set_sync_cursor(cursor)
+            }
+        }
+
+        let failing_store = FailingReceiptStore {
+            inner: MemStore::default(),
+        };
+        let g_fail = next_hydration_generation();
+        let g_stale = next_hydration_generation();
+        assert!(
+            record_hydration_ack(&failing_store.inner, "ada", true, Some(&g_stale), None).unwrap()
+        );
+        let mut rec_i4 = hosted_record("claude", "ada", STATUS_RUNNING, true);
+        rec_i4.hydration_status = HydrationStatus::Unconfirmed;
+        rec_i4.hydration_generation = Some(g_fail);
+        persist_hosted_session(&failing_store, &rec_i4, "owner")
+            .expect("I4: receipt promotion/pruning errors must not fail persist_hosted_session");
+        assert!(
+            find_hosted_session(&failing_store.inner, &["claude:ada"])
+                .unwrap()
+                .is_some()
+        );
     }
 }

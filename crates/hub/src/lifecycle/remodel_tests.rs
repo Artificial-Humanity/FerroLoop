@@ -1140,6 +1140,14 @@ impl StateStore for FaultyStore {
     ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
         self.inner.get_state_by_key(scope, concern, slug)
     }
+    fn delete_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner.delete_state_by_key(scope, concern, slug)
+    }
     fn list_state(
         &self,
         scope: Option<&StateScope>,
@@ -1384,6 +1392,7 @@ fn a_peers_failed_remodel_restores_exactly_the_session_it_tore_down() {
         HostedSessionRecord {
             updated_at_ms: before.updated_at_ms,
             vendor_session_id: before.vendor_session_id.clone(),
+            hydration_generation: before.hydration_generation.clone(),
             ..after
         },
         before
@@ -1656,6 +1665,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         cwd: None,
         hydration_dispatched: false,
         hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+        hydration_generation: None,
         runtime_spawned: false,
         tombstone_ids: vec!["gs-old".into()],
         vendor_session_id: None,
