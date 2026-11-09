@@ -27,6 +27,7 @@ import {
   type HubStatsResponse,
   type InterruptSessionResponse,
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   type LivenessResponse,
   type OperatorAccount,
   type OperatorRole,
@@ -1103,6 +1104,7 @@ export class HubApiClient {
     return {
       ...res,
       hydration_status: normalizeHydrationStatus(res.hydration_status),
+      warnings: normalizeHydrationWarnings(res.warnings),
     };
   }
 
@@ -2350,6 +2352,7 @@ export class HubApiClient {
     return {
       ...res,
       hydration_status: normalizeHydrationStatus(res.hydration_status),
+      warnings: normalizeHydrationWarnings(res.warnings),
     };
   }
 

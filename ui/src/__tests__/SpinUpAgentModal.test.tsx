@@ -1164,4 +1164,243 @@ describe("SpinUpAgentModal", () => {
 
     unmount();
   });
+
+  it("renders plain-text hydration warnings when present and omits them when empty or absent in SpinUpAgentModal and App (#419)", async () => {
+    let nextWarnings: string[] | undefined = undefined;
+    const onSpunUp = vi.fn();
+
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.endsWith("/api/v1/sessions/spin-up") && method === "POST") {
+          const body = JSON.parse(String(init?.body));
+          return json({
+            ...(nextWarnings !== undefined ? { warnings: nextWarnings } : {}),
+            session_id: `sess-${body.persona}`,
+            persona: body.persona,
+            project: body.project,
+            role: body.role,
+            vendor: body.vendor,
+            model: body.model ?? null,
+            posture: body.posture,
+            node_id: body.node_id ?? "ai-lab-0",
+            hosted: Boolean(body.hosted),
+            status: "running",
+            hydration_dispatched: true,
+            hydration_status: "confirmed",
+          });
+        }
+        return json({});
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const { unmount: unmountModal } = render(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        apiClient={apiClient}
+        onSpunUp={onSpunUp}
+      />,
+    );
+
+    // 1. Absent warnings (undefined) -> normalized to [] and no warning list rendered
+    nextWarnings = undefined;
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "fiona" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpunUp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          persona: "fiona",
+          hydration_status: "confirmed",
+          warnings: [],
+        }),
+      );
+    });
+    expect(screen.getByTestId("spin-up-hydration-status")).toHaveAttribute(
+      "data-hydration-status",
+      "confirmed",
+    );
+    expect(screen.queryByTestId("spin-up-warnings")).not.toBeInTheDocument();
+
+    // 2. Empty warnings ([]) -> no warning list rendered
+    nextWarnings = [];
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "feira" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpunUp).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          persona: "feira",
+          hydration_status: "confirmed",
+          warnings: [],
+        }),
+      );
+    });
+    expect(screen.queryByTestId("spin-up-warnings")).not.toBeInTheDocument();
+
+    // 3. Present warnings -> rendered one line per item as plain text, while launch still reads as succeeded
+    nextWarnings = [
+      "role file not found: looked in /workspace/.agents/roles/FerroLoop/scribe.md",
+      "<img src=x onerror=alert(1)> missing project WORKFLOW.md",
+    ];
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "felix" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    const warningsList = await screen.findByTestId("spin-up-warnings");
+    expect(warningsList).toHaveAttribute("role", "status");
+    const items = screen.getAllByTestId("spin-up-warning-item");
+    expect(items).toHaveLength(2);
+    expect(items[0]).toHaveTextContent(
+      "role file not found: looked in /workspace/.agents/roles/FerroLoop/scribe.md",
+    );
+    expect(items[1].textContent).toBe(
+      "<img src=x onerror=alert(1)> missing project WORKFLOW.md",
+    );
+    expect(items[1].querySelector("img")).toBeNull();
+    expect(screen.getByTestId("spin-up-hydration-status")).toHaveAttribute(
+      "data-hydration-status",
+      "confirmed",
+    );
+
+    unmountModal();
+
+    // 4. App surfaces spin-up warnings in session-hydration-warnings after modal closes
+    let appSpinUpWarnings: string[] | undefined = [
+      "cwd is outside project ferroloop",
+      "<b>plain text warning</b>",
+    ];
+    const appFetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.includes("/api/v1/auth/session")) {
+          return json({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          });
+        }
+        if (url.endsWith("/api/v1/agents")) {
+          return json({
+            agents: [
+              {
+                name_key: "felix",
+                display_name: "Felix",
+                project: "FerroLoop",
+                role: "ui-developer",
+              },
+            ],
+            routes: [],
+          });
+        }
+        if (url.endsWith("/api/v1/hosted-sessions")) {
+          return json({ sessions: [] });
+        }
+        if (url.endsWith("/api/v1/sessions/spin-up") && method === "POST") {
+          const body = JSON.parse(String(init?.body));
+          return json({
+            ...(appSpinUpWarnings !== undefined
+              ? { warnings: appSpinUpWarnings }
+              : {}),
+            session_id: "claude:felix",
+            persona: body.persona,
+            project: body.project,
+            role: body.role,
+            vendor: body.vendor,
+            model: body.model ?? null,
+            node_id: body.node_id ?? "ai-lab-0",
+            hosted: Boolean(body.hosted),
+            status: "running",
+            hydration_dispatched: true,
+            hydration_status: "confirmed",
+          });
+        }
+        return json({});
+      },
+    );
+
+    const appApiClient = new HubApiClient({
+      fetchImpl: appFetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount: unmountApp } = render(
+      <App
+        apiClient={appApiClient}
+        wsClient={wsStub}
+        initialSelectedAgentName="felix"
+      />,
+    );
+
+    fireEvent.click(await screen.findByTestId("spin-up-agent-btn"));
+    expect(
+      await screen.findByTestId("spin-up-agent-modal"),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "felix" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    const sessionWarnings = await screen.findByTestId(
+      "session-hydration-warnings",
+    );
+    expect(sessionWarnings).toHaveAttribute("role", "status");
+    const sessionWarningItems = screen.getAllByTestId(
+      "session-hydration-warning-item",
+    );
+    expect(sessionWarningItems).toHaveLength(2);
+    expect(sessionWarningItems[0]).toHaveTextContent(
+      "cwd is outside project ferroloop",
+    );
+    expect(sessionWarningItems[1].textContent).toBe("<b>plain text warning</b>");
+    expect(sessionWarningItems[1].querySelector("b")).toBeNull();
+    expect(
+      screen.getByTestId("session-hydration-status-badge"),
+    ).toHaveAttribute("data-hydration-status", "confirmed");
+
+    // Spin up again with absent warnings -> banner clears
+    appSpinUpWarnings = undefined;
+    fireEvent.click(screen.getByTestId("spin-up-agent-btn"));
+    fireEvent.change(await screen.findByTestId("spin-up-persona-input"), {
+      target: { value: "felix" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByTestId("session-hydration-warnings"),
+      ).not.toBeInTheDocument();
+    });
+
+    unmountApp();
+  });
 });

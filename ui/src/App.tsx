@@ -75,6 +75,7 @@ import {
 import {
   DEFAULT_WORKSPACE_AGENTS,
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   type AgentLivenessItem,
   type AgentRecord,
   type AuthSessionResponse,
@@ -1884,6 +1885,7 @@ export const App: React.FC<AppProps> = ({
             typeof data.hydration_dispatched === "boolean"
               ? data.hydration_dispatched
               : undefined;
+          const hydrationWarnings = normalizeHydrationWarnings(data.warnings);
           setSpunUpByAgent((prev) => {
             const existing = prev[personaKey];
             const vendor =
@@ -1907,6 +1909,7 @@ export const App: React.FC<AppProps> = ({
                 hydrationDispatched:
                   hydrationDispatched ?? existing?.hydrationDispatched,
                 hydrationStatus,
+                warnings: hydrationWarnings,
               },
             };
           });
@@ -2067,6 +2070,7 @@ export const App: React.FC<AppProps> = ({
         sessionId: string | null;
         hydrationDispatched?: boolean;
         hydrationStatus?: HydrationStatus;
+        warnings?: string[];
       }
     >
   >({});
@@ -2169,6 +2173,9 @@ export const App: React.FC<AppProps> = ({
       activeHostedSession?.hydration_dispatched
     );
   }, [activeSession, activeRoute, activeSpunUp, activeHostedSession]);
+  const activeHydrationWarnings = useMemo<string[]>(() => {
+    return normalizeHydrationWarnings(activeSpunUp?.warnings);
+  }, [activeSpunUp]);
   const activeAdapter = useMemo(() => {
     const candidates = [
       activeSession?.adapter,
@@ -2479,9 +2486,11 @@ export const App: React.FC<AppProps> = ({
   const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
     const rawRes = await apiClient.spinUpSession(req);
     const hydrationStatus = normalizeHydrationStatus(rawRes.hydration_status);
+    const warnings = normalizeHydrationWarnings(rawRes.warnings);
     const res = {
       ...rawRes,
       hydration_status: hydrationStatus,
+      warnings,
     };
     const personaKey = (res.persona || req.persona || "").trim().toLowerCase();
     if (personaKey) {
@@ -2493,6 +2502,7 @@ export const App: React.FC<AppProps> = ({
           sessionId: res.session_id || null,
           hydrationDispatched: Boolean(res.hydration_dispatched),
           hydrationStatus,
+          warnings,
         },
       }));
       setHostedSessionsByAgent((prev) => {
@@ -2797,6 +2807,7 @@ export const App: React.FC<AppProps> = ({
                 const hydrationStatus = normalizeHydrationStatus(
                   res.hydration_status,
                 );
+                const warnings = normalizeHydrationWarnings(res.warnings);
                 setSpunUpByAgent((prev) => ({
                   ...prev,
                   [personaKey]: {
@@ -2806,6 +2817,7 @@ export const App: React.FC<AppProps> = ({
                       res.session_id || prev[personaKey]?.sessionId || null,
                     hydrationDispatched: Boolean(res.hydration_dispatched),
                     hydrationStatus,
+                    warnings,
                   },
                 }));
                 setHostedSessionsByAgent((prev) => {
@@ -3277,6 +3289,7 @@ export const App: React.FC<AppProps> = ({
       }
       hydrationStatus={activeHydrationStatus}
       hydrationDispatched={activeHydrationDispatched}
+      hydrationWarnings={activeHydrationWarnings}
       sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
       turns={transcriptTurns}
       transcriptRefreshState={transcriptRefreshState}
