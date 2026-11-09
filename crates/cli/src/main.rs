@@ -986,10 +986,10 @@ fn run(cli: Cli) -> Result<i32> {
     };
     let cli = match cli {
         Cli {
+            db,
             command: Command::Host { cmd },
-            ..
         } => {
-            cmd::host::execute(cmd)?;
+            cmd::host::execute_with_db(cmd, db.as_deref())?;
             return Ok(0);
         }
         other => other,
