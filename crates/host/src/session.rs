@@ -80,6 +80,7 @@ pub(crate) struct SessionParts {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) enum ResizeError {
     SessionFenced,
     WrongMode,

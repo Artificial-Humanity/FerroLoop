@@ -888,13 +888,18 @@ async fn reliable_hold(
     phase: &str,
     cancellable: bool,
 ) -> bool {
+    let timeout = if cancellable {
+        std::time::Duration::from_secs(30)
+    } else {
+        std::time::Duration::from_secs(5)
+    };
     reliable_hold_until(
         host,
         conn,
         state,
         phase,
         cancellable,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        std::time::Instant::now() + timeout,
     )
     .await
 }

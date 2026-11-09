@@ -5155,10 +5155,22 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
 fn attached_completed_pty_reader_receives_session_fenced_notice_on_compaction() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let mut rpc = Rpc::connect(&daemon.paths.endpoint);
-    let mut child = spec("fenced-reader", &["exit", "0"]);
+    let mut old_rpc = Rpc::connect(&daemon.paths.endpoint);
+
+    let mut child = spec("fenced-reader", &["hold"]);
     child.kind = SpawnKind::Pty;
     let (stream, _) = rpc.inner.spawn_pty_session(child, None).unwrap();
     let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+
+    let mut old_child = spec("fenced-reader-v1", &["hold"]);
+    old_child.kind = SpawnKind::Pty;
+    let (old_stream, _) = old_rpc.inner.spawn_pty_session(old_child, None).unwrap();
+    let old_lease = old_rpc
+        .inner
+        .claim_controller(old_stream.clone())
+        .unwrap()
+        .lease;
+
     let XResp::Subscription {
         ticket: sub_ticket, ..
     } = rpc
@@ -5174,67 +5186,91 @@ fn attached_completed_pty_reader_receives_session_fenced_notice_on_compaction() 
     };
     let (rt, mut events) = event_socket(&daemon.paths.endpoint, sub_ticket);
     assert_eq!(event_seq(&rt, &mut events, 0), 1);
+    assert_eq!(event_seq(&rt, &mut events, 1), 2);
 
-    // Hold the reader before the next record's first part so unread records are
-    // still pending when completed-PTY compaction fences the journal.
+    let XResp::Subscription {
+        ticket: old_sub_ticket,
+        ..
+    } = old_rpc
+        .inner
+        .extension_request(XReq::SubscribeReliable {
+            stream: old_stream.clone(),
+            lease: old_lease,
+            after_seq: Some(0),
+        })
+        .unwrap()
+    else {
+        panic!("old subscribe ticket");
+    };
+    let mut old_events = rt.block_on(async {
+        let client = AsyncHostClient::connect_with(
+            &daemon.paths.endpoint,
+            fl_host_proto::ConnectOptions {
+                minor: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("old event connect");
+        assert_eq!(client.negotiated().1, 1);
+        client
+            .open_extension_stream(old_sub_ticket)
+            .await
+            .expect("old open")
+    });
+    assert_eq!(event_seq(&rt, &mut old_events, 0), 1);
+    assert_eq!(event_seq(&rt, &mut old_events, 1), 2);
+
+    // Hold both readers before the next record's first part so unread records are
+    // still pending when completed-PTY compaction fences their journals.
     arm(&daemon.paths.subscriber, "reliable-before-part");
-    wait_at(&daemon.paths.subscriber, "reliable-before-part");
     rpc.inner.kill_session(stream.clone(), lease).unwrap();
+    old_rpc
+        .inner
+        .kill_session(old_stream.clone(), old_lease)
+        .unwrap();
+    wait_at(&daemon.paths.subscriber, "reliable-before-part");
 
-    // Drive completed-PTY compaction and >8 completed-PTY retention pressure.
-    for n in 0..9 {
-        let mut extra = spec(&format!("compact-extra-{n}"), &["exit", "0"]);
-        extra.kind = SpawnKind::Pty;
-        let (extra_stream, _) = rpc.inner.spawn_pty_session(extra, None).unwrap();
-        let mut cleanup_sent = false;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let status = rpc.inner.pty_retention_status().unwrap().unwrap();
-            let records = rpc.inner.list_sessions().unwrap();
-            if !cleanup_sent
-                && records.iter().any(|r| {
-                    r.stream == extra_stream && matches!(r.state, ChildState::LeaderExited(_))
-                })
-            {
-                let extra_lease = rpc
-                    .inner
-                    .claim_controller(extra_stream.clone())
-                    .unwrap()
-                    .lease;
-                rpc.inner
-                    .kill_session(extra_stream.clone(), extra_lease)
-                    .unwrap();
-                cleanup_sent = true;
-            }
-            if records.iter().any(|r| {
-                r.stream == extra_stream && matches!(r.state, ChildState::CleanupComplete(_))
-            }) && status.completed_pty_sessions <= 8
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "extra PTY {n} did not complete");
-            thread::sleep(Duration::from_millis(5));
+    // Completing both PTYs triggers completed-PTY compaction (`compact_completed_pty`)
+    // and cancels their reader streams without needing to churn 9 extra PTYs.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rpc.inner.pty_retention_status().unwrap().unwrap();
+        let records = rpc.inner.list_sessions().unwrap();
+        if records
+            .iter()
+            .any(|r| r.stream == stream && matches!(r.state, ChildState::CleanupComplete(_)))
+            && records.iter().any(|r| {
+                r.stream == old_stream && matches!(r.state, ChildState::CleanupComplete(_))
+            })
+            && status.completed_pty_sessions == 2
+        {
+            break;
         }
+        assert!(Instant::now() < deadline, "compaction PTY did not complete");
+        thread::sleep(Duration::from_millis(5));
     }
 
-    let notice = rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                match events
-                    .next_frame()
-                    .await
-                    .expect("fenced reader frame before EOF")
-                {
-                    fl_host_proto::ExtensionFrame::Notice { code } => return code,
-                    fl_host_proto::ExtensionFrame::ReliablePart { .. } => continue,
-                    other => panic!("unexpected frame on fenced PTY stream: {other:?}"),
+    for mut reader in [events, old_events] {
+        let notice = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match reader
+                        .next_frame()
+                        .await
+                        .expect("fenced reader frame before EOF")
+                    {
+                        fl_host_proto::ExtensionFrame::Notice { code } => return code,
+                        fl_host_proto::ExtensionFrame::ReliablePart { .. } => continue,
+                        other => panic!("unexpected frame on fenced PTY stream: {other:?}"),
+                    }
                 }
-            }
-        })
-        .await
-        .expect("fenced notice deadline")
-    });
-    assert_eq!(notice, Refuse::SessionFenced);
+            })
+            .await
+            .expect("fenced notice deadline")
+        });
+        assert_eq!(notice, Refuse::SessionFenced);
+    }
     release(&daemon.paths.subscriber, "reliable-before-part");
 }
 
