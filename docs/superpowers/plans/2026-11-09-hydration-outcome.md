@@ -17,6 +17,11 @@ launches, service changes, vendor polling, callbacks or new acknowledgement
 commands. Keep `hydration_dispatched` behavior compatible. No UI changes; Felix
 owns presentation. Do not modify #402 receipt semantics or elevate delivery intent.
 
+Coordination: Feira owns D3. She adds `host_session_id` immediately after
+`tmux_target` in SpinUpResponse and RemodelResponse and populates their literals.
+Place `hydration_status` after `hydration_dispatched`, preserve her field when
+integrating main, and leave host addressing to her branch.
+
 ## Review Focus
 
 - Old records deserialize as unconfirmed regardless of their old boolean.
@@ -64,8 +69,9 @@ callers cannot accidentally derive the boolean from confirmation.
       create their own prerequisites and pass in CI without live sockets.
 - [ ] Commit with Fiona coauthor trailer, verify clean worktree and return exact
       commit and validation evidence. Fresh independent task and branch review.
-- [ ] Create and link a follow-up issue for eventual confirmation, considering
-      generation-fenced registration by the launched session. Explain in the PR
+- [ ] Link existing follow-up [#406](https://github.com/Artificial-Humanity/FerroLoop/issues/406)
+      for eventual confirmation and generation-fenced registration; do not create
+      a duplicate. Explain in the PR
       that ordinary fresh launches remain unconfirmed until such a signal exists.
 - [ ] Open a separate PR with `fl github pr create`, request Ferris exact-head
       review and merge only after current-head approval and green CI.
