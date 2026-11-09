@@ -591,26 +591,29 @@ fn launch_spec_for_with_session(
             thinking_effort: thinking_level.map(str::to_string),
             initial_prompt: prompt.to_string(),
             cwd: cwd.map(PathBuf::from),
-            home_dir: home.clone(),
+            home_dir: home,
             remote_control: options.remote_control,
             posture,
         };
-        if let Ok(plan) = host_adapter.prepare_launch(&req) {
-            return Some(LaunchSpec {
+        return host_adapter
+            .prepare_launch(&req)
+            .ok()
+            .map(|plan| LaunchSpec {
                 env: plan.env,
                 argv: plan.argv,
             });
-        }
     }
     let adapter = env.vendor_adapter(vendor)?;
-    Some(adapter.build_launch_spec_with_options(
-        persona,
-        model,
-        thinking_level,
-        prompt,
-        home.as_deref(),
-        options,
-    ))
+    adapter
+        .build_launch_spec_with_options(
+            persona,
+            model,
+            thinking_level,
+            prompt,
+            home.as_deref(),
+            options,
+        )
+        .ok()
 }
 
 #[cfg(test)]
@@ -4578,6 +4581,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         &record.project,
         &agent_role_from_label(&record.role),
     )?;
+    fl_wire::vendor_adapter::launch_permissions(&record.vendor, record.posture)
+        .map_err(|why| invalid_field("posture", &why))?;
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = runtime_unit(&want_target).to_string();
@@ -4981,14 +4986,14 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     check_registration(store, &to, OwnAgent::Retiring)?;
     // The restore puts back what was there: a session with no record was not hosted, and a
     // restore must not turn it into a managed one.
-    let restore = lookup_vendor(&from_vendor).is_some().then(|| {
-        let restore_posture =
-            if fl_wire::vendor_adapter::launch_permissions(&from_vendor, from_posture).is_ok() {
-                from_posture
-            } else {
-                fl_core::permissions::Posture::Auto
-            };
-        SpinUpRequest {
+    let restore = if lookup_vendor(&from_vendor).is_some() {
+        fl_wire::vendor_adapter::launch_permissions(&from_vendor, from_posture).map_err(|why| {
+            LifecycleError::Invalid(format!(
+                "cannot build restore plan for `{}` on `{from_vendor}` with recorded posture `{from_posture}`: {why}",
+                target.session_id
+            ))
+        })?;
+        Some(SpinUpRequest {
             persona: target.persona.clone(),
             project,
             role,
@@ -5000,9 +5005,11 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             cwd: old_cwd,
             // A restore must not fail on a window: it puts the session back as it can start.
             context_window: None,
-            posture: restore_posture,
-        }
-    });
+            posture: from_posture,
+        })
+    } else {
+        None
+    };
     // With no restore, a failed spin-up leaves the persona down; only the Owner may take that
     // risk (the remodel then warns that no restore is possible).
     if restore.is_none() && caller != Caller::Owner {

@@ -2030,6 +2030,52 @@ fn remodel_applies_posture_emits_receipts_and_refuses_unsupported_posture_before
             .any(|a| a == "--yolo" || a == "--always-approve"),
         "default auto remodel must not emit bypass flags: {grok_argv:?}"
     );
+
+    // 4. Remodeling a session whose recorded posture does not compile for `from_vendor`
+    // (e.g., `codex:ada` with `posture = Posture::Ask`) is refused with 400 before teardown.
+    let out_codex = remodel(
+        &store,
+        &env_rt,
+        "grok:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out_codex.session_id, "codex:ada");
+    let mut codex_rec = record(&store, "codex:ada");
+    codex_rec.posture = Posture::Ask;
+    persist_hosted_session(&store, &codex_rec, "owner").unwrap();
+    fake.calls.borrow_mut().clear();
+
+    let err_restore = remodel(
+        &store,
+        &env_rt,
+        "codex:ada",
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err_restore, LifecycleError::Invalid(_)),
+        "{err_restore:?}"
+    );
+    assert_eq!(err_restore.status(), 400);
+    assert!(
+        err_restore.to_string().contains(
+            "cannot build restore plan for `codex:ada` on `codex` with recorded posture `ask`"
+        ),
+        "{err_restore}"
+    );
+    assert_eq!(
+        record(&store, "codex:ada").status,
+        STATUS_RUNNING,
+        "failed restore-posture validation must not tear down the source session"
+    );
+    assert!(
+        fake.calls.borrow().is_empty(),
+        "no runtime kill or spawn may run when restore plan posture is invalid: {:?}",
+        fake.calls.borrow()
+    );
 }
 
 #[test]

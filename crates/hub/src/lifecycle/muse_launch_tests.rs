@@ -2218,3 +2218,40 @@ fn spin_up_refuses_unsupported_vendor_posture_before_registering_agent_or_persis
         );
     }
 }
+
+#[test]
+fn restart_hosted_session_refuses_record_with_unsupported_posture_without_spawning() {
+    use fl_core::permissions::Posture;
+
+    let home = TempDir::new().unwrap();
+    for (vendor, bad_posture) in [
+        ("codex", Posture::Ask),
+        ("antigravity", Posture::Ask),
+        ("muse", Posture::Plan),
+        ("lemonade", Posture::Bypass),
+    ] {
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let out = spin(&store, &env, "ada", vendor);
+        let mut record = find_hosted_session(&store, &[&out.session_id])
+            .unwrap()
+            .unwrap();
+        record.posture = bad_posture;
+        persist_hosted_session(&store, &record, "owner").unwrap();
+
+        let second = FakeRuntime::default();
+        let err =
+            restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner")
+                .unwrap_err();
+        assert!(
+            matches!(err, LifecycleError::Invalid(_)),
+            "{vendor} {bad_posture}: {err:?}"
+        );
+        assert_eq!(err.status(), 400, "{vendor} {bad_posture}");
+        assert!(
+            second.launches.borrow().is_empty(),
+            "restart must produce no launch when {vendor} refuses {bad_posture}"
+        );
+    }
+}

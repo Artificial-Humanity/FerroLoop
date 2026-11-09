@@ -210,6 +210,7 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
             home,
             VendorLaunchOptions::default(),
         )
+        .expect("default Auto posture is supported by all built-in adapters")
     }
 
     /// Build the full `LaunchSpec` (`env` + `argv`) with explicit [`VendorLaunchOptions`].
@@ -221,7 +222,7 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
-    ) -> LaunchSpec;
+    ) -> Result<LaunchSpec, String>;
 
     /// Whether a launch with `thinking_level` (already a plain token) can honour it. The default
     /// refuses: a vendor with no launch option for it must not report a level it never applied.
@@ -517,12 +518,12 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
-    ) -> LaunchSpec {
+    ) -> Result<LaunchSpec, String> {
         // Place `--remote-control` before `--permission-mode <mode>` so `--remote-control [name]`
         // (which accepts an optional name in Commander.js) is always followed by a `--` flag
         // and never consumes the trailing positional `<prompt>` when `model` and
         // `thinking_level` are both `None`.
-        let perms = self.check_posture(options.posture).unwrap_or_default();
+        let perms = self.check_posture(options.posture)?;
         let mut argv = vec![self.resolve_binary(home)];
         if options.remote_control {
             argv.extend(self.remote_control_args(persona));
@@ -535,10 +536,10 @@ impl VendorCliAdapter for ClaudeCliAdapter {
             argv.extend(["--effort".to_string(), level.to_string()]);
         }
         argv.push(muse_prompt_argument(prompt));
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 
     fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
@@ -592,8 +593,8 @@ impl VendorCliAdapter for CodexCliAdapter {
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
-    ) -> LaunchSpec {
-        let perms = self.check_posture(options.posture).unwrap_or_default();
+    ) -> Result<LaunchSpec, String> {
+        let perms = self.check_posture(options.posture)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if options.remote_control {
@@ -609,10 +610,10 @@ impl VendorCliAdapter for CodexCliAdapter {
             ]);
         }
         argv.push(muse_prompt_argument(prompt));
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 
     fn interrupt_key(&self) -> &str {
@@ -683,8 +684,8 @@ impl VendorCliAdapter for AntigravityCliAdapter {
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
-    ) -> LaunchSpec {
-        let perms = self.check_posture(options.posture).unwrap_or_default();
+    ) -> Result<LaunchSpec, String> {
+        let perms = self.check_posture(options.posture)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if options.remote_control {
@@ -699,10 +700,10 @@ impl VendorCliAdapter for AntigravityCliAdapter {
         }
         argv.push("--prompt-interactive".to_string());
         argv.push(muse_prompt_argument(prompt));
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 
     fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
@@ -738,18 +739,18 @@ impl VendorCliAdapter for GrokCliAdapter {
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
-    ) -> LaunchSpec {
-        let perms = self.check_posture(options.posture).unwrap_or_default();
+    ) -> Result<LaunchSpec, String> {
+        let perms = self.check_posture(options.posture)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if let Some(m) = self.normalize_model(model) {
             argv.extend(["--model".to_string(), m]);
         }
         argv.push(muse_prompt_argument(prompt));
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 
     fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
@@ -785,8 +786,8 @@ impl VendorCliAdapter for MuseCliAdapter {
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
-    ) -> LaunchSpec {
-        let perms = self.check_posture(options.posture).unwrap_or_default();
+    ) -> Result<LaunchSpec, String> {
+        let perms = self.check_posture(options.posture)?;
         let mut argv = vec![
             self.resolve_binary(home),
             "--model".to_string(),
@@ -794,10 +795,10 @@ impl VendorCliAdapter for MuseCliAdapter {
         ];
         argv.extend(perms.args);
         argv.push(muse_prompt_argument(prompt));
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 
     fn reset_command(&self) -> &str {
@@ -834,8 +835,9 @@ impl VendorCliAdapter for LemonadeCliAdapter {
         _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
-        _options: VendorLaunchOptions,
-    ) -> LaunchSpec {
+        options: VendorLaunchOptions,
+    ) -> Result<LaunchSpec, String> {
+        let perms = self.check_posture(options.posture)?;
         let host = std::env::var("FL_LEMONADE_HOST")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -863,6 +865,7 @@ impl VendorCliAdapter for LemonadeCliAdapter {
             port,
             "chat".to_string(),
         ];
+        argv.extend(perms.args);
         if !prompt.trim().is_empty() {
             argv.extend(["--system".to_string(), prompt.to_string()]);
         }
@@ -870,10 +873,10 @@ impl VendorCliAdapter for LemonadeCliAdapter {
             self.normalize_model(model)
                 .unwrap_or_else(|| LEMONADE_DEFAULT_CLI_MODEL.to_string()),
         );
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 }
 
@@ -915,21 +918,23 @@ impl VendorCliAdapter for OllamaCliAdapter {
         _thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
-        _options: VendorLaunchOptions,
-    ) -> LaunchSpec {
+        options: VendorLaunchOptions,
+    ) -> Result<LaunchSpec, String> {
+        let perms = self.check_posture(options.posture)?;
         let mut argv = vec![
             self.resolve_binary(home),
             "run".to_string(),
             self.normalize_model(model)
                 .unwrap_or_else(|| OLLAMA_DEFAULT_CLI_MODEL.to_string()),
         ];
+        argv.extend(perms.args);
         if !prompt.trim().is_empty() {
             argv.push(muse_prompt_argument(prompt));
         }
-        LaunchSpec {
+        Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
-        }
+        })
     }
 }
 
@@ -1235,8 +1240,9 @@ mod tests {
         };
         let claude = lookup_vendor_cli_adapter("claude").unwrap();
         assert!(claude.supports_remote_control());
-        let spec_off =
-            claude.build_launch_spec_with_options("ada", Some("opus"), None, "Hi", None, off);
+        let spec_off = claude
+            .build_launch_spec_with_options("ada", Some("opus"), None, "Hi", None, off)
+            .unwrap();
         assert_eq!(
             &spec_off.argv[1..],
             &["--permission-mode", "auto", "--model", "opus", "Hi"]
@@ -1244,8 +1250,9 @@ mod tests {
 
         let codex = lookup_vendor_cli_adapter("codex").unwrap();
         assert!(codex.supports_remote_control());
-        let spec_off =
-            codex.build_launch_spec_with_options("ada", Some("gpt-5"), None, "Hi", None, off);
+        let spec_off = codex
+            .build_launch_spec_with_options("ada", Some("gpt-5"), None, "Hi", None, off)
+            .unwrap();
         assert_eq!(
             &spec_off.argv[1..],
             &[
@@ -1261,14 +1268,9 @@ mod tests {
 
         let agy = lookup_vendor_cli_adapter("antigravity").unwrap();
         assert!(agy.supports_remote_control());
-        let spec_off = agy.build_launch_spec_with_options(
-            "ada",
-            Some("claude-sonnet-5-5"),
-            None,
-            "Hi",
-            None,
-            off,
-        );
+        let spec_off = agy
+            .build_launch_spec_with_options("ada", Some("claude-sonnet-5-5"), None, "Hi", None, off)
+            .unwrap();
         assert_eq!(
             &spec_off.argv[1..],
             &[
@@ -1504,20 +1506,7 @@ mod tests {
                         | ("muse", Posture::Plan)
                 ) || (matches!(vendor, "lemonade" | "ollama")
                     && posture != Posture::Auto);
-                if unsupported {
-                    let err = res
-                        .err()
-                        .unwrap_or_else(|| panic!("{vendor} {posture} must be refused"));
-                    assert!(!err.is_empty(), "{vendor} {posture}");
-                    continue;
-                }
-                let perms = res
-                    .unwrap_or_else(|e| panic!("{vendor} {posture} must be supported, got: {e}"));
-                assert!(!perms.receipts.is_empty(), "{vendor} {posture}");
-                for receipt in &perms.receipts {
-                    assert!(!receipt.summary.is_empty(), "{vendor} {posture}");
-                }
-                let spec = adapter.build_launch_spec_with_options(
+                let spec_res = adapter.build_launch_spec_with_options(
                     "ada",
                     None,
                     None,
@@ -1528,6 +1517,26 @@ mod tests {
                         posture,
                     },
                 );
+                if unsupported {
+                    let err = res
+                        .err()
+                        .unwrap_or_else(|| panic!("{vendor} {posture} must be refused"));
+                    assert!(!err.is_empty(), "{vendor} {posture}");
+                    let spec_err = spec_res.err().unwrap_or_else(|| {
+                        panic!("{vendor} {posture} launch spec must fail closed")
+                    });
+                    assert_eq!(spec_err, err, "{vendor} {posture}");
+                    continue;
+                }
+                let perms = res
+                    .unwrap_or_else(|e| panic!("{vendor} {posture} must be supported, got: {e}"));
+                assert!(!perms.receipts.is_empty(), "{vendor} {posture}");
+                for receipt in &perms.receipts {
+                    assert!(!receipt.summary.is_empty(), "{vendor} {posture}");
+                }
+                let spec = spec_res.unwrap_or_else(|e| {
+                    panic!("{vendor} {posture} launch spec must succeed, got: {e}")
+                });
                 assert_eq!(
                     has_bypass(&spec.argv),
                     posture == Posture::Bypass && !matches!(vendor, "lemonade" | "ollama"),
