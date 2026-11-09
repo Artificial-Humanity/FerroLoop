@@ -1874,25 +1874,28 @@ mod tests {
         let drained = Arc::clone(&received);
         let ticks = Arc::new(AtomicUsize::new(0));
         let drain_ticks = Arc::clone(&ticks);
+        let advance_reader = Arc::new(move |duration| {
+            assert_eq!(duration, Duration::from_millis(1));
+            advance(&sleeper_clock, duration);
+            // The reader runs on all elapsed time, including producer work.
+            // It takes four milliseconds per 2 KiB record; without pacing the
+            // producer offers a 64 KiB read each millisecond.
+            if drain_ticks.fetch_add(1, Ordering::SeqCst) % 4 != 3 {
+                return;
+            }
+            let (weak, sub) = drain_reader.lock().unwrap().as_ref().unwrap().clone();
+            let hub = weak.upgrade().unwrap();
+            if !sub.want_slow(&hub) && sub.next_event(&hub).is_some() {
+                let event = drain_one(&sub, &hub);
+                check_record(&event);
+                drained.lock().unwrap().push(event.seq);
+            }
+        });
+        let pacing_advance = Arc::clone(&advance_reader);
         let hub = Arc::new(Hub::with_timing(
             move || *grace_clock.lock().unwrap(),
             move || *pacing_clock.lock().unwrap(),
-            move |duration| {
-                assert_eq!(duration, Duration::from_millis(1));
-                advance(&sleeper_clock, duration);
-                // Reader takes four milliseconds per 2 KiB record; the
-                // producer offers a 64 KiB read each millisecond without pacing.
-                if drain_ticks.fetch_add(1, Ordering::SeqCst) % 4 != 3 {
-                    return;
-                }
-                let (weak, sub) = drain_reader.lock().unwrap().as_ref().unwrap().clone();
-                let hub = weak.upgrade().unwrap();
-                if sub.next_event(&hub).is_some() {
-                    let event = drain_one(&sub, &hub);
-                    check_record(&event);
-                    drained.lock().unwrap().push(event.seq);
-                }
-            },
+            move |duration| pacing_advance(duration),
         ));
         let out = fixture(1, &hub);
         let sub = Arc::new(hub.subscribe(None, None).ok().unwrap());
@@ -1909,10 +1912,20 @@ mod tests {
                 "bounded pacing must keep the producer progressing"
             );
             let end = (offset + room).min(input.len());
-            advance(&clock, Duration::from_millis(1));
+            let before = ticks.load(Ordering::SeqCst);
+            advance_reader(Duration::from_millis(1));
+            assert_eq!(
+                ticks.load(Ordering::SeqCst),
+                before + 1,
+                "producer time must advance the same reader scheduler"
+            );
             assert!(out.push(&input[offset..end]));
             offset = end;
-            assert!(!sub.want_slow(&hub), "draining sustained reader was shed");
+            let completed = received.lock().unwrap().len();
+            if sub.want_slow(&hub) {
+                assert!(completed > 0, "RED must include successful reader progress");
+                panic!("draining sustained reader was shed after {completed} completed records");
+            }
             let inner = out.inner.lock().unwrap();
             assert!(inner.events.len() <= MAX_EVENTS);
             assert!(OutputSession::charge(&inner).charge <= MAX_STDOUT_BACKLOG);
