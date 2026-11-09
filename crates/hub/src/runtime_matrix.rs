@@ -46,8 +46,8 @@ use crate::auth::HubAuthority;
 use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
     DiscoveredSessionSummary, SessionQuotaUsage, codex_account_quota,
-    codex_session_matches_account, discover_route_sessions_without_model_info,
-    normalize_codex_plan, quota_for_resolved_route, quota_for_resolved_route_at,
+    codex_reading_matches_account, discover_route_sessions_without_model_info,
+    quota_for_resolved_route, quota_for_resolved_route_at, quota_richness,
     snapshot_discovery_store,
 };
 use crate::runtime_update::update_command;
@@ -405,21 +405,6 @@ fn quota_adapter(cli: &str) -> &str {
     if cli == "agy" { "antigravity" } else { cli }
 }
 
-/// How many facts a quota reading holds; the reading with the most is the most useful. A window
-/// that reset before `now_ms` describes an allowance that no longer applies, so it counts for
-/// nothing.
-fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
-    let text = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.trim().is_empty());
-    let live = |w: &Option<crate::discovery::QuotaWindowUsage>| {
-        w.as_ref()
-            .is_some_and(|w| w.resets_at_ms.is_none_or(|reset| reset >= now_ms))
-    };
-    usize::from(text(&q.tier))
-        + usize::from(live(&q.primary_window))
-        + usize::from(live(&q.secondary_window))
-        + usize::from(text(&q.exhausted_reason))
-}
-
 /// The allowance of one vendor: the richest live reading among its sessions (the newest session
 /// wins a tie), else the account probe.
 fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage> {
@@ -429,6 +414,7 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
         .then(|| (inputs.quota_source.account)(adapter, home))
         .flatten()
         .filter(|q| quota_richness(q, now_ms) > 0);
+    let account_tier = codex_account.as_ref().and_then(|q| q.tier.as_deref());
     let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
         .sessions
         .iter()
@@ -439,27 +425,24 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
     let mut reads_left = MAX_QUOTA_SESSIONS_PER_ADAPTER;
     let mut best: Option<(usize, SessionQuotaUsage)> = None;
     for session in sessions {
-        if codex_account.is_some() && !codex_session_matches_account(session, home) {
-            continue;
-        }
         let reading = match &session.quota_usage {
             Some(q) => Some(q.clone()),
             None if session.source == "route" && reads_left > 0 => {
+                if codex_account.is_some()
+                    && !crate::discovery::codex_session_matches_account(session, home)
+                {
+                    continue;
+                }
                 reads_left -= 1;
                 (inputs.quota_source.session)(session, home)
             }
             None => None,
         };
         let Some(reading) = reading else { continue };
-        if let Some(account) = &codex_account {
-            let matching_tier = account
-                .tier
-                .as_deref()
-                .zip(reading.tier.as_deref())
-                .is_some_and(|(a, b)| normalize_codex_plan(a) == normalize_codex_plan(b));
-            if !matching_tier {
-                continue;
-            }
+        if adapter == "codex"
+            && !codex_reading_matches_account(session, &reading, account_tier, home)
+        {
+            continue;
         }
         let richness = quota_richness(&reading, now_ms);
         if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
@@ -2131,6 +2114,7 @@ mod tests {
             primary_window: primary.map(|u| window(u, 300)),
             secondary_window: secondary.map(|u| window(u, 10_080)),
             exhausted_reason: None,
+            observed_at_ms: None,
         }
     }
 
@@ -2402,6 +2386,7 @@ mod tests {
             primary_window: Some(window_resetting(95.0, past)),
             secondary_window: Some(window_resetting(80.0, past)),
             exhausted_reason: None,
+            observed_at_ms: None,
         };
         inp.sessions = vec![
             quota_session(
