@@ -1701,7 +1701,8 @@ pub struct HubWireStatusResponse {
     pub codex_queues: Vec<HubCodexRouteQueueStatus>,
 }
 
-/// Allowlist projection of [`fl_wire::daemon::CodexRouteQueueStatus`] (omits raw `thread_id`).
+/// Allowlist projection of [`fl_wire::daemon::CodexRouteQueueStatus`] (omits raw `thread_id`
+/// and redacts any `thread_id` or filesystem path fragments from `Unknown.reason`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubCodexRouteQueueStatus {
     pub persona: String,
@@ -1710,14 +1711,184 @@ pub struct HubCodexRouteQueueStatus {
     pub queue: fl_wire::daemon::CodexQueueInspection,
 }
 
+fn redact_literal_case_insensitive(text: &str, needle: &str) -> String {
+    let needle = needle.trim();
+    if needle.is_empty() || needle == "/" {
+        return text.to_string();
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let text_indices: Vec<(usize, char)> = text.char_indices().collect();
+    if needle_chars.is_empty() || text_indices.len() < needle_chars.len() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < text_indices.len() {
+        if i + needle_chars.len() <= text_indices.len() {
+            let matched = text_indices[i..i + needle_chars.len()]
+                .iter()
+                .zip(&needle_chars)
+                .all(|(&(_, tc), &nc)| tc == nc || tc.to_lowercase().eq(nc.to_lowercase()));
+            if matched {
+                out.push_str("[redacted]");
+                i += needle_chars.len();
+                continue;
+            }
+        }
+        out.push(text_indices[i].1);
+        i += 1;
+    }
+    out
+}
+
+fn is_windows_drive_path_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn is_filesystem_path_fragment(candidate: &str) -> bool {
+    let trimmed = candidate.trim_end_matches(['.', ':']);
+    if trimmed.is_empty() || trimmed == "[redacted]" {
+        return false;
+    }
+    if (trimmed.starts_with('/') && trimmed.len() > 1)
+        || (trimmed.starts_with("~/") && trimmed.len() > 2)
+        || (trimmed.starts_with("./") && trimmed.len() > 2)
+        || (trimmed.starts_with("../") && trimmed.len() > 3)
+        || is_windows_drive_path_prefix(trimmed)
+        || trimmed.contains('\\')
+    {
+        return true;
+    }
+    if trimmed.contains('/') {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with('.')
+            || lower.contains("/.")
+            || lower.contains("app-server-control")
+            || [
+                ".sock", ".socket", ".pipe", ".json", ".toml", ".log", ".db", ".fls", ".redb",
+                ".key", ".pem",
+            ]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn redact_filesystem_path_fragments(text: &str) -> String {
+    // Pass 1: redact quoted path spans (preserving contractions like `can't` and RPC names
+    // like `` `thread/queue/list` ``).
+    let mut after_quotes = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(ch) = rest.chars().next() {
+        if matches!(ch, '"' | '\'' | '`') {
+            let after_open = &rest[ch.len_utf8()..];
+            if let Some(close_rel) = after_open.find(ch) {
+                let inner = &after_open[..close_rel];
+                if !inner.contains('\n') && is_filesystem_path_fragment(inner.trim()) {
+                    after_quotes.push(ch);
+                    after_quotes.push_str("[redacted]");
+                    after_quotes.push(ch);
+                    rest = &after_open[close_rel + ch.len_utf8()..];
+                    continue;
+                }
+            }
+        }
+        after_quotes.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    // Pass 2: redact unquoted Unix/Windows path tokens.
+    let is_delim = |c: char| -> bool {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '='
+            )
+    };
+    let bytes = after_quotes.as_bytes();
+    let mut out = String::with_capacity(after_quotes.len());
+    let mut cursor = 0usize;
+    while cursor < after_quotes.len() {
+        let ch = after_quotes[cursor..].chars().next().unwrap();
+        if is_delim(ch) || ch == ':' {
+            out.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+        let start = cursor;
+        while cursor < after_quotes.len() {
+            let c = after_quotes[cursor..].chars().next().unwrap();
+            if is_delim(c) {
+                break;
+            }
+            if c == ':' {
+                let is_drive_colon = cursor == start + 1
+                    && bytes[start].is_ascii_alphabetic()
+                    && bytes
+                        .get(cursor + 1)
+                        .is_some_and(|b| matches!(b, b'\\' | b'/'));
+                if !is_drive_colon {
+                    break;
+                }
+            }
+            cursor += c.len_utf8();
+        }
+        let token = &after_quotes[start..cursor];
+        let core = token.trim_end_matches('.');
+        let trailing_dots = &token[core.len()..];
+        if is_filesystem_path_fragment(core) {
+            out.push_str("[redacted]");
+            out.push_str(trailing_dots);
+        } else {
+            out.push_str(token);
+        }
+    }
+    out
+}
+
+fn sanitize_codex_queue_reason(
+    reason: &str,
+    thread_id: Option<&str>,
+    local_socket: Option<&Path>,
+) -> String {
+    let mut sanitized = reason.to_string();
+    if let Some(tid) = thread_id {
+        sanitized = redact_literal_case_insensitive(&sanitized, tid);
+    }
+    if let Some(sock) = local_socket {
+        let sock_str = sock.to_string_lossy();
+        sanitized = redact_literal_case_insensitive(&sanitized, &sock_str);
+    }
+    redact_filesystem_path_fragments(&sanitized)
+}
+
 impl HubCodexRouteQueueStatus {
-    fn from_wire(row: fl_wire::daemon::CodexRouteQueueStatus) -> Self {
+    fn from_wire(row: fl_wire::daemon::CodexRouteQueueStatus, local_socket: Option<&Path>) -> Self {
         let fl_wire::daemon::CodexRouteQueueStatus {
             persona,
             project,
-            thread_id: _,
+            thread_id,
             queue,
         } = row;
+        let queue = match queue {
+            fl_wire::daemon::CodexQueueInspection::Unknown {
+                reason,
+                verified_codex_version,
+                detected_codex_version,
+            } => fl_wire::daemon::CodexQueueInspection::Unknown {
+                reason: sanitize_codex_queue_reason(&reason, thread_id.as_deref(), local_socket),
+                verified_codex_version,
+                detected_codex_version,
+            },
+            known => known,
+        };
         Self {
             persona,
             project,
@@ -1906,7 +2077,7 @@ impl HubWireStatusResponse {
         let fl_wire::daemon::DaemonStatus {
             node_id: _,
             host: _,
-            socket_path: _,
+            socket_path,
             listen_addr: _,
             connected_peers: _,
             routes: _,
@@ -1924,7 +2095,7 @@ impl HubWireStatusResponse {
                 .collect(),
             codex_queues: codex_queues
                 .into_iter()
-                .map(HubCodexRouteQueueStatus::from_wire)
+                .map(|row| HubCodexRouteQueueStatus::from_wire(row, Some(&socket_path)))
                 .collect(),
         }
     }
@@ -11208,10 +11379,12 @@ mod council_guidance_tests {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
+        const SECRET_SOCKET_PATH: &str = "/secret/codex-control.sock";
         let (tmp, state) = wire_status_fixture();
         let sock = tmp.path().join("active-secret-routes.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let sock_for_status = sock.clone();
+        let sock_for_reason = sock.clone();
         let ts = fl_core::at::At::from_unix_millis(1_700_000_002_000);
         let ts_for_status = ts.clone();
 
@@ -11305,18 +11478,36 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(ts_for_status),
                     oldest_pending_age_ms: Some(250),
                 }],
-                codex_queues: vec![fl_wire::daemon::CodexRouteQueueStatus {
-                    persona: "felix".into(),
-                    project: Some("ferroloop".into()),
-                    thread_id: Some("SECRET_CODEX_THREAD".into()),
-                    queue: fl_wire::daemon::CodexQueueInspection::Known {
-                        depth: 3,
-                        has_more: false,
-                        estimated_oldest_age_secs: Some(9),
-                        verified_codex_version: fl_wire::daemon::VERIFIED_CODEX_QUEUE_RPC_VERSION
-                            .into(),
+                codex_queues: vec![
+                    fl_wire::daemon::CodexRouteQueueStatus {
+                        persona: "felix".into(),
+                        project: Some("ferroloop".into()),
+                        thread_id: Some("SECRET_CODEX_THREAD".into()),
+                        queue: fl_wire::daemon::CodexQueueInspection::Known {
+                            depth: 3,
+                            has_more: false,
+                            estimated_oldest_age_secs: Some(9),
+                            verified_codex_version:
+                                fl_wire::daemon::VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+                        },
                     },
-                }],
+                    fl_wire::daemon::CodexRouteQueueStatus {
+                        persona: "ada".into(),
+                        project: Some("ferroloop".into()),
+                        thread_id: Some("SECRET_CODEX_THREAD".into()),
+                        queue: fl_wire::daemon::CodexQueueInspection::Unknown {
+                            reason: format!(
+                                "Codex app-server rejected `thread/queue/list`: thread not found: SECRET_CODEX_THREAD / secret_codex_thread via {SECRET_SOCKET_PATH} and {}",
+                                sock_for_reason.display()
+                            ),
+                            verified_codex_version:
+                                fl_wire::daemon::VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+                            detected_codex_version: Some(
+                                fl_wire::daemon::VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+                            ),
+                        },
+                    },
+                ],
             });
             writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
             stream.flush().unwrap();
@@ -11335,6 +11526,10 @@ mod council_guidance_tests {
             "key_path",
             "SECRET_CSRF_TOKEN",
             "SECRET_CODEX_THREAD",
+            "secret_codex_thread",
+            SECRET_SOCKET_PATH,
+            "codex-control.sock",
+            "active-secret-routes.sock",
             "/secret/key_path",
             "/secret/claude.sock",
         ] {
@@ -11366,6 +11561,54 @@ mod council_guidance_tests {
         assert!(body["codex_queues"][0].get("thread_id").is_none());
         assert_eq!(body["codex_queues"][0]["queue"]["state"], "known");
         assert_eq!(body["codex_queues"][0]["queue"]["depth"], 3);
+        assert_eq!(body["codex_queues"][1]["persona"], "ada");
+        assert!(body["codex_queues"][1].get("thread_id").is_none());
+        assert_eq!(body["codex_queues"][1]["queue"]["state"], "unknown");
+        let unknown_reason = body["codex_queues"][1]["queue"]["reason"].as_str().unwrap();
+        assert!(
+            unknown_reason.contains("`thread/queue/list`"),
+            "{unknown_reason}"
+        );
+        assert!(unknown_reason.contains("[redacted]"), "{unknown_reason}");
         let _ = server_handle.join();
+    }
+
+    #[test]
+    fn hub_codex_route_queue_status_redacts_thread_ids_and_paths_in_unknown_reason() {
+        let row = fl_wire::daemon::CodexRouteQueueStatus {
+            persona: "felix".into(),
+            project: Some("ferroloop".into()),
+            thread_id: Some("  01960000-ABCD-7000-8000-SECRETTHREAD  ".into()),
+            queue: fl_wire::daemon::CodexQueueInspection::Unknown {
+                reason: "can't reach `thread/queue/list` for 01960000-abcd-7000-8000-secretthread at '/Users/Secret User/.codex/app-server-control.sock' or C:\\Users\\secret_win\\codex.sock or \\\\.\\pipe\\secret_pipe or local.sock.".into(),
+                verified_codex_version: "0.167.0".into(),
+                detected_codex_version: Some("0.167.0".into()),
+            },
+        };
+        let projected = HubCodexRouteQueueStatus::from_wire(row, Some(Path::new("local.sock")));
+        let fl_wire::daemon::CodexQueueInspection::Unknown { reason, .. } = projected.queue else {
+            panic!("expected Unknown");
+        };
+        for leaked in [
+            "01960000",
+            "secretthread",
+            "Secret User",
+            "app-server-control.sock",
+            "secret_win",
+            "secret_pipe",
+            "local.sock",
+        ] {
+            assert!(
+                !reason
+                    .to_ascii_lowercase()
+                    .contains(&leaked.to_ascii_lowercase()),
+                "Unknown.reason leaked `{leaked}` in: {reason}"
+            );
+        }
+        assert!(
+            reason.contains("can't reach `thread/queue/list`"),
+            "{reason}"
+        );
+        assert!(reason.ends_with("[redacted]."), "{reason}");
     }
 }

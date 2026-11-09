@@ -399,22 +399,29 @@ pub fn collect_codex_route_queues(
                 }
             })
             .collect(),
-        Err(err) => items
-            .into_iter()
-            .map(|item| {
-                let reason = if item.thread_id.is_none() {
-                    "Codex route has no thread_id".to_string()
-                } else {
-                    err.clone()
-                };
-                CodexRouteQueueStatus {
-                    persona: item.persona,
-                    project: item.project,
-                    thread_id: item.thread_id,
-                    queue: CodexQueueInspection::unknown(reason, None),
-                }
-            })
-            .collect(),
+        Err(err) => {
+            let safe_err = if err.starts_with("CODEX_HOME must be an absolute path") {
+                "CODEX_HOME must be an absolute path".to_string()
+            } else {
+                err
+            };
+            items
+                .into_iter()
+                .map(|item| {
+                    let reason = if item.thread_id.is_none() {
+                        "Codex route has no thread_id".to_string()
+                    } else {
+                        safe_err.clone()
+                    };
+                    CodexRouteQueueStatus {
+                        persona: item.persona,
+                        project: item.project,
+                        thread_id: item.thread_id,
+                        queue: CodexQueueInspection::unknown(reason, None),
+                    }
+                })
+                .collect()
+        }
     }
 }
 

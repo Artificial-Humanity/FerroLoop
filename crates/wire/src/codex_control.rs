@@ -37,6 +37,7 @@ pub const VERIFIED_CODEX_QUEUE_RPC_VERSION: &str = "0.167.0";
 /// Page size requested from `thread/queue/list`. When `nextCursor` is non-empty, `has_more`
 /// marks the returned depth as a lower bound (`"at least N"`).
 pub const CODEX_QUEUE_LIST_LIMIT: u32 = 100;
+const _: () = assert!(CODEX_QUEUE_LIST_LIMIT > 0);
 /// Connect, handshake, `initialize`, and `thread/queue/list` budget per control socket session.
 pub const CODEX_QUEUE_INSPECT_TIMEOUT: Duration = Duration::from_millis(750);
 /// Longest a single socket read may block.
@@ -297,6 +298,12 @@ fn parse_queue_list_result(
             );
         }
     };
+    if data.is_empty() && has_more {
+        return CodexQueueInspection::unknown(
+            "Codex app-server sent a malformed `thread/queue/list` response: empty page with `nextCursor`",
+            detected.clone(),
+        );
+    }
     let estimated_oldest_age_secs = data
         .first()
         .and_then(|first| first.get("id"))
@@ -344,12 +351,40 @@ pub(crate) fn inspect_thread_queues(
             .collect();
     }
 
+    let sock_display = sock.to_string_lossy();
+    let redact_sock = |reason: &str| -> String {
+        let trimmed = sock_display.trim();
+        if trimmed.is_empty() || trimmed == "/" {
+            reason.to_string()
+        } else {
+            reason.replace(trimmed, "[redacted]")
+        }
+    };
+    let finalize = |results: Vec<Option<CodexQueueInspection>>| -> Vec<CodexQueueInspection> {
+        results
+            .into_iter()
+            .map(|r| match r.expect("every slot populated") {
+                CodexQueueInspection::Unknown {
+                    reason,
+                    verified_codex_version,
+                    detected_codex_version,
+                } => CodexQueueInspection::Unknown {
+                    reason: redact_sock(&reason),
+                    verified_codex_version,
+                    detected_codex_version,
+                },
+                known => known,
+            })
+            .collect()
+    };
+
     let fill_remaining = |results: &mut [Option<CodexQueueInspection>],
                           indices: &[usize],
                           reason: &str,
                           detected: &Option<String>| {
+        let sanitized = redact_sock(reason);
         for &idx in indices {
-            results[idx] = Some(CodexQueueInspection::unknown(reason, detected.clone()));
+            results[idx] = Some(CodexQueueInspection::unknown(&sanitized, detected.clone()));
         }
     };
 
@@ -367,10 +402,7 @@ pub(crate) fn inspect_thread_queues(
                 kind => format!("cannot connect to Codex app-server control socket ({kind})"),
             };
             fill_remaining(&mut results, &valid_indices, &reason, &None);
-            return results
-                .into_iter()
-                .map(|r| r.expect("every slot populated"))
-                .collect();
+            return finalize(results);
         }
     };
 
@@ -382,10 +414,7 @@ pub(crate) fn inspect_thread_queues(
     };
     if let Err(err) = conn.handshake() {
         fill_remaining(&mut results, &valid_indices, &err, &None);
-        return results
-            .into_iter()
-            .map(|r| r.expect("every slot populated"))
-            .collect();
+        return finalize(results);
     }
     if let Err(err) = conn.send_json(&json!({
         "id": 1,
@@ -400,10 +429,7 @@ pub(crate) fn inspect_thread_queues(
         },
     })) {
         fill_remaining(&mut results, &valid_indices, &err, &None);
-        return results
-            .into_iter()
-            .map(|r| r.expect("every slot populated"))
-            .collect();
+        return finalize(results);
     }
 
     let init_result = match conn.await_strict_rpc_response(1, "initialize") {
@@ -411,10 +437,7 @@ pub(crate) fn inspect_thread_queues(
         Ok(Err(rpc_err)) | Err(rpc_err) => {
             let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
             fill_remaining(&mut results, &valid_indices, &rpc_err, &None);
-            return results
-                .into_iter()
-                .map(|r| r.expect("every slot populated"))
-                .collect();
+            return finalize(results);
         }
     };
 
@@ -430,18 +453,12 @@ pub(crate) fn inspect_thread_queues(
             ),
         };
         fill_remaining(&mut results, &valid_indices, &reason, &detected);
-        return results
-            .into_iter()
-            .map(|r| r.expect("every slot populated"))
-            .collect();
+        return finalize(results);
     }
 
     if let Err(err) = conn.send_json(&json!({ "method": "initialized", "params": {} })) {
         fill_remaining(&mut results, &valid_indices, &err, &detected);
-        return results
-            .into_iter()
-            .map(|r| r.expect("every slot populated"))
-            .collect();
+        return finalize(results);
     }
 
     for (seq, &idx) in valid_indices.iter().enumerate() {
@@ -463,7 +480,10 @@ pub(crate) fn inspect_thread_queues(
                 results[idx] = Some(parse_queue_list_result(&result, now_ms, &detected));
             }
             Ok(Err(rpc_err)) => {
-                results[idx] = Some(CodexQueueInspection::unknown(rpc_err, detected.clone()));
+                results[idx] = Some(CodexQueueInspection::unknown(
+                    redact_sock(&rpc_err),
+                    detected.clone(),
+                ));
             }
             Err(transport_err) => {
                 fill_remaining(
@@ -478,10 +498,7 @@ pub(crate) fn inspect_thread_queues(
     }
 
     let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
-    results
-        .into_iter()
-        .map(|r| r.expect("every slot populated"))
-        .collect()
+    finalize(results)
 }
 
 /// An app-server acknowledgment that an existing turn accepted steering input.
@@ -2810,6 +2827,16 @@ mod tests {
             Some("0.168.0")
         );
         assert_eq!(
+            extract_codex_server_version(&json!({"userAgent": "codex-tui/0.167.0-beta.1 (Linux)"}))
+                .as_deref(),
+            Some("0.167.0-beta.1")
+        );
+        assert_eq!(
+            extract_codex_server_version(&json!({"userAgent": "codex_cli_rs/0.167.0+build1"}))
+                .as_deref(),
+            Some("0.167.0+build1")
+        );
+        assert_eq!(
             extract_codex_server_version(&json!({"serverInfo": {"version": "0.167.0"}})).as_deref(),
             Some("0.167.0")
         );
@@ -2971,7 +2998,7 @@ mod tests {
     fn inspect_thread_queues_fails_closed_to_unknown_never_zero() {
         let now_ms: u64 = 1_762_000_100_000;
 
-        // 1. Missing / offline socket -> Unknown.
+        // 1. Missing / offline socket -> Unknown (never embeds socket filesystem path).
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("missing.sock");
         let out = inspect_thread_queues(&missing, &["thread-1"], now_ms, SHORT);
@@ -2981,7 +3008,9 @@ mod tests {
                 reason,
                 verified_codex_version,
                 detected_codex_version: None,
-            } if reason.contains("offline") && verified_codex_version == VERIFIED_CODEX_QUEUE_RPC_VERSION
+            } if reason.contains("offline")
+                && !reason.contains("missing.sock")
+                && verified_codex_version == VERIFIED_CODEX_QUEUE_RPC_VERSION
         ));
 
         // 2. Route without thread_id -> Unknown without connecting to listener.
@@ -2998,7 +3027,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
 
-        // 3. Unverified Codex versions (0.168.0, 0.166.0) and missing version -> Unknown, never sends thread/queue/list.
+        // 3. Unverified Codex versions (0.168.0, 0.166.0, pre-release/build suffixes) and missing version -> Unknown, never sends thread/queue/list.
         for (init_result, expected_detected) in [
             (
                 json!({"userAgent": "codex_cli_rs/0.168.0 (Linux; x86_64)"}),
@@ -3007,6 +3036,14 @@ mod tests {
             (
                 json!({"userAgent": "ferroloop/0.166.0 (Linux; x86_64)"}),
                 Some("0.166.0"),
+            ),
+            (
+                json!({"userAgent": "codex-tui/0.167.0-beta.1 (Linux)"}),
+                Some("0.167.0-beta.1"),
+            ),
+            (
+                json!({"userAgent": "codex_cli_rs/0.167.0+build1"}),
+                Some("0.167.0+build1"),
             ),
             (json!({"codexHome": "/tmp/.codex"}), None),
         ] {
@@ -3078,7 +3115,46 @@ mod tests {
             }
         );
 
-        // 5. Timeout -> Unknown.
+        // 5. Malformed empty page with non-empty nextCursor -> Unknown (never Known { depth: 0, has_more: true }).
+        let detected = Some(VERIFIED_CODEX_QUEUE_RPC_VERSION.to_string());
+        let empty_cursor = parse_queue_list_result(
+            &json!({ "data": [], "nextCursor": "100" }),
+            now_ms,
+            &detected,
+        );
+        assert!(
+            matches!(
+                &empty_cursor,
+                CodexQueueInspection::Unknown {
+                    reason,
+                    verified_codex_version,
+                    detected_codex_version: Some(v),
+                } if reason.contains("empty page with `nextCursor`")
+                    && verified_codex_version == VERIFIED_CODEX_QUEUE_RPC_VERSION
+                    && v == VERIFIED_CODEX_QUEUE_RPC_VERSION
+            ),
+            "expected Unknown for empty page with nextCursor, got {empty_cursor:?}"
+        );
+
+        let sub = TempDir::new().unwrap();
+        let (sock, server) = spawn(sub.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(&verified_init_reply(1));
+            c.expect_json(); // initialized
+            c.expect_json(); // route 0
+            c.send_text(r#"{"id":2,"result":{"data":[],"nextCursor":"100"}}"#);
+            c.drain_until_eof();
+        });
+        let out = inspect_thread_queues(&sock, &["t-empty-cursor"], now_ms, SHORT);
+        server.join().unwrap();
+        assert!(matches!(
+            &out[0],
+            CodexQueueInspection::Unknown { reason, .. }
+                if reason.contains("empty page with `nextCursor`")
+        ));
+
+        // 6. Timeout -> Unknown.
         let sub = TempDir::new().unwrap();
         let (sock, server) = spawn(sub.path(), |c| {
             c.handshake();
