@@ -115,40 +115,167 @@ export interface ParsedTurnAttachment {
 }
 
 /**
+ * Unwrap at most one outer `<pasted_content id="X">...</pasted_content id="X">`
+ * wrapper added by Claude Code's bracketed-paste handler, and unescape one level
+ * of Claude Code's nested paste-tag escapes inside the body.
+ *
+ * Mismatched `id`s, unclosed tags, sibling blocks sharing the same `id`, or literal
+ * tags inside prose are left untouched.
+ */
+export function stripOuterPastedContentWrapper(content: string): {
+  text: string;
+  unwrapped: boolean;
+} {
+  if (!content) {
+    return { text: "", unwrapped: false };
+  }
+  const trimmed = content.trim();
+  const openPrefix = '<pasted_content id="';
+  if (!trimmed.startsWith(openPrefix)) {
+    return { text: content, unwrapped: false };
+  }
+  const openEnd = trimmed.indexOf('">', openPrefix.length);
+  if (openEnd < 0) {
+    return { text: content, unwrapped: false };
+  }
+  const id = trimmed.slice(openPrefix.length, openEnd);
+  if (!id || /[\s"'<>]/.test(id)) {
+    return { text: content, unwrapped: false };
+  }
+  const openTag = `<pasted_content id="${id}">`;
+  const closeTag = `</pasted_content id="${id}">`;
+  if (
+    trimmed.length < openTag.length + closeTag.length ||
+    !trimmed.endsWith(closeTag)
+  ) {
+    return { text: content, unwrapped: false };
+  }
+  const rawInner = trimmed.slice(openTag.length, trimmed.length - closeTag.length);
+  if (rawInner.includes(openTag) || rawInner.includes(closeTag)) {
+    return { text: content, unwrapped: false };
+  }
+  const trimmedInner = rawInner.replace(/^[\r\n]+|[\r\n]+$/g, "");
+  const unescaped = trimmedInner
+    .replace(/<\\pasted_content /g, "<pasted_content ")
+    .replace(/<\\\/pasted_content /g, "</pasted_content ")
+    .replace(/<\/\\pasted_content /g, "</pasted_content ");
+  return { text: unescaped, unwrapped: true };
+}
+
+/**
+ * Strip the leading `[Operator Prompt via FerroDeck — from <name>]` (or
+ * `[Operator Prompt via FerroDeck]`) line when `<name>` is the owner
+ * (`owner` or `lmcfarlin`), while preserving the attribution line when
+ * another sender name is present.
+ */
+export function stripOperatorPromptHeader(content: string): string {
+  if (!content) {
+    return "";
+  }
+  const trimmed = content.trimStart();
+  if (!trimmed.startsWith("[Operator Prompt via FerroDeck")) {
+    return content;
+  }
+  const newlineIdx = trimmed.indexOf("\n");
+  const firstLine = (newlineIdx >= 0 ? trimmed.slice(0, newlineIdx) : trimmed).trim();
+  const rest = newlineIdx >= 0 ? trimmed.slice(newlineIdx + 1) : "";
+  const headerMatch = firstLine.match(
+    /^\[Operator Prompt via FerroDeck(?:\s*(?:—|–|--|-)\s*from\s+([^\]]+?))?\s*\]$/i,
+  );
+  if (!headerMatch) {
+    return content;
+  }
+  const sender = (headerMatch[1] ?? "").trim().toLowerCase();
+  if (!sender || sender === "owner" || sender === "lmcfarlin") {
+    return rest.trim();
+  }
+  return content;
+}
+
+/**
  * Strip Antigravity web/mobile `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`,
  * `<USER_SETTINGS_CHANGE>`, and `<CONTEXT_SUMMARY>` wrappers (and
- * `<EPHEMERAL_MESSAGE>` outer tags) so operator and notice turns render cleanly.
+ * `<EPHEMERAL_MESSAGE>` outer tags), as well as Claude Code's outer
+ * `<pasted_content id="X">` wrapper and owner `[Operator Prompt via FerroDeck]`
+ * header, so operator and notice turns render cleanly.
  */
 export function stripAgyUserRequestWrapper(content: string): string {
   if (!content) {
     return "";
   }
+  let current = content;
+  let pasteUnwrapped = false;
+
+  const outerPaste = stripOuterPastedContentWrapper(current);
+  if (outerPaste.unwrapped) {
+    current = outerPaste.text;
+    pasteUnwrapped = true;
+  }
+
   const startsWithWrapper =
     /^\s*<(?:USER_REQUEST|ADDITIONAL_METADATA|EPHEMERAL_MESSAGE|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
-      content,
+      current,
     );
   const hasSettingsOrSummaryBlock =
     /<(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>[\s\S]*?<\/(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
-      content,
+      current,
     );
-  if (!startsWithWrapper && !hasSettingsOrSummaryBlock) {
-    return content;
+
+  if (startsWithWrapper || hasSettingsOrSummaryBlock) {
+    let result = current
+      .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
+      .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
+      .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "");
+    if (startsWithWrapper) {
+      result = result
+        .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
+          inner.trim(),
+        )
+        .replace(
+          /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
+          (_full, inner: string) => inner.trim(),
+        );
+    }
+    current = result.replace(/\n{3,}/g, "\n\n").trim();
   }
-  let result = content
-    .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
-    .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
-    .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "");
-  if (startsWithWrapper) {
-    result = result
-      .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
-        inner.trim(),
-      )
-      .replace(
-        /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
-        (_full, inner: string) => inner.trim(),
-      );
+
+  if (!pasteUnwrapped) {
+    const innerPaste = stripOuterPastedContentWrapper(current);
+    if (innerPaste.unwrapped) {
+      current = innerPaste.text;
+      pasteUnwrapped = true;
+    }
   }
-  return result.replace(/\n{3,}/g, "\n\n").trim();
+
+  const afterHeader = stripOperatorPromptHeader(current);
+  if (afterHeader !== current) {
+    current = afterHeader.replace(/\n{3,}/g, "\n\n").trim();
+  } else if (pasteUnwrapped || startsWithWrapper || hasSettingsOrSummaryBlock) {
+    current = current.replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  return current;
+}
+
+/**
+ * Normalize an operator prompt or on-disk user turn so optimistic prompt
+ * deduplication matches across `<pasted_content>` wrappers, `[Operator Prompt
+ * via FerroDeck...]` headers, nested-tag backslash escapes, and whitespace.
+ */
+export function normalizeOperatorPromptForMatch(content: string): string {
+  if (!content) {
+    return "";
+  }
+  let text = stripAgyUserRequestWrapper(content);
+  text = text.replace(/^\s*\[Operator Prompt via FerroDeck[^\]]*\]\s*/i, "");
+  const postHeaderPaste = stripOuterPastedContentWrapper(text);
+  if (postHeaderPaste.unwrapped) {
+    text = postHeaderPaste.text;
+  }
+  text = text
+    .replace(/<\\(\/?[a-zA-Z_][\w:-]*)/g, "<$1")
+    .replace(/<\/\\([a-zA-Z_][\w:-]*)/g, "</$1");
+  return text.replace(/\s+/g, " ").trim();
 }
 
 export function isSubagentHandbackContent(content: string): boolean {
@@ -391,6 +518,16 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   const activeTimeZone = useActiveTimeZone();
   const [systemExpanded, setSystemExpanded] = React.useState(false);
   const [expandedCodeBlocks, setExpandedCodeBlocks] = React.useState<Record<number, boolean>>({});
+  const [copied, setCopied] = React.useState(false);
+  const copyTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  React.useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   React.useEffect(() => {
     if (typeof window === "undefined") return;
@@ -472,6 +609,24 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           };
   const effectiveContent =
     cleanedContent || (isSystem ? turn.content.trim() : "");
+  const handleCopyTurn = React.useCallback(() => {
+    if (!effectiveContent) {
+      return;
+    }
+    try {
+      void navigator.clipboard?.writeText(effectiveContent);
+      setCopied(true);
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = setTimeout(() => {
+        setCopied(false);
+        copyTimerRef.current = null;
+      }, 1_500);
+    } catch {
+      // Ignore clipboard failures in restricted environments.
+    }
+  }, [effectiveContent]);
   const segments = React.useMemo(
     () => splitTurnContent(effectiveContent),
     [effectiveContent],
@@ -593,16 +748,40 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           </span>
         </div>
 
-        {turn.created_at && (
-          <time
-            dateTime={turn.created_at}
-            title={turn.created_at}
-            className="fd-mono"
-            style={{ fontSize: "11px", color: "var(--text-dim)" }}
-          >
-            {formatTimestamp(turn.created_at, activeTimeZone)}
-          </time>
-        )}
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          {effectiveContent && (
+            <button
+              type="button"
+              data-testid={`turn-copy-btn-${turn.index}`}
+              aria-label="Copy turn text"
+              title="Copy turn text"
+              onClick={handleCopyTurn}
+              className="fd-mono"
+              style={{
+                padding: "2px 6px",
+                fontSize: "10.5px",
+                lineHeight: 1.3,
+                borderRadius: "var(--radius-sm)",
+                border: "1px solid var(--border-subtle)",
+                backgroundColor: copied ? "var(--accent-subtle)" : "var(--bg-elevated)",
+                color: copied ? "var(--accent-hover)" : "var(--text-dim)",
+                cursor: "pointer",
+              }}
+            >
+              {copied ? "Copied" : "Copy"}
+            </button>
+          )}
+          {turn.created_at && (
+            <time
+              dateTime={turn.created_at}
+              title={turn.created_at}
+              className="fd-mono"
+              style={{ fontSize: "11px", color: "var(--text-dim)" }}
+            >
+              {formatTimestamp(turn.created_at, activeTimeZone)}
+            </time>
+          )}
+        </div>
       </header>
 
       {shouldEncapsulateInternalWork ? (

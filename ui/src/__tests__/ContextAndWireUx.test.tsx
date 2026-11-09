@@ -608,6 +608,154 @@ describe("optimistic prompt preservation", () => {
     ).toBe(wrappedOnDisk);
   });
 
+  it("matches and prunes the #304 paste-wrapped prompt shape when inner <pasted_content> tags were escaped by Claude Code", () => {
+    const optimisticBody = [
+      "Look at this wrapper:",
+      '<pasted_content id="1234">',
+      "quoted body",
+      '</pasted_content id="1234">',
+    ].join("\n");
+    const prompt = {
+      content: optimisticBody,
+      sentAt: 10_000,
+      agentKey: "ferris",
+    };
+
+    const rawOnDiskContent = [
+      '<pasted_content id="5678">',
+      "[Operator Prompt via FerroDeck — from lmcfarlin]",
+      "",
+      "Look at this wrapper:",
+      '<\\pasted_content id="1234">',
+      "quoted body",
+      '<\\/pasted_content id="1234">',
+      '</pasted_content id="5678">',
+    ].join("\n");
+
+    const hubNormalizedOnDiskContent = [
+      "[Operator Prompt via FerroDeck — from lmcfarlin]",
+      "",
+      "Look at this wrapper:",
+      '<pasted_content id="1234">',
+      "quoted body",
+      '</pasted_content id="1234">',
+    ].join("\n");
+
+    for (const contentOnDisk of [rawOnDiskContent, hubNormalizedOnDiskContent]) {
+      const turnsWith304 = [
+        ...diskTurns,
+        turn({
+          index: 304,
+          role: "user",
+          content: contentOnDisk,
+          created_at: new Date(10_500).toISOString(),
+        }),
+      ];
+      expect(
+        preserveOptimisticTurn(turnsWith304, prompt, 15_000, "ferris", undefined, true),
+      ).toBe(turnsWith304);
+      expect(
+        pruneOptimisticPrompts([prompt], turnsWith304, 15_000, "ferris", undefined, true),
+      ).toHaveLength(0);
+    }
+  });
+
+  it("matches an on-disk user prompt older than 10 turns and never duplicates it during busy-session keep-alive", () => {
+    const sentAt = 20_000;
+    const prompt = {
+      content: "Run the full verification suite and report back.",
+      sentAt,
+      agentKey: "ferris",
+    };
+    const trailingTurns: TranscriptTurn[] = [];
+    for (let i = 1; i <= 15; i += 1) {
+      trailingTurns.push(
+        turn({
+          index: 100 + i,
+          role: i % 2 === 0 ? "tool" : "assistant",
+          content: `Step ${i} output`,
+          created_at: new Date(sentAt + i * 1_000).toISOString(),
+        }),
+      );
+    }
+    const busyTranscript: TranscriptTurn[] = [
+      ...diskTurns,
+      turn({
+        index: 100,
+        role: "user",
+        content: [
+          '<pasted_content id="7777">',
+          "[Operator Prompt via FerroDeck — from lmcfarlin]",
+          "",
+          "Run the full verification suite and report back.",
+          '</pasted_content id="7777">',
+        ].join("\n"),
+        created_at: new Date(sentAt + 200).toISOString(),
+      }),
+      ...trailingTurns,
+    ];
+
+    const pastTtlWhileBusy = sentAt + OPTIMISTIC_PROMPT_TTL_MS + 30_000;
+    expect(
+      preserveOptimisticTurn(
+        busyTranscript,
+        prompt,
+        pastTtlWhileBusy,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toBe(busyTranscript);
+    expect(
+      pruneOptimisticPrompts(
+        [prompt],
+        busyTranscript,
+        pastTtlWhileBusy,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("places a still-pending optimistic turn at its chronological sentAt position rather than always at the end", () => {
+    const turnsWithTimestamps: TranscriptTurn[] = [
+      turn({
+        index: 10,
+        role: "assistant",
+        content: "Initial reply",
+        created_at: new Date(10_000).toISOString(),
+      }),
+      turn({
+        index: 11,
+        role: "assistant",
+        content: "Later reply after optimistic prompt was sent",
+        created_at: new Date(30_000).toISOString(),
+      }),
+    ];
+
+    const multiPending = [
+      { content: "Second pending", sentAt: 25_000, agentKey: "ferris" },
+      { content: "First pending", sentAt: 20_000, agentKey: "ferris" },
+    ];
+
+    const merged = preserveOptimisticTurn(
+      turnsWithTimestamps,
+      multiPending,
+      35_000,
+      "ferris",
+      undefined,
+      true,
+    );
+
+    expect(merged.map((t) => t.content)).toEqual([
+      "Initial reply",
+      "First pending",
+      "Second pending",
+      "Later reply after optimistic prompt was sent",
+    ]);
+  });
+
   it("polls faster while the session is busy", () => {
     expect(transcriptPollIntervalMs(true)).toBe(2_000);
     expect(transcriptPollIntervalMs(false)).toBe(3_500);
