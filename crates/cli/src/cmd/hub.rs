@@ -470,6 +470,9 @@ fn cmd_serve(
             .await
             .map_err(|e| (2, format!("failed to bind Hub server: {e}")))?
             .with_boot_reconcile();
+        server
+            .state()
+            .set_wire_socket(Some(crate::cmd::wire::resolve_socket_path(env, None)));
         server.state().set_vault_consumer_config(vault_consumers);
         server.state().set_mcp_switches(move |project| {
             let entry =
