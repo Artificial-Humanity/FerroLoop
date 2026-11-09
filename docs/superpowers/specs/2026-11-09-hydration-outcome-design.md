@@ -1,7 +1,7 @@
 # Hydration outcome (Issue 383 D2b) — proposed design
 
-Status: awaiting Ferris's design decision. No implementation is authorized by
-this document. D2a trust preflight is separate and already in progress.
+Status: Ferris approved the small truthful-status scope on 2026-11-09, with the
+compatibility correction below. Implement after D2a, as a separate PR.
 
 ## Meaning and evidence
 
@@ -9,10 +9,13 @@ Feira confirmed #402's vocabulary: Delivered means vendor-queued but unacknowled
 Acked means direct active-turn acceptance or explicit agent read/ack. Both are
 resolved for push retry purposes, so queued input is not sent again.
 
-Add `hydration_status` with `confirmed`, `unconfirmed`, and `failed`. Retain
-`hydration_dispatched`, true exactly when the status is confirmed. Process status
-and runtime ownership remain separate. Legacy records with no acceptance evidence
-are unconfirmed even when their old boolean was true.
+Add `hydration_status` with `confirmed`, `unconfirmed`, and `failed`, with a serde
+default of unconfirmed. Preserve `hydration_dispatched` and document its existing
+meaning: the prompt was handed to the vendor. Do not redefine that boolean as
+confirmed or turn nearly every fresh launch into a legacy UI failure. Process
+status and runtime ownership remain separate. Legacy records without acceptance
+evidence have unconfirmed status even when their old boolean was true. D2a prevents
+the trust-dialog false success at its source.
 
 - App-server acceptance of this exact submission on its pinned native route can
   confirm it. This is acceptance, not proof of completion or correct hydration.
@@ -38,9 +41,9 @@ TransportAccepted (`wire/dispatcher.rs:211`). On current main, ordinary Codex
 delivery queues; direct acceptance is reached through explicit OwnerSendNow.
 Therefore typed outcomes alone do not confirm normal fresh launches.
 
-## Approaches for Ferris's decision
+## Approaches and decision
 
-**A. Small honest-status PR (recommended within the requested small PR scope).**
+**A. Small honest-status PR (approved, with the boolean preserved as above).**
 Replace false positives with the tri-state and preserve available typed evidence.
 Fresh argv launches return unconfirmed; a trust-dialog process and a delayed
 startup remain unconfirmed without proof. Definite failures return failed. Do not
@@ -48,7 +51,7 @@ poll vendor APIs or resend. This fixes the truthfulness defect but deliberately
 does not promise eventual confirmation for every new session. Tests cover alive
 dialogs, delayed starts, definite exit/refusal, ambiguous delivery and no resend.
 
-**B. Confirm ordinary fresh launches with explicit per-launch acknowledgement.**
+**B. Explicit per-launch acknowledgement (deferred; do not implement here).**
 Persist a unique generation token before launch and include an explicit generic
 `fl agent hydration-ack` instruction in that prompt. An acknowledgement writes a
 separate receipt keyed by session and generation; it never rewrites the hosted
@@ -66,9 +69,12 @@ is insufficient. Stale-generation and early/delayed/duplicate acknowledgement
 tests are required. A receipt proves the agent handled the acknowledgement
 instruction, not that it completed the rest of hydration.
 
-## Decision requested
+## Delivery boundary
 
-Approve A as the small D2b truthfulness fix, with fresh launches explicitly
-unconfirmed until a later acceptance mechanism is designed; or authorize B's
-larger acknowledgement/fencing scope. Do not build either until Ferris chooses.
-No live launches, service changes or trust-config writes are part of this work.
+Implement A after D2a. Keep the new field additive and retain the existing boolean
+behavior for compatibility. In the PR, create and link a follow-up issue for
+confirmation. Evaluate registration from the launched session, fenced by launch
+generation, as one candidate signal; route discovery alone is insufficient. Do
+not add the callback, fencing mechanism or new acknowledgement command here.
+Felix owns FerroDeck presentation after this PR merges. No live launches, service
+changes or trust-config writes are part of this work.
