@@ -1184,6 +1184,103 @@ export interface WireAckResponse {
   receipt?: WireReceipt | null;
 }
 
+export type WireDaemonState = "active" | "inactive" | "unreachable";
+
+export type WireDiagnosticsScope = "daemon_lifetime" | string;
+
+export type WireSuppressionPhase = "prefix_draining" | "retained_fence" | string;
+
+export type WireFailureStage =
+  | "message_lookup_missing"
+  | "message_lookup_error"
+  | "initial_receipt_read_error"
+  | "transport_error"
+  | "receipt_write_error"
+  | "receipt_write_missing"
+  | "final_receipt_read_error"
+  | "final_receipt_read_missing"
+  | "unresolved_receipt_status"
+  | "worker_panic"
+  | string;
+
+export type WireFenceReason =
+  | WireFailureStage
+  | "queue_overflow"
+  | "worker_spawn_failure"
+  | "global_metadata_cap"
+  | string;
+
+export type WireDispatchCallOutcome =
+  | "unknown"
+  | "returned_ok"
+  | "returned_error"
+  | string;
+
+export type WireRouteAdapter =
+  | "claude"
+  | "agy"
+  | "codex"
+  | "muse"
+  | "grok"
+  | "host_cli"
+  | "webhook"
+  | string;
+
+export interface WireRouteDispatchObservation {
+  adapter: WireRouteAdapter;
+  identity_digest: string | null;
+  route_updated_at: string | null;
+  explicit: boolean;
+  outcome: WireDispatchCallOutcome;
+}
+
+export interface WireFenceDiagnostic {
+  recipient: string | null;
+  recipient_digest: string | null;
+  recipient_invalid: boolean;
+  trigger_message_id: string | null;
+  trigger_message_id_digest: string | null;
+  trigger_message_id_omitted: boolean;
+  hold_observed_at: string;
+  phase: WireSuppressionPhase;
+  first_reason: WireFenceReason;
+  decisive_reason: WireFenceReason;
+  failure_stages: WireFailureStage[];
+  omitted_failure_stages: number;
+  omitted_failure_stages_saturated: boolean;
+  route_observations: WireRouteDispatchObservation[];
+  omitted_route_observations: number;
+  omitted_route_observations_saturated: boolean;
+  route_dispatch_calls: number;
+  route_dispatch_calls_saturated: boolean;
+  registration_generation: number | null;
+}
+
+export interface WireDispatchDiagnostics {
+  schema_version: number;
+  instance_nonce: string | null;
+  instance_started_at: string;
+  scope: WireDiagnosticsScope;
+  records: WireFenceDiagnostic[];
+  global_capacity_exhausted: boolean;
+  diagnostics_partial: boolean;
+  omitted_evidence_total: number;
+  omitted_evidence_total_saturated: boolean;
+}
+
+export interface WireRecipientPendingSummary {
+  recipient: string;
+  pending_count: number;
+  oldest_pending_at?: string | null;
+  oldest_pending_age_ms?: number | null;
+}
+
+export interface WireStatusResponse {
+  daemon: WireDaemonState;
+  dispatch_diagnostics: WireDispatchDiagnostics | null;
+  pending_recipients: WireRecipientPendingSummary[];
+}
+
 export interface StepDef {
   step_id: string;
   title: string;

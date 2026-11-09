@@ -11,11 +11,13 @@ import {
   type AgentRecord,
   type CommitteeVoteVerdict,
   type WireCommitteeMetadata,
+  type WireDaemonState,
   type WireDelegateMetadata,
   type WireInboxItem,
   type WireMessage,
   type WireReceipt,
   type WireSendRequest,
+  type WireStatusResponse,
 } from "../types/api";
 
 export type WireIntentMode = "mail" | "delegate" | "committee";
@@ -193,6 +195,7 @@ export function parseWireIntentMetadata(
 
 export interface WireMailPaneProps {
   messages?: WireInboxItem[];
+  wireStatus?: WireStatusResponse | null;
   selectedAgentName?: string | null;
   agents?: AgentRecord[];
   loading?: boolean;
@@ -204,6 +207,30 @@ export interface WireMailPaneProps {
 }
 
 export type RecipientScope = "selected" | "all";
+
+function isValidWireDaemonState(val: unknown): val is WireDaemonState {
+  return val === "active" || val === "inactive" || val === "unreachable";
+}
+
+export function formatPendingAge(ageMs?: number | null): string {
+  if (ageMs === null || ageMs === undefined || !Number.isFinite(ageMs) || ageMs < 0) {
+    return "unknown";
+  }
+  if (ageMs < 1_000) {
+    return `${Math.floor(ageMs)}ms`;
+  }
+  if (ageMs < 60_000) {
+    return `${Math.floor(ageMs / 1_000)}s`;
+  }
+  if (ageMs < 3_600_000) {
+    const mins = Math.floor(ageMs / 60_000);
+    const secs = Math.floor((ageMs % 60_000) / 1_000);
+    return `${mins}m ${secs}s`;
+  }
+  const hours = Math.floor(ageMs / 3_600_000);
+  const mins = Math.floor((ageMs % 3_600_000) / 60_000);
+  return `${hours}h ${mins}m`;
+}
 
 function resolvePrimaryReceipt(
   item: WireInboxItem,
@@ -246,6 +273,7 @@ function ackKey(agent: string | null | undefined, messageId: string): string {
 
 export const WireMailPane: React.FC<WireMailPaneProps> = ({
   messages,
+  wireStatus,
   selectedAgentName,
   agents,
   loading = false,
@@ -256,6 +284,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   apiClient,
 }) => {
   const [internalMessages, setInternalMessages] = useState<WireInboxItem[]>([]);
+  const [internalWireStatus, setInternalWireStatus] = useState<WireStatusResponse | null>(null);
   const [internalLoading, setInternalLoading] = useState(false);
   const [internalError, setInternalError] = useState<string | null>(null);
   const activeTimeZone = useActiveTimeZone();
@@ -342,8 +371,37 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   }, []);
 
   const effectiveMessages = messages ?? internalMessages;
+  const effectiveWireStatus = wireStatus !== undefined ? wireStatus : internalWireStatus;
   const effectiveLoading = loading || internalLoading;
   const effectiveError = error ?? internalError;
+
+  const fetchWireStatus = React.useCallback(async () => {
+    if (
+      !apiClient ||
+      typeof apiClient.getWireStatus !== "function" ||
+      wireStatus !== undefined
+    ) {
+      return;
+    }
+    try {
+      const res = await apiClient.getWireStatus();
+      if (res && typeof res === "object" && isValidWireDaemonState(res.daemon)) {
+        setInternalWireStatus({
+          daemon: res.daemon,
+          dispatch_diagnostics: res.dispatch_diagnostics ?? null,
+          pending_recipients: Array.isArray(res.pending_recipients)
+            ? res.pending_recipients
+            : [],
+        });
+      }
+    } catch {
+      setInternalWireStatus({
+        daemon: "unreachable",
+        dispatch_diagnostics: null,
+        pending_recipients: [],
+      });
+    }
+  }, [apiClient, wireStatus]);
 
   const fetchMessages = React.useCallback(async () => {
     if (!apiClient || messages !== undefined) {
@@ -364,6 +422,10 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   React.useEffect(() => {
     void fetchMessages();
   }, [fetchMessages]);
+
+  React.useEffect(() => {
+    void fetchWireStatus();
+  }, [fetchWireStatus]);
 
   const filteredMessages = useMemo(() => {
     const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
@@ -1231,6 +1293,243 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     </div>
   );
 
+  const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
+  const statusStrip =
+    effectiveWireStatus !== null
+      ? (() => {
+          const diag = effectiveWireStatus.dispatch_diagnostics;
+          const displayedPending = (effectiveWireStatus.pending_recipients ?? []).filter(
+            (item) =>
+              item.pending_count > 0 &&
+              (scope !== "selected" ||
+                !selectedKey ||
+                item.recipient.trim().toLowerCase() === selectedKey),
+          );
+          const isSupportedEmpty =
+            diag !== null &&
+            diag.records.length === 0 &&
+            !diag.global_capacity_exhausted &&
+            !diag.diagnostics_partial;
+          const displayedRecords =
+            diag !== null
+              ? scope === "selected" && selectedKey
+                ? diag.records.filter(
+                    (r) => (r.recipient ?? "").trim().toLowerCase() === selectedKey,
+                  )
+                : diag.records
+              : [];
+          const hiddenOtherHoldCount =
+            diag !== null ? diag.records.length - displayedRecords.length : 0;
+
+          const unavailableReason =
+            effectiveWireStatus.daemon === "inactive"
+              ? "wire daemon inactive"
+              : effectiveWireStatus.daemon === "unreachable"
+                ? "status query failed"
+                : "unsupported daemon";
+
+          return (
+            <div
+              data-testid="wire-status-strip"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                padding: "6px 12px",
+                borderBottom: "1px solid var(--border-subtle)",
+                backgroundColor: "var(--bg-elevated)",
+                fontSize: "11.5px",
+                minWidth: 0,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  minWidth: 0,
+                }}
+              >
+                {diag === null ? (
+                  <div
+                    data-testid="wire-diagnostics-unavailable"
+                    className="fd-mono"
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    {`Auto-push diagnostics: unavailable (${unavailableReason})`}
+                  </div>
+                ) : isSupportedEmpty ? (
+                  <span
+                    data-testid="wire-diagnostics-available"
+                    className="fd-badge fd-mono"
+                    style={{
+                      color: "var(--status-alive)",
+                      borderColor: "rgba(16, 185, 129, 0.35)",
+                      backgroundColor: "rgba(16, 185, 129, 0.1)",
+                    }}
+                  >
+                    Auto-push diagnostics: 0 holds (daemon_lifetime)
+                  </span>
+                ) : null}
+
+                {displayedPending.map((item) => (
+                  <span
+                    key={item.recipient}
+                    data-testid={`wire-pending-recipient-${item.recipient}`}
+                    className="fd-badge fd-mono"
+                    style={{
+                      color: "var(--accent-hover)",
+                      borderColor: "var(--border-accent)",
+                      backgroundColor: "var(--accent-subtle)",
+                    }}
+                  >
+                    {`${item.recipient}: ${item.pending_count} pending (oldest ${formatPendingAge(item.oldest_pending_age_ms)})`}
+                  </span>
+                ))}
+              </div>
+
+              {diag !== null && !isSupportedEmpty && (
+                <div
+                  data-testid="wire-diagnostics-holds"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    padding: "6px 8px",
+                    borderRadius: "6px",
+                    border: "1px solid rgba(251, 191, 36, 0.4)",
+                    backgroundColor: "rgba(251, 191, 36, 0.08)",
+                    minWidth: 0,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span
+                      data-testid="wire-diagnostics-hold-count"
+                      className="fd-badge fd-mono"
+                      style={{
+                        borderColor: "rgba(251, 191, 36, 0.45)",
+                        backgroundColor: "rgba(251, 191, 36, 0.16)",
+                        color: "#fbbf24",
+                      }}
+                    >
+                      {`holds=${diag.records.length}`}
+                    </span>
+                    {diag.global_capacity_exhausted && (
+                      <span
+                        data-testid="wire-diagnostics-global-cap"
+                        className="fd-badge fd-mono"
+                        style={{
+                          borderColor: "rgba(239, 68, 68, 0.45)",
+                          backgroundColor: "rgba(239, 68, 68, 0.16)",
+                          color: "#FCA5A5",
+                        }}
+                      >
+                        global_capacity_exhausted
+                      </span>
+                    )}
+                    {diag.diagnostics_partial && (
+                      <span
+                        data-testid="wire-diagnostics-partial"
+                        className="fd-badge fd-mono"
+                        style={{
+                          borderColor: "rgba(251, 191, 36, 0.45)",
+                          backgroundColor: "rgba(251, 191, 36, 0.16)",
+                          color: "#fbbf24",
+                        }}
+                      >
+                        {`diagnostics_partial (omitted=${diag.omitted_evidence_total}${diag.omitted_evidence_total_saturated ? "+" : ""})`}
+                      </span>
+                    )}
+                    {hiddenOtherHoldCount > 0 && (
+                      <span
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        {`${hiddenOtherHoldCount} hold(s) on other recipients — switch to All / Broadcast to view`}
+                      </span>
+                    )}
+                  </div>
+
+                  {displayedRecords.map((record, index) => {
+                    const rowKey =
+                      record.recipient ||
+                      record.recipient_digest?.slice(0, 12) ||
+                      String(index);
+                    const recipientLabel =
+                      record.recipient_invalid || !record.recipient
+                        ? `invalid-recipient (${record.recipient_digest?.slice(0, 12) ?? "unknown"})`
+                        : record.recipient;
+                    const triggerLabel = record.trigger_message_id_omitted
+                      ? `omitted (${record.trigger_message_id_digest?.slice(0, 12) ?? "unknown"})`
+                      : (record.trigger_message_id ?? "none");
+                    const stagesSuffix =
+                      record.omitted_failure_stages > 0
+                        ? ` (+${record.omitted_failure_stages}${record.omitted_failure_stages_saturated ? "+" : ""} omitted)`
+                        : "";
+                    const routeObsSummary = record.route_observations
+                      .map((obs) => `${obs.adapter}:${obs.outcome}`)
+                      .join(", ");
+
+                    return (
+                      <div
+                        key={rowKey}
+                        data-testid={`wire-hold-row-${rowKey}`}
+                        className="fd-mono"
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          flexWrap: "wrap",
+                          fontSize: "11px",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        <span className="fd-badge fd-mono" style={{ fontWeight: 700 }}>
+                          {recipientLabel}
+                        </span>
+                        <span className="fd-badge fd-mono">{record.phase}</span>
+                        <span>{`decisive_reason=${record.decisive_reason}`}</span>
+                        {record.first_reason !== record.decisive_reason && (
+                          <span>{`first_reason=${record.first_reason}`}</span>
+                        )}
+                        {record.failure_stages.length > 0 && (
+                          <span>
+                            {`stages=${record.failure_stages.join(" -> ")}${stagesSuffix}`}
+                          </span>
+                        )}
+                        <span>{`trigger=${triggerLabel}`}</span>
+                        <span>
+                          {`observed=${formatTimestamp(record.hold_observed_at, activeTimeZone)}`}
+                        </span>
+                        <span>
+                          {`calls=${record.route_dispatch_calls}${record.route_dispatch_calls_saturated ? "+" : ""}`}
+                        </span>
+                        {routeObsSummary && <span>{routeObsSummary}</span>}
+                        <span>
+                          {`registration_generation=${record.registration_generation ?? "unknown"}`}
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                  <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Daemon-lifetime hold suppresses automatic pushes; ACK and route registration do not clear it.
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()
+      : null;
+
   return (
     <section ref={paneRef} className="fd-pane" data-testid="wire-mail-pane">
       {/* Filter & Scope Toolbar */}
@@ -1332,6 +1631,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
             aria-label={effectiveLoading ? "Syncing..." : "Refresh"}
             title="Refresh"
             onClick={() => {
+              void fetchWireStatus();
               if (onRefresh) {
                 onRefresh();
               } else {
@@ -1373,6 +1673,8 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
         </div>
         </div>
       </div>
+
+      {statusStrip}
 
       {/* Main Content: Stacked (Compose above Inbox) when narrow, 2-Column Split when wide */}
       <div
