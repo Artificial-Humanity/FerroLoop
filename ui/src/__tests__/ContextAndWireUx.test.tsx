@@ -12,6 +12,7 @@ import {
   OPTIMISTIC_PROMPT_TTL_MS,
   pruneOptimisticPrompts,
   preserveOptimisticTurn,
+  resolvePromptSentAtMs,
   THEME_STORAGE_KEY,
   transcriptPollIntervalMs,
 } from "../App";
@@ -606,6 +607,298 @@ describe("optimistic prompt preservation", () => {
         3_000,
       ),
     ).toBe(wrappedOnDisk);
+  });
+
+  it("matches and prunes the #304 paste-wrapped prompt shape when inner <pasted_content> tags were escaped by Claude Code", () => {
+    const optimisticBody = [
+      "Look at this wrapper:",
+      '<pasted_content id="1234">',
+      "quoted body",
+      '</pasted_content id="1234">',
+    ].join("\n");
+    const prompt = {
+      content: optimisticBody,
+      sentAt: 10_000,
+      agentKey: "ferris",
+    };
+
+    const rawOnDiskContent = [
+      '<pasted_content id="5678">',
+      "[Operator Prompt via FerroDeck — from lmcfarlin]",
+      "",
+      "Look at this wrapper:",
+      '<\\pasted_content id="1234">',
+      "quoted body",
+      '<\\/pasted_content id="1234">',
+      '</pasted_content id="5678">',
+    ].join("\n");
+
+    const hubNormalizedOnDiskContent = [
+      "[Operator Prompt via FerroDeck — from lmcfarlin]",
+      "",
+      "Look at this wrapper:",
+      '<pasted_content id="1234">',
+      "quoted body",
+      '</pasted_content id="1234">',
+    ].join("\n");
+
+    for (const contentOnDisk of [rawOnDiskContent, hubNormalizedOnDiskContent]) {
+      const turnsWith304 = [
+        ...diskTurns,
+        turn({
+          index: 304,
+          role: "user",
+          content: contentOnDisk,
+          created_at: new Date(10_500).toISOString(),
+        }),
+      ];
+      expect(
+        preserveOptimisticTurn(turnsWith304, prompt, 15_000, "ferris", undefined, true),
+      ).toBe(turnsWith304);
+      expect(
+        pruneOptimisticPrompts([prompt], turnsWith304, 15_000, "ferris", undefined, true),
+      ).toHaveLength(0);
+    }
+  });
+
+  it("matches an on-disk user prompt older than 10 turns and never duplicates it during busy-session keep-alive", () => {
+    const sentAt = 20_000;
+    const prompt = {
+      content: "Run the full verification suite and report back.",
+      sentAt,
+      agentKey: "ferris",
+    };
+    const trailingTurns: TranscriptTurn[] = [];
+    for (let i = 1; i <= 15; i += 1) {
+      trailingTurns.push(
+        turn({
+          index: 100 + i,
+          role: i % 2 === 0 ? "tool" : "assistant",
+          content: `Step ${i} output`,
+          created_at: new Date(sentAt + i * 1_000).toISOString(),
+        }),
+      );
+    }
+    const busyTranscript: TranscriptTurn[] = [
+      ...diskTurns,
+      turn({
+        index: 100,
+        role: "user",
+        content: [
+          '<pasted_content id="7777">',
+          "[Operator Prompt via FerroDeck — from lmcfarlin]",
+          "",
+          "Run the full verification suite and report back.",
+          '</pasted_content id="7777">',
+        ].join("\n"),
+        created_at: new Date(sentAt + 200).toISOString(),
+      }),
+      ...trailingTurns,
+    ];
+
+    const pastTtlWhileBusy = sentAt + OPTIMISTIC_PROMPT_TTL_MS + 30_000;
+    expect(
+      preserveOptimisticTurn(
+        busyTranscript,
+        prompt,
+        pastTtlWhileBusy,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toBe(busyTranscript);
+    expect(
+      pruneOptimisticPrompts(
+        [prompt],
+        busyTranscript,
+        pastTtlWhileBusy,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("keeps still-pending optimistic prompts at the tail of turns in sentAt order until they land on disk", () => {
+    const turnsWithTimestamps: TranscriptTurn[] = [
+      turn({
+        index: 10,
+        role: "assistant",
+        content: "Initial reply",
+        created_at: new Date(10_000).toISOString(),
+      }),
+      turn({
+        index: 11,
+        role: "assistant",
+        content: "Later reply while agent is busy",
+        created_at: new Date(30_000).toISOString(),
+      }),
+    ];
+
+    const multiPending = [
+      { content: "Second pending", sentAt: 25_000, agentKey: "ferris" },
+      { content: "First pending", sentAt: 20_000, agentKey: "ferris" },
+    ];
+
+    const merged = preserveOptimisticTurn(
+      turnsWithTimestamps,
+      multiPending,
+      35_000,
+      "ferris",
+      undefined,
+      true,
+    );
+
+    expect(merged.map((t) => t.content)).toEqual([
+      "Initial reply",
+      "Later reply while agent is busy",
+      "First pending",
+      "Second pending",
+    ]);
+  });
+
+  it("does not falsely drop a short or repeated optimistic prompt due to earlier-turn collisions outside the skew window, and appends pending prompts at the tail", () => {
+    const turnsWithEarlierCollisions: TranscriptTurn[] = [
+      turn({
+        index: 1,
+        role: "user",
+        content: "Please say yes if the build succeeded.",
+        created_at: new Date(10_000).toISOString(),
+      }),
+      turn({
+        index: 2,
+        role: "user",
+        content: "yes",
+        created_at: new Date(11_000).toISOString(),
+      }),
+      turn({
+        index: 3,
+        role: "assistant",
+        content: "Running verification now.",
+        tool_calls: [{ name: "run_command", arguments: { command: "cargo test" } }],
+        created_at: new Date(54_000).toISOString(),
+      }),
+      turn({
+        index: 4,
+        role: "tool",
+        content: "Created At: t\nCommand output: ok",
+        created_at: new Date(56_000).toISOString(),
+      }),
+      turn({
+        index: 5,
+        role: "assistant",
+        content: "Verification passed.",
+        created_at: new Date(58_000).toISOString(),
+      }),
+    ];
+
+    const shortPending = {
+      content: "yes",
+      sentAt: 60_000,
+      agentKey: "ferris",
+    };
+
+    const merged = preserveOptimisticTurn(
+      turnsWithEarlierCollisions,
+      shortPending,
+      62_000,
+      "ferris",
+      undefined,
+      true,
+    );
+
+    expect(merged.map((t) => `${t.role}:${t.content}`)).toEqual([
+      "user:Please say yes if the build succeeded.",
+      "user:yes",
+      "assistant:Running verification now.",
+      "tool:Created At: t\nCommand output: ok",
+      "assistant:Verification passed.",
+      "user:yes",
+    ]);
+    expect(
+      pruneOptimisticPrompts(
+        [shortPending],
+        turnsWithEarlierCollisions,
+        62_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("prunes merged queued prompts via normalized containment and tolerates browser-ahead clock skew", () => {
+    const baseMs = 100_000;
+    const firstQueued = {
+      content: "First queued instruction.\nCheck module A.",
+      sentAt: baseMs,
+      agentKey: "ferris",
+    };
+    const secondQueued = {
+      content: "Second queued instruction.\nCheck module B.",
+      sentAt: baseMs + 1_000,
+      agentKey: "ferris",
+    };
+
+    const mergedDiskTurns: TranscriptTurn[] = [
+      turn({
+        index: 1,
+        role: "user",
+        content: [
+          '<pasted_content id="8888">',
+          "[Operator Prompt via FerroDeck — from lmcfarlin]",
+          "",
+          "First queued instruction.\nCheck module A.",
+          "",
+          "Second queued instruction.\nCheck module B.",
+          '</pasted_content id="8888">',
+        ].join("\n"),
+        created_at: new Date(baseMs + 1_500).toISOString(),
+      }),
+    ];
+
+    expect(
+      pruneOptimisticPrompts(
+        [firstQueued, secondQueued],
+        mergedDiskTurns,
+        baseMs + 2_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+
+    // Browser clock 5,000 ms ahead of the host clock that stamped the disk turn:
+    const browserAheadPrompt = {
+      content: "Sent from iPad with clock 5s ahead",
+      sentAt: baseMs + 5_000,
+      agentKey: "ferris",
+    };
+    const hostStampedTurns: TranscriptTurn[] = [
+      turn({
+        index: 2,
+        role: "user",
+        content: "Sent from iPad with clock 5s ahead",
+        created_at: new Date(baseMs).toISOString(),
+      }),
+    ];
+
+    expect(
+      pruneOptimisticPrompts(
+        [browserAheadPrompt],
+        hostStampedTurns,
+        baseMs + 6_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+
+    expect(resolvePromptSentAtMs("2026-11-09T15:00:00.000Z", 123)).toBe(
+      Date.parse("2026-11-09T15:00:00.000Z"),
+    );
+    expect(resolvePromptSentAtMs(undefined, 456)).toBe(456);
+    expect(resolvePromptSentAtMs("not-a-timestamp", 789)).toBe(789);
   });
 
   it("polls faster while the session is busy", () => {

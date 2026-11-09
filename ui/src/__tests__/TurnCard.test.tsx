@@ -1,8 +1,11 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   isOperatorUserTurn,
+  normalizeOperatorPromptForMatch,
   stripAgyUserRequestWrapper,
+  stripOperatorPromptHeader,
+  stripOuterPastedContentWrapper,
   stripSubagentHandbackWrapper,
   TurnCard,
 } from "../components/TurnCard";
@@ -588,5 +591,266 @@ describe("TurnCard directed assistant highlight", () => {
       expect(sysToggle).toHaveAttribute("aria-expanded", "true");
       expect(within(card).getByText(expectedSnippet)).toBeInTheDocument();
     }
+  });
+
+  it("hides outer <pasted_content id=\"X\"> wrapper only when opening and closing ids match and leaves mismatched or prose tags untouched", () => {
+    const matchingWrapper = [
+      '<pasted_content id="1234">',
+      "First line of operator prompt",
+      "Second line of operator prompt",
+      '</pasted_content id="1234">',
+    ].join("\n");
+
+    const mismatchedWrapper = [
+      '<pasted_content id="1234">',
+      "Mismatched closing tag should stay visible",
+      '</pasted_content id="5678">',
+    ].join("\n");
+
+    const literalInProse = [
+      "Look at the wrapper tag in this snippet:",
+      '<pasted_content id="1234">inner literal</pasted_content id="1234">',
+    ].join("\n");
+
+    const turn304Shape = [
+      '<pasted_content id="9999">',
+      "[Operator Prompt via FerroDeck — from lmcfarlin]",
+      "",
+      "Why does my message have:",
+      '<\\pasted_content id="1234">literal inner tag</\\pasted_content id="1234">',
+      '</pasted_content id="9999">',
+    ].join("\n");
+
+    const plainCodexTurn = "Plain Codex user turn without any paste wrapper.";
+
+    const hubNormalize = (raw: string) =>
+      stripOperatorPromptHeader(stripOuterPastedContentWrapper(raw).text);
+
+    expect(stripOuterPastedContentWrapper(matchingWrapper)).toEqual({
+      text: "First line of operator prompt\nSecond line of operator prompt",
+      unwrapped: true,
+    });
+    expect(stripOuterPastedContentWrapper(mismatchedWrapper)).toEqual({
+      text: mismatchedWrapper,
+      unwrapped: false,
+    });
+    expect(stripOuterPastedContentWrapper(literalInProse)).toEqual({
+      text: literalInProse,
+      unwrapped: false,
+    });
+    expect(hubNormalize(turn304Shape)).toBe(
+      'Why does my message have:\n<pasted_content id="1234">literal inner tag</pasted_content id="1234">',
+    );
+    expect(stripAgyUserRequestWrapper(plainCodexTurn)).toBe(plainCodexTurn);
+
+    render(
+      <>
+        <TurnCard
+          turn={turn({
+            index: 24,
+            role: "user",
+            content: hubNormalize(matchingWrapper),
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 25,
+            role: "user",
+            content: hubNormalize(mismatchedWrapper),
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 26,
+            role: "user",
+            content: hubNormalize(literalInProse),
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 27,
+            role: "user",
+            content: hubNormalize(turn304Shape),
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 28,
+            role: "user",
+            content: hubNormalize(plainCodexTurn),
+          })}
+        />
+      </>,
+    );
+
+    const matchedCard = screen.getByTestId("turn-card-24");
+    expect(within(matchedCard).getByText(/First line of operator prompt/)).toBeInTheDocument();
+    expect(within(matchedCard).queryByText(/pasted_content/)).toBeNull();
+
+    const mismatchedCard = screen.getByTestId("turn-card-25");
+    expect(within(mismatchedCard).getByText(/pasted_content id="1234"/)).toBeInTheDocument();
+    expect(within(mismatchedCard).getByText(/pasted_content id="5678"/)).toBeInTheDocument();
+
+    const proseCard = screen.getByTestId("turn-card-26");
+    expect(
+      within(proseCard).getByText(/<pasted_content id="1234">inner literal<\/pasted_content id="1234">/),
+    ).toBeInTheDocument();
+
+    const turn304Card = screen.getByTestId("turn-card-27");
+    expect(within(turn304Card).queryByText(/id="9999"/)).toBeNull();
+    expect(within(turn304Card).queryByText(/Operator Prompt via FerroDeck/)).toBeNull();
+    expect(
+      within(turn304Card).getByText(
+        /<pasted_content id="1234">literal inner tag<\/pasted_content id="1234">/,
+      ),
+    ).toBeInTheDocument();
+
+    const codexCard = screen.getByTestId("turn-card-28");
+    expect(
+      within(codexCard).getByText("Plain Codex user turn without any paste wrapper."),
+    ).toBeInTheDocument();
+  });
+
+  it("hides [Operator Prompt via FerroDeck — from <name>] when sender is owner/lmcfarlin and preserves it for other senders", () => {
+    const fromOwner = "[Operator Prompt via FerroDeck — from owner]\n\nShip the fix.";
+    const fromLmcfarlin = "[Operator Prompt via FerroDeck — from lmcfarlin]\n\nCheck the logs.";
+    const bareHeader = "[Operator Prompt via FerroDeck]\n\nRun tests.";
+    const fromFerris = "[Operator Prompt via FerroDeck — from ferris]\n\nCoordinating across agents.";
+
+    expect(stripOperatorPromptHeader(fromOwner)).toBe("Ship the fix.");
+    expect(stripOperatorPromptHeader(fromLmcfarlin)).toBe("Check the logs.");
+    expect(stripOperatorPromptHeader(bareHeader)).toBe("Run tests.");
+    expect(stripOperatorPromptHeader(fromFerris)).toBe(fromFerris);
+    expect(stripOperatorPromptHeader("[Operator Prompt via FerroDeck — from owner]")).toBe(
+      "[Operator Prompt via FerroDeck — from owner]",
+    );
+    expect(stripOperatorPromptHeader("[Operator Prompt via FerroDeck — from owner]\n   ")).toBe(
+      "[Operator Prompt via FerroDeck — from owner]",
+    );
+
+    render(
+      <>
+        <TurnCard
+          turn={turn({
+            index: 29,
+            role: "user",
+            content: stripOperatorPromptHeader(fromLmcfarlin),
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 30,
+            role: "user",
+            content: stripOperatorPromptHeader(fromFerris),
+          })}
+        />
+      </>,
+    );
+
+    const ownerCard = screen.getByTestId("turn-card-29");
+    expect(within(ownerCard).getByText("Check the logs.")).toBeInTheDocument();
+    expect(within(ownerCard).queryByText(/Operator Prompt via FerroDeck/)).toBeNull();
+
+    const ferrisCard = screen.getByTestId("turn-card-30");
+    expect(
+      within(ferrisCard).getByText(/\[Operator Prompt via FerroDeck — from ferris\]/),
+    ).toBeInTheDocument();
+    expect(within(ferrisCard).getByText(/Coordinating across agents\./)).toBeInTheDocument();
+  });
+
+  it("copies cleaned turn text (without outer paste wrapper or owner header) when clicking Copy on a TurnCard", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const wrappedTurn = [
+      '<pasted_content id="4321">',
+      "[Operator Prompt via FerroDeck — from lmcfarlin]",
+      "",
+      "Cleaned copy payload line 1",
+      '<\\pasted_content id="1111">kept inner tag</\\pasted_content id="1111">',
+      '</pasted_content id="4321">',
+    ].join("\n");
+    const hubNormalizedTurn = stripOperatorPromptHeader(
+      stripOuterPastedContentWrapper(wrappedTurn).text,
+    );
+
+    render(
+      <TurnCard
+        turn={turn({
+          index: 31,
+          role: "user",
+          content: hubNormalizedTurn,
+        })}
+      />,
+    );
+
+    const copyBtn = screen.getByTestId("turn-copy-btn-31");
+    expect(copyBtn).toHaveTextContent("Copy");
+    fireEvent.click(copyBtn);
+
+    expect(writeText).toHaveBeenCalledWith(
+      'Cleaned copy payload line 1\n<pasted_content id="1111">kept inner tag</pasted_content id="1111">',
+    );
+    expect(copyBtn).toHaveTextContent("Copied");
+    expect(
+      normalizeOperatorPromptForMatch(wrappedTurn),
+    ).toBe(
+      'Cleaned copy payload line 1 <pasted_content id="1111">kept inner tag</pasted_content id="1111">',
+    );
+
+    const soleNestedAfterHeader = [
+      '<pasted_content id="9999">',
+      "[Operator Prompt via FerroDeck — from owner]",
+      "",
+      '<\\pasted_content id="1234">literal</\\pasted_content id="1234">',
+      '</pasted_content id="9999">',
+    ].join("\n");
+    expect(normalizeOperatorPromptForMatch(soleNestedAfterHeader)).toBe(
+      '<pasted_content id="1234">literal</pasted_content id="1234">',
+    );
+
+    const attrlessNested = [
+      '<pasted_content id="9999">',
+      "<\\pasted_content>body<\\/pasted_content> and </\\pasted_content>",
+      '</pasted_content id="9999">',
+    ].join("\n");
+    expect(stripOuterPastedContentWrapper(attrlessNested)).toEqual({
+      text: "<pasted_content>body</pasted_content> and </pasted_content>",
+      unwrapped: true,
+    });
+  });
+
+  it("does not double-unwrap hub-normalized sole nested <pasted_content> turns when rendering or copying", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const hubNormalizedSoleNested = '<pasted_content id="1234">literal</pasted_content id="1234">';
+
+    render(
+      <TurnCard
+        turn={turn({
+          index: 32,
+          role: "user",
+          content: hubNormalizedSoleNested,
+        })}
+      />,
+    );
+
+    const card = screen.getByTestId("turn-card-32");
+    expect(
+      within(card).getByText('<pasted_content id="1234">literal</pasted_content id="1234">'),
+    ).toBeInTheDocument();
+
+    const copyBtn = screen.getByTestId("turn-copy-btn-32");
+    fireEvent.click(copyBtn);
+    expect(writeText).toHaveBeenCalledWith(
+      '<pasted_content id="1234">literal</pasted_content id="1234">',
+    );
   });
 });
