@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fl_host_proto::{
     ChildExit, ControlEvent, Frame, FrameKind, HostedChild, LINE_HEADER_LEN, MAX_EVENT_ENVELOPE,
     MAX_FRAME_PAYLOAD, MAX_STDOUT_BACKLOG, MAX_STDOUT_LINE, MAX_SUBSCRIBERS, SessionEpoch,
-    SessionId, ShutdownSwitch, fragment_line_with_termination,
+    SessionId, ShutdownSwitch, WRITE_TIMEOUT, fragment_line_with_termination,
 };
 
 use crate::input::{Barrier, hold_dir, poll_barrier};
@@ -23,6 +23,7 @@ const MAX_EVENTS: usize = 4096;
 const SUB_QUEUE: usize = 64;
 const SUB_BYTES: usize = 2 * 1024 * 1024;
 const TERMINAL_SLOTS: usize = 64;
+const OVERFLOW_GRACE: Duration = Duration::from_secs(1);
 
 fn line_envelope(len: usize) -> usize {
     if len == 0 {
@@ -82,6 +83,9 @@ pub struct Hub {
     status: Option<PathBuf>,
     status_lock: Mutex<()>,
     slots: Arc<AtomicUsize>,
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    pacing_clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    pacing_sleep: Box<dyn Fn(Duration) + Send + Sync>,
 }
 
 struct Fanout {
@@ -101,7 +105,22 @@ struct Sub {
     wake: Arc<Condvar>,
     kill: Option<Arc<ShutdownSwitch>>,
     /// Next `seq` to enqueue. Excess catchup stays in shared pending storage.
-    cursors: HashMap<StreamKey, u64>,
+    cursors: HashMap<StreamKey, Cursor>,
+    // One deadline per overflow episode; writes cannot renew it. Deferred
+    // records stay behind cursors in the shared, independently bounded backlog.
+    overflow_deadline: Option<Instant>,
+    // Once shedding starts, even its best-effort control notice shares this
+    // deadline. It must not acquire another complete transport timeout.
+    write_cutoff: Option<Instant>,
+    // Metadata only: the final completed record may have left the queue before
+    // expiry is observed. Keep its identity for the best-effort slow notice.
+    last_written: Option<(StreamKey, u64)>,
+}
+
+#[derive(Clone, Copy)]
+struct Cursor {
+    next: u64,
+    published: u64,
 }
 
 pub struct OutputSession {
@@ -132,6 +151,18 @@ struct Charge {
 
 impl Hub {
     pub fn new() -> Self {
+        Self::with_clock(Instant::now)
+    }
+
+    fn with_clock(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        Self::with_timing(clock, Instant::now, std::thread::sleep)
+    }
+
+    fn with_timing(
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+        pacing_clock: impl Fn() -> Instant + Send + Sync + 'static,
+        pacing_sleep: impl Fn(Duration) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             fanout: Mutex::new(Fanout {
                 subs: Vec::new(),
@@ -142,6 +173,9 @@ impl Hub {
             status: std::env::var_os("FL_HOST_BACKLOG_STATUS").map(PathBuf::from),
             status_lock: Mutex::new(()),
             slots: Arc::new(AtomicUsize::new(0)),
+            clock: Box::new(clock),
+            pacing_clock: Box::new(pacing_clock),
+            pacing_sleep: Box::new(pacing_sleep),
         }
     }
 
@@ -187,6 +221,9 @@ impl Hub {
             wake: Arc::clone(&wake),
             kill,
             cursors: HashMap::new(),
+            overflow_deadline: None,
+            write_cutoff: None,
+            last_written: None,
         });
         drop(fanout);
         self.pull_preexisting();
@@ -223,8 +260,12 @@ impl Hub {
             if sub.dropped || !sub.wants_key(key) {
                 continue;
             }
+            sub.expire((self.clock)());
+            if sub.slow {
+                continue;
+            }
             prime_cursor(sub, key, pending, next_seq);
-            drive_cursor(sub, key, pending, next_seq, fresh_index);
+            drive_cursor(sub, key, pending, next_seq, fresh_index, (self.clock)());
         }
         for sub in &fanout.subs {
             sub.wake.notify_all();
@@ -246,6 +287,23 @@ impl Hub {
                 && sub.wants_key(key)
                 && (sub.queue.len() >= SUB_QUEUE / 2 || sub.queued_bytes >= SUB_BYTES / 2)
         })
+    }
+
+    // Admission never waits for a subscriber to release a grace. Actual held
+    // event references remain charged until the writer releases them.
+    fn end_graces(&self, key: &StreamKey) {
+        let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        let now = (self.clock)();
+        for sub in &mut fanout.subs {
+            if !sub.dropped
+                && !sub.slow
+                && sub.wants_key(key)
+                && let Some(deadline) = sub.overflow_deadline
+            {
+                sub.mark_slow(now.min(deadline));
+                sub.wake.notify_all();
+            }
+        }
     }
 
     fn note_status(&self, charge: Charge) {
@@ -294,7 +352,7 @@ pub struct Subscriber {
 }
 
 fn assign(sub: &mut Sub, event: &Arc<Logical>, preexisting: bool) -> Assign {
-    if sub.dropped {
+    if sub.dropped || sub.slow {
         return Assign::Skip;
     }
     let mut track = event.track.lock().unwrap_or_else(|err| err.into_inner());
@@ -305,7 +363,7 @@ fn assign(sub: &mut Sub, event: &Arc<Logical>, preexisting: bool) -> Assign {
     if event.exited {
         if sub.terminals.contains_key(&event.session) || sub.terminals.len() >= TERMINAL_SLOTS {
             track.delivered.remove(&sub.id);
-            return Assign::Overflow;
+            return Assign::TerminalOverflow;
         }
         event.exposed.store(true, Ordering::SeqCst);
         track.holders = track.holders.saturating_add(1);
@@ -333,10 +391,12 @@ enum Assign {
     Queued,
     Skip,
     Overflow,
+    TerminalOverflow,
 }
 
 fn prime_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_seq: u64) {
-    if sub.cursors.contains_key(key) {
+    if let Some(cursor) = sub.cursors.get_mut(key) {
+        cursor.published = next_seq;
         return;
     }
     // An event another subscriber still holds is unfinished. Starting past it
@@ -351,7 +411,13 @@ fn prime_cursor(sub: &mut Sub, key: &StreamKey, pending: &[Arc<Logical>], next_s
             start = event.seq;
         }
     }
-    sub.cursors.insert(key.clone(), start);
+    sub.cursors.insert(
+        key.clone(),
+        Cursor {
+            next: start,
+            published: next_seq,
+        },
+    );
 }
 
 /// Queue a prefix of this epoch. Stop when the next `seq` is missing or the budget is full.
@@ -361,12 +427,13 @@ fn drive_cursor(
     pending: &[Arc<Logical>],
     next_seq: u64,
     fresh_index: Option<u64>,
+    now: Instant,
 ) {
     loop {
-        if sub.dropped {
+        if sub.dropped || sub.slow {
             return;
         }
-        let Some(cursor) = sub.cursors.get(key).copied() else {
+        let Some(cursor) = sub.cursors.get(key).map(|cursor| cursor.next) else {
             return;
         };
         let event = pending
@@ -378,12 +445,12 @@ fn drive_cursor(
                 let Some(next) = cursor.checked_add(1) else {
                     return;
                 };
-                sub.cursors.insert(key.clone(), next);
+                sub.cursors.get_mut(key).expect("primed cursor").next = next;
                 continue;
             }
             return;
         };
-        if !offer(sub, key, cursor, &event, fresh_index) {
+        if !offer(sub, key, cursor, &event, fresh_index, now) {
             return;
         }
     }
@@ -396,6 +463,7 @@ fn offer(
     cursor: u64,
     event: &Arc<Logical>,
     fresh_index: Option<u64>,
+    now: Instant,
 ) -> bool {
     // Only fresh publication can establish live overflow. A record published
     // while a subscriber was catching up remains bounded catchup on later
@@ -406,11 +474,15 @@ fn offer(
             let Some(next) = cursor.checked_add(1) else {
                 return false;
             };
-            sub.cursors.insert(key.clone(), next);
+            sub.cursors.get_mut(key).expect("primed cursor").next = next;
             true
         }
         Assign::Overflow => {
-            sub.slow = true;
+            sub.overflow_deadline.get_or_insert(now + OVERFLOW_GRACE);
+            false
+        }
+        Assign::TerminalOverflow => {
+            sub.mark_slow(now);
             false
         }
         Assign::Skip => {
@@ -424,7 +496,7 @@ fn offer(
                 let Some(next) = cursor.checked_add(1) else {
                     return false;
                 };
-                sub.cursors.insert(key.clone(), next);
+                sub.cursors.get_mut(key).expect("primed cursor").next = next;
                 true
             } else {
                 false
@@ -478,7 +550,7 @@ fn settle_locked(event: &Logical, wrote: bool, fanout: &Fanout) {
                 && sub
                     .cursors
                     .get(&(event.session.clone(), event.epoch))
-                    .is_some_and(|cursor| *cursor <= event.seq)
+                    .is_some_and(|cursor| cursor.next <= event.seq)
         });
         let release = track.holders == 0 && track.completes > 0 && !waiting;
         if release {
@@ -858,16 +930,24 @@ impl OutputSession {
     fn flush_out(&self) {
         let key = (self.session.session.as_str().to_owned(), self.session.epoch);
         loop {
-            // Give every backlogged writer bounded time to drain a burst without
-            // holding order or letting a slow subscriber stall the producer forever.
-            let started = std::time::Instant::now();
-            while self.hub.any_backlogged(&key) && started.elapsed() < Duration::from_millis(20) {
-                std::thread::sleep(Duration::from_millis(1));
+            // Preserve the bounded LegacyPipe producer pacing. No order/fanout
+            // lock or socket write is held during these scheduling yields.
+            let started = (self.hub.pacing_clock)();
+            while self.hub.any_backlogged(&key)
+                && (self.hub.pacing_clock)().saturating_duration_since(started)
+                    < Duration::from_millis(20)
+            {
+                (self.hub.pacing_sleep)(Duration::from_millis(1));
             }
             if !self.flush_one() {
                 return;
             }
         }
+    }
+
+    fn end_graces(&self) {
+        self.hub
+            .end_graces(&(self.session.session.as_str().to_owned(), self.session.epoch));
     }
 
     /// Parse, assign the sequence and admit one record atomically. Both the
@@ -885,6 +965,8 @@ impl OutputSession {
         }
         let coalesce = Self::coalescible(&inner);
         if inner.events.len() >= MAX_EVENTS && !coalesce {
+            drop(inner);
+            self.end_graces();
             return false;
         }
         let room = if coalesce {
@@ -904,6 +986,8 @@ impl OutputSession {
                 .saturating_add(envelope.saturating_sub(old_envelope))
                 > MAX_STDOUT_BACKLOG
             {
+                drop(inner);
+                self.end_graces();
                 return false;
             }
             let OutInner {
@@ -926,6 +1010,8 @@ impl OutputSession {
         }
         let envelope = line_envelope(take);
         if Self::charge(&inner).charge.saturating_add(envelope) > MAX_STDOUT_BACKLOG {
+            drop(inner);
+            self.end_graces();
             return false;
         }
         let raw = inner.staging[..take].to_vec();
@@ -946,12 +1032,16 @@ impl OutputSession {
             return 0;
         }
         if inner.events.len() >= MAX_EVENTS && !Self::coalescible(&inner) {
+            drop(inner);
+            self.end_graces();
             return 0;
         }
         let charge = Self::charge(&inner);
         let budget = MAX_STDOUT_BACKLOG.saturating_sub(charge.charge);
         let budget = budget.saturating_sub(MAX_EVENT_ENVELOPE.min(budget));
         if budget == 0 {
+            drop(inner);
+            self.end_graces();
             return 0;
         }
         budget.min(64 * 1024)
@@ -967,20 +1057,26 @@ impl Subscriber {
         self,
         hub: Arc<Hub>,
         minor: u16,
-        mut write: impl FnMut(Frame) -> Result<(), ()> + Send,
+        mut write: impl FnMut(Frame, Option<Instant>) -> Result<(), ()> + Send,
         mut closed: impl FnMut() -> bool + Send,
     ) {
         let hold = hold_dir();
         if let Some(dir) = hold.as_ref() {
             let _ = std::fs::write(dir.join(format!("subscribed-{}", self.id)), b"1");
         }
-        let mut sent_any = false;
         loop {
             let next = self.next_event(&hub);
+            if self.dropped(&hub) {
+                break;
+            }
+            // Expiry can follow the final completed write, leaving no queued
+            // event. Shedding must not depend on another publication arriving.
+            if self.want_slow(&hub) {
+                let _ = self.write_slow(&hub, &mut write);
+                self.finish_drop(&hub);
+                break;
+            }
             let Some(event) = next else {
-                if self.dropped(&hub) {
-                    break;
-                }
                 if closed() {
                     self.finish_drop(&hub);
                     break;
@@ -992,11 +1088,6 @@ impl Subscriber {
                     .unwrap_or_else(|err| err.into_inner());
                 continue;
             };
-            if self.want_slow(&hub) && sent_any {
-                let _ = self.write_slow(&hub, &mut write);
-                self.finish_drop(&hub);
-                break;
-            }
             if let Some(dir) = hold.as_ref() {
                 let phase = if event.exited {
                     "before-exited"
@@ -1014,7 +1105,7 @@ impl Subscriber {
                 if !wait_hold(dir, phase, || {
                     self.dropped(&hub) || self.want_slow(&hub) || closed()
                 }) {
-                    if self.want_slow(&hub) && sent_any && !self.dropped(&hub) {
+                    if self.want_slow(&hub) && !self.dropped(&hub) {
                         let _ = self.write_slow(&hub, &mut write);
                     }
                     self.finish_drop(&hub);
@@ -1034,7 +1125,7 @@ impl Subscriber {
             let frames = frames_of(&event);
             let mut failed = frames.is_empty();
             for frame in frames {
-                if write(frame).is_err() {
+                if self.want_slow(&hub) || write(frame, self.write_cutoff(&hub)).is_err() {
                     failed = true;
                     break;
                 }
@@ -1045,14 +1136,14 @@ impl Subscriber {
             }
             self.pop_sent(&hub, &event);
             settle(&event, true);
-            sent_any = true;
             hub.pull_preexisting();
         }
     }
 
     fn next_event(&self, hub: &Hub) -> Option<Arc<Logical>> {
-        let fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        let sub = fanout.subs.iter().find(|sub| sub.id == self.id)?;
+        let mut fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        let sub = fanout.subs.iter_mut().find(|sub| sub.id == self.id)?;
+        sub.expire((hub.clock)());
         if sub.dropped {
             return None;
         }
@@ -1075,6 +1166,7 @@ impl Subscriber {
         let Some(sub) = fanout.subs.iter_mut().find(|sub| sub.id == self.id) else {
             return;
         };
+        sub.last_written = Some(((event.session.clone(), event.epoch), event.seq));
         if event.exited {
             if sub
                 .terminals
@@ -1093,6 +1185,8 @@ impl Subscriber {
             let removed = sub.queue.remove(pos).expect("queued event");
             let bytes = removed.raw_len.saturating_add(removed.envelope);
             sub.queued_bytes = sub.queued_bytes.saturating_sub(bytes);
+            sub.expire((hub.clock)());
+            sub.reset_grace();
         }
     }
 
@@ -1106,36 +1200,67 @@ impl Subscriber {
     }
 
     fn want_slow(&self, hub: &Hub) -> bool {
-        let fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
-        fanout
-            .subs
-            .iter()
-            .find(|sub| sub.id == self.id)
-            .is_some_and(|sub| sub.slow)
+        let mut fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(sub) = fanout.subs.iter_mut().find(|sub| sub.id == self.id) else {
+            return false;
+        };
+        sub.expire((hub.clock)());
+        sub.slow
     }
 
-    fn write_slow(&self, hub: &Hub, write: &mut impl FnMut(Frame) -> Result<(), ()>) -> bool {
+    fn write_cutoff(&self, hub: &Hub) -> Option<Instant> {
+        let fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
+        let sub = fanout.subs.iter().find(|sub| sub.id == self.id)?;
+        sub.write_cutoff.or_else(|| {
+            sub.overflow_deadline
+                .map(|deadline| deadline + WRITE_TIMEOUT)
+        })
+    }
+
+    fn write_slow(
+        &self,
+        hub: &Hub,
+        write: &mut impl FnMut(Frame, Option<Instant>) -> Result<(), ()>,
+    ) -> bool {
         let fanout = hub.fanout.lock().unwrap_or_else(|err| err.into_inner());
         let Some(sub) = fanout.subs.iter().find(|sub| sub.id == self.id) else {
             return false;
         };
-        let Some(event) = sub.queue.front().or_else(|| sub.terminals.values().next()) else {
+        if sub.dropped {
+            return false;
+        }
+        let identity = sub
+            .queue
+            .front()
+            .or_else(|| sub.terminals.values().next())
+            .map(|event| ((event.session.clone(), event.epoch), event.seq))
+            .or_else(|| sub.last_written.clone());
+        let Some(((session, epoch), seq)) = identity else {
             return false;
         };
-        let Ok(session) = SessionId::new(&event.session) else {
+        let Ok(session) = SessionId::new(&session) else {
             return false;
         };
         let slow = ControlEvent::SlowSubscriber {
             session,
-            session_epoch: SessionEpoch(event.epoch),
-            seq: event.seq,
+            session_epoch: SessionEpoch(epoch),
+            seq,
         };
+        // Capture identity and cutoff together: removal after this lock is
+        // released must not grant a fresh transport allowance to the notice.
+        let cutoff = sub.write_cutoff.or_else(|| {
+            sub.overflow_deadline
+                .map(|deadline| deadline + WRITE_TIMEOUT)
+        });
         drop(fanout);
         let payload = serde_json::to_vec(&slow).unwrap_or_default();
-        write(Frame {
-            kind: FrameKind::Event,
-            payload,
-        })
+        write(
+            Frame {
+                kind: FrameKind::Event,
+                payload,
+            },
+            cutoff,
+        )
         .is_ok()
     }
 
@@ -1194,6 +1319,36 @@ fn wait_hold(dir: &std::path::Path, phase: &str, mut dropped: impl FnMut() -> bo
 }
 
 impl Sub {
+    fn mark_slow(&mut self, at: Instant) {
+        self.slow = true;
+        self.write_cutoff.get_or_insert(at + WRITE_TIMEOUT);
+        self.cursors.clear();
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if !self.slow
+            && let Some(deadline) = self.overflow_deadline
+            && now >= deadline
+        {
+            self.mark_slow(deadline);
+        }
+    }
+
+    fn reset_grace(&mut self) {
+        // Include deferred cursor obligations: a large record can leave the
+        // reference queue nearly empty while the subscriber is still behind.
+        if !self.slow
+            && self.queue.len() < SUB_QUEUE / 2
+            && self.queued_bytes < SUB_BYTES / 2
+            && self
+                .cursors
+                .values()
+                .all(|cursor| cursor.next >= cursor.published)
+        {
+            self.overflow_deadline = None;
+        }
+    }
+
     fn wants_key(&self, key: &StreamKey) -> bool {
         self.filter.as_ref().is_none_or(|filter| filter == &key.0)
     }
@@ -1222,9 +1377,36 @@ mod tests {
         )
     }
 
+    fn clocked_hub() -> (Arc<Hub>, Arc<Mutex<Instant>>) {
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let reading = Arc::clone(&clock);
+        let pacing = Arc::new(Mutex::new(Instant::now()));
+        let pacing_reading = Arc::clone(&pacing);
+        (
+            Arc::new(Hub::with_timing(
+                move || *reading.lock().unwrap(),
+                move || *pacing_reading.lock().unwrap(),
+                move |duration| advance(&pacing, duration),
+            )),
+            clock,
+        )
+    }
+
+    fn advance(clock: &Mutex<Instant>, duration: Duration) {
+        *clock.lock().unwrap() += duration;
+    }
+
+    fn drain_one(sub: &Subscriber, hub: &Hub) -> Arc<Logical> {
+        let event = sub.next_event(hub).expect("queued event");
+        sub.pop_sent(hub, &event);
+        settle(&event, true);
+        hub.pull_preexisting();
+        event
+    }
+
     #[test]
     fn catchup_crosses_subscription_watermark_without_shedding_progressing_reader() {
-        let hub = Arc::new(Hub::new());
+        let (hub, clock) = clocked_hub();
         let out = fixture(1, &hub);
         for _ in 0..128 {
             out.emit_line(b"old".to_vec());
@@ -1246,12 +1428,522 @@ mod tests {
         }
         assert!(!sub.want_slow(&hub));
         assert!(out.inner.lock().unwrap().events.is_empty());
-        // Once caught up, an actually full live queue still sheds the reader.
+        // Once caught up, a full live queue sheds after its bounded grace.
         for _ in 0..=SUB_QUEUE {
             out.emit_line(b"live".to_vec());
         }
+        assert!(!sub.want_slow(&hub));
+        advance(&clock, OVERFLOW_GRACE);
         assert!(sub.want_slow(&hub));
         sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_preserves_exact_burst() {
+        let (hub, _clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        let expected: Vec<u8> = (0..96)
+            .flat_map(|n| format!("record-{n:03}\n").into_bytes())
+            .collect();
+        // One producer burst, with the reader deliberately unscheduled. All
+        // admissions and writes below are deterministic, without timing sleeps.
+        assert!(out.push(&expected));
+        assert!(!sub.want_slow(&hub), "a bounded burst gets a drain grace");
+        let mut received = Vec::new();
+        for seq in 1..=96 {
+            let event = sub.next_event(&hub).expect("exact buffered record");
+            assert_eq!(event.seq, seq);
+            let Body::Line(raw) = &event.body else {
+                panic!("stdout record")
+            };
+            received.extend_from_slice(raw);
+            assert!(event.terminated);
+            received.push(b'\n');
+            sub.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+            assert!(!sub.want_slow(&hub));
+            let fanout = hub.fanout.lock().unwrap();
+            assert!(fanout.subs[0].queue.len() <= SUB_QUEUE);
+            assert!(fanout.subs[0].queued_bytes <= SUB_BYTES);
+        }
+        assert_eq!(received, expected);
+        assert!(out.inner.lock().unwrap().events.is_empty());
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_handles_byte_limited_burst() {
+        let (hub, _clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        for byte in 0..3 {
+            out.emit_line(vec![byte; 800 * 1024]);
+        }
+        assert!(
+            !sub.want_slow(&hub),
+            "byte overflow also gets bounded grace"
+        );
+        for byte in 0..3 {
+            let event = sub.next_event(&hub).expect("large record");
+            assert!(matches!(&event.body, Body::Line(raw) if raw == &vec![byte; 800 * 1024]));
+            sub.pop_sent(&hub, &event);
+            settle(&event, true);
+            hub.pull_preexisting();
+            assert!(!sub.want_slow(&hub));
+        }
+        assert!(out.inner.lock().unwrap().events.is_empty());
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_expires_without_new_publication() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert!(out.push(&b"x\n".repeat(SUB_QUEUE + 1)));
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        advance(&clock, OVERFLOW_GRACE - Duration::from_nanos(1));
+        assert!(!sub.want_slow(&hub));
+        advance(&clock, Duration::from_nanos(1));
+        assert!(sub.want_slow(&hub));
+        assert_eq!(sub.write_cutoff(&hub), Some(expiry + WRITE_TIMEOUT));
+        // A later publication must not recreate a shed subscriber's cursor.
+        out.emit_line(b"after expiry".to_vec());
+        assert!(hub.fanout.lock().unwrap().subs[0].cursors.is_empty());
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_progress_does_not_renew_episode() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert!(out.push(&b"x\n".repeat(SUB_QUEUE + 1)));
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        for _ in 0..9 {
+            advance(&clock, Duration::from_millis(100));
+            drain_one(&sub, &hub);
+            assert!(out.push(b"slower\n"));
+            assert!(!sub.want_slow(&hub));
+            assert_eq!(
+                hub.fanout.lock().unwrap().subs[0].overflow_deadline,
+                Some(expiry)
+            );
+        }
+        advance(&clock, Duration::from_millis(100));
+        assert!(sub.want_slow(&hub));
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_resets_only_below_both_half_limits() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert!(out.push(&b"x\n".repeat(SUB_QUEUE + 1)));
+        for _ in 0..33 {
+            drain_one(&sub, &hub);
+        }
+        assert!(
+            hub.fanout.lock().unwrap().subs[0]
+                .overflow_deadline
+                .is_some(),
+            "exactly half full does not reset"
+        );
+        drain_one(&sub, &hub);
+        assert!(
+            hub.fanout.lock().unwrap().subs[0]
+                .overflow_deadline
+                .is_none()
+        );
+        while sub.next_event(&hub).is_some() {
+            drain_one(&sub, &hub);
+        }
+        advance(&clock, OVERFLOW_GRACE);
+        assert!(out.push(&b"y\n".repeat(SUB_QUEUE + 1)));
+        assert!(
+            !sub.want_slow(&hub),
+            "a drained episode permits one new grace"
+        );
+        while sub.next_event(&hub).is_some() {
+            drain_one(&sub, &hub);
+        }
+        // Two large queued records exceed half the byte allowance with only
+        // two slots occupied. The first drain must not renew the deadline.
+        for _ in 0..4 {
+            out.emit_line(vec![b'z'; 600 * 1024]);
+        }
+        drain_one(&sub, &hub);
+        drain_one(&sub, &hub);
+        assert!(
+            hub.fanout.lock().unwrap().subs[0]
+                .overflow_deadline
+                .is_some()
+        );
+        drain_one(&sub, &hub);
+        assert!(
+            hub.fanout.lock().unwrap().subs[0]
+                .overflow_deadline
+                .is_none()
+        );
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_record_pressure_sheds_all_without_freeing_held_data() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let first = hub.subscribe(None, None).ok().unwrap();
+        let second = hub.subscribe(None, None).ok().unwrap();
+        let now = *clock.lock().unwrap();
+        for _ in 0..MAX_EVENTS {
+            assert!(out.room() >= 2);
+            assert!(out.push(b"x\n"));
+        }
+        assert_eq!(out.room(), 0);
+        assert!(first.want_slow(&hub));
+        assert!(second.want_slow(&hub));
+        assert_eq!(first.write_cutoff(&hub), Some(now + WRITE_TIMEOUT));
+        let held = first.next_event(&hub).unwrap();
+        assert_eq!(held.track.lock().unwrap().holders, 2);
+        assert_eq!(out.inner.lock().unwrap().events.len(), MAX_EVENTS);
+        assert_eq!(
+            *clock.lock().unwrap(),
+            now,
+            "admission does not wait on writers"
+        );
+        first.abandon(&hub);
+        assert_eq!(held.track.lock().unwrap().holders, 1);
+        second.abandon(&hub);
+        assert_eq!(held.track.lock().unwrap().holders, 0);
+        // Nothing was written: disconnect cannot manufacture reusable capacity.
+        assert_eq!(out.room(), 0);
+        assert_eq!(out.inner.lock().unwrap().events.len(), MAX_EVENTS);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_expired_record_pressure_preserves_original_cutoff() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        // Publish up to the shared limit without asking admission to end the
+        // grace early. The next room check happens only after expiry.
+        for _ in 0..MAX_EVENTS {
+            out.emit_line(b"x".to_vec());
+        }
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            assert!(!fanout.subs[0].slow);
+            assert_eq!(fanout.subs[0].overflow_deadline, Some(expiry));
+        }
+        advance(&clock, OVERFLOW_GRACE + Duration::from_millis(100));
+        let now = *clock.lock().unwrap();
+        assert_eq!(out.room(), 0);
+        assert!(hub.fanout.lock().unwrap().subs[0].slow);
+        assert_eq!(sub.write_cutoff(&hub), Some(expiry + WRITE_TIMEOUT));
+        assert_eq!(*clock.lock().unwrap(), now, "admission must not wait");
+        assert_eq!(out.inner.lock().unwrap().events.len(), MAX_EVENTS);
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_expired_write_cannot_reset_episode() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert!(out.push(&b"x\n".repeat(SUB_QUEUE + 1)));
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        for _ in 0..=SUB_QUEUE / 2 {
+            drain_one(&sub, &hub);
+        }
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            let state = &fanout.subs[0];
+            assert_eq!(state.queue.len(), SUB_QUEUE / 2);
+            assert!(state.queued_bytes < SUB_BYTES / 2);
+            assert!(
+                state
+                    .cursors
+                    .values()
+                    .all(|cursor| cursor.next >= cursor.published)
+            );
+            assert_eq!(state.overflow_deadline, Some(expiry));
+        }
+        *clock.lock().unwrap() = expiry - Duration::from_nanos(1);
+        let mut writes = 0;
+        sub.run(
+            Arc::clone(&hub),
+            2,
+            |frame, cutoff| {
+                writes += 1;
+                assert_eq!(cutoff, Some(expiry + WRITE_TIMEOUT));
+                if writes == 1 {
+                    assert_eq!(frame.kind, FrameKind::Line);
+                    // This completed frame takes the queue below half, but its
+                    // write crossed expiry and cannot erase the old deadline.
+                    *clock.lock().unwrap() = expiry + Duration::from_nanos(1);
+                } else {
+                    assert!(matches!(
+                        serde_json::from_slice::<ControlEvent>(&frame.payload).unwrap(),
+                        ControlEvent::SlowSubscriber { .. }
+                    ));
+                }
+                Ok(())
+            },
+            || false,
+        );
+        assert_eq!(
+            writes, 2,
+            "only the in-flight frame and slow notice are sent"
+        );
+        let fanout = hub.fanout.lock().unwrap();
+        let state = &fanout.subs[0];
+        assert!(state.slow);
+        assert!(state.dropped);
+        assert_eq!(state.write_cutoff, Some(expiry + WRITE_TIMEOUT));
+    }
+
+    #[test]
+    fn legacy_overflow_grace_byte_pressure_sheds_without_reader_wait() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        let now = *clock.lock().unwrap();
+        loop {
+            let room = out.room();
+            if room == 0 {
+                break;
+            }
+            let mut bytes = vec![b'x'; room];
+            *bytes.last_mut().unwrap() = b'\n';
+            assert!(out.push(&bytes));
+            let inner = out.inner.lock().unwrap();
+            assert!(OutputSession::charge(&inner).charge <= MAX_STDOUT_BACKLOG);
+            assert!(inner.events.len() <= MAX_EVENTS);
+        }
+        assert!(sub.want_slow(&hub));
+        assert_eq!(sub.write_cutoff(&hub), Some(now + WRITE_TIMEOUT));
+        let inner = out.inner.lock().unwrap();
+        assert!(inner.events.len() < MAX_EVENTS, "byte cap, not record cap");
+        assert!(OutputSession::charge(&inner).charge > MAX_STDOUT_BACKLOG - 2 * MAX_EVENT_ENVELOPE);
+        drop(inner);
+        assert_eq!(*clock.lock().unwrap(), now);
+        sub.abandon(&hub);
+        assert_eq!(out.room(), 0, "never-written data stays charged");
+    }
+
+    #[test]
+    fn legacy_slow_notice_and_fragmented_writes_share_absolute_disconnect_deadline() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        // The first logical event is fragmented; writes cannot restart the
+        // episode deadline, even when each fragment succeeds.
+        for _ in 0..3 {
+            out.emit_line(vec![b'x'; 800 * 1024]);
+        }
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        let mut writes = 0;
+        sub.run(
+            Arc::clone(&hub),
+            2,
+            |_, cutoff| {
+                assert_eq!(cutoff, Some(expiry + WRITE_TIMEOUT));
+                writes += 1;
+                advance(&clock, OVERFLOW_GRACE);
+                Ok(())
+            },
+            || false,
+        );
+        assert_eq!(writes, 1, "expiry stops fragmented delivery");
+        assert!(hub.fanout.lock().unwrap().subs[0].dropped);
+
+        // Simulate a write begun just before grace expiry that uses nearly its
+        // entire transport allowance; the subsequent notice gets only the
+        // remaining absolute budget, never another five seconds.
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        while sub.next_event(&hub).is_some() {
+            drain_one(&sub, &hub);
+        }
+        assert!(out.push(&b"y\n".repeat(SUB_QUEUE + 1)));
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        let mut kinds = Vec::new();
+        sub.run(
+            Arc::clone(&hub),
+            2,
+            |frame, cutoff| {
+                kinds.push(frame.kind);
+                assert_eq!(cutoff, Some(expiry + WRITE_TIMEOUT));
+                if kinds.len() == 1 {
+                    *clock.lock().unwrap() = expiry + WRITE_TIMEOUT - Duration::from_nanos(1);
+                    Ok(())
+                } else {
+                    assert!(matches!(
+                        serde_json::from_slice::<ControlEvent>(&frame.payload).unwrap(),
+                        ControlEvent::SlowSubscriber { .. }
+                    ));
+                    *clock.lock().unwrap() = cutoff.unwrap();
+                    Err(())
+                }
+            },
+            || false,
+        );
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(*clock.lock().unwrap(), expiry + WRITE_TIMEOUT);
+        assert!(hub.fanout.lock().unwrap().subs.last().unwrap().dropped);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_final_write_expiry_notifies_and_releases_slot() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        for _ in 0..SUB_QUEUE {
+            out.emit_line(b"small".to_vec());
+        }
+        // The final record keeps the byte threshold above half until its last
+        // fragment is written, so the same overflow episode lasts to queue-empty.
+        out.emit_line(vec![b'x'; SUB_BYTES / 2]);
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        let mut lines = fl_host_proto::LineReassembler::new();
+        let mut records = 0;
+        let mut notices = 0;
+        let empty_slow_polls = AtomicUsize::new(0);
+        sub.run(
+            Arc::clone(&hub),
+            2,
+            |frame, cutoff| {
+                assert_eq!(cutoff, Some(expiry + WRITE_TIMEOUT));
+                if frame.kind == FrameKind::Line {
+                    if lines.push_frame(&frame).unwrap().is_some() {
+                        records += 1;
+                        if records == SUB_QUEUE + 1 {
+                            *clock.lock().unwrap() = expiry + Duration::from_nanos(1);
+                        }
+                    }
+                } else {
+                    let notice: ControlEvent = serde_json::from_slice(&frame.payload).unwrap();
+                    assert!(matches!(notice, ControlEvent::SlowSubscriber {
+                        seq, session_epoch: SessionEpoch(1), ..
+                    } if seq == (SUB_QUEUE + 1) as u64));
+                    notices += 1;
+                }
+                Ok(())
+            },
+            || {
+                let fanout = hub.fanout.lock().unwrap();
+                let state = &fanout.subs[0];
+                if state.slow && state.queue.is_empty() {
+                    // Bound the RED case: the peer is still open, but an old
+                    // run loop would otherwise idle forever without a notice.
+                    empty_slow_polls.fetch_add(1, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        assert_eq!(records, SUB_QUEUE + 1);
+        assert_eq!(notices, 1, "final-write expiry must send a slow notice");
+        assert_eq!(empty_slow_polls.load(Ordering::SeqCst), 0);
+        assert!(hub.fanout.lock().unwrap().subs[0].dropped);
+        assert_eq!(hub.slots.load(Ordering::SeqCst), 0);
+        assert!(out.inner.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn legacy_bounded_pacing_preserves_sustained_slower_reader_stream() {
+        const RECORDS: usize = 16_384;
+        const RECORD_BYTES: usize = 2048;
+        fn check_record(event: &Logical) {
+            assert!(event.terminated);
+            assert!(matches!(&event.body, Body::Line(raw)
+                if raw.len() == RECORD_BYTES - 1 && raw.iter().all(|byte| *byte == b'x')));
+        }
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let grace_clock = Arc::clone(&clock);
+        let pacing_clock = Arc::clone(&clock);
+        let sleeper_clock = Arc::clone(&clock);
+        type Reader = Option<(std::sync::Weak<Hub>, Arc<Subscriber>)>;
+        let reader = Arc::new(Mutex::new(Reader::None));
+        let drain_reader = Arc::clone(&reader);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let drained = Arc::clone(&received);
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let drain_ticks = Arc::clone(&ticks);
+        let advance_reader = Arc::new(move |duration| {
+            assert_eq!(duration, Duration::from_millis(1));
+            advance(&sleeper_clock, duration);
+            // The reader runs on all elapsed time, including producer work.
+            // It takes four milliseconds per 2 KiB record; without pacing the
+            // producer offers a 64 KiB read each millisecond.
+            if drain_ticks.fetch_add(1, Ordering::SeqCst) % 4 != 3 {
+                return;
+            }
+            let (weak, sub) = drain_reader.lock().unwrap().as_ref().unwrap().clone();
+            let hub = weak.upgrade().unwrap();
+            if !sub.want_slow(&hub) && sub.next_event(&hub).is_some() {
+                let event = drain_one(&sub, &hub);
+                check_record(&event);
+                drained.lock().unwrap().push(event.seq);
+            }
+        });
+        let pacing_advance = Arc::clone(&advance_reader);
+        let hub = Arc::new(Hub::with_timing(
+            move || *grace_clock.lock().unwrap(),
+            move || *pacing_clock.lock().unwrap(),
+            move |duration| pacing_advance(duration),
+        ));
+        let out = fixture(1, &hub);
+        let sub = Arc::new(hub.subscribe(None, None).ok().unwrap());
+        *reader.lock().unwrap() = Some((Arc::downgrade(&hub), Arc::clone(&sub)));
+        let mut input = vec![b'x'; RECORDS * RECORD_BYTES];
+        for chunk in input.as_chunks_mut::<RECORD_BYTES>().0 {
+            *chunk.last_mut().unwrap() = b'\n';
+        }
+        let mut offset = 0;
+        while offset < input.len() {
+            let room = out.room();
+            assert!(
+                room > 0,
+                "bounded pacing must keep the producer progressing"
+            );
+            let end = (offset + room).min(input.len());
+            let before = ticks.load(Ordering::SeqCst);
+            advance_reader(Duration::from_millis(1));
+            assert_eq!(
+                ticks.load(Ordering::SeqCst),
+                before + 1,
+                "producer time must advance the same reader scheduler"
+            );
+            assert!(out.push(&input[offset..end]));
+            offset = end;
+            let completed = received.lock().unwrap().len();
+            if sub.want_slow(&hub) {
+                assert!(completed > 0, "RED must include successful reader progress");
+                panic!("draining sustained reader was shed after {completed} completed records");
+            }
+            let inner = out.inner.lock().unwrap();
+            assert!(inner.events.len() <= MAX_EVENTS);
+            assert!(OutputSession::charge(&inner).charge <= MAX_STDOUT_BACKLOG);
+        }
+        while sub.next_event(&hub).is_some() {
+            let event = drain_one(&sub, &hub);
+            check_record(&event);
+            received.lock().unwrap().push(event.seq);
+        }
+        assert_eq!(
+            *received.lock().unwrap(),
+            (1..=RECORDS as u64).collect::<Vec<_>>()
+        );
+        assert!(ticks.load(Ordering::SeqCst) > RECORDS);
+        assert!(!sub.want_slow(&hub));
+        assert!(out.inner.lock().unwrap().events.is_empty());
+        reader.lock().unwrap().take();
+        Arc::try_unwrap(sub).ok().unwrap().abandon(&hub);
     }
 
     #[test]
@@ -1263,7 +1955,7 @@ mod tests {
         old.run(
             Arc::clone(&hub),
             1,
-            |_| panic!("unsupported fragment sent"),
+            |_, _| panic!("unsupported fragment sent"),
             || false,
         );
         assert_eq!(out.inner.lock().unwrap().events.len(), 1);
