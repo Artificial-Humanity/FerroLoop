@@ -753,9 +753,10 @@ impl RouteTable {
         // rejection per persona so replaying that stale snapshot cannot resurrect the claim.
         for (key, result) in other.passive_agy_revalidation {
             let current = self.passive_agy_revalidation.get(&key);
+            // Keep confirmations even when this receiver missed the rejection, so replaying
+            // that older rejection cannot revoke the successfully revalidated claim.
             if current.is_none_or(|old| result.observed_at > old.observed_at)
-                && (!result.source_validated
-                    || current.is_some_and(|old| old.entry == result.entry))
+                && (!result.source_validated || current.is_none_or(|old| old.entry == result.entry))
             {
                 self.passive_agy_revalidation.insert(key, result);
             }
@@ -8715,6 +8716,55 @@ mod tests {
         older.upsert("kayla", agy_route("valid-older"), At::from_unix_millis(200));
         newer.merge_newer(older);
         assert_eq!(newer.get("kayla"), Some(&expected));
+    }
+
+    fn assert_passive_agy_confirmation_survives_replay_without_prior_rejection(fresh: bool) {
+        let home = TempDir::new().unwrap();
+        let mut old = RouteTable::default();
+        let mut route = agy_route("revalidated-conversation");
+        if let VendorRoute::Agy { agentapi_exe, .. } = &mut route {
+            *agentapi_exe = Some(PathBuf::from("agy"));
+        }
+        old.upsert("kayla", route, At::from_unix_millis(9000));
+        let mut rejected = old.clone();
+        rejected.discover_agy_routes(home.path(), false, &At::from_unix_millis(10000));
+        assert!(rejected.get("kayla").is_none());
+        agy_registration_fixture(home.path(), "revalidated-conversation", "Kayla", 9000);
+        let mut confirmed = rejected.clone();
+        confirmed.discover_agy_routes(home.path(), false, &At::from_unix_millis(10001));
+        assert_eq!(confirmed.get("kayla"), old.get("kayla"));
+
+        for merge in ["direct", "dispatch", "daemon"] {
+            let base = if fresh {
+                RouteTable::default()
+            } else {
+                old.clone()
+            };
+            let mut live = base.clone();
+            match merge {
+                "direct" => live.merge_newer(confirmed.clone()),
+                "dispatch" => live.merge_dispatch_result(&base, confirmed.clone()),
+                "daemon" => live.merge_daemon_dispatch_result(&base, confirmed.clone()),
+                _ => unreachable!(),
+            }
+            assert_eq!(live.get("kayla"), old.get("kayla"), "confirmation: {merge}");
+            live.merge_newer(rejected.clone());
+            assert_eq!(
+                live.get("kayla"),
+                old.get("kayla"),
+                "stale rejection after confirmation: {merge}, fresh={fresh}"
+            );
+        }
+    }
+
+    #[test]
+    fn passive_agy_confirmation_survives_replay_on_original_receiver() {
+        assert_passive_agy_confirmation_survives_replay_without_prior_rejection(false);
+    }
+
+    #[test]
+    fn passive_agy_confirmation_survives_replay_on_fresh_receiver() {
+        assert_passive_agy_confirmation_survives_replay_without_prior_rejection(true);
     }
 
     #[test]
