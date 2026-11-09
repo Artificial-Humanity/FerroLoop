@@ -1269,6 +1269,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             restart_policy: "on-failure".into(),
             restart_count: 0,
             tmux_target: Some("Fiona:codex".into()),
+            host_session_id: Some("Fiona.codex".into()),
             cwd: None,
             context_window: None,
             hydration_dispatched: false,

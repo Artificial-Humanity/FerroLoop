@@ -695,6 +695,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         restart_policy: "on-failure".into(),
         restart_count: 0,
         tmux_target: None,
+        host_session_id: None,
         cwd: None,
         context_window: None,
         hydration_dispatched: false,

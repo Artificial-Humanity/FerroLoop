@@ -2045,6 +2045,10 @@ pub struct SpinUpResponse {
     pub hosted: bool,
     pub status: String,
     pub tmux_target: Option<String>,
+    /// The `fl-host` session identifier for this runtime (`<Persona>.<vendor>`, or `muse.<persona>`),
+    /// when the session has a runtime target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     /// Whether the prompt was handed to the vendor; this is not acceptance evidence.
     pub hydration_dispatched: bool,
     #[serde(default)]
@@ -2087,6 +2091,10 @@ pub struct HostedSessionRecord {
     pub restart_policy: String,
     pub restart_count: u32,
     pub tmux_target: Option<String>,
+    /// The `fl-host` session identifier for this runtime (`<Persona>.<vendor>`, or `muse.<persona>`),
+    /// when the session has a runtime target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     pub cwd: Option<String>,
     /// The context window chosen for the session, in tokens. Validated and recorded; whether and
     /// how a launch applies it is separate. Absent when none was chosen.
@@ -2119,6 +2127,14 @@ pub struct HostedSessionRecord {
     pub decommission_prepared_at_ms: Option<u64>,
 }
 
+/// Compute the `fl-host` session identifier for an optional `tmux_target` (`<Persona>.<vendor>`,
+/// or `muse.<persona>`).
+fn host_session_id_for_target(tmux_target: Option<&str>) -> Option<String> {
+    tmux_target
+        .and_then(fl_wire::vendor_adapter::unit_to_host_session_id)
+        .map(|id| id.as_str().to_string())
+}
+
 /// Slug of the runtime entry for `session_id` (`:` is not a slug character).
 pub fn hosted_session_slug(session_id: &str) -> String {
     format!("{HOSTED_SLUG_PREFIX}{}", session_id.replace(':', "-"))
@@ -2129,7 +2145,10 @@ pub fn persist_hosted_session<S: StateStore>(
     record: &HostedSessionRecord,
     by: &str,
 ) -> Result<(), LifecycleError> {
-    let value = serde_json::to_value(record).map_err(|e| LifecycleError::Store(e.to_string()))?;
+    let mut normalized = record.clone();
+    normalized.host_session_id = host_session_id_for_target(normalized.tmux_target.as_deref());
+    let value =
+        serde_json::to_value(&normalized).map_err(|e| LifecycleError::Store(e.to_string()))?;
     // Never replace another session's record (see `check_slug_free`).
     check_slug_free(store, &record.session_id)?;
     store.upsert_state(UpsertStateArgs {
@@ -2155,7 +2174,13 @@ pub fn list_hosted_sessions<S: StateStore>(
         .into_iter()
         .filter(|e| e.slug.starts_with(HOSTED_SLUG_PREFIX))
         .filter_map(|e| match e.payload {
-            StatePayload::Runtime(rt) => serde_json::from_value(rt.value).ok(),
+            StatePayload::Runtime(rt) => {
+                let mut rec: HostedSessionRecord = serde_json::from_value(rt.value).ok()?;
+                if rec.host_session_id.is_none() {
+                    rec.host_session_id = host_session_id_for_target(rec.tmux_target.as_deref());
+                }
+                Some(rec)
+            }
             _ => None,
         })
         .collect();
@@ -3712,6 +3737,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     register_spun_up_agent(store, &v, by)?;
 
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
+    let host_session_id = host_session_id_for_target(tmux_target.as_deref());
     let unit = tmux_target
         .as_deref()
         .map_or("", |t| env.runtime.unit(t))
@@ -3732,6 +3758,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         restart_policy: "on-failure".to_string(),
         restart_count: previous.as_ref().map_or(0, |r| r.restart_count),
         tmux_target: tmux_target.clone(),
+        host_session_id: host_session_id.clone(),
         cwd: v.cwd.clone(),
         context_window: v.context_window,
         posture: v.posture,
@@ -3814,6 +3841,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
         tmux_target,
+        host_session_id,
         hydration_dispatched: hydration.dispatched,
         hydration_status: hydration.status,
         prompt: Some(prompt),
@@ -3999,6 +4027,7 @@ fn record_for_target<S: AgentRegistry>(
         restart_policy: "never".to_string(),
         restart_count: 0,
         tmux_target: None,
+        host_session_id: None,
         cwd: None,
         context_window: None,
         posture: fl_core::permissions::Posture::Auto,
@@ -4786,6 +4815,7 @@ fn preflight_teardown_runtime<S: AgentRegistry + StateStore>(
     {
         if record.tmux_target.is_none() {
             record.tmux_target = sib.tmux_target.clone();
+            record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
         }
         if !record.runtime_spawned && sib.runtime_spawned {
             record.runtime_spawned = true;
@@ -5126,9 +5156,11 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
             // The window now under the shared name is not what that record created, so it does
             // not own it: a teardown must not kill it unless this restart opens it.
             record.tmux_target = Some(want_target.clone());
+            record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
             record.runtime_spawned = false;
         }
     }
+    record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
     if record.hosted
         && !adopted_old_session
         && record.runtime_spawned
@@ -5282,6 +5314,10 @@ pub struct RemodelResponse {
     /// `execute`: whether the old session's runtime is gone.
     pub runtime_stopped: bool,
     pub tmux_target: Option<String>,
+    /// The `fl-host` session identifier for this runtime (`<Persona>.<vendor>`, or `muse.<persona>`),
+    /// when the session has a runtime target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     /// `prepare`: the handoff prompt; `execute`: the new session's reforge prompt.
     pub prompt: Option<String>,
     /// `execute`: slug of the workspace handoff entry that records the remodel.
@@ -5801,6 +5837,11 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
     let to = &plan.to;
     if plan.mode == RemodelMode::Prepare {
         let out = prepare_decommission(store, env, target, by, caller)?;
+        let tmux_target = target.hosted.as_ref().and_then(|r| r.tmux_target.clone());
+        let host_session_id = tmux_target
+            .as_deref()
+            .and_then(fl_wire::vendor_adapter::unit_to_host_session_id)
+            .map(|id| id.as_str().to_string());
         return Ok(RemodelResponse {
             mode: RemodelMode::Prepare,
             session_id: out.session_id.clone(),
@@ -5820,7 +5861,8 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
             hydration_dispatched: false,
             hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
             runtime_stopped: false,
-            tmux_target: target.hosted.as_ref().and_then(|r| r.tmux_target.clone()),
+            tmux_target,
+            host_session_id,
             prompt: out.prompt,
             handoff: None,
             warnings: Vec::new(),
@@ -5894,6 +5936,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
                 hydration_status: out.hydration_status,
                 runtime_stopped: torn.runtime_stopped,
                 tmux_target: out.tmux_target,
+                host_session_id: out.host_session_id,
                 prompt: out.prompt,
                 handoff: Some(handoff),
                 warnings,
@@ -9534,6 +9577,8 @@ mod tests {
         status: &str,
         spawned: bool,
     ) -> HostedSessionRecord {
+        let tmux_target = Some(format!("{}:{vendor}", capitalize(persona)));
+        let host_session_id = host_session_id_for_target(tmux_target.as_deref());
         HostedSessionRecord {
             session_id: format!("{vendor}:{persona}"),
             persona: persona.into(),
@@ -9548,7 +9593,8 @@ mod tests {
             status: status.into(),
             restart_policy: "on-failure".into(),
             restart_count: 0,
-            tmux_target: Some(format!("{}:{vendor}", capitalize(persona))),
+            tmux_target,
+            host_session_id,
             cwd: None,
             context_window: None,
             hydration_dispatched: false,
@@ -11201,5 +11247,152 @@ mod tests {
                 spec.argv
             );
         }
+    }
+
+    #[test]
+    fn spin_up_and_remodel_expose_host_session_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let mut env = fake.env(home.path());
+        env.key_probe = &RestoreKeys;
+
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(spun.session_id, "codex:ada");
+        assert_eq!(spun.tmux_target.as_deref(), Some("Ada:codex"));
+        assert_eq!(spun.host_session_id.as_deref(), Some("Ada.codex"));
+        let stored_codex = find_hosted_session(&store, &["codex:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_codex.host_session_id.as_deref(), Some("Ada.codex"));
+
+        let target = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
+        let prepared = remodel_session(
+            &store,
+            &env,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(prepared.host_session_id.as_deref(), Some("Ada.codex"));
+
+        let remodeled = remodel_session(
+            &store,
+            &env,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(remodeled.session_id, "muse:ada");
+        assert_eq!(remodeled.tmux_target.as_deref(), Some("muse:ada"));
+        assert_eq!(remodeled.host_session_id.as_deref(), Some("muse.ada"));
+        let stored_muse = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+        assert_eq!(stored_muse.host_session_id.as_deref(), Some("muse.ada"));
+
+        // API-only vendor session (`tmux_target: None`) populates `host_session_id: None` across
+        // SpinUpResponse, HostedSessionRecord, and RemodelResponse (both Prepare and Execute).
+        let api_spun = spin_up(
+            &store,
+            &env,
+            &req("bea", "assistant", "kimi-api"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(api_spun.tmux_target, None);
+        assert_eq!(api_spun.host_session_id, None);
+        let api_rec = find_hosted_session(&store, &["kimi-api:bea"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(api_rec.tmux_target, None);
+        assert_eq!(api_rec.host_session_id, None);
+
+        let api_target = SessionTarget::resolve(&store, "kimi-api:bea", None).unwrap();
+        let api_prepared = remodel_session(
+            &store,
+            &env,
+            &api_target,
+            &RemodelRequest {
+                vendor: "openrouter-api".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(api_prepared.tmux_target, None);
+        assert_eq!(api_prepared.host_session_id, None);
+
+        let api_remodeled = remodel_session(
+            &store,
+            &env,
+            &api_target,
+            &RemodelRequest {
+                vendor: "openrouter-api".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(api_remodeled.tmux_target, None);
+        assert_eq!(api_remodeled.host_session_id, None);
+        let api_rec_after = find_hosted_session(&store, &["openrouter-api:bea"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(api_rec_after.tmux_target, None);
+        assert_eq!(api_rec_after.host_session_id, None);
+
+        // Legacy HostedSessionRecord JSON serialized without `host_session_id` deserializes cleanly
+        // and backfills `host_session_id` when read via `list_hosted_sessions`.
+        let mut legacy_json = serde_json::to_value(&stored_muse).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("host_session_id");
+        let deserialized: HostedSessionRecord =
+            serde_json::from_value(legacy_json.clone()).unwrap();
+        assert_eq!(deserialized.host_session_id, None);
+
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: hosted_session_slug("muse:ada"),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: legacy_json,
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        let listed = list_hosted_sessions(&store).unwrap();
+        let backfilled = listed.iter().find(|r| r.session_id == "muse:ada").unwrap();
+        assert_eq!(backfilled.host_session_id.as_deref(), Some("muse.ada"));
     }
 }

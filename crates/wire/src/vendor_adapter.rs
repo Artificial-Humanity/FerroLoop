@@ -1115,12 +1115,78 @@ pub fn host_session_id_to_unit(id: &SessionId) -> String {
     }
 }
 
+/// Split `target` into `(vendor, persona)` when it has the `<vendor>:<persona>` lifecycle
+/// session-id shape (`"codex:kage"`, `"muse:eve"`): a registered vendor id (matched
+/// case-insensitively) and a non-empty persona slug separated by a single `:`.
+pub fn split_lifecycle_session_id(target: &str) -> Option<(String, &str)> {
+    let (vendor, persona) = target.trim().split_once(':')?;
+    if vendor.is_empty() || persona.is_empty() || persona.contains(':') {
+        return None;
+    }
+    let spec = fl_core::lookup_vendor(&vendor.to_ascii_lowercase())?;
+    Some((spec.id, persona))
+}
+
+/// Map a `<vendor>:<persona>` lifecycle session id (`"codex:kage"`, `"muse:eve"`) onto its
+/// `fl_host_proto::SessionId` (`"Kage.codex"`, `"muse.eve"`) using the registry's display
+/// casing for `<persona>` (`agents`).
+///
+/// - For `"muse:<persona>"`, the host session id is `"muse.<persona>"` (with `<persona>`
+///   lowercased).
+/// - For any other registered vendor, `<persona>` is looked up in `agents` (active records
+///   take precedence over retired ones). When matching records disagree on `display_name`,
+///   an `Err` is returned describing the ambiguity.
+/// - Returns `Ok(None)` when `target` is not a `<vendor>:<persona>` lifecycle id or `<persona>`
+///   is not present in `agents`.
+pub fn lifecycle_id_to_host_session_id(
+    target: &str,
+    agents: &[fl_core::AgentRecord],
+) -> Result<Option<SessionId>, String> {
+    let Some((vendor, persona)) = split_lifecycle_session_id(target) else {
+        return Ok(None);
+    };
+    if vendor == "muse" {
+        return Ok(SessionId::new(&format!("muse.{}", persona.to_ascii_lowercase())).ok());
+    }
+    let matches_persona = |a: &&fl_core::AgentRecord| {
+        a.name_key.eq_ignore_ascii_case(persona) || a.display_name.eq_ignore_ascii_case(persona)
+    };
+    let active: Vec<&fl_core::AgentRecord> = agents
+        .iter()
+        .filter(|a| a.status == fl_core::AgentStatus::Active)
+        .filter(matches_persona)
+        .collect();
+    let candidates = if !active.is_empty() {
+        active
+    } else {
+        agents.iter().filter(matches_persona).collect()
+    };
+    let mut display_names: Vec<&str> = candidates
+        .into_iter()
+        .map(|a| a.display_name.as_str())
+        .collect();
+    display_names.sort_unstable();
+    display_names.dedup();
+    match display_names.as_slice() {
+        [] => Ok(None),
+        [display] => Ok(SessionId::new(&format!("{display}.{vendor}")).ok()),
+        many => Err(format!(
+            "ambiguous fl-host session target `{}`: registry has multiple display casings for persona `{persona}` ({})",
+            target.trim(),
+            many.join(", ")
+        )),
+    }
+}
+
 /// Live `SessionId`s in `sessions` that belong to `unit`.
 ///
 /// - `unit == ""` or `unit == "muse"` matches nothing (the shared Muse container is never a single
 ///   session unit).
 /// - `unit` containing `:` (`"muse:ada"`, `"Ada:claude"`) matches the exact `SessionId`
-///   (`"muse.ada"`, `"Ada.claude"`).
+///   (`"muse.ada"`, `"Ada.claude"`), and when `unit` has the `<vendor>:<persona>` lifecycle shape
+///   (`"codex:kage"`, `"muse:eve"`), also matches live sessions whose `s.stream.session` is
+///   `muse.<persona_lower>` (for `vendor == "muse"`) or `<SessionPersona>.<vendor>` where
+///   `SessionPersona.eq_ignore_ascii_case(persona)` (for non-Muse vendors).
 /// - Bare `unit` (`"Ada"`) matches `"Ada"` and any `"Ada.<window>"` (`"Ada.claude"`, etc.).
 pub fn matching_live_host_sessions(sessions: &[SessionSummary], unit: &str) -> Vec<SessionId> {
     let unit = unit.trim();
@@ -1131,11 +1197,27 @@ pub fn matching_live_host_sessions(sessions: &[SessionSummary], unit: &str) -> V
         .iter()
         .filter(|s| matches!(s.state, ChildState::Running(_)));
     if unit.contains(':') {
-        let Some(wanted) = unit_to_host_session_id(unit) else {
-            return Vec::new();
-        };
+        let wanted = unit_to_host_session_id(unit);
+        let lifecycle = split_lifecycle_session_id(unit);
         return live
-            .filter(|s| s.stream.session == wanted)
+            .filter(|s| {
+                if wanted.as_ref() == Some(&s.stream.session) {
+                    return true;
+                }
+                if let Some((ref vendor, persona)) = lifecycle {
+                    if vendor == "muse" {
+                        let expected = format!("muse.{}", persona.to_ascii_lowercase());
+                        return s.stream.session.as_str() == expected;
+                    }
+                    if let Some((sess_persona, sess_vendor)) =
+                        s.stream.session.as_str().split_once('.')
+                    {
+                        return sess_vendor == vendor.as_str()
+                            && sess_persona.eq_ignore_ascii_case(persona);
+                    }
+                }
+                false
+            })
             .map(|s| s.stream.session.clone())
             .collect();
     }
@@ -1631,11 +1713,100 @@ mod tests {
             vec![SessionId::new("Ada.claude").unwrap()]
         );
         assert_eq!(
+            matching_live_host_sessions(&sessions, "claude:ada"),
+            vec![SessionId::new("Ada.claude").unwrap()]
+        );
+        assert_eq!(
+            matching_live_host_sessions(&sessions, "CLAUDE:Ada"),
+            vec![SessionId::new("Ada.claude").unwrap()]
+        );
+        assert_eq!(
             matching_live_host_sessions(&sessions, "muse:ada"),
+            vec![SessionId::new("muse.ada").unwrap()]
+        );
+        assert_eq!(
+            matching_live_host_sessions(&sessions, "Muse:Ada"),
             vec![SessionId::new("muse.ada").unwrap()]
         );
         assert!(matching_live_host_sessions(&sessions, "muse:bob").is_empty());
         assert!(matching_live_host_sessions(&sessions, "muse").is_empty());
+    }
+
+    #[test]
+    fn lifecycle_id_to_host_session_id_uses_registry_display_casing_and_refuses_ambiguity() {
+        use fl_core::{AgentId, AgentRecord, AgentRole, AgentStatus, At, Iri};
+
+        let make_agent =
+            |id: u64, name_key: &str, display_name: &str, status: AgentStatus| AgentRecord {
+                id: AgentId(Iri::parse(&format!("urn:test:agent:{id}")).unwrap()),
+                name_key: name_key.to_string(),
+                display_name: display_name.to_string(),
+                email: format!("{name_key}@artificialhumanity.io"),
+                project: "ferroloop".to_string(),
+                role: AgentRole::Assistant,
+                extra_areas: Vec::new(),
+                status,
+                updated_at: At::from_unix_millis(1),
+                by: "owner".to_string(),
+            };
+
+        let agents = vec![
+            make_agent(1, "kage", "Kage", AgentStatus::Active),
+            make_agent(2, "jarvis", "JARVIS", AgentStatus::Active),
+            make_agent(3, "jarvis", "Jarvis", AgentStatus::Retired),
+        ];
+
+        assert_eq!(
+            split_lifecycle_session_id("codex:kage"),
+            Some(("codex".to_string(), "kage"))
+        );
+        assert_eq!(
+            split_lifecycle_session_id("codex:Kage"),
+            Some(("codex".to_string(), "Kage"))
+        );
+        assert_eq!(
+            split_lifecycle_session_id("CODEX:kage"),
+            Some(("codex".to_string(), "kage"))
+        );
+        assert_eq!(
+            split_lifecycle_session_id("Muse:Eve"),
+            Some(("muse".to_string(), "Eve"))
+        );
+        assert_eq!(split_lifecycle_session_id("Kage:codex"), None);
+        assert_eq!(
+            lifecycle_id_to_host_session_id("codex:kage", &agents).unwrap(),
+            Some(SessionId::new("Kage.codex").unwrap())
+        );
+        assert_eq!(
+            lifecycle_id_to_host_session_id("CODEX:Kage", &agents).unwrap(),
+            Some(SessionId::new("Kage.codex").unwrap())
+        );
+        // Active record wins over retired record with older casing.
+        assert_eq!(
+            lifecycle_id_to_host_session_id("claude:jarvis", &agents).unwrap(),
+            Some(SessionId::new("JARVIS.claude").unwrap())
+        );
+        // Muse keeps `muse.<persona>` lowercased.
+        assert_eq!(
+            lifecycle_id_to_host_session_id("muse:eve", &[]).unwrap(),
+            Some(SessionId::new("muse.eve").unwrap())
+        );
+        assert_eq!(
+            lifecycle_id_to_host_session_id("Muse:Eve", &[]).unwrap(),
+            Some(SessionId::new("muse.eve").unwrap())
+        );
+        // Unregistered non-Muse persona returns None.
+        assert_eq!(
+            lifecycle_id_to_host_session_id("codex:unknown", &agents).unwrap(),
+            None
+        );
+        // Conflicting active display casings refuse on ambiguity.
+        let conflicting = vec![
+            make_agent(10, "kage", "Kage", AgentStatus::Active),
+            make_agent(11, "kage", "KAGE", AgentStatus::Active),
+        ];
+        let err = lifecycle_id_to_host_session_id("codex:kage", &conflicting).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
     }
 
     #[test]

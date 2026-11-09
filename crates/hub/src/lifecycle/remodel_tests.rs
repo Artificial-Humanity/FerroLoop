@@ -1642,6 +1642,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         restart_policy: "never".into(),
         restart_count: 0,
         tmux_target: None,
+        host_session_id: None,
         cwd: None,
         hydration_dispatched: false,
         hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
