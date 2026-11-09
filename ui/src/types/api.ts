@@ -733,6 +733,13 @@ export function normalizeHydrationStatus(raw: unknown): HydrationStatus {
   return "unconfirmed";
 }
 
+export function normalizeHydrationWarnings(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.filter((item): item is string => typeof item === "string");
+}
+
 export interface HostedSessionSummary {
   session_id: string;
   persona: string;
@@ -768,6 +775,7 @@ export interface SpinUpSessionRequest {
 }
 
 export interface SpinUpSessionResponse {
+  warnings?: string[];
   session_id: string;
   persona: string;
   project: string;

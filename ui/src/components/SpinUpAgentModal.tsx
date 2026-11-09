@@ -8,6 +8,7 @@ import {
 import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
 import {
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   type EnrolledNode,
   type PermissionPosture,
   type ProjectSummary,
@@ -998,6 +999,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       const normalizedRes: SpinUpSessionResponse = {
         ...res,
         hydration_status: normalizeHydrationStatus(res.hydration_status),
+        warnings: normalizeHydrationWarnings(res.warnings),
       };
       setLastSpinUpResult(normalizedRes);
       onSpunUp?.(normalizedRes);
@@ -1913,40 +1915,76 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
             const hydrationStatus = normalizeHydrationStatus(
               lastSpinUpResult.hydration_status,
             );
+            const warnings = normalizeHydrationWarnings(
+              lastSpinUpResult.warnings,
+            );
             const isFailed = hydrationStatus === "failed";
             const isConfirmed = hydrationStatus === "confirmed";
             return (
               <div
-                role={isFailed ? "status" : undefined}
-                data-testid="spin-up-hydration-status"
-                data-hydration-status={hydrationStatus}
-                data-hydration-dispatched={String(
-                  Boolean(lastSpinUpResult.hydration_dispatched),
-                )}
-                className="fd-mono"
                 style={{
-                  padding: "6px 8px",
-                  borderRadius: "4px",
-                  fontSize: "11px",
-                  border: isFailed
-                    ? "1px solid rgba(245, 158, 11, 0.45)"
-                    : isConfirmed
-                      ? "1px solid rgba(16, 185, 129, 0.4)"
-                      : "1px solid var(--border-subtle)",
-                  backgroundColor: isFailed
-                    ? "rgba(245, 158, 11, 0.14)"
-                    : isConfirmed
-                      ? "rgba(16, 185, 129, 0.12)"
-                      : "var(--bg-elevated)",
-                  color: isFailed
-                    ? "#FBBF24"
-                    : isConfirmed
-                      ? "#34D399"
-                      : "var(--text-secondary)",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
                 }}
               >
-                Hydration: <strong>{hydrationStatus}</strong> (dispatched:{" "}
-                {lastSpinUpResult.hydration_dispatched ? "true" : "false"})
+                <div
+                  role={isFailed ? "status" : undefined}
+                  data-testid="spin-up-hydration-status"
+                  data-hydration-status={hydrationStatus}
+                  data-hydration-dispatched={String(
+                    Boolean(lastSpinUpResult.hydration_dispatched),
+                  )}
+                  className="fd-mono"
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: "4px",
+                    fontSize: "11px",
+                    border: isFailed
+                      ? "1px solid rgba(245, 158, 11, 0.45)"
+                      : isConfirmed
+                        ? "1px solid rgba(16, 185, 129, 0.4)"
+                        : "1px solid var(--border-subtle)",
+                    backgroundColor: isFailed
+                      ? "rgba(245, 158, 11, 0.14)"
+                      : isConfirmed
+                        ? "rgba(16, 185, 129, 0.12)"
+                        : "var(--bg-elevated)",
+                    color: isFailed
+                      ? "#FBBF24"
+                      : isConfirmed
+                        ? "#34D399"
+                        : "var(--text-secondary)",
+                  }}
+                >
+                  Hydration: <strong>{hydrationStatus}</strong> (dispatched:{" "}
+                  {lastSpinUpResult.hydration_dispatched ? "true" : "false"})
+                </div>
+                {warnings.length > 0 && (
+                  <ul
+                    role="status"
+                    data-testid="spin-up-warnings"
+                    className="fd-mono"
+                    style={{
+                      margin: 0,
+                      padding: "6px 8px 6px 22px",
+                      borderRadius: "4px",
+                      fontSize: "11px",
+                      border: "1px solid rgba(245, 158, 11, 0.45)",
+                      backgroundColor: "rgba(245, 158, 11, 0.14)",
+                      color: "#FBBF24",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "2px",
+                    }}
+                  >
+                    {warnings.map((warning, idx) => (
+                      <li key={idx} data-testid="spin-up-warning-item">
+                        {warning}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
             );
           })()}
