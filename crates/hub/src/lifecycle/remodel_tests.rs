@@ -1644,6 +1644,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         tmux_target: None,
         cwd: None,
         hydration_dispatched: false,
+        hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
         runtime_spawned: false,
         tombstone_ids: vec!["gs-old".into()],
         vendor_session_id: None,

@@ -800,3 +800,104 @@ fn hub_remodel_owner_refusal_child() {
     assert_eq!(before_registry, store.registry_events_after(0).unwrap());
     assert_eq!(before_routes, std::fs::read(&routes_path).unwrap());
 }
+
+/// These children have the prompt in argv but cannot consume it until the test releases them.
+/// A dialog waits for input; delayed startup waits for a separate initialization gate.
+fn hydration_waiting_child_stays_unconfirmed(dialog: bool) {
+    let f = Fixture::new();
+    let gate = if dialog {
+        "printf 'Trust this workspace? [y/N]\\n'; read answer; [ \"$answer\" = y ] || exit 1"
+    } else {
+        "printf 'Initializing vendor runtime...\\n'; while [ ! -f \"$root/release\" ]; do sleep 0.01; done"
+    };
+    std::fs::write(
+        f.root.path().join("vendor"),
+        format!(
+            "#!/bin/sh\nroot=$(dirname \"$0\")\nprintf 'launch\\n' >> \"$root/handoffs\"\nprintf '%s\\n' \"$@\" > \"$root/arguments\"\n{gate}\nprintf 'consumed\\n' > \"$root/consumed\"\nexec /bin/cat\n"
+        ),
+    ).unwrap();
+    let out = f.spin("claude", false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let marker = if dialog {
+        "Trust this workspace?"
+    } else {
+        "Initializing vendor runtime..."
+    };
+    loop {
+        let screen = f
+            .rpc()
+            .capture_output(SessionId::new("Ada.claude").unwrap(), 65536)
+            .unwrap();
+        if screen.contains(marker) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child did not reach its gate: {screen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(f.running("Ada.claude"));
+    assert!(
+        !f.root.path().join("consumed").exists(),
+        "child must still be blocked"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("handoffs")).unwrap(),
+        "launch\n"
+    );
+    assert!(
+        std::fs::read_to_string(f.root.path().join("arguments"))
+            .unwrap()
+            .contains(out["prompt"].as_str().unwrap())
+    );
+    assert_eq!(out["hydration_dispatched"], true);
+    assert_eq!(out["hydration_status"], "unconfirmed");
+    if dialog {
+        let mut rpc = f.rpc();
+        let stream = rpc
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.stream.session.as_str() == "Ada.claude")
+            .unwrap()
+            .stream;
+        let grant = rpc.claim_controller(stream.clone()).unwrap();
+        rpc.send_line(stream, grant.lease, "y".into()).unwrap();
+    } else {
+        std::fs::write(f.root.path().join("release"), "ready").unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f.root.path().join("consumed").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "child did not finish initialization"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let records = f.json(&["state", "list", "--concern", "runtime", "--json"], false);
+    let record = records
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["slug"] == "hosted-session-claude-ada")
+        .unwrap();
+    assert_eq!(
+        record["payload"]["runtime"]["value"]["hydration_status"],
+        "unconfirmed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("handoffs")).unwrap(),
+        "launch\n"
+    );
+}
+
+#[test]
+fn hydration_status_live_dialog_is_unconfirmed_without_a_second_handoff() {
+    hydration_waiting_child_stays_unconfirmed(true);
+}
+
+#[test]
+fn hydration_status_delayed_start_remains_unconfirmed_after_initialization() {
+    hydration_waiting_child_stays_unconfirmed(false);
+}

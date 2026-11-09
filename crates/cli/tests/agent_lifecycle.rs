@@ -136,6 +136,7 @@ fn spin_up_registers_the_agent_and_persists_a_hosted_record() {
     assert_eq!(out["status"], "running");
     assert_eq!(out["tmux_target"], "Felicity:claude");
     assert_eq!(out["hydration_dispatched"], false);
+    assert_eq!(out["hydration_status"], "failed");
     assert!(
         out["prompt"]
             .as_str()
@@ -163,7 +164,7 @@ fn spin_up_registers_the_agent_and_persists_a_hosted_record() {
         .assert()
         .success()
         .stdout(contains(
-            "muse:ada\trunning\tmuse:ada\thydration_dispatched=false",
+            "muse:ada\trunning\tmuse:ada\thydration_dispatched=false\thydration_status=failed",
         ));
     let records = env.hosted_records();
     let ada = records.iter().find(|r| r["persona"] == "ada").unwrap();
@@ -444,6 +445,7 @@ fn remodel_execute_moves_the_persona_to_another_vendor_in_json_and_text() {
     assert_eq!(out["status"], "running");
     assert_eq!(out["tmux_target"], "Felicity:codex");
     assert_eq!(out["hydration_dispatched"], false);
+    assert_eq!(out["hydration_status"], "failed");
     assert_eq!(out["handoff"], "remodel-felicity");
 
     let roster = env.roster(false);
@@ -462,7 +464,7 @@ fn remodel_execute_moves_the_persona_to_another_vendor_in_json_and_text() {
         .success()
         .stdout(contains(
             "grok:felicity\trunning\tFelicity:grok\thydration_dispatched=false\t\
-             remodeled_from=codex:felicity",
+             remodeled_from=codex:felicity\thydration_status=failed",
         ));
 
     // The handoff entry is in the store for the next session to read.
@@ -542,4 +544,93 @@ kimi-api, lemonade, muse, ollama, openai-api, openrouter-api, xai-api",
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["status"], "running");
     assert_eq!(env.roster(false)[0]["status"], "active");
+}
+
+#[cfg(unix)]
+#[test]
+fn hydration_status_codex_queue_and_ambiguous_exit_never_steer_or_resend() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    for exit_code in [0, 1] {
+        let env = Env::new();
+        let bin = env.path().join("codex-fixture");
+        let log = env.path().join("queue-inputs");
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$(dirname \"$0\")/queue-inputs\"\nexit {exit_code}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = env.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "thread-ada".into(),
+                cwd: Some(env.path().into()),
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&env.routes())).unwrap();
+        let mut command = env.spin_up("ada", "assistant", "codex");
+        command
+            .env("FL_WIRE_CODEX_BIN", &bin)
+            .env("CODEX_HOME", env.path().join("codex-home"))
+            .env("FL_WIRE_CODEX_CONTROL_SOCK", &socket)
+            .env("FL_HOST_SOCK", env.path().join("no-host.sock"))
+            .env("FL_WIRE_TMUX_BIN", "/bin/false");
+        let out = Env::json_of(command);
+        assert_eq!(out["hydration_dispatched"], exit_code == 0);
+        assert_eq!(out["hydration_status"], "unconfirmed");
+        let input = std::fs::read_to_string(log).unwrap();
+        assert_eq!(input.lines().filter(|line| *line == "queue").count(), 1);
+        assert!(input.starts_with("queue\n--thread\nthread-ada\n--message\n"));
+        assert!(input.contains(out["prompt"].as_str().unwrap()));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "hydration must preserve Ordinary intent even with the owner sender label"
+        );
+        assert_eq!(env.hosted_records()[0]["hydration_status"], "unconfirmed");
+    }
+}
+
+#[test]
+fn hydration_status_legacy_record_decodes_as_unconfirmed_when_saved_again() {
+    let env = Env::new();
+    Env::json_of(env.spin_up("ada", "assistant", "claude"));
+    let mut legacy = env.hosted_records().remove(0);
+    legacy.as_object_mut().unwrap().remove("hydration_status");
+    legacy["hydration_dispatched"] = true.into();
+    env.fl()
+        .args([
+            "state",
+            "runtime",
+            "set",
+            "--scope",
+            "workspace",
+            "--key",
+            "hosted-session-claude-ada",
+            "--value",
+            &legacy.to_string(),
+            "--merge",
+            "last_writer",
+            "--by",
+            "owner",
+        ])
+        .assert()
+        .success();
+    env.fl()
+        .args([
+            "agent",
+            "decommission",
+            "claude:ada",
+            "--mode",
+            "prepare",
+            "--by",
+            "owner",
+        ])
+        .assert()
+        .success();
+    let record = env.hosted_records().remove(0);
+    assert_eq!(record["hydration_dispatched"], true);
+    assert_eq!(record["hydration_status"], "unconfirmed");
 }
