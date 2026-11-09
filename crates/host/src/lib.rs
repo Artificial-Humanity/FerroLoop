@@ -2931,6 +2931,168 @@ mod deadline_tests {
     }
 
     #[test]
+    fn pipe_epochs_survive_completed_pty_compaction_and_slot_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+
+        // 1. Completed ReliablePipe with unacknowledged data and an attached replay cursor.
+        let pipe_stream = fl_host_proto::StreamId {
+            host: host.inner.authority.instance().clone(),
+            session: SessionId::new("reliable-pipe").unwrap(),
+            epoch: fl_host_proto::SessionEpoch(1),
+        };
+        let pipe_journal = host
+            .inner
+            .reserve_reliable_journal(pipe_stream.clone())
+            .unwrap();
+        assert!(!pipe_journal.pty_mode());
+        for text in [b"pipe-one".as_slice(), b"pipe-two".as_slice()] {
+            let mut buf = pipe_journal.allocate(text.len()).unwrap();
+            buf.as_mut_slice().copy_from_slice(text);
+            super::reliable::append(&pipe_journal, super::reliable::ReliableBody::Line(buf))
+                .unwrap();
+        }
+        pipe_journal.eof();
+        let pipe_session = Arc::new(Session::with_reliable(
+            SessionParts {
+                session: pipe_stream.session.clone(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            },
+            Some(Arc::clone(&pipe_journal)),
+        ));
+        pipe_session.note_cleanup(CleanupReport { complete: true });
+        let pipe_output = super::output::OutputSession::open(
+            Arc::clone(&pipe_session),
+            Arc::clone(&host.inner.hub),
+        );
+        let pipe_writer = super::input::WriterHandle::start(Arc::clone(&pipe_session), None);
+        host.inner.authority.register(
+            host.inner
+                .authority
+                .prepare_epoch(Arc::clone(&pipe_journal))
+                .unwrap(),
+            &pipe_session,
+            &pipe_writer,
+        );
+        let pipe_key = ("reliable-pipe".to_owned(), 1);
+        host.inner
+            .outputs
+            .lock()
+            .unwrap()
+            .insert(pipe_key.clone(), pipe_output);
+        host.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(pipe_key.0.clone(), Arc::clone(&pipe_session));
+        let (_, mut pipe_cursor) = super::reliable::begin_replay(&pipe_journal, 0).unwrap();
+        let first_rec = pipe_cursor.next().unwrap().unwrap();
+        assert_eq!(first_rec.seq, 1);
+        drop(first_rec);
+
+        // 2. Running LegacyPipe holding output.
+        let legacy_session = Arc::new(Session::new(SessionParts {
+            session: SessionId::new("legacy-pipe").unwrap(),
+            epoch: 2,
+            vendor_pid: 0,
+            vendor_start: 0,
+            supervisor_pid: 0,
+            supervisor_start: 0,
+            pgid: 0,
+            control_inode: 0,
+            control: None,
+            stdin: None,
+        }));
+        let legacy_output = super::output::OutputSession::open(
+            Arc::clone(&legacy_session),
+            Arc::clone(&host.inner.hub),
+        );
+        legacy_session.push_stdout_tail(b"legacy-line\n", 64 * 1024);
+        let legacy_key = ("legacy-pipe".to_owned(), 2);
+        host.inner
+            .outputs
+            .lock()
+            .unwrap()
+            .insert(legacy_key.clone(), legacy_output);
+        host.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(legacy_key.0.clone(), Arc::clone(&legacy_session));
+
+        // 3. Completed-PTY tail compaction (>8 completed PTYs).
+        for n in 0..12 {
+            let (session, journal, writer) =
+                retained_pty_fixture(&host, &format!("pty-{n:02}"), n + 10);
+            journal.eof();
+            session.note_cleanup(CleanupReport { complete: true });
+            host.inner.maintain_completed();
+            writer.shutdown();
+        }
+        let status = host.inner.pty_retention_status();
+        assert_eq!(status.completed_pty_sessions, 8);
+        assert_eq!(status.evicted_total, 4);
+        assert!(!status.recent_evictions.contains(&pipe_stream));
+        assert!(!pipe_journal.compacted());
+        assert_eq!(pipe_journal.position(), (0, 2));
+
+        // 4. Fill remaining slots to 64 (8 completed PTYs + 2 pipes + 54 live PTYs)
+        // and apply spawn-slot pressure as 8 more live PTYs arrive until all 8
+        // completed PTYs are evicted without retiring either pipe epoch.
+        for n in 0..54 {
+            let (_s, _j, w) = retained_pty_fixture(&host, &format!("live-pty-{n:02}"), n + 100);
+            w.shutdown();
+        }
+        assert_eq!(host.inner.outputs.lock().unwrap().len(), 64);
+        for n in 0..8 {
+            host.inner
+                .with_spawn_gate(|notices| host.inner.evict_completed_ptys(true, notices));
+            assert_eq!(host.inner.outputs.lock().unwrap().len(), 63);
+            let (_s, _j, w) = retained_pty_fixture(&host, &format!("pressure-pty-{n:02}"), n + 200);
+            w.shutdown();
+            assert_eq!(host.inner.outputs.lock().unwrap().len(), 64);
+        }
+        let status = host.inner.pty_retention_status();
+        assert_eq!(status.completed_pty_sessions, 0);
+        assert_eq!(status.evicted_total, 12);
+        assert!(!status.recent_evictions.contains(&pipe_stream));
+
+        // Both pipe epochs must remain intact in outputs and sessions.
+        assert!(host.inner.outputs.lock().unwrap().contains_key(&pipe_key));
+        assert!(host.inner.outputs.lock().unwrap().contains_key(&legacy_key));
+        assert!(!pipe_journal.compacted());
+
+        let second_rec = pipe_cursor.next().unwrap().unwrap();
+        assert_eq!(second_rec.seq, 2);
+        drop(second_rec);
+        assert!(pipe_cursor.next().unwrap().is_none());
+        super::reliable::acknowledge(&pipe_journal, 2).unwrap();
+        assert_eq!(pipe_journal.position(), (2, 2));
+        drop(pipe_cursor);
+        host.inner.maintain_completed();
+        assert!(
+            !host.inner.outputs.lock().unwrap().contains_key(&pipe_key),
+            "fully acknowledged completed ReliablePipe retires only after Ack and cursor drop"
+        );
+        assert!(host.inner.outputs.lock().unwrap().contains_key(&legacy_key));
+        assert_eq!(legacy_session.stdout_tail(4096), "legacy-line\n");
+
+        pipe_writer.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn pty_compaction_requires_cleanup_eof_and_retired_threads() {
         let dir = tempfile::tempdir().unwrap();
         let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(

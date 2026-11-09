@@ -90,6 +90,10 @@ pub enum HostError {
     EndpointStateDenied,
     #[error("frame deadline exceeded")]
     FrameTimeout,
+    #[error("PTY epoch evicted: {stream}")]
+    PtyEpochEvicted { stream: crate::StreamId },
+    #[error("stale epoch (possibly evicted; no recent eviction proof): {stream}")]
+    StaleEpoch { stream: crate::StreamId },
     #[error("host io: {0}")]
     Io(String),
 }

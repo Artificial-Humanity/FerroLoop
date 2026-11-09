@@ -453,11 +453,11 @@ impl AuthorityRegistry {
         epoch.claiming = None;
         epoch.owner = None;
         let active = epoch.active.take();
+        let final_write = epoch.final_write.take();
+        epoch.journal.compact_completed_pty();
         if let Some(active) = &active {
             active.cancelled.store(true, Ordering::SeqCst);
         }
-        let final_write = epoch.final_write.take();
-        epoch.journal.compact_completed_pty();
         // The registry admits at most sixteen pending tickets, so detachment
         // needs no allocation or uncharged temporary collection.
         let mut pending: [Option<Pending>; 16] = std::array::from_fn(|_| None);

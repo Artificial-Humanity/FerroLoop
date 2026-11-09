@@ -1259,12 +1259,13 @@ fn toml_non_empty_str(table: &toml::Table, key: &str) -> Option<String> {
 
 // --- Antigravity ------------------------------------------------------------
 
-/// One `clientModelConfigs[]` entry: the full model id (with thinking suffix) and the
-/// `MODEL_PLACEHOLDER_*` name that trajectory steps use for it.
+/// One `clientModelConfigs[]` entry: the full model id (with thinking suffix), the
+/// `MODEL_PLACEHOLDER_*` name that trajectory steps use for it, and its display `label`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgyConfiguredModel {
     model_id: String,
     placeholder: Option<String>,
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,6 +1285,7 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
             Some(AgyConfiguredModel {
                 model_id: non_empty_str(entry.get("modelId"))?,
                 placeholder: non_empty_str(entry.pointer("/modelOrAlias/model")),
+                label: non_empty_str(entry.get("label")),
             })
         })
         .collect();
@@ -1298,15 +1300,13 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
     })
 }
 
-/// The model that RUNS in a `GetCascadeTrajectory` response (`trajectory.steps`) or a
-/// `GetCascadeTrajectorySteps` response (`steps`): see [`running_model_from_json`]. This is the
-/// tail-steps parser; it never reads a requested model (`planModel`), so a window that holds
-/// only user inputs names no model and the caller falls through to the full trajectory. A body
-/// cut off by the size cap is not valid JSON; the last `"generatorModel"` string in the text
-/// that did arrive is used then.
+/// Model of the newest step that names one in a `GetCascadeTrajectory` response
+/// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`): see
+/// [`trajectory_model_from_json`]. A body cut off by the size cap is not valid JSON; the last
+/// `"generatorModel"` string in the text that did arrive is used then.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
-        return running_model_from_json(&val);
+        return trajectory_model_from_json(&val);
     }
     const KEY: &str = "\"generatorModel\"";
     let mut latest = None;
@@ -1339,49 +1339,265 @@ const AGY_RUNNING_MODEL_POINTERS: [&str; 2] =
     ["/metadata/generatorModel", "/metadata/modelUsage/model"];
 
 /// Where a `CORTEX_STEP_TYPE_USER_INPUT` step says which model the user REQUESTED for the turn
-/// it starts: `userConfig`, else `lastUserConfig`. The planner may keep another model (an input
-/// sent while a tool step runs, `metadata.isInterruptingStep`, is not applied to that turn).
+/// it starts: `userConfig`, else `lastUserConfig`. An input sent while a tool step runs
+/// (`metadata.isInterruptingStep`) is not applied to that turn.
 const AGY_REQUESTED_MODEL_POINTERS: [&str; 2] = [
     "/userInput/userConfig/plannerConfig/planModel",
     "/userInput/lastUserConfig/plannerConfig/planModel",
 ];
 
-/// First non-blank string at any of `pointers` on the newest step that has one.
-fn newest_step_model(val: &Value, pointers: &[&str]) -> Option<String> {
-    agy_steps(val)?.iter().rev().find_map(|step| {
-        pointers
+/// Normalize an Antigravity display base name (e.g. `"Gemini 4 Argon"`, `"Claude Sonnet 5.5"`)
+/// to its canonical base model id (`"gemini-4-argon"`, `"claude-sonnet-5-5"`).
+fn normalize_agy_base_model_name(raw: &str) -> String {
+    let tokens: Vec<String> = raw
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    for &default_id in &AGY_DEFAULT_MODELS {
+        let default_tokens: Vec<String> = default_id
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if tokens == default_tokens {
+            return default_id.to_string();
+        }
+    }
+    let slug = raw
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    let (base, _) =
+        split_agy_thinking_suffix(&fl_wire::vendor_adapter::agy_cli_model_id(&slug, None));
+    base
+}
+
+/// Normalize the target of a `Model Selection` `<USER_SETTINGS_CHANGE>` notice (for example
+/// `"Gemini 4 Argon (Low)"` or `"claude-sonnet-5-5-high"`) into a placeholder or
+/// effort-suffixed model id (`"gemini-4-argon-low"`). Rejects truncated or unbalanced
+/// parentheticals (such as `"Gemini 4 Argon (Hi"`).
+fn normalize_agy_settings_model_target(raw: &str) -> Option<String> {
+    let target = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '`' | '\'' | '"'))
+        .trim();
+    if target.is_empty() {
+        return None;
+    }
+    if target.contains('(') || target.contains(')') {
+        let (prefix, paren) = target.split_once('(')?;
+        let prefix = prefix.trim();
+        if prefix.is_empty() || prefix.contains('(') || prefix.contains(')') {
+            return None;
+        }
+        let level_raw = paren.trim().strip_suffix(')')?;
+        if level_raw.contains('(') || level_raw.contains(')') {
+            return None;
+        }
+        let level = level_raw.trim().to_ascii_lowercase();
+        if !matches!(level.as_str(), "low" | "medium" | "high") {
+            return None;
+        }
+        let base = normalize_agy_base_model_name(prefix);
+        return (!base.is_empty()).then(|| format!("{base}-{level}"));
+    }
+    if target.starts_with("MODEL_") {
+        return Some(target.to_string());
+    }
+    let lowered = target.to_ascii_lowercase();
+    let (base_raw, suffix) = split_agy_thinking_suffix(&lowered);
+    let base = normalize_agy_base_model_name(&base_raw);
+    if base.is_empty() {
+        return None;
+    }
+    Some(match suffix {
+        Some(level) => format!("{base}-{level}"),
+        None => base,
+    })
+}
+
+/// Strip all case-insensitive `open_tag ... close_tag` blocks from `text` (and any unclosed
+/// trailing `open_tag` block) so embedded user or system blocks cannot spoof top-level tags.
+fn strip_case_insensitive_tag_blocks(text: &str, open_tag: &str, close_tag: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(rel_open) = lower[cursor..].find(open_tag) {
+        let open_pos = cursor + rel_open;
+        out.push_str(&text[cursor..open_pos]);
+        let after_open = open_pos + open_tag.len();
+        if let Some(rel_close) = lower[after_open..].find(close_tag) {
+            cursor = after_open + rel_close + close_tag.len();
+        } else {
+            return out;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Extract the target model from the latest `<USER_SETTINGS_CHANGE>` block in `text` that
+/// records a `Model Selection` change. Ignores `<USER_SETTINGS_CHANGE>` text quoted inside
+/// `<SYSTEM_MESSAGE>` or `<USER_REQUEST>` blocks, and requires a closing tag.
+fn parse_agy_user_settings_change_model(text: &str) -> Option<String> {
+    const OPEN: &str = "<user_settings_change>";
+    const CLOSE: &str = "</user_settings_change>";
+    let without_sys =
+        strip_case_insensitive_tag_blocks(text, "<system_message>", "</system_message>");
+    let cleaned =
+        strip_case_insensitive_tag_blocks(&without_sys, "<user_request>", "</user_request>");
+    let lower = cleaned.to_ascii_lowercase();
+    let mut search_end = lower.len();
+    while let Some(open_pos) = lower[..search_end].rfind(OPEN) {
+        let content_start = open_pos + OPEN.len();
+        let Some(rel_close) = lower[content_start..].find(CLOSE) else {
+            search_end = open_pos;
+            continue;
+        };
+        let block_end = content_start + rel_close;
+        let block = &cleaned[content_start..block_end];
+        let block_lower = &lower[content_start..block_end];
+        if let Some(sel_pos) = block_lower.find("model selection") {
+            let after_sel = &block[sel_pos + "model selection".len()..];
+            let after_sel_lower = &block_lower[sel_pos + "model selection".len()..];
+            if let Some(to_pos) = after_sel_lower.find(" to ") {
+                let rest = after_sel[to_pos + 4..].trim_start();
+                let mut end = rest.len();
+                for (idx, ch) in rest.char_indices() {
+                    if ch == '\n' || ch == '\r' || rest[idx..].starts_with("</") {
+                        end = idx;
+                        break;
+                    }
+                    if ch == '.' {
+                        let after_dot = &rest[idx + 1..];
+                        if after_dot.is_empty()
+                            || after_dot.starts_with(char::is_whitespace)
+                            || after_dot.starts_with('<')
+                        {
+                            end = idx;
+                            break;
+                        }
+                    }
+                }
+                if let Some(model) = normalize_agy_settings_model_target(&rest[..end]) {
+                    return Some(model);
+                }
+            }
+        }
+        search_end = open_pos;
+    }
+    None
+}
+
+/// True only when `step` is an explicit `USER_INPUT` step (`type` is `USER_INPUT` or
+/// `CORTEX_STEP_TYPE_USER_INPUT`, and any `source` field is `USER_EXPLICIT`).
+fn is_agy_explicit_user_input_step(step: &Value) -> bool {
+    let Some(step_type) = step.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if !step_type.eq_ignore_ascii_case("USER_INPUT")
+        && !step_type.eq_ignore_ascii_case("CORTEX_STEP_TYPE_USER_INPUT")
+    {
+        return false;
+    }
+    if let Some(source) = step.get("source").and_then(Value::as_str)
+        && !source.eq_ignore_ascii_case("USER_EXPLICIT")
+    {
+        return false;
+    }
+    true
+}
+
+/// Check an explicit `USER_INPUT` step or transcript line JSON object for a
+/// `<USER_SETTINGS_CHANGE>` model selection. Tool-output (`GENERIC`/`MODEL`) and
+/// `SYSTEM_MESSAGE` steps are ignored.
+fn step_user_settings_change_model(step: &Value) -> Option<String> {
+    if !is_agy_explicit_user_input_step(step) {
+        return None;
+    }
+    for pointer in [
+        "/content",
+        "/userInput/userResponse",
+        "/userInput/query",
+        "/userInput/text",
+    ] {
+        if let Some(text) = step.pointer(pointer).and_then(Value::as_str)
+            && let Some(model) = parse_agy_user_settings_change_model(text)
+        {
+            return Some(model);
+        }
+    }
+    if let Some(items) = step.pointer("/userInput/items").and_then(Value::as_array) {
+        for item in items.iter().rev() {
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.as_str());
+            if let Some(text) = text
+                && let Some(model) = parse_agy_user_settings_change_model(text)
+            {
+                return Some(model);
+            }
+        }
+    }
+    None
+}
+
+/// Model attested by a single trajectory step: its running model (`generatorModel`, else
+/// `modelUsage.model`), or on a non-interrupting user-input step its `<USER_SETTINGS_CHANGE>`
+/// selection or `planModel`.
+fn step_model(step: &Value) -> Option<String> {
+    if let Some(running) = AGY_RUNNING_MODEL_POINTERS
+        .iter()
+        .find_map(|pointer| non_empty_str(step.pointer(pointer)))
+    {
+        return Some(running);
+    }
+    if step
+        .pointer("/metadata/isInterruptingStep")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
+    step_user_settings_change_model(step).or_else(|| {
+        AGY_REQUESTED_MODEL_POINTERS
             .iter()
             .find_map(|pointer| non_empty_str(step.pointer(pointer)))
     })
 }
 
-/// The model that is running: the `generatorModel` of the latest step that has one, else that
-/// step's `modelUsage.model`. Newer steps that name no model do not hide an older one. The
-/// value is a placeholder (`MODEL_PLACEHOLDER_*`).
-fn running_model_from_json(val: &Value) -> Option<String> {
-    newest_step_model(val, &AGY_RUNNING_MODEL_POINTERS)
+/// Newest evidence wins by step order: a non-interrupting `USER_INPUT` `planModel` or
+/// `<USER_SETTINGS_CHANGE>` newer than the last generator step reflects the selection;
+/// otherwise the generator step's model is the attested value.
+fn trajectory_model_from_json(val: &Value) -> Option<String> {
+    agy_steps(val)?.iter().rev().find_map(step_model)
 }
 
-/// The model the user REQUESTED, from the newest user-input step that names one. It is only a
-/// fallback for a conversation whose planner has not answered a turn yet; once any step
-/// reports a running model, that wins (see [`complete_trajectory_model_from_json`]).
-fn requested_model_from_json(val: &Value) -> Option<String> {
-    newest_step_model(val, &AGY_REQUESTED_MODEL_POINTERS)
+/// Step index of the newest generator step (`generatorModel` or `modelUsage.model`) in a
+/// trajectory JSON response whose first step is at `step_offset`.
+fn last_generator_step_index_from_json(val: &Value, step_offset: u64) -> Option<u64> {
+    let steps = agy_steps(val)?;
+    steps.iter().enumerate().rev().find_map(|(index, step)| {
+        AGY_RUNNING_MODEL_POINTERS
+            .iter()
+            .any(|pointer| non_empty_str(step.pointer(pointer)).is_some())
+            .then_some(step_offset + index as u64)
+    })
 }
 
-/// The model of a complete trajectory: the running model, and only when no step has one (a
-/// conversation before its first turn) the requested model. The requested value is a
-/// placeholder or an effort-suffixed id.
-fn complete_trajectory_model_from_json(val: &Value) -> Option<String> {
-    running_model_from_json(val).or_else(|| requested_model_from_json(val))
-}
-
-/// [`parse_agy_generator_model`] for a body that must be complete, with the requested-model
-/// fallback. A `GetCascadeTrajectory` body cut off by the size cap holds the OLDEST steps, so
-/// its last `generatorModel` is a stale early model: a body that is not valid JSON names no
-/// model.
+/// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
+/// body cut off by the size cap holds the OLDEST steps, so its last `generatorModel` is a
+/// stale early model: a body that is not valid JSON names no model.
+#[cfg(test)]
 fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
-    complete_trajectory_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
+    trajectory_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
 }
 
 /// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
@@ -1397,6 +1613,70 @@ pub(crate) fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<Strin
     (model_id.to_string(), None)
 }
 
+/// Match `wanted` against `config.models` by `modelId`, `placeholder`, or `label`. When
+/// multiple configured entries with different thinking suffixes share one `MODEL_PLACEHOLDER_*`
+/// or base label without an explicit level in `wanted`, return `(base, None)` rather than
+/// guessing effort from config order.
+fn match_agy_config_model(
+    config: &AgyModelConfig,
+    wanted: &str,
+) -> Option<(String, Option<String>)> {
+    if let Some(entry) = config
+        .models
+        .iter()
+        .find(|entry| entry.model_id.eq_ignore_ascii_case(wanted))
+    {
+        return Some(split_agy_thinking_suffix(&entry.model_id));
+    }
+    let placeholder_matches: Vec<(String, Option<String>)> = config
+        .models
+        .iter()
+        .filter(|entry| entry.placeholder.as_deref() == Some(wanted))
+        .map(|entry| split_agy_thinking_suffix(&entry.model_id))
+        .collect();
+    if let Some((first_base, first_level)) = placeholder_matches.first() {
+        let unambiguous_level = placeholder_matches
+            .iter()
+            .all(|(base, level)| base == first_base && level == first_level)
+            .then(|| first_level.clone())
+            .flatten();
+        return Some((first_base.clone(), unambiguous_level));
+    }
+    if !wanted.starts_with("MODEL_")
+        && let Some(wanted_norm) = normalize_agy_settings_model_target(wanted)
+    {
+        let (wanted_base, wanted_level) = split_agy_thinking_suffix(&wanted_norm);
+        let label_matches: Vec<(String, Option<String>)> = config
+            .models
+            .iter()
+            .filter_map(|entry| {
+                let label = entry.label.as_deref()?;
+                let label_norm = normalize_agy_settings_model_target(label)?;
+                let (label_base, _) = split_agy_thinking_suffix(&label_norm);
+                let (entry_base, entry_level) = split_agy_thinking_suffix(&entry.model_id);
+                if label.eq_ignore_ascii_case(wanted) || label_norm == wanted_norm {
+                    return Some((entry_base, wanted_level.clone().or(entry_level)));
+                }
+                if label_base == wanted_base
+                    && (wanted_level.is_none() || entry_level == wanted_level)
+                {
+                    return Some((entry_base, wanted_level.clone().or(entry_level)));
+                }
+                None
+            })
+            .collect();
+        if let Some((first_base, first_level)) = label_matches.first() {
+            let unambiguous_level = label_matches
+                .iter()
+                .all(|(base, level)| base == first_base && level == first_level)
+                .then(|| first_level.clone())
+                .flatten();
+            return Some((first_base.clone(), unambiguous_level));
+        }
+    }
+    None
+}
+
 /// Match the trajectory's model (then the config's default placeholder) against the
 /// configured models. The trajectory value is a placeholder, or an effort-suffixed model id
 /// (`claude-sonnet-5-5-high`) as the user's pending choice can be; an id the config does not
@@ -1410,22 +1690,17 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
             available_models.push(base);
         }
     }
-    let by_config = |wanted: &str| {
-        config.models.iter().find(|entry| {
-            entry.placeholder.as_deref() == Some(wanted)
-                || entry.model_id.eq_ignore_ascii_case(wanted)
-        })
-    };
     let mut model_is_default = false;
     let matched = [placeholder, config.default_placeholder.as_deref()]
         .into_iter()
         .enumerate()
         .filter_map(|(index, wanted)| wanted.map(|wanted| (index == 1, wanted)))
         .find_map(|(is_default, wanted)| {
-            let found = match by_config(wanted) {
-                Some(entry) => Some(split_agy_thinking_suffix(&entry.model_id)),
+            let found = match match_agy_config_model(config, wanted) {
+                Some(found) => Some(found),
                 None if !wanted.starts_with("MODEL_") => {
-                    Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
+                    normalize_agy_settings_model_target(wanted)
+                        .map(|normalized| split_agy_thinking_suffix(&normalized))
                 }
                 None => None,
             };
@@ -1538,6 +1813,37 @@ fn agy_last_step_index(tail: &str) -> Option<u64> {
     })
 }
 
+/// Model from a `<USER_SETTINGS_CHANGE>` in the transcript tail when that line is newer
+/// than the last generator (`PLANNER_RESPONSE`) line in the transcript tail, along with
+/// its `step_index`.
+fn agy_transcript_tail_settings_model(tail: &str) -> Option<(Option<u64>, String)> {
+    for line in tail.lines().rev() {
+        let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let step_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+        if step_type.eq_ignore_ascii_case("PLANNER_RESPONSE")
+            || step_type.eq_ignore_ascii_case("CORTEX_STEP_TYPE_PLANNER_RESPONSE")
+            || AGY_RUNNING_MODEL_POINTERS
+                .iter()
+                .any(|pointer| non_empty_str(val.pointer(pointer)).is_some())
+        {
+            return None;
+        }
+        if val
+            .pointer("/metadata/isInterruptingStep")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            continue;
+        }
+        if let Some(model) = step_user_settings_change_model(&val) {
+            return Some((val.get("step_index").and_then(Value::as_u64), model));
+        }
+    }
+    None
+}
+
 /// First step the tail-steps call asks for: [`AGY_STEPS_TAIL_MARGIN`] before the transcript's
 /// last `step_index`. 0 when the transcript is missing, unreadable or names no step, and
 /// for a conversation too short to need the tail call.
@@ -1548,14 +1854,36 @@ fn agy_tail_step_offset(transcript_path: Option<&str>) -> u64 {
         .map_or(0, |index| index.saturating_sub(AGY_STEPS_TAIL_MARGIN))
 }
 
-/// Latest running model from `GetCascadeTrajectorySteps`, which returns only the newest
-/// steps. `None` when no tail offset is known, the call fails, or the steps name no running
-/// model (a window of user inputs only is `None`: the requested model is not read here).
+/// Resolve a trajectory RPC response body against an optional newer `<USER_SETTINGS_CHANGE>`
+/// from the transcript tail.
+fn parse_agy_trajectory_with_transcript_settings(
+    body: &str,
+    step_offset: u64,
+    tx_settings: Option<&(Option<u64>, String)>,
+    allow_truncated_scan: bool,
+) -> Option<String> {
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        if let Some((tx_idx, tx_model)) = tx_settings {
+            let last_gen = last_generator_step_index_from_json(&val, step_offset);
+            if last_gen.is_none_or(|gen_idx| tx_idx.is_none_or(|idx| idx >= gen_idx)) {
+                return Some(tx_model.clone());
+            }
+        }
+        return trajectory_model_from_json(&val);
+    }
+    allow_truncated_scan
+        .then(|| parse_agy_generator_model(body))
+        .flatten()
+}
+
+/// Latest model from `GetCascadeTrajectorySteps`, which returns only the newest steps.
+/// `None` when no tail offset is known, the call fails, or the steps name no model.
 fn agy_tail_generator_model(
     port: u16,
     csrf: &str,
     session_id: &str,
     transcript_path: Option<&str>,
+    tx_settings: Option<&(Option<u64>, String)>,
 ) -> Option<String> {
     let step_offset = agy_tail_step_offset(transcript_path);
     if step_offset == 0 {
@@ -1570,7 +1898,9 @@ fn agy_tail_generator_model(
         &body,
         AGY_TRAJECTORY_MAX_BYTES,
     )
-    .and_then(|resp| parse_agy_generator_model(&resp))
+    .and_then(|resp| {
+        parse_agy_trajectory_with_transcript_settings(&resp, step_offset, tx_settings, true)
+    })
 }
 
 fn agy_cached_generator_model(
@@ -1583,20 +1913,32 @@ fn agy_cached_generator_model(
     if let Some(hit) = agy_cache_get(&AGY_PLACEHOLDER_CACHE, &key) {
         return hit;
     }
+    let tx_settings = transcript_path
+        .and_then(|p| read_file_tail(Path::new(p), AGY_TRANSCRIPT_TAIL_BYTES))
+        .and_then(|tail| agy_transcript_tail_settings_model(&tail));
     // A long conversation's full trajectory can be tens of megabytes, so ask for the newest
     // steps first. The full call runs only when that fast path finds no model.
-    let placeholder =
-        agy_tail_generator_model(port, csrf, session_id, transcript_path).or_else(|| {
-            let body = serde_json::json!({ "cascadeId": session_id }).to_string();
-            agy_rpc(
-                port,
-                csrf,
-                "GetCascadeTrajectory",
-                &body,
-                AGY_TRAJECTORY_MAX_BYTES,
-            )
-            .and_then(|resp| parse_agy_complete_generator_model(&resp))
-        });
+    let placeholder = agy_tail_generator_model(
+        port,
+        csrf,
+        session_id,
+        transcript_path,
+        tx_settings.as_ref(),
+    )
+    .or_else(|| {
+        let body = serde_json::json!({ "cascadeId": session_id }).to_string();
+        agy_rpc(
+            port,
+            csrf,
+            "GetCascadeTrajectory",
+            &body,
+            AGY_TRAJECTORY_MAX_BYTES,
+        )
+        .and_then(|resp| {
+            parse_agy_trajectory_with_transcript_settings(&resp, 0, tx_settings.as_ref(), false)
+        })
+    })
+    .or_else(|| tx_settings.map(|(_, model)| model));
     agy_cache_put(&AGY_PLACEHOLDER_CACHE, key, placeholder.clone());
     placeholder
 }
@@ -2018,15 +2360,23 @@ fn plain_bounded_str(value: Option<&Value>, max_chars: usize) -> Option<String> 
 }
 
 /// Per-session `(model, thinking_level)` from the newest Codex rollout lines. Each field is
-/// the most recent valid value, found independently: a later line may carry only one of them.
-/// The effort comes from `payload.effort`, else `payload.reasoning_effort`, else
-/// `payload.collaboration_mode.settings.reasoning_effort`. A cut-off first line of a tail
-/// is not valid JSON and is skipped like any other malformed line.
+/// the most recent valid value, found independently across `turn_context` and
+/// `thread_settings_applied` lines: a later line may carry only one of them. A cut-off first
+/// line of a tail is not valid JSON and is skipped like any other malformed line.
 fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
-    const EFFORT_POINTERS: [&str; 3] = [
+    const MODEL_POINTERS: [&str; 4] = [
+        "/payload/model",
+        "/payload/thread_settings/model",
+        "/payload/collaboration_mode/settings/model",
+        "/payload/thread_settings/collaboration_mode/settings/model",
+    ];
+    const EFFORT_POINTERS: [&str; 6] = [
         "/payload/effort",
         "/payload/reasoning_effort",
         "/payload/collaboration_mode/settings/reasoning_effort",
+        "/payload/thread_settings/effort",
+        "/payload/thread_settings/reasoning_effort",
+        "/payload/thread_settings/collaboration_mode/settings/reasoning_effort",
     ];
     let (mut model, mut effort) = (None, None);
     for line in jsonl.lines().rev() {
@@ -2041,7 +2391,9 @@ fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
             continue;
         };
         if model.is_none() {
-            model = plain_bounded_str(val.pointer("/payload/model"), MODEL_ID_MAX_CHARS);
+            model = MODEL_POINTERS
+                .iter()
+                .find_map(|pointer| plain_bounded_str(val.pointer(pointer), MODEL_ID_MAX_CHARS));
         }
         if effort.is_none() {
             effort = EFFORT_POINTERS.iter().find_map(|pointer| {
@@ -2053,8 +2405,8 @@ fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Model and thinking level of a Codex session. The session's rollout transcript names what
-/// the session runs; `~/.codex/config.toml` is only the default for a field the rollout
-/// does not carry.
+/// the session runs; `~/.codex/config.toml` is only the default when the rollout does not
+/// carry a session model.
 fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
     let (session_model, session_effort) = transcript_path
         .and_then(|p| read_file_tail(Path::new(p), CLAUDE_TRANSCRIPT_TAIL_BYTES))
@@ -2074,14 +2426,22 @@ fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessi
     }
     let config_model = config.as_ref().and_then(|c| toml_non_empty_str(c, "model"));
     // The config default stands in when the rollout tail names no model; it is no live report.
-    let model_is_default = session_model.is_none() && config_model.is_some();
+    // Only fall back to config's `model_reasoning_effort` when no session model was observed in
+    // the rollout, so a live rollout model without an effort is never paired with config's effort.
+    let has_session_model = session_model.is_some();
+    let model_is_default = !has_session_model && config_model.is_some();
+    let thinking_level = session_effort.or_else(|| {
+        (!has_session_model)
+            .then(|| {
+                config
+                    .as_ref()
+                    .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
+            })
+            .flatten()
+    });
     SessionModelInfo {
         model: session_model.or(config_model),
-        thinking_level: session_effort.or_else(|| {
-            config
-                .as_ref()
-                .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
-        }),
+        thinking_level,
         available_models,
         model_is_default,
     }
@@ -7641,7 +8001,7 @@ mod tests {
         })
     }
 
-    /// Assert that a step list names the RUNNING model `want` through both the tail parser and
+    /// Assert that a step list names the model `want` through both the tail parser and
     /// the complete-body parser, in both body shapes.
     fn assert_agy_steps_model(steps: &[Value], want: Option<&str>) {
         for body in agy_step_bodies(steps) {
@@ -7654,29 +8014,24 @@ mod tests {
         }
     }
 
-    /// Assert that a step list has no running model: the tail parser names none and the
-    /// complete-body parser falls back to the requested model `want`.
-    fn assert_agy_requested_model_only(steps: &[Value], want: Option<&str>) {
-        for body in agy_step_bodies(steps) {
-            assert_eq!(parse_agy_generator_model(&body), None, "{body}");
-            assert_eq!(
-                parse_agy_complete_generator_model(&body).as_deref(),
-                want,
-                "{body}"
-            );
-        }
-    }
-
     #[test]
-    fn agy_a_newer_user_input_does_not_replace_the_running_model() {
+    fn agy_newer_non_interrupting_user_input_replaces_an_older_generator_step_by_recency() {
         let steps = [
             user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
             planner_step("MODEL_PLACEHOLDER_M418"),
             tool_step_with_model("MODEL_PLACEHOLDER_M418"),
             user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
         ];
-        assert_agy_steps_model(&steps, Some("MODEL_PLACEHOLDER_M418"));
-        // An input sent while a tool step runs is flagged, and the planner keeps its model.
+        assert_agy_steps_model(&steps, Some("MODEL_PLACEHOLDER_M401"));
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(None, Some("MODEL_PLACEHOLDER_M401")),
+            ],
+            Some("MODEL_PLACEHOLDER_M401"),
+        );
+        // An input sent while a tool step runs is flagged (`isInterruptingStep`), and the
+        // planner keeps its running model.
         let mut interrupting = user_input_step(Some("MODEL_PLACEHOLDER_M401"), None);
         interrupting["metadata"] = serde_json::json!({ "isInterruptingStep": true });
         assert_agy_steps_model(
@@ -7687,15 +8042,11 @@ mod tests {
             ],
             Some("MODEL_PLACEHOLDER_M418"),
         );
-        // A requested model on the step's own userInput never beats the step's generatorModel
-        // either, and a lastUserConfig is no different from a userConfig.
-        assert_agy_steps_model(
-            &[
-                planner_step("MODEL_PLACEHOLDER_M418"),
-                user_input_step(None, Some("MODEL_PLACEHOLDER_M401")),
-            ],
-            Some("MODEL_PLACEHOLDER_M418"),
-        );
+        // On a single step that carries both `generatorModel` and `userInput`, the step's
+        // own `generatorModel` takes precedence.
+        let mut same_step = user_input_step(Some("MODEL_PLACEHOLDER_M401"), None);
+        same_step["metadata"] = serde_json::json!({ "generatorModel": "MODEL_PLACEHOLDER_M418" });
+        assert_agy_steps_model(&[same_step], Some("MODEL_PLACEHOLDER_M418"));
     }
 
     #[test]
@@ -7738,12 +8089,12 @@ mod tests {
             ],
             Some("MODEL_PLACEHOLDER_M319"),
         );
-        // A user input, however new, hides nothing.
+        // A user input with no model signal hides nothing.
         assert_agy_steps_model(
             &[
                 planner_step("MODEL_PLACEHOLDER_M400"),
                 tool_step(),
-                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                user_input_step(None, None),
                 tool_step(),
             ],
             Some("MODEL_PLACEHOLDER_M400"),
@@ -7788,24 +8139,23 @@ mod tests {
 
     #[test]
     fn agy_before_the_first_turn_the_requested_model_is_the_only_signal() {
-        // Only user inputs: the tail parser names nothing, the complete parser reads planModel.
-        assert_agy_requested_model_only(
+        assert_agy_steps_model(
             &[user_input_step(Some("MODEL_PLACEHOLDER_M405"), None)],
             Some("MODEL_PLACEHOLDER_M405"),
         );
         // lastUserConfig is used when userConfig is absent, empty or blank on the step.
-        assert_agy_requested_model_only(
+        assert_agy_steps_model(
             &[user_input_step(None, Some("MODEL_PLACEHOLDER_M417"))],
             Some("MODEL_PLACEHOLDER_M417"),
         );
         for blank in ["", "   "] {
-            assert_agy_requested_model_only(
+            assert_agy_steps_model(
                 &[user_input_step(Some(blank), Some("claude-sonnet-5-5-high"))],
                 Some("claude-sonnet-5-5-high"),
             );
         }
         // userConfig wins over lastUserConfig on one step.
-        assert_agy_requested_model_only(
+        assert_agy_steps_model(
             &[user_input_step(
                 Some("MODEL_PLACEHOLDER_M405"),
                 Some("MODEL_PLACEHOLDER_M417"),
@@ -7813,7 +8163,7 @@ mod tests {
             Some("MODEL_PLACEHOLDER_M405"),
         );
         // The newest user-input step comes first, and steps with no model do not hide it.
-        assert_agy_requested_model_only(
+        assert_agy_steps_model(
             &[
                 user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
                 user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
@@ -7822,7 +8172,7 @@ mod tests {
             Some("MODEL_PLACEHOLDER_M405"),
         );
         // A newest step with only blank requests falls back to an older step's request.
-        assert_agy_requested_model_only(
+        assert_agy_steps_model(
             &[
                 user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
                 user_input_step(Some("  "), Some("")),
@@ -7830,10 +8180,168 @@ mod tests {
             Some("MODEL_PLACEHOLDER_M417"),
         );
         // The value is trimmed.
-        assert_agy_requested_model_only(
+        assert_agy_steps_model(
             &[user_input_step(Some(" gpt-oss-120b-medium "), None)],
             Some("gpt-oss-120b-medium"),
         );
+    }
+
+    #[test]
+    fn agy_shared_placeholder_across_different_thinking_suffixes_returns_unknown_thinking_level() {
+        let shared_config_json = r#"{
+            "clientModelConfigs": [
+                {"label":"Gemini 4 Argon (High)","modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+                {"label":"Gemini 4 Argon (Medium)","modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+                {"label":"Gemini 4 Argon (Low)","modelId":"gemini-4-argon-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+                {"label":"Gemini 3.8 Flash (High)","modelId":"gemini-3.8-flash-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"}}
+            ],
+            "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}}
+        }"#;
+        let config = parse_agy_model_config(shared_config_json).expect("shared config parses");
+        // Ambiguous shared placeholder must never guess effort from config order (`high`).
+        let info = resolve_agy_model_info(&config, Some("MODEL_PLACEHOLDER_M417"));
+        assert_eq!(info.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(info.thinking_level, None);
+
+        // Default fallback through the shared placeholder also leaves `thinking_level: None`.
+        let fallback = resolve_agy_model_info(&config, None);
+        assert_eq!(fallback.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(fallback.thinking_level, None);
+        assert!(fallback.model_is_default);
+
+        // An explicit effort-suffixed id (e.g. from `<USER_SETTINGS_CHANGE>` or `planModel`)
+        // still resolves its concrete thinking level even when the placeholder is shared.
+        let low = resolve_agy_model_info(&config, Some("gemini-4-argon-low"));
+        assert_eq!(low.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(low.thinking_level.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn agy_user_settings_change_parses_model_selection_and_follows_step_recency() {
+        let change_to_argon_low = "<USER_REQUEST>\nContinue\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3.8 Flash (High) to Gemini 4 Argon (Low). No need to comment on this change; just continue fulfilling the user's request.\n</USER_SETTINGS_CHANGE>";
+        assert_eq!(
+            parse_agy_user_settings_change_model(change_to_argon_low).as_deref(),
+            Some("gemini-4-argon-low")
+        );
+        let change_to_sonnet_high = "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Argon (Low) to Claude Sonnet 5.5 (High).\n</USER_SETTINGS_CHANGE>";
+        assert_eq!(
+            parse_agy_user_settings_change_model(change_to_sonnet_high).as_deref(),
+            Some("claude-sonnet-5-5-high")
+        );
+
+        let settings_step = serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "content": change_to_argon_low,
+        });
+        // `<USER_SETTINGS_CHANGE>` newer than the last generator step wins.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M318"),
+                settings_step.clone(),
+            ],
+            Some("gemini-4-argon-low"),
+        );
+        // Generator step newer than `<USER_SETTINGS_CHANGE>` wins.
+        assert_agy_steps_model(
+            &[settings_step, planner_step("MODEL_PLACEHOLDER_M318")],
+            Some("MODEL_PLACEHOLDER_M318"),
+        );
+
+        // Tool-output (`GENERIC` / `MODEL` / `CORTEX_STEP_TYPE_RUN_COMMAND`) and `SYSTEM_MESSAGE`
+        // steps carrying `<USER_SETTINGS_CHANGE>` are ignored and never override `PLANNER_RESPONSE`.
+        for non_user_step in [
+            serde_json::json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "SYSTEM_MESSAGE",
+                "source": "SYSTEM",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "SYSTEM",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": format!("<SYSTEM_MESSAGE>\n{change_to_sonnet_high}\n</SYSTEM_MESSAGE>"),
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": format!("<USER_REQUEST>\n{change_to_sonnet_high}\n</USER_REQUEST>"),
+            }),
+        ] {
+            assert_eq!(
+                step_user_settings_change_model(&non_user_step),
+                None,
+                "{non_user_step}"
+            );
+            assert_agy_steps_model(
+                &[
+                    planner_step("MODEL_PLACEHOLDER_M318"),
+                    non_user_step.clone(),
+                ],
+                Some("MODEL_PLACEHOLDER_M318"),
+            );
+            let tail = format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "ok"
+                }),
+                non_user_step
+            );
+            assert_eq!(
+                agy_transcript_tail_settings_model(&tail),
+                None,
+                "{non_user_step}"
+            );
+        }
+
+        // Truncated parentheticals (`"(Hi"`) or unclosed `<USER_SETTINGS_CHANGE>` tags return `None`.
+        for malformed in [
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to Gemini 4 Argon (Hi",
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to Gemini 4 Argon (Hi\n</USER_SETTINGS_CHANGE>",
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to (Hi.\n</USER_SETTINGS_CHANGE>",
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to Gemini 4 Argon (Unknown).\n</USER_SETTINGS_CHANGE>",
+        ] {
+            assert_eq!(
+                parse_agy_user_settings_change_model(malformed),
+                None,
+                "{malformed}"
+            );
+        }
+
+        // `resolve_agy_model_info` matches configured models by `label` (e.g. `"GPT-OSS"` -> `gpt-oss-120b`)
+        // and rejects truncated parenthetical strings.
+        let config = parse_agy_model_config(AGY_CONFIG_FIXTURE).expect("config parses");
+        let gpt_oss = resolve_agy_model_info(&config, Some("GPT-OSS"));
+        assert_eq!(gpt_oss.model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(gpt_oss.thinking_level.as_deref(), Some("medium"));
+        let argon_label = resolve_agy_model_info(&config, Some("Gemini 4 Argon (Low)"));
+        assert_eq!(argon_label.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(argon_label.thinking_level.as_deref(), Some("low"));
+        let truncated_info = resolve_agy_model_info(&config, Some("Gemini 4 Argon (Hi"));
+        assert!(truncated_info.model_is_default);
+        assert_eq!(truncated_info.model.as_deref(), Some("gemini-3.8-flash"));
     }
 
     #[test]
@@ -8429,50 +8937,66 @@ mod tests {
     }
 
     #[test]
-    fn agy_live_model_reads_the_running_model_and_falls_back_to_the_requested_one_only_in_full() {
+    fn agy_live_model_reads_the_newest_evidence_by_step_order_and_falls_back_when_tail_is_silent() {
         fn leak(body: &str) -> &'static str {
             Box::leak(body.to_string().into_boxed_str())
         }
         let tmp = TempDir::new().unwrap();
         let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
         let pending = user_input_step(Some("MODEL_PLACEHOLDER_M405"), None);
+        let mut interrupting = pending.clone();
+        interrupting["metadata"] = serde_json::json!({ "isInterruptingStep": true });
         // (case, steps the tail call returns, steps the full trajectory holds, model, effort,
         //  whether the full trajectory is asked)
         let cases = [
-            // The tail window holds a planner step before the user input: the tail decides.
+            // Non-interrupting user input newer than the planner step: the user selection wins
+            // directly from the tail call.
             (
-                "tail-running",
+                "tail-newer-user-input",
                 vec![
                     planner_step("MODEL_PLACEHOLDER_M400"),
                     tool_step(),
                     pending.clone(),
                 ],
                 vec![planner_step("MODEL_PLACEHOLDER_M417")],
+                "claude-sonnet-5-5",
+                "high",
+                false,
+            ),
+            // Interrupting user input after a planner step: the planner step wins from the tail.
+            (
+                "tail-interrupting-user-input",
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M400"),
+                    tool_step(),
+                    interrupting,
+                ],
+                vec![planner_step("MODEL_PLACEHOLDER_M417")],
                 "claude-opus-5-5",
                 "low",
                 false,
             ),
-            // The tail window holds only a user input: no running model, so the full
-            // trajectory is asked and its planner steps name the model that runs.
+            // Planner step newer than user input: the planner step wins from the tail.
             (
-                "tail-user-input-only",
-                vec![tool_step(), pending.clone()],
+                "tail-newer-planner",
                 vec![
+                    pending.clone(),
                     planner_step("MODEL_PLACEHOLDER_M400"),
                     tool_step(),
-                    pending.clone(),
                 ],
+                vec![planner_step("MODEL_PLACEHOLDER_M417")],
                 "claude-opus-5-5",
                 "low",
-                true,
+                false,
             ),
-            // First turn: no step anywhere has a running model, so the requested one shows.
+            // The tail window holds only silent tool steps: no model signal, so the full
+            // trajectory is asked.
             (
-                "first-turn",
-                vec![tool_step(), pending.clone()],
-                vec![pending],
-                "claude-sonnet-5-5",
-                "high",
+                "tail-silent-only",
+                vec![tool_step()],
+                vec![planner_step("MODEL_PLACEHOLDER_M400"), tool_step()],
+                "claude-opus-5-5",
+                "low",
                 true,
             ),
         ];
@@ -8503,6 +9027,46 @@ mod tests {
             assert_eq!(stub_paths(&stub), want, "{cascade}");
             stub.shutdown();
         }
+
+        // Transcript `<USER_SETTINGS_CHANGE>` newer than the last `PLANNER_RESPONSE` resolves
+        // to `gemini-4-argon` with `thinking_level: Some("low")` even when the config uses a
+        // shared placeholder for `gemini-4-argon`.
+        let shared_config: &'static str = leak(
+            r#"{
+                "clientModelConfigs": [
+                    {"label":"Gemini 4 Argon (High)","modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+                    {"label":"Gemini 4 Argon (Medium)","modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+                    {"label":"Gemini 4 Argon (Low)","modelId":"gemini-4-argon-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+                    {"label":"Gemini 3.8 Flash (High)","modelId":"gemini-3.8-flash-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"}}
+                ],
+                "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"}}
+            }"#,
+        );
+        let tx_with_settings = write_agy_transcript(
+            tmp.path(),
+            concat!(
+                "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"Start\"}\n",
+                "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"content\":\"Done\"}\n",
+                "{\"step_index\":2,\"type\":\"USER_INPUT\",\"content\":\"<USER_SETTINGS_CHANGE>\\nThe user changed setting `Model Selection` from Gemini 3.8 Flash (High) to Gemini 4 Argon (Low). No need to comment on this change; just continue fulfilling the user's request.\\n</USER_SETTINGS_CHANGE>\"}\n"
+            ),
+        );
+        let [full, _] = agy_step_bodies(&[
+            user_input_step(Some("MODEL_PLACEHOLDER_M318"), None),
+            planner_step("MODEL_PLACEHOLDER_M318"),
+        ]);
+        let stub =
+            spawn_agy_stub_with_steps(shared_config, leak(&full), "agy-live-tx-settings", None);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let info = agy_live_model_info_for_transcript(
+            Some(&addr),
+            Some("stub-csrf"),
+            "agy-live-tx-settings",
+            Some(&tx_with_settings),
+            false,
+        );
+        assert_eq!(info.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        stub.shutdown();
     }
 
     #[test]
@@ -9530,21 +10094,119 @@ mod tests {
     }
 
     #[test]
-    fn codex_effort_falls_back_to_config_when_the_rollout_has_a_model_only() {
+    fn codex_effort_does_not_fall_back_to_config_when_the_rollout_has_a_model_only() {
         let tmp = codex_home_with_config();
         let info = codex_session_info(
             tmp.path(),
             &[r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#],
         );
         assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
-        assert_eq!(info.thinking_level.as_deref(), Some("high"));
-        // An effort with no model keeps the config model.
+        assert_eq!(info.thinking_level, None);
+        assert!(!info.model_is_default);
+        // Verify apply_model_overrides does not falsely clear a pending effort override.
+        let make_session =
+            |model: Option<String>, thinking_level: Option<String>| DiscoveredSessionSummary {
+                id: "codex:t-fixture".to_string(),
+                source: "route".to_string(),
+                adapter: "codex".to_string(),
+                persona: None,
+                status: "active".to_string(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: None,
+                quota_usage: None,
+                model,
+                thinking_level,
+                available_models: info.available_models.clone(),
+                context_usage: None,
+                execution_mode: None,
+                model_is_default: info.model_is_default,
+            };
+        let mut overrides = std::collections::BTreeMap::from([(
+            "codex:t-fixture".to_string(),
+            crate::session_actions::ModelOverride::new(
+                "gpt-6.1-sol".to_string(),
+                Some("medium".to_string()),
+            ),
+        )]);
+        // First pass records the baseline before the rollout switched to gpt-6.1-sol.
+        let mut baseline_sessions = vec![make_session(
+            Some("gpt-6.1-terra".to_string()),
+            Some("high".to_string()),
+        )];
+        crate::session_actions::apply_model_overrides(&mut baseline_sessions, &mut overrides);
+        // Second pass uses the rollout info where only model = gpt-6.1-sol is present.
+        let mut sessions = vec![make_session(
+            info.model.clone(),
+            info.thinking_level.clone(),
+        )];
+        crate::session_actions::apply_model_overrides(&mut sessions, &mut overrides);
+        assert!(
+            overrides.contains_key("codex:t-fixture"),
+            "pending effort override must not be dropped when rollout has model only"
+        );
+        assert_eq!(sessions[0].model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(sessions[0].thinking_level.as_deref(), Some("medium"));
+
+        // An effort with no model keeps the config model as default.
         let info = codex_session_info(
             tmp.path(),
             &[r#"{"type":"turn_context","payload":{"effort":"minimal"}}"#],
         );
         assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
         assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+        assert!(info.model_is_default);
+    }
+
+    #[test]
+    fn codex_thread_settings_applied_updates_model_and_effort_in_file_order() {
+        let tmp = codex_home_with_config();
+        // Initial turn_context followed by TUI thread_settings_applied event_msg.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-terra","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium"}}}}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        assert!(!info.model_is_default);
+
+        // A later turn_context after an earlier thread_settings_applied wins.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium"}}}}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-terra","effort":"low"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        assert!(!info.model_is_default);
+
+        // thread_settings_applied carrying only collaboration_mode.settings.{model,reasoning_effort}.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"low"}}}}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        assert!(!info.model_is_default);
+
+        // payload.collaboration_mode.settings.model directly on payload is also honored.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"minimal"}}}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+        assert!(!info.model_is_default);
     }
 
     #[test]
