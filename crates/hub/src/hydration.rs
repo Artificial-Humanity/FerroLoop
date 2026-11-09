@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 
 use fl_core::store::Catalog;
-use fl_mcp::project_paths::resolve_git_project;
+use fl_mcp::project_paths::{GitProjectLayout, resolve_git_project};
 
 use crate::project_init::{config_entries, read_config, user_config_path};
 
@@ -55,6 +55,36 @@ fn unique(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
 }
 
+pub(crate) type ProjectRoots = Result<Vec<String>, ()>;
+
+pub(crate) fn project_roots(store: &impl Catalog) -> ProjectRoots {
+    store
+        .list_projects()
+        .map(|projects| projects.into_iter().map(|project| project.root).collect())
+        .map_err(|_| ())
+}
+
+fn corresponding_project(
+    root: &Path,
+    registered: &GitProjectLayout,
+    current: &GitProjectLayout,
+) -> Option<PathBuf> {
+    if registered.common_dir != current.common_dir {
+        return None;
+    }
+    let suffix = root.strip_prefix(&registered.worktree_root).ok()?;
+    let candidate = current.worktree_root.join(suffix);
+    let resolved = canonical_dir(&candidate)?;
+    // A corresponding subproject must exist at the same relative location. Do not
+    // let a worktree symlink redirect it to a different project or repository.
+    if resolved != candidate || !resolved.starts_with(&current.worktree_root) {
+        return None;
+    }
+    let layout = resolve_git_project(&resolved).ok()??;
+    (layout.common_dir == current.common_dir && layout.worktree_root == current.worktree_root)
+        .then_some(resolved)
+}
+
 impl Context {
     pub(crate) fn resolve<S: Catalog>(
         store: &S,
@@ -63,6 +93,20 @@ impl Context {
         cwd: Option<&Path>,
         name: &str,
     ) -> Self {
+        Self::resolve_with_catalog(project_roots(store), home, workspace, cwd, name)
+    }
+
+    pub(crate) fn resolve_with_catalog(
+        projects: ProjectRoots,
+        home: Option<&Path>,
+        workspace: Option<&Path>,
+        cwd: Option<&Path>,
+        name: &str,
+    ) -> Self {
+        #[cfg(test)]
+        if let Some(hook) = RESOLVE_HOOK.with_borrow_mut(Option::take) {
+            hook();
+        }
         let mut context = Self {
             workspace: workspace.and_then(canonical_dir),
             ..Self::default()
@@ -95,10 +139,10 @@ impl Context {
         }
         // Config names are authoritative; catalog roots have only their directory name.
         if !bound {
-            match store.list_projects() {
+            match projects {
                 Ok(projects) => {
                     for project in projects {
-                        let path = Path::new(project.root.trim());
+                        let path = Path::new(project.trim());
                         if path
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
@@ -158,8 +202,12 @@ impl Context {
             let registered = resolve_git_project(root);
             let current = resolve_git_project(cwd);
             match (registered, current) {
-                (Ok(Some(registered)), Ok(Some(current))) if registered.worktree_root == *root && registered.common_dir == current.common_dir => {
-                    context.project = Some(current.worktree_root);
+                (Ok(Some(registered)), Ok(Some(current))) => {
+                    if let Some(selected) = corresponding_project(root, &registered, &current) {
+                        context.project = Some(selected);
+                    } else {
+                        context.warnings.push(format!("cwd is outside project {name} or its corresponding project directory is unavailable; using registered project guidance"));
+                    }
                 }
                 (Ok(None), Ok(None)) if canonical_dir(cwd).is_some_and(|p| p.starts_with(root)) => {}
                 _ => context.warnings.push(format!("cwd is outside project {name} or its repository identity is unavailable; using registered project guidance")),
@@ -304,6 +352,7 @@ pub(crate) fn log_warnings(persona: &str, session_id: &str, warnings: &[String])
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static RESOLVE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static WARNING_LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -389,6 +438,67 @@ mod tests {
         assert!(result.text.contains("--project logical-name"));
         assert!(result.text.contains("--scope project:logical-name"));
         assert!(!result.text.contains("STATE.md"));
+    }
+
+    fn subproject_fixture() -> (Fixture, PathBuf, PathBuf) {
+        let f = Fixture::new();
+        let repo = f.project.parent().unwrap().to_path_buf();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let worktree = f.home.path().join("linked");
+        let gitdir = repo.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..").unwrap();
+        let subproject = worktree.join("Actual-Checkout");
+        std::fs::create_dir(&subproject).unwrap();
+        for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+            std::fs::write(subproject.join(file), "worktree subproject").unwrap();
+        }
+        (f, worktree, subproject)
+    }
+
+    #[test]
+    fn hydration_subproject_selects_only_corresponding_same_repository_guidance() {
+        let (f, worktree, subproject) = subproject_fixture();
+        for (cwd, expected) in [
+            (&f.project, &f.project),
+            (&worktree, &subproject),
+            (&subproject, &subproject),
+        ] {
+            let context = f.context(cwd);
+            assert_eq!(context.project.as_ref(), Some(expected));
+            assert!(context.warnings.is_empty(), "{:?}", context.warnings);
+        }
+        std::fs::remove_dir_all(&subproject).unwrap();
+        let context = f.context(&worktree);
+        assert_eq!(context.project.as_ref(), Some(&f.project));
+        assert!(!context.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hydration_subproject_rejects_symlink_escape_and_nested_foreign_repository() {
+        let (f, worktree, subproject) = subproject_fixture();
+        let foreign = f.home.path().join("foreign");
+        std::fs::create_dir_all(foreign.join(".git")).unwrap();
+        std::fs::write(foreign.join("AGENTS.md"), "foreign").unwrap();
+        std::fs::remove_dir_all(&subproject).unwrap();
+        std::os::unix::fs::symlink(&foreign, &subproject).unwrap();
+        for cwd in [&worktree, &foreign] {
+            let context = f.context(cwd);
+            assert_eq!(context.project.as_ref(), Some(&f.project));
+            assert!(!context.warnings.is_empty());
+        }
+        std::fs::remove_file(&subproject).unwrap();
+        std::fs::create_dir_all(subproject.join(".git")).unwrap();
+        let context = f.context(&worktree);
+        assert_eq!(context.project.as_ref(), Some(&f.project));
+        assert!(!context.warnings.is_empty());
     }
 
     #[test]

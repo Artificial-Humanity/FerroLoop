@@ -217,6 +217,7 @@ fn teardown_that_stops_nothing_leaves_the_restore_source_alone() {
     let dir = resurrect_dir(&home);
     // Runtime calls off: the session (if any) keeps running and keeps being saved.
     let off = LifecycleEnv {
+        log_hydration_warnings: true,
         home_override: Some(home.path()),
         spawn_runtime: false,
         runtime: &TmuxRuntime,
