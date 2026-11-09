@@ -233,17 +233,17 @@ impl VendorHostAdapter for CodexHostAdapter {
         &self,
         request: &VendorLaunchRequest,
     ) -> Result<VendorLaunchPlan, VendorAdapterError> {
-        let cfg =
-            self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
         let perms = fl_core::permissions::compile_posture(
             fl_core::permissions::Vendor::Codex,
             &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
             request.posture,
         )
-        .map_err(|e| VendorAdapterError::InvalidConfig {
+        .map_err(|e| VendorAdapterError::PermissionRefused {
             vendor: self.vendor_id().to_string(),
             reason: format!("posture: {e}"),
         })?;
+        let cfg =
+            self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
         let binary = self.resolve_binary(request.home_dir.as_deref());
         let mut argv = vec![binary.clone()];
         argv.extend(perms.launch_args);
@@ -2024,7 +2024,7 @@ mod tests {
         };
         assert!(matches!(
             adapter.prepare_launch(&ask_req),
-            Err(VendorAdapterError::InvalidConfig { ref reason, .. }) if reason.contains("posture")
+            Err(VendorAdapterError::PermissionRefused { ref reason, .. }) if reason.contains("posture")
         ));
     }
 

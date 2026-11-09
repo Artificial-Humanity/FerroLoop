@@ -555,6 +555,8 @@ fn launch_spec_for(
         None,
         None,
     )
+    .ok()
+    .flatten()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,7 +570,7 @@ fn launch_spec_for_with_session(
     prompt: &str,
     cwd: Option<&str>,
     vendor_session_id: Option<&str>,
-) -> Option<LaunchSpec> {
+) -> Result<Option<LaunchSpec>, LifecycleError> {
     let home = env
         .home_override
         .map(Path::to_path_buf)
@@ -591,20 +593,46 @@ fn launch_spec_for_with_session(
             thinking_effort: thinking_level.map(str::to_string),
             initial_prompt: prompt.to_string(),
             cwd: cwd.map(PathBuf::from),
-            home_dir: home,
+            home_dir: home.clone(),
             remote_control: options.remote_control,
             posture,
         };
-        return host_adapter
-            .prepare_launch(&req)
-            .ok()
-            .map(|plan| LaunchSpec {
-                env: plan.env,
-                argv: plan.argv,
-            });
+        match host_adapter.prepare_launch(&req) {
+            Ok(plan) => {
+                return Ok(Some(LaunchSpec {
+                    env: plan.env,
+                    argv: plan.argv,
+                }));
+            }
+            Err(fl_core::VendorAdapterError::PermissionRefused { reason, .. }) => {
+                let detail = reason
+                    .strip_prefix("posture:")
+                    .map(str::trim_start)
+                    .unwrap_or(&reason);
+                return Err(invalid_field("posture", detail));
+            }
+            Err(host_err) => {
+                let Some(adapter) = env.vendor_adapter(vendor) else {
+                    return Err(LifecycleError::Invalid(host_err.to_string()));
+                };
+                let spec = adapter
+                    .build_launch_spec_with_options(
+                        persona,
+                        model,
+                        thinking_level,
+                        prompt,
+                        home.as_deref(),
+                        options,
+                    )
+                    .map_err(|why| invalid_field("posture", &why))?;
+                return Ok(Some(spec));
+            }
+        }
     }
-    let adapter = env.vendor_adapter(vendor)?;
-    adapter
+    let Some(adapter) = env.vendor_adapter(vendor) else {
+        return Ok(None);
+    };
+    let spec = adapter
         .build_launch_spec_with_options(
             persona,
             model,
@@ -613,7 +641,8 @@ fn launch_spec_for_with_session(
             home.as_deref(),
             options,
         )
-        .ok()
+        .map_err(|why| invalid_field("posture", &why))?;
+    Ok(Some(spec))
 }
 
 #[cfg(test)]
@@ -3261,13 +3290,24 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         previous.as_ref(),
         OwnerGate::SpinUp,
     )?;
+    let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
+    let launch = launch_spec_for_with_session(
+        env,
+        &v.vendor,
+        &v.persona,
+        v.model.as_deref(),
+        v.thinking_level.as_deref(),
+        v.posture,
+        &prompt,
+        v.cwd.as_deref(),
+        vendor_session_id.as_deref(),
+    )?;
     register_spun_up_agent(store, &v, by)?;
 
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
     let unit = tmux_target.as_deref().map_or("", runtime_unit).to_string();
 
     let now = now_ms();
-    let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
     let mut record = HostedSessionRecord {
         session_id: session_id.clone(),
         persona: v.persona.clone(),
@@ -3311,17 +3351,6 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     // A route left by another vendor would take the hydration prompt.
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
-    let launch = launch_spec_for_with_session(
-        env,
-        &v.vendor,
-        &v.persona,
-        v.model.as_deref(),
-        v.thinking_level.as_deref(),
-        v.posture,
-        &prompt,
-        v.cwd.as_deref(),
-        record.vendor_session_id.as_deref(),
-    );
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
     let spawned = has_runtime
         && v.hosted
@@ -4604,7 +4633,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         &prompt,
         record.cwd.as_deref(),
         record.vendor_session_id.as_deref(),
-    );
+    )?;
     // A stale `<Display>:muse` record whose old session still runs: that one Muse is the agent.
     // No second Muse is opened beside it; the prompt goes to it by delivery and the ownership
     // flag stays as recorded.
@@ -9769,5 +9798,227 @@ mod tests {
         assert_eq!(rendered_out, "Teach auto mode about your environment");
         assert_eq!(fallback_out, "fallback raw output");
         drop(server_thread);
+    }
+
+    #[test]
+    fn host_adapter_prepare_launch_fails_closed_on_permission_refusal_and_falls_back_on_non_permission_error()
+     {
+        use fl_core::permissions::Posture;
+        use fl_core::{
+            AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
+            ConfigEffectiveScope, TeardownOutcome, TeardownTarget, TranscriptNormalizeReport,
+            TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec,
+            VendorHostAdapter, VendorHostAdapterRegistry, VendorLaunchPlan, VendorLaunchRequest,
+        };
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct StubHostAdapter {
+            vendor: &'static str,
+            err: VendorAdapterError,
+        }
+
+        impl VendorHostAdapter for StubHostAdapter {
+            fn vendor_id(&self) -> &str {
+                self.vendor
+            }
+            fn default_binary(&self) -> &str {
+                self.vendor
+            }
+            fn prepare_launch(
+                &self,
+                _req: &VendorLaunchRequest,
+            ) -> Result<VendorLaunchPlan, VendorAdapterError> {
+                Err(self.err.clone())
+            }
+            fn validate_config(
+                &self,
+                model: Option<&str>,
+                thinking_effort: Option<&str>,
+            ) -> Result<VendorConfigSpec, VendorAdapterError> {
+                Ok(VendorConfigSpec {
+                    normalized_model: model.map(str::to_string),
+                    normalized_thinking_effort: thinking_effort.map(str::to_string),
+                    model_scope: ConfigEffectiveScope::NextLaunch,
+                    thinking_effort_scope: ConfigEffectiveScope::NextLaunch,
+                })
+            }
+            fn attach_or_resume(
+                &self,
+                _req: &AttachOrResumeRequest,
+            ) -> Result<AttachOrResumeOutcome, VendorAdapterError> {
+                unreachable!()
+            }
+            fn probe_readiness(
+                &self,
+                _binding: &AdapterIdentityBinding,
+                _vendor_session_id: Option<&str>,
+                _control_endpoint: Option<&str>,
+            ) -> Result<AdapterReadiness, VendorAdapterError> {
+                Ok(AdapterReadiness::Unknown)
+            }
+            fn submit_turn(&self, _req: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+                unreachable!()
+            }
+            fn steer_turn(&self, _req: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+                unreachable!()
+            }
+            fn cancel_turn(&self, _req: &TurnDeliveryRequest) -> TurnDeliveryOutcome {
+                unreachable!()
+            }
+            fn normalize_transcript(
+                &self,
+                _raw_jsonl: &str,
+                _after_cursor: Option<&str>,
+            ) -> Result<TranscriptNormalizeReport, VendorAdapterError> {
+                unreachable!()
+            }
+            fn stop(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                Ok(TeardownOutcome::Completed)
+            }
+            fn detach(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                Ok(TeardownOutcome::Completed)
+            }
+            fn archive(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                Ok(TeardownOutcome::Completed)
+            }
+            fn delete(
+                &self,
+                _target: &TeardownTarget,
+            ) -> Result<TeardownOutcome, VendorAdapterError> {
+                Ok(TeardownOutcome::Completed)
+            }
+        }
+
+        struct ResetRegistry;
+        impl Drop for ResetRegistry {
+            fn drop(&mut self) {
+                TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetRegistry;
+
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+
+        // 1. PermissionRefused from host adapter never falls back to CLI adapter, even if CLI
+        //    adapter supports that posture (`claude` + `Posture::Plan`).
+        let reg = VendorHostAdapterRegistry::new();
+        reg.register(Arc::new(StubHostAdapter {
+            vendor: "claude",
+            err: VendorAdapterError::PermissionRefused {
+                vendor: "claude".into(),
+                reason: "host adapter refused posture".into(),
+            },
+        }));
+        TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg));
+
+        let store = MemStore::default();
+        let mut r = req("ada", "assistant", "claude");
+        r.posture = Posture::Plan;
+        let err = spin_up(&store, &env, &r, "owner", Caller::Owner).unwrap_err();
+        assert!(matches!(err, LifecycleError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("host adapter refused posture"));
+        assert!(
+            store.agent_by_name("ada").unwrap().is_none(),
+            "permission refusal in launch_spec_for_with_session must abort before registering agent"
+        );
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
+        assert!(fake.launches.borrow().is_empty());
+
+        // 2. Non-permission error from host adapter (e.g. InvalidConfig on a window-tagged model
+        //    for Codex) falls back to the CLI adapter when the CLI adapter can launch with the
+        //    same posture, never producing a blank runtime (`None`).
+        let reg2 = VendorHostAdapterRegistry::new();
+        reg2.register(Arc::new(StubHostAdapter {
+            vendor: "codex",
+            err: VendorAdapterError::InvalidConfig {
+                vendor: "codex".into(),
+                reason: "invalid Codex model id `opus[1m]`".into(),
+            },
+        }));
+        TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg2));
+
+        let mut codex_req = req("ada", "assistant", "codex");
+        codex_req.model = Some("opus[1m]".into());
+        codex_req.posture = Posture::Bypass;
+        let out = spin_up(&store, &env, &codex_req, "owner", Caller::Owner).unwrap();
+        assert!(out.runtime_spawned);
+        let launches = fake.launches.borrow();
+        assert_eq!(launches.len(), 1);
+        let spec = launches[0]
+            .1
+            .as_ref()
+            .expect("built-in vendor must never spawn a blank runtime");
+        assert!(
+            spec.argv.windows(2).any(|w| w == ["-a", "never"]),
+            "CLI fallback must preserve requested Bypass posture: {:?}",
+            spec.argv
+        );
+        assert!(
+            !spec.argv.iter().any(|a| a == "--model"),
+            "CLI fallback must normalize out window-tagged model on codex: {:?}",
+            spec.argv
+        );
+        drop(launches);
+
+        // 3. Non-permission error from host adapter when the CLI adapter cannot launch with the
+        //    requested posture (`codex` + `Posture::Ask`) fails closed with `LifecycleError::Invalid`.
+        let err_ask = launch_spec_for_with_session(
+            &env,
+            "codex",
+            "ada",
+            Some("opus[1m]"),
+            None,
+            Posture::Ask,
+            "Hydrate",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err_ask, LifecycleError::Invalid(_)), "{err_ask:?}");
+
+        // 4. Non-permission error from a host adapter that has no CLI adapter fallback surfaces
+        //    `LifecycleError::Invalid` instead of `Ok(None)`.
+        let reg3 = VendorHostAdapterRegistry::new();
+        reg3.register(Arc::new(StubHostAdapter {
+            vendor: "host-only-vendor",
+            err: VendorAdapterError::Transport {
+                vendor: "host-only-vendor".into(),
+                reason: "control socket unreachable".into(),
+            },
+        }));
+        TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg3));
+        let err_no_cli = launch_spec_for_with_session(
+            &env,
+            "host-only-vendor",
+            "ada",
+            None,
+            None,
+            Posture::Auto,
+            "Hydrate",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_no_cli, LifecycleError::Invalid(_)),
+            "{err_no_cli:?}"
+        );
+        assert!(
+            err_no_cli
+                .to_string()
+                .contains("control socket unreachable")
+        );
     }
 }
