@@ -99,6 +99,30 @@ impl Env {
 }
 
 #[test]
+fn untrusted_codex_spin_up_exits_nonzero_before_registering_or_contacting_a_host() {
+    let env = Env::new();
+    let config_home = env.path().join("explicit-codex");
+    std::fs::create_dir(&config_home).unwrap();
+    for config in [None, Some("token = \"PRIVATE_TOKEN\n")] {
+        if let Some(config) = config {
+            std::fs::write(config_home.join("config.toml"), config).unwrap();
+        }
+        let mut command = env.spin_up("ada", "assistant", "codex");
+        command
+            .env_remove("FL_TEST_SPINUP_NO_SPAWN")
+            .env("CODEX_HOME", &config_home)
+            .env("FL_HOST_SOCK", env.path().join("absent-host.sock"))
+            .assert()
+            .failure()
+            .stderr(contains("Codex trust check"))
+            .stderr(contains("trust_level = \"trusted\""))
+            .stderr(contains("PRIVATE_TOKEN").not());
+        assert!(env.roster(true).is_empty());
+        assert!(env.hosted_records().is_empty());
+    }
+}
+
+#[test]
 fn spin_up_registers_the_agent_and_persists_a_hosted_record() {
     let env = Env::new();
     let out = Env::json_of(env.spin_up("felicity", "ui-developer", "claude"));

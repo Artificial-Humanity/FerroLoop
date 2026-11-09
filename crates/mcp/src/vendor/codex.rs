@@ -9,10 +9,154 @@
 use super::{Field, Fields, FileRefusal, Rendered, Vendor, VendorFile, VendorRefusal};
 use super::{Kind, args, command, env, headers, refuse, url};
 use crate::catalog::{EnvValue, HeaderValue, Server, Transport, VendorName};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 const SERVERS: &str = "mcp_servers";
+
+/// Canonical launch directory and the project entry that granted trust.
+#[derive(Debug)]
+pub struct CodexProjectTrust {
+    pub cwd: PathBuf,
+    pub trust_key: PathBuf,
+}
+
+/// Safe, actionable refusal; never contains configuration text.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Codex trust check for {cwd}: {reason} ({config_path}). To trust this project, add or correct in {config_path}:\n[projects.{key}]\ntrust_level = \"trusted\""
+)]
+pub struct CodexTrustError {
+    cwd: PathBuf,
+    config_path: PathBuf,
+    key: toml::Value,
+    reason: String,
+}
+
+/// Check explicit inputs without reading or changing process environment.
+pub fn check_codex_project_trust(
+    cwd: &Path,
+    config_path: &Path,
+) -> Result<CodexProjectTrust, CodexTrustError> {
+    let mut error = CodexTrustError {
+        cwd: cwd.into(),
+        config_path: config_path.into(),
+        key: toml::Value::String(cwd.display().to_string()),
+        reason: String::new(),
+    };
+    let mut check = || -> Result<CodexProjectTrust, String> {
+        let cwd = cwd
+            .canonicalize()
+            .map_err(|_| "cwd cannot be resolved".to_string())?;
+        if !cwd.is_dir() {
+            return Err("cwd is not a directory".into());
+        }
+        error.cwd = cwd.clone();
+        let mut project: &Path = &cwd;
+        let mut marker_exists = false;
+        for ancestor in cwd.ancestors() {
+            match ancestor.join(".git").symlink_metadata() {
+                Ok(_) => {
+                    project = ancestor;
+                    marker_exists = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("cannot inspect Git directory marker".into()),
+            }
+        }
+        error.key = toml::Value::String(project.display().to_string());
+        let mut keys = vec![project.to_path_buf()];
+        let marker = project.join(".git");
+        if marker_exists && !marker.is_dir() {
+            let text = read_trust_file(&marker, 8192)
+                .map_err(|why| format!("Git directory marker: {why}"))?;
+            let gitdir = text
+                .strip_prefix("gitdir:")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("invalid Git directory marker")?;
+            let gitdir = project.join(gitdir);
+            let common = read_trust_file(&gitdir.join("commondir"), 8192)
+                .map_err(|why| format!("Git common directory marker: {why}"))?;
+            if common.trim().is_empty() {
+                return Err("invalid Git common directory".into());
+            }
+            let common = gitdir
+                .join(common.trim())
+                .canonicalize()
+                .map_err(|_| "cannot resolve Git common directory")?;
+            if !common.is_dir() {
+                return Err("Git common directory is not a directory".into());
+            }
+            let main = common
+                .parent()
+                .ok_or("Git common directory has no parent")?;
+            if main != project {
+                keys.push(main.into());
+            }
+        }
+        let text = read_trust_file(config_path, 1024 * 1024)?;
+        let config = text.parse::<toml::Table>().map_err(|e| {
+            let at = e.span().map_or(0, |s| s.start).min(text.len());
+            let line = text.as_bytes()[..at]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count()
+                + 1;
+            format!("is not valid TOML (line {line})")
+        })?;
+        let projects = config.get("projects").and_then(toml::Value::as_table);
+        for key in keys {
+            if let Some(entry) = key.to_str().and_then(|key| projects?.get(key)) {
+                if entry.get("trust_level").and_then(toml::Value::as_str) == Some("trusted") {
+                    return Ok(CodexProjectTrust {
+                        cwd,
+                        trust_key: key,
+                    });
+                }
+                break;
+            }
+        }
+        Err("does not trust this project".into())
+    };
+    check().map_err(|reason| {
+        error.reason = reason;
+        error
+    })
+}
+
+/// Metadata prevents opening devices/FIFOs; the limited reader also detects growth or
+/// understated metadata, without ever allocating an unbounded configuration string.
+fn read_trust_file(path: &Path, limit: u64) -> Result<String, String> {
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "input does not exist".to_string()
+        } else {
+            "fl could not read input".to_string()
+        }
+    };
+    let metadata = path.metadata().map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err("fl could not read input: not a regular file".into());
+    }
+    if metadata.len() > limit {
+        return Err(format!("input exceeds {limit} byte limit"));
+    }
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    if !file.metadata().map_err(unreadable)?.is_file() {
+        return Err("input is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("input exceeds {limit} byte limit"));
+    }
+    String::from_utf8(bytes).map_err(|_| "input is not UTF-8".into())
+}
 
 pub struct Codex;
 
@@ -231,10 +375,160 @@ impl TomlFile {
 
 #[cfg(test)]
 mod tests {
-    use super::Codex;
+    use super::{Codex, check_codex_project_trust};
     use crate::vendor::Vendor;
     use crate::vendor::fixtures::*;
     use std::path::Path;
+
+    fn trust_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let config = dir.path().join("config.toml");
+        (dir, cwd, config)
+    }
+
+    fn trust_entry(path: &Path, level: &str) -> String {
+        format!(
+            "[projects.{}]\ntrust_level = \"{}\"\n",
+            toml::Value::String(path.display().to_string()),
+            level
+        )
+    }
+
+    #[test]
+    fn trust_uses_canonical_cwd_or_nearest_git_root_not_an_arbitrary_ancestor() {
+        let (_dir, cwd, config) = trust_fixture();
+        std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+        assert_eq!(check_codex_project_trust(&cwd, &config).unwrap().cwd, cwd);
+        let sub = cwd.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(check_codex_project_trust(&sub, &config).is_err());
+        std::fs::create_dir(cwd.join(".git")).unwrap();
+        let checked = check_codex_project_trust(&sub, &config).unwrap();
+        assert_eq!(checked.cwd, sub);
+        assert_eq!(checked.trust_key, cwd);
+    }
+
+    #[test]
+    fn trust_worktree_fallback_never_overrides_an_existing_denial() {
+        let (dir, cwd, config) = trust_fixture();
+        let main = dir.path().join("main");
+        let gitdir = main.join(".git/worktrees/branch");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let fallback = trust_entry(&main, "trusted");
+        std::fs::write(&config, &fallback).unwrap();
+        assert_eq!(
+            check_codex_project_trust(&cwd, &config).unwrap().trust_key,
+            main
+        );
+        for own in [
+            trust_entry(&cwd, "untrusted"),
+            format!(
+                "[projects.{}]\n",
+                toml::Value::String(cwd.display().to_string())
+            ),
+        ] {
+            std::fs::write(&config, format!("{own}\n{fallback}")).unwrap();
+            assert!(check_codex_project_trust(&cwd, &config).is_err());
+        }
+    }
+
+    #[test]
+    fn trust_refusals_are_bounded_actionable_and_redacted() {
+        let (_dir, cwd, config) = trust_fixture();
+        for bytes in [
+            b"secret = \"PRIVATE_TOKEN\n".to_vec(),
+            vec![b'x'; 1024 * 1024 + 1],
+            vec![0xff],
+            Vec::new(),
+        ] {
+            std::fs::write(&config, bytes).unwrap();
+            let err = check_codex_project_trust(&cwd, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("PRIVATE_TOKEN"));
+            assert!(err.contains(cwd.to_str().unwrap()), "{err}");
+            assert!(err.contains(config.to_str().unwrap()), "{err}");
+            assert!(
+                err.contains(&trust_entry(&cwd, "trusted").trim().to_string()),
+                "{err}"
+            );
+        }
+        std::fs::remove_file(&config).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+        std::fs::create_dir(&config).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+    }
+
+    #[test]
+    fn trust_accepts_the_config_byte_limit_and_refuses_one_more_byte() {
+        let (_dir, cwd, config) = trust_fixture();
+        let mut text = trust_entry(&cwd, "trusted");
+        text.push('#');
+        text.push_str(&"x".repeat(1024 * 1024 - text.len()));
+        std::fs::write(&config, &text).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_ok());
+        text.push('x');
+        std::fs::write(&config, &text).unwrap();
+        assert!(
+            check_codex_project_trust(&cwd, &config)
+                .unwrap_err()
+                .to_string()
+                .contains("1048576 byte limit")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_refuses_an_unreadable_config_and_canonicalizes_symlink_cwd() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, cwd, config) = trust_fixture();
+        std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+        let link = dir.path().join("alias");
+        symlink(&cwd, &link).unwrap();
+        assert_eq!(check_codex_project_trust(&link, &config).unwrap().cwd, cwd);
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can read mode-000 files; verify the actual read boundary where applicable.
+        if std::fs::File::open(&config).is_err() {
+            assert!(check_codex_project_trust(&cwd, &config).is_err());
+        }
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_trust_read_detects_bytes_when_metadata_reports_zero() {
+        // procfs reports zero bytes even though this process has a nonempty command line.
+        let file = Path::new("/proc/self/cmdline");
+        assert_eq!(std::fs::metadata(file).unwrap().len(), 0);
+        assert!(
+            super::read_trust_file(file, 1)
+                .unwrap_err()
+                .contains("1 byte limit")
+        );
+    }
+
+    #[test]
+    fn trust_rejects_bad_git_indirection_even_with_a_trusted_entry() {
+        let (dir, cwd, config) = trust_fixture();
+        std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+        for text in ["PRIVATE_TOKEN".to_string(), "x".repeat(8193)] {
+            std::fs::write(cwd.join(".git"), text).unwrap();
+            let err = check_codex_project_trust(&cwd, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("PRIVATE_TOKEN"));
+        }
+        let gitdir = dir.path().join("gitdir");
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}", gitdir.display())).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+        std::fs::write(gitdir.join("commondir"), "x".repeat(8193)).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+    }
 
     #[test]
     fn a_stdio_server_forwards_a_secret_by_name_and_writes_literals_only() {

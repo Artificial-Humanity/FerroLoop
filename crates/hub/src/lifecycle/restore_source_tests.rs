@@ -141,6 +141,7 @@ fn prune_failure_is_reported_not_raised() {
 fn teardown_prunes_the_stopped_session_from_the_restore_source() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let dir = resurrect_dir(&home);
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
@@ -172,6 +173,7 @@ fn teardown_prunes_the_stopped_session_from_the_restore_source() {
 fn teardown_succeeds_when_the_restore_source_cannot_be_pruned() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     // The newest save is a directory: reading it fails.
     let dir = home.path().join(".local/share/tmux/resurrect");
     fs::create_dir_all(dir.join(SAVE)).unwrap();
@@ -200,6 +202,7 @@ fn teardown_succeeds_when_the_restore_source_cannot_be_pruned() {
 fn teardown_with_no_resurrect_directory_reports_no_save() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     let target = spun(&store, &env, "fiona");
@@ -327,6 +330,7 @@ fn a_last_link_inside_the_directory_is_followed_even_when_absolute() {
 fn teardown_prunes_a_session_the_hub_did_not_start_once_it_is_not_running() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let dir = resurrect_dir(&home);
     // Hand-launched: the session runs before the spin-up, so the spin-up does not own it.
     let fake = FakeRuntime::running(&["Fiona"]);
@@ -356,6 +360,7 @@ fn teardown_prunes_a_session_the_hub_did_not_start_once_it_is_not_running() {
 fn teardown_leaves_a_running_session_the_hub_did_not_start_alone() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let dir = resurrect_dir(&home);
     let fake = FakeRuntime::running(&["Fiona"]);
     let env = fake.env(home.path());

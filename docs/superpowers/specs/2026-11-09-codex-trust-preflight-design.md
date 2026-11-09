@@ -34,14 +34,25 @@ unnecessary for this bounded configuration check.
   when runtime spawning is enabled. Non-hosted/no-spawn paths do not launch Codex.
 - Canonicalize and pin valid cwd, using current directory once when unresolved;
   reject an explicit nonexistent cwd. Pass that same path to preflight and spawn.
-- Resolve and pin config home: a lifecycle `home_override` selects its `.codex`
-  directory for isolated callers; otherwise nonempty `CODEX_HOME` wins, then
-  `HOME/.codex`. Resolve relative config-home paths to absolute paths. Put the
-  checked directory in final launch `CODEX_HOME` after either adapter path; do not
-  change global HOME. MCP retains its existing ambient CODEX_HOME/HOME precedence.
+- Resolve and pin config home: nonempty hub `CODEX_HOME` wins, otherwise
+  lifecycle `home_override` selects its `.codex` directory for isolated callers,
+  otherwise hub `HOME/.codex`. Empty `CODEX_HOME` is unset, consistently with
+  existing MCP behavior. Resolve relative config-home paths to absolute paths.
+  Put the checked directory in final launch `CODEX_HOME` after either adapter
+  path; do not change global HOME. MCP retains ambient CODEX_HOME/HOME precedence.
 - Refusal is a typed lifecycle 4xx and CLI nonzero, before durable state changes.
   Neither absent host adapter registry nor legacy launch fallback bypasses it.
 - Preserve other vendors' behavior and existing permission/ownership checks.
+
+## Config-location decision (2026-11-09, Ferris)
+
+Option B explicitly makes **future hosted Codex launches** use the hub-selected
+config location above. Previously native children inherited the host daemon's
+HOME and neither adapter explicitly passed CODEX_HOME. Running agents remain
+untouched. On ai-lab-0 the hub and fl-host user services run as the same user with
+the same HOME, so their default effective location is unchanged; Jarvis verifies
+that HOME agreement at rollout. An explicit hub CODEX_HOME now controls future
+hosted launches too. No host protocol query or environment discovery is added.
 
 ## Verification
 
