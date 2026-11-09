@@ -286,6 +286,20 @@ pub const MUSE_DEFAULT_MODEL: &str = "muse-wonder-full-1.0";
 pub const MUSE_CATALOG_MODELS: [&str; 3] =
     [MUSE_DEFAULT_MODEL, "muse-wonder-1.0", "muse-spark-1.3"];
 
+/// The Muse reasoning effort tiers the CLI accepts for `--reasoning-effort`.
+pub const MUSE_REASONING_EFFORTS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// Canonical lowercase Muse `--reasoning-effort` tier for `level`, or `None` when unsupported.
+pub fn normalize_muse_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
+    let lower = level?.trim().to_ascii_lowercase();
+    MUSE_REASONING_EFFORTS
+        .iter()
+        .copied()
+        .find(|tier| *tier == lower)
+}
+
 /// Unversioned names the CLI rejects ("model ... does not exist"), with the catalog id each means.
 const MUSE_MODEL_ALIASES: [(&str, &str); 3] = [
     ("muse-wonder-full", MUSE_DEFAULT_MODEL),
@@ -437,8 +451,9 @@ pub fn muse_prompt_argument(prompt: &str) -> String {
 }
 
 /// `AGENT_PERSONA` (omitted for `codex`, which shares one `codex app-server` daemon across
-/// sessions) plus a `PATH` that starts with `<home>/.local/bin` when that directory is not
-/// already a `PATH` entry.
+/// sessions), `MUSE_NO_AUTO_UPDATE=1` for `muse` (so the `~/.local/bin/muse` launcher never forks
+/// a background auto-update subshell that pins the session supervisor), plus a `PATH` that starts
+/// with `<home>/.local/bin` when that directory is not already a `PATH` entry.
 pub fn launch_env_for_vendor(
     vendor: &str,
     persona: &str,
@@ -447,6 +462,9 @@ pub fn launch_env_for_vendor(
     let mut env = Vec::new();
     if vendor != "codex" {
         env.push(("AGENT_PERSONA".into(), persona.into()));
+    }
+    if vendor == "muse" {
+        env.push(("MUSE_NO_AUTO_UPDATE".into(), "1".into()));
     }
     if let Some(path) = path_with_local_bin(home) {
         env.push(("PATH".into(), path));
@@ -800,11 +818,25 @@ impl VendorCliAdapter for MuseCliAdapter {
         Some(normalize_muse_model(requested))
     }
 
+    /// Muse supports `--reasoning-effort <none|minimal|low|medium|high|xhigh|max|ultra>` with or
+    /// without `--model`.
+    fn check_thinking_level(&self, _model: Option<&str>, level: &str) -> Result<(), String> {
+        if normalize_muse_reasoning_effort(Some(level)).is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "muse supports thinking_level {}, not `{}`",
+                MUSE_REASONING_EFFORTS.join(", "),
+                level.trim().to_ascii_lowercase()
+            ))
+        }
+    }
+
     fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
-        _thinking_level: Option<&str>,
+        thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
@@ -816,7 +848,13 @@ impl VendorCliAdapter for MuseCliAdapter {
             "--model".to_string(),
             normalize_muse_model(model),
         ];
+        if let Some(effort) = normalize_muse_reasoning_effort(thinking_level) {
+            argv.extend(["--reasoning-effort".to_string(), effort.to_string()]);
+        }
         argv.extend(perms.args);
+        if options.posture == Posture::Auto {
+            argv.push("--disable-sandbox".to_string());
+        }
         argv.push(muse_prompt_argument(prompt));
         Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
@@ -1245,8 +1283,42 @@ mod tests {
             spec.argv
         );
 
+        let muse = lookup_vendor_cli_adapter("muse").unwrap();
+        for effort in MUSE_REASONING_EFFORTS {
+            assert!(muse.check_thinking_level(None, effort).is_ok(), "{effort}");
+            assert!(
+                muse.check_thinking_level(None, &effort.to_ascii_uppercase())
+                    .is_ok(),
+                "{effort}"
+            );
+        }
+        assert!(muse.check_thinking_level(None, "extreme").is_err());
+        let spec = muse.build_launch_spec("ada", None, Some(" HIGH "), "Hi", None);
+        assert_eq!(
+            &spec.argv[1..],
+            &[
+                "--model",
+                MUSE_DEFAULT_MODEL,
+                "--reasoning-effort",
+                "high",
+                "--approval-mode",
+                "on-request",
+                "--approval-judge",
+                "on",
+                "--disable-sandbox",
+                "Hi"
+            ]
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "MUSE_NO_AUTO_UPDATE" && v == "1"),
+            "{:?}",
+            spec.env
+        );
+
         // Vendors with no launch option for it ignore the level.
-        for vendor in ["grok", "muse", "lemonade", "ollama"] {
+        for vendor in ["grok", "lemonade", "ollama"] {
             let a = lookup_vendor_cli_adapter(vendor).unwrap();
             let with = a.build_launch_spec("ada", None, Some("high"), "Hi", None);
             let without = a.build_launch_spec("ada", None, None, "Hi", None);
@@ -1312,7 +1384,7 @@ mod tests {
             "high low",
             "$(id)",
         ] {
-            for vendor in ["claude", "codex", "antigravity"] {
+            for vendor in ["claude", "codex", "antigravity", "muse"] {
                 let a = lookup_vendor_cli_adapter(vendor).unwrap();
                 let with = a.build_launch_spec("ada", Some("opus"), Some(bad), "Hi", None);
                 let without = a.build_launch_spec("ada", Some("opus"), None, "Hi", None);
@@ -1446,6 +1518,7 @@ mod tests {
                 "on-request",
                 "--approval-judge",
                 "on",
+                "--disable-sandbox",
                 "Hello"
             ]
         );
@@ -1472,9 +1545,44 @@ mod tests {
                 "on-request",
                 "--approval-judge",
                 "off",
+                "--disable-sandbox",
                 "Hello"
             ]
         );
+        for non_auto in [Posture::Ask, Posture::AcceptEdits] {
+            let spec_non_auto = muse
+                .build_launch_spec_with_options(
+                    "ada",
+                    None,
+                    None,
+                    "Hello",
+                    None,
+                    VendorLaunchOptions {
+                        remote_control: true,
+                        posture: non_auto,
+                        auto_approval: None,
+                    },
+                )
+                .unwrap();
+            assert!(
+                !spec_non_auto.argv.iter().any(|a| a == "--disable-sandbox"),
+                "muse {non_auto} must keep the sandbox: {:?}",
+                spec_non_auto.argv
+            );
+        }
+        let spec_muse_plan = muse.build_launch_spec_with_options(
+            "ada",
+            None,
+            None,
+            "Hello",
+            None,
+            VendorLaunchOptions {
+                remote_control: true,
+                posture: Posture::Plan,
+                auto_approval: None,
+            },
+        );
+        assert!(spec_muse_plan.is_err());
         assert_eq!(muse.reset_command(), "/new");
 
         let lemonade = lookup_vendor_cli_adapter("lemonade").unwrap();
