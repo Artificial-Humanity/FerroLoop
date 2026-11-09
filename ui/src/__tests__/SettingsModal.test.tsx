@@ -1613,27 +1613,40 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     ) as HTMLSelectElement;
     expect(codexSelect.value).toBe("vendor-reviewer");
 
+    // Saving unrelated settings when no auto_approval draft change was made does not send auto_approval
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    await screen.findByTestId("settings-saved-banner");
+    expect(putBodies.length).toBe(1);
+    expect(putBodies[0]).not.toHaveProperty("auto_approval");
+    expect(putBodies[0]).not.toHaveProperty("auto_approval_capabilities");
+
     // Change codex to ask-human and save
     fireEvent.change(codexSelect, { target: { value: "ask-human" } });
     expect(codexSelect.value).toBe("ask-human");
     fireEvent.click(screen.getByTestId("save-settings-btn"));
     await screen.findByTestId("settings-saved-banner");
 
-    expect(putBodies.length).toBe(1);
-    expect(putBodies[0]).not.toHaveProperty("auto_approval_capabilities");
-    expect(putBodies[0].auto_approval).toEqual({ codex: "ask-human" });
+    expect(putBodies.length).toBe(2);
+    expect(putBodies[1]).not.toHaveProperty("auto_approval_capabilities");
+    expect(putBodies[1].auto_approval).toEqual({ codex: "ask-human" });
 
     // Reset codex to default (<vendor>: null)
     fireEvent.click(screen.getByTestId("auto-approval-reset-codex"));
     await act(async () => {
       await Promise.resolve();
     });
-    expect(putBodies.length).toBe(2);
-    expect(putBodies[1].auto_approval).toEqual({ codex: null });
+    expect(putBodies.length).toBe(3);
+    expect(putBodies[2].auto_approval).toEqual({ codex: null });
     expect(
       (screen.getByTestId("auto-approval-select-codex") as HTMLSelectElement)
         .value,
     ).toBe("vendor-reviewer");
+
+    // Saving unrelated settings after reset does not re-send { codex: null }
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    await screen.findByTestId("settings-saved-banner");
+    expect(putBodies.length).toBe(4);
+    expect(putBodies[3]).not.toHaveProperty("auto_approval");
 
     // 400 error is displayed inline inside settings-auto-approval-section
     nextPutError = "choice 'invalid' is not supported for vendor 'muse'";

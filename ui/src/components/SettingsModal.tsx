@@ -1506,6 +1506,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     () => new Set(),
   );
   const [settings, setSettings] = useState<HubSettings>(DEFAULT_HUB_SETTINGS);
+  const settingsRef = useRef<HubSettings>(settings);
+  settingsRef.current = settings;
+  const onSettingsUpdatedRef = useRef(onSettingsUpdated);
+  onSettingsUpdatedRef.current = onSettingsUpdated;
   const [currencyPref, setCurrencyPref] = useState<CurrencyPreference>(() =>
     getActiveCurrency(),
   );
@@ -1927,11 +1931,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         frame.data &&
         typeof frame.data === "object"
       ) {
-        setSettings((prev) => {
-          const next = normalizeHubSettings(frame.data, prev);
-          onSettingsUpdated?.(next);
-          return next;
-        });
+        const next = normalizeHubSettings(frame.data, settingsRef.current);
+        setSettings(next);
+        onSettingsUpdatedRef.current?.(next);
         setAutoApprovalDraft({});
         setAutoApprovalError(null);
       }
@@ -1939,7 +1941,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return () => {
       unsub();
     };
-  }, [wsClient, onSettingsUpdated]);
+  }, [wsClient]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -2285,23 +2287,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       const client = apiClient ?? new HubApiClient();
       const draftKeys = Object.keys(autoApprovalDraft);
-      let autoApprovalPatch: Record<string, AutoApproval | null> | undefined;
-      if (draftKeys.length > 0) {
-        autoApprovalPatch = { ...autoApprovalDraft };
-      } else if (
-        settings.auto_approval &&
-        settings.auto_approval_capabilities
-      ) {
-        const configurableOnly: Record<string, AutoApproval | null> = {};
-        for (const [vendor, choice] of Object.entries(settings.auto_approval)) {
-          if (settings.auto_approval_capabilities[vendor]?.configurable) {
-            configurableOnly[vendor] = choice;
-          }
-        }
-        if (Object.keys(configurableOnly).length > 0) {
-          autoApprovalPatch = configurableOnly;
-        }
-      }
+      const autoApprovalPatch: Record<string, AutoApproval | null> | undefined =
+        draftKeys.length > 0 ? { ...autoApprovalDraft } : undefined;
       const patch: HubSettingsPatch = {
         ...settings,
         ...(autoApprovalPatch !== undefined
@@ -2331,6 +2318,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handleResetVendorAutoApproval = async (vendor: string) => {
     if (savingSettings) return;
+    const prevSettings = settings;
     const cap = settings.auto_approval_capabilities?.[vendor];
     const fallbackDefault = cap?.default ?? "vendor-reviewer";
     setAutoApprovalError(null);
@@ -2353,9 +2341,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       });
       const merged = normalizeHubSettings(updated, nextFallbackSettings);
       setSettings(merged);
+      setAutoApprovalDraft((prev) => {
+        const next = { ...prev };
+        delete next[vendor];
+        return next;
+      });
       setSettingsSaved(true);
       onSettingsUpdated?.(merged);
     } catch (err) {
+      setSettings(prevSettings);
       const msg =
         err instanceof Error
           ? err.message
