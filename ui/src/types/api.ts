@@ -941,6 +941,7 @@ export interface PromptResponse {
   status?: "sent" | "queued" | "delivery_failed";
   queued?: boolean;
   is_busy?: boolean;
+  accepted_at?: string;
   /** Transport compatibility only; never proof of model consumption. */
   delivered?: boolean;
   delivery_stage?: "transport_accepted" | "vendor_queued" | "app_server_accepted" | "compaction_accepted" | "refused" | "unconfirmed" | "not_connected";
@@ -958,6 +959,8 @@ export interface PromptResponse {
   receipts?: WireReceipt[];
   attachments?: SavedPromptAttachment[];
 }
+
+export type OperatorPromptResponse = PromptResponse;
 
 /** Explicit uncertainty is handled without restoring a draft that might deliver twice. */
 export function isPromptDeliveryFailure(response?: PromptResponse): boolean {
