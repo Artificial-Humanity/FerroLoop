@@ -1,6 +1,8 @@
 //! Metadata-only store census. Never uses a store opener, header reader or socket.
 use super::RecoveryError;
-pub use super::inventory_metadata::{MAX_ARTIFACT_BYTES, metadata_digest, read_metadata_artifact};
+pub use super::inventory_metadata::{
+    MAX_ARTIFACT_BYTES, metadata_digest, preflight_candidates, read_metadata_artifact,
+};
 use super::inventory_metadata::{absolute, epoch, record, scan, unit_metadata};
 pub use super::inventory_types::*;
 use crate::{choose_backend, physical_path};
@@ -284,6 +286,9 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
                     .declared_modes
                     .push(edge.declared_mode.clone());
                 item.ownership.mode_sources.push(edge.source.clone());
+                if edge.effective_path.as_ref() != Some(path) {
+                    continue;
+                }
                 item.consumers.extend(
                     inputs
                         .consumers
@@ -291,7 +296,11 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
                         .chain(&inputs.deployment.consumers)
                         .filter(|c| {
                             (c.scope == edge.scope || c.scope == "*")
-                                && (edge.caller != "code index" || c.caller == "code index")
+                                && if c.binding_callers.is_empty() {
+                                    c.caller == edge.caller
+                                } else {
+                                    c.binding_callers.contains(&edge.caller)
+                                }
                         })
                         .cloned(),
                 );

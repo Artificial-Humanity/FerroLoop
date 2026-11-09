@@ -18,6 +18,9 @@ impl Observation {
 #[serde(default, deny_unknown_fields)]
 pub struct ConsumerEdge {
     pub caller: String,
+    /// Applicable resolver callers; empty matches only this consumer's caller.
+    /// Cross-store access must explicitly name its resolver families and scope.
+    pub binding_callers: Vec<String>,
     pub scope: String,
     pub effects: Vec<String>,
     pub handle_lifetime: String,

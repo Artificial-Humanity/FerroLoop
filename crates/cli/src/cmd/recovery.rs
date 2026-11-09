@@ -5,10 +5,12 @@ use clap::{Args, Subcommand};
 use fl_core::state::StateScope;
 use fl_store::recovery::inventory::{
     BindingInput, ConsumerEdge, DeploymentMetadata, InventoryInputs, collect_inventory,
-    metadata_digest, read_metadata_artifact,
+    metadata_digest, preflight_candidates, read_metadata_artifact,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+const MAX_HUB_DISCOVERY_ENTRIES: usize = 4096;
 
 #[derive(Subcommand)]
 pub enum Cmd {
@@ -45,7 +47,7 @@ fn consumers(scope: &str) -> Vec<ConsumerEdge> {
         (
             "MCP",
             "read,write,index",
-            "per tool call; cross-store IRI scans",
+            "per tool call; primary selection",
             "crates/cli/src/cmd/state_mcp.rs::open_workflow_store",
             "unspecified_legacy_auto",
         ),
@@ -100,6 +102,17 @@ fn consumers(scope: &str) -> Vec<ConsumerEdge> {
         .into_iter()
         .map(|(caller, effects, lifetime, symbol, mode)| ConsumerEdge {
             caller: caller.into(),
+            binding_callers: match caller {
+                "CLI" | "MCP" => vec!["config", "CLI root", "CLI override"],
+                "hub" if scope == "workspace" => vec!["config"],
+                "hub" => vec!["hub"],
+                "code index" => vec!["code index"],
+                "store maintenance" => vec!["config", "CLI root", "CLI override", "hub"],
+                _ => vec!["config"],
+            }
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             scope: scope.into(),
             effects: effects.split(',').map(str::to_owned).collect(),
             handle_lifetime: lifetime.into(),
@@ -136,6 +149,36 @@ pub fn inventory_inputs(
     workspace_edge.precedence = "[state].store > XDG_DATA_HOME > HOME".into();
     inputs.bindings.push(workspace_edge);
     inputs.consumers.extend(consumers("workspace"));
+    // Root-based CLI/MCP resolution must retain every entry, even when no
+    // valid slug exists or multiple roots have the same basename.
+    for (index, entry) in config.projects.iter().enumerate() {
+        let label = format!("root:{}", entry.root.display());
+        let mut binding = BindingInput::config(
+            &label,
+            entry.store.clone(),
+            env.clone(),
+            &format!("{}:[[project]][{index}].store", config_path.display()),
+        );
+        binding.caller = "CLI root".into();
+        binding.project_root = Some(entry.root.clone());
+        binding.precedence =
+            "config::bound_entry: longest matching root; ambiguous roots refused".into();
+        inputs.bindings.push(binding);
+        inputs
+            .consumers
+            .extend(consumers(&label).into_iter().filter(|c| c.caller != "hub"));
+    }
+    inputs.consumers.push(ConsumerEdge {
+        caller: "MCP cross-store".into(),
+        binding_callers: vec!["config".into(), "CLI root".into()],
+        scope: "*".into(),
+        effects: vec!["read".into()],
+        handle_lifetime: "IRI ownership scan; per tool call".into(),
+        source_symbol: "crates/cli/src/cmd/state_mcp.rs::open_workflow_store".into(),
+        source_revision: version::build_info().commit,
+        declared_mode: "unspecified_legacy_auto".into(),
+        provenance: "source-derived cross-store scan possibility; not observed traffic".into(),
+    });
     let mut slugs: BTreeSet<String> = config
         .projects
         .iter()
@@ -144,7 +187,18 @@ pub fn inventory_inputs(
     if let Some(home) = &home {
         let hub_root = home.join(".local/share/fl");
         if let Ok(entries) = std::fs::read_dir(&hub_root) {
-            for entry in entries {
+            let mut discovered = BTreeSet::new();
+            for (visited, entry) in entries.enumerate() {
+                if visited >= MAX_HUB_DISCOVERY_ENTRIES {
+                    // Keep no enumeration-dependent subset after truncation.
+                    // Configured bindings remain intact, and the main metadata
+                    // scan still accounts for candidates in declared roots.
+                    inputs
+                        .warnings
+                        .push("hub discovery limit; directory-derived bindings omitted".into());
+                    discovered.clear();
+                    break;
+                }
                 let entry = match entry {
                     Ok(v) => v,
                     Err(_) => {
@@ -162,9 +216,14 @@ pub fn inventory_inputs(
                     && stem != "fl"
                     && !stem.ends_with(".code")
                 {
-                    slugs.insert(stem.to_owned());
+                    discovered.insert(stem.to_owned());
                 }
             }
+            slugs.extend(discovered);
+        } else {
+            inputs
+                .warnings
+                .push("hub directory unavailable; directory-derived bindings unknown".into());
         }
     } else {
         inputs.warnings.push("hub home path unknown".into());
@@ -206,8 +265,9 @@ pub fn run(cmd: Cmd, explicit_db: Option<PathBuf>) -> Result<i32> {
         .config
         .or_else(config::path)
         .context("inventory needs a config path or HOME/XDG_CONFIG_HOME")?;
+    let mut candidates = preflight_candidates(&args.roots)?;
     let config_bytes = match std::fs::symlink_metadata(&config_path) {
-        Ok(_) => Some(read_metadata_artifact(&config_path, &[])?),
+        Ok(_) => Some(read_metadata_artifact(&config_path, &candidates)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => bail!(
             "inventory config metadata unavailable: {}",
@@ -251,16 +311,12 @@ pub fn run(cmd: Cmd, explicit_db: Option<PathBuf>) -> Result<i32> {
         inputs.bindings.push(edge);
     }
     if let Some(path) = args.deployment {
-        let stores: Vec<_> = inputs
-            .bindings
-            .iter()
-            .filter_map(|b| {
-                fl_store::choose_backend(&b.logical_path, b.backend_env.as_deref())
-                    .ok()
-                    .map(|k| fl_store::physical_path(&b.logical_path, k))
-            })
-            .collect();
-        let bytes = read_metadata_artifact(&path, &stores)?;
+        candidates.extend(inputs.bindings.iter().filter_map(|b| {
+            fl_store::choose_backend(&b.logical_path, b.backend_env.as_deref())
+                .ok()
+                .map(|k| fl_store::physical_path(&b.logical_path, k))
+        }));
+        let bytes = read_metadata_artifact(&path, &candidates)?;
         inputs.deployment = serde_json::from_slice::<DeploymentMetadata>(&bytes)
             .map_err(|_| anyhow::anyhow!("invalid deployment metadata: {}", path.display()))?;
     }

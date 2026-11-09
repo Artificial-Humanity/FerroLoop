@@ -228,3 +228,178 @@ fn explicit_database_override_is_a_separate_provenance_edge() {
     assert_eq!(edge["physical_path"], explicit.to_str().unwrap());
     assert!(!explicit.exists());
 }
+
+#[cfg(target_os = "linux")]
+fn reverse_alias_is_refused_without_open(deployment: bool) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let world = World::new();
+    let artifact = world.home.path().join(if deployment {
+        "deployment.json"
+    } else {
+        ".config/fl/config.toml"
+    });
+    std::fs::write(&artifact, if deployment { "{}" } else { "# valid config" }).unwrap();
+    std::os::unix::fs::symlink(&artifact, world.stores.join("unbound.fls")).unwrap();
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(fd >= 0);
+    let fd = unsafe { std::fs::File::from_raw_fd(fd) };
+    let watched = std::ffi::CString::new(artifact.to_str().unwrap()).unwrap();
+    assert!(
+        unsafe {
+            libc::inotify_add_watch(
+                fd.as_raw_fd(),
+                watched.as_ptr(),
+                libc::IN_OPEN | libc::IN_ACCESS | libc::IN_MODIFY,
+            )
+        } >= 0
+    );
+    let mut command = world.fl();
+    command
+        .args(["recovery", "inventory", "--root"])
+        .arg(&world.stores)
+        .arg("--json");
+    if deployment {
+        command.arg("--deployment").arg(&artifact);
+    }
+    let output = command.output().unwrap();
+    let mut bytes = [0u8; 4096];
+    let count = unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) };
+    assert_eq!(count, -1, "aliased store was opened or read");
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        !output.status.success(),
+        "reverse store alias must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsafe or oversized metadata artifact")
+    );
+    assert!(!world.stores.join("fl.fls").exists());
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn reverse_symlink_config_candidate_is_never_opened() {
+    reverse_alias_is_refused_without_open(false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn reverse_symlink_unbound_deployment_candidate_is_never_opened() {
+    reverse_alias_is_refused_without_open(true);
+}
+
+fn config_root_entries_are_preserved(roots: &[&str]) {
+    let world = World::new();
+    let mut config = String::new();
+    let mut stores = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let store = world
+            .home
+            .path()
+            .join(format!("outside-{index}/bound.redb"));
+        config.push_str(&format!(
+            "[[project]]\nroot = {root:?}\nstore = {store:?}\n"
+        ));
+        stores.push(store.with_extension("fls"));
+    }
+    std::fs::write(world.home.path().join(".config/fl/config.toml"), config).unwrap();
+    let map = world.inventory();
+    for (root, store) in roots.iter().zip(stores) {
+        assert!(has_path(&map, &store), "missing binding for {root}");
+        assert!(
+            map["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["caller"] == "CLI root"
+                    && b["project_root"] == *root
+                    && b["physical_path"] == store.to_str().unwrap())
+        );
+        assert!(
+            map["required_additional_roots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == store.parent().unwrap().to_str().unwrap())
+        );
+        assert!(!store.exists());
+    }
+    assert_eq!(map["complete"], false);
+}
+#[test]
+fn unnamed_non_slug_config_root_is_preserved() {
+    config_root_entries_are_preserved(&["/work/My.Project"]);
+}
+#[test]
+fn distinct_config_roots_with_same_basename_are_preserved() {
+    config_root_entries_are_preserved(&["/work/one/Shared", "/work/two/Shared"]);
+}
+
+#[test]
+fn mismatched_resolvers_attach_only_their_applicable_consumers() {
+    let world = World::new();
+    world.config();
+    std::fs::write(world.stores.join("example.fls"), b"fixture").unwrap();
+    let map = world.inventory();
+    let callers = |name: &str| {
+        let path = world.stores.join(name);
+        let store = map["stores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| {
+                s["identity"]["given_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == path.to_str().unwrap())
+            })
+            .unwrap();
+        let mut result: Vec<_> = store["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["caller"].as_str().unwrap())
+            .collect();
+        result.sort();
+        result.dedup();
+        result
+    };
+    assert_eq!(
+        callers("different.fls"),
+        vec!["CLI", "MCP", "MCP cross-store", "store maintenance"]
+    );
+    assert_eq!(callers("example.fls"), vec!["hub", "store maintenance"]);
+    assert_eq!(callers("example.code.fls"), vec!["code index"]);
+}
+
+#[test]
+fn hub_discovery_is_bounded_and_reports_omitted_bindings() {
+    let world = World::new();
+    for index in 0..4097 {
+        std::fs::write(world.stores.join(format!("ignored-{index}.txt")), b"").unwrap();
+    }
+    std::fs::write(world.stores.join("discovered.fls"), b"fixture").unwrap();
+    let map = world.inventory();
+    assert!(
+        map["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("hub discovery limit"))
+    );
+    assert!(
+        !map["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["caller"] == "hub"),
+        "a truncated directory must not choose an enumeration-dependent subset"
+    );
+    assert!(
+        has_path(&map, &world.stores.join("discovered.fls")),
+        "metadata scan still accounts for unbound candidates"
+    );
+    assert_eq!(map["complete"], false);
+}

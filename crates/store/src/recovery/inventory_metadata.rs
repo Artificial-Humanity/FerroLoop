@@ -69,6 +69,20 @@ pub fn read_metadata_artifact(
     if store_extension(&canonical) {
         return Err(refuse());
     }
+    // Check candidates before even opening the artifact: a store symlink may
+    // point to this otherwise ordinary, singly-linked metadata filename.
+    let aliases_store = |meta: &fs::Metadata| {
+        store_paths.iter().any(|store| {
+            canonical == *store
+                || fs::canonicalize(store).is_ok_and(|p| p == canonical)
+                || fs::metadata(store)
+                    .ok()
+                    .is_some_and(|m| file_id(&m).is_some() && file_id(&m) == file_id(meta))
+        })
+    };
+    if aliases_store(&before) {
+        return Err(refuse());
+    }
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -91,14 +105,8 @@ pub fn read_metadata_artifact(
             return Err(refuse());
         }
     }
-    for store in store_paths {
-        if canonical == *store
-            || fs::metadata(store)
-                .ok()
-                .is_some_and(|m| file_id(&m).is_some() && file_id(&m) == file_id(&meta))
-        {
-            return Err(refuse());
-        }
+    if aliases_store(&meta) {
+        return Err(refuse());
     }
     let mut bytes = Vec::new();
     file.take(MAX_ARTIFACT_BYTES + 1)
@@ -205,6 +213,27 @@ pub(super) fn scan(root: &Path, paths: &mut BTreeSet<PathBuf>, warnings: &mut Ve
             pending.push((child, depth + 1));
         }
     }
+}
+/// Discover all candidates in declared roots before reading any metadata artifact.
+/// A partial scan cannot establish that an artifact is not a store alias.
+pub fn preflight_candidates(roots: &[PathBuf]) -> Result<Vec<PathBuf>, RecoveryError> {
+    if roots.is_empty() || roots.iter().any(|root| !absolute(root)) {
+        return Err(RecoveryError::Refused(
+            "explicit absolute scan roots without parent traversal are required".into(),
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    let mut warnings = Vec::new();
+    for root in roots {
+        scan(root, &mut paths, &mut warnings);
+    }
+    if !warnings.is_empty() {
+        return Err(RecoveryError::Refused(format!(
+            "candidate preflight incomplete; metadata artifacts cannot safely be read: {}",
+            warnings.join("; ")
+        )));
+    }
+    Ok(paths.into_iter().collect())
 }
 pub(super) fn absolute(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir))
