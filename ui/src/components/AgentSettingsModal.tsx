@@ -3,7 +3,13 @@ import { HubApiClient, HubApiError } from "../api/client";
 import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { projectChoices } from "../hooks/useProjects";
-import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
+import {
+  isLiveSessionStatus,
+  PinIcon,
+  togglePinnedAgent,
+  usePinnedState,
+} from "./RosterSidebar";
+import { evaluateQuotaStatus, resolveQuotaPoolKey } from "../utils/quotaStatus";
 import {
   canonicalizeDefaultRole,
   CREATE_CUSTOM_ROLE_VALUE,
@@ -348,10 +354,15 @@ export interface AgentSettingsModalProps {
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
   /**
-   * Ignored. The quota summary moved out of this modal; callers that still pass it keep
-   * compiling until they drop the prop.
+   * Session usage allowance telemetry (`primary_window`, `secondary_window`, `exhausted_reason`,
+   * `observed_at_ms`) evaluated alongside liveness in the Status & Allowance detail block.
    */
   quotaUsage?: SessionQuotaUsage | null;
+  /**
+   * Process liveness state (`alive`, `stale`, `dead`) so the Status & Allowance detail can show
+   * both process liveness and usage allowance without conflating them.
+   */
+  livenessState?: "alive" | "stale" | "dead" | null;
   /**
    * Effective execution mode the hub reports for the session (`auto`, `yolo`, `plan`, `default`,
    * `accept-edits`, or a vendor value). `null` means the hub reported none ("Unknown"). When the
@@ -419,6 +430,8 @@ interface FetchedSessionState {
   model: string | null;
   thinkingLevel: string | null;
   availableModels: string[] | null;
+  quotaUsage: SessionQuotaUsage | null;
+  status: string | null;
   /** Prop values in effect when the fetch was issued. */
   props: SessionPropSnapshot;
 }
@@ -428,6 +441,7 @@ interface SessionPropSnapshot {
   model?: string;
   thinkingLevel?: string;
   executionMode?: string | null;
+  quotaUsage?: SessionQuotaUsage | null;
 }
 
 /** Fields whose prop value is newer than the fetched session value. */
@@ -436,6 +450,7 @@ interface OverrideLatch {
   thinkingLevel: boolean;
   executionMode: boolean;
   adapter: boolean;
+  quotaUsage: boolean;
 }
 
 const NO_OVERRIDES: OverrideLatch = {
@@ -443,7 +458,27 @@ const NO_OVERRIDES: OverrideLatch = {
   thinkingLevel: false,
   executionMode: false,
   adapter: false,
+  quotaUsage: false,
 };
+
+function sameModalQuotaUsage(
+  a: SessionQuotaUsage | null | undefined,
+  b: SessionQuotaUsage | null | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.tier === b.tier &&
+    a.observed_at_ms === b.observed_at_ms &&
+    a.exhausted_reason === b.exhausted_reason &&
+    a.primary_window?.used_percent === b.primary_window?.used_percent &&
+    a.primary_window?.window_minutes === b.primary_window?.window_minutes &&
+    a.primary_window?.resets_at_ms === b.primary_window?.resets_at_ms &&
+    a.secondary_window?.used_percent === b.secondary_window?.used_percent &&
+    a.secondary_window?.window_minutes === b.secondary_window?.window_minutes &&
+    a.secondary_window?.resets_at_ms === b.secondary_window?.resets_at_ms
+  );
+}
 
 export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   isOpen,
@@ -460,6 +495,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   switchingModel = false,
   onChangeModelAndThinking,
   contextEstimate,
+  quotaUsage,
+  livenessState,
   executionMode,
   turnCount,
   canCompact,
@@ -600,12 +637,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     model: selectedModel,
     thinkingLevel: selectedThinkingLevel,
     executionMode,
+    quotaUsage,
   });
   latestPropsRef.current = {
     adapter,
     model: selectedModel,
     thinkingLevel: selectedThinkingLevel,
     executionMode,
+    quotaUsage,
     apiClient,
   };
   const requestSnapshotRef = useRef<SessionPropSnapshot>({
@@ -613,13 +652,28 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     model: selectedModel,
     thinkingLevel: selectedThinkingLevel,
     executionMode,
+    quotaUsage,
   });
   const canFetchSessions =
     Boolean(apiClient) && typeof apiClient?.getSessions === "function";
+  const quotaSourceRef = useRef<{
+    poolKey: string;
+    quotaUsage: SessionQuotaUsage | null | undefined;
+    staleAcrossPoolSwitch: boolean;
+  }>({
+    poolKey: "",
+    quotaUsage: undefined,
+    staleAcrossPoolSwitch: false,
+  });
   useEffect(() => {
     setFetchedSession(null);
     const { apiClient: client, ...propsAtRequest } = latestPropsRef.current;
     requestSnapshotRef.current = propsAtRequest;
+    quotaSourceRef.current = {
+      poolKey: "",
+      quotaUsage: undefined,
+      staleAcrossPoolSwitch: false,
+    };
     setOverridden((prev) => (prev === NO_OVERRIDES ? prev : NO_OVERRIDES));
     if (!isOpen || !canFetchSessions || !client || (!sessionId && !agentName)) {
       return;
@@ -640,6 +694,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
           model: match?.model ?? null,
           thinkingLevel: match?.thinking_level ?? null,
           availableModels: match?.available_models ?? null,
+          quotaUsage: match?.quota_usage ?? null,
+          status: match?.status ?? null,
           props: propsAtRequest,
         });
       })
@@ -658,6 +714,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       thinkingLevel: selectedThinkingLevel !== snap.thinkingLevel,
       executionMode: executionMode !== snap.executionMode,
       adapter: adapter !== snap.adapter,
+      quotaUsage: !sameModalQuotaUsage(quotaUsage, snap.quotaUsage),
     };
     setOverridden((prev) => {
       const next = {
@@ -665,15 +722,17 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         thinkingLevel: prev.thinkingLevel || changed.thinkingLevel,
         executionMode: prev.executionMode || changed.executionMode,
         adapter: prev.adapter || changed.adapter,
+        quotaUsage: prev.quotaUsage || changed.quotaUsage,
       };
       return next.model === prev.model &&
         next.thinkingLevel === prev.thinkingLevel &&
         next.executionMode === prev.executionMode &&
-        next.adapter === prev.adapter
+        next.adapter === prev.adapter &&
+        next.quotaUsage === prev.quotaUsage
         ? prev
         : next;
     });
-  }, [isOpen, adapter, selectedModel, selectedThinkingLevel, executionMode]);
+  }, [isOpen, adapter, selectedModel, selectedThinkingLevel, executionMode, quotaUsage]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -691,13 +750,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, recastModalOpen, recasting, onClose]);
 
-  if (!isOpen) {
-    return null;
-  }
-
-  const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
-  const agentKey = (agentName || displayTarget).trim().toLowerCase();
-  const targetSessionOrAgent = sessionId || agentName || "";
   // A field is overridden once latched, and also in the render where its prop
   // first differs from the request snapshot (before the latch effect has run).
   const isOverridden = <K extends keyof OverrideLatch>(
@@ -745,6 +797,79 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   );
   const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
   const shownModel = pendingAgyModel || effectiveModel;
+  const isQuotaOverridden =
+    overridden.quotaUsage ||
+    !sameModalQuotaUsage(
+      quotaUsage,
+      fetchedSession !== null ? fetchedSession.props.quotaUsage : requestSnapshotRef.current.quotaUsage,
+    );
+  const isAdapterOverridden =
+    isOverridden("adapter", adapter) ||
+    adapter !== requestSnapshotRef.current.adapter;
+  const sessionVendor = canonicalAdapter(
+    (fetchedSession?.adapter && fetchedSession.adapter.trim().toLowerCase() !== "unknown"
+      ? fetchedSession.adapter
+      : requestSnapshotRef.current.adapter) ?? "",
+  );
+  const effectiveVendor = canonicalAdapter(effectiveAdapter ?? "");
+  const currentPoolKey = resolveQuotaPoolKey(effectiveAdapter, effectiveModel);
+  const candidateQuotaUsage = (() => {
+    const fetchedQuota = fetchedSession?.quotaUsage ?? null;
+    const propQuota = quotaUsage ?? null;
+    if (propQuota && fetchedQuota) {
+      const propTs = propQuota.observed_at_ms;
+      const fetchedTs = fetchedQuota.observed_at_ms;
+      if (
+        typeof propTs === "number" &&
+        Number.isFinite(propTs) &&
+        typeof fetchedTs === "number" &&
+        Number.isFinite(fetchedTs) &&
+        propTs !== fetchedTs
+      ) {
+        return propTs > fetchedTs ? propQuota : fetchedQuota;
+      }
+      return isQuotaOverridden ? propQuota : fetchedQuota;
+    }
+    if (fetchedSession !== null && !isQuotaOverridden) {
+      return fetchedQuota ?? propQuota;
+    }
+    return propQuota ?? fetchedQuota;
+  })();
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const prev = quotaSourceRef.current;
+    if (!prev.poolKey) {
+      quotaSourceRef.current = {
+        poolKey: currentPoolKey,
+        quotaUsage: candidateQuotaUsage,
+        staleAcrossPoolSwitch: false,
+      };
+      return;
+    }
+    const sameQuota = sameModalQuotaUsage(candidateQuotaUsage, prev.quotaUsage);
+    if (currentPoolKey !== prev.poolKey) {
+      quotaSourceRef.current = {
+        poolKey: currentPoolKey,
+        quotaUsage: candidateQuotaUsage,
+        staleAcrossPoolSwitch: sameQuota,
+      };
+    } else if (!sameQuota) {
+      quotaSourceRef.current = {
+        poolKey: currentPoolKey,
+        quotaUsage: candidateQuotaUsage,
+        staleAcrossPoolSwitch: false,
+      };
+    }
+  }, [isOpen, currentPoolKey, candidateQuotaUsage]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
+  const agentKey = (agentName || displayTarget).trim().toLowerCase();
+  const targetSessionOrAgent = sessionId || agentName || "";
   const effectiveThinkingLevel =
     fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
     selectedThinkingLevel;
@@ -889,6 +1014,44 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     (executionMode !== undefined ? executionMode : null);
   const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
   const executionModeIsYolo = executionModeKey === "yolo";
+  const sameAsTrackedQuota = sameModalQuotaUsage(
+    candidateQuotaUsage,
+    quotaSourceRef.current.quotaUsage,
+  );
+  const isQuotaFromPreviousPool = Boolean(
+    quotaSourceRef.current.poolKey &&
+      currentPoolKey &&
+      ((currentPoolKey !== quotaSourceRef.current.poolKey && sameAsTrackedQuota) ||
+        (currentPoolKey === quotaSourceRef.current.poolKey &&
+          quotaSourceRef.current.staleAcrossPoolSwitch &&
+          sameAsTrackedQuota)),
+  );
+  const adapterChangedAcrossVendors =
+    isAdapterOverridden &&
+    Boolean(sessionVendor && effectiveVendor && sessionVendor !== effectiveVendor) &&
+    (!isQuotaOverridden || isQuotaFromPreviousPool);
+  const effectiveQuotaUsage =
+    adapterChangedAcrossVendors || isQuotaFromPreviousPool ? null : candidateQuotaUsage;
+  const effectiveLivenessState: "alive" | "stale" | "dead" =
+    livenessState ??
+    (fetchedSession?.status
+      ? isLiveSessionStatus(fetchedSession.status)
+        ? "alive"
+        : "dead"
+      : sessionId
+        ? "alive"
+        : "dead");
+  const quotaEval = evaluateQuotaStatus({
+    quotaUsage: effectiveQuotaUsage,
+    vendor: effectiveAdapter,
+    model: effectiveModel,
+  });
+  const livenessLabel =
+    effectiveLivenessState === "alive"
+      ? "Online (alive)"
+      : effectiveLivenessState === "stale"
+        ? "Stale"
+        : "Offline (dead)";
 
   return (
     <div className="fd-modal-backdrop" onClick={onClose}>
@@ -1690,6 +1853,85 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   Read-only: how this session handles tool approvals. Change it in the agent&apos;s own
                   CLI.
                 </span>
+              </div>
+
+              <div
+                data-testid="agent-settings-status-detail"
+                data-liveness-state={effectiveLivenessState}
+                data-quota-state={quotaEval.status}
+                data-quota-reason={quotaEval.reasonKind}
+                data-quota-pool={quotaEval.poolLabel ?? undefined}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  paddingTop: "4px",
+                  borderTop: "1px solid var(--border-subtle)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      textTransform: "uppercase",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    Status &amp; Allowance
+                  </span>
+                  {quotaEval.poolLabel && (
+                    <span
+                      data-testid="agent-settings-allowance-pool"
+                      className="fd-badge fd-mono"
+                      style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                    >
+                      Pool: {quotaEval.poolLabel}
+                    </span>
+                  )}
+                </div>
+                <div
+                  data-testid="agent-settings-liveness-detail"
+                  style={{ fontSize: "12px", color: "var(--text-secondary)" }}
+                >
+                  Process: <strong style={{ color: "var(--text-primary)" }}>{livenessLabel}</strong>
+                </div>
+                <div
+                  data-testid="agent-settings-allowance-detail"
+                  style={{
+                    fontSize: "12px",
+                    color:
+                      quotaEval.status === "red"
+                        ? "var(--status-danger)"
+                        : quotaEval.status === "orange"
+                          ? "#F97316"
+                          : quotaEval.status === "yellow"
+                            ? "var(--status-stale)"
+                            : "var(--text-secondary)",
+                  }}
+                >
+                  Allowance: {quotaEval.detailText}
+                </div>
+                {effectiveLivenessState === "dead" && quotaEval.status !== "unknown" && (
+                  <div
+                    data-testid="agent-settings-offline-quota-note"
+                    style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                  >
+                    Process is offline; usage allowance is reported separately (
+                    {quotaEval.reasonKind === "exhausted"
+                      ? "quota exhausted"
+                      : `${quotaEval.status} state`}
+                    ).
+                  </div>
+                )}
               </div>
             </div>
           </div>
