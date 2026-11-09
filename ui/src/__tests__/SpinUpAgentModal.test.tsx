@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { HubApiClient } from "../lib/api";
@@ -775,6 +775,215 @@ describe("SpinUpAgentModal", () => {
       );
       expect(updatedBadge).toHaveAttribute("role", "status");
       expect(updatedBadge).toHaveTextContent("Hydration: failed");
+    });
+
+    unmount();
+  });
+
+  it("syncs hydration state on WebSocket sessions lifecycle events (spun_up, remodeled, restarted, decommission) and ignores mode === 'prepare'", async () => {
+    let hostedSessionsResponse: Array<Record<string, unknown>> = [
+      {
+        session_id: "claude:felix",
+        persona: "felix",
+        project: "ferroloop",
+        role: "ui-developer",
+        vendor: "claude",
+        status: "running",
+        restart_count: 0,
+        updated_at_ms: 1000,
+        hydration_dispatched: true,
+        hydration_status: "unconfirmed",
+      },
+      {
+        session_id: "claude:felix-old-decommissioned",
+        persona: "felix",
+        project: "ferroloop",
+        role: "ui-developer",
+        vendor: "claude",
+        status: "decommissioned",
+        restart_count: 0,
+        updated_at_ms: 9999,
+        hydration_dispatched: false,
+        hydration_status: "failed",
+      },
+    ];
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+
+      if (url.includes("/api/v1/auth/session")) {
+        return json({
+          authenticated: true,
+          authority: { tier: "owner", login: "lmcfarlin" },
+        });
+      }
+      if (url.endsWith("/api/v1/agents")) {
+        return json({
+          agents: [
+            {
+              name_key: "felix",
+              display_name: "Felix",
+              project: "FerroLoop",
+              role: "ui-developer",
+            },
+          ],
+          routes: [],
+        });
+      }
+      if (url.endsWith("/api/v1/hosted-sessions")) {
+        return json({
+          sessions: hostedSessionsResponse,
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const topicSubscribers = new Map<
+      string,
+      Set<(frame: { event?: string; data?: unknown }) => void>
+    >();
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: (
+        topic: string,
+        cb: (frame: { event?: string; data?: unknown }) => void,
+      ) => {
+        if (!topicSubscribers.has(topic)) {
+          topicSubscribers.set(topic, new Set());
+        }
+        topicSubscribers.get(topic)!.add(cb);
+        return () => {
+          topicSubscribers.get(topic)?.delete(cb);
+        };
+      },
+    } as unknown as HubWsClient;
+
+    const emitSessionsEvent = (event: string, data: Record<string, unknown>) => {
+      act(() => {
+        for (const cb of topicSubscribers.get("sessions") ?? []) {
+          cb({ event, data });
+        }
+      });
+    };
+
+    const { unmount } = render(
+      <App
+        apiClient={apiClient}
+        wsClient={wsStub}
+        initialSelectedAgentName="felix"
+      />,
+    );
+
+    // Initial state: decommissioned record is ignored, running record (unconfirmed) is selected
+    const initialBadge = await screen.findByTestId(
+      "session-hydration-status-badge",
+    );
+    expect(initialBadge).toHaveAttribute(
+      "data-hydration-status",
+      "unconfirmed",
+    );
+    expect(initialBadge).toHaveAttribute("data-hydration-dispatched", "true");
+
+    // 1. mode === "prepare" is ignored and does not overwrite hydration state
+    emitSessionsEvent("session.remodeled", {
+      persona: "felix",
+      vendor: "codex",
+      session_id: "codex:felix",
+      mode: "prepare",
+      hosted: true,
+      hydration_dispatched: false,
+      hydration_status: "failed",
+    });
+    expect(
+      screen.getByTestId("session-hydration-status-badge"),
+    ).toHaveAttribute("data-hydration-status", "unconfirmed");
+
+    // 2. session.remodeled (mode !== "prepare") updates spunUpByAgent and hostedSessionsByAgent,
+    // and activeHydrationStatus prioritizes activeSpunUp over any stale hosted poll
+    emitSessionsEvent("session.remodeled", {
+      persona: "felix",
+      vendor: "codex",
+      model: "gpt-5.4",
+      session_id: "codex:felix",
+      mode: "execute",
+      hosted: true,
+      hydration_dispatched: false,
+      hydration_status: "failed",
+    });
+
+    await waitFor(() => {
+      const badge = screen.getByTestId("session-hydration-status-badge");
+      expect(badge).toHaveAttribute("data-hydration-status", "failed");
+      expect(badge).toHaveAttribute("data-hydration-dispatched", "false");
+    });
+
+    // 3. session.restarted updates hydration status to confirmed
+    hostedSessionsResponse = [
+      {
+        session_id: "codex:felix",
+        persona: "felix",
+        project: "ferroloop",
+        role: "ui-developer",
+        vendor: "codex",
+        status: "running",
+        restart_count: 1,
+        updated_at_ms: 2000,
+        hydration_dispatched: true,
+        hydration_status: "confirmed",
+      },
+    ];
+    emitSessionsEvent("session.restarted", {
+      persona: "felix",
+      vendor: "codex",
+      session_id: "codex:felix",
+      hosted: true,
+      hydration_dispatched: true,
+      hydration_status: "confirmed",
+    });
+
+    await waitFor(() => {
+      const badge = screen.getByTestId("session-hydration-status-badge");
+      expect(badge).toHaveAttribute("data-hydration-status", "confirmed");
+      expect(badge).toHaveAttribute("data-hydration-dispatched", "true");
+    });
+
+    // 4. session.decommission clears both spunUpByAgent and hostedSessionsByAgent
+    hostedSessionsResponse = [
+      {
+        session_id: "codex:felix",
+        persona: "felix",
+        project: "ferroloop",
+        role: "ui-developer",
+        vendor: "codex",
+        status: "decommissioned",
+        restart_count: 1,
+        updated_at_ms: 3000,
+        hydration_dispatched: true,
+        hydration_status: "confirmed",
+      },
+    ];
+    emitSessionsEvent("session.decommission", {
+      persona: "felix",
+      session_id: "codex:felix",
+      status: "decommissioned",
+      mode: "teardown",
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByTestId("session-hydration-status-badge"),
+      ).not.toBeInTheDocument();
     });
 
     unmount();
