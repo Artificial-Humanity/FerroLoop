@@ -163,11 +163,11 @@ its usual `Extended` envelope):
 
 The response is `{"op":"session_owner","matches":true}` or `false`. The query
 returns only a boolean; `ListSessions` and the legacy protocol shapes are unchanged.
-`hosted_id` must contain 1–128 UTF-8 bytes. Empty or oversized query values are
-rejected during validation. The host retains a fixed-size owner marker from
-`FL_HOSTED_ID` in the explicit, allowed launch environment; inherited environment
-alone supplies no marker. Missing or oversized launch markers do not establish
-ownership.
+An ownership match requires a `hosted_id` of 1–128 UTF-8 bytes. An empty query
+returns `false`; values over 128 bytes are rejected during validation. The host
+retains a fixed-size owner marker from `FL_HOSTED_ID` in the explicit, allowed
+launch environment; inherited environment alone supplies no marker. Missing or
+oversized launch markers do not establish ownership.
 
 The host checks the full `(host instance, session ID, epoch)` against its retained
 session before comparing the marker. A stale stream cannot establish ownership of
