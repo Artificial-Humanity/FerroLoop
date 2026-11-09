@@ -1288,6 +1288,7 @@ mod tests {
             }
         }
         let (mut client, mut server) = memory_rpc();
+        client.minor = 1;
         let caller = async {
             let stream = crate::StreamId {
                 host: crate::HostInstance::new([0; 16]),

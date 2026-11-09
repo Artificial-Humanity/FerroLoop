@@ -3844,7 +3844,8 @@ fn host_build_identity_is_opt_in() {
     );
     let expected = fl_host_proto::RELIABLE_FEATURE
         | fl_host_proto::HOST_STATUS_FEATURE
-        | fl_host_proto::SESSION_OWNER_FEATURE;
+        | fl_host_proto::SESSION_OWNER_FEATURE
+        | fl_host_proto::PTY_RETENTION_FEATURE;
     #[cfg(unix)]
     let expected = expected | fl_host_proto::PTY_FEATURE | fl_host_proto::RENDERED_PTY_FEATURE;
     assert_eq!(features, expected);
@@ -5042,12 +5043,26 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
         child.kind = SpawnKind::Pty;
         let stream = rpc.inner.spawn_pty_session(child, None).unwrap().0;
         streams.push(stream.clone());
+        let mut cleanup_requested = false;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let status = rpc.inner.pty_retention_status().unwrap().unwrap();
             let records = rpc.inner.list_sessions().unwrap();
+            // A bare synthetic child is not a hosted owner: leader exit alone
+            // deliberately does not request containment cleanup. Request that
+            // boundary after natural exit, without subscribing or acknowledging.
+            if !cleanup_requested
+                && records
+                    .iter()
+                    .any(|r| r.stream == stream && matches!(r.state, ChildState::LeaderExited(_)))
+            {
+                let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+                rpc.inner.kill_session(stream.clone(), lease).unwrap();
+                cleanup_requested = true;
+            }
             if status.projection_reserved_bytes == 0
                 && status.completed_pty_sessions == (n + 1).min(8)
+                && status.evicted_total == u64::from((n + 1).saturating_sub(8))
                 && records.iter().any(|r| {
                     r.stream == stream && matches!(r.state, ChildState::CleanupComplete(_))
                 })
@@ -5066,7 +5081,12 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
                 }
                 break;
             }
-            assert!(Instant::now() < deadline, "epoch {n} did not finish");
+            assert!(
+                Instant::now() < deadline,
+                "epoch {n} did not finish: diagnostic={status:?} records={records:?} child_finished_output={} tail={:?}",
+                marker.exists(),
+                rpc.inner.capture_output(stream.session.clone(), 128)
+            );
             thread::sleep(Duration::from_millis(5));
         }
     }

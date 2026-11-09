@@ -52,7 +52,7 @@ and `SliceBudget::used(ChargeKind::Projection)` for diagnostics.
 - [x] Run `cargo test -p fl-host` and affected strict Clippy/fmt/diff checks. Document
       accounting reservation versus actual allocation and new completed capture rule.
 - [x] Commit with Fiona trailer.
-- [ ] Fresh independent task review before Task 2.
+- [x] Fresh independent task review before Task 2 (fa96441b approved without findings).
 
 Implementation notes: RED reproduced projection admission failure at zero-based
 session 14, retained projection charge after successful cleanup, and refusal of
@@ -87,27 +87,27 @@ gates the query. `None` means older host; no new fields on HostStatus/SessionSum
 Internal exact function signatures may follow existing authority patterns, keeping
 the spec's lock and reference ordering. Do not invent a new on-wire refusal enum.
 
-- [ ] Add failing deterministic tests for PTY compaction without Ack, preserved
+- [x] Add failing deterministic tests for PTY compaction without Ack, preserved
       reference charges, cleanup/EOF/thread eligibility, oldest-first eight-tail
       limit and pressure eviction below the 64-slot admission limit.
-- [ ] Implement journal-owned compaction after cleanup/EOF with no fabricated Ack;
+- [x] Implement journal-owned compaction after cleanup/EOF with no fabricated Ack;
       fence/cancel completed authority, detach re-entrant objects under lock and
       release them afterward. Preserve held references and reliable-pipe tests.
-- [ ] Enforce completed retention during existing spawn/status maintenance; log
+- [x] Enforce completed retention during existing spawn/status maintenance; log
       each exact evicted StreamId and record bounded recent history/cumulative count.
       Preserve raw capture for retained completed sessions independently of authority.
-- [ ] Add bounded capability/query/response and async/blocking client helper. New
+- [x] Add bounded capability/query/response and async/blocking client helper. New
       clients enrich stale responses for known evictions into explicit identity-named
       errors via one bounded diagnostic lookup, preserving stale/unknown behavior
       outside the retained history. Avoid recursive diagnostic requests.
-- [ ] Render diagnostics in `fl host status` human/JSON output, explicitly unavailable
+- [x] Render diagnostics in `fl host status` human/JSON output, explicitly unavailable
       on older hosts. Enrich PTY capacity errors with limit/use and actionable remedy;
       do not transform unrelated spawn failures into misleading projection errors.
-- [ ] Add isolated-daemon tests for over64 sequential PTYs without consumers/Acks;
+- [x] Add isolated-daemon tests for over64 sequential PTYs without consumers/Acks;
       final tail bytes, baseline projection charge, bounded inventory, eviction
       order/count/identity, late-reader errors and stale same-name epochs. Include
       held stream/ticket races and old-client/old-host decode fixtures.
-- [ ] Update public docs with PTY-specific retention, eight-tail/64-history limits,
+- [x] Update public docs with PTY-specific retention, eight-tail/64-history limits,
       capability bit, request/response, accounting/RSS distinction and CLI remedies.
 - [ ] Run focused checks, then `cargo test --workspace`,
       `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -155,3 +155,24 @@ trio. Full workspace verification and independent Task 2 review have NOT run.
 Logs: the approved artifact directory contains `408-task2-{red,green,proto-red,unit,
 retention,ipc,cli-red,cli-green}.log`. No live-host launch or configuration change
 was performed. This checkpoint is not an approval or completion claim.
+
+
+### Task 2 resumed focused verification (2026-11-09)
+
+Epoch-zero diagnostics showed the child finished all output (tail ended in
+`99999`, latest sequence 100003) and exited with code zero, but remained
+`LeaderExited` with its projection reserved. The bare supervisor only publishes
+successful cleanup after cleanup is requested; automatic hosted-owner cleanup
+belongs to #409. The fixture now claims a controller solely to request cleanup
+after natural exit, without any event subscription or Ack. It also waits for the
+expected cumulative eviction count so eight older completed epochs cannot satisfy
+the current epoch's completion predicate prematurely. Timeout assertions preserve
+state, reservation, output-marker and raw-tail evidence.
+
+The 74-epoch isolated-daemon regression passes. Host suites pass 235 tests
+(103 unit, 30 foundation, 85 IPC, 17 reliable events); protocol suites pass 82
+(22 unit, 23 framing, 37 transport); CLI status passes both real-host and old-host
+cases. Compatibility fixtures now expect the advertised diagnostic capability and
+select minor 1 for the capacity-error case. Public protocol/operator documentation
+is complete. Full workspace verification awaits integration with current main;
+independent Task 2 and whole-branch reviews remain outstanding.

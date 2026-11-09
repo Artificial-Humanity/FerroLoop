@@ -1,23 +1,26 @@
 # Reliable host events
 
-The standalone host supports explicitly negotiated protocol 1.1 reliable **pipe**
-sessions. This adds controller acknowledgement and replay while that host process
-survives. It does not install a host service, connect a controller or vendor adapter,
-or authorize migration. PTY execution and terminal snapshot codecs remain unavailable.
+The standalone host supports explicitly negotiated reliable **pipe** sessions and
+Unix PTY sessions. Controller acknowledgement and replay last while that host
+process survives, subject to the mode-specific retention rules below. Protocol
+capabilities describe the serving host; these APIs do not install a service or
+authorize migration. Unix PTYs also support [rendered capture](host-rendered-capture.md).
 The historical [foundation contract](host-foundation.md) describes legacy pipe
 sessions and platform containment limitations.
 
 ## Negotiate before spawning
 
 Authenticate each RPC and event socket independently. Request protocol minor 1,
-then query `Capabilities`. The reliable feature bit is 1; PTY bit 2 is not enabled.
+then query `Capabilities`. The reliable feature bit is 1; Unix hosts advertise
+PTY bit 2. Check the advertised bits before using an optional extension.
 The host retains each connection's authenticated negotiated minor. Minor-zero
 connections cannot send Extended requests or receive extension frame 9. Authentication
 and legacy 1.0 wire shapes are unchanged. An unsupported request is an explicit
 refusal, never permission to retry with legacy semantics.
 
-`SpawnSession` selects an immutable `legacy` or `reliable_pipe` mode, validated
-before native child side effects. PTY requests refuse as Unsupported. A reliable
+`SpawnSession` selects an immutable `legacy`, `reliable_pipe` or `pty` mode,
+validated before native child side effects. Unsupported platform/mode combinations
+refuse explicitly. A reliable
 stream is identified by `(host_instance, session, session_epoch)`, with a fresh
 random instance at each host startup. A session name alone cannot grant authority.
 Legacy List returns only legacy sessions. Negotiated ListSessions includes retained
@@ -120,9 +123,59 @@ ACK cursor. Minor-1 readers receive Unsupported and disconnect at a gap.
 
 Finite lifecycle reservation allows Exited and CleanupComplete to progress
 independently of data occupancy. Exited precedes successful CleanupComplete;
-cleanup and process death remain distinct observations. Kill is not permission
+cleanup and process death remain distinct observations. For reliable pipes, Kill is not permission
 to discard lifecycle records. No abandonment TTL exists. Non-reliable output
 retains its existing backpressure policy and never uses unattended eviction.
+
+## Completed PTY retention and diagnostics
+
+PTY completion has a separate policy from pipe replay. Successful containment
+cleanup immediately drops the parser and projection reservation. Leader exit
+alone is not proof of cleanup: a bare session still needs an explicit cleanup
+request. Output may continue draining into its raw tail after cleanup.
+
+After successful cleanup, stdout EOF and retirement of the epoch's threads,
+spawn/status maintenance fences the completed PTY authority, cancels pending
+claims/tickets/streams, and releases journal-owned replay records. It never
+advances Ack. Outstanding references retain their real allocation charges until
+those references drop. A retained completed PTY offers only its final raw tail;
+controller/replay/rendered operations refuse with `SessionFenced`.
+
+The host retains at most eight completed PTY epochs, each with at most 64 KiB of
+raw tail (512 KiB total, plus bounded bookkeeping). Maintenance evicts oldest
+completed PTYs first, including when an otherwise admissible spawn needs a slot.
+Live PTYs, incomplete cleanup and pipe epochs are ineligible. There is no retention
+timer: regular spawn/status operations maintain the bound. Each eviction is logged
+with its full host instance, session and epoch identity.
+
+`PTY_RETENTION_FEATURE` (bit 32) gates the opt-in extension request
+`{"op":"pty_retention_status"}`. Its response is:
+
+```json
+{"op":"pty_retention_status","status":{"projection_reserved_bytes":0,"projection_limit_bytes":592968704,"completed_pty_sessions":0,"completed_pty_limit":8,"evicted_total":0,"recent_evictions":[]}}
+```
+
+The numeric projection limit above illustrates the current default geometry; it
+is derived from the storage bound, not a fixed wire constant. Recent evictions
+contain at most 64 full `StreamId` values, oldest first; `evicted_total` is
+cumulative for this host instance. No fields are added to existing `HostStatus`
+or `SessionSummary` responses. Async/blocking clients expose
+`pty_retention_status()` as `Option`: `None` means unavailable on an older host,
+never invented zero usage. Unsupported diagnostic requests are never sent to it.
+
+`fl host status` shows reservation use/limit, completed count/limit and eviction
+history. Its JSON includes `pty_retention_diagnostics` (`available` or
+`unavailable`) and `pty_retention` (the status object or `null`). Reservations are
+accounting allowances, not measured RSS. If a PTY spawn or resize hits resource
+limits, inspect status, reduce geometry/scrollback or stop unused live sessions;
+resource exhaustion can also have causes other than projection capacity.
+
+Typed clients enrich a stale-epoch refusal with one bounded diagnostic lookup.
+An identity present in recent history gets an explicit `PTY epoch evicted` error;
+an older or unknown identity remains `stale epoch (possibly evicted)` without
+claiming proof. Mutations are not retried. Raw protocol clients keep the existing
+`StaleEpoch` refusal and can query the negotiated diagnostic themselves. Old
+clients never receive an unsolicited new response or refusal variant.
 
 ## Recovery boundary and evidence
 

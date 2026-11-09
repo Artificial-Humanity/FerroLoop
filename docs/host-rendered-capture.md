@@ -26,7 +26,11 @@ Successful cleanup releases the PTY parser and its reservation independently of
 consumer Ack. Rendered capture and resize then refuse with `SessionFenced`.
 Incomplete cleanup keeps the projection. The existing 64 KiB raw tail remains
 available through raw capture; output still draining after cleanup can update it.
-Neither release nor capture advances Ack.
+Neither release nor capture advances Ack. After cleanup, EOF and thread retirement,
+spawn/status maintenance retains at most eight completed raw tails and evicts the
+oldest first (also under spawn-slot pressure). Live sessions and incomplete cleanup
+are ineligible. See [retention diagnostics](host-replay-pty.md#completed-pty-retention-and-diagnostics)
+for eviction identity, client errors and `fl host status` output.
 
 The shared projection allowance derives from 64 default sessions times the
 conservative per-session storage bound: approximately 593 MB decimal. Reservations

@@ -1337,11 +1337,7 @@ mod tests {
             .is_err()
         );
     }
-}
 
-#[cfg(test)]
-mod retention_tests {
-    use super::*;
     #[test]
     fn retention_diagnostic_roundtrip_and_history_bound() {
         let stream = serde_json::json!({"host":"01010101010101010101010101010101", "session":"retained", "epoch":1});
