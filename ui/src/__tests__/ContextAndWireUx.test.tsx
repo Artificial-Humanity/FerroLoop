@@ -27,6 +27,7 @@ import {
 import { ThinkingBlock } from "../components/ThinkingBlock";
 import { summarizeWireContent } from "../components/TurnCard";
 import type { TranscriptTurn } from "../types/api";
+import { TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function turn(partial: Partial<TranscriptTurn> & { index: number }): TranscriptTurn {
   return {
@@ -1939,6 +1940,7 @@ describe("App transcript observation ownership", () => {
       const url = String(input);
       if (url.includes("/auth/session")) return response({ authenticated: true, authority: { tier: "owner", login: "owner" } });
       if (url.includes("/transcript")) return read(url);
+      if (url.endsWith("/agents")) return response({ agents: TEST_WORKSPACE_AGENTS, routes: [] });
       if (url.endsWith("/sessions")) return response({ sessions });
       return response({});
     });

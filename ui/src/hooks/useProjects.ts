@@ -2,41 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { HubApiError } from "../api/client";
 import type { ProjectSummary } from "../types/api";
 
-/**
- * The project list the app falls back to when the hub cannot serve
- * `GET /api/v1/projects` (an older hub, a 404, a failed request). It mirrors the
- * lists that used to be hard-coded in the roster, Settings and Spin-Up.
- */
-const FALLBACK_PROJECT_NAMES = [
-  "AI-Lab-AMD",
-  "FerroLoop",
-  "Kaggle-Gemma4",
-  "Lucida",
-  "Prosodia",
-  "Sonora",
-  "Website",
-] as const;
-
-function fallbackEntry(name: string): ProjectSummary {
-  const slug = name.toLowerCase();
-  return {
-    id: slug,
-    slug,
-    name,
-    kind: "project",
-    path: null,
-    has_git: false,
-    purpose: null,
-    tracker: null,
-    store_path: null,
-    active_agent_count: 0,
-  };
-}
-
-export const FALLBACK_PROJECTS: readonly ProjectSummary[] = Object.freeze(
-  FALLBACK_PROJECT_NAMES.map(fallbackEntry),
-);
-
 /** Display label of a project: its name, or the slug when the name is blank. */
 export function projectLabel(project: Pick<ProjectSummary, "name" | "slug">): string {
   return project.name.trim() || project.slug;
@@ -106,7 +71,7 @@ export interface ProjectsState {
   loaded: boolean;
   /** Message of the last failed load (not set when the endpoint is merely absent). */
   error: string | null;
-  /** True when `projects` came from the hub, false for the built-in fallback. */
+  /** True when `projects` came from the hub, false when no hub list is loaded. */
   fromHub: boolean;
   /**
    * Whether the hub can create, edit and delete projects. `unsupported` when it answered 404
@@ -116,6 +81,8 @@ export interface ProjectsState {
   projectManagement: "available" | "unsupported";
   /** Reloads the list. Overlapping calls resolve in order; the latest one wins. */
   refresh: () => Promise<void>;
+  /** Clears cached hub projects (e.g. on logout or 401). */
+  clear: () => void;
 }
 
 interface ProjectsClient {
@@ -130,13 +97,17 @@ function isEndpointMissing(err: unknown): boolean {
   return err instanceof HubApiError && (err.status === 404 || err.status === 405);
 }
 
+function isUnauthorized(err: unknown): boolean {
+  return err instanceof HubApiError && (err.status === 401 || err.status === 403);
+}
+
 /**
  * One project list for the whole app. Loads `listProjects()` on mount and on
- * `refresh()`; falls back to the built-in list when the hub does not offer it.
+ * `refresh()`; never falls back to a hard-coded project roster.
  */
 export function useProjects(apiClient: ProjectsClient | undefined): ProjectsState {
-  const [state, setState] = useState<Omit<ProjectsState, "refresh">>({
-    projects: [...FALLBACK_PROJECTS],
+  const [state, setState] = useState<Omit<ProjectsState, "refresh" | "clear">>({
+    projects: [],
     loaded: false,
     error: null,
     fromHub: false,
@@ -148,13 +119,26 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
   const seqRef = useRef(0);
   const hubListRef = useRef<ProjectSummary[] | null>(null);
 
+  const clear = useCallback((): void => {
+    ++seqRef.current;
+    hubListRef.current = null;
+    if (!aliveRef.current) return;
+    setState({
+      projects: [],
+      loaded: false,
+      error: null,
+      fromHub: false,
+      projectManagement: "available",
+    });
+  }, []);
+
   const refresh = useCallback(async (): Promise<void> => {
     const seq = ++seqRef.current;
     const client = clientRef.current;
-    let next: Omit<ProjectsState, "refresh">;
+    let next: Omit<ProjectsState, "refresh" | "clear">;
     if (!client || typeof client.listProjects !== "function") {
       next = {
-        projects: [...FALLBACK_PROJECTS],
+        projects: [],
         loaded: true,
         error: null,
         fromHub: false,
@@ -172,11 +156,11 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
           throw new HubApiError(404, EMPTY_REPLY);
         }
         if (list.every((p) => p.legacy === true)) {
-          // The hub that serves only `{id, artifact dirs}` cannot manage projects: use the
-          // built-in list for labels, roster and Spin-Up, and never show those entries.
+          // The hub that serves only `{id, artifact dirs}` cannot manage projects:
+          // never show those entries as managed projects.
           hubListRef.current = null;
           next = {
-            projects: [...FALLBACK_PROJECTS],
+            projects: [],
             loaded: true,
             error: null,
             fromHub: false,
@@ -192,8 +176,12 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
           };
         }
       } catch (err) {
-        // Keep the last list the hub gave us over regressing to the built-in one.
-        const kept = hubListRef.current;
+        const unauthorized = isUnauthorized(err);
+        if (unauthorized) {
+          hubListRef.current = null;
+        }
+        // Keep the last list the hub gave us on transient non-auth errors.
+        const kept = unauthorized ? null : hubListRef.current;
         const missing = isEndpointMissing(err);
         // An empty or malformed reply is thrown as a 404 above; only a real HubApiError
         // from the endpoint (or the shortcut message) tells an absent endpoint.
@@ -201,7 +189,7 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
         const management: ProjectManagement =
           missing && !emptyReply ? "unsupported" : "available";
         next = {
-          projects: kept ?? [...FALLBACK_PROJECTS],
+          projects: kept ?? [],
           loaded: true,
           error: missing
             ? null
@@ -227,5 +215,5 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
     };
   }, [refresh]);
 
-  return { ...state, refresh };
+  return { ...state, refresh, clear };
 }

@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient, HubApiError } from "../api/client";
 import { HubWsClient } from "../api/ws";
-import { DEFAULT_WORKSPACE_AGENTS, resolveLivenessState } from "../types/api";
+import { TEST_WORKSPACE_AGENTS as DEFAULT_WORKSPACE_AGENTS } from "./fixtures/testAgents";
+import { resolveLivenessState } from "../types/api";
 
 describe("HubApiClient", () => {
   beforeEach(() => {

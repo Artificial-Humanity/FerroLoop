@@ -18,14 +18,28 @@ import { SettingsModal } from "../components/SettingsModal";
 import { TerminalPane } from "../components/TerminalPane";
 import { VaultGatePane } from "../components/VaultGatePane";
 import { WireMailPane } from "../components/WireMailPane";
+import { TEST_PROJECTS, TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function makeStubApiClient(): HubApiClient {
-  const fetchImpl = vi.fn(async () =>
-    new Response(JSON.stringify({}), {
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/v1/agents")) {
+      return new Response(
+        JSON.stringify({ agents: TEST_WORKSPACE_AGENTS, routes: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.endsWith("/api/v1/projects")) {
+      return new Response(JSON.stringify({ projects: TEST_PROJECTS }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({}), {
       status: 200,
       headers: { "Content-Type": "application/json" },
-    }),
-  );
+    });
+  });
   return new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
 }
 
@@ -1068,6 +1082,8 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
         isOpen={true}
         onClose={vi.fn()}
         apiClient={apiClient}
+        agents={TEST_WORKSPACE_AGENTS}
+        projects={TEST_PROJECTS}
         initialProject="FerroLoop"
         initialProjectSubTab="agents"
         onBulkSessionAction={onBulkSessionAction}

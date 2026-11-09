@@ -14,7 +14,8 @@ import {
 import { TerminalPane } from "../components/TerminalPane";
 import { VaultGatePane } from "../components/VaultGatePane";
 import { WireMailPane } from "../components/WireMailPane";
-import { DEFAULT_WORKSPACE_AGENTS, type WireInboxItem } from "../types/api";
+import { TEST_WORKSPACE_AGENTS as DEFAULT_WORKSPACE_AGENTS } from "./fixtures/testAgents";
+import { type WireInboxItem } from "../types/api";
 
 const SAMPLE_WIRE_MESSAGES: WireInboxItem[] = [
   {
@@ -79,6 +80,12 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
             authenticated: true,
             authority: { tier: "owner", login: "lmcfarlin" },
           }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/agents")) {
+        return new Response(
+          JSON.stringify({ agents: DEFAULT_WORKSPACE_AGENTS, routes: [] }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -570,6 +577,12 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      if (url.endsWith("/api/v1/agents")) {
+        return new Response(
+          JSON.stringify({ agents: DEFAULT_WORKSPACE_AGENTS, routes: [] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify({}), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -600,7 +613,7 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
     expect(screen.queryByTestId("mobile-split-backdrop")).toBeNull();
 
     // Open AgentSettingsModal -> Clear / Reforge modal -> close via top-right ✕ button
-    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(await screen.findByTestId("agent-settings-btn-ferris"));
     fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
     expect(screen.getByTestId("clear-session-modal")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("clear-modal-close-btn"));
