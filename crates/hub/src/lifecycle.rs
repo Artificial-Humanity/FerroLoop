@@ -3593,10 +3593,7 @@ fn unregister_routes_in_daemon<'a>(
         if home_override.is_some() {
             return;
         }
-        let sock = std::env::var_os("FL_WIRE_SOCKET")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(fl_wire::daemon::default_socket_path);
+        let sock = fl_wire::daemon::resolve_socket_path(None, None, None);
         for persona in personas {
             let persona = persona.trim().to_ascii_lowercase();
             if persona.is_empty() {
