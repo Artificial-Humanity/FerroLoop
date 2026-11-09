@@ -52,13 +52,21 @@ pub fn format_push_message(msg: &WireMessage) -> String {
 }
 
 pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), String> {
+    dispatch_to_route_with_status(route, msg).map(|_| ())
+}
+
+pub fn dispatch_to_route_with_status(
+    route: &VendorRoute,
+    msg: &WireMessage,
+) -> Result<DeliveryStatus, String> {
     match route {
         VendorRoute::Claude {
             pid,
             session_id,
             socket_path,
             key_path,
-        } => dispatch_to_claude(*pid, session_id, socket_path, key_path.as_deref(), msg),
+        } => dispatch_to_claude(*pid, session_id, socket_path, key_path.as_deref(), msg)
+            .map(|()| DeliveryStatus::Acked),
         VendorRoute::Agy {
             conversation_id,
             ls_address,
@@ -92,10 +100,11 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 &title,
                 &delivered_body,
             )
+            .map(|()| DeliveryStatus::Acked)
         }
         VendorRoute::Codex { thread_id, cwd } => {
             let formatted = format_push_message(msg);
-            deliver_to_codex_route(thread_id, cwd.as_ref(), &formatted)
+            dispatch_codex_wire_message(thread_id, cwd.as_ref(), &formatted)
         }
         VendorRoute::Muse {
             session_id,
@@ -111,6 +120,7 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 tmux_pane.as_deref(),
                 &formatted,
             )
+            .map(|()| DeliveryStatus::Acked)
         }
         VendorRoute::Grok {
             session_id,
@@ -126,6 +136,7 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 tmux_pane.as_deref(),
                 &formatted,
             )
+            .map(|()| DeliveryStatus::Acked)
         }
         VendorRoute::HostCli {
             session_id,
@@ -140,11 +151,53 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 tmux_pane.as_deref(),
                 &formatted,
             )
+            .map(|()| DeliveryStatus::Acked)
         }
-        VendorRoute::Webhook { socket_path } => {
-            push_webhook_message(socket_path, msg).map_err(String::from)
+        VendorRoute::Webhook { socket_path } => push_webhook_message(socket_path, msg)
+            .map(|()| DeliveryStatus::Acked)
+            .map_err(String::from),
+    }
+}
+
+/// Dispatch a `WireMessage` to a Codex route: steer the active turn over the app-server control
+/// socket first, and fall back to `codex queue` only on a proven `Idle` or `NoActiveTurn`
+/// preflight refusal (or when `FL_WIRE_CODEX_BIN` is set without a control-socket override).
+/// A `codex queue` enqueue returns `DeliveryStatus::Delivered` so `fl wire read --ack` or the
+/// session hook still sees and acknowledges the message. Any other steer refusal or error returns
+/// `Err`, keeping the receipt `DeliveryStatus::Pending` for hook/read delivery.
+fn dispatch_codex_wire_message(
+    thread_id: &str,
+    cwd: Option<&PathBuf>,
+    formatted: &str,
+) -> Result<DeliveryStatus, String> {
+    let sock = crate::codex_control::resolve_control_socket(
+        std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+        std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )?;
+    if let Some(sock) = sock {
+        match crate::codex_control::steer_active_turn(
+            &sock,
+            thread_id,
+            formatted,
+            crate::codex_control::STEER_TIMEOUT,
+        ) {
+            Ok(_ack) => return Ok(DeliveryStatus::Acked),
+            Err(CodexSteerError::Refused {
+                stage: CodexSteerStage::ThreadRead,
+                reason: CodexSteerRefusalReason::Idle,
+                ..
+            })
+            | Err(CodexSteerError::Refused {
+                stage: CodexSteerStage::TurnsList,
+                reason: CodexSteerRefusalReason::NoActiveTurn,
+                ..
+            }) => {}
+            Err(err) => return Err(err.to_string()),
         }
     }
+    deliver_to_codex_route(thread_id, cwd, formatted).map(|()| DeliveryStatus::Delivered)
 }
 
 /// Why a push failed, for a caller that may send to another route instead.
@@ -2800,7 +2853,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     msg: &WireMessage,
     now: At,
 ) -> Vec<DeliveryReceipt> {
-    dispatch_message_selected(
+    dispatch_message_selected_with_status(
         store,
         routes,
         home_override,
@@ -2808,7 +2861,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         now,
         None,
         &mut DispatchReport::default(),
-        dispatch_to_route,
+        dispatch_to_route_with_status,
     )
     .0
 }
@@ -2844,7 +2897,7 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
     recipient: &str,
     report: &mut DispatchReport,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
-    dispatch_message_selected(
+    dispatch_message_selected_with_status(
         store,
         routes,
         home_override,
@@ -2852,7 +2905,7 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
         now,
         Some(recipient),
         report,
-        dispatch_to_route,
+        dispatch_to_route_with_status,
     )
 }
 
@@ -2882,8 +2935,7 @@ pub(crate) fn dispatch_message_for_recipient_with_test_dispatch<S: MessageStore>
     )
 }
 
-// The private callback keeps fault tests on this same pass without invoking vendor I/O.
-// Production callers always supply dispatch_to_route.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_message_selected<S: MessageStore>(
     store: &S,
@@ -2895,6 +2947,31 @@ fn dispatch_message_selected<S: MessageStore>(
     report: &mut DispatchReport,
     mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<(), String>,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
+    dispatch_message_selected_with_status(
+        store,
+        routes,
+        home_override,
+        msg,
+        now,
+        recipient,
+        report,
+        |route, msg| dispatch(route, msg).map(|()| DeliveryStatus::Acked),
+    )
+}
+
+// The private callback keeps fault tests on this same pass without invoking vendor I/O.
+// Production callers always supply dispatch_to_route_with_status.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_message_selected_with_status<S: MessageStore>(
+    store: &S,
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    msg: &WireMessage,
+    now: At,
+    recipient: Option<&str>,
+    report: &mut DispatchReport,
+    mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<DeliveryStatus, String>,
+) -> (Vec<DeliveryReceipt>, Option<bool>) {
     let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
         report.record_failure(FailureStage::InitialReceiptReadError);
         return (Vec::new(), None);
@@ -2903,8 +2980,10 @@ fn dispatch_message_selected<S: MessageStore>(
         receipts.retain(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
     }
     let deliverable = |rcpt: &DeliveryReceipt| {
-        !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
-            && rcpt.attempts < MAX_DELIVER
+        !matches!(
+            rcpt.status,
+            DeliveryStatus::Delivered | DeliveryStatus::Acked | DeliveryStatus::Expired
+        ) && rcpt.attempts < MAX_DELIVER
     };
     // Discovery scans every vendor's session files, so it runs only for a receipt still to
     // deliver under a name that can be a persona key, and then only when that receipt has no
@@ -2965,7 +3044,7 @@ fn dispatch_message_selected<S: MessageStore>(
             }
         }
         let target_status = match pushed {
-            Ok(()) => DeliveryStatus::Acked,
+            Ok(status) => status,
             Err(_) => DeliveryStatus::Pending,
         };
         match store.update_wire_receipt(
@@ -3299,6 +3378,12 @@ mod tests {
             ),
             (
                 "urn:x:duplicate-2",
+                "diagnostic-recipient",
+                DeliveryStatus::Pending,
+                1,
+            ),
+            (
+                "urn:x:delivered",
                 "diagnostic-recipient",
                 DeliveryStatus::Delivered,
                 1,
@@ -6383,8 +6468,9 @@ mod tests {
             At::from_unix_millis(20),
         );
         assert_eq!(discoveries(), before + 1);
-        // Acked, expired, or out of attempts: nothing to deliver, so nothing to discover.
+        // Delivered, acked, expired, or out of attempts: nothing to deliver, so nothing to discover.
         for (status, attempts) in [
+            (DeliveryStatus::Delivered, 1),
             (DeliveryStatus::Acked, 0),
             (DeliveryStatus::Expired, 0),
             (DeliveryStatus::Pending, MAX_DELIVER),
@@ -7845,5 +7931,367 @@ exit 1"#,
             "[Operator Prompt via FerroDeck — from owner]\n\nFirst paragraph\n\nSecond paragraph[201~"
         );
         assert!(socket_frames(&listener).is_none());
+    }
+
+    #[test]
+    fn codex_wire_dispatch_steers_busy_turn_and_queues_only_on_idle_or_no_active_turn() {
+        use crate::codex_control::fake_server;
+        let _lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Case 1: Busy Codex thread ("active" + inProgress turn) steers directly -> Acked, no `codex queue`.
+        {
+            let tmp = TempDir::new().unwrap();
+            let (bin, out) = fake_codex_queue_bin(tmp.path());
+            let (sock, server) = fake_server::spawn(tmp.path(), |c| {
+                c.handshake();
+                c.expect_json();
+                c.send_text(r#"{"id":1,"result":{}}"#);
+                c.expect_json();
+                c.expect_json();
+                c.send_text(&serde_json::json!({"id":2,"result":{"thread":{
+                    "id":"thread-busy", "sessionId":"s-1", "cliVersion":"0.166.0", "createdAt":1,
+                    "cwd":"/tmp", "ephemeral":false, "modelProvider":"openai", "path":null,
+                    "preview":"", "source":"cli", "status":{"type":"active","activeFlags":[]},
+                    "canAcceptDirectInput":true, "turns":[], "updatedAt":1
+                }}}).to_string());
+                c.expect_json();
+                c.send_text(
+                    &serde_json::json!({"id":3,"result":{"data":[{
+                    "id":"turn-busy", "status":"inProgress", "items":[], "itemsView":"notLoaded"
+                }],"nextCursor":null,"backwardsCursor":null}})
+                    .to_string(),
+                );
+                let steer_req = c.expect_json();
+                assert_eq!(steer_req["method"], "turn/steer");
+                assert_eq!(steer_req["params"]["threadId"], "thread-busy");
+                assert_eq!(steer_req["params"]["expectedTurnId"], "turn-busy");
+                c.send_text(r#"{"id":4,"result":{"turnId":"turn-busy"}}"#);
+                c.drain_until_eof();
+            });
+            let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+            let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+
+            let store = MemStore::default();
+            let msg = mail_to(&store, "fiona");
+            let mut routes = RouteTable::default();
+            routes.upsert_explicit(
+                "fiona",
+                codex_route("thread-busy"),
+                At::from_unix_millis(100),
+            );
+
+            let updated = dispatch_message_for_store(
+                &store,
+                &mut routes,
+                Some(tmp.path()),
+                &msg,
+                At::from_unix_millis(200),
+            );
+            server.join().unwrap();
+            assert_eq!(updated.len(), 1);
+            assert!(!out.exists(), "busy steer must not invoke `codex queue`");
+            let rcpts = store.list_wire_receipts(&msg.id).unwrap();
+            assert_eq!(rcpts[0].status, DeliveryStatus::Acked);
+        }
+
+        // Case 2: Proven idle ("idle") or active-with-no-inProgress-turn falls back to `codex queue` -> Delivered,
+        // and a second dispatch does not re-push an already Delivered receipt.
+        for (status, has_completed_turn) in [("idle", false), ("active", true)] {
+            let tmp = TempDir::new().unwrap();
+            let (bin, out) = fake_codex_queue_bin(tmp.path());
+            let (sock, server) = fake_server::spawn(tmp.path(), move |c| {
+                c.handshake();
+                c.expect_json();
+                c.send_text(r#"{"id":1,"result":{}}"#);
+                c.expect_json();
+                c.expect_json();
+                c.send_text(&serde_json::json!({"id":2,"result":{"thread":{
+                    "id":"thread-idle", "sessionId":"s-2", "cliVersion":"0.166.0", "createdAt":1,
+                    "cwd":"/tmp", "ephemeral":false, "modelProvider":"openai", "path":null,
+                    "preview":"", "source":"cli", "status":{"type":status,"activeFlags":[]},
+                    "canAcceptDirectInput":true, "turns":[], "updatedAt":1
+                }}}).to_string());
+                if has_completed_turn {
+                    c.expect_json();
+                    c.send_text(
+                        &serde_json::json!({"id":3,"result":{"data":[{
+                        "id":"turn-done", "status":"completed", "items":[], "itemsView":"notLoaded"
+                    }],"nextCursor":null,"backwardsCursor":null}})
+                        .to_string(),
+                    );
+                }
+                c.drain_until_eof();
+            });
+            let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+            let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+
+            let store = MemStore::default();
+            let msg = mail_to(&store, "fiona");
+            let mut routes = RouteTable::default();
+            routes.upsert_explicit(
+                "fiona",
+                codex_route("thread-idle"),
+                At::from_unix_millis(100),
+            );
+
+            let updated = dispatch_message_for_store(
+                &store,
+                &mut routes,
+                Some(tmp.path()),
+                &msg,
+                At::from_unix_millis(200),
+            );
+            server.join().unwrap();
+            assert_eq!(updated.len(), 1);
+            assert!(
+                out.exists(),
+                "proven idle route must fall back to `codex queue`"
+            );
+            let rcpts = store.list_wire_receipts(&msg.id).unwrap();
+            assert_eq!(
+                rcpts[0].status,
+                DeliveryStatus::Delivered,
+                "idle `codex queue` must mark receipt Delivered, not Acked"
+            );
+
+            // Second push attempt must skip an already Delivered receipt without calling `codex queue` again.
+            fs::remove_file(&out).unwrap();
+            let second = dispatch_message_for_store(
+                &store,
+                &mut routes,
+                Some(tmp.path()),
+                &msg,
+                At::from_unix_millis(300),
+            );
+            assert!(second.is_empty());
+            assert!(!out.exists(), "Delivered receipt must not be re-pushed");
+        }
+
+        // Case 3: Steer refused on busy/non-idle thread (e.g. stale expectedTurnId or notLoaded) ->
+        // does NOT call `codex queue`, receipt stays Pending with attempts == 1, and report records failure stages.
+        for status in ["notLoaded", "active"] {
+            let tmp = TempDir::new().unwrap();
+            let (bin, out) = fake_codex_queue_bin(tmp.path());
+            let (sock, server) = fake_server::spawn(tmp.path(), move |c| {
+                c.handshake();
+                c.expect_json();
+                c.send_text(r#"{"id":1,"result":{}}"#);
+                c.expect_json();
+                c.expect_json();
+                c.send_text(&serde_json::json!({"id":2,"result":{"thread":{
+                    "id":"thread-refused", "sessionId":"s-3", "cliVersion":"0.166.0", "createdAt":1,
+                    "cwd":"/tmp", "ephemeral":false, "modelProvider":"openai", "path":null,
+                    "preview":"", "source":"cli", "status":{"type":status,"activeFlags":[]},
+                    "canAcceptDirectInput":true, "turns":[], "updatedAt":1
+                }}}).to_string());
+                if status == "active" {
+                    c.expect_json();
+                    c.send_text(
+                        &serde_json::json!({"id":3,"result":{"data":[{
+                        "id":"turn-busy", "status":"inProgress", "items":[], "itemsView":"notLoaded"
+                    }],"nextCursor":null,"backwardsCursor":null}})
+                        .to_string(),
+                    );
+                    c.expect_json();
+                    c.send_text(
+                        r#"{"id":4,"error":{"code":-32602,"message":"stale expectedTurnId"}}"#,
+                    );
+                }
+                c.drain_until_eof();
+            });
+            let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+            let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+
+            let store = MemStore::default();
+            let msg = mail_to(&store, "fiona");
+            let mut routes = RouteTable::default();
+            routes.upsert_explicit(
+                "fiona",
+                codex_route("thread-refused"),
+                At::from_unix_millis(100),
+            );
+
+            let mut report = DispatchReport::default();
+            let (updated, attempted) = dispatch_message_for_recipient_with_report(
+                &store,
+                &mut routes,
+                Some(tmp.path()),
+                &msg,
+                At::from_unix_millis(200),
+                "fiona",
+                &mut report,
+            );
+            server.join().unwrap();
+            assert_eq!(attempted, Some(true));
+            assert_eq!(updated.len(), 1);
+            assert!(
+                !out.exists(),
+                "refused steer on {status} route must never fall back to `codex queue`"
+            );
+            assert_eq!(report.failure_stages, vec![FailureStage::TransportError]);
+            let rcpts = store.list_wire_receipts(&msg.id).unwrap();
+            assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
+            assert_eq!(rcpts[0].attempts, 1);
+        }
+
+        // Case 4: End-to-end isolated daemon (`spawn_daemon`) with fake app-server control socket:
+        // refused steer on busy route holds with FenceDiagnostic and stays Pending in DaemonStatus;
+        // hook/read (`LocalRequest::Read { ack: true }`) delivers, marks Acked, clears pending_recipients,
+        // and unfences the recipient so the next message is steered when the turn becomes idle/active.
+        {
+            use crate::daemon::{
+                DEFAULT_LOCAL_RPC_TIMEOUT, DaemonConfig, LocalClient, LocalRequest, LocalResponse,
+                spawn_daemon,
+            };
+            use crate::dispatch_diagnostics::{FenceReason, RouteAdapter};
+
+            let tmp = TempDir::new().unwrap();
+            let (bin, out) = fake_codex_queue_bin(tmp.path());
+            let (sock, server) = fake_server::spawn(tmp.path(), |c| {
+                // 1st connection: busy thread, turn/steer rejected with -32602 -> held
+                c.handshake();
+                c.expect_json();
+                c.send_text(r#"{"id":1,"result":{}}"#);
+                c.expect_json();
+                c.expect_json();
+                c.send_text(&serde_json::json!({"id":2,"result":{"thread":{
+                    "id":"thread-daemon", "sessionId":"s-d", "cliVersion":"0.166.0", "createdAt":1,
+                    "cwd":"/tmp", "ephemeral":false, "modelProvider":"openai", "path":null,
+                    "preview":"", "source":"cli", "status":{"type":"active","activeFlags":[]},
+                    "canAcceptDirectInput":true, "turns":[], "updatedAt":1
+                }}}).to_string());
+                c.expect_json();
+                c.send_text(
+                    &serde_json::json!({"id":3,"result":{"data":[{
+                    "id":"turn-1", "status":"inProgress", "items":[], "itemsView":"notLoaded"
+                }],"nextCursor":null,"backwardsCursor":null}})
+                    .to_string(),
+                );
+                c.expect_json();
+                c.send_text(r#"{"id":4,"error":{"code":-32602,"message":"turn busy"}}"#);
+                c.drain_until_eof();
+            });
+            let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+            let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+
+            let store = std::sync::Arc::new(
+                fl_store::RedbStore::open(&tmp.path().join("daemon.redb")).unwrap(),
+            );
+            let routes_path = tmp.path().join("routes.json");
+            let daemon_sock = tmp.path().join("wire.sock");
+            let mut daemon = spawn_daemon(
+                std::sync::Arc::clone(&store),
+                DaemonConfig {
+                    node_id: "node-test".into(),
+                    host: "host-test".into(),
+                    socket_path: daemon_sock.clone(),
+                    routes_path: Some(routes_path),
+                    home_override: Some(tmp.path().to_path_buf()),
+                    listen_addr: None,
+                    peers: vec![],
+                    psk: vec![],
+                },
+            )
+            .unwrap();
+
+            let mut client = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+            client
+                .request(&LocalRequest::RegisterRoute {
+                    persona: "fiona".into(),
+                    route: codex_route("thread-daemon"),
+                    explicit: true,
+                })
+                .unwrap();
+
+            let mut client = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+            let LocalResponse::Sent { message: msg1, .. } = client
+                .request(&LocalRequest::Send {
+                    args: SendWireArgs {
+                        id: None,
+                        sender_id: None,
+                        sender_name: "ferris".into(),
+                        sender_host: None,
+                        to: WireAddress::AgentName("fiona".into()),
+                        kind: MessageKind::Mail,
+                        urgency: MessageUrgency::Normal,
+                        durable: true,
+                        subject: "busy hold".into(),
+                        body: "check".into(),
+                        reply_to: None,
+                        thread_id: None,
+                        deadline_at: None,
+                        at: At::from_unix_millis(500),
+                    },
+                })
+                .unwrap()
+            else {
+                panic!("expected Sent");
+            };
+            server.join().unwrap();
+
+            // Wait briefly for the worker thread to finish recording the hold diagnostic.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                let mut c = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+                let LocalResponse::Status(st) = c.request(&LocalRequest::Status).unwrap() else {
+                    panic!("expected Status");
+                };
+                if st
+                    .dispatch_diagnostics
+                    .as_ref()
+                    .is_some_and(|d| !d.records.is_empty())
+                {
+                    break st;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for hold diagnostic"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+
+            assert!(!out.exists(), "refused steer must not invoke `codex queue`");
+            let diag = &status.dispatch_diagnostics.as_ref().unwrap().records[0];
+            assert_eq!(diag.recipient.as_deref(), Some("fiona"));
+            assert_eq!(diag.first_reason, FenceReason::TransportError);
+            assert_eq!(diag.decisive_reason, FenceReason::UnresolvedReceiptStatus);
+            assert_eq!(diag.route_observations[0].adapter, RouteAdapter::Codex);
+            assert_eq!(status.pending_recipients.len(), 1);
+            assert_eq!(status.pending_recipients[0].recipient, "fiona");
+            assert_eq!(status.pending_recipients[0].pending_count, 1);
+
+            let rcpts = store.list_wire_receipts(&msg1.id).unwrap();
+            assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
+
+            // Hook / `fl wire read --ack` reads and acknowledges the held message, clearing pending_recipients.
+            let mut c = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+            let LocalResponse::Inbox { items } = c
+                .request(&LocalRequest::Read {
+                    filter: WireFilter {
+                        recipient: Some("fiona".into()),
+                        unread_only: true,
+                        ..Default::default()
+                    },
+                    ack: true,
+                })
+                .unwrap()
+            else {
+                panic!("expected Inbox");
+            };
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].message.id, msg1.id);
+            assert_eq!(items[0].receipt.status, DeliveryStatus::Acked);
+
+            let mut c = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+            let LocalResponse::Status(st_after) = c.request(&LocalRequest::Status).unwrap() else {
+                panic!("expected Status");
+            };
+            assert!(
+                st_after.pending_recipients.is_empty(),
+                "Acked receipt must be removed from pending_recipients"
+            );
+
+            daemon.stop();
+        }
     }
 }

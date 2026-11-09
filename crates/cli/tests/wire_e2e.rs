@@ -1009,3 +1009,71 @@ fn wire_status_diagnostics_omission_and_saturation_remain_visible() {
         assert!(output.contains(field), "missing {field}: {output}");
     }
 }
+
+#[test]
+fn wire_status_reports_pending_recipients_and_codex_queues_depth_and_age() {
+    let env = TestEnv::new();
+    let listener = std::os::unix::net::UnixListener::bind(&env.sock_file).unwrap();
+    let response = json!({
+        "status": "status",
+        "node_id": "fixture-node",
+        "host": "fixture-host",
+        "socket_path": env.sock_file,
+        "listen_addr": null,
+        "connected_peers": [],
+        "routes": [],
+        "dispatch_diagnostics": diagnostic_fixture(false),
+        "pending_recipients": [{
+            "recipient": "fiona",
+            "pending_count": 2,
+            "oldest_pending_at": "2026-11-09T00:00:00.000Z",
+            "oldest_pending_age_ms": 45000
+        }],
+        "codex_queues": [{
+            "recipient": "fiona",
+            "thread_id": "thread-402",
+            "queued_count": 3,
+            "oldest_queued_at": "2026-11-09T00:00:00.000Z",
+            "oldest_queued_age_ms": 120000
+        }]
+    });
+    let resp_json = response.clone();
+    let peer = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            writeln!(stream, "{resp_json}").unwrap();
+        }
+    });
+
+    let mut json_cmd = env.fl();
+    json_cmd.args(["wire", "status", "--json"]);
+    let st = run_json(json_cmd);
+    assert_eq!(st["pending_recipients"][0]["recipient"], "fiona");
+    assert_eq!(st["pending_recipients"][0]["pending_count"], 2);
+    assert_eq!(st["pending_recipients"][0]["oldest_pending_age_ms"], 45000);
+    assert_eq!(st["codex_queues"][0]["recipient"], "fiona");
+    assert_eq!(st["codex_queues"][0]["thread_id"], "thread-402");
+    assert_eq!(st["codex_queues"][0]["queued_count"], 3);
+    assert_eq!(st["codex_queues"][0]["oldest_queued_age_ms"], 120000);
+
+    let text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    peer.join().unwrap();
+    std::fs::remove_file(&env.sock_file).unwrap();
+    assert!(text_out.status.success());
+    let text = String::from_utf8(text_out.stdout).unwrap();
+    assert!(
+        text.contains("pending_recipients=fiona:2(oldest_age=45000ms)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("codex_queues=fiona:3(oldest_age=120000ms)"),
+        "{text}"
+    );
+}
