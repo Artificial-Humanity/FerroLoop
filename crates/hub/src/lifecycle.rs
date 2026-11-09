@@ -4154,7 +4154,7 @@ fn delete_agy_cascade_trajectories(
     tombstone_ids: &mut Vec<String>,
 ) {
     use fl_wire::vendor_adapter::antigravity_session::{
-        AgySessionRequest, native_cascade_id, resolve_agy_session,
+        AgyEndpoint, AgySessionRequest, native_cascade_id, resolve_agy_session,
     };
     let deadline = std::time::Instant::now() + AGY_DELETE_CASCADE_DEADLINE;
     let home_override = env.home_override;
@@ -4199,7 +4199,15 @@ fn delete_agy_cascade_trajectories(
         push_tombstone(&mut cascade_ids, id);
     }
 
-    let (mut ls_addr, mut csrf) = match route_ls_addr {
+    // Generic tombstones also contain persona aliases and other vendors' native ids.
+    // Only normalized Antigravity UUIDs are legal deletion targets, on every path.
+    let mut native_ids = Vec::new();
+    for id in cascade_ids.iter().filter_map(|id| native_cascade_id(id)) {
+        push_tombstone(&mut native_ids, &id);
+    }
+    cascade_ids = native_ids;
+
+    let (ls_addr, csrf) = match route_ls_addr {
         Some(addr) => (Some(addr), route_csrf),
         None if crate::discovery::agy_env_fallback_allowed(home_override) => {
             let env_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS")
@@ -4217,7 +4225,11 @@ fn delete_agy_cascade_trajectories(
         None => (None, None),
     };
 
-    if cascade_ids.is_empty() || ls_addr.is_none() {
+    let mut connection = ls_addr
+        .as_deref()
+        .zip(csrf.as_deref())
+        .and_then(|(addr, token)| AgyEndpoint::new(addr, token).ok());
+    if cascade_ids.is_empty() || connection.is_none() {
         let known_id = record
             .vendor_session_id
             .as_deref()
@@ -4240,19 +4252,15 @@ fn delete_agy_cascade_trajectories(
         );
         match recovered {
             Ok(resolved) => {
-                // Recovered evidence never turns legacy placeholders into deletion targets.
-                cascade_ids.retain(|id| native_cascade_id(id).is_some());
                 if let Some(id) = resolved.cascade_id {
                     push_tombstone(&mut cascade_ids, &id);
                     push_tombstone(tombstone_ids, &id);
                 }
-                if let Some(connection) = resolved.endpoint {
-                    ls_addr = Some(connection.address);
-                    csrf = Some(connection.csrf_token);
+                if let Some(recovered_connection) = resolved.endpoint {
+                    connection = Some(recovered_connection);
                 } else if known_id.is_none() {
                     // A newly recovered identity cannot borrow an unrelated ambient endpoint.
-                    ls_addr = None;
-                    csrf = None;
+                    connection = None;
                 }
             }
             Err(error) => {
@@ -4272,15 +4280,16 @@ fn delete_agy_cascade_trajectories(
         return;
     }
 
-    let Some(addr) = ls_addr else {
+    let Some(connection) = connection else {
         eprintln!(
             "fl-hub: Antigravity DeleteCascadeTrajectory skipped for session `{}` (cascades {:?}): \
-             no language-server address recorded on route or environment; continuing teardown",
+             no verified language-server address and CSRF token pair; continuing teardown",
             record.session_id, cascade_ids
         );
         return;
     };
 
+    let addr = &connection.address;
     for cascade_id in &cascade_ids {
         let Some(remaining) = deadline
             .checked_duration_since(std::time::Instant::now())
@@ -4295,8 +4304,8 @@ fn delete_agy_cascade_trajectories(
         };
         let timeout = remaining.min(AGY_DELETE_CASCADE_TIMEOUT);
         if let Err(reason) = post_agy_delete_cascade_trajectory_with_timeout(
-            &addr,
-            csrf.as_deref(),
+            addr,
+            Some(&connection.csrf_token),
             cascade_id,
             timeout,
         ) {
@@ -9420,7 +9429,7 @@ mod tests {
         routes.upsert(
             "ada",
             VendorRoute::Agy {
-                conversation_id: "conv-ada-cascade-159".into(),
+                conversation_id: "4df33135-e9a4-4f85-adfd-000000000001".into(),
                 ls_pid: None,
                 ls_address: Some(ls_addr),
                 csrf_token: Some("csrf-secret-159".into()),
@@ -9464,7 +9473,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
         assert_eq!(
             parsed.get("cascadeId").and_then(|v| v.as_str()),
-            Some("conv-ada-cascade-159")
+            Some("4df33135-e9a4-4f85-adfd-000000000001")
         );
     }
 
@@ -9484,16 +9493,19 @@ mod tests {
 
         let dead_addr = "127.0.0.1:1".to_string();
 
-        let err =
-            post_agy_delete_cascade_trajectory(&dead_addr, Some("csrf-dead"), "conv-ada-dead-159")
-                .expect_err("unreachable language server must return error for logging");
+        let err = post_agy_delete_cascade_trajectory(
+            &dead_addr,
+            Some("csrf-dead"),
+            "4df33135-e9a4-4f85-adfd-000000000002",
+        )
+        .expect_err("unreachable language server must return error for logging");
         assert!(!err.is_empty());
 
         let mut routes = RouteTable::default();
         routes.upsert(
             "ada",
             VendorRoute::Agy {
-                conversation_id: "conv-ada-dead-159".into(),
+                conversation_id: "4df33135-e9a4-4f85-adfd-000000000002".into(),
                 ls_pid: None,
                 ls_address: Some(dead_addr),
                 csrf_token: Some("csrf-dead".into()),
@@ -9509,7 +9521,7 @@ mod tests {
         assert_eq!(out.status, "decommissioned");
         assert!(RouteTable::load(Some(&rpath)).get("ada").is_none());
         let tombstones = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
-        assert!(tombstones.contains("conv-ada-dead-159"));
+        assert!(tombstones.contains("4df33135-e9a4-4f85-adfd-000000000002"));
     }
 
     #[test]
@@ -9529,7 +9541,7 @@ mod tests {
             let err = post_agy_delete_cascade_trajectory(
                 &bad_addr,
                 Some("csrf-secret-159"),
-                "conv-ada-non-loopback-159",
+                "4df33135-e9a4-4f85-adfd-000000000003",
             )
             .expect_err("non-loopback or scheme-prefixed address must be refused");
             assert!(
@@ -9558,7 +9570,7 @@ mod tests {
         routes.upsert(
             "ada",
             VendorRoute::Agy {
-                conversation_id: "conv-ada-non-loopback-159".into(),
+                conversation_id: "4df33135-e9a4-4f85-adfd-000000000003".into(),
                 ls_pid: None,
                 ls_address: Some(format!("https://127.0.0.1:{port}")),
                 csrf_token: Some("csrf-secret-159".into()),
@@ -9599,9 +9611,9 @@ mod tests {
             .unwrap()
             .unwrap();
         rec.tombstone_ids = vec![
-            "conv-ada-stall-2".into(),
-            "conv-ada-stall-3".into(),
-            "conv-ada-stall-4".into(),
+            "4df33135-e9a4-4f85-adfd-000000000005".into(),
+            "4df33135-e9a4-4f85-adfd-000000000006".into(),
+            "4df33135-e9a4-4f85-adfd-000000000007".into(),
         ];
         persist_hosted_session(&store, &rec, "owner").unwrap();
 
@@ -9627,7 +9639,7 @@ mod tests {
         routes.upsert(
             "ada",
             VendorRoute::Agy {
-                conversation_id: "conv-ada-stall-1".into(),
+                conversation_id: "4df33135-e9a4-4f85-adfd-000000000004".into(),
                 ls_pid: None,
                 ls_address: Some(ls_addr),
                 csrf_token: Some("csrf-stall-159".into()),
@@ -9710,7 +9722,7 @@ mod tests {
             routes.upsert(
                 "ada",
                 VendorRoute::Agy {
-                    conversation_id: "conv-ada-no-addr-159".into(),
+                    conversation_id: "4df33135-e9a4-4f85-adfd-000000000008".into(),
                     ls_pid: None,
                     ls_address: None,
                     csrf_token: None,

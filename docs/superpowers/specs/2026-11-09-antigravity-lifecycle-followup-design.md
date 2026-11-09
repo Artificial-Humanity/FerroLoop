@@ -10,7 +10,9 @@ the Record 186 adapter series and are excluded here.
 
 ## Approach
 
-Extend the existing CLI adapter with a small shared Antigravity session resolver. Retain the
+Extend the existing CLI adapter with a small shared Antigravity session resolver, as inline
+`pub mod antigravity_session` in `crates/wire/src/vendor_adapter.rs`. Keep the existing public
+module API and the non-growing legacy vendor-module file boundary; add no host adapter. Retain the
 existing cached-route cleanup path and two-second total deletion budget. When an ID or endpoint
 is missing, use a verified exact host session and its process tree. A new HostAdapter migration
 would exceed the assignment; broad route discovery or newest-trajectory selection cannot prove

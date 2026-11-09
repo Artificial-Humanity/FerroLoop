@@ -805,6 +805,29 @@ fn hub_remodel_owner_refusal_child() {
 #[cfg(target_os = "linux")]
 #[test]
 fn agy_teardown_recovers_missing_route_identity_and_paired_endpoint() {
+    agy_recovery_case(None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agy_teardown_recovers_bare_persona_route_identity() {
+    agy_recovery_case(Some(("ada", true)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agy_teardown_recovers_address_without_token() {
+    agy_recovery_case(Some(("4df33135-e9a4-4f85-adfd-3b09dc339628", false)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agy_teardown_never_sends_bare_persona_alongside_cached_uuid() {
+    agy_recovery_case(Some(("4df33135-e9a4-4f85-adfd-3b09dc339628", true)));
+}
+
+#[cfg(target_os = "linux")]
+fn agy_recovery_case(route: Option<(&str, bool)>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     let f = Fixture::new();
@@ -817,8 +840,34 @@ fn agy_teardown_recovers_missing_route_identity_and_paired_endpoint() {
     )).unwrap();
     f.spin("antigravity", false);
     assert!(!f.root.path().join(".cache/agent-bus/routes.json").exists());
+    if let Some((route_id, token)) = route {
+        let mut routes = fl_wire::identity::RouteTable::default();
+        routes.upsert(
+            "ada",
+            fl_wire::identity::VendorRoute::Agy {
+                conversation_id: route_id.into(),
+                ls_pid: None,
+                ls_address: Some(addr.to_string()),
+                csrf_token: token.then(|| "fixture-token".into()),
+                agentapi_exe: None,
+            },
+            fl_core::At::from_unix_millis(1),
+        );
+        routes
+            .save(Some(&f.root.path().join(".cache/agent-bus/routes.json")))
+            .unwrap();
+        // Legacy records may contain a bare persona alongside a valid cached UUID.
+        let store = fl_store::open_store(&f.root.path().join("fl.fls")).unwrap();
+        let mut record = fl_hub::lifecycle::list_hosted_sessions(&store)
+            .unwrap()
+            .remove(0);
+        record.vendor_session_id = Some("ada".into());
+        fl_hub::lifecycle::persist_hosted_session(&store, &record, "owner").unwrap();
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(4);
+        let mut requests = Vec::new();
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -827,21 +876,35 @@ fn agy_teardown_recovers_missing_route_identity_and_paired_endpoint() {
                         .unwrap();
                     let mut request = Vec::new();
                     let mut buf = [0; 1024];
-                    while !request.windows(cid.len()).any(|w| w == cid.as_bytes()) {
+                    loop {
                         let n = stream.read(&mut buf).unwrap();
                         assert!(n > 0 && request.len() < 8192);
                         request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let len: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap();
+                            if request.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
                     }
                     stream
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
                         )
                         .unwrap();
-                    return String::from_utf8(request).unwrap();
+                    requests.push(String::from_utf8(request).unwrap());
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return String::new();
+                    if done_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                        return requests;
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -850,18 +913,24 @@ fn agy_teardown_recovers_missing_route_identity_and_paired_endpoint() {
         }
     });
     let out = f.teardown("antigravity");
+    done_tx.send(()).unwrap();
+    let requests = server.join().unwrap();
     assert_eq!(out["runtime_stopped"], true);
-    let request = server.join().unwrap();
-    assert!(
-        request.contains("/DeleteCascadeTrajectory"),
-        "missing-route teardown skipped deletion"
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the verified native cascade may be deleted: {requests:?}"
     );
+    let request = &requests[0];
+    assert!(request.contains("/DeleteCascadeTrajectory"));
     assert!(
         request
             .to_ascii_lowercase()
             .contains("x-codeium-csrf-token: fixture-token")
     );
-    assert!(request.contains(cid));
+    let body: serde_json::Value =
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["cascadeId"], cid);
     let entries = f.json(&["state", "list", "--concern", "runtime", "--json"], true);
     let record = &entries
         .as_array()

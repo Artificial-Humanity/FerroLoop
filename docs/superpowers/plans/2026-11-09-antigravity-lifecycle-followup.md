@@ -35,8 +35,10 @@ resolution between teardown and an optional CLI-adapter finalization hook; persi
 
 ### Task 1: Resolve missing cleanup identity and endpoint
 
-**Files:** Create `crates/wire/src/vendor_adapter/antigravity_session.rs`; modify
-`crates/wire/src/vendor_adapter.rs` and the cleanup slice of `crates/hub/src/lifecycle.rs`.
+**Files:** Add inline `pub mod antigravity_session` within the existing
+`crates/wire/src/vendor_adapter.rs` and modify the cleanup slice of
+`crates/hub/src/lifecycle.rs`. The public resolver API is unchanged; the inline location
+respects the non-growing legacy vendor-module file boundary.
 Unit tests stay with the module; real host/CLI integration tests belong in `crates/cli/tests/`.
 
 **Interface:** Export a small resolver request containing exact hosted ID, host target,
