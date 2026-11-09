@@ -7255,9 +7255,50 @@ fn build_reforge_prompt_with_hydrate(
     persona: &str,
     hydrate: impl FnOnce() -> Option<String>,
 ) -> Result<String, LifecycleError> {
-    let store = state
-        .open_store()
-        .map_err(|e| LifecycleError::Store(e.to_string()))?;
+    let snapshot = {
+        let store = state
+            .open_store()
+            .map_err(|e| LifecycleError::Store(e.to_string()))?;
+        let authority = read_reforge_authority(&*store, persona)?;
+        // Recast and catalog roles require current local guidance. Other roles need
+        // only authority checks before trying the external helper.
+        authority
+            .filter(|authority| authority.current_guidance_required)
+            .map(|authority| snapshot_reforge_prompt(&*store, authority))
+    };
+    if let Some(snapshot) = snapshot {
+        return Ok(contextual_reforge_prompt(state, snapshot));
+    }
+    if let Some(prompt) = hydrate()
+        && !prompt.trim().is_empty()
+    {
+        return Ok(prompt);
+    }
+    let snapshot = {
+        let store = state
+            .open_store()
+            .map_err(|e| LifecycleError::Store(e.to_string()))?;
+        // The helper may have changed registration or guidance. Validate authority
+        // and capture optional context from this same fresh, locked store view.
+        let authority = read_reforge_authority(&*store, persona)?.ok_or_else(|| {
+            LifecycleError::NotFound(format!("no agent record for reforge of `{persona}`"))
+        })?;
+        snapshot_reforge_prompt(&*store, authority)
+    };
+    // Both the external helper and filesystem rendering run outside the store lock.
+    Ok(contextual_reforge_prompt(state, snapshot))
+}
+
+struct ReforgeAuthority {
+    agent: AgentRecord,
+    guidance: lifecycle::RegisteredRoleGuidance,
+    current_guidance_required: bool,
+}
+
+fn read_reforge_authority<S: fl_core::store::AgentRegistry + fl_core::store::StateStore>(
+    store: &S,
+    persona: &str,
+) -> Result<Option<ReforgeAuthority>, LifecycleError> {
     let mut agents: Vec<AgentRecord> = store
         .list_agents(None, true)?
         .into_iter()
@@ -7267,52 +7308,62 @@ fn build_reforge_prompt_with_hydrate(
         })
         .collect();
     agents.sort_by_key(|agent| agent.status != AgentStatus::Active);
-    let agent = agents.into_iter().next();
-    let snapshot = agent
-        .map(|agent| {
-            let persona = agent.name_key.clone();
-            snapshot_reforge_prompt(&*store, agent, || {
-                lifecycle::find_hosted_session(&*store, &[&persona])
-            })
-        })
-        .transpose()?;
-    // Both the external helper and local filesystem renderer run without the store
-    // serialization lock. Authority and metadata use the single snapshot above.
-    drop(store);
-    if !snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.current_guidance_required)
-        && let Some(prompt) = hydrate()
-        && !prompt.trim().is_empty()
-    {
-        return Ok(prompt);
-    }
-    let snapshot = snapshot.ok_or_else(|| {
-        LifecycleError::NotFound(format!("no agent record for reforge of `{persona}`"))
-    })?;
-    Ok(contextual_reforge_prompt(state, snapshot))
+    agents
+        .into_iter()
+        .next()
+        .map(|agent| prepare_reforge_authority(store, agent))
+        .transpose()
 }
 
-struct ReforgePromptSnapshot {
-    agent: AgentRecord,
-    guidance: lifecycle::RegisteredRoleGuidance,
-    projects: crate::hydration::ProjectRoots,
-    hosted: Option<lifecycle::HostedSessionRecord>,
-    current_guidance_required: bool,
-    warnings: Vec<String>,
-}
-
-fn snapshot_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catalog>(
+fn prepare_reforge_authority<S: fl_core::store::StateStore>(
     store: &S,
     agent: AgentRecord,
-    hosted: impl FnOnce() -> Result<Option<lifecycle::HostedSessionRecord>, LifecycleError>,
-) -> Result<ReforgePromptSnapshot, LifecycleError> {
+) -> Result<ReforgeAuthority, LifecycleError> {
     let recast_required = lifecycle::recast_guidance_required(store, &agent)?;
     let catalog_custom = match &agent.role {
         AgentRole::Custom(slug) => lifecycle::has_catalog_guidance(store, slug)?,
         _ => false,
     };
     let guidance = lifecycle::prepare_registered_role_guidance(store, &agent.role)?;
+    Ok(ReforgeAuthority {
+        agent,
+        guidance,
+        current_guidance_required: recast_required || catalog_custom,
+    })
+}
+
+struct ReforgePromptSnapshot {
+    authority: ReforgeAuthority,
+    projects: crate::hydration::ProjectRoots,
+    hosted: Option<lifecycle::HostedSessionRecord>,
+    warnings: Vec<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REFORGE_CONTEXT_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn snapshot_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catalog>(
+    store: &S,
+    authority: ReforgeAuthority,
+) -> ReforgePromptSnapshot {
+    let persona = authority.agent.name_key.clone();
+    snapshot_reforge_context(store, authority, || {
+        lifecycle::find_hosted_session(store, &[&persona])
+    })
+}
+
+fn snapshot_reforge_context<S: fl_core::store::Catalog>(
+    store: &S,
+    authority: ReforgeAuthority,
+    hosted: impl FnOnce() -> Result<Option<lifecycle::HostedSessionRecord>, LifecycleError>,
+) -> ReforgePromptSnapshot {
+    #[cfg(test)]
+    if let Some(hook) = REFORGE_CONTEXT_READ_HOOK.with_borrow_mut(Option::take) {
+        hook();
+    }
     let (hosted, warnings) = match hosted() {
         Ok(record) => (record, Vec::new()),
         Err(_) => (
@@ -7320,24 +7371,22 @@ fn snapshot_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catal
             vec!["hosted-session context unavailable; continuing with registered guidance".into()],
         ),
     };
-    Ok(ReforgePromptSnapshot {
-        agent,
-        guidance,
+    ReforgePromptSnapshot {
+        authority,
         projects: crate::hydration::project_roots(store),
         hosted,
-        current_guidance_required: recast_required || catalog_custom,
         warnings,
-    })
+    }
 }
 
 fn contextual_reforge_prompt(state: &HubState, snapshot: ReforgePromptSnapshot) -> String {
     let ReforgePromptSnapshot {
-        agent,
-        guidance,
+        authority: ReforgeAuthority {
+            agent, guidance, ..
+        },
         projects,
         hosted,
         warnings,
-        ..
     } = snapshot;
     let env = lifecycle_env(state);
     let workspace = env.workspace_root.and_then(fl_core::find_workspace_root);
@@ -9824,10 +9873,10 @@ mod council_guidance_tests {
                 by: "owner".into(),
             })
             .unwrap();
-        let snapshot = snapshot_reforge_prompt(&store, agent.clone(), || {
+        let authority = prepare_reforge_authority(&store, agent.clone()).unwrap();
+        let snapshot = snapshot_reforge_context(&store, authority, || {
             Err(LifecycleError::Store("PRIVATE backend details".into()))
-        })
-        .unwrap();
+        });
         assert!(snapshot.hosted.is_none());
         assert_eq!(snapshot.warnings.len(), 1);
         assert!(snapshot.warnings[0].contains("hosted-session context unavailable"));
@@ -9849,10 +9898,7 @@ mod council_guidance_tests {
         assert!(!logs.iter().any(|line| line.contains("PRIVATE")));
         let mut invalid = agent.clone();
         invalid.role = AgentRole::Custom("../invalid".into());
-        assert!(
-            snapshot_reforge_prompt(&store, invalid, || panic!("authority must fail first"))
-                .is_err()
-        );
+        assert!(prepare_reforge_authority(&store, invalid).is_err());
         let mut catalog = agent;
         catalog.role = AgentRole::Custom("council-chair".into());
         store
@@ -9868,12 +9914,165 @@ mod council_guidance_tests {
                 by: "owner".into(),
             })
             .unwrap();
-        assert!(
-            snapshot_reforge_prompt(&store, catalog, || panic!(
-                "catalog failure must remain hard"
-            ))
-            .is_err()
+        assert!(prepare_reforge_authority(&store, catalog).is_err());
+    }
+
+    fn register_reforge_agent(state: &HubState, project: &str, role: AgentRole) {
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: None,
+                project: project.into(),
+                role,
+                extra_areas: vec![],
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn hydration_reforge_success_skips_optional_context_reads() {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        register_reforge_agent(&state, "ferroloop", AgentRole::Assistant);
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = reads.clone();
+        REFORGE_CONTEXT_READ_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || observed.set(observed.get() + 1)));
+        });
+        let result = build_reforge_prompt_with_hydrate(&state, "ada", || {
+            assert!(state.store_lock.try_lock().is_ok());
+            Some("CURRENT EXTERNAL PROMPT".into())
+        });
+        REFORGE_CONTEXT_READ_HOOK.with_borrow_mut(|hook| *hook = None);
+        assert_eq!(result.unwrap(), "CURRENT EXTERNAL PROMPT");
+        assert_eq!(
+            reads.get(),
+            0,
+            "successful hydrate must skip optional context reads"
         );
+    }
+
+    #[test]
+    fn hydration_reforge_failed_or_blank_helper_refreshes_entire_snapshot() {
+        use fl_core::store::Catalog;
+        for helper_result in [None, Some(" \n\t".to_string())] {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().join("unrelated-hub"),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            register_reforge_agent(&state, "old-project", AgentRole::Assistant);
+            let fresh_root = tmp.path().join("new-project");
+            std::fs::create_dir(&fresh_root).unwrap();
+            std::fs::write(fresh_root.join("AGENTS.md"), "fresh project guidance").unwrap();
+            let foreign_cwd = tmp.path().join("foreign");
+            std::fs::create_dir(&foreign_cwd).unwrap();
+            crate::hydration::WARNING_LOG.with_borrow_mut(Vec::clear);
+            let prompt = build_reforge_prompt_with_hydrate(&state, "ada", || {
+                register_reforge_agent(
+                    &state,
+                    "new-project",
+                    AgentRole::Custom("council-chair".into()),
+                );
+                let store = state.open_store().unwrap();
+                let mut role = fl_core::agent::get_role(&*store, "council-chair")
+                    .unwrap()
+                    .unwrap();
+                role.prompt_template = "FRESH CATALOG ADVICE".into();
+                fl_core::agent::upsert_role(&*store, role).unwrap();
+                store.add_project(fresh_root.to_str().unwrap()).unwrap();
+                let hosted = serde_json::from_value(json!({
+                    "session_id": "codex:ada", "persona": "ada", "project": "new-project",
+                    "role": "council-chair", "vendor": "codex", "node_id": "test",
+                    "hosted": true, "status": "running", "restart_policy": "never",
+                    "restart_count": 0, "cwd": foreign_cwd, "hydration_dispatched": false,
+                    "created_at_ms": 1, "updated_at_ms": 1
+                }))
+                .unwrap();
+                lifecycle::persist_hosted_session(&*store, &hosted, "owner").unwrap();
+                helper_result
+            })
+            .unwrap();
+            assert!(prompt.contains("FRESH CATALOG ADVICE"), "{prompt}");
+            assert!(
+                prompt.contains("--project new-project --role custom:council-chair"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains(fresh_root.join("AGENTS.md").to_str().unwrap()),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("old-project"), "{prompt}");
+            let logs = crate::hydration::WARNING_LOG.with_borrow(Clone::clone);
+            assert!(
+                logs.iter().any(|line| line.contains("session=codex:ada")
+                    && line.contains("cwd is outside project")),
+                "{logs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hydration_reforge_failed_or_blank_helper_revalidates_current_authority() {
+        for helper_result in [None, Some("  ".to_string())] {
+            for corruption in ["deleted", "corrupt"] {
+                let tmp = TempDir::new().unwrap();
+                let state = HubState::new(HubServerConfig {
+                    store_path: tmp.path().join("store.redb"),
+                    repo_root: tmp.path().into(),
+                    home_override: Some(tmp.path().into()),
+                    ..HubServerConfig::default()
+                });
+                register_reforge_agent(&state, "ferroloop", AgentRole::Assistant);
+                let result = build_reforge_prompt_with_hydrate(&state, "ada", || {
+                    register_reforge_agent(
+                        &state,
+                        "ferroloop",
+                        AgentRole::Custom("council-chair".into()),
+                    );
+                    let store = state.open_store().unwrap();
+                    if corruption == "deleted" {
+                        fl_core::agent::delete_role(&*store, "council-chair").unwrap();
+                    } else {
+                        store
+                            .upsert_state(UpsertStateArgs {
+                                scope: StateScope::Workspace,
+                                slug: "role-council-chair".into(),
+                                sensitivity: SensitivityPatch::Inherit,
+                                payload: StatePayload::Runtime(RuntimeEntry {
+                                    value: json!({"invalid": "guidance"}),
+                                    merge_mode: fl_core::state::MergeMode::LastWriter,
+                                }),
+                                at: stamp::now(),
+                                by: "owner".into(),
+                            })
+                            .unwrap();
+                    }
+                    helper_result.clone()
+                });
+                let error = result.unwrap_err();
+                assert_eq!(error.status(), 400, "{corruption}: {error}");
+                assert!(error.to_string().contains("missing or deleted"));
+                let error = build_reforge_prompt_with_hydrate(&state, "ada", || {
+                    panic!("invalid authority must fail before the external helper")
+                })
+                .unwrap_err();
+                assert_eq!(error.status(), 400, "{corruption}: {error}");
+            }
+        }
     }
 
     #[test]
