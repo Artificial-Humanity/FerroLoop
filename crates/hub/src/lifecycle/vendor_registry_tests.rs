@@ -965,7 +965,7 @@ fn thinking_level_is_rejected_for_hostile_values_on_every_vendor() {
         "",
         "'x'",
     ] {
-        for vendor in ["claude", "codex", "antigravity"] {
+        for vendor in ["claude", "codex", "antigravity", "muse"] {
             let r = SpinUpRequest {
                 model: Some("opus".into()),
                 thinking_level: Some(bad.into()),
@@ -982,6 +982,32 @@ fn thinking_level_is_rejected_for_hostile_values_on_every_vendor() {
             }
         }
     }
+}
+
+#[test]
+fn muse_accepts_its_eight_reasoning_effort_tiers_and_refuses_unknown_levels() {
+    for level in [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "HIGH", " Ultra ",
+    ] {
+        let r = SpinUpRequest {
+            thinking_level: Some(level.into()),
+            ..req("ada", "muse")
+        };
+        assert_eq!(
+            r.validate().unwrap().thinking_level.as_deref(),
+            Some(level.trim()),
+            "{level}"
+        );
+    }
+    let bad = SpinUpRequest {
+        thinking_level: Some("extreme".into()),
+        ..req("ada", "muse")
+    };
+    let err = bad.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("none, minimal, low, medium, high, xhigh, max, ultra"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -1023,7 +1049,7 @@ fn antigravity_accepts_only_low_medium_high_and_needs_a_model() {
 
 #[test]
 fn vendors_that_ignore_the_level_reject_it() {
-    for vendor in ["grok", "muse", "lemonade", "ollama"] {
+    for vendor in ["grok", "lemonade", "ollama"] {
         let r = SpinUpRequest {
             thinking_level: Some("high".into()),
             ..req("ada", vendor)
@@ -1037,8 +1063,8 @@ fn vendors_that_ignore_the_level_reject_it() {
 }
 
 #[test]
-fn claude_and_codex_accept_a_level_without_a_model() {
-    for vendor in ["claude", "codex"] {
+fn claude_codex_and_muse_accept_a_level_without_a_model() {
+    for vendor in ["claude", "codex", "muse"] {
         let r = SpinUpRequest {
             thinking_level: Some("high".into()),
             ..req("ada", vendor)
