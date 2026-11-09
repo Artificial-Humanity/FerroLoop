@@ -224,6 +224,9 @@ fn caller_of(authority: &HubAuthority) -> Caller {
 /// route, model or conversation id: it reads the account the environment's language server
 /// serves, and only when the host may be probed (no `home_override`).
 fn account_quota(vendor: &str, home: Option<&Path>) -> Option<SessionQuotaUsage> {
+    if vendor == "grok" {
+        return None;
+    }
     quota_for_resolved_route_at(vendor, None, home, &AgyQuotaTarget::default())
 }
 
@@ -755,5 +758,34 @@ mod tests {
         assert!(overlay(&base, &patch(json!({"cooldown": 1}))).is_err());
         assert!(overlay(&base, &patch(json!({"cooldown_ms": -1}))).is_err());
         assert!(overlay(&base, &patch(json!({"primary_trigger_pct": 10}))).is_err());
+    }
+
+    #[test]
+    fn grok_without_transcript_does_not_feed_balance_account_quota_or_watch_quotas() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let logs = home.join(".grok").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let line = json!({
+            "time": "2026-11-08T18:00:00.000Z",
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok",
+                "config": {
+                    "creditUsagePercent": 24.0,
+                    "billingPeriodEnd": "2099-12-01T00:00:00Z"
+                }
+            }
+        });
+        std::fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
+
+        // Balance planner's account probe keeps Grok without a transcript unknown.
+        assert!(account_quota("grok", Some(home)).is_none());
+
+        // Roster/session route discovery still populates Grok quota without a transcript path.
+        let direct = crate::discovery::quota_for_resolved_route("grok", None, Some(home), "grok-1")
+            .expect("roster/session route discovery still reads unified.jsonl");
+        assert_eq!(direct.tier.as_deref(), Some("SuperGrok"));
+        assert_eq!(direct.secondary_window.unwrap().used_percent, 24.0);
     }
 }
