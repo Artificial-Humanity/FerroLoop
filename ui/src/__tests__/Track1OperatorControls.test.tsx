@@ -347,6 +347,84 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         );
       });
     });
+
+    it("does not fabricate high thinking level when unknown: omits thinking_level on Claude model-only change and blocks Antigravity model-only change until a level is chosen (#351)", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        session_id: "sess-ada-01",
+        vendor: "claude",
+        model: "claude-sonnet-5-5",
+        switched: true,
+        method: "operator-prompt",
+      });
+
+      const { rerender } = render(
+        <ChatPane
+          agentName="ada"
+          agentDisplayName="Ada"
+          adapter="claude"
+          model="claude-opus-5-5"
+          thinkingLevel={null}
+          sessionId="sess-ada-01"
+          turns={[]}
+          agentSettingsOpen={true}
+          onSetSessionModel={onSetSessionModel}
+        />,
+      );
+
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "claude · claude-opus-5-5 (unknown)",
+      );
+      const modelSelect = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      const thinkingSelect = screen.getByTestId("session-thinking-select") as HTMLSelectElement;
+      expect(thinkingSelect.value).toBe("");
+      expect(modelSelect).not.toBeDisabled();
+      expect(screen.queryByTestId("agy-thinking-required-hint")).toBeNull();
+
+      // Claude model-only change with unknown effort sends `undefined` for thinking_level (no guessed "high").
+      fireEvent.change(modelSelect, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => {
+        expect(onSetSessionModel).toHaveBeenCalledWith("claude-sonnet-5-5", undefined);
+        expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
+          "Model: claude-sonnet-5-5",
+        );
+      });
+
+      onSetSessionModel.mockClear();
+
+      // Antigravity session with unknown thinking_level: model apply is blocked until a thinking level is chosen.
+      rerender(
+        <ChatPane
+          agentName="felix"
+          agentDisplayName="Felix"
+          adapter="antigravity"
+          model="gemini-4-argon"
+          thinkingLevel={null}
+          sessionId="sess-felix-01"
+          turns={[]}
+          agentSettingsOpen={true}
+          onSetSessionModel={onSetSessionModel}
+        />,
+      );
+
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "antigravity · gemini-4-argon (unknown)",
+      );
+      expect(thinkingSelect.value).toBe("");
+      expect(modelSelect).toBeDisabled();
+      expect(screen.getByTestId("agy-thinking-required-hint")).toHaveTextContent(
+        /choose a thinking level/i,
+      );
+
+      // Even if a change event is dispatched on the model select before picking a level, no API call is made.
+      fireEvent.change(modelSelect, { target: { value: "gemini-3.8-flash" } });
+      expect(onSetSessionModel).not.toHaveBeenCalled();
+
+      // Once the operator picks an explicit thinking level, the change is sent with that level.
+      fireEvent.change(thinkingSelect, { target: { value: "low" } });
+      await waitFor(() => {
+        expect(onSetSessionModel).toHaveBeenCalledWith("gemini-3.8-flash", "low");
+      });
+    });
   });
 
   describe("Records 4 & 44 — Unified Settings Modal with Isolated Bulk Session Operations", () => {

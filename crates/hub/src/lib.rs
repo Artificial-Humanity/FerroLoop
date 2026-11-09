@@ -7242,7 +7242,7 @@ mod tests {
                 "POST",
                 &format!("/api/v1/sessions/{target}/model"),
                 OWNER,
-                &json!({ "model": "gemini-4-argon" }),
+                &json!({ "model": "gemini-4-argon", "thinking_level": "high" }),
             );
             assert_eq!(resp.status, 200, "{target}: {}", error_text(&resp));
             let body = resp.json_value().unwrap();
@@ -7355,6 +7355,61 @@ mod tests {
         assert_eq!(body["vendor"], "claude");
         assert!(body.get("cli_model").is_none(), "{body}");
         assert_eq!(hosted_model(&state, "claude:ada"), "claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn model_endpoint_refuses_bare_multi_effort_antigravity_model_without_thinking_level_and_accepts_suffixed_id()
+     {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let hosted_model = |state: &HubState, session_id: &str| {
+            let list = call(state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+            list.json_value().unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session_id"] == session_id)
+                .unwrap_or_else(|| panic!("no hosted session {session_id}"))["model"]
+                .clone()
+        };
+
+        let mut agy_body = spin_up_body("grace");
+        agy_body["vendor"] = json!("antigravity");
+        assert_eq!(spin_up(&state, &agy_body).status, 200);
+
+        // Bare multi-effort model (`gemini-4-argon`) without `thinking_level`: refused with 400.
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/antigravity:grace/model",
+            OWNER,
+            &json!({ "model": "gemini-4-argon" }),
+        );
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            error_text(&resp),
+            "choose a thinking level for this Antigravity model"
+        );
+        assert!(state.session_model_override("grace").is_none());
+        assert!(state.session_model_override("antigravity:grace").is_none());
+        assert!(hosted_model(&state, "antigravity:grace").is_null());
+
+        // Effort-suffixed model id (`claude-sonnet-5-5-low`) without `thinking_level`: accepted.
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/antigravity:grace/model",
+            OWNER,
+            &json!({ "model": "claude-sonnet-5-5-low" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["vendor"], "antigravity");
+        assert_eq!(body["cli_model"], "claude-sonnet-5-5-low");
+        assert_eq!(
+            hosted_model(&state, "antigravity:grace"),
+            "claude-sonnet-5-5-low"
+        );
     }
 
     #[test]

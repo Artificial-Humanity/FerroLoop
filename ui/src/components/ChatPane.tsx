@@ -660,6 +660,21 @@ export function isAntigravityAdapter(adapter?: string | null): boolean {
   );
 }
 
+/**
+ * True when an Antigravity model id requires an explicit thinking level (`low`, `medium`, `high`)
+ * rather than already carrying an effort suffix or having one fixed effort (`gpt-oss-120b`).
+ */
+export function agyModelRequiresThinkingLevel(modelId?: string | null): boolean {
+  const lower = (modelId ?? "").trim().toLowerCase();
+  if (!lower) return true;
+  for (const suffix of ["-low", "-medium", "-high"]) {
+    if (lower.endsWith(suffix) && lower.length > suffix.length) {
+      return false;
+    }
+  }
+  return lower !== "gpt-oss-120b";
+}
+
 /** Lower-cased, trimmed adapter name with the antigravity aliases folded into "antigravity". */
 export function canonicalAdapter(adapter?: string | null): string {
   return isAntigravityAdapter(adapter) ? "antigravity" : (adapter ?? "").trim().toLowerCase();
@@ -1551,7 +1566,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       "",
   );
   const [selectedThinkingLevel, setSelectedThinkingLevel] = React.useState<string>(
-    () => (thinkingLevel && thinkingLevel.trim().toLowerCase()) || "high",
+    () => (thinkingLevel && thinkingLevel.trim().toLowerCase()) || "",
   );
 
   React.useEffect(() => {
@@ -1566,11 +1581,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   React.useEffect(() => {
     const trimmedThinking = (thinkingLevel ?? "").trim().toLowerCase();
-    if (trimmedThinking) {
-      setSelectedThinkingLevel(trimmedThinking);
-    } else {
-      setSelectedThinkingLevel("high");
-    }
+    setSelectedThinkingLevel(trimmedThinking);
   }, [thinkingLevel, targetSessionOrAgent]);
 
   React.useEffect(() => {
@@ -1778,9 +1789,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   ) => {
     const prevModel = selectedModel;
     const prevThinking = selectedThinkingLevel;
-    const effectiveThinking = (nextThinkingLevel ?? selectedThinkingLevel ?? "high")
-      .trim()
-      .toLowerCase();
+    const rawThinking =
+      nextThinkingLevel !== undefined ? nextThinkingLevel : selectedThinkingLevel;
+    const effectiveThinking = (rawThinking ?? "").trim().toLowerCase();
+    const thinkingArg = effectiveThinking || undefined;
+    if (
+      isAntigravityAdapter(resolveSessionVendor(adapter, nextModel)) &&
+      !effectiveThinking &&
+      agyModelRequiresThinkingLevel(nextModel)
+    ) {
+      setSelectedModel(nextModel);
+      setSubmitError("choose a thinking level for this Antigravity model");
+      return;
+    }
     setSelectedModel(nextModel);
     setSelectedThinkingLevel(effectiveThinking);
     if (!targetSessionOrAgent || !nextModel || switchingModel) {
@@ -1791,12 +1812,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setSubmitError(null);
     try {
       if (onSetSessionModel) {
-        await onSetSessionModel(nextModel, effectiveThinking);
+        await onSetSessionModel(nextModel, thinkingArg);
       } else if (apiClient) {
         await apiClient.setSessionModel(
           targetSessionOrAgent,
           nextModel,
-          effectiveThinking,
+          thinkingArg,
         );
         if (onRefresh) {
           onRefresh();
@@ -1804,7 +1825,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else {
         throw new Error("No session route is configured for switching model.");
       }
-      setCompactFeedback(`Model: ${nextModel} (${effectiveThinking})`);
+      setCompactFeedback(
+        effectiveThinking
+          ? `Model: ${nextModel} (${effectiveThinking})`
+          : `Model: ${nextModel}`,
+      );
     } catch (err) {
       setSelectedModel(prevModel);
       setSelectedThinkingLevel(prevThinking);

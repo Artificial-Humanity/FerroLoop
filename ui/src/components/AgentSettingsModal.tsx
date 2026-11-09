@@ -22,6 +22,7 @@ import {
   resolveSessionVendor,
   canonicalAdapter,
   isAntigravityAdapter,
+  agyModelRequiresThinkingLevel,
   type EstimatedContextUsage,
 } from "./ChatPane";
 import {
@@ -524,6 +525,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const [contextWindowSending, setContextWindowSending] = useState(false);
   const [contextWindowNotice, setContextWindowNotice] =
     useState<ContextWindowNotice | null>(null);
+  const [pendingAgyModel, setPendingAgyModel] = useState<string | null>(null);
   const contextWindowSelectRef = useRef<HTMLSelectElement | null>(null);
   const contextWindowRequestRef = useRef(0);
   const contextWindowRefocusRef = useRef(false);
@@ -535,6 +537,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setContextWindowPick(null);
     setContextWindowSending(false);
     setContextWindowNotice(null);
+    setPendingAgyModel(null);
   }, [isOpen, sessionId, agentName]);
   useEffect(() => {
     // The hub reported a different window: follow the server from here on.
@@ -741,10 +744,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     effectiveAvailableModels,
   );
   const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
+  const shownModel = pendingAgyModel || effectiveModel;
   const effectiveThinkingLevel =
     fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
     selectedThinkingLevel;
-  const effectiveThinking = (effectiveThinkingLevel || "high").trim().toLowerCase();
+  const effectiveThinking = (effectiveThinkingLevel ?? "").trim().toLowerCase();
+  const isAgySession = isAntigravityAdapter(knownAdapter || effectiveAdapter);
+  const agyThinkingRequired =
+    isAgySession && !effectiveThinking && agyModelRequiresThinkingLevel(shownModel);
   const contextVendor = canonicalAdapter(knownAdapter);
   const offeredContextWindows = contextEstimate.offeredWindows ?? [];
   const contextWindowEditable =
@@ -864,10 +871,11 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     }
   };
   const thinkingOptions: ReadonlyArray<{ value: string; label: string }> =
-    effectiveThinking &&
-    !THINKING_LEVEL_OPTIONS.some((opt) => opt.value === effectiveThinking)
-      ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
-      : THINKING_LEVEL_OPTIONS;
+    !effectiveThinking
+      ? [{ value: "", label: "unknown (select level)" }, ...THINKING_LEVEL_OPTIONS]
+      : !THINKING_LEVEL_OPTIONS.some((opt) => opt.value === effectiveThinking)
+        ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
+        : THINKING_LEVEL_OPTIONS;
   const effectiveExecutionMode =
     fetchedFor("executionMode", executionMode, fetchedSession?.executionMode) ??
     (executionMode !== undefined ? executionMode : null);
@@ -1218,8 +1226,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   {effectiveAdapter && effectiveAdapter.toLowerCase() !== "unknown"
                     ? `${effectiveAdapter} · `
                     : ""}
-                  {effectiveModel || "default"}
-                  {effectiveThinkingLevel ? ` (${effectiveThinkingLevel})` : ""}
+                  {shownModel || "default"}
+                  {effectiveThinking ? ` (${effectiveThinking})` : " (unknown)"}
                 </span>
               </div>
               {typeof turnCount === "number" && (
@@ -1261,11 +1269,21 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   aria-label="Session Model"
                   data-testid="session-model-select"
                   className="fd-select fd-mono"
-                  disabled={!targetSessionOrAgent || switchingModel}
-                  value={effectiveModel}
+                  disabled={!targetSessionOrAgent || switchingModel || agyThinkingRequired}
+                  value={shownModel}
                   onChange={(e) => {
+                    const nextModel = e.target.value;
                     setOverridden((prev) => (prev.model ? prev : { ...prev, model: true }));
-                    onChangeModelAndThinking(e.target.value, effectiveThinking);
+                    if (
+                      isAgySession &&
+                      !effectiveThinking &&
+                      agyModelRequiresThinkingLevel(nextModel)
+                    ) {
+                      setPendingAgyModel(nextModel);
+                      return;
+                    }
+                    setPendingAgyModel(null);
+                    onChangeModelAndThinking(nextModel, effectiveThinking);
                   }}
                   style={{
                     width: "100%",
@@ -1307,10 +1325,16 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   disabled={!targetSessionOrAgent || switchingModel}
                   value={effectiveThinking}
                   onChange={(e) => {
+                    const nextThinking = e.target.value;
+                    if (!nextThinking) {
+                      return;
+                    }
                     setOverridden((prev) =>
                       prev.thinkingLevel ? prev : { ...prev, thinkingLevel: true },
                     );
-                    onChangeModelAndThinking(effectiveModel, e.target.value);
+                    const modelToApply = pendingAgyModel || effectiveModel;
+                    setPendingAgyModel(null);
+                    onChangeModelAndThinking(modelToApply, nextThinking);
                   }}
                   style={{
                     width: "100%",
@@ -1320,12 +1344,24 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   }}
                 >
                   {thinkingOptions.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
+                    <option key={opt.value} value={opt.value} disabled={opt.value === ""}>
                       {opt.label}
                     </option>
                   ))}
                 </select>
               </div>
+              {agyThinkingRequired && (
+                <div
+                  data-testid="agy-thinking-required-hint"
+                  style={{
+                    gridColumn: "1 / -1",
+                    fontSize: "11.5px",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  Choose a thinking level to switch this Antigravity model.
+                </div>
+              )}
 
               <div
                 data-testid="context-window-row"
