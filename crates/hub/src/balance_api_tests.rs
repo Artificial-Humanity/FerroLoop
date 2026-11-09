@@ -668,6 +668,8 @@ fn no_metered_api_vendor_is_ever_a_target() {
 fn a_switch_its_remodel_would_refuse_is_skipped_and_the_next_agent_moves() {
     use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest};
     let tmp = TempDir::new().unwrap();
+    let _trusted =
+        crate::lifecycle::trusted_codex_home(tmp.path(), &std::env::current_dir().unwrap());
     let state = hub(&tmp);
     quota(&state, "claude", 95.0);
     quota(&state, "codex", 40.0);

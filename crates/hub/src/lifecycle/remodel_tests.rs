@@ -746,6 +746,7 @@ fn restored_of(err: &LifecycleError) -> Option<&str> {
 fn a_new_runtime_that_does_not_start_is_a_failed_spin_up_and_restores_the_old_vendor() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     register(&store, "felicity", AgentRole::Assistant);
@@ -801,6 +802,7 @@ fn a_new_runtime_that_does_not_start_is_a_failed_spin_up_and_restores_the_old_ve
 fn a_restore_that_starts_no_runtime_reports_the_persona_down() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     spin(&store, &env, "felicity", "assistant", "claude");
@@ -825,6 +827,7 @@ fn a_restore_that_starts_no_runtime_reports_the_persona_down() {
 #[test]
 fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() {
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
 
     // Hosted, but its runtime was not started by this lifecycle (the name was taken).
     let store = MemStore::default();
@@ -896,6 +899,7 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
 #[test]
 fn the_precheck_refuses_what_a_remodel_refuses_and_touches_nothing() {
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let precheck = |store: &MemStore, env: &LifecycleEnv<'_>, id: &str, caller: Caller| {
         remodel_precheck(store, env, &target(store, id), &remodel_req("grok"), caller)
     };
@@ -1296,6 +1300,7 @@ fn a_spin_up_that_fails_after_registering_restores_and_decommissions_its_record(
 fn a_teardown_that_fails_after_stopping_the_runtime_restores_it() {
     let store = FaultyStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     spin(&store.inner, &env, "felicity", "assistant", "claude");
@@ -1333,6 +1338,7 @@ fn a_peers_failed_remodel_restores_exactly_the_session_it_tore_down() {
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     let worktree = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), worktree.path());
     register(&store, "felicity", AgentRole::Assistant);
     spin_with(
         &store,
@@ -1464,6 +1470,7 @@ fn a_muse_remodel_stops_and_reopens_only_its_own_window() {
 fn a_failed_remodel_of_a_muse_session_restores_its_window_without_killing_the_session() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::with_muse_windows(&["mira"]);
     let env = fake.env(home.path());
     spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap();
@@ -1847,6 +1854,7 @@ fn recast_metadata_write_failure_leaves_registry_and_previous_binding_unchanged(
 fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_workspace_root() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let ws = TempDir::new().unwrap();
     let proj_dir = ws.path().join("Kaggle-Gemma4");
     std::fs::create_dir_all(&proj_dir).unwrap();
@@ -1907,6 +1915,7 @@ fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_work
     rec.cwd = Some(ws.path().display().to_string());
     persist_hosted_session(&store, &rec, "owner").unwrap();
 
+    let _project_trust = trusted_codex_home(home.path(), &proj_dir);
     let out2 = remodel(
         &store,
         &env_ws,
@@ -1944,6 +1953,7 @@ fn remodel_applies_posture_emits_receipts_and_refuses_unsupported_posture_before
 
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env_rt = fake.env(home.path());
 
