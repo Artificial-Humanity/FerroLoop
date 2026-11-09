@@ -300,11 +300,19 @@ report lexical-only degraded readiness separately from full index readiness.
    logical, domain and query verification with all external effects disabled.
 4. Preserve the pre-restore store as a verified rollback generation when readable;
    retain an unreadable original as forensic material without calling it verified.
-   Publish the verified replacement atomically while users remain fenced, flush
-   it and sync the parent directory. An installation journal records old/new image
-   digests and stages durably. A crash at any stage leaves either a complete old
-   image or a complete new image; resume resolves the journal before admitting
-   users. Never use stale redb files as rollback for current fls data.
+   Flush the preserved generation and sync its directory before replacement.
+   Record and durably flush installation-journal intent, including old/new image
+   digests and paths, and sync the journal directory. Flush the verified staged
+   replacement and sync its staging directory **before** atomically renaming it
+   over the destination while users remain fenced. Then sync the destination
+   parent directory; if the rename crosses directories on the same filesystem,
+   sync both source and destination directories. Durably record completion before
+   admission. A crash after replacement but before directory sync has an uncertain
+   name outcome: recovery compares the journal's digests with the surviving images,
+   verifies the selected complete image, finishes its publication and directory
+   sync, and records the decision before admitting users. The durable rollback
+   generation remains available throughout. Never use stale redb files as rollback
+   for current fls data.
 5. Invalidate old RPC sessions, transactions, caches and retry assumptions. Start
    only the intended owner and verify identity/sequence with compatible clients.
    Reconcile replication cursors, peer histories, outbox/in-flight attempts and
@@ -339,7 +347,7 @@ tests, not results already obtained.
 | Truncate/corrupt image, metadata, receipt, revision or dependency; valid count but wrong payload | Reopen/hash/domain/query verification refuses publication or replacement |
 | Wrong store, incompatible schema/feature, alias/hardlink/symlink escape, malicious destination | Fail before source or active destination mutation; no secret-bearing diagnostic |
 | Verifier accidentally sees live socket or external adapters | Test fails; verifier must use isolated copy and cannot produce external effects |
-| Restore crash before replacement, at rename, before parent sync, during catalog update | Old or new complete image recoverable; journal deterministic; admission remains closed |
+| Restore crash before replacement, immediately after rename but before directory sync, or during catalog update | Staged image, rollback generation and journal intent were flushed before rename; recover deterministically from journal digests and surviving images, finish required directory syncs, and keep admission closed until the complete selected image is durable |
 | Stale client, cached transaction, repeated request or pending external effect after restore | Old session rejected; no automatic resend; explicit unknown/reconciliation outcome |
 | Two-store reference mismatch and restored older receipt horizon | Block unsafe readiness; document reconciliation, no invented global consistent cut |
 | Oversized source/pin, slow disk/verifier, timeout and repeated cancellation | Enforced memory/disk/deadline/concurrency bounds; no runaway retries |
