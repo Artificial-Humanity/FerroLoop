@@ -227,11 +227,22 @@ impl<'a> LifecycleEnv<'a> {
     }
 
     /// Adapter-layer launch options (including `remote_control`, enabled by default unless
-    /// `FL_WIRE_REMOTE_CONTROL=0` or `false`).
+    /// `FL_WIRE_REMOTE_CONTROL=0` or `false`, and default `Posture::Auto`).
     pub fn vendor_launch_options(&self) -> fl_wire::vendor_adapter::VendorLaunchOptions {
+        self.vendor_launch_options_for(fl_core::permissions::Posture::Auto)
+    }
+
+    /// Adapter-layer launch options for a specific permission `posture`.
+    pub fn vendor_launch_options_for(
+        &self,
+        posture: fl_core::permissions::Posture,
+    ) -> fl_wire::vendor_adapter::VendorLaunchOptions {
         let remote_control =
             parse_remote_control_env(std::env::var("FL_WIRE_REMOTE_CONTROL").ok().as_deref());
-        fl_wire::vendor_adapter::VendorLaunchOptions { remote_control }
+        fl_wire::vendor_adapter::VendorLaunchOptions {
+            remote_control,
+            posture,
+        }
     }
 }
 
@@ -539,6 +550,7 @@ fn launch_spec_for(
         persona,
         model,
         thinking_level,
+        fl_core::permissions::Posture::Auto,
         prompt,
         None,
         None,
@@ -552,6 +564,7 @@ fn launch_spec_for_with_session(
     persona: &str,
     model: Option<&str>,
     thinking_level: Option<&str>,
+    posture: fl_core::permissions::Posture,
     prompt: &str,
     cwd: Option<&str>,
     vendor_session_id: Option<&str>,
@@ -560,6 +573,7 @@ fn launch_spec_for_with_session(
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let options = env.vendor_launch_options_for(posture);
     if let Some(host_adapter) = env.host_vendor_adapter(vendor) {
         let mut binding = fl_core::AdapterIdentityBinding::new(
             format!("{vendor}:{persona}"),
@@ -577,25 +591,29 @@ fn launch_spec_for_with_session(
             thinking_effort: thinking_level.map(str::to_string),
             initial_prompt: prompt.to_string(),
             cwd: cwd.map(PathBuf::from),
-            home_dir: home.clone(),
-            remote_control: env.vendor_launch_options().remote_control,
+            home_dir: home,
+            remote_control: options.remote_control,
+            posture,
         };
-        if let Ok(plan) = host_adapter.prepare_launch(&req) {
-            return Some(LaunchSpec {
+        return host_adapter
+            .prepare_launch(&req)
+            .ok()
+            .map(|plan| LaunchSpec {
                 env: plan.env,
                 argv: plan.argv,
             });
-        }
     }
     let adapter = env.vendor_adapter(vendor)?;
-    Some(adapter.build_launch_spec_with_options(
-        persona,
-        model,
-        thinking_level,
-        prompt,
-        home.as_deref(),
-        env.vendor_launch_options(),
-    ))
+    adapter
+        .build_launch_spec_with_options(
+            persona,
+            model,
+            thinking_level,
+            prompt,
+            home.as_deref(),
+            options,
+        )
+        .ok()
 }
 
 #[cfg(test)]
@@ -1316,6 +1334,26 @@ pub struct SpinUpRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_window: Option<u64>,
+    /// Operator-facing permission posture (`ask`, `accept-edits`, `auto`, `plan`, `bypass`).
+    /// Defaults to `auto`.
+    #[serde(default, deserialize_with = "deserialize_posture")]
+    pub posture: fl_core::permissions::Posture,
+}
+
+/// `posture` from JSON: absent or `null` is `auto`; any other value must name one of the five
+/// canonical postures.
+fn deserialize_posture<'de, D>(deserializer: D) -> Result<fl_core::permissions::Posture, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value>>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(fl_core::permissions::Posture::Auto),
+        Some(serde_json::Value::String(s)) => s.parse().map_err(serde::de::Error::custom),
+        Some(_) => Err(serde::de::Error::custom(
+            "posture must be ask, accept-edits, auto, plan or bypass",
+        )),
+    }
 }
 
 /// `context_window` from JSON: absent or `null` is none; anything but a non-negative integer is
@@ -1380,6 +1418,8 @@ struct ValidSpinUp {
     hosted: bool,
     cwd: Option<String>,
     context_window: Option<u64>,
+    posture: fl_core::permissions::Posture,
+    permission_receipts: Vec<fl_wire::vendor_adapter::PermissionReceipt>,
 }
 
 fn trimmed_opt(raw: &Option<String>) -> Option<String> {
@@ -1595,6 +1635,8 @@ impl SpinUpRequest {
         if let Some(cwd) = &cwd {
             check_text("cwd", cwd)?;
         }
+        let perms = fl_wire::vendor_adapter::launch_permissions(&vendor, self.posture)
+            .map_err(|msg| LifecycleError::Invalid(format!("posture: {msg}")))?;
         Ok(ValidSpinUp {
             persona,
             project,
@@ -1606,6 +1648,8 @@ impl SpinUpRequest {
             hosted: self.hosted.unwrap_or(true),
             cwd,
             context_window: self.context_window,
+            posture: self.posture,
+            permission_receipts: perms.receipts,
         })
     }
 }
@@ -1636,6 +1680,12 @@ pub struct SpinUpResponse {
     /// name already runs).
     #[serde(default)]
     pub runtime_spawned: bool,
+    /// Permission posture compiled into the session's launch flags.
+    #[serde(default)]
+    pub posture: fl_core::permissions::Posture,
+    /// Compiler receipts describing how `posture` mapped onto the vendor's native flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_receipts: Vec<fl_wire::vendor_adapter::PermissionReceipt>,
 }
 
 /// Durable record of a hosted session, one `hosted-session-*` workspace runtime entry each.
@@ -1664,6 +1714,10 @@ pub struct HostedSessionRecord {
     /// how a launch applies it is separate. Absent when none was chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// The permission posture chosen for the session; a restart launches with it. Records written
+    /// before the field existed deserialize to `auto`.
+    #[serde(default)]
+    pub posture: fl_core::permissions::Posture,
     pub hydration_dispatched: bool,
     /// Whether this lifecycle created the tmux session. Teardown of a runtime it created
     /// uses [`SessionRuntime::kill`]. An owner teardown of one it did not create still
@@ -3230,6 +3284,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         tmux_target: tmux_target.clone(),
         cwd: v.cwd.clone(),
         context_window: v.context_window,
+        posture: v.posture,
         hydration_dispatched: false,
         tombstone_ids: Vec::new(),
         vendor_session_id,
@@ -3262,6 +3317,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         &v.persona,
         v.model.as_deref(),
         v.thinking_level.as_deref(),
+        v.posture,
         &prompt,
         v.cwd.as_deref(),
         record.vendor_session_id.as_deref(),
@@ -3321,6 +3377,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         hydration_dispatched,
         prompt: Some(prompt),
         context_window: v.context_window,
+        posture: v.posture,
+        permission_receipts: v.permission_receipts,
     })
 }
 
@@ -3502,6 +3560,7 @@ fn record_for_target<S: AgentRegistry>(
         tmux_target: None,
         cwd: None,
         context_window: None,
+        posture: fl_core::permissions::Posture::Auto,
         hydration_dispatched: false,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
@@ -4522,6 +4581,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         &record.project,
         &agent_role_from_label(&record.role),
     )?;
+    fl_wire::vendor_adapter::launch_permissions(&record.vendor, record.posture)
+        .map_err(|why| invalid_field("posture", &why))?;
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = runtime_unit(&want_target).to_string();
@@ -4539,6 +4600,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         &record.persona,
         record.model.as_deref(),
         record.thinking_level.as_deref(),
+        record.posture,
         &prompt,
         record.cwd.as_deref(),
         record.vendor_session_id.as_deref(),
@@ -4661,6 +4723,10 @@ pub struct RemodelRequest {
     pub node_id: Option<String>,
     #[serde(default)]
     pub hosted: Option<bool>,
+    /// Permission posture for the new session (`ask`, `accept-edits`, `auto`, `plan`, `bypass`;
+    /// default `auto`).
+    #[serde(default, deserialize_with = "deserialize_posture")]
+    pub posture: fl_core::permissions::Posture,
 }
 
 /// `POST /api/v1/sessions/:id/remodel` response.
@@ -4697,6 +4763,12 @@ pub struct RemodelResponse {
     pub handoff: Option<String>,
     /// Problems that did not stop the remodel.
     pub warnings: Vec<String>,
+    /// Permission posture compiled into the new session's launch flags.
+    #[serde(default)]
+    pub posture: fl_core::permissions::Posture,
+    /// Compiler receipts describing how `posture` mapped onto the new vendor's native flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_receipts: Vec<fl_wire::vendor_adapter::PermissionReceipt>,
 }
 
 /// Slug of the workspace handoff entry a remodel of `persona` writes.
@@ -4731,6 +4803,7 @@ impl RemodelPlan {
             cwd: self.to.cwd.clone(),
             // A window is chosen for one vendor and model: a remodel starts without one.
             context_window: None,
+            posture: self.to.posture,
         }
     }
 }
@@ -4869,6 +4942,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     let old_cwd = old.and_then(|r| r.cwd.clone());
     let from_model = old.and_then(|r| r.model.clone());
     let from_thinking_level = old.and_then(|r| r.thinking_level.clone());
+    let from_posture = old.map_or(fl_core::permissions::Posture::Auto, |r| r.posture);
     let resolved_cwd = if trimmed_opt(&req.cwd).is_some() {
         req.cwd.clone()
     } else {
@@ -4894,6 +4968,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         hosted: req.hosted.or(old.map(|r| r.hosted)),
         cwd: resolved_cwd,
         context_window: None,
+        posture: req.posture,
     }
     .validate()?;
     validate_catalog_role(store, &to.role)?;
@@ -4911,9 +4986,14 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     check_registration(store, &to, OwnAgent::Retiring)?;
     // The restore puts back what was there: a session with no record was not hosted, and a
     // restore must not turn it into a managed one.
-    let restore = lookup_vendor(&from_vendor)
-        .is_some()
-        .then(|| SpinUpRequest {
+    let restore = if lookup_vendor(&from_vendor).is_some() {
+        fl_wire::vendor_adapter::launch_permissions(&from_vendor, from_posture).map_err(|why| {
+            LifecycleError::Invalid(format!(
+                "cannot build restore plan for `{}` on `{from_vendor}` with recorded posture `{from_posture}`: {why}",
+                target.session_id
+            ))
+        })?;
+        Some(SpinUpRequest {
             persona: target.persona.clone(),
             project,
             role,
@@ -4925,7 +5005,11 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             cwd: old_cwd,
             // A restore must not fail on a window: it puts the session back as it can start.
             context_window: None,
-        });
+            posture: from_posture,
+        })
+    } else {
+        None
+    };
     // With no restore, a failed spin-up leaves the persona down; only the Owner may take that
     // risk (the remodel then warns that no restore is possible).
     if restore.is_none() && caller != Caller::Owner {
@@ -5187,6 +5271,8 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
             prompt: out.prompt,
             handoff: None,
             warnings: Vec::new(),
+            posture: to.posture,
+            permission_receipts: to.permission_receipts.clone(),
         });
     }
 
@@ -5257,6 +5343,8 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
                 prompt: out.prompt,
                 handoff: Some(handoff),
                 warnings,
+                posture: out.posture,
+                permission_receipts: out.permission_receipts,
             });
         }
         Err(error) => error,
@@ -5660,7 +5748,8 @@ mod tests {
             launch_args("claude", Some("claude-sonnet-5-5")),
             strings(&[
                 "--remote-control",
-                "--enable-auto-mode",
+                "--permission-mode",
+                "auto",
                 "--model",
                 "claude-sonnet-5-5",
                 "hello"
@@ -5668,12 +5757,15 @@ mod tests {
         );
         assert_eq!(
             launch_args("claude", None),
-            strings(&["--remote-control", "--enable-auto-mode", "hello"])
+            strings(&["--remote-control", "--permission-mode", "auto", "hello"])
         );
         assert_eq!(
             launch_args("codex", Some("gpt-6-sol")),
             strings(&[
-                "--yolo",
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
                 "--remote",
                 "unix://",
                 "--model",
@@ -5683,11 +5775,19 @@ mod tests {
         );
         assert_eq!(
             launch_args("grok", Some("grok-5")),
-            strings(&["--yolo", "--always-approve", "--model", "grok-5", "hello"])
+            strings(&["--permission-mode", "auto", "--model", "grok-5", "hello"])
         );
         assert_eq!(
             launch_args("muse", Some("muse-2")),
-            strings(&["--model", "muse-2", "hello"])
+            strings(&[
+                "--model",
+                "muse-2",
+                "--approval-mode",
+                "on-request",
+                "--approval-judge",
+                "off",
+                "hello"
+            ])
         );
         assert!(parse_remote_control_env(None));
         for on in ["", "1", "true", " TRUE ", "yes", "on"] {
@@ -8463,6 +8563,7 @@ mod tests {
             vendor: vendor.into(),
             model: None,
             thinking_level: None,
+            posture: fl_core::permissions::Posture::Auto,
             node_id: DEFAULT_NODE_ID.into(),
             hosted: true,
             status: status.into(),

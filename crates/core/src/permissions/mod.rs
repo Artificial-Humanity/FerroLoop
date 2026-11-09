@@ -17,7 +17,7 @@ mod policy;
 #[cfg(test)]
 mod tests;
 
-pub use compile::compile;
+pub use compile::{compile, compile_posture};
 pub use facts::{
     ChangeField, MuseProfileFact, ProfileCeiling, ProvenFact, Surface, Transport, Vendor,
     VendorFacts,

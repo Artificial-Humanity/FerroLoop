@@ -91,6 +91,10 @@ fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
             home.join(".local/bin/muse").to_string_lossy().into_owned(),
             "--model".into(),
             MUSE_DEFAULT_MODEL.into(),
+            "--approval-mode".into(),
+            "on-request".into(),
+            "--approval-judge".into(),
+            "off".into(),
             prompt.to_string(),
         ],
     }
@@ -230,6 +234,10 @@ fn the_launch_argv_puts_the_model_first_and_the_prompt_last() {
                 bin.clone(),
                 "--model".to_string(),
                 want.to_string(),
+                "--approval-mode".to_string(),
+                "on-request".to_string(),
+                "--approval-judge".to_string(),
+                "off".to_string(),
                 out.prompt.unwrap(),
             ],
             "{requested:?}"
@@ -279,8 +287,11 @@ fn a_claude_model_id_keeps_its_window_tag_through_spin_up_and_restart() {
         )
         .unwrap();
         let spun = first.launches.borrow()[0].1.clone().unwrap().argv;
-        assert_eq!(&spun[3..5], ["--model", model], "spin-up {model}");
-        assert_eq!(&spun[1..3], ["--remote-control", "--enable-auto-mode"]);
+        assert_eq!(&spun[4..6], ["--model", model], "spin-up {model}");
+        assert_eq!(
+            &spun[1..4],
+            ["--remote-control", "--permission-mode", "auto"]
+        );
         assert_eq!(out.model.as_deref(), Some(model));
         let record = find_hosted_session(&store, &["claude:ada"])
             .unwrap()
@@ -290,7 +301,7 @@ fn a_claude_model_id_keeps_its_window_tag_through_spin_up_and_restart() {
         let second = FakeRuntime::default();
         restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner").unwrap();
         let restarted = second.launches.borrow()[0].1.clone().unwrap().argv;
-        assert_eq!(&restarted[3..5], ["--model", model], "restart {model}");
+        assert_eq!(&restarted[4..6], ["--model", model], "restart {model}");
     }
 }
 
@@ -556,19 +567,26 @@ fn built_in_vendors_launch_with_their_prompt() {
             "claude",
             "claude",
             "FL_WIRE_CLAUDE_BIN",
-            vec!["--remote-control", "--enable-auto-mode"],
+            vec!["--remote-control", "--permission-mode", "auto"],
         ),
         (
             "codex",
             "codex",
             "FL_WIRE_CODEX_BIN",
-            vec!["--yolo", "--remote", "unix://"],
+            vec![
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
+                "--remote",
+                "unix://",
+            ],
         ),
         (
             "grok",
             "grok",
             "FL_WIRE_GROK_BIN",
-            vec!["--yolo", "--always-approve"],
+            vec!["--permission-mode", "auto"],
         ),
         (
             "antigravity",
@@ -630,19 +648,26 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             "claude",
             "claude",
             "FL_WIRE_CLAUDE_BIN",
-            vec!["--remote-control", "--enable-auto-mode"],
+            vec!["--remote-control", "--permission-mode", "auto"],
         ),
         (
             "codex",
             "codex",
             "FL_WIRE_CODEX_BIN",
-            vec!["--yolo", "--remote", "unix://"],
+            vec![
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
+                "--remote",
+                "unix://",
+            ],
         ),
         (
             "grok",
             "grok",
             "FL_WIRE_GROK_BIN",
-            vec!["--yolo", "--always-approve"],
+            vec!["--permission-mode", "auto"],
         ),
         (
             "antigravity",
@@ -2044,4 +2069,189 @@ fn non_muse_vendors_keep_a_blank_session_that_teardown_kills_by_name() {
     }
     assert_eq!(killed(&fake), ["kill Ada", "kill Ada", "kill Ada"]);
     assert!(fake.marks.borrow().is_empty());
+}
+
+#[test]
+fn spin_up_and_restart_apply_posture_persist_record_and_emit_bypass_only_on_bypass() {
+    use fl_core::permissions::Posture;
+
+    let _bin = MuseBinEnv::cleared();
+    let home = TempDir::new().unwrap();
+    install_home_muse(home.path());
+
+    for (vendor, supported_postures) in [
+        (
+            "claude",
+            &[
+                Posture::Ask,
+                Posture::AcceptEdits,
+                Posture::Auto,
+                Posture::Plan,
+                Posture::Bypass,
+            ][..],
+        ),
+        (
+            "codex",
+            &[
+                Posture::AcceptEdits,
+                Posture::Auto,
+                Posture::Plan,
+                Posture::Bypass,
+            ][..],
+        ),
+        (
+            "grok",
+            &[
+                Posture::Ask,
+                Posture::AcceptEdits,
+                Posture::Auto,
+                Posture::Plan,
+                Posture::Bypass,
+            ][..],
+        ),
+        (
+            "antigravity",
+            &[
+                Posture::AcceptEdits,
+                Posture::Auto,
+                Posture::Plan,
+                Posture::Bypass,
+            ][..],
+        ),
+        (
+            "muse",
+            &[
+                Posture::Ask,
+                Posture::AcceptEdits,
+                Posture::Auto,
+                Posture::Bypass,
+            ][..],
+        ),
+    ] {
+        for &posture in supported_postures {
+            let store = MemStore::default();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let mut request = req("ada", vendor);
+            request.posture = posture;
+            let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            assert_eq!(out.posture, posture, "{vendor} {posture}");
+            assert!(
+                !out.permission_receipts.is_empty(),
+                "expected permission receipts for {vendor} {posture}"
+            );
+            for r in &out.permission_receipts {
+                assert!(!r.summary.is_empty(), "{vendor} {posture}: {r:?}");
+            }
+            let record = find_hosted_session(&store, &[&out.session_id])
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.posture, posture, "{vendor} {posture}");
+
+            let spun_argv = fake.launches.borrow()[0].1.clone().unwrap().argv;
+            let has_bypass_flag = spun_argv.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--dangerously-skip-permissions"
+                        | "--allow-dangerously-skip-permissions"
+                        | "--disable-approval"
+                        | "--yolo"
+                        | "--always-approve"
+                        | "bypassPermissions"
+                )
+            }) || spun_argv.windows(2).any(|w| w == ["-a", "never"]);
+            assert_eq!(
+                has_bypass_flag,
+                posture == Posture::Bypass,
+                "{vendor} {posture} argv={spun_argv:?}"
+            );
+
+            // Restart must preserve and re-emit the persisted posture.
+            let second = FakeRuntime::default();
+            let restarted =
+                restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner")
+                    .unwrap();
+            assert_eq!(restarted.record.posture, posture);
+            let restart_argv = second.launches.borrow()[0].1.clone().unwrap().argv;
+            assert_eq!(
+                &spun_argv[..spun_argv.len() - 1],
+                &restart_argv[..restart_argv.len() - 1],
+                "restart argv flags must match spin-up for {vendor} {posture}"
+            );
+        }
+    }
+}
+
+#[test]
+fn spin_up_refuses_unsupported_vendor_posture_before_registering_agent_or_persisting_record() {
+    use fl_core::permissions::Posture;
+
+    let home = TempDir::new().unwrap();
+    for (vendor, posture) in [
+        ("codex", Posture::Ask),
+        ("antigravity", Posture::Ask),
+        ("muse", Posture::Plan),
+        ("lemonade", Posture::Bypass),
+    ] {
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut request = req("ada", vendor);
+        request.posture = posture;
+        let err = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap_err();
+        assert!(
+            matches!(err, LifecycleError::Invalid(_)),
+            "{vendor} {posture}: {err:?}"
+        );
+        assert_eq!(err.status(), 400, "{vendor} {posture}");
+        assert!(
+            store.agent_by_name("ada").unwrap().is_none(),
+            "no agent should be registered when {vendor} refuses {posture}"
+        );
+        assert!(
+            list_hosted_sessions(&store).unwrap().is_empty(),
+            "no hosted session should be persisted when {vendor} refuses {posture}"
+        );
+        assert!(
+            fake.launches.borrow().is_empty(),
+            "no runtime should be spawned when {vendor} refuses {posture}"
+        );
+    }
+}
+
+#[test]
+fn restart_hosted_session_refuses_record_with_unsupported_posture_without_spawning() {
+    use fl_core::permissions::Posture;
+
+    let home = TempDir::new().unwrap();
+    for (vendor, bad_posture) in [
+        ("codex", Posture::Ask),
+        ("antigravity", Posture::Ask),
+        ("muse", Posture::Plan),
+        ("lemonade", Posture::Bypass),
+    ] {
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let out = spin(&store, &env, "ada", vendor);
+        let mut record = find_hosted_session(&store, &[&out.session_id])
+            .unwrap()
+            .unwrap();
+        record.posture = bad_posture;
+        persist_hosted_session(&store, &record, "owner").unwrap();
+
+        let second = FakeRuntime::default();
+        let err =
+            restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner")
+                .unwrap_err();
+        assert!(
+            matches!(err, LifecycleError::Invalid(_)),
+            "{vendor} {bad_posture}: {err:?}"
+        );
+        assert_eq!(err.status(), 400, "{vendor} {bad_posture}");
+        assert!(
+            second.launches.borrow().is_empty(),
+            "restart must produce no launch when {vendor} refuses {bad_posture}"
+        );
+    }
 }

@@ -1262,6 +1262,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             vendor: "codex".into(),
             model: None,
             thinking_level: None,
+            posture: fl_core::permissions::Posture::Auto,
             node_id: "local".into(),
             hosted: true,
             status: crate::lifecycle::STATUS_DECOMMISSIONED.into(),

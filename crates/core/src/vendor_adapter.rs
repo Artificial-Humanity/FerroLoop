@@ -122,6 +122,8 @@ pub struct VendorLaunchRequest {
     pub cwd: Option<PathBuf>,
     pub home_dir: Option<PathBuf>,
     pub remote_control: bool,
+    #[serde(default)]
+    pub posture: crate::permissions::Posture,
 }
 
 /// Prepared command-line and environment plan for launching a vendor CLI in a runtime session.
@@ -152,6 +154,8 @@ pub struct AttachOrResumeRequest {
     pub thinking_effort: Option<String>,
     #[serde(default = "default_remote_control")]
     pub remote_control: bool,
+    #[serde(default)]
+    pub posture: crate::permissions::Posture,
 }
 
 impl AttachOrResumeRequest {
@@ -166,6 +170,7 @@ impl AttachOrResumeRequest {
             model: None,
             thinking_effort: None,
             remote_control: true,
+            posture: crate::permissions::Posture::default(),
         }
     }
 }

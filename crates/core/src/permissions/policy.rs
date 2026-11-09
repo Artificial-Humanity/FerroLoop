@@ -22,7 +22,9 @@ pub const MAX_SHELL_GLOB_STARS: usize = 8;
 pub const MAX_PATH_SEGMENTS: usize = 64;
 
 /// How a vendor resolves "ask": a separate axis from rules and sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Posture {
     /// Prompt for what no rule decides.
@@ -30,11 +32,46 @@ pub enum Posture {
     /// Edits are accepted without a prompt; everything else follows the rules.
     AcceptEdits,
     /// The vendor's automatic approval path.
+    #[default]
     Auto,
     /// Read-only planning.
     Plan,
     /// Checks disabled. Never produced by rules.
     Bypass,
+}
+
+impl Posture {
+    /// Wire and CLI spelling (`ask`, `accept-edits`, `auto`, `plan`, `bypass`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+impl std::fmt::Display for Posture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Posture {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "accept-edits" => Ok(Self::AcceptEdits),
+            "auto" => Ok(Self::Auto),
+            "plan" => Ok(Self::Plan),
+            "bypass" => Ok(Self::Bypass),
+            _ => Err("posture must be ask, accept-edits, auto, plan or bypass".to_string()),
+        }
+    }
 }
 
 /// The sandbox axis.
