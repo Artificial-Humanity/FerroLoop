@@ -538,7 +538,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setContextWindowSending(false);
     setContextWindowNotice(null);
     setPendingAgyModel(null);
-  }, [isOpen, sessionId, agentName]);
+  }, [isOpen, sessionId, agentName, selectedModel, selectedThinkingLevel]);
   useEffect(() => {
     // The hub reported a different window: follow the server from here on.
     setContextWindowPick((prev) =>
@@ -751,7 +751,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const effectiveThinking = (effectiveThinkingLevel ?? "").trim().toLowerCase();
   const isAgySession = isAntigravityAdapter(knownAdapter || effectiveAdapter);
   const agyThinkingRequired =
-    isAgySession && !effectiveThinking && agyModelRequiresThinkingLevel(shownModel);
+    isAgySession &&
+    !effectiveThinking &&
+    agyModelRequiresThinkingLevel(shownModel, effectiveAvailableModels);
   const contextVendor = canonicalAdapter(knownAdapter);
   const offeredContextWindows = contextEstimate.offeredWindows ?? [];
   const contextWindowEditable =
@@ -870,12 +872,18 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       }
     }
   };
+  const baseThinkingOptions: ReadonlyArray<{ value: string; label: string }> =
+    isAgySession
+      ? THINKING_LEVEL_OPTIONS.map((opt) =>
+          opt.value === "high" ? { value: "high", label: "high" } : opt,
+        )
+      : THINKING_LEVEL_OPTIONS;
   const thinkingOptions: ReadonlyArray<{ value: string; label: string }> =
     !effectiveThinking
-      ? [{ value: "", label: "unknown (select level)" }, ...THINKING_LEVEL_OPTIONS]
-      : !THINKING_LEVEL_OPTIONS.some((opt) => opt.value === effectiveThinking)
-        ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
-        : THINKING_LEVEL_OPTIONS;
+      ? [{ value: "", label: "unknown (select level)" }, ...baseThinkingOptions]
+      : !baseThinkingOptions.some((opt) => opt.value === effectiveThinking)
+        ? [{ value: effectiveThinking, label: effectiveThinking }, ...baseThinkingOptions]
+        : baseThinkingOptions;
   const effectiveExecutionMode =
     fetchedFor("executionMode", executionMode, fetchedSession?.executionMode) ??
     (executionMode !== undefined ? executionMode : null);
@@ -1269,7 +1277,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   aria-label="Session Model"
                   data-testid="session-model-select"
                   className="fd-select fd-mono"
-                  disabled={!targetSessionOrAgent || switchingModel || agyThinkingRequired}
+                  disabled={!targetSessionOrAgent || switchingModel}
                   value={shownModel}
                   onChange={(e) => {
                     const nextModel = e.target.value;
@@ -1277,7 +1285,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     if (
                       isAgySession &&
                       !effectiveThinking &&
-                      agyModelRequiresThinkingLevel(nextModel)
+                      agyModelRequiresThinkingLevel(nextModel, effectiveAvailableModels)
                     ) {
                       setPendingAgyModel(nextModel);
                       return;

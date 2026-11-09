@@ -1259,12 +1259,13 @@ fn toml_non_empty_str(table: &toml::Table, key: &str) -> Option<String> {
 
 // --- Antigravity ------------------------------------------------------------
 
-/// One `clientModelConfigs[]` entry: the full model id (with thinking suffix) and the
-/// `MODEL_PLACEHOLDER_*` name that trajectory steps use for it.
+/// One `clientModelConfigs[]` entry: the full model id (with thinking suffix), the
+/// `MODEL_PLACEHOLDER_*` name that trajectory steps use for it, and its display `label`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgyConfiguredModel {
     model_id: String,
     placeholder: Option<String>,
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,6 +1285,7 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
             Some(AgyConfiguredModel {
                 model_id: non_empty_str(entry.get("modelId"))?,
                 placeholder: non_empty_str(entry.pointer("/modelOrAlias/model")),
+                label: non_empty_str(entry.get("label")),
             })
         })
         .collect();
@@ -1352,6 +1354,9 @@ fn normalize_agy_base_model_name(raw: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
         .collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
     for &default_id in &AGY_DEFAULT_MODELS {
         let default_tokens: Vec<String> = default_id
             .split(|c: char| !c.is_ascii_alphanumeric())
@@ -1362,26 +1367,21 @@ fn normalize_agy_base_model_name(raw: &str) -> String {
             return default_id.to_string();
         }
     }
-    match tokens
-        .iter()
-        .map(String::as_str)
+    let slug = raw
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
         .collect::<Vec<_>>()
-        .as_slice()
-    {
-        ["gemini", "4", "0", "argon"] | ["argon"] => "gemini-4-argon".to_string(),
-        ["gpt", "oss"] => "gpt-oss-120b".to_string(),
-        _ => raw
-            .trim()
-            .to_ascii_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("-"),
-    }
+        .join("-");
+    let (base, _) =
+        split_agy_thinking_suffix(&fl_wire::vendor_adapter::agy_cli_model_id(&slug, None));
+    base
 }
 
 /// Normalize the target of a `Model Selection` `<USER_SETTINGS_CHANGE>` notice (for example
 /// `"Gemini 4 Argon (Low)"` or `"claude-sonnet-5-5-high"`) into a placeholder or
-/// effort-suffixed model id (`"gemini-4-argon-low"`).
+/// effort-suffixed model id (`"gemini-4-argon-low"`). Rejects truncated or unbalanced
+/// parentheticals (such as `"Gemini 4 Argon (Hi"`).
 fn normalize_agy_settings_model_target(raw: &str) -> Option<String> {
     let target = raw
         .trim()
@@ -1390,19 +1390,25 @@ fn normalize_agy_settings_model_target(raw: &str) -> Option<String> {
     if target.is_empty() {
         return None;
     }
+    if target.contains('(') || target.contains(')') {
+        let (prefix, paren) = target.split_once('(')?;
+        let prefix = prefix.trim();
+        if prefix.is_empty() || prefix.contains('(') || prefix.contains(')') {
+            return None;
+        }
+        let level_raw = paren.trim().strip_suffix(')')?;
+        if level_raw.contains('(') || level_raw.contains(')') {
+            return None;
+        }
+        let level = level_raw.trim().to_ascii_lowercase();
+        if !matches!(level.as_str(), "low" | "medium" | "high") {
+            return None;
+        }
+        let base = normalize_agy_base_model_name(prefix);
+        return (!base.is_empty()).then(|| format!("{base}-{level}"));
+    }
     if target.starts_with("MODEL_") {
         return Some(target.to_string());
-    }
-    if let Some((prefix, paren)) = target.rsplit_once('(')
-        && let Some(level_raw) = paren.trim().strip_suffix(')')
-    {
-        let level = level_raw.trim().to_ascii_lowercase();
-        if matches!(level.as_str(), "low" | "medium" | "high") {
-            let base = normalize_agy_base_model_name(prefix);
-            if !base.is_empty() {
-                return Some(format!("{base}-{level}"));
-            }
-        }
     }
     let lowered = target.to_ascii_lowercase();
     let (base_raw, suffix) = split_agy_thinking_suffix(&lowered);
@@ -1416,19 +1422,46 @@ fn normalize_agy_settings_model_target(raw: &str) -> Option<String> {
     })
 }
 
+/// Strip all case-insensitive `open_tag ... close_tag` blocks from `text` (and any unclosed
+/// trailing `open_tag` block) so embedded user or system blocks cannot spoof top-level tags.
+fn strip_case_insensitive_tag_blocks(text: &str, open_tag: &str, close_tag: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(rel_open) = lower[cursor..].find(open_tag) {
+        let open_pos = cursor + rel_open;
+        out.push_str(&text[cursor..open_pos]);
+        let after_open = open_pos + open_tag.len();
+        if let Some(rel_close) = lower[after_open..].find(close_tag) {
+            cursor = after_open + rel_close + close_tag.len();
+        } else {
+            return out;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 /// Extract the target model from the latest `<USER_SETTINGS_CHANGE>` block in `text` that
-/// records a `Model Selection` change.
+/// records a `Model Selection` change. Ignores `<USER_SETTINGS_CHANGE>` text quoted inside
+/// `<SYSTEM_MESSAGE>` or `<USER_REQUEST>` blocks, and requires a closing tag.
 fn parse_agy_user_settings_change_model(text: &str) -> Option<String> {
     const OPEN: &str = "<user_settings_change>";
     const CLOSE: &str = "</user_settings_change>";
-    let lower = text.to_ascii_lowercase();
+    let without_sys =
+        strip_case_insensitive_tag_blocks(text, "<system_message>", "</system_message>");
+    let cleaned =
+        strip_case_insensitive_tag_blocks(&without_sys, "<user_request>", "</user_request>");
+    let lower = cleaned.to_ascii_lowercase();
     let mut search_end = lower.len();
     while let Some(open_pos) = lower[..search_end].rfind(OPEN) {
         let content_start = open_pos + OPEN.len();
-        let block_end = lower[content_start..]
-            .find(CLOSE)
-            .map_or(text.len(), |rel| content_start + rel);
-        let block = &text[content_start..block_end];
+        let Some(rel_close) = lower[content_start..].find(CLOSE) else {
+            search_end = open_pos;
+            continue;
+        };
+        let block_end = content_start + rel_close;
+        let block = &cleaned[content_start..block_end];
         let block_lower = &lower[content_start..block_end];
         if let Some(sel_pos) = block_lower.find("model selection") {
             let after_sel = &block[sel_pos + "model selection".len()..];
@@ -1462,8 +1495,32 @@ fn parse_agy_user_settings_change_model(text: &str) -> Option<String> {
     None
 }
 
-/// Check a step or transcript line JSON object for a `<USER_SETTINGS_CHANGE>` model selection.
+/// True only when `step` is an explicit `USER_INPUT` step (`type` is `USER_INPUT` or
+/// `CORTEX_STEP_TYPE_USER_INPUT`, and any `source` field is `USER_EXPLICIT`).
+fn is_agy_explicit_user_input_step(step: &Value) -> bool {
+    let Some(step_type) = step.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if !step_type.eq_ignore_ascii_case("USER_INPUT")
+        && !step_type.eq_ignore_ascii_case("CORTEX_STEP_TYPE_USER_INPUT")
+    {
+        return false;
+    }
+    if let Some(source) = step.get("source").and_then(Value::as_str)
+        && !source.eq_ignore_ascii_case("USER_EXPLICIT")
+    {
+        return false;
+    }
+    true
+}
+
+/// Check an explicit `USER_INPUT` step or transcript line JSON object for a
+/// `<USER_SETTINGS_CHANGE>` model selection. Tool-output (`GENERIC`/`MODEL`) and
+/// `SYSTEM_MESSAGE` steps are ignored.
 fn step_user_settings_change_model(step: &Value) -> Option<String> {
+    if !is_agy_explicit_user_input_step(step) {
+        return None;
+    }
     for pointer in [
         "/content",
         "/userInput/userResponse",
@@ -1556,8 +1613,9 @@ pub(crate) fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<Strin
     (model_id.to_string(), None)
 }
 
-/// Match `wanted` against `config.models`. When multiple configured entries with different
-/// thinking suffixes share one `MODEL_PLACEHOLDER_*`, return `(base, None)` rather than
+/// Match `wanted` against `config.models` by `modelId`, `placeholder`, or `label`. When
+/// multiple configured entries with different thinking suffixes share one `MODEL_PLACEHOLDER_*`
+/// or base label without an explicit level in `wanted`, return `(base, None)` rather than
 /// guessing effort from config order.
 fn match_agy_config_model(
     config: &AgyModelConfig,
@@ -1570,19 +1628,53 @@ fn match_agy_config_model(
     {
         return Some(split_agy_thinking_suffix(&entry.model_id));
     }
-    let matches: Vec<(String, Option<String>)> = config
+    let placeholder_matches: Vec<(String, Option<String>)> = config
         .models
         .iter()
         .filter(|entry| entry.placeholder.as_deref() == Some(wanted))
         .map(|entry| split_agy_thinking_suffix(&entry.model_id))
         .collect();
-    let (first_base, first_level) = matches.first()?;
-    let unambiguous_level = matches
-        .iter()
-        .all(|(base, level)| base == first_base && level == first_level)
-        .then(|| first_level.clone())
-        .flatten();
-    Some((first_base.clone(), unambiguous_level))
+    if let Some((first_base, first_level)) = placeholder_matches.first() {
+        let unambiguous_level = placeholder_matches
+            .iter()
+            .all(|(base, level)| base == first_base && level == first_level)
+            .then(|| first_level.clone())
+            .flatten();
+        return Some((first_base.clone(), unambiguous_level));
+    }
+    if !wanted.starts_with("MODEL_")
+        && let Some(wanted_norm) = normalize_agy_settings_model_target(wanted)
+    {
+        let (wanted_base, wanted_level) = split_agy_thinking_suffix(&wanted_norm);
+        let label_matches: Vec<(String, Option<String>)> = config
+            .models
+            .iter()
+            .filter_map(|entry| {
+                let label = entry.label.as_deref()?;
+                let label_norm = normalize_agy_settings_model_target(label)?;
+                let (label_base, _) = split_agy_thinking_suffix(&label_norm);
+                let (entry_base, entry_level) = split_agy_thinking_suffix(&entry.model_id);
+                if label.eq_ignore_ascii_case(wanted) || label_norm == wanted_norm {
+                    return Some((entry_base, wanted_level.clone().or(entry_level)));
+                }
+                if label_base == wanted_base
+                    && (wanted_level.is_none() || entry_level == wanted_level)
+                {
+                    return Some((entry_base, wanted_level.clone().or(entry_level)));
+                }
+                None
+            })
+            .collect();
+        if let Some((first_base, first_level)) = label_matches.first() {
+            let unambiguous_level = label_matches
+                .iter()
+                .all(|(base, level)| base == first_base && level == first_level)
+                .then(|| first_level.clone())
+                .flatten();
+            return Some((first_base.clone(), unambiguous_level));
+        }
+    }
+    None
 }
 
 /// Match the trajectory's model (then the config's default placeholder) against the
@@ -1607,7 +1699,8 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
             let found = match match_agy_config_model(config, wanted) {
                 Some(found) => Some(found),
                 None if !wanted.starts_with("MODEL_") => {
-                    Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
+                    normalize_agy_settings_model_target(wanted)
+                        .map(|normalized| split_agy_thinking_suffix(&normalized))
                 }
                 None => None,
             };
@@ -8136,6 +8229,101 @@ mod tests {
             &[settings_step, planner_step("MODEL_PLACEHOLDER_M318")],
             Some("MODEL_PLACEHOLDER_M318"),
         );
+
+        // Tool-output (`GENERIC` / `MODEL` / `CORTEX_STEP_TYPE_RUN_COMMAND`) and `SYSTEM_MESSAGE`
+        // steps carrying `<USER_SETTINGS_CHANGE>` are ignored and never override `PLANNER_RESPONSE`.
+        for non_user_step in [
+            serde_json::json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "SYSTEM_MESSAGE",
+                "source": "SYSTEM",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "SYSTEM",
+                "content": change_to_argon_low,
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": format!("<SYSTEM_MESSAGE>\n{change_to_sonnet_high}\n</SYSTEM_MESSAGE>"),
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": format!("<USER_REQUEST>\n{change_to_sonnet_high}\n</USER_REQUEST>"),
+            }),
+        ] {
+            assert_eq!(
+                step_user_settings_change_model(&non_user_step),
+                None,
+                "{non_user_step}"
+            );
+            assert_agy_steps_model(
+                &[
+                    planner_step("MODEL_PLACEHOLDER_M318"),
+                    non_user_step.clone(),
+                ],
+                Some("MODEL_PLACEHOLDER_M318"),
+            );
+            let tail = format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "ok"
+                }),
+                non_user_step
+            );
+            assert_eq!(
+                agy_transcript_tail_settings_model(&tail),
+                None,
+                "{non_user_step}"
+            );
+        }
+
+        // Truncated parentheticals (`"(Hi"`) or unclosed `<USER_SETTINGS_CHANGE>` tags return `None`.
+        for malformed in [
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to Gemini 4 Argon (Hi",
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to Gemini 4 Argon (Hi\n</USER_SETTINGS_CHANGE>",
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to (Hi.\n</USER_SETTINGS_CHANGE>",
+            "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to Gemini 4 Argon (Unknown).\n</USER_SETTINGS_CHANGE>",
+        ] {
+            assert_eq!(
+                parse_agy_user_settings_change_model(malformed),
+                None,
+                "{malformed}"
+            );
+        }
+
+        // `resolve_agy_model_info` matches configured models by `label` (e.g. `"GPT-OSS"` -> `gpt-oss-120b`)
+        // and rejects truncated parenthetical strings.
+        let config = parse_agy_model_config(AGY_CONFIG_FIXTURE).expect("config parses");
+        let gpt_oss = resolve_agy_model_info(&config, Some("GPT-OSS"));
+        assert_eq!(gpt_oss.model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(gpt_oss.thinking_level.as_deref(), Some("medium"));
+        let argon_label = resolve_agy_model_info(&config, Some("Gemini 4 Argon (Low)"));
+        assert_eq!(argon_label.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(argon_label.thinking_level.as_deref(), Some("low"));
+        let truncated_info = resolve_agy_model_info(&config, Some("Gemini 4 Argon (Hi"));
+        assert!(truncated_info.model_is_default);
+        assert_eq!(truncated_info.model.as_deref(), Some("gemini-3.8-flash"));
     }
 
     #[test]

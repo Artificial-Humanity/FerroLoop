@@ -662,9 +662,13 @@ export function isAntigravityAdapter(adapter?: string | null): boolean {
 
 /**
  * True when an Antigravity model id requires an explicit thinking level (`low`, `medium`, `high`)
- * rather than already carrying an effort suffix or having one fixed effort (`gpt-oss-120b`).
+ * rather than already carrying an effort suffix or having only a single effort variant in
+ * `availableModels`.
  */
-export function agyModelRequiresThinkingLevel(modelId?: string | null): boolean {
+export function agyModelRequiresThinkingLevel(
+  modelId?: string | null,
+  availableModels?: string[] | null,
+): boolean {
   const lower = (modelId ?? "").trim().toLowerCase();
   if (!lower) return true;
   for (const suffix of ["-low", "-medium", "-high"]) {
@@ -672,7 +676,17 @@ export function agyModelRequiresThinkingLevel(modelId?: string | null): boolean 
       return false;
     }
   }
-  return lower !== "gpt-oss-120b";
+  if (Array.isArray(availableModels) && availableModels.length > 0) {
+    const variants = availableModels
+      .map((m) => (m ?? "").trim().toLowerCase())
+      .filter((m) =>
+        ["-low", "-medium", "-high"].some((s) => m === `${lower}${s}`),
+      );
+    if (variants.length === 1) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Lower-cased, trimmed adapter name with the antigravity aliases folded into "antigravity". */
@@ -1796,7 +1810,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (
       isAntigravityAdapter(resolveSessionVendor(adapter, nextModel)) &&
       !effectiveThinking &&
-      agyModelRequiresThinkingLevel(nextModel)
+      agyModelRequiresThinkingLevel(nextModel, availableModels)
     ) {
       setSelectedModel(nextModel);
       setSubmitError("choose a thinking level for this Antigravity model");

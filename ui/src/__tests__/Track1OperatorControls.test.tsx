@@ -391,7 +391,8 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
 
       onSetSessionModel.mockClear();
 
-      // Antigravity session with unknown thinking_level: model apply is blocked until a thinking level is chosen.
+      // Antigravity session with unknown thinking_level: model select stays enabled so the operator
+      // can pick and change their mind, while Save/apply is blocked until a thinking level is chosen.
       rerender(
         <ChatPane
           agentName="felix"
@@ -410,19 +411,31 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         "antigravity · gemini-4-argon (unknown)",
       );
       expect(thinkingSelect.value).toBe("");
-      expect(modelSelect).toBeDisabled();
+      expect(modelSelect).not.toBeDisabled();
       expect(screen.getByTestId("agy-thinking-required-hint")).toHaveTextContent(
         /choose a thinking level/i,
       );
+      // Antigravity thinking options must not label `high` as `(Default)`.
+      const highOption = Array.from(thinkingSelect.options).find((o) => o.value === "high");
+      expect(highOption?.textContent).toBe("high");
+      expect(highOption?.textContent).not.toContain("Default");
 
-      // Even if a change event is dispatched on the model select before picking a level, no API call is made.
+      // Operator picks a model, then changes their mind to another model before picking a level:
+      // the select stays enabled and updates, and no API call is made yet.
       fireEvent.change(modelSelect, { target: { value: "gemini-3.8-flash" } });
+      expect(modelSelect.value).toBe("gemini-3.8-flash");
+      expect(modelSelect).not.toBeDisabled();
       expect(onSetSessionModel).not.toHaveBeenCalled();
 
-      // Once the operator picks an explicit thinking level, the change is sent with that level.
+      fireEvent.change(modelSelect, { target: { value: "claude-sonnet-5-5" } });
+      expect(modelSelect.value).toBe("claude-sonnet-5-5");
+      expect(modelSelect).not.toBeDisabled();
+      expect(onSetSessionModel).not.toHaveBeenCalled();
+
+      // Once the operator picks an explicit thinking level, the change is sent with the chosen model and level.
       fireEvent.change(thinkingSelect, { target: { value: "low" } });
       await waitFor(() => {
-        expect(onSetSessionModel).toHaveBeenCalledWith("gemini-3.8-flash", "low");
+        expect(onSetSessionModel).toHaveBeenCalledWith("claude-sonnet-5-5", "low");
       });
     });
   });
