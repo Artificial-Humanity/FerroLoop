@@ -3617,6 +3617,11 @@ export const App: React.FC<AppProps> = ({
         initialProject={spinUpInitialProject}
         projects={projects}
         nodes={nodes}
+        defaultNodeId={
+          nodes.find((n) => n.role === "hub")?.node_id ??
+          nodes[0]?.node_id ??
+          null
+        }
         onSpinUp={handleSpinUpSession}
         apiClient={apiClient}
       />
