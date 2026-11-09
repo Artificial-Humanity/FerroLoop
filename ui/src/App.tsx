@@ -49,7 +49,6 @@ import { FerroStatePane } from "./components/FerroStatePane";
 import { FerroWatchPane } from "./components/FerroWatchPane";
 import { TriageQueuePane } from "./components/TriageQueuePane";
 import {
-  isPureToolOutputTurn,
   normalizeOperatorPromptForMatch,
 } from "./components/TurnCard";
 import { WireMailPane } from "./components/WireMailPane";
@@ -321,7 +320,20 @@ function optimisticSessionMatches(
   return sameAgent && (!itemSessionId || isSyntheticSessionId(itemSessionId));
 }
 
-const PROMPT_DISK_CLOCK_SKEW_MS = 2_000;
+const PROMPT_DISK_CLOCK_SKEW_MS = 30_000;
+
+export function resolvePromptSentAtMs(
+  acceptedAt?: unknown,
+  fallbackMs: number = Date.now(),
+): number {
+  if (typeof acceptedAt === "string" && acceptedAt.trim()) {
+    const parsed = Date.parse(acceptedAt);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallbackMs;
+}
 
 function isPromptOnDisk(
   turns: TranscriptTurn[],
@@ -356,14 +368,19 @@ function isPromptOnDisk(
         continue;
       }
     }
-    if (turn.content.trim() === trimmed) {
+    if (turn.content.trim() === trimmed || turn.content.includes(trimmed)) {
       return true;
     }
     const normTurn = normalizeOperatorPromptForMatch(turn.content);
     if (!normTurn) {
       continue;
     }
-    if (normTurn === normTarget || normTurn === collapsedTrimmed) {
+    if (
+      normTurn === normTarget ||
+      normTurn === collapsedTrimmed ||
+      normTurn.includes(normTarget) ||
+      normTurn.includes(collapsedTrimmed)
+    ) {
       return true;
     }
   }
@@ -455,19 +472,7 @@ export function preserveOptimisticTurn(
       tool_calls: [],
       created_at: new Date(item.sentAt).toISOString(),
     };
-    let insertIdx = out.findIndex((t) => {
-      if (!t.created_at) return false;
-      const ms = Date.parse(t.created_at);
-      return Number.isFinite(ms) && ms > item.sentAt;
-    });
-    if (insertIdx >= 0) {
-      while (insertIdx < out.length && isPureToolOutputTurn(out[insertIdx])) {
-        insertIdx += 1;
-      }
-      out.splice(insertIdx, 0, nextTurn);
-    } else {
-      out.push(nextTurn);
-    }
+    out.push(nextTurn);
   }
   return out.length === turns.length ? turns : out;
 }
@@ -1909,7 +1914,12 @@ export const App: React.FC<AppProps> = ({
           ? rawSessionId === activeSessionId && (!rawPersona || rawPersona === activeKey)
           : !activeSessionId && Boolean(rawPersona) && rawPersona === activeKey;
         if (matchesActive && rawContent && data.delivered !== false) {
-          recordOptimisticPrompt(rawContent, activeKey, Date.now(), rawSessionId || null);
+          recordOptimisticPrompt(
+            rawContent,
+            activeKey,
+            resolvePromptSentAtMs(data.accepted_at),
+            rawSessionId || null,
+          );
           refreshOptimisticView((previous) => previous + 1);
         }
         if (matchesActive) adoptPromptMetadata(data, { ...ownerRef.current });
@@ -2462,7 +2472,12 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
+      recordOptimisticPrompt(
+        content,
+        agentKey,
+        resolvePromptSentAtMs(res.accepted_at),
+        activeSessionIdRef.current,
+      );
       refreshOptimisticView((previous) => previous + 1);
     }
     void refreshSessionsAndTranscript(targetId);
@@ -2490,7 +2505,12 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
+      recordOptimisticPrompt(
+        content,
+        agentKey,
+        resolvePromptSentAtMs(res.accepted_at),
+        activeSessionIdRef.current,
+      );
       refreshOptimisticView((previous) => previous + 1);
     }
     void refreshSessionsAndTranscript(targetId);

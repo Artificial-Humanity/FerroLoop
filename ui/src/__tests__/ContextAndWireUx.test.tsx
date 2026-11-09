@@ -12,6 +12,7 @@ import {
   OPTIMISTIC_PROMPT_TTL_MS,
   pruneOptimisticPrompts,
   preserveOptimisticTurn,
+  resolvePromptSentAtMs,
   THEME_STORAGE_KEY,
   transcriptPollIntervalMs,
 } from "../App";
@@ -718,7 +719,7 @@ describe("optimistic prompt preservation", () => {
     ).toHaveLength(0);
   });
 
-  it("places a still-pending optimistic turn at its chronological sentAt position rather than always at the end", () => {
+  it("keeps still-pending optimistic prompts at the tail of turns in sentAt order until they land on disk", () => {
     const turnsWithTimestamps: TranscriptTurn[] = [
       turn({
         index: 10,
@@ -729,7 +730,7 @@ describe("optimistic prompt preservation", () => {
       turn({
         index: 11,
         role: "assistant",
-        content: "Later reply after optimistic prompt was sent",
+        content: "Later reply while agent is busy",
         created_at: new Date(30_000).toISOString(),
       }),
     ];
@@ -750,13 +751,13 @@ describe("optimistic prompt preservation", () => {
 
     expect(merged.map((t) => t.content)).toEqual([
       "Initial reply",
+      "Later reply while agent is busy",
       "First pending",
       "Second pending",
-      "Later reply after optimistic prompt was sent",
     ]);
   });
 
-  it("does not falsely drop a short or repeated optimistic prompt due to substring or earlier-turn collisions, and keeps tool outputs grouped with their assistant tool-call turn", () => {
+  it("does not falsely drop a short or repeated optimistic prompt due to earlier-turn collisions outside the skew window, and appends pending prompts at the tail", () => {
     const turnsWithEarlierCollisions: TranscriptTurn[] = [
       turn({
         index: 1,
@@ -775,32 +776,32 @@ describe("optimistic prompt preservation", () => {
         role: "assistant",
         content: "Running verification now.",
         tool_calls: [{ name: "run_command", arguments: { command: "cargo test" } }],
-        created_at: new Date(14_000).toISOString(),
+        created_at: new Date(54_000).toISOString(),
       }),
       turn({
         index: 4,
         role: "tool",
         content: "Created At: t\nCommand output: ok",
-        created_at: new Date(16_000).toISOString(),
+        created_at: new Date(56_000).toISOString(),
       }),
       turn({
         index: 5,
         role: "assistant",
         content: "Verification passed.",
-        created_at: new Date(18_000).toISOString(),
+        created_at: new Date(58_000).toISOString(),
       }),
     ];
 
     const shortPending = {
       content: "yes",
-      sentAt: 15_000,
+      sentAt: 60_000,
       agentKey: "ferris",
     };
 
     const merged = preserveOptimisticTurn(
       turnsWithEarlierCollisions,
       shortPending,
-      19_000,
+      62_000,
       "ferris",
       undefined,
       true,
@@ -811,19 +812,93 @@ describe("optimistic prompt preservation", () => {
       "user:yes",
       "assistant:Running verification now.",
       "tool:Created At: t\nCommand output: ok",
-      "user:yes",
       "assistant:Verification passed.",
+      "user:yes",
     ]);
     expect(
       pruneOptimisticPrompts(
         [shortPending],
         turnsWithEarlierCollisions,
-        19_000,
+        62_000,
         "ferris",
         undefined,
         true,
       ),
     ).toHaveLength(1);
+  });
+
+  it("prunes merged queued prompts via normalized containment and tolerates browser-ahead clock skew", () => {
+    const baseMs = 100_000;
+    const firstQueued = {
+      content: "First queued instruction.\nCheck module A.",
+      sentAt: baseMs,
+      agentKey: "ferris",
+    };
+    const secondQueued = {
+      content: "Second queued instruction.\nCheck module B.",
+      sentAt: baseMs + 1_000,
+      agentKey: "ferris",
+    };
+
+    const mergedDiskTurns: TranscriptTurn[] = [
+      turn({
+        index: 1,
+        role: "user",
+        content: [
+          '<pasted_content id="8888">',
+          "[Operator Prompt via FerroDeck — from lmcfarlin]",
+          "",
+          "First queued instruction.\nCheck module A.",
+          "",
+          "Second queued instruction.\nCheck module B.",
+          '</pasted_content id="8888">',
+        ].join("\n"),
+        created_at: new Date(baseMs + 1_500).toISOString(),
+      }),
+    ];
+
+    expect(
+      pruneOptimisticPrompts(
+        [firstQueued, secondQueued],
+        mergedDiskTurns,
+        baseMs + 2_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+
+    // Browser clock 5,000 ms ahead of the host clock that stamped the disk turn:
+    const browserAheadPrompt = {
+      content: "Sent from iPad with clock 5s ahead",
+      sentAt: baseMs + 5_000,
+      agentKey: "ferris",
+    };
+    const hostStampedTurns: TranscriptTurn[] = [
+      turn({
+        index: 2,
+        role: "user",
+        content: "Sent from iPad with clock 5s ahead",
+        created_at: new Date(baseMs).toISOString(),
+      }),
+    ];
+
+    expect(
+      pruneOptimisticPrompts(
+        [browserAheadPrompt],
+        hostStampedTurns,
+        baseMs + 6_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+
+    expect(resolvePromptSentAtMs("2026-11-09T15:00:00.000Z", 123)).toBe(
+      Date.parse("2026-11-09T15:00:00.000Z"),
+    );
+    expect(resolvePromptSentAtMs(undefined, 456)).toBe(456);
+    expect(resolvePromptSentAtMs("not-a-timestamp", 789)).toBe(789);
   });
 
   it("polls faster while the session is busy", () => {

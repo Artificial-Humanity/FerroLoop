@@ -192,76 +192,43 @@ export function stripOperatorPromptHeader(content: string): string {
   return content;
 }
 
-function stripAgyUserRequestWrapperWithState(content: string): {
-  text: string;
-  pasteUnwrapped: boolean;
-} {
-  if (!content) {
-    return { text: "", pasteUnwrapped: false };
-  }
-  let current = content;
-  let pasteUnwrapped = false;
-
-  const outerPaste = stripOuterPastedContentWrapper(current);
-  if (outerPaste.unwrapped) {
-    current = outerPaste.text;
-    pasteUnwrapped = true;
-  }
-
-  const startsWithWrapper =
-    /^\s*<(?:USER_REQUEST|ADDITIONAL_METADATA|EPHEMERAL_MESSAGE|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
-      current,
-    );
-  const hasSettingsOrSummaryBlock =
-    /<(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>[\s\S]*?<\/(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
-      current,
-    );
-
-  if (startsWithWrapper || hasSettingsOrSummaryBlock) {
-    let result = current
-      .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
-      .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
-      .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "");
-    if (startsWithWrapper) {
-      result = result
-        .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
-          inner.trim(),
-        )
-        .replace(
-          /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
-          (_full, inner: string) => inner.trim(),
-        );
-    }
-    current = result.replace(/\n{3,}/g, "\n\n").trim();
-  }
-
-  if (!pasteUnwrapped) {
-    const innerPaste = stripOuterPastedContentWrapper(current);
-    if (innerPaste.unwrapped) {
-      current = innerPaste.text;
-      pasteUnwrapped = true;
-    }
-  }
-
-  const afterHeader = stripOperatorPromptHeader(current);
-  if (afterHeader !== current) {
-    current = afterHeader.replace(/\n{3,}/g, "\n\n").trim();
-  } else if (pasteUnwrapped || startsWithWrapper || hasSettingsOrSummaryBlock) {
-    current = current.replace(/\n{3,}/g, "\n\n").trim();
-  }
-
-  return { text: current, pasteUnwrapped };
-}
-
 /**
  * Strip Antigravity web/mobile `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`,
  * `<USER_SETTINGS_CHANGE>`, and `<CONTEXT_SUMMARY>` wrappers (and
- * `<EPHEMERAL_MESSAGE>` outer tags), as well as Claude Code's outer
- * `<pasted_content id="X">` wrapper and owner `[Operator Prompt via FerroDeck]`
- * header, so operator and notice turns render cleanly.
+ * `<EPHEMERAL_MESSAGE>` outer tags), so operator and notice turns render cleanly.
  */
 export function stripAgyUserRequestWrapper(content: string): string {
-  return stripAgyUserRequestWrapperWithState(content).text;
+  if (!content) {
+    return "";
+  }
+  const startsWithWrapper =
+    /^\s*<(?:USER_REQUEST|ADDITIONAL_METADATA|EPHEMERAL_MESSAGE|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
+      content,
+    );
+  const hasSettingsOrSummaryBlock =
+    /<(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>[\s\S]*?<\/(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
+      content,
+    );
+
+  if (!startsWithWrapper && !hasSettingsOrSummaryBlock) {
+    return content;
+  }
+
+  let result = content
+    .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
+    .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
+    .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "");
+  if (startsWithWrapper) {
+    result = result
+      .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
+        inner.trim(),
+      )
+      .replace(
+        /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
+        (_full, inner: string) => inner.trim(),
+      );
+  }
+  return result.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /**
@@ -273,9 +240,29 @@ export function normalizeOperatorPromptForMatch(content: string): string {
   if (!content) {
     return "";
   }
-  const stripped = stripAgyUserRequestWrapperWithState(content);
-  let text = stripped.text.trim();
-  let pasteUnwrapped = stripped.pasteUnwrapped;
+  let text = content.trim();
+  let pasteUnwrapped = false;
+
+  const initialPaste = stripOuterPastedContentWrapper(text);
+  if (initialPaste.unwrapped) {
+    text = initialPaste.text;
+    pasteUnwrapped = true;
+  }
+
+  text = stripAgyUserRequestWrapper(text).trim();
+
+  if (!pasteUnwrapped) {
+    const postAgyPaste = stripOuterPastedContentWrapper(text);
+    if (postAgyPaste.unwrapped) {
+      text = postAgyPaste.text;
+      pasteUnwrapped = true;
+    }
+  }
+
+  const afterOwnerHeader = stripOperatorPromptHeader(text);
+  if (afterOwnerHeader !== text) {
+    text = afterOwnerHeader.trim();
+  }
 
   if (/^Another Claude session sent a message:/i.test(text)) {
     text = text

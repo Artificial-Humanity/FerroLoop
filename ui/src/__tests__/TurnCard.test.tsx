@@ -623,6 +623,9 @@ describe("TurnCard directed assistant highlight", () => {
 
     const plainCodexTurn = "Plain Codex user turn without any paste wrapper.";
 
+    const hubNormalize = (raw: string) =>
+      stripOperatorPromptHeader(stripOuterPastedContentWrapper(raw).text);
+
     expect(stripOuterPastedContentWrapper(matchingWrapper)).toEqual({
       text: "First line of operator prompt\nSecond line of operator prompt",
       unwrapped: true,
@@ -635,7 +638,7 @@ describe("TurnCard directed assistant highlight", () => {
       text: literalInProse,
       unwrapped: false,
     });
-    expect(stripAgyUserRequestWrapper(turn304Shape)).toBe(
+    expect(hubNormalize(turn304Shape)).toBe(
       'Why does my message have:\n<pasted_content id="1234">literal inner tag</pasted_content id="1234">',
     );
     expect(stripAgyUserRequestWrapper(plainCodexTurn)).toBe(plainCodexTurn);
@@ -646,35 +649,35 @@ describe("TurnCard directed assistant highlight", () => {
           turn={turn({
             index: 24,
             role: "user",
-            content: matchingWrapper,
+            content: hubNormalize(matchingWrapper),
           })}
         />
         <TurnCard
           turn={turn({
             index: 25,
             role: "user",
-            content: mismatchedWrapper,
+            content: hubNormalize(mismatchedWrapper),
           })}
         />
         <TurnCard
           turn={turn({
             index: 26,
             role: "user",
-            content: literalInProse,
+            content: hubNormalize(literalInProse),
           })}
         />
         <TurnCard
           turn={turn({
             index: 27,
             role: "user",
-            content: turn304Shape,
+            content: hubNormalize(turn304Shape),
           })}
         />
         <TurnCard
           turn={turn({
             index: 28,
             role: "user",
-            content: plainCodexTurn,
+            content: hubNormalize(plainCodexTurn),
           })}
         />
       </>,
@@ -727,8 +730,20 @@ describe("TurnCard directed assistant highlight", () => {
 
     render(
       <>
-        <TurnCard turn={turn({ index: 29, role: "user", content: fromLmcfarlin })} />
-        <TurnCard turn={turn({ index: 30, role: "user", content: fromFerris })} />
+        <TurnCard
+          turn={turn({
+            index: 29,
+            role: "user",
+            content: stripOperatorPromptHeader(fromLmcfarlin),
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 30,
+            role: "user",
+            content: stripOperatorPromptHeader(fromFerris),
+          })}
+        />
       </>,
     );
 
@@ -758,13 +773,16 @@ describe("TurnCard directed assistant highlight", () => {
       '<\\pasted_content id="1111">kept inner tag</\\pasted_content id="1111">',
       '</pasted_content id="4321">',
     ].join("\n");
+    const hubNormalizedTurn = stripOperatorPromptHeader(
+      stripOuterPastedContentWrapper(wrappedTurn).text,
+    );
 
     render(
       <TurnCard
         turn={turn({
           index: 31,
           role: "user",
-          content: wrappedTurn,
+          content: hubNormalizedTurn,
         })}
       />,
     );
@@ -803,5 +821,36 @@ describe("TurnCard directed assistant highlight", () => {
       text: "<pasted_content>body</pasted_content> and </pasted_content>",
       unwrapped: true,
     });
+  });
+
+  it("does not double-unwrap hub-normalized sole nested <pasted_content> turns when rendering or copying", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const hubNormalizedSoleNested = '<pasted_content id="1234">literal</pasted_content id="1234">';
+
+    render(
+      <TurnCard
+        turn={turn({
+          index: 32,
+          role: "user",
+          content: hubNormalizedSoleNested,
+        })}
+      />,
+    );
+
+    const card = screen.getByTestId("turn-card-32");
+    expect(
+      within(card).getByText('<pasted_content id="1234">literal</pasted_content id="1234">'),
+    ).toBeInTheDocument();
+
+    const copyBtn = screen.getByTestId("turn-copy-btn-32");
+    fireEvent.click(copyBtn);
+    expect(writeText).toHaveBeenCalledWith(
+      '<pasted_content id="1234">literal</pasted_content id="1234">',
+    );
   });
 });
