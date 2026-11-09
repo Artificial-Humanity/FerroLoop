@@ -1278,26 +1278,79 @@ fn write_if_pollout(fd: libc::c_int, bytes: &[u8]) -> bool {
         revents: 0,
     };
     // SAFETY: one pollfd with zero timeout so an unresponsive or full stderr pipe
-    // never blocks status draining or epoch retirement, without mutating fd flags.
-    if unsafe { libc::poll(&mut pfd, 1, 0) } > 0
-        && (pfd.revents & libc::POLLOUT) != 0
-        && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) == 0
+    // never blocks status draining or epoch retirement.
+    if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0
+        || (pfd.revents & libc::POLLOUT) == 0
+        || (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
     {
-        let _ = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        true
-    } else {
-        false
+        return false;
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        let mut path = [0u8; 32];
+        let mut cursor = std::io::Cursor::new(path.as_mut_slice());
+        if write!(cursor, "/proc/self/fd/{fd}\0").is_ok() {
+            // SAFETY: NUL-terminated stack path; opens an independent kernel file
+            // description with O_NONBLOCK so `fd`'s own status flags are untouched.
+            let opened = unsafe {
+                libc::open(
+                    path.as_ptr().cast(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if opened >= 0 {
+                let n = unsafe { libc::write(opened, bytes.as_ptr().cast(), bytes.len()) };
+                unsafe { libc::close(opened) };
+                return n > 0;
+            }
+        }
+    }
+    // SAFETY: if `fd` is a socket, MSG_DONTWAIT performs a non-blocking write without
+    // mutating file status flags; if `fd` is not a socket, send fails with ENOTSOCK.
+    let sent = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
+    if sent >= 0 {
+        return sent > 0;
+    }
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOTSOCK) {
+        return false;
+    }
+    static NONBLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = NONBLOCK_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let dup_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_fd < 0 {
+        return false;
+    }
+    let flags = unsafe { libc::fcntl(dup_fd, libc::F_GETFL) };
+    if flags < 0 {
+        unsafe { libc::close(dup_fd) };
+        return false;
+    }
+    if (flags & libc::O_NONBLOCK) == 0
+        && unsafe { libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0
+    {
+        unsafe { libc::close(dup_fd) };
+        return false;
+    }
+    let n = unsafe { libc::write(dup_fd, bytes.as_ptr().cast(), bytes.len()) };
+    if (flags & libc::O_NONBLOCK) == 0 {
+        let _ = unsafe { libc::fcntl(dup_fd, libc::F_SETFL, flags) };
+    }
+    unsafe { libc::close(dup_fd) };
+    n > 0
 }
 
 #[cfg(unix)]
-fn emit_hosted_cleanup_notice_unix(session: &Session, descendants: usize) {
+fn emit_hosted_cleanup_notice_unix(session: &Session, direct_children: usize) {
+    if direct_children == 0 {
+        return;
+    }
     use std::io::Write;
     let mut raw = [0u8; 256];
     let mut cursor = std::io::Cursor::new(raw.as_mut_slice());
     if writeln!(
         cursor,
-        "fl-host: hosted session {} (epoch {}) armed post-leader-exit cleanup after {}ms (descendants={descendants})",
+        "fl-host: hosted session {} (epoch {}) armed post-leader-exit cleanup after {}ms (direct_children={direct_children})",
         session.session.as_str(),
         session.epoch,
         HOSTED_LEADER_EXIT_GRACE.as_millis(),
@@ -1336,9 +1389,9 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
                     adopted,
                 });
             }
-            protocol::SupervisorMsg::HostedLeaderExitCleanup { descendants } => {
-                if session.has_hosted_owner() {
-                    emit_hosted_cleanup_notice_unix(&session, descendants);
+            protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children } => {
+                if session.has_hosted_owner() && direct_children > 0 {
+                    emit_hosted_cleanup_notice_unix(&session, direct_children);
                 }
             }
             protocol::SupervisorMsg::Cleanup { complete } => {
@@ -1398,6 +1451,37 @@ fn observe_windows_job_after_poll(
     WatchTick::Poll { requested, quiet }
 }
 
+#[cfg(any(windows, test))]
+struct NonBlockingStderrSink;
+
+#[cfg(any(windows, test))]
+impl std::io::Write for NonBlockingStderrSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        static STDERR_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<([u8; 256], usize)>> =
+            std::sync::OnceLock::new();
+        let tx = STDERR_TX.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<([u8; 256], usize)>(16);
+            let _ = std::thread::Builder::new()
+                .name("fl-host-stderr".into())
+                .spawn(move || {
+                    while let Ok((raw, len)) = rx.recv() {
+                        let _ = std::io::stderr().write_all(&raw[..len]);
+                    }
+                });
+            tx
+        });
+        let len = buf.len().min(256);
+        let mut raw = [0u8; 256];
+        raw[..len].copy_from_slice(&buf[..len]);
+        let _ = tx.try_send((raw, len));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Poll until cleanup is resolved or the post-request deadline expires.
 ///
 /// Unresolved cleanup leaves this loop so `shutdown` can join the thread. The
@@ -1408,7 +1492,8 @@ fn windows_watch_until(
     host: Arc<HostInner>,
     mut observe: impl FnMut(&Session) -> WatchTick,
 ) {
-    windows_watch_until_log(session, host, &mut std::io::stderr(), &mut observe);
+    let mut sink = NonBlockingStderrSink;
+    windows_watch_until_log(session, host, &mut sink, &mut observe);
 }
 
 #[cfg(any(windows, test))]
@@ -1420,6 +1505,7 @@ fn windows_watch_until_log(
 ) {
     let mut cleanup_started: Option<Instant> = None;
     let mut leader_exited_at: Option<Instant> = None;
+    let mut emit_hosted_notice = false;
     loop {
         match observe(&session) {
             WatchTick::Stop => break,
@@ -1454,7 +1540,7 @@ fn windows_watch_until_log(
                     cleanup_started = Some(Instant::now());
                     let _ = session.request_cleanup();
                     requested = true;
-                    let _ = emit_hosted_cleanup_notice_windows(&session, sink);
+                    emit_hosted_notice = true;
                 }
                 if (requested || cleanup_started.is_some())
                     && cleanup_deadline_expired(cleanup_started, Instant::now())
@@ -1466,6 +1552,9 @@ fn windows_watch_until_log(
             }
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if emit_hosted_notice {
+        let _ = emit_hosted_cleanup_notice_windows(&session, sink);
     }
 }
 
@@ -1770,19 +1859,15 @@ mod deadline_tests {
             host.shutdown().unwrap();
         }
 
-        // A failing io::Write sink must run outside all host locks and still complete cleanup.
-        struct FailingSink<'a> {
-            host: &'a super::HostInner,
-            calls: usize,
-            locks_free: bool,
+        // A blocked/failing io::Write sink must run after retire + note_cleanup and outside all host locks.
+        struct BlockedSink {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
         }
-        impl std::io::Write for FailingSink<'_> {
+        impl std::io::Write for BlockedSink {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                self.calls += 1;
-                self.locks_free = self.host.registry.try_lock().is_ok()
-                    && self.host.sessions.try_lock().is_ok()
-                    && self.host.outputs.try_lock().is_ok()
-                    && self.host.spawn_gate.try_lock().is_ok();
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
                 Err(std::io::ErrorKind::BrokenPipe.into())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1805,18 +1890,18 @@ mod deadline_tests {
             })
             .with_hosted_owner(Some("hosted-409")),
         );
-        let started = Instant::now();
-        let mut leader_sent = false;
-        let mut sink = FailingSink {
-            host: &host.inner,
-            calls: 0,
-            locks_free: false,
-        };
-        windows_watch_until_log(
-            Arc::clone(&session),
-            Arc::clone(&host.inner),
-            &mut sink,
-            &mut |s| {
+        let (entered, observing) = std::sync::mpsc::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let watched = Arc::clone(&session);
+        let inner = Arc::clone(&host.inner);
+        let watcher = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut leader_sent = false;
+            let mut sink = BlockedSink {
+                entered,
+                release: waiting,
+            };
+            windows_watch_until_log(watched, inner, &mut sink, &mut |s| {
                 if !leader_sent {
                     leader_sent = true;
                     return WatchTick::Leader(Some(0));
@@ -1834,16 +1919,30 @@ mod deadline_tests {
                     requested: false,
                     quiet: false,
                 }
-            },
+            });
+        });
+        observing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let registry_retired = host
+            .inner
+            .registry
+            .try_lock()
+            .is_ok_and(|registry| registry.sessions.is_empty());
+        let cleanup_published = session.cleanup_report() == Some(CleanupReport { complete: true });
+        let locks_free = host.inner.sessions.try_lock().is_ok()
+            && host.inner.outputs.try_lock().is_ok()
+            && host.inner.spawn_gate.try_lock().is_ok();
+        release.send(()).unwrap();
+        watcher.join().unwrap();
+        assert!(
+            registry_retired,
+            "blocked log ran before session retired from registry or held registry lock"
         );
-        assert_eq!(sink.calls, 1);
-        assert!(sink.locks_free, "log write held a host lock");
+        assert!(
+            cleanup_published,
+            "blocked log ran before session.note_cleanup completed"
+        );
+        assert!(locks_free, "blocked log held a host lock");
         assert!(session.cleanup_requested());
-        assert_eq!(
-            session.cleanup_report(),
-            Some(CleanupReport { complete: true })
-        );
-        assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
         host.shutdown().unwrap();
     }
 
@@ -2014,11 +2113,16 @@ mod deadline_tests {
                 hosted_owner: false,
             }
         );
-        let msg = super::protocol::SupervisorMsg::HostedLeaderExitCleanup { descendants: 3 };
+        let msg = super::protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children: 3 };
         let line = super::protocol::to_line(&msg).unwrap();
         assert_eq!(
             super::protocol::from_line::<super::protocol::SupervisorMsg>(&line[..line.len() - 1])
                 .unwrap(),
+            msg
+        );
+        let legacy_cleanup = br#"{"op":"hosted_leader_exit_cleanup","descendants":3}"#;
+        assert_eq!(
+            super::protocol::from_line::<super::protocol::SupervisorMsg>(legacy_cleanup).unwrap(),
             msg
         );
 
@@ -2027,6 +2131,10 @@ mod deadline_tests {
         let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         assert!(super::write_if_pollout(writer.as_raw_fd(), b"hello\n"));
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
         let mut got = [0u8; 6];
         reader.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello\n");
@@ -2050,6 +2158,27 @@ mod deadline_tests {
             b"must-not-block\n"
         ));
         assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+
+        // Also verify socket fallback path (`MSG_DONTWAIT` when `/proc/self/fd` returns ENXIO).
+        let mut socks = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, socks.as_mut_ptr()) },
+            0
+        );
+        let mut sock_reader = unsafe { std::fs::File::from_raw_fd(socks[0]) };
+        let sock_writer = unsafe { OwnedFd::from_raw_fd(socks[1]) };
+        assert!(super::write_if_pollout(sock_writer.as_raw_fd(), b"sock!\n"));
+        assert_eq!(
+            unsafe { libc::fcntl(sock_writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        let mut sock_got = [0u8; 6];
+        sock_reader.read_exact(&mut sock_got).unwrap();
+        assert_eq!(&sock_got, b"sock!\n");
     }
 
     #[test]

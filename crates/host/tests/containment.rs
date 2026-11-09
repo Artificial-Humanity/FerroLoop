@@ -2342,7 +2342,6 @@ fn hosted_owner_leader_exit_cleans_up_lingering_descendants() {
             .env
             .insert("FL_HOSTED_ID".into(), format!("hosted-owner-{idx}"));
         child_spec.env_allow.insert("FL_HOSTED_ID".into());
-        let spawned_at = Instant::now();
         let session = host.spawn(&child_spec).expect("spawn hosted");
         let text = session
             .read_stdout_until(b" END", Duration::from_secs(5))
@@ -2354,12 +2353,17 @@ fn hosted_owner_leader_exit_cleans_up_lingering_descendants() {
             .expect("supervisor")
             .start;
         let exit = session.wait_leader(Duration::from_secs(5)).expect("leader");
+        let leader_exited_at = Instant::now();
         assert_eq!(exit.code, Some(0));
+        assert!(
+            same_process(pid, start),
+            "lingering child ({mode}) exited before post-leader-exit grace window"
+        );
         let report = session
             .wait_cleanup(HOSTED_LEADER_EXIT_GRACE + CLEANUP_DEADLINE + Duration::from_secs(2))
             .expect("auto cleanup after grace");
         assert!(report.complete);
-        assert!(spawned_at.elapsed() >= HOSTED_LEADER_EXIT_GRACE);
+        assert!(leader_exited_at.elapsed() >= HOSTED_LEADER_EXIT_GRACE);
         assert!(matches!(session.state(), ChildState::CleanupComplete(_)));
         assert!(host.session_phase(session.session()).is_none());
         let registry = read_registry(host.endpoint()).expect("registry");
