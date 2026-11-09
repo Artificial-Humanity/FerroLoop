@@ -718,6 +718,12 @@ describe("TurnCard directed assistant highlight", () => {
     expect(stripOperatorPromptHeader(fromLmcfarlin)).toBe("Check the logs.");
     expect(stripOperatorPromptHeader(bareHeader)).toBe("Run tests.");
     expect(stripOperatorPromptHeader(fromFerris)).toBe(fromFerris);
+    expect(stripOperatorPromptHeader("[Operator Prompt via FerroDeck — from owner]")).toBe(
+      "[Operator Prompt via FerroDeck — from owner]",
+    );
+    expect(stripOperatorPromptHeader("[Operator Prompt via FerroDeck — from owner]\n   ")).toBe(
+      "[Operator Prompt via FerroDeck — from owner]",
+    );
 
     render(
       <>
@@ -776,5 +782,26 @@ describe("TurnCard directed assistant highlight", () => {
     ).toBe(
       'Cleaned copy payload line 1 <pasted_content id="1111">kept inner tag</pasted_content id="1111">',
     );
+
+    const soleNestedAfterHeader = [
+      '<pasted_content id="9999">',
+      "[Operator Prompt via FerroDeck — from owner]",
+      "",
+      '<\\pasted_content id="1234">literal</\\pasted_content id="1234">',
+      '</pasted_content id="9999">',
+    ].join("\n");
+    expect(normalizeOperatorPromptForMatch(soleNestedAfterHeader)).toBe(
+      '<pasted_content id="1234">literal</pasted_content id="1234">',
+    );
+
+    const attrlessNested = [
+      '<pasted_content id="9999">',
+      "<\\pasted_content>body<\\/pasted_content> and </\\pasted_content>",
+      '</pasted_content id="9999">',
+    ].join("\n");
+    expect(stripOuterPastedContentWrapper(attrlessNested)).toEqual({
+      text: "<pasted_content>body</pasted_content> and </pasted_content>",
+      unwrapped: true,
+    });
   });
 });

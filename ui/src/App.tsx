@@ -48,7 +48,10 @@ import { VaultGatePane } from "./components/VaultGatePane";
 import { FerroStatePane } from "./components/FerroStatePane";
 import { FerroWatchPane } from "./components/FerroWatchPane";
 import { TriageQueuePane } from "./components/TriageQueuePane";
-import { normalizeOperatorPromptForMatch } from "./components/TurnCard";
+import {
+  isPureToolOutputTurn,
+  normalizeOperatorPromptForMatch,
+} from "./components/TurnCard";
 import { WireMailPane } from "./components/WireMailPane";
 import {
   setActiveTimeZone,
@@ -318,6 +321,8 @@ function optimisticSessionMatches(
   return sameAgent && (!itemSessionId || isSyntheticSessionId(itemSessionId));
 }
 
+const PROMPT_DISK_CLOCK_SKEW_MS = 2_000;
+
 function isPromptOnDisk(
   turns: TranscriptTurn[],
   content: string,
@@ -325,27 +330,44 @@ function isPromptOnDisk(
 ): boolean {
   const trimmed = content.trim();
   if (!trimmed) return true;
+  const collapsedTrimmed = trimmed.replace(/\s+/g, " ");
   const normTarget = normalizeOperatorPromptForMatch(content);
   if (!normTarget) return true;
-  return turns.some((turn) => {
+  let startIdx = 0;
+  if (sentAt !== undefined) {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const rawTs = turns[i].created_at;
+      if (!rawTs) continue;
+      const ms = Date.parse(rawTs);
+      if (Number.isFinite(ms) && ms < sentAt - PROMPT_DISK_CLOCK_SKEW_MS) {
+        startIdx = i + 1;
+        break;
+      }
+    }
+  }
+  for (let i = startIdx; i < turns.length; i++) {
+    const turn = turns[i];
     if ((turn.role || "").toLowerCase() !== "user" || !turn.content) {
-      return false;
+      continue;
     }
     if (sentAt !== undefined && turn.created_at) {
       const turnMs = Date.parse(turn.created_at);
-      if (Number.isFinite(turnMs) && turnMs < sentAt - 60_000) {
-        return false;
+      if (Number.isFinite(turnMs) && turnMs < sentAt - PROMPT_DISK_CLOCK_SKEW_MS) {
+        continue;
       }
     }
-    if (turn.content.trim() === trimmed || turn.content.includes(trimmed)) {
+    if (turn.content.trim() === trimmed) {
       return true;
     }
     const normTurn = normalizeOperatorPromptForMatch(turn.content);
     if (!normTurn) {
-      return false;
+      continue;
     }
-    return normTurn === normTarget || normTurn.includes(normTarget);
-  });
+    if (normTurn === normTarget || normTurn === collapsedTrimmed) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function pruneOptimisticPrompts(
@@ -433,12 +455,15 @@ export function preserveOptimisticTurn(
       tool_calls: [],
       created_at: new Date(item.sentAt).toISOString(),
     };
-    const insertIdx = out.findIndex((t) => {
+    let insertIdx = out.findIndex((t) => {
       if (!t.created_at) return false;
       const ms = Date.parse(t.created_at);
       return Number.isFinite(ms) && ms > item.sentAt;
     });
     if (insertIdx >= 0) {
+      while (insertIdx < out.length && isPureToolOutputTurn(out[insertIdx])) {
+        insertIdx += 1;
+      }
       out.splice(insertIdx, 0, nextTurn);
     } else {
       out.push(nextTurn);

@@ -756,6 +756,76 @@ describe("optimistic prompt preservation", () => {
     ]);
   });
 
+  it("does not falsely drop a short or repeated optimistic prompt due to substring or earlier-turn collisions, and keeps tool outputs grouped with their assistant tool-call turn", () => {
+    const turnsWithEarlierCollisions: TranscriptTurn[] = [
+      turn({
+        index: 1,
+        role: "user",
+        content: "Please say yes if the build succeeded.",
+        created_at: new Date(10_000).toISOString(),
+      }),
+      turn({
+        index: 2,
+        role: "user",
+        content: "yes",
+        created_at: new Date(11_000).toISOString(),
+      }),
+      turn({
+        index: 3,
+        role: "assistant",
+        content: "Running verification now.",
+        tool_calls: [{ name: "run_command", arguments: { command: "cargo test" } }],
+        created_at: new Date(14_000).toISOString(),
+      }),
+      turn({
+        index: 4,
+        role: "tool",
+        content: "Created At: t\nCommand output: ok",
+        created_at: new Date(16_000).toISOString(),
+      }),
+      turn({
+        index: 5,
+        role: "assistant",
+        content: "Verification passed.",
+        created_at: new Date(18_000).toISOString(),
+      }),
+    ];
+
+    const shortPending = {
+      content: "yes",
+      sentAt: 15_000,
+      agentKey: "ferris",
+    };
+
+    const merged = preserveOptimisticTurn(
+      turnsWithEarlierCollisions,
+      shortPending,
+      19_000,
+      "ferris",
+      undefined,
+      true,
+    );
+
+    expect(merged.map((t) => `${t.role}:${t.content}`)).toEqual([
+      "user:Please say yes if the build succeeded.",
+      "user:yes",
+      "assistant:Running verification now.",
+      "tool:Created At: t\nCommand output: ok",
+      "user:yes",
+      "assistant:Verification passed.",
+    ]);
+    expect(
+      pruneOptimisticPrompts(
+        [shortPending],
+        turnsWithEarlierCollisions,
+        19_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(1);
+  });
+
   it("polls faster while the session is busy", () => {
     expect(transcriptPollIntervalMs(true)).toBe(2_000);
     expect(transcriptPollIntervalMs(false)).toBe(3_500);

@@ -156,9 +156,8 @@ export function stripOuterPastedContentWrapper(content: string): {
   }
   const trimmedInner = rawInner.replace(/^[\r\n]+|[\r\n]+$/g, "");
   const unescaped = trimmedInner
-    .replace(/<\\pasted_content /g, "<pasted_content ")
-    .replace(/<\\\/pasted_content /g, "</pasted_content ")
-    .replace(/<\/\\pasted_content /g, "</pasted_content ");
+    .replace(/<\\(\/?)pasted_content(?=[\s>])/g, "<$1pasted_content")
+    .replace(/<\/\\pasted_content(?=[\s>])/g, "</pasted_content");
   return { text: unescaped, unwrapped: true };
 }
 
@@ -187,21 +186,18 @@ export function stripOperatorPromptHeader(content: string): string {
   }
   const sender = (headerMatch[1] ?? "").trim().toLowerCase();
   if (!sender || sender === "owner" || sender === "lmcfarlin") {
-    return rest.trim();
+    const body = rest.trim();
+    return body.length > 0 ? body : content.trim();
   }
   return content;
 }
 
-/**
- * Strip Antigravity web/mobile `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`,
- * `<USER_SETTINGS_CHANGE>`, and `<CONTEXT_SUMMARY>` wrappers (and
- * `<EPHEMERAL_MESSAGE>` outer tags), as well as Claude Code's outer
- * `<pasted_content id="X">` wrapper and owner `[Operator Prompt via FerroDeck]`
- * header, so operator and notice turns render cleanly.
- */
-export function stripAgyUserRequestWrapper(content: string): string {
+function stripAgyUserRequestWrapperWithState(content: string): {
+  text: string;
+  pasteUnwrapped: boolean;
+} {
   if (!content) {
-    return "";
+    return { text: "", pasteUnwrapped: false };
   }
   let current = content;
   let pasteUnwrapped = false;
@@ -254,7 +250,18 @@ export function stripAgyUserRequestWrapper(content: string): string {
     current = current.replace(/\n{3,}/g, "\n\n").trim();
   }
 
-  return current;
+  return { text: current, pasteUnwrapped };
+}
+
+/**
+ * Strip Antigravity web/mobile `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`,
+ * `<USER_SETTINGS_CHANGE>`, and `<CONTEXT_SUMMARY>` wrappers (and
+ * `<EPHEMERAL_MESSAGE>` outer tags), as well as Claude Code's outer
+ * `<pasted_content id="X">` wrapper and owner `[Operator Prompt via FerroDeck]`
+ * header, so operator and notice turns render cleanly.
+ */
+export function stripAgyUserRequestWrapper(content: string): string {
+  return stripAgyUserRequestWrapperWithState(content).text;
 }
 
 /**
@@ -266,12 +273,66 @@ export function normalizeOperatorPromptForMatch(content: string): string {
   if (!content) {
     return "";
   }
-  let text = stripAgyUserRequestWrapper(content);
-  text = text.replace(/^\s*\[Operator Prompt via FerroDeck[^\]]*\]\s*/i, "");
-  const postHeaderPaste = stripOuterPastedContentWrapper(text);
-  if (postHeaderPaste.unwrapped) {
-    text = postHeaderPaste.text;
+  const stripped = stripAgyUserRequestWrapperWithState(content);
+  let text = stripped.text.trim();
+  let pasteUnwrapped = stripped.pasteUnwrapped;
+
+  if (/^Another Claude session sent a message:/i.test(text)) {
+    text = text
+      .replace(/^Another Claude session sent a message:\s*/i, "")
+      .replace(/\n\nThis came from another Claude session[\s\S]*$/i, "")
+      .trim();
   }
+
+  if (text.startsWith("<SYSTEM_MESSAGE>") || text.includes("\n<SYSTEM_MESSAGE>")) {
+    const closeIdx = text.lastIndexOf("</SYSTEM_MESSAGE>");
+    const beforeClose = closeIdx >= 0 ? text.slice(0, closeIdx) : text;
+    if (beforeClose.trimStart().startsWith("<SYSTEM_MESSAGE>")) {
+      text = beforeClose.trimStart().slice("<SYSTEM_MESSAGE>".length).trim();
+    } else {
+      const openIdx = beforeClose.indexOf("\n<SYSTEM_MESSAGE>");
+      if (openIdx >= 0) {
+        text = beforeClose.slice(openIdx + "\n<SYSTEM_MESSAGE>".length).trim();
+      }
+    }
+  }
+
+  if (!pasteUnwrapped) {
+    const preMsgPaste = stripOuterPastedContentWrapper(text);
+    if (preMsgPaste.unwrapped) {
+      text = preMsgPaste.text;
+      pasteUnwrapped = true;
+    }
+  }
+
+  if (text.startsWith("[Message]")) {
+    const firstLineEnd = text.indexOf("\n");
+    const firstLine = firstLineEnd >= 0 ? text.slice(0, firstLineEnd) : text;
+    const contentMarker = " content=";
+    const contentIdx = firstLine.indexOf(contentMarker);
+    if (contentIdx >= 0) {
+      text = text.slice(contentIdx + contentMarker.length).trim();
+    }
+  }
+
+  if (!pasteUnwrapped) {
+    const postMsgPaste = stripOuterPastedContentWrapper(text);
+    if (postMsgPaste.unwrapped) {
+      text = postMsgPaste.text;
+      pasteUnwrapped = true;
+    }
+  }
+
+  text = text.replace(/^\s*\[Operator Prompt via FerroDeck[^\]]*\]\s*/i, "");
+
+  if (!pasteUnwrapped) {
+    const postHeaderPaste = stripOuterPastedContentWrapper(text);
+    if (postHeaderPaste.unwrapped) {
+      text = postHeaderPaste.text;
+      pasteUnwrapped = true;
+    }
+  }
+
   text = text
     .replace(/<\\(\/?[a-zA-Z_][\w:-]*)/g, "<$1")
     .replace(/<\/\\([a-zA-Z_][\w:-]*)/g, "</$1");

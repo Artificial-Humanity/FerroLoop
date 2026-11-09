@@ -5031,8 +5031,11 @@ pub(crate) fn strip_outer_pasted_content_wrapper(content: &str) -> Option<String
     let unescaped = if inner.contains("pasted_content") {
         inner
             .replace("<\\pasted_content ", "<pasted_content ")
+            .replace("<\\pasted_content>", "<pasted_content>")
             .replace("<\\/pasted_content ", "</pasted_content ")
+            .replace("<\\/pasted_content>", "</pasted_content>")
             .replace("</\\pasted_content ", "</pasted_content ")
+            .replace("</\\pasted_content>", "</pasted_content>")
     } else {
         inner.to_string()
     };
@@ -5067,7 +5070,14 @@ pub(crate) fn strip_operator_prompt_header(text: &str) -> String {
     };
     if should_strip {
         match trimmed.find('\n') {
-            Some(nl) => trimmed[nl + 1..].trim().to_string(),
+            Some(nl) => {
+                let body = trimmed[nl + 1..].trim();
+                if body.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    body.to_string()
+                }
+            }
             None => trimmed.to_string(),
         }
     } else {
@@ -13835,6 +13845,18 @@ mod tests {
         assert_eq!(
             content,
             "<pasted_content id=\"1234\">literal</pasted_content id=\"1234\">"
+        );
+
+        // (d) Attribute-less `<pasted_content>` tags escaped inside an outer wrapper are also unescaped,
+        // and header-only owner prompts fall back to preserving the header line instead of returning empty.
+        let attrless_nested = "<pasted_content id=\"9999\">\n<\\pasted_content>inner<\\/pasted_content> and </\\pasted_content>\n</pasted_content id=\"9999\">";
+        assert_eq!(
+            strip_outer_pasted_content_wrapper(attrless_nested).as_deref(),
+            Some("<pasted_content>inner</pasted_content> and </pasted_content>")
+        );
+        assert_eq!(
+            strip_operator_prompt_header("[Operator Prompt via FerroDeck — from owner]\n   "),
+            "[Operator Prompt via FerroDeck — from owner]"
         );
 
         // 7. Codex or other vendor transcript with no wrapper -> completely unchanged.
