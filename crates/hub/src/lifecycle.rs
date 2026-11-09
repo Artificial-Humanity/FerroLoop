@@ -9218,6 +9218,7 @@ mod tests {
         assert!(banned.contains(old), "{banned:?}");
         assert!(!banned.contains("antigravity:ada"), "{banned:?}");
 
+        let new_source = crate::latency_tests::write_agy_identity(home.path(), "conv-new", "ada");
         let at = At::from_unix_millis(2);
         let mut table = RouteTable::default();
         table.upsert(
@@ -9240,6 +9241,7 @@ mod tests {
             "a new native id stays deliverable"
         );
 
+        std::fs::remove_file(new_source).unwrap();
         table.upsert(
             "ada",
             VendorRoute::Grok {
@@ -9259,6 +9261,7 @@ mod tests {
             "an empty grok id stays"
         );
 
+        crate::latency_tests::write_agy_identity(home.path(), old, "ada");
         table.upsert(
             "ada",
             VendorRoute::Agy {

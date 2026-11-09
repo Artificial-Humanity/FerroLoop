@@ -150,12 +150,52 @@ struct InFlightPrompt {
     dispatched_at_ms: i64,
 }
 
+/// Dispatch ownership only: this does not restore a route or establish discovery identity.
+#[derive(Debug, Clone)]
+pub(crate) struct PromptQueueTarget {
+    pub(crate) session_id: String,
+    pub(crate) persona: Option<String>,
+    adapter: String,
+    aliases: std::collections::BTreeSet<String>,
+}
+
+impl PromptQueueTarget {
+    pub(crate) fn observed(session: &DiscoveredSessionSummary, raw: &str) -> Option<Self> {
+        // Only passive Antigravity invalidation needs this retained ownership binding.
+        if session.adapter != "antigravity" {
+            return None;
+        }
+        let mut aliases = std::collections::BTreeSet::from([raw.to_owned()]);
+        aliases.extend(session.persona.iter().cloned());
+        Some(Self {
+            session_id: session.id.clone(),
+            persona: session.persona.clone(),
+            adapter: session.adapter.clone(),
+            aliases,
+        })
+    }
+
+    pub(crate) fn accepts(&self, route: &fl_wire::identity::VendorRoute) -> bool {
+        use fl_wire::identity::VendorRoute;
+        let adapter = match route {
+            VendorRoute::Agy { .. } => "antigravity",
+            VendorRoute::Claude { .. } => "claude",
+            VendorRoute::Codex { .. } => "codex",
+            VendorRoute::Muse { .. } => "muse",
+            VendorRoute::Grok { .. } => "grok",
+            _ => return false,
+        };
+        adapter == self.adapter && api::route_matches_session_id(route, &self.session_id)
+    }
+}
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
     in_flight: BTreeMap<String, InFlightPrompt>,
     active_queue_sends: std::collections::BTreeSet<String>,
     next_seq: u64,
+    targets: BTreeMap<String, PromptQueueTarget>,
 }
 
 /// A logical dispatch claim, held across I/O without holding the queue mutex.
@@ -216,6 +256,7 @@ impl Drop for SessionDispatchGuard<'_> {
 }
 
 pub(crate) struct DirectPromptInput {
+    pub queue_target: Option<PromptQueueTarget>,
     pub intended_codex_thread_id: Option<String>,
     pub persona: Option<String>,
     pub prompt: String,
@@ -231,11 +272,21 @@ pub(crate) enum DirectPromptDecision<'a> {
 }
 
 impl PromptQueueState {
+    fn remember_target(&mut self, target: Option<PromptQueueTarget>) {
+        if let Some(target) = target {
+            self.targets
+                .entry(target.session_id.clone())
+                .and_modify(|saved| saved.aliases.extend(target.aliases.iter().cloned()))
+                .or_insert(target);
+        }
+    }
+
     fn enqueue(
         &mut self,
         session_key: &str,
         input: DirectPromptInput,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        self.remember_target(input.queue_target);
         let now = stamp::now();
         self.next_seq += 1;
         let item = QueuedOperatorPrompt {
@@ -617,6 +668,34 @@ impl HubState {
         sessions
     }
 
+    /// Resolve only queue ownership. Ambiguous aliases must never bypass a retained fence.
+    pub(crate) fn prompt_queue_target(&self, raw: &str) -> Result<Option<PromptQueueTarget>, ()> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let PromptQueueState {
+            targets,
+            queues,
+            in_flight,
+            active_queue_sends,
+            ..
+        } = &mut *guard;
+        targets.retain(|key, _| {
+            in_flight.contains_key(key)
+                || active_queue_sends.contains(key)
+                || queues.get(key).is_some_and(|q| !q.is_empty())
+        });
+        if let Some(target) = targets.get(raw) {
+            return Ok(Some(target.clone()));
+        }
+        let mut found = targets
+            .values()
+            .filter(|target| target.aliases.contains(raw));
+        let first = found.next().cloned();
+        if found.next().is_some() {
+            return Err(());
+        }
+        Ok(first)
+    }
+
     /// Forget the in-flight marker for `session_key`, so the session no longer reads as busy
     /// because of a prompt the operator just interrupted. Queued prompts stay queued.
     pub fn clear_session_in_flight(&self, session_key: &str) {
@@ -664,8 +743,8 @@ impl HubState {
             self.config.home_override.as_deref(),
             session_key,
         );
-        let intended_codex_thread_id = match observed {
-            Some(session) if session.adapter == "codex" => Some(session.id),
+        let intended_codex_thread_id = match &observed {
+            Some(session) if session.adapter == "codex" => Some(session.id.clone()),
             Some(_) => None,
             None => session_key.strip_prefix("codex-").map(str::to_string),
         };
@@ -673,6 +752,9 @@ impl HubState {
         guard.enqueue(
             session_key,
             DirectPromptInput {
+                queue_target: observed
+                    .as_ref()
+                    .and_then(|session| PromptQueueTarget::observed(session, session_key)),
                 intended_codex_thread_id,
                 persona,
                 prompt,
@@ -786,6 +868,7 @@ impl HubState {
             let (item, queue) = guard.enqueue(canonical, input);
             return DirectPromptDecision::Queued(item, queue);
         }
+        guard.remember_target(input.queue_target);
         guard.active_queue_sends.insert(canonical.into());
         guard.active_queue_sends.insert(raw.into());
         DirectPromptDecision::Dispatch(SessionDispatchGuard {
@@ -1313,6 +1396,7 @@ mod tests {
                 false,
                 false,
                 DirectPromptInput {
+                    queue_target: None,
                     intended_codex_thread_id: None,
                     persona: None,
                     prompt: "one".into(),
@@ -1334,6 +1418,7 @@ mod tests {
             false,
             false,
             DirectPromptInput {
+                queue_target: None,
                 intended_codex_thread_id: None,
                 persona: None,
                 prompt: "two".into(),
@@ -6268,6 +6353,12 @@ mod tests {
         use fl_core::at::At;
         use fl_wire::identity::RouteTable;
 
+        if let fl_wire::identity::VendorRoute::Agy {
+            conversation_id, ..
+        } = &route
+        {
+            crate::latency_tests::write_agy_identity(home, conversation_id, persona);
+        }
         let path = home.join(".cache").join("agent-bus").join("routes.json");
         let mut routes = RouteTable::load(Some(&path));
         routes.upsert(persona, route, At::from_unix_millis(1));
