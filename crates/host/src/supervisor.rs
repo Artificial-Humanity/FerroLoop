@@ -204,11 +204,13 @@ fn supervise(
             && leader_exited_at.is_some_and(|t| t.elapsed() >= HOSTED_LEADER_EXIT_GRACE)
         {
             cleanup_started = Some(Instant::now());
-            let descendants = direct_children()
+            let direct_children = direct_children()
                 .into_iter()
                 .filter(|&pid| pid != vendor_pid)
                 .count();
-            let _ = write_msg(&SupervisorMsg::HostedLeaderExitCleanup { descendants });
+            if direct_children > 0 {
+                let _ = write_msg(&SupervisorMsg::HostedLeaderExitCleanup { direct_children });
+            }
         }
         if let Some(started) = cleanup_started {
             let signal = if started.elapsed() >= TERM_GRACE {

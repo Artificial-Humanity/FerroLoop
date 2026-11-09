@@ -119,15 +119,18 @@ impl Daemon {
     }
 
     fn stop(&mut self) {
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(20));
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -5180,6 +5183,27 @@ fn hosted_owner_pty_and_reliable_pipe_auto_cleanup_after_leader_exit() {
         panic!("spawn reliable pipe")
     };
 
+    // 3. Hosted-owner session that exits cleanly with 0 lingering direct children.
+    let mut clean_spec = spec("hosted-clean", &["exit", "0"]);
+    clean_spec
+        .env
+        .insert("FL_HOSTED_ID".into(), "hosted-clean-owner".into());
+    clean_spec.env_allow.insert("FL_HOSTED_ID".into());
+    let XResp::Session {
+        stream: clean_stream,
+        ..
+    } = rpc
+        .inner
+        .extension_request(XReq::SpawnSession {
+            spec: clean_spec,
+            mode: fl_host_proto::SessionMode::ReliablePipe,
+            pty: None,
+        })
+        .unwrap()
+    else {
+        panic!("spawn clean reliable pipe")
+    };
+
     let extract_child = |rpc: &mut Rpc, session_name: &str| -> (u32, u64) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -5218,41 +5242,37 @@ fn hosted_owner_pty_and_reliable_pipe_auto_cleanup_after_leader_exit() {
             || records.iter().any(|r| {
                 r.stream == pipe_stream && matches!(r.state, ChildState::CleanupComplete(_))
             });
+        let clean_done = records.iter().all(|r| r.stream != clean_stream)
+            || records.iter().any(|r| {
+                r.stream == clean_stream && matches!(r.state, ChildState::CleanupComplete(_))
+            });
         let stderr = daemon.stderr.lock().expect("stderr").clone();
-        let pty_logged = stderr.lines().any(|line| {
-            line.starts_with(&format!(
-                "fl-host: hosted session hosted-pty (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=",
+        #[cfg(target_os = "linux")]
+        let logs_ready = {
+            let pty_expected = format!(
+                "fl-host: hosted session hosted-pty (epoch {}) armed post-leader-exit cleanup after 500ms (direct_children=1)",
                 pty_stream.epoch.0
-            ))
-        });
-        let pipe_logged = stderr.lines().any(|line| {
-            line.starts_with(&format!(
-                "fl-host: hosted session hosted-relpipe (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=",
+            );
+            let pipe_expected = format!(
+                "fl-host: hosted session hosted-relpipe (epoch {}) armed post-leader-exit cleanup after 500ms (direct_children=1)",
                 pipe_stream.epoch.0
-            ))
-        });
+            );
+            stderr.lines().any(|line| line == pty_expected)
+                && stderr.lines().any(|line| line == pipe_expected)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let logs_ready = true;
         if pty_done
             && pipe_done
+            && clean_done
             && status.projection_reserved_bytes == 0
             && status.completed_pty_sessions == 1
-            && pty_logged
-            && pipe_logged
+            && logs_ready
         {
-            #[cfg(target_os = "linux")]
-            {
-                assert!(stderr.lines().any(|line| {
-                    line == format!(
-                        "fl-host: hosted session hosted-pty (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=1)",
-                        pty_stream.epoch.0
-                    )
-                }), "stderr: {stderr}");
-                assert!(stderr.lines().any(|line| {
-                    line == format!(
-                        "fl-host: hosted session hosted-relpipe (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=1)",
-                        pipe_stream.epoch.0
-                    )
-                }), "stderr: {stderr}");
-            }
+            assert!(
+                !stderr.contains("hosted-clean"),
+                "clean exit with 0 direct_children logged unexpectedly: {stderr}"
+            );
             break;
         }
         assert!(
