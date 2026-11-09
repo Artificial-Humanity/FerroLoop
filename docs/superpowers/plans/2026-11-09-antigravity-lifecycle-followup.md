@@ -46,15 +46,15 @@ Take an absolute deadline. Keep process/host probes injectable for tests; defaul
 runtime implementations must not acquire live-host authority. The implementer may choose
 concrete Rust type names and must report the exported signatures for Task 2.
 
-- [ ] Write failing missing-route cleanup and resolver tests, including the five applicable
+- [x] Write failing missing-route cleanup and resolver tests, including the five applicable
   identity/connection hazards in the spec and Review Focus.
-- [ ] Run focused tests and record the expected failure.
-- [ ] Implement bounded exact-host/process resolution, descendant environment recovery,
+- [x] Run focused tests and record the expected failure.
+- [x] Implement bounded exact-host/process resolution, descendant environment recovery,
   and known-UUID idle LS-child listener recovery. Unsupported evidence fails closed.
-- [ ] Integrate fallback before route removal/runtime stop. Include discovery in the total
+- [x] Integrate fallback before route removal/runtime stop. Include discovery in the total
   deadline and retain the existing successful cached-route behavior and diagnostics.
-- [ ] Run affected wire/hub tests and meaningful isolated cleanup integration checks.
-- [ ] Commit with Fiona's co-author trailer and report the resolver interface.
+- [x] Run affected wire/hub tests and meaningful isolated cleanup integration checks.
+- [x] Commit with Fiona's co-author trailer and report the resolver interface.
 
 ### Task 2: Finalize titles on the existing CLI path
 

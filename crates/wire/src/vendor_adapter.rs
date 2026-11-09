@@ -4,6 +4,7 @@
 //! `claude`, `codex`, `antigravity`, `grok`, `muse`, `lemonade`, and `ollama`.
 
 pub use crate::host_runtime::HostRuntimePort;
+pub mod antigravity_session;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

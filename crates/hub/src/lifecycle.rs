@@ -389,6 +389,12 @@ pub enum RuntimePresence {
 /// `kill` and `exists` take the unit, so a Muse window is never confused with the session that
 /// holds other agents' windows.
 pub trait SessionRuntime: std::fmt::Debug {
+    /// Whether this runtime authorizes exact native-host process discovery. Fake and legacy
+    /// runtimes remain isolated unless they explicitly implement this capability.
+    fn allows_host_process_probe(&self) -> bool {
+        false
+    }
+
     /// Whether each vendor has a separate session rather than a shared persona container.
     fn separate_vendor_units(&self) -> bool {
         false
@@ -805,6 +811,10 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
 }
 
 impl SessionRuntime for HostRuntime {
+    fn allows_host_process_probe(&self) -> bool {
+        !use_legacy_tmux_fallback()
+    }
+
     fn preflight_spawn(&self, hosted_id: &str) -> Result<(), LifecycleError> {
         if use_legacy_tmux_fallback() {
             return Ok(());
@@ -4104,7 +4114,12 @@ fn post_agy_delete_cascade_trajectory_with_timeout(
     let Some(port) = fl_wire::identity::agy_ls_port(ls_address) else {
         return Err("non-loopback language-server address".to_string());
     };
-    let url = format!("http://127.0.0.1:{port}{AGY_DELETE_CASCADE_PATH}");
+    let host = if ls_address.trim().starts_with("[::1]:") {
+        "[::1]"
+    } else {
+        "127.0.0.1"
+    };
+    let url = format!("http://{host}:{port}{AGY_DELETE_CASCADE_PATH}");
     let body = serde_json::json!({ "cascadeId": cascade_id }).to_string();
     let cfg = ureq::config::Config::builder()
         .proxy(None)
@@ -4133,11 +4148,16 @@ fn post_agy_delete_cascade_trajectory_with_timeout(
 /// is missing or unreachable, logs a diagnostic to stderr and continues so teardown never aborts
 /// or fails silently.
 fn delete_agy_cascade_trajectories(
-    home_override: Option<&Path>,
+    env: &LifecycleEnv<'_>,
     record: &HostedSessionRecord,
     target: &SessionTarget,
-    tombstone_ids: &[String],
+    tombstone_ids: &mut Vec<String>,
 ) {
+    use fl_wire::vendor_adapter::antigravity_session::{
+        AgySessionRequest, native_cascade_id, resolve_agy_session,
+    };
+    let deadline = std::time::Instant::now() + AGY_DELETE_CASCADE_DEADLINE;
+    let home_override = env.home_override;
     let mut route_ls_addr: Option<String> = None;
     let mut route_csrf: Option<String> = None;
     let mut cascade_ids: Vec<String> = Vec::new();
@@ -4175,14 +4195,11 @@ fn delete_agy_cascade_trajectories(
     if !is_agy {
         return;
     }
-    for id in tombstone_ids {
+    for id in tombstone_ids.iter() {
         push_tombstone(&mut cascade_ids, id);
     }
-    if cascade_ids.is_empty() {
-        return;
-    }
 
-    let (ls_addr, csrf) = match route_ls_addr {
+    let (mut ls_addr, mut csrf) = match route_ls_addr {
         Some(addr) => (Some(addr), route_csrf),
         None if crate::discovery::agy_env_fallback_allowed(home_override) => {
             let env_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS")
@@ -4200,6 +4217,61 @@ fn delete_agy_cascade_trajectories(
         None => (None, None),
     };
 
+    if cascade_ids.is_empty() || ls_addr.is_none() {
+        let known_id = record
+            .vendor_session_id
+            .as_deref()
+            .and_then(native_cascade_id)
+            .or_else(|| cascade_ids.iter().find_map(|id| native_cascade_id(id)));
+        let host_target = record
+            .tmux_target
+            .clone()
+            .unwrap_or_else(|| hosted_tmux_target("antigravity", &record.persona));
+        let recovered = resolve_agy_session(
+            &AgySessionRequest {
+                hosted_id: &record.session_id,
+                host_target: &host_target,
+                known_cascade_id: known_id.as_deref(),
+                cached_route: None,
+                allow_host_probe: env.spawn_runtime && env.runtime.allows_host_process_probe(),
+                host_endpoint: None,
+            },
+            deadline,
+        );
+        match recovered {
+            Ok(resolved) => {
+                // Recovered evidence never turns legacy placeholders into deletion targets.
+                cascade_ids.retain(|id| native_cascade_id(id).is_some());
+                if let Some(id) = resolved.cascade_id {
+                    push_tombstone(&mut cascade_ids, &id);
+                    push_tombstone(tombstone_ids, &id);
+                }
+                if let Some(connection) = resolved.endpoint {
+                    ls_addr = Some(connection.address);
+                    csrf = Some(connection.csrf_token);
+                } else if known_id.is_none() {
+                    // A newly recovered identity cannot borrow an unrelated ambient endpoint.
+                    ls_addr = None;
+                    csrf = None;
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "fl-hub: Antigravity cleanup discovery refused for session `{}`: {error}; continuing teardown",
+                    record.session_id
+                );
+                return;
+            }
+        }
+    }
+    if cascade_ids.is_empty() {
+        eprintln!(
+            "fl-hub: Antigravity DeleteCascadeTrajectory skipped for session `{}`: no verified native cascade id; continuing teardown",
+            record.session_id
+        );
+        return;
+    }
+
     let Some(addr) = ls_addr else {
         eprintln!(
             "fl-hub: Antigravity DeleteCascadeTrajectory skipped for session `{}` (cascades {:?}): \
@@ -4209,7 +4281,6 @@ fn delete_agy_cascade_trajectories(
         return;
     };
 
-    let deadline = std::time::Instant::now() + AGY_DELETE_CASCADE_DEADLINE;
     for cascade_id in &cascade_ids {
         let Some(remaining) = deadline
             .checked_duration_since(std::time::Instant::now())
@@ -4664,7 +4735,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             push_tombstone(&mut tombstone_ids, tid);
         }
     }
-    delete_agy_cascade_trajectories(env.home_override, &record, target, &tombstone_ids);
+    delete_agy_cascade_trajectories(env, &record, target, &mut tombstone_ids);
     if (env.spawn_runtime || env.home_override.is_some())
         && let Some(adapter) = env.host_vendor_adapter(&record.vendor)
     {

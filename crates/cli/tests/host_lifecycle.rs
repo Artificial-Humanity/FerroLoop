@@ -800,3 +800,194 @@ fn hub_remodel_owner_refusal_child() {
     assert_eq!(before_registry, store.registry_events_after(0).unwrap());
     assert_eq!(before_routes, std::fs::read(&routes_path).unwrap());
 }
+
+/// A running vendor can expose its native identity through a child before it registers a route.
+#[cfg(target_os = "linux")]
+#[test]
+fn agy_teardown_recovers_missing_route_identity_and_paired_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cid = "4df33135-e9a4-4f85-adfd-3b09dc339628";
+    std::fs::write(f.root.path().join("vendor"), format!(
+        "#!/bin/sh\nANTIGRAVITY_CONVERSATION_ID={cid} ANTIGRAVITY_LS_ADDRESS={addr} ANTIGRAVITY_CSRF_TOKEN=fixture-token /bin/sleep 60 &\nwait\n"
+    )).unwrap();
+    f.spin("antigravity", false);
+    assert!(!f.root.path().join(".cache/agent-bus/routes.json").exists());
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(cid.len()).any(|w| w == cid.as_bytes()) {
+                        let n = stream.read(&mut buf).unwrap();
+                        assert!(n > 0 && request.len() < 8192);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .unwrap();
+                    return String::from_utf8(request).unwrap();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return String::new();
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("mock server: {e}"),
+            }
+        }
+    });
+    let out = f.teardown("antigravity");
+    assert_eq!(out["runtime_stopped"], true);
+    let request = server.join().unwrap();
+    assert!(
+        request.contains("/DeleteCascadeTrajectory"),
+        "missing-route teardown skipped deletion"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-codeium-csrf-token: fixture-token")
+    );
+    assert!(request.contains(cid));
+    let entries = f.json(&["state", "list", "--concern", "runtime", "--json"], true);
+    let record = &entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["slug"] == "hosted-session-antigravity-ada")
+        .unwrap()["payload"]["runtime"]["value"];
+    assert!(
+        record["tombstone_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == cid),
+        "recovered identity must survive teardown in durable tombstones"
+    );
+}
+
+/// Host IPC discovery uses the same total budget and rejects replacement streams and owners.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agy_cleanup_resolver_rechecks_host_owner_epoch_and_deadline() {
+    use fl_host_proto::{
+        ExtensionRequest as Req, ExtensionResponse as Resp, HostConfig, HostListener, HostRequest,
+        HostResponse,
+    };
+    use fl_wire::vendor_adapter::antigravity_session::{
+        AgyResolutionError, AgySessionRequest, resolve_agy_session,
+    };
+    for mode in ["foreign", "epoch", "pid", "stall"] {
+        let (f, summary) = tokio::task::spawn_blocking(|| {
+            let f = Fixture::new();
+            f.raw_spawn("Ada.antigravity", Some("antigravity:ada"));
+            let summary = f
+                .rpc()
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.stream.session.as_str() == "Ada.antigravity")
+                .unwrap();
+            (f, summary)
+        })
+        .await
+        .unwrap();
+        let endpoint = HostEndpoint::unix(f.root.path().join("probe.sock")).unwrap();
+        let listener = HostListener::bind(HostConfig::new(endpoint.clone()))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut listener = listener;
+            let mut conn = listener.accept().await.unwrap();
+            let mut lists = 0;
+            while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                if mode == "stall" {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    break;
+                }
+                let response = match request {
+                    Req::Capabilities => Resp::Capabilities {
+                        host: summary.stream.host.clone(),
+                        features: fl_host_proto::RELIABLE_FEATURE
+                            | fl_host_proto::SESSION_OWNER_FEATURE,
+                        limits: Default::default(),
+                    },
+                    Req::ListSessions => {
+                        lists += 1;
+                        let mut changed = summary.clone();
+                        if lists > 1 {
+                            if mode == "epoch" {
+                                changed.stream.epoch.0 += 1;
+                            }
+                            if mode == "pid"
+                                && let ChildState::Running(ref mut child) = changed.state
+                            {
+                                child.pid += 1;
+                            }
+                        }
+                        Resp::Sessions {
+                            records: vec![changed],
+                        }
+                    }
+                    Req::CheckSessionOwner { .. } => Resp::SessionOwner {
+                        matches: mode != "foreign",
+                    },
+                    unexpected => panic!("unexpected resolver request: {unexpected:?}"),
+                };
+                if conn
+                    .respond(&HostResponse::Extended { id, response })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let elapsed = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            resolve_agy_session(
+                &AgySessionRequest {
+                    hosted_id: "antigravity:ada",
+                    host_target: "Ada.antigravity",
+                    known_cascade_id: Some("4df33135-e9a4-4f85-adfd-3b09dc339628"),
+                    cached_route: None,
+                    allow_host_probe: true,
+                    host_endpoint: Some(&endpoint),
+                },
+                Instant::now() + Duration::from_millis(if mode == "stall" { 150 } else { 2000 }),
+            )
+        })
+        .await
+        .unwrap();
+        let elapsed = elapsed.elapsed();
+        server.abort();
+        let _ = server.await;
+        tokio::task::spawn_blocking(move || drop(f)).await.unwrap();
+        assert_eq!(
+            result,
+            Err(if mode == "stall" {
+                AgyResolutionError::Limit
+            } else {
+                AgyResolutionError::Host
+            }),
+            "{mode}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "host stall must not use default 10s frame timeout"
+        );
+    }
+}
