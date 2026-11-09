@@ -315,12 +315,11 @@ impl AsyncHostClient {
             let evicted = diagnostic
                 .as_ref()
                 .is_some_and(|s| s.recent_evictions.contains(&stream));
-            let identity = serde_json::to_string(&stream).expect("stream identity");
-            return Err(HostError::Protocol(if evicted {
-                format!("PTY epoch evicted: {identity}")
+            return Err(if evicted {
+                HostError::PtyEpochEvicted { stream }
             } else {
-                format!("stale epoch (possibly evicted; no recent eviction proof): {identity}")
-            }));
+                HostError::StaleEpoch { stream }
+            });
         }
         if pty_capacity
             && matches!(
@@ -1602,6 +1601,124 @@ mod extension_client_tests {
             .await
             .unwrap();
         assert!(client.read_response().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn diagnosed_extension_request_returns_typed_evicted_and_stale_epoch_errors() {
+        let host = crate::HostInstance::new([0x11; 16]);
+        let evicted_stream = crate::StreamId {
+            host: host.clone(),
+            session: SessionId::new("evicted-pty").unwrap(),
+            epoch: crate::SessionEpoch(7),
+        };
+        let stale_stream = crate::StreamId {
+            host,
+            session: SessionId::new("stale-pty").unwrap(),
+            epoch: crate::SessionEpoch(3),
+        };
+        for (target, expected_evicted) in [(evicted_stream.clone(), true), (stale_stream, false)] {
+            let (left, mut right) = tokio::io::duplex(64 * 1024);
+            let mut client = AsyncHostClient {
+                io: ClientIo::Mem(left),
+                major: 1,
+                minor: 1,
+                correlator: ClientCorrelator::new(),
+                frame_timeout: Duration::from_secs(1),
+                write_timeout: Duration::from_secs(1),
+                mode: SessionMode::Rpc,
+                endpoint: None,
+            };
+            let evicted_for_server = evicted_stream.clone();
+            let server = tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let frame = auth::read_frame_async(&mut right, deadline, false)
+                    .await
+                    .unwrap();
+                let HostRequest::Extended { id, .. } =
+                    crate::decode_request_for_minor(1, &frame).unwrap()
+                else {
+                    panic!("expected extended request");
+                };
+                let refused = crate::encode_response_for_minor(
+                    1,
+                    &HostResponse::Extended {
+                        id,
+                        response: crate::ExtensionResponse::Refused {
+                            code: crate::ExtensionRefusal::StaleEpoch,
+                        },
+                    },
+                )
+                .unwrap();
+                auth::write_frame_async(&mut right, &refused, deadline)
+                    .await
+                    .unwrap();
+                let frame = auth::read_frame_async(&mut right, deadline, false)
+                    .await
+                    .unwrap();
+                let HostRequest::Extended {
+                    id,
+                    request: crate::ExtensionRequest::Capabilities,
+                } = crate::decode_request_for_minor(1, &frame).unwrap()
+                else {
+                    panic!("expected capabilities query");
+                };
+                let caps = crate::encode_response_for_minor(
+                    1,
+                    &HostResponse::Extended {
+                        id,
+                        response: crate::ExtensionResponse::Capabilities {
+                            host: evicted_for_server.host.clone(),
+                            features: crate::PTY_RETENTION_FEATURE,
+                            limits: crate::ExtensionLimits::default(),
+                        },
+                    },
+                )
+                .unwrap();
+                auth::write_frame_async(&mut right, &caps, deadline)
+                    .await
+                    .unwrap();
+                let frame = auth::read_frame_async(&mut right, deadline, false)
+                    .await
+                    .unwrap();
+                let HostRequest::Extended {
+                    id,
+                    request: crate::ExtensionRequest::PtyRetentionStatus,
+                } = crate::decode_request_for_minor(1, &frame).unwrap()
+                else {
+                    panic!("expected pty_retention_status query");
+                };
+                let status = crate::encode_response_for_minor(
+                    1,
+                    &HostResponse::Extended {
+                        id,
+                        response: crate::ExtensionResponse::PtyRetentionStatus {
+                            status: crate::PtyRetentionStatus {
+                                projection_reserved_bytes: 0,
+                                projection_limit_bytes: 1024,
+                                completed_pty_sessions: 0,
+                                completed_pty_limit: 8,
+                                evicted_total: 1,
+                                recent_evictions: vec![evicted_for_server],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                auth::write_frame_async(&mut right, &status, deadline)
+                    .await
+                    .unwrap();
+            });
+            let err = client
+                .claim_controller(target.clone())
+                .await
+                .expect_err("must fail with typed epoch error");
+            server.await.unwrap();
+            if expected_evicted {
+                assert_eq!(err, HostError::PtyEpochEvicted { stream: target });
+            } else {
+                assert_eq!(err, HostError::StaleEpoch { stream: target });
+            }
+        }
     }
 }
 

@@ -79,6 +79,14 @@ pub(crate) struct SessionParts {
     pub stdin: Option<File>,
 }
 
+#[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum ResizeError {
+    SessionFenced,
+    WrongMode,
+    Host(HostError),
+}
+
 impl Session {
     pub(crate) fn with_hosted_owner(mut self, owner: Option<&str>) -> Self {
         if let Some(owner) = owner.filter(|s| !s.is_empty() && s.len() <= self.hosted_owner.len()) {
@@ -144,49 +152,48 @@ impl Session {
             })?
             .snapshot()
     }
-    pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> Result<u64, HostError> {
+    pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> Result<u64, ResizeError> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
             let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
             let projection = projection.as_mut().ok_or_else(|| {
-                HostError::Protocol(
-                    if self
-                        .reliable
-                        .as_ref()
-                        .is_some_and(|journal| journal.pty_mode())
-                    {
-                        "SessionFenced"
-                    } else {
-                        "wrong session mode"
-                    }
-                    .into(),
-                )
-            })?;
-            projection.resize(cols, rows, || {
-                let master = self
-                    .resize_master
+                if self
+                    .reliable
                     .as_ref()
-                    .ok_or_else(|| HostError::Io("PTY master unavailable".into()))?;
-                let size = libc::winsize {
-                    ws_row: rows,
-                    ws_col: cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-                // Dedicated live duplicate, independent of the stdin writer's ownership.
-                if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
-                    return Err(HostError::Io(std::io::Error::last_os_error().to_string()));
+                    .is_some_and(|journal| journal.pty_mode())
+                {
+                    ResizeError::SessionFenced
+                } else {
+                    ResizeError::WrongMode
                 }
-                Ok(())
-            })
+            })?;
+            projection
+                .resize(cols, rows, || {
+                    let master = self
+                        .resize_master
+                        .as_ref()
+                        .ok_or_else(|| HostError::Io("PTY master unavailable".into()))?;
+                    let size = libc::winsize {
+                        ws_row: rows,
+                        ws_col: cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    // Dedicated live duplicate, independent of the stdin writer's ownership.
+                    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
+                        return Err(HostError::Io(std::io::Error::last_os_error().to_string()));
+                    }
+                    Ok(())
+                })
+                .map_err(ResizeError::Host)
         }
         #[cfg(not(unix))]
         {
             let _ = (cols, rows);
-            Err(HostError::Unsupported {
+            Err(ResizeError::Host(HostError::Unsupported {
                 subject: "pty resize",
-            })
+            }))
         }
     }
 
@@ -1298,9 +1305,10 @@ mod tests {
             session.capture_screen(),
             Err(fl_host_proto::ExtensionRefusal::SessionFenced)
         ));
-        assert!(
-            matches!(session.resize_pty(80, 24), Err(HostError::Protocol(reason)) if reason == "SessionFenced")
-        );
+        assert!(matches!(
+            session.resize_pty(80, 24),
+            Err(ResizeError::SessionFenced)
+        ));
         // Cleanup can precede EOF. Both admitted output and forced replay drops
         // must drain into the bounded raw tail without recreating the parser.
         let mut left = 80 * 1024;

@@ -348,7 +348,10 @@ async fn dispatch(
             };
             match writer.claim(conn_id, expected_epoch.0) {
                 Err(reason) => {
-                    let _ = tx.send(HostResponse::Failed { id, reason });
+                    let _ = tx.send(HostResponse::Failed {
+                        id,
+                        reason: reason.to_string(),
+                    });
                 }
                 Ok(rx) => schedule(tx, rx, id, move |counter| HostResponse::Lease {
                     id,
@@ -372,7 +375,10 @@ async fn dispatch(
             };
             match writer.signal(conn_id, expected_epoch.0, lease, signal) {
                 Err(reason) => {
-                    let _ = tx.send(HostResponse::Failed { id, reason });
+                    let _ = tx.send(HostResponse::Failed {
+                        id,
+                        reason: reason.to_string(),
+                    });
                 }
                 Ok(rx) => schedule(tx, rx, id, move |_| HostResponse::Signaled { id }),
             }
@@ -392,7 +398,10 @@ async fn dispatch(
             };
             match writer.kill(conn_id, expected_epoch.0, lease) {
                 Err(reason) => {
-                    let _ = tx.send(HostResponse::Failed { id, reason });
+                    let _ = tx.send(HostResponse::Failed {
+                        id,
+                        reason: reason.to_string(),
+                    });
                 }
                 Ok(rx) => schedule(tx, rx, id, move |_| HostResponse::Killed { id }),
             }
@@ -402,7 +411,7 @@ async fn dispatch(
 
 fn schedule(
     tx: &UnboundedSender<HostResponse>,
-    rx: oneshot::Receiver<Result<u64, String>>,
+    rx: oneshot::Receiver<Result<u64, crate::input::ControlError>>,
     id: RequestId,
     success: impl FnOnce(u64) -> HostResponse + Send + 'static,
 ) {
@@ -410,7 +419,10 @@ fn schedule(
     tokio::spawn(async move {
         let response = match rx.await {
             Ok(Ok(counter)) => success(counter),
-            Ok(Err(reason)) => HostResponse::Failed { id, reason },
+            Ok(Err(reason)) => HostResponse::Failed {
+                id,
+                reason: reason.to_string(),
+            },
             Err(_) => return,
         };
         let _ = tx.send(response);
@@ -790,7 +802,7 @@ pub(super) async fn extended(
                 )?
                 .await
                 .map_err(|_| Refusal::SessionFenced)?
-                .map_err(|reason| crate::input::control_refusal(&reason))?;
+                .map_err(crate::input::ControlError::into_refusal)?;
             Ok(XResp::Resized {
                 cols,
                 rows,
@@ -876,13 +888,18 @@ async fn reliable_hold(
     phase: &str,
     cancellable: bool,
 ) -> bool {
+    let timeout = if cancellable {
+        std::time::Duration::from_secs(30)
+    } else {
+        std::time::Duration::from_secs(5)
+    };
     reliable_hold_until(
         host,
         conn,
         state,
         phase,
         cancellable,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        std::time::Instant::now() + timeout,
     )
     .await
 }
@@ -923,10 +940,27 @@ async fn run_extension(
     let mut parked = None;
     loop {
         if host.stop.load(Ordering::SeqCst)
-            || stream_state.cancelled()
             || conn.peer_closed()
             || !host.authority.connection_live(rpc)
         {
+            break;
+        }
+        if stream_state.cancelled() {
+            if journal.compacted()
+                && let Ok(_wire) = crate::slice_budget::reserve(
+                    journal.budget(),
+                    crate::slice_budget::ChargeKind::Viewer,
+                    256 * 1024,
+                )
+                && let Ok(frame) = fl_host_proto::encode_extension_frame(
+                    conn.negotiated_minor(),
+                    &fl_host_proto::ExtensionFrame::Notice {
+                        code: fl_host_proto::ExtensionRefusal::SessionFenced,
+                    },
+                )
+            {
+                let _ = conn.write_frame(&frame).await;
+            }
             break;
         }
         if let Some(gap) = active.gap() {
@@ -1025,12 +1059,12 @@ async fn run_extension(
             .max(1)
             .div_ceil(fl_host_proto::MAX_EXTENSION_PART);
         let mut complete = true;
+        let mut wrote_part = false;
         for index in 0..parts {
-            if !reliable_hold(host, conn, &stream_state, "reliable-before-part", true).await {
-                complete = false;
-                break;
-            }
-            if stream_state.cancelled() || !host.authority.connection_live(rpc) {
+            if !reliable_hold(host, conn, &stream_state, "reliable-before-part", true).await
+                || stream_state.cancelled()
+                || !host.authority.connection_live(rpc)
+            {
                 complete = false;
                 break;
             }
@@ -1084,6 +1118,7 @@ async fn run_extension(
                     complete = false;
                     break;
                 }
+                wrote_part = true;
                 if conn.write_frame_until(&frame, deadline).await.is_err() {
                     complete = false;
                     break;
@@ -1104,9 +1139,12 @@ async fn run_extension(
                 if let Some(final_write) = final_write {
                     final_write.complete();
                 }
-            } else if conn.write_frame(&frame).await.is_err() {
-                complete = false;
-                break;
+            } else {
+                wrote_part = true;
+                if conn.write_frame(&frame).await.is_err() {
+                    complete = false;
+                    break;
+                }
             }
             if index + 1 < parts
                 && !reliable_hold(host, conn, &stream_state, "reliable-after-part", true).await
@@ -1116,6 +1154,20 @@ async fn run_extension(
             }
         }
         if !complete {
+            if !wrote_part
+                && journal.compacted()
+                && !host.stop.load(Ordering::SeqCst)
+                && !conn.peer_closed()
+                && host.authority.connection_live(rpc)
+                && let Ok(frame) = fl_host_proto::encode_extension_frame(
+                    conn.negotiated_minor(),
+                    &fl_host_proto::ExtensionFrame::Notice {
+                        code: fl_host_proto::ExtensionRefusal::SessionFenced,
+                    },
+                )
+            {
+                let _ = conn.write_frame(&frame).await;
+            }
             parked = Some(record);
             break;
         }
