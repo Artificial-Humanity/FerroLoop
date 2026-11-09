@@ -1007,6 +1007,53 @@ describe("optimistic prompt preservation", () => {
     ).toHaveLength(0);
   });
 
+  it("matches and prunes a slow-delivery turn under the 2s anchored window when sentAt is anchored to pre-dispatch accepted_at", () => {
+    const preDispatchAcceptedIso = new Date(10_000).toISOString();
+    const diskTurnCreatedIso = new Date(11_000).toISOString();
+    const responseReceivedAtMs = 16_000;
+
+    // Pre-dispatch accepted_at at t = 10_000, disk turn written during delivery at t = 11_000,
+    // and HTTP delivery response arriving at t = 16_000 (5s after the disk turn was written):
+    const anchoredPrompt = {
+      content: "Deploy the hotfix",
+      sentAt: resolvePromptSentAtMs(preDispatchAcceptedIso, responseReceivedAtMs),
+      sentAtAnchored: true,
+      agentKey: "ferris",
+    };
+    expect(anchoredPrompt.sentAt).toBe(10_000);
+
+    const turnsAfterSlowDelivery: TranscriptTurn[] = [
+      ...diskTurns,
+      turn({
+        index: 8,
+        role: "user",
+        content: "Deploy the hotfix",
+        created_at: diskTurnCreatedIso,
+      }),
+    ];
+
+    expect(
+      preserveOptimisticTurn(
+        turnsAfterSlowDelivery,
+        anchoredPrompt,
+        responseReceivedAtMs,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toBe(turnsAfterSlowDelivery);
+    expect(
+      pruneOptimisticPrompts(
+        [anchoredPrompt],
+        turnsAfterSlowDelivery,
+        responseReceivedAtMs,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+  });
+
   it("polls faster while the session is busy", () => {
     expect(transcriptPollIntervalMs(true)).toBe(2_000);
     expect(transcriptPollIntervalMs(false)).toBe(3_500);
@@ -2738,8 +2785,11 @@ describe("App transcript observation ownership", () => {
       expect(within(screen.getByTestId("turn-card-2")).getByText("yes")).toBeInTheDocument();
     });
 
-    // Once the second "yes" lands on disk and a third "yes" arrives 10s later via prompt_sent with accepted_at,
-    // the third "yes" stays visible as turn-card-4 across the post-event transcript refresh:
+    // Once the second "yes" lands on disk during delivery (created_at at baseMs + 11_000, 1s after
+    // pre-dispatch accepted_at at baseMs + 10_000, even if delivery finished 5s later at baseMs + 16_000),
+    // it matches and prunes the second optimistic "yes" without duplication; a third "yes" arriving at
+    // baseMs + 20_000 via prompt_sent with accepted_at stays visible as turn-card-4:
+    const secondYesDiskCreatedIso = new Date(baseMs + 11_000).toISOString();
     const thirdYesAcceptedIso = new Date(baseMs + 20_000).toISOString();
     h.setRead(async () =>
       response({
@@ -2747,8 +2797,8 @@ describe("App transcript observation ownership", () => {
         turns: [
           turn({ index: 0, role: "user", content: "yes", created_at: firstYesIso }),
           turn({ index: 1, role: "assistant", content: "Proceed with step 2?", created_at: new Date(baseMs + 5_000).toISOString() }),
-          turn({ index: 2, role: "user", content: "yes", created_at: secondYesAcceptedIso }),
-          turn({ index: 3, role: "assistant", content: "Proceed with step 3?", created_at: new Date(baseMs + 12_000).toISOString() }),
+          turn({ index: 2, role: "user", content: "yes", created_at: secondYesDiskCreatedIso }),
+          turn({ index: 3, role: "assistant", content: "Proceed with step 3?", created_at: new Date(baseMs + 16_000).toISOString() }),
         ],
         queue: [],
         is_busy: true,
@@ -2762,7 +2812,9 @@ describe("App transcript observation ownership", () => {
       accepted_at: thirdYesAcceptedIso,
     });
     await waitFor(() => {
+      expect(within(screen.getByTestId("turn-card-3")).getByText("Proceed with step 3?")).toBeInTheDocument();
       expect(within(screen.getByTestId("turn-card-4")).getByText("yes")).toBeInTheDocument();
+      expect(screen.queryByTestId("turn-card-5")).toBeNull();
     });
     h.unmount();
   });
