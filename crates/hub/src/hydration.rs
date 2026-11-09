@@ -210,6 +210,13 @@ impl Context {
                     }
                 }
                 (Ok(None), Ok(None)) if canonical_dir(cwd).is_some_and(|p| p.starts_with(root)) => {}
+                // A project umbrella may host its router and sibling repositories. Only
+                // the canonical non-Git direct child of the established workspace is trusted.
+                (Ok(_), Ok(None)) if canonical_dir(cwd).is_some_and(|cwd| {
+                    context.workspace.as_ref().is_some_and(|workspace| {
+                        cwd.parent() == Some(workspace.as_path()) && root.starts_with(&cwd)
+                    })
+                }) => {}
                 _ => context.warnings.push(format!("cwd is outside project {name} or its repository identity is unavailable; using registered project guidance")),
             }
         }
@@ -233,12 +240,24 @@ fn regular_file(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok().filter(|p| p.is_file())
 }
 
+#[cfg(test)]
 pub(crate) fn render(
+    context: Context,
+    name: &str,
+    project: &str,
+    role: &str,
+    guidance: RoleGuidance<'_>,
+) -> HydrationPrompt {
+    render_with_generation(context, name, project, role, guidance, None)
+}
+
+pub(crate) fn render_with_generation(
     mut context: Context,
     name: &str,
     project: &str,
     role: &str,
     guidance: RoleGuidance<'_>,
+    generation: Option<&str>,
 ) -> HydrationPrompt {
     let residence = context
         .project
@@ -315,6 +334,10 @@ pub(crate) fn render(
         (dirs.len() == 1).then(|| regular_file(&dirs[0].join("STATE.md"))).flatten()
     }).map(|path| format!("Optional legacy reference: skim `{}`; FerroState wins wherever the two disagree. Do not require it.\n", path.display())).unwrap_or_default();
     let name_lower = name.to_ascii_lowercase();
+    let register_env = match generation.map(str::trim).filter(|g| !g.is_empty()) {
+        Some(g) => format!("AGENT_PERSONA={name_lower} AGENT_HYDRATION_GENERATION={g}"),
+        None => format!("AGENT_PERSONA={name_lower}"),
+    };
     let scope = crate::api::project_state_scope(project);
     let render_scopes = if scope == "workspace" {
         "--scope workspace".into()
@@ -330,7 +353,7 @@ pub(crate) fn render(
          4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state handoff get --scope {scope} --key {name_lower}` for your own latest handoff (if it reports none, `fl state handoff get --scope {scope}` reads the shared `current` handoff), and `fl state search \"<query>\"` to look up anything specific.\n\
          {legacy}\
          5. Re-register your active session route so FerroWire and FerroDeck track this fresh session:\n\
-         ```bash\nAGENT_PERSONA={name_lower} fl wire register {name} --project {project} --role {role} --replace\n```\n\
+         ```bash\n{register_env} fl wire register {name} --project {project} --role {role} --replace\n```\n\
          6. Check and acknowledge any pending FerroWire messages:\n\
          ```bash\nAGENT_PERSONA={name_lower} fl wire read --ack\n```\n\n\
          Identity summary: `{name}` | Co-author trailer: `Co-authored-by: {name} <{name_lower}@artificialhumanity.io>`"
@@ -440,6 +463,97 @@ mod tests {
         assert!(!result.text.contains("STATE.md"));
     }
 
+    #[test]
+    fn hydration_sonora_umbrella_accepts_only_the_non_git_workspace_child() {
+        let f = Fixture::new();
+        let umbrella = f.workspace.join("Sonora");
+        let root = umbrella.join("github");
+        let non_git_sibling = umbrella.join("notes");
+        let git_sibling = umbrella.join("website");
+        let unrelated = f.workspace.join("unrelated");
+        for dir in [
+            root.join(".git"),
+            non_git_sibling.clone(),
+            git_sibling.join(".git"),
+            unrelated.clone(),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+            std::fs::write(root.join(file), "registered guidance").unwrap();
+        }
+        f.bind(std::slice::from_ref(&root));
+        let result = f.prompt(&umbrella, "assistant", RoleGuidance::File);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(
+            result
+                .text
+                .contains(&format!("`{}`", root.join("AGENTS.md").display()))
+        );
+        for cwd in [
+            &f.workspace,
+            f.home.path(),
+            &non_git_sibling,
+            &git_sibling,
+            &unrelated,
+        ] {
+            let context = f.context(cwd);
+            assert_eq!(context.project.as_ref(), Some(&root));
+            assert!(
+                context
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("cwd is outside project")),
+                "{cwd:?}"
+            );
+        }
+        std::fs::write(umbrella.join(".git"), "gitdir: missing").unwrap();
+        assert!(!f.context(&umbrella).warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hydration_sonora_symlinks_cannot_widen_workspace_containment() {
+        let f = Fixture::new();
+        let external = f.home.path().join("external");
+        let root = external.join("github");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let umbrella_link = f.workspace.join("Sonora");
+        std::os::unix::fs::symlink(&external, &umbrella_link).unwrap();
+        f.bind(&[umbrella_link.join("github")]);
+        let context = Context::resolve(
+            &f.store,
+            Some(f.home.path()),
+            Some(&f.workspace),
+            Some(&umbrella_link),
+            "logical-name",
+        );
+        assert_eq!(context.project.as_ref(), Some(&root));
+        assert!(!context.warnings.is_empty());
+        let real_umbrella = f.workspace.join("Real");
+        std::fs::create_dir(&real_umbrella).unwrap();
+        std::os::unix::fs::symlink(&root, real_umbrella.join("github")).unwrap();
+        f.bind(&[real_umbrella.join("github")]);
+        assert!(!f.context(&real_umbrella).warnings.is_empty());
+    }
+
+    #[test]
+    fn hydration_without_workspace_never_accepts_filesystem_root() {
+        let f = Fixture::new();
+        let root = f.home.path().join("standalone");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        f.bind(std::slice::from_ref(&root));
+        let cwd = root.ancestors().last().unwrap();
+        let context = f.context(cwd);
+        assert!(context.workspace.is_none());
+        assert!(
+            context
+                .warnings
+                .iter()
+                .any(|w| w.contains("cwd is outside project"))
+        );
+    }
+
     fn subproject_fixture() -> (Fixture, PathBuf, PathBuf) {
         let f = Fixture::new();
         let repo = f.project.parent().unwrap().to_path_buf();
@@ -465,7 +579,10 @@ mod tests {
     #[test]
     fn hydration_subproject_selects_only_corresponding_same_repository_guidance() {
         let (f, worktree, subproject) = subproject_fixture();
+        let sibling = worktree.join("sibling");
+        std::fs::create_dir(&sibling).unwrap();
         for (cwd, expected) in [
+            (&sibling, &subproject),
             (&f.project, &f.project),
             (&worktree, &subproject),
             (&subproject, &subproject),

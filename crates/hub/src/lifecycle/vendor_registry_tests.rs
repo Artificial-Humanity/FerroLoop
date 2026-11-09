@@ -704,6 +704,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         context_window: None,
         hydration_dispatched: false,
         hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+        hydration_generation: None,
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
         vendor_session_id: None,

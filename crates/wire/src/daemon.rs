@@ -193,6 +193,32 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from("/tmp/fl-wire.sock")
 }
 
+pub fn resolve_socket_path(
+    explicit: Option<&Path>,
+    configured: Option<&Path>,
+    explicit_db: Option<&Path>,
+) -> PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    if let Some(s) = std::env::var_os("FL_WIRE_SOCKET") {
+        let p = PathBuf::from(s);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    if let Some(p) = configured {
+        return p.to_path_buf();
+    }
+    if let Some(dir) = explicit_db
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty())
+    {
+        return dir.join("fl-wire.sock");
+    }
+    default_socket_path()
+}
+
 fn now_at() -> At {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5750,5 +5776,75 @@ mod tests {
             lock(&rig.inner.subscribers).is_empty(),
             "slow subscriber exceeding MAX_SUBSCRIBER_BUFFER must be dropped via try_send"
         );
+    }
+
+    #[test]
+    fn resolve_socket_path_follows_precedence_and_ignores_relative_env() {
+        struct SocketEnvGuard(Option<std::ffi::OsString>);
+        impl Drop for SocketEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("FL_WIRE_SOCKET", v),
+                        None => std::env::remove_var("FL_WIRE_SOCKET"),
+                    }
+                }
+            }
+        }
+
+        let _tmux_lock = crate::dispatcher::TMUX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _codex_lock = crate::dispatcher::CODEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_guard = SocketEnvGuard(std::env::var_os("FL_WIRE_SOCKET"));
+
+        let explicit = Path::new("/tmp/explicit-wire.sock");
+        let configured = Path::new("/tmp/configured-wire.sock");
+        let explicit_db = Path::new("/tmp/custom-db-dir/store.redb");
+        let env_abs = Path::new("/tmp/env-wire.sock");
+
+        // SAFETY: guarded by TMUX_ENV_LOCK and CODEX_ENV_LOCK; restored by _env_guard.
+        unsafe {
+            std::env::set_var("FL_WIRE_SOCKET", env_abs);
+        }
+
+        // 1. Explicit path wins over FL_WIRE_SOCKET, configured, and explicit_db.
+        assert_eq!(
+            resolve_socket_path(Some(explicit), Some(configured), Some(explicit_db)),
+            explicit
+        );
+
+        // 2. Absolute FL_WIRE_SOCKET wins over configured and explicit_db.
+        assert_eq!(
+            resolve_socket_path(None, Some(configured), Some(explicit_db)),
+            env_abs
+        );
+
+        // 3. Relative FL_WIRE_SOCKET is ignored; configured path wins over explicit_db.
+        unsafe {
+            std::env::set_var("FL_WIRE_SOCKET", "relative/wire.sock");
+        }
+        assert_eq!(
+            resolve_socket_path(None, Some(configured), Some(explicit_db)),
+            configured
+        );
+
+        // 4. Without explicit/env/configured, explicit_db parent directory supplies fl-wire.sock.
+        assert_eq!(
+            resolve_socket_path(None, None, Some(explicit_db)),
+            PathBuf::from("/tmp/custom-db-dir/fl-wire.sock")
+        );
+
+        // 5. Bare filename explicit_db (empty parent) falls back to default_socket_path().
+        unsafe {
+            std::env::remove_var("FL_WIRE_SOCKET");
+        }
+        assert_eq!(
+            resolve_socket_path(None, None, Some(Path::new("store.redb"))),
+            default_socket_path()
+        );
+        assert_eq!(resolve_socket_path(None, None, None), default_socket_path());
     }
 }

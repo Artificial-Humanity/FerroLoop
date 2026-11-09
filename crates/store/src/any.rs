@@ -1238,6 +1238,7 @@ delegate! {
         fn retire_memory(&self, scope: &StateScope, slug: &str, lifecycle: MemoryLifecycle, superseded_by: Option<StateId>, at: At, by: &str) -> Result<StateEntry, StoreError>;
         fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError>;
         fn get_state_by_key(&self, scope: &StateScope, concern: StateConcern, slug: &str) -> Result<Option<StateEntry>, StoreError>;
+        fn delete_state_by_key(&self, scope: &StateScope, concern: StateConcern, slug: &str) -> Result<bool, StoreError>;
         fn list_state(&self, scope: Option<&StateScope>, concern: Option<StateConcern>) -> Result<Vec<StateEntry>, StoreError>;
         fn state_revisions(&self, id: &StateId) -> Result<Vec<StateRevision>, StoreError>;
         fn list_conflicts(&self) -> Result<Vec<StateConflict>, StoreError>;
