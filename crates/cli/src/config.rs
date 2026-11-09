@@ -675,7 +675,12 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
     };
-    let mut file: File = toml::from_str(&text)
+    parse(path, &text)
+}
+
+/// Parse already-read configuration. Inventory supplies bounded, alias-checked bytes.
+pub fn parse(path: &Path, text: &str) -> Result<Config> {
+    let mut file: File = toml::from_str(text)
         .with_context(|| format!("{} is not a valid fl config", path.display()))?;
     if let Some(st) = &file.state {
         if let Some(s) = &st.store

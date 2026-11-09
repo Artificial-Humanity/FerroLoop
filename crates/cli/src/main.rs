@@ -109,6 +109,9 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::store::Cmd,
     },
+    /// Inspect recovery metadata without opening stores.
+    #[command(subcommand)]
+    Recovery(cmd::recovery::Cmd),
     /// Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway.
     #[command(visible_alias = "gateway")]
     Vault {
@@ -166,6 +169,7 @@ impl Command {
             | Command::Hub { .. }
             | Command::Host { .. }
             | Command::Store { .. }
+            | Command::Recovery(_)
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
@@ -213,6 +217,7 @@ impl Command {
             | Command::Hub { .. }
             | Command::Host { .. }
             | Command::Store { .. }
+            | Command::Recovery(_)
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
@@ -249,6 +254,7 @@ impl Command {
             | Command::Hub { .. }
             | Command::Host { .. }
             | Command::Store { .. }
+            | Command::Recovery(_)
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
@@ -290,6 +296,7 @@ impl Command {
             | Command::Hub { .. }
             | Command::Host { .. }
             | Command::Store { .. }
+            | Command::Recovery(_)
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
@@ -935,6 +942,15 @@ fn run_mcp_entry() -> Result<i32> {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // Inventory must validate metadata artifacts before even reading config.
+    let cli = match cli {
+        Cli {
+            db,
+            command: Command::Recovery(cmd),
+        } => return cmd::recovery::run(cmd, db),
+        other => other,
+    };
+
     // `fl install` plans from a manifest and the install prefix alone: it opens no store and
     // reads no project config, so a broken config cannot stop it and it cannot touch one.
     let cli = match cli {
@@ -1640,6 +1656,7 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Arch { .. }
         | Command::Hub { .. }
         | Command::Store { .. }
+        | Command::Recovery(_)
         | Command::Vault { .. }
         | Command::Auth { .. }
         | Command::Watch { .. }
