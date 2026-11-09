@@ -1679,7 +1679,7 @@ fn all_wire_receipts_by_message(store: &AnyStore) -> BTreeMap<MessageId, Vec<Del
 #[cfg(test)]
 const WIRE_STATUS_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
-const WIRE_STATUS_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+const WIRE_STATUS_RPC_TIMEOUT: Duration = Duration::from_millis(1250);
 
 /// Observed local `fl-wire` daemon status for `GET /api/v1/wire/status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1697,6 +1697,33 @@ pub struct HubWireStatusResponse {
     pub dispatch_diagnostics: Option<HubDispatchDiagnostics>,
     pub pending_recipients_available: bool,
     pub pending_recipients: Vec<HubRecipientPendingSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_queues: Vec<HubCodexRouteQueueStatus>,
+}
+
+/// Allowlist projection of [`fl_wire::daemon::CodexRouteQueueStatus`] (omits raw `thread_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubCodexRouteQueueStatus {
+    pub persona: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub queue: fl_wire::daemon::CodexQueueInspection,
+}
+
+impl HubCodexRouteQueueStatus {
+    fn from_wire(row: fl_wire::daemon::CodexRouteQueueStatus) -> Self {
+        let fl_wire::daemon::CodexRouteQueueStatus {
+            persona,
+            project,
+            thread_id: _,
+            queue,
+        } = row;
+        Self {
+            persona,
+            project,
+            queue,
+        }
+    }
 }
 
 /// Allowlist projection of [`fl_wire::dispatch_diagnostics::DispatchDiagnostics`].
@@ -1885,6 +1912,7 @@ impl HubWireStatusResponse {
             routes: _,
             dispatch_diagnostics,
             pending_recipients,
+            codex_queues,
         } = status;
         Self {
             daemon: WireDaemonState::Active,
@@ -1893,6 +1921,10 @@ impl HubWireStatusResponse {
             pending_recipients: pending_recipients
                 .into_iter()
                 .map(HubRecipientPendingSummary::from_wire)
+                .collect(),
+            codex_queues: codex_queues
+                .into_iter()
+                .map(HubCodexRouteQueueStatus::from_wire)
                 .collect(),
         }
     }
@@ -1955,6 +1987,7 @@ fn handle_get_wire_status(state: &HubState) -> HttpResponse {
                 dispatch_diagnostics: None,
                 pending_recipients_available,
                 pending_recipients,
+                codex_queues: Vec::new(),
             }
         }
         WireDaemonProbe::Unreachable => {
@@ -1968,6 +2001,7 @@ fn handle_get_wire_status(state: &HubState) -> HttpResponse {
                 dispatch_diagnostics: None,
                 pending_recipients_available,
                 pending_recipients,
+                codex_queues: Vec::new(),
             }
         }
     };
@@ -11100,6 +11134,7 @@ mod council_guidance_tests {
                     omitted_evidence_total_saturated: false,
                 }),
                 pending_recipients: vec![],
+                codex_queues: vec![],
             });
             writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
             stream.flush().unwrap();
@@ -11143,6 +11178,7 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(started_at),
                     oldest_pending_age_ms: Some(1500),
                 }],
+                codex_queues: vec![],
             });
             writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
             stream.flush().unwrap();
@@ -11269,6 +11305,18 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(ts_for_status),
                     oldest_pending_age_ms: Some(250),
                 }],
+                codex_queues: vec![fl_wire::daemon::CodexRouteQueueStatus {
+                    persona: "felix".into(),
+                    project: Some("ferroloop".into()),
+                    thread_id: Some("SECRET_CODEX_THREAD".into()),
+                    queue: fl_wire::daemon::CodexQueueInspection::Known {
+                        depth: 3,
+                        has_more: false,
+                        estimated_oldest_age_secs: Some(9),
+                        verified_codex_version: fl_wire::daemon::VERIFIED_CODEX_QUEUE_RPC_VERSION
+                            .into(),
+                    },
+                }],
             });
             writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
             stream.flush().unwrap();
@@ -11286,6 +11334,7 @@ mod council_guidance_tests {
             "token",
             "key_path",
             "SECRET_CSRF_TOKEN",
+            "SECRET_CODEX_THREAD",
             "/secret/key_path",
             "/secret/claude.sock",
         ] {
@@ -11312,6 +11361,11 @@ mod council_guidance_tests {
         assert_eq!(obs[1]["identity_digest"], "sha256:99aabbccddeeff00");
         assert_eq!(obs[1]["explicit"], false);
         assert_eq!(obs[1]["outcome"], "returned_error");
+        assert_eq!(body["codex_queues"][0]["persona"], "felix");
+        assert_eq!(body["codex_queues"][0]["project"], "ferroloop");
+        assert!(body["codex_queues"][0].get("thread_id").is_none());
+        assert_eq!(body["codex_queues"][0]["queue"]["state"], "known");
+        assert_eq!(body["codex_queues"][0]["queue"]["depth"], 3);
         let _ = server_handle.join();
     }
 }

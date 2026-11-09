@@ -34,6 +34,10 @@ use fl_core::ids::MessageId;
 use fl_core::store::{AgentRegistry, MessageStore};
 use serde::{Deserialize, Serialize};
 
+pub use crate::codex_control::{
+    CODEX_QUEUE_INSPECT_TIMEOUT, CODEX_QUEUE_LIST_LIMIT, CodexQueueInspection,
+    CodexRouteQueueStatus, VERIFIED_CODEX_QUEUE_RPC_VERSION, parse_uuid_v7_unix_ms,
+};
 use crate::dispatch_diagnostics::{
     DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
     FenceDiagnostic, FenceReason, SuppressionPhase,
@@ -305,6 +309,113 @@ pub struct DaemonStatus {
     pub dispatch_diagnostics: Option<DispatchDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_recipients: Vec<RecipientPendingSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_queues: Vec<CodexRouteQueueStatus>,
+}
+
+/// Inspect Codex app-server queue depth/age for all registered Codex routes in `routes`.
+///
+/// Must be called outside any daemon state lock: performs read-only WebSocket RPC over the
+/// Codex control socket, reusing a single handshake when multiple Codex routes share the socket.
+pub fn collect_codex_route_queues(
+    routes: &[RouteEntry],
+    registry: Option<&dyn AgentRegistry>,
+    home_override: Option<&Path>,
+    now_ms: u64,
+) -> Vec<CodexRouteQueueStatus> {
+    struct RouteSnapshot {
+        persona: String,
+        project: Option<String>,
+        thread_id: Option<String>,
+    }
+
+    let mut items = Vec::new();
+    for entry in routes {
+        let VendorRoute::Codex { thread_id, .. } = &entry.route else {
+            continue;
+        };
+        let trimmed_tid = thread_id.trim();
+        let project = registry
+            .and_then(|reg| reg.agent_by_name(&entry.persona).ok().flatten())
+            .map(|agent| agent.project)
+            .filter(|p| !p.trim().is_empty());
+        items.push(RouteSnapshot {
+            persona: entry.persona.clone(),
+            project,
+            thread_id: (!trimmed_tid.is_empty()).then(|| trimmed_tid.to_string()),
+        });
+    }
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let resolved_sock = if let Some(home) = home_override {
+        crate::codex_control::resolve_control_socket(None, None, None, Some(home.as_os_str()))
+    } else {
+        crate::codex_control::resolve_control_socket(
+            std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+            std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+            std::env::var_os("CODEX_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
+    };
+
+    match resolved_sock {
+        Ok(Some(sock)) => {
+            let thread_refs: Vec<&str> = items
+                .iter()
+                .map(|item| item.thread_id.as_deref().unwrap_or(""))
+                .collect();
+            let inspections = crate::codex_control::inspect_thread_queues(
+                &sock,
+                &thread_refs,
+                now_ms,
+                CODEX_QUEUE_INSPECT_TIMEOUT,
+            );
+            items
+                .into_iter()
+                .zip(inspections)
+                .map(|(item, queue)| CodexRouteQueueStatus {
+                    persona: item.persona,
+                    project: item.project,
+                    thread_id: item.thread_id,
+                    queue,
+                })
+                .collect()
+        }
+        Ok(None) => items
+            .into_iter()
+            .map(|item| {
+                let reason = if item.thread_id.is_none() {
+                    "Codex route has no thread_id"
+                } else {
+                    "Codex control socket disabled while FL_WIRE_CODEX_BIN is set without FL_WIRE_CODEX_CONTROL_SOCK"
+                };
+                CodexRouteQueueStatus {
+                    persona: item.persona,
+                    project: item.project,
+                    thread_id: item.thread_id,
+                    queue: CodexQueueInspection::unknown(reason, None),
+                }
+            })
+            .collect(),
+        Err(err) => items
+            .into_iter()
+            .map(|item| {
+                let reason = if item.thread_id.is_none() {
+                    "Codex route has no thread_id".to_string()
+                } else {
+                    err.clone()
+                };
+                CodexRouteQueueStatus {
+                    persona: item.persona,
+                    project: item.project,
+                    thread_id: item.thread_id,
+                    queue: CodexQueueInspection::unknown(reason, None),
+                }
+            })
+            .collect(),
+    }
 }
 
 pub fn collect_pending_recipient_summaries<S: MessageStore>(
@@ -1649,6 +1760,14 @@ where
                 let routes: Vec<RouteEntry> =
                     lock(&self.routes).entries.values().cloned().collect();
                 let pending_recipients = self.pending_recipients_snapshot(&now);
+                let dispatch_diagnostics = Some(self.diagnostics_snapshot());
+                // All daemon state mutexes are dropped before any store lookup or control-socket I/O.
+                let codex_queues = collect_codex_route_queues(
+                    &routes,
+                    Some(self.store.as_ref() as &dyn AgentRegistry),
+                    self.config.home_override.as_deref(),
+                    now.unix_millis(),
+                );
                 (
                     LocalResponse::Status(DaemonStatus {
                         node_id: self.config.node_id.clone(),
@@ -1657,8 +1776,9 @@ where
                         listen_addr: self.config.listen_addr.clone(),
                         connected_peers,
                         routes,
-                        dispatch_diagnostics: Some(self.diagnostics_snapshot()),
+                        dispatch_diagnostics,
                         pending_recipients,
+                        codex_queues,
                     }),
                     None,
                 )
@@ -5846,5 +5966,231 @@ mod tests {
             default_socket_path()
         );
         assert_eq!(resolve_socket_path(None, None, None), default_socket_path());
+    }
+
+    #[test]
+    fn status_populates_codex_queues_outside_daemon_state_locks_in_single_session() {
+        use crate::codex_control::fake_server::spawn_at;
+        use fl_core::agent::AgentRole;
+        use serde_json::json;
+
+        let rig = rig();
+        for (name, project) in [("Felix", "ferroloop"), ("Kacey", "ferroloop")] {
+            rig.inner
+                .store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: project.into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: now_at(),
+                    by: name.to_ascii_lowercase(),
+                })
+                .unwrap();
+        }
+
+        for (persona, route) in [
+            (
+                "felix",
+                VendorRoute::Codex {
+                    thread_id: "thread-felix".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "ghost",
+                VendorRoute::Codex {
+                    thread_id: "   ".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "kacey",
+                VendorRoute::Codex {
+                    thread_id: "thread-kacey".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "ada",
+                VendorRoute::Webhook {
+                    socket_path: rig._tmp.path().join("ada.sock"),
+                },
+            ),
+        ] {
+            let (resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: persona.into(),
+                route,
+                explicit: true,
+            });
+            assert!(matches!(resp, LocalResponse::RouteRegistered));
+        }
+
+        let control_sock = rig
+            ._tmp
+            .path()
+            .join(".codex/app-server-control/app-server-control.sock");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let now_ms = now_at().unix_millis();
+        let ts_ms = now_ms.saturating_sub(15_000);
+        let uuid_v7 = format!(
+            "{:08x}-{:04x}-7000-8000-000000000001",
+            (ts_ms >> 16) as u32,
+            (ts_ms & 0xFFFF) as u16
+        );
+
+        let server = spawn_at(&control_sock, move |c| {
+            c.handshake();
+            let init = c.expect_json();
+            assert_eq!(init["method"], "initialize");
+            entered_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            c.send_text(
+                &json!({
+                    "id": 1,
+                    "result": {
+                        "userAgent": format!("ferroloop/{VERIFIED_CODEX_QUEUE_RPC_VERSION} (Linux; x86_64)"),
+                        "codexHome": "/tmp/.codex",
+                        "platformFamily": "unix",
+                        "platformOs": "linux",
+                    }
+                })
+                .to_string(),
+            );
+            assert_eq!(c.expect_json()["method"], "initialized");
+
+            let q1 = c.expect_json();
+            assert_eq!(q1["id"], 2);
+            assert_eq!(q1["params"]["threadId"], "thread-felix");
+            c.send_text(
+                &json!({
+                    "id": 2,
+                    "result": {
+                        "data": [
+                            {"id": uuid_v7, "clientUserMessageId": "c1", "input": []},
+                            {"id": "msg-2", "clientUserMessageId": "c2", "input": []},
+                        ],
+                        "nextCursor": "100",
+                    }
+                })
+                .to_string(),
+            );
+
+            let q2 = c.expect_json();
+            assert_eq!(q2["id"], 3);
+            assert_eq!(q2["params"]["threadId"], "thread-kacey");
+            c.send_text(
+                &json!({
+                    "id": 3,
+                    "result": {
+                        "data": [],
+                        "nextCursor": null,
+                    }
+                })
+                .to_string(),
+            );
+            c.drain_until_eof();
+        });
+
+        let inner_for_status = Arc::clone(&rig.inner);
+        let status_thread =
+            std::thread::spawn(move || inner_for_status.handle_local_request(LocalRequest::Status));
+
+        // Wait until LocalRequest::Status is parked inside codex_control socket I/O.
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("status entered codex_control socket I/O");
+
+        // Prove no daemon state lock is held while Status waits on the control socket:
+        // mutating route table, enqueue_gate, and diagnostics all complete promptly.
+        let (reg_resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "concurrent".into(),
+            route: VendorRoute::Webhook {
+                socket_path: rig._tmp.path().join("concurrent.sock"),
+            },
+            explicit: true,
+        });
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+        let (unreg_resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::UnregisterRoute {
+                persona: "concurrent".into(),
+            });
+        assert!(matches!(unreg_resp, LocalResponse::RouteUnregistered));
+        let _ = rig.inner.diagnostics_snapshot();
+
+        resume_tx.send(()).unwrap();
+        let (LocalResponse::Status(status), _) = status_thread.join().unwrap() else {
+            panic!("expected Status");
+        };
+        let log = server.join().unwrap();
+        // Single WebSocket handshake + 1 initialize + 1 initialized + 2 thread/queue/list frames (+ close).
+        let text_methods: Vec<String> = log
+            .iter()
+            .filter(|f| f.opcode == 0x1)
+            .map(|f| f.json()["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            text_methods,
+            [
+                "initialize",
+                "initialized",
+                "thread/queue/list",
+                "thread/queue/list"
+            ]
+        );
+
+        assert_eq!(status.codex_queues.len(), 3);
+        assert_eq!(status.codex_queues[0].persona, "felix");
+        assert_eq!(status.codex_queues[0].project.as_deref(), Some("ferroloop"));
+        assert_eq!(
+            status.codex_queues[0].thread_id.as_deref(),
+            Some("thread-felix")
+        );
+        match &status.codex_queues[0].queue {
+            CodexQueueInspection::Known {
+                depth,
+                has_more,
+                estimated_oldest_age_secs,
+                verified_codex_version,
+            } => {
+                assert_eq!(*depth, 2);
+                assert!(*has_more);
+                let age = estimated_oldest_age_secs.expect("UUIDv7 oldest age");
+                assert!((14..=17).contains(&age), "unexpected age {age}");
+                assert_eq!(verified_codex_version, VERIFIED_CODEX_QUEUE_RPC_VERSION);
+            }
+            other => panic!("expected Known for felix, got {other:?}"),
+        }
+
+        assert_eq!(status.codex_queues[1].persona, "ghost");
+        assert_eq!(status.codex_queues[1].thread_id, None);
+        assert!(matches!(
+            &status.codex_queues[1].queue,
+            CodexQueueInspection::Unknown { reason, .. } if reason.contains("no thread_id")
+        ));
+
+        assert_eq!(status.codex_queues[2].persona, "kacey");
+        assert_eq!(status.codex_queues[2].project.as_deref(), Some("ferroloop"));
+        assert_eq!(
+            status.codex_queues[2].queue,
+            CodexQueueInspection::Known {
+                depth: 0,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+
+        // Older daemon JSON without `codex_queues` still deserializes cleanly to empty Vec.
+        let mut legacy_json = serde_json::to_value(&status).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("codex_queues");
+        let parsed: DaemonStatus = serde_json::from_value(legacy_json).unwrap();
+        assert!(parsed.codex_queues.is_empty());
     }
 }

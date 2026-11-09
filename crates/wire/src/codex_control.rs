@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ws::{WsError, compute_accept_key, read_http_headers};
@@ -31,6 +31,14 @@ use crate::ws::{WsError, compute_accept_key, read_http_headers};
 pub(crate) const COMPACT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Overall budget for active-turn socket connect, preflight, and acknowledgment.
 pub(crate) const STEER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Exact Codex CLI / app-server release against which `thread/queue/list` was verified.
+/// Any missing or differing server version fails closed to [`CodexQueueInspection::Unknown`].
+pub const VERIFIED_CODEX_QUEUE_RPC_VERSION: &str = "0.167.0";
+/// Page size requested from `thread/queue/list`. When `nextCursor` is non-empty, `has_more`
+/// marks the returned depth as a lower bound (`"at least N"`).
+pub const CODEX_QUEUE_LIST_LIMIT: u32 = 100;
+/// Connect, handshake, `initialize`, and `thread/queue/list` budget per control socket session.
+pub const CODEX_QUEUE_INSPECT_TIMEOUT: Duration = Duration::from_millis(750);
 /// Longest a single socket read may block.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest data frame or reassembled message accepted from the server.
@@ -127,6 +135,353 @@ pub(crate) fn compact_thread(
     // Best effort: the outcome is already decided.
     let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
     outcome
+}
+
+/// Read-only inspection result for a single Codex route's app-server submission queue.
+///
+/// An unverified, unreachable, timed-out, or rejected query is always [`Self::Unknown`] and
+/// never reports `depth: 0`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CodexQueueInspection {
+    Known {
+        depth: usize,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_oldest_age_secs: Option<u64>,
+        verified_codex_version: String,
+    },
+    Unknown {
+        reason: String,
+        verified_codex_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detected_codex_version: Option<String>,
+    },
+}
+
+impl CodexQueueInspection {
+    pub fn unknown(reason: impl Into<String>, detected_codex_version: Option<String>) -> Self {
+        Self::Unknown {
+            reason: reason.into(),
+            verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.to_string(),
+            detected_codex_version,
+        }
+    }
+}
+
+/// Display-only Codex queue visibility snapshot for one registered persona route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexRouteQueueStatus {
+    pub persona: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub queue: CodexQueueInspection,
+}
+
+/// Parse an RFC 9562 canonical `8-4-4-4-12` UUIDv7 string and extract its upper 48-bit
+/// big-endian Unix epoch timestamp in milliseconds. Returns `None` for any non-canonical
+/// format, non-hex character, non-v7 version nibble, or non-RFC-9562 (`0b10`) variant.
+pub fn parse_uuid_v7_unix_ms(id: &str) -> Option<u64> {
+    let raw = id.as_bytes();
+    if raw.len() != 36 {
+        return None;
+    }
+    if raw[8] != b'-' || raw[13] != b'-' || raw[18] != b'-' || raw[23] != b'-' {
+        return None;
+    }
+    fn hex_nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut bytes = [0u8; 16];
+    let mut src = 0usize;
+    for dst in &mut bytes {
+        if matches!(src, 8 | 13 | 18 | 23) {
+            src += 1;
+        }
+        let hi = hex_nibble(*raw.get(src)?)?;
+        let lo = hex_nibble(*raw.get(src + 1)?)?;
+        *dst = (hi << 4) | lo;
+        src += 2;
+    }
+    if src != 36 {
+        return None;
+    }
+    if (bytes[6] >> 4) != 7 || (bytes[8] >> 6) != 0b10 {
+        return None;
+    }
+    let ts_ms = (u64::from(bytes[0]) << 40)
+        | (u64::from(bytes[1]) << 32)
+        | (u64::from(bytes[2]) << 24)
+        | (u64::from(bytes[3]) << 16)
+        | (u64::from(bytes[4]) << 8)
+        | u64::from(bytes[5]);
+    Some(ts_ms)
+}
+
+pub(crate) fn estimate_uuid_v7_age_secs(id: &str, now_ms: u64) -> Option<u64> {
+    let ts_ms = parse_uuid_v7_unix_ms(id)?;
+    if ts_ms <= now_ms {
+        Some((now_ms - ts_ms) / 1000)
+    } else if ts_ms - now_ms <= 5_000 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn sanitize_version_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clean: String = trimmed
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
+/// Extract the Codex server semver from `InitializeResponse` (`userAgent` product token
+/// `<originator>/<version> ...` or fallback `serverInfo.version`).
+pub(crate) fn extract_codex_server_version(init_result: &Value) -> Option<String> {
+    if let Some(ua_val) = init_result.get("userAgent") {
+        let ua = ua_val.as_str()?;
+        let first_token = ua.split_whitespace().next()?;
+        let (product, version) = first_token.split_once('/')?;
+        if product.is_empty() || version.contains('/') {
+            return None;
+        }
+        return sanitize_version_token(version);
+    }
+    let version = init_result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .and_then(|info| info.get("version"))
+        .and_then(Value::as_str)?;
+    sanitize_version_token(version)
+}
+
+fn parse_queue_list_result(
+    result: &Value,
+    now_ms: u64,
+    detected: &Option<String>,
+) -> CodexQueueInspection {
+    let Some(data) = result.get("data").and_then(Value::as_array) else {
+        return CodexQueueInspection::unknown(
+            "Codex app-server sent a malformed `thread/queue/list` response: missing `data` array",
+            detected.clone(),
+        );
+    };
+    if !data.iter().all(Value::is_object) {
+        return CodexQueueInspection::unknown(
+            "Codex app-server sent a malformed `thread/queue/list` response: non-object queue item",
+            detected.clone(),
+        );
+    }
+    let has_more = match result.get("nextCursor") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(cursor)) => !cursor.trim().is_empty(),
+        Some(_) => {
+            return CodexQueueInspection::unknown(
+                "Codex app-server sent a malformed `thread/queue/list` response: invalid `nextCursor`",
+                detected.clone(),
+            );
+        }
+    };
+    let estimated_oldest_age_secs = data
+        .first()
+        .and_then(|first| first.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|id| estimate_uuid_v7_age_secs(id, now_ms));
+    CodexQueueInspection::Known {
+        depth: data.len(),
+        has_more,
+        estimated_oldest_age_secs,
+        verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.to_string(),
+    }
+}
+
+/// Inspect `thread/queue/list` for one or more `thread_ids` sharing `sock` using a single
+/// WebSocket handshake and `initialize` exchange. Never mutates server or queue state, and
+/// fails closed to [`CodexQueueInspection::Unknown`] on any transport, version, or RPC error.
+pub(crate) fn inspect_thread_queues(
+    sock: &Path,
+    thread_ids: &[&str],
+    now_ms: u64,
+    timeout: Duration,
+) -> Vec<CodexQueueInspection> {
+    let mut results: Vec<Option<CodexQueueInspection>> = vec![None; thread_ids.len()];
+    let mut valid_indices = Vec::with_capacity(thread_ids.len());
+    for (idx, tid) in thread_ids.iter().enumerate() {
+        let trimmed = tid.trim();
+        if trimmed.is_empty() {
+            results[idx] = Some(CodexQueueInspection::unknown(
+                "Codex route has no thread_id",
+                None,
+            ));
+        } else if trimmed.len() > MAX_STEER_INPUT {
+            results[idx] = Some(CodexQueueInspection::unknown(
+                "Codex route thread_id exceeds maximum length",
+                None,
+            ));
+        } else {
+            valid_indices.push(idx);
+        }
+    }
+    if valid_indices.is_empty() {
+        return results
+            .into_iter()
+            .map(|r| r.expect("every slot populated"))
+            .collect();
+    }
+
+    let fill_remaining = |results: &mut [Option<CodexQueueInspection>],
+                          indices: &[usize],
+                          reason: &str,
+                          detected: &Option<String>| {
+        for &idx in indices {
+            results[idx] = Some(CodexQueueInspection::unknown(reason, detected.clone()));
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    let stream = match connect_for_steering(sock, deadline) {
+        Ok(stream) => stream,
+        Err(err) => {
+            let reason = match err.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                    "Codex app-server control socket is offline".to_string()
+                }
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    "timed out connecting to Codex app-server control socket".to_string()
+                }
+                kind => format!("cannot connect to Codex app-server control socket ({kind})"),
+            };
+            fill_remaining(&mut results, &valid_indices, &reason, &None);
+            return results
+                .into_iter()
+                .map(|r| r.expect("every slot populated"))
+                .collect();
+        }
+    };
+
+    let mut conn = Conn {
+        stream,
+        rbuf: Vec::new(),
+        rng: SystemRandom::new(),
+        deadline,
+    };
+    if let Err(err) = conn.handshake() {
+        fill_remaining(&mut results, &valid_indices, &err, &None);
+        return results
+            .into_iter()
+            .map(|r| r.expect("every slot populated"))
+            .collect();
+    }
+    if let Err(err) = conn.send_json(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": { "name": "ferroloop", "version": "0.1.0" },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false,
+                "optOutNotificationMethods": null,
+            },
+        },
+    })) {
+        fill_remaining(&mut results, &valid_indices, &err, &None);
+        return results
+            .into_iter()
+            .map(|r| r.expect("every slot populated"))
+            .collect();
+    }
+
+    let init_result = match conn.await_strict_rpc_response(1, "initialize") {
+        Ok(Ok(res)) => res,
+        Ok(Err(rpc_err)) | Err(rpc_err) => {
+            let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
+            fill_remaining(&mut results, &valid_indices, &rpc_err, &None);
+            return results
+                .into_iter()
+                .map(|r| r.expect("every slot populated"))
+                .collect();
+        }
+    };
+
+    let detected = extract_codex_server_version(&init_result);
+    if detected.as_deref() != Some(VERIFIED_CODEX_QUEUE_RPC_VERSION) {
+        let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
+        let reason = match &detected {
+            Some(ver) => format!(
+                "unverified Codex app-server version {ver} (verified {VERIFIED_CODEX_QUEUE_RPC_VERSION})"
+            ),
+            None => format!(
+                "Codex app-server initialize response missing server version (verified {VERIFIED_CODEX_QUEUE_RPC_VERSION})"
+            ),
+        };
+        fill_remaining(&mut results, &valid_indices, &reason, &detected);
+        return results
+            .into_iter()
+            .map(|r| r.expect("every slot populated"))
+            .collect();
+    }
+
+    if let Err(err) = conn.send_json(&json!({ "method": "initialized", "params": {} })) {
+        fill_remaining(&mut results, &valid_indices, &err, &detected);
+        return results
+            .into_iter()
+            .map(|r| r.expect("every slot populated"))
+            .collect();
+    }
+
+    for (seq, &idx) in valid_indices.iter().enumerate() {
+        let req_id = 2 + seq as i64;
+        let thread_id = thread_ids[idx].trim();
+        if let Err(err) = conn.send_json(&json!({
+            "id": req_id,
+            "method": "thread/queue/list",
+            "params": {
+                "threadId": thread_id,
+                "limit": CODEX_QUEUE_LIST_LIMIT,
+            },
+        })) {
+            fill_remaining(&mut results, &valid_indices[seq..], &err, &detected);
+            break;
+        }
+        match conn.await_strict_rpc_response(req_id, "thread/queue/list") {
+            Ok(Ok(result)) => {
+                results[idx] = Some(parse_queue_list_result(&result, now_ms, &detected));
+            }
+            Ok(Err(rpc_err)) => {
+                results[idx] = Some(CodexQueueInspection::unknown(rpc_err, detected.clone()));
+            }
+            Err(transport_err) => {
+                fill_remaining(
+                    &mut results,
+                    &valid_indices[seq..],
+                    &transport_err,
+                    &detected,
+                );
+                break;
+            }
+        }
+    }
+
+    let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
+    results
+        .into_iter()
+        .map(|r| r.expect("every slot populated"))
+        .collect()
 }
 
 /// An app-server acknowledgment that an existing turn accepted steering input.
@@ -751,6 +1106,50 @@ impl Conn {
         }
     }
 
+    /// Strict read-only RPC response reader for queue inspection: skips server notifications and
+    /// requests, returns `Err` on transport/framing/ID/malformed-response failures (session cannot
+    /// continue), `Ok(Err(_))` on a valid JSON-RPC `error` reply for `id` (session remains aligned
+    /// for subsequent requests), and `Ok(Ok(result))` when `result` is a JSON object.
+    fn await_strict_rpc_response(
+        &mut self,
+        id: i64,
+        method: &str,
+    ) -> Result<Result<Value, String>, String> {
+        loop {
+            let text = self.recv_text()?;
+            let malformed = || format!("Codex app-server sent a malformed response to `{method}`");
+            let message: Value = serde_json::from_str(&text).map_err(|_| malformed())?;
+            if !message.is_object() {
+                return Err(malformed());
+            }
+            if let Some(m) = message.get("method") {
+                if m.is_string()
+                    && message.get("result").is_none()
+                    && message.get("error").is_none()
+                {
+                    continue;
+                }
+                return Err(malformed());
+            }
+            if message.get("id").and_then(Value::as_i64) != Some(id) {
+                return Err(format!(
+                    "Codex app-server response ID did not match `{method}`"
+                ));
+            }
+            return match (
+                message.get("error").filter(|error| !error.is_null()),
+                message.get("result"),
+            ) {
+                (Some(error), None) => Ok(Err(format!(
+                    "Codex app-server rejected `{method}`: {}",
+                    describe_rpc_error(error)
+                ))),
+                (None, Some(result)) if result.is_object() => Ok(Ok(result.clone())),
+                _ => Err(malformed()),
+            };
+        }
+    }
+
     /// Read messages until the JSON-RPC response to request `id` arrives. Notifications, server
     /// requests (they carry a `method`) and responses to other ids are ignored.
     fn await_response(&mut self, id: i64, method: &str) -> Result<Value, String> {
@@ -1098,8 +1497,21 @@ pub(crate) mod fake_server {
         script: impl FnOnce(&mut ServerConn) + Send + 'static,
     ) -> (PathBuf, JoinHandle<Vec<Received>>) {
         let sock = dir.join("codex.sock");
-        let listener = UnixListener::bind(&sock).expect("bind fake control socket");
-        let handle = std::thread::spawn(move || {
+        let handle = spawn_at(&sock, script);
+        (sock, handle)
+    }
+
+    /// Bind `sock` (creating parent directories if needed) and run `script` against the first
+    /// connection on a thread.
+    pub(crate) fn spawn_at(
+        sock: &Path,
+        script: impl FnOnce(&mut ServerConn) + Send + 'static,
+    ) -> JoinHandle<Vec<Received>> {
+        if let Some(parent) = sock.parent() {
+            std::fs::create_dir_all(parent).expect("create fake control socket parent");
+        }
+        let listener = UnixListener::bind(sock).expect("bind fake control socket");
+        std::thread::spawn(move || {
             // Bounded, so a client that never connects fails the test instead of hanging it.
             listener
                 .set_nonblocking(true)
@@ -1129,8 +1541,7 @@ pub(crate) mod fake_server {
             };
             script(&mut conn);
             conn.log
-        });
-        (sock, handle)
+        })
     }
 }
 
@@ -2305,5 +2716,383 @@ mod tests {
             err.contains("cannot connect") && err.contains("absent.sock"),
             "{err}"
         );
+    }
+
+    fn make_uuid_v7(ts_ms: u64, variant_nibble: u8) -> String {
+        assert!(ts_ms <= 0xFFFF_FFFF_FFFF);
+        assert!(matches!(variant_nibble, 0x8..=0xB));
+        format!(
+            "{:08x}-{:04x}-7123-{:01x}abc-0123456789ab",
+            (ts_ms >> 16) as u32,
+            (ts_ms & 0xFFFF) as u16,
+            variant_nibble,
+        )
+    }
+
+    fn verified_init_reply(id: i64) -> String {
+        json!({
+            "id": id,
+            "result": {
+                "userAgent": format!(
+                    "ferroloop/{VERIFIED_CODEX_QUEUE_RPC_VERSION} (Ubuntu 26.4.0; x86_64) dumb (ferroloop; 0.1.0)"
+                ),
+                "codexHome": "/tmp/mock-codex",
+                "platformFamily": "unix",
+                "platformOs": "linux",
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn uuid_v7_parser_enforces_rfc9562_and_age_estimation_bounds() {
+        let now_ms: u64 = 1_762_000_050_500;
+        let oldest_ms: u64 = 1_762_000_038_100; // 12.4s ago -> 12s
+        for variant in [0x8, 0x9, 0xA, 0xB] {
+            let v7 = make_uuid_v7(oldest_ms, variant);
+            assert_eq!(parse_uuid_v7_unix_ms(&v7), Some(oldest_ms));
+            assert_eq!(
+                parse_uuid_v7_age_upper(&v7, oldest_ms),
+                Some(oldest_ms),
+                "uppercase hex must parse identically"
+            );
+            assert_eq!(estimate_uuid_v7_age_secs(&v7, now_ms), Some(12));
+        }
+
+        fn parse_uuid_v7_age_upper(v7: &str, _expected: u64) -> Option<u64> {
+            parse_uuid_v7_unix_ms(&v7.to_ascii_uppercase())
+        }
+
+        // Small sub-5s clock skew clamps to 0s; >5s future timestamp returns None.
+        let jitter_future = make_uuid_v7(now_ms + 3_200, 0x8);
+        assert_eq!(estimate_uuid_v7_age_secs(&jitter_future, now_ms), Some(0));
+        let implausible_future = make_uuid_v7(now_ms + 5_001, 0x8);
+        assert_eq!(estimate_uuid_v7_age_secs(&implausible_future, now_ms), None);
+
+        // Reject UUIDv4, UUIDv1, non-RFC9562 variants, URN prefix, non-canonical lengths, and opaque IDs.
+        for invalid in [
+            "550e8400-e29b-41d4-a716-446655440000", // UUIDv4
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8", // UUIDv1
+            "01900000-0000-7000-0000-000000000001", // NCS variant 0b0xxx
+            "01900000-0000-7000-c000-000000000001", // Microsoft variant 0b110x
+            "01900000-0000-7000-f000-000000000001", // Future variant 0b111x
+            "urn:uuid:01900000-0000-7000-8000-000000000001",
+            "01900000000070008000000000000001",
+            "01900000_0000-7000-8000-000000000001",
+            "01900000-0000-7000-8000-00000000000g",
+            "msg-1",
+            "",
+        ] {
+            assert_eq!(
+                parse_uuid_v7_unix_ms(invalid),
+                None,
+                "must reject {invalid}"
+            );
+            assert_eq!(estimate_uuid_v7_age_secs(invalid, now_ms), None);
+        }
+    }
+
+    #[test]
+    fn extract_codex_server_version_handles_user_agent_and_fallback() {
+        let live = json!({
+            "userAgent": "ferroloop/0.167.0 (Ubuntu 26.4.0; x86_64) dumb (ferroloop; 0.1.0)",
+            "codexHome": "/home/test/.codex",
+            "platformFamily": "unix",
+            "platformOs": "linux"
+        });
+        assert_eq!(
+            extract_codex_server_version(&live).as_deref(),
+            Some("0.167.0")
+        );
+        assert_eq!(
+            extract_codex_server_version(&json!({"userAgent": "codex_cli_rs/0.168.0 (Linux)"}))
+                .as_deref(),
+            Some("0.168.0")
+        );
+        assert_eq!(
+            extract_codex_server_version(&json!({"serverInfo": {"version": "0.167.0"}})).as_deref(),
+            Some("0.167.0")
+        );
+        for missing in [
+            json!({}),
+            json!({"userAgent": ""}),
+            json!({"userAgent": "ferroloop"}),
+            json!({"userAgent": "ferroloop/"}),
+            json!({"userAgent": "/0.167.0"}),
+            json!({"userAgent": 42, "serverInfo": {"version": "0.167.0"}}),
+        ] {
+            assert_eq!(
+                extract_codex_server_version(&missing),
+                None,
+                "must reject {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_thread_queues_known_exact_bounded_uuidv7_non_uuid_and_empty_in_one_session() {
+        let now_ms: u64 = 1_762_000_100_000;
+        let oldest_v7 = make_uuid_v7(now_ms - 12_400, 0x8);
+        let newer_v7 = make_uuid_v7(now_ms - 3_000, 0x9);
+        let oldest_v7_for_server = oldest_v7.clone();
+        let newer_v7_for_server = newer_v7.clone();
+
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), move |c| {
+            c.handshake();
+            let init = c.expect_json();
+            assert_eq!(init["id"], 1);
+            assert_eq!(init["method"], "initialize");
+            assert_eq!(
+                init["params"]["capabilities"],
+                json!({
+                    "experimentalApi": true,
+                    "requestAttestation": false,
+                    "optOutNotificationMethods": null,
+                })
+            );
+            c.send_text(&verified_init_reply(1));
+            let initialized = c.expect_json();
+            assert_eq!(initialized["method"], "initialized");
+
+            // Route 0 ("thread-exact"): 2 items, UUIDv7 oldest, nextCursor = null.
+            let q1 = c.expect_json();
+            assert_eq!(q1["id"], 2);
+            assert_eq!(q1["method"], "thread/queue/list");
+            assert_eq!(
+                q1["params"],
+                json!({"threadId": "thread-exact", "limit": CODEX_QUEUE_LIST_LIMIT})
+            );
+            c.send_text(
+                &json!({
+                    "id": 2,
+                    "result": {
+                        "data": [
+                            {"id": oldest_v7_for_server, "clientUserMessageId": "c1", "input": []},
+                            {"id": newer_v7_for_server, "clientUserMessageId": "c2", "input": []},
+                        ],
+                        "nextCursor": null,
+                    }
+                })
+                .to_string(),
+            );
+
+            // Route 1 ("thread-bounded"): 3 items returned, nextCursor = "100", UUIDv4 id.
+            let q2 = c.expect_json();
+            assert_eq!(q2["id"], 3);
+            assert_eq!(q2["params"]["threadId"], "thread-bounded");
+            c.send_text(
+                &json!({
+                    "id": 3,
+                    "result": {
+                        "data": [
+                            {"id": "550e8400-e29b-41d4-a716-446655440000", "clientUserMessageId": "c3", "input": []},
+                            {"id": "msg-2", "clientUserMessageId": "c4", "input": []},
+                            {"id": "msg-3", "clientUserMessageId": "c5", "input": []},
+                        ],
+                        "nextCursor": "100",
+                    }
+                })
+                .to_string(),
+            );
+
+            // Route 2 ("thread-empty"): empty queue on verified 0.167.0.
+            let q3 = c.expect_json();
+            assert_eq!(q3["id"], 4);
+            assert_eq!(q3["params"]["threadId"], "thread-empty");
+            c.send_text(
+                &json!({
+                    "id": 4,
+                    "result": {
+                        "data": [],
+                        "nextCursor": null,
+                    }
+                })
+                .to_string(),
+            );
+            c.drain_until_eof();
+        });
+
+        // Include a threadless route alongside the three live routes to prove one session serves
+        // all valid routes while threadless routes fail to Unknown without RPC calls.
+        let out = inspect_thread_queues(
+            &sock,
+            &["thread-exact", "", "thread-bounded", "thread-empty"],
+            now_ms,
+            SHORT,
+        );
+        let log = server.join().unwrap();
+        assert_eq!(
+            methods(&log),
+            [
+                "initialize",
+                "initialized",
+                "thread/queue/list",
+                "thread/queue/list",
+                "thread/queue/list",
+            ]
+        );
+
+        assert_eq!(
+            out[0],
+            CodexQueueInspection::Known {
+                depth: 2,
+                has_more: false,
+                estimated_oldest_age_secs: Some(12),
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+        assert!(matches!(
+            &out[1],
+            CodexQueueInspection::Unknown { reason, detected_codex_version: None, .. }
+                if reason.contains("no thread_id")
+        ));
+        assert_eq!(
+            out[2],
+            CodexQueueInspection::Known {
+                depth: 3,
+                has_more: true,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+        assert_eq!(
+            out[3],
+            CodexQueueInspection::Known {
+                depth: 0,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_thread_queues_fails_closed_to_unknown_never_zero() {
+        let now_ms: u64 = 1_762_000_100_000;
+
+        // 1. Missing / offline socket -> Unknown.
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing.sock");
+        let out = inspect_thread_queues(&missing, &["thread-1"], now_ms, SHORT);
+        assert!(matches!(
+            &out[0],
+            CodexQueueInspection::Unknown {
+                reason,
+                verified_codex_version,
+                detected_codex_version: None,
+            } if reason.contains("offline") && verified_codex_version == VERIFIED_CODEX_QUEUE_RPC_VERSION
+        ));
+
+        // 2. Route without thread_id -> Unknown without connecting to listener.
+        let untouched = dir.path().join("untouched.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&untouched).unwrap();
+        let out = inspect_thread_queues(&untouched, &["   "], now_ms, SHORT);
+        assert!(matches!(
+            &out[0],
+            CodexQueueInspection::Unknown { reason, .. } if reason.contains("no thread_id")
+        ));
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        // 3. Unverified Codex versions (0.168.0, 0.166.0) and missing version -> Unknown, never sends thread/queue/list.
+        for (init_result, expected_detected) in [
+            (
+                json!({"userAgent": "codex_cli_rs/0.168.0 (Linux; x86_64)"}),
+                Some("0.168.0"),
+            ),
+            (
+                json!({"userAgent": "ferroloop/0.166.0 (Linux; x86_64)"}),
+                Some("0.166.0"),
+            ),
+            (json!({"codexHome": "/tmp/.codex"}), None),
+        ] {
+            let sub = TempDir::new().unwrap();
+            let (sock, server) = spawn(sub.path(), move |c| {
+                c.handshake();
+                c.expect_json();
+                c.send_text(&json!({"id": 1, "result": init_result}).to_string());
+                c.drain_until_eof();
+            });
+            let out = inspect_thread_queues(&sock, &["thread-1", "thread-2"], now_ms, SHORT);
+            let log = server.join().unwrap();
+            assert_eq!(methods(&log), ["initialize"]);
+            for item in &out {
+                match item {
+                    CodexQueueInspection::Unknown {
+                        reason,
+                        verified_codex_version,
+                        detected_codex_version,
+                    } => {
+                        assert_eq!(verified_codex_version, VERIFIED_CODEX_QUEUE_RPC_VERSION);
+                        assert_eq!(detected_codex_version.as_deref(), expected_detected);
+                        assert!(
+                            reason.contains(VERIFIED_CODEX_QUEUE_RPC_VERSION),
+                            "{reason}"
+                        );
+                    }
+                    other => panic!("expected Unknown, got {other:?}"),
+                }
+            }
+        }
+
+        // 4. JSON-RPC errors (-32600, -32601) -> Unknown (and per-route error keeps session alive for sibling route).
+        let sub = TempDir::new().unwrap();
+        let (sock, server) = spawn(sub.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(&verified_init_reply(1));
+            c.expect_json(); // initialized
+            c.expect_json(); // route 0
+            c.send_text(r#"{"id":2,"error":{"code":-32600,"message":"invalid request"}}"#);
+            c.expect_json(); // route 1
+            c.send_text(r#"{"id":3,"error":{"code":-32601,"message":"method not found"}}"#);
+            c.expect_json(); // route 2
+            c.send_text(
+                r#"{"id":4,"result":{"data":[{"id":"msg-ok","clientUserMessageId":"c","input":[]}],"nextCursor":null}}"#,
+            );
+            c.drain_until_eof();
+        });
+        let out = inspect_thread_queues(&sock, &["t-32600", "t-32601", "t-ok"], now_ms, SHORT);
+        server.join().unwrap();
+        assert!(matches!(
+            &out[0],
+            CodexQueueInspection::Unknown { reason, detected_codex_version: Some(v), .. }
+                if reason.contains("-32600") && v == VERIFIED_CODEX_QUEUE_RPC_VERSION
+        ));
+        assert!(matches!(
+            &out[1],
+            CodexQueueInspection::Unknown { reason, detected_codex_version: Some(v), .. }
+                if reason.contains("-32601") && v == VERIFIED_CODEX_QUEUE_RPC_VERSION
+        ));
+        assert_eq!(
+            out[2],
+            CodexQueueInspection::Known {
+                depth: 1,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+
+        // 5. Timeout -> Unknown.
+        let sub = TempDir::new().unwrap();
+        let (sock, server) = spawn(sub.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(&verified_init_reply(1));
+            c.expect_json();
+            c.expect_json();
+            c.drain_until_eof(); // stalls on thread/queue/list
+        });
+        let out = inspect_thread_queues(&sock, &["t-stall"], now_ms, Duration::from_millis(120));
+        server.join().unwrap();
+        assert!(matches!(
+            &out[0],
+            CodexQueueInspection::Unknown { reason, .. } if reason.contains("timed out")
+        ));
     }
 }
