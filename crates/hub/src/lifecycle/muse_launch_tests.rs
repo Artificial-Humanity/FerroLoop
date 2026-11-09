@@ -310,6 +310,7 @@ fn a_window_tag_is_kept_for_claude_only() {
     for vendor in ["codex", "grok", "antigravity"] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let fake = FakeRuntime::default();
         let mut request = req("ada", vendor);
         request.model = Some("opus[1m]".into());
@@ -511,6 +512,7 @@ fn launched_built_in_vendors_do_not_receive_a_duplicate_prompt() {
     for vendor in ["claude", "codex", "grok", "antigravity"] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let listener = webhook_listener(home.path(), "ada");
         let fake = FakeRuntime::default();
         let out = spin(&store, &fake.env(home.path()), "ada", vendor);
@@ -597,6 +599,7 @@ fn built_in_vendors_launch_with_their_prompt() {
     ] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let fake = FakeRuntime::default();
         let out = spin(&store, &fake.env(home.path()), "ada", vendor);
         let launches = fake.launches.borrow();
@@ -610,10 +613,14 @@ fn built_in_vendors_launch_with_their_prompt() {
         let mut expected = vec![expected_bin];
         expected.extend(flags.into_iter().map(String::from));
         expected.push(out.prompt.unwrap());
-        assert_eq!(
-            spec.env,
-            launch_env_for_vendor(vendor, "ada", Some(home.path()))
-        );
+        let mut expected_env = launch_env_for_vendor(vendor, "ada", Some(home.path()));
+        if vendor == "codex" {
+            expected_env.push((
+                "CODEX_HOME".into(),
+                home.path().join(".codex").display().to_string(),
+            ));
+        }
+        assert_eq!(spec.env, expected_env);
         assert_eq!(spec.argv, expected, "{vendor}");
     }
 }
@@ -678,6 +685,7 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
     ] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let fake = FakeRuntime::default();
         let env = fake.env(home.path());
         let mut request = req("ada", vendor);
@@ -706,10 +714,14 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             expected.push("--prompt-interactive".into());
         }
         expected.push(out.prompt);
-        assert_eq!(
-            spec.env,
-            launch_env_for_vendor(vendor, "ada", Some(home.path()))
-        );
+        let mut expected_env = launch_env_for_vendor(vendor, "ada", Some(home.path()));
+        if vendor == "codex" {
+            expected_env.push((
+                "CODEX_HOME".into(),
+                home.path().join(".codex").display().to_string(),
+            ));
+        }
+        assert_eq!(spec.env, expected_env);
         assert_eq!(spec.argv, expected, "{vendor}");
     }
 }
@@ -2060,6 +2072,7 @@ fn a_hand_edited_flag_does_not_make_a_window_without_the_mark_ours_on_restart() 
 fn non_muse_vendors_keep_a_blank_session_that_teardown_kills_by_name() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     for vendor in ["claude", "codex", "grok"] {
@@ -2077,6 +2090,7 @@ fn spin_up_and_restart_apply_posture_persist_record_and_emit_bypass_only_on_bypa
 
     let _bin = MuseBinEnv::cleared();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     install_home_muse(home.path());
 
     for (vendor, supported_postures) in [
@@ -2224,6 +2238,7 @@ fn restart_hosted_session_refuses_record_with_unsupported_posture_without_spawni
     use fl_core::permissions::Posture;
 
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     for (vendor, bad_posture) in [
         ("codex", Posture::Ask),
         ("antigravity", Posture::Ask),

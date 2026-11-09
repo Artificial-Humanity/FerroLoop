@@ -798,81 +798,20 @@ fn codex_trust(root: &Path, plan: &Plan) -> Option<String> {
     if !writes {
         return None;
     }
-    let keys = trust_keys(root);
-    let key = keys[0].to_string_lossy().to_string();
     let config = match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
         Some(home) => Some(PathBuf::from(home).join("config.toml")),
         None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex/config.toml")),
     };
-    let why = match &config {
+    let why = match config {
+        Some(config) => vendor::check_codex_project_trust(root, &config)
+            .err()?
+            .to_string(),
         None => "neither $CODEX_HOME nor $HOME is set, so fl cannot read Codex's config".into(),
-        Some(file) => match std::fs::read_to_string(file) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                format!("{} does not exist", file.display())
-            }
-            Err(e) => format!("fl could not read {} ({e})", file.display()),
-            Ok(text) => match text.parse::<toml::Table>() {
-                Err(e) => {
-                    let at = e.span().map_or(0, |s| s.start).min(text.len());
-                    let line = text[..at].matches('\n').count() + 1;
-                    format!(
-                        "{} is not valid TOML (line {line}), so fl cannot tell whether Codex \
-                         trusts this project",
-                        file.display()
-                    )
-                }
-                Ok(table) if trusts(&table, &keys) => return None,
-                Ok(_) => format!("{} does not trust {key}", file.display()),
-            },
-        },
     };
-    let file = config.map_or("Codex's config".into(), |f| f.display().to_string());
     Some(format!(
-        "Codex loads {} only in a project its user trusts, and {why}. To trust it, add to \
-         {file}:\n[projects.{}]\ntrust_level = \"trusted\"",
+        "Codex loads {} only in a project its user trusts, and {why}",
         root.join(".codex/config.toml").display(),
-        toml::Value::String(key.clone())
     ))
-}
-
-/// The keys Codex looks this project up by, in its order: the project root
-/// (the nearest directory holding `.git`, canonical), then the main
-/// checkout's root when that is a linked worktree. No `.git`: the root.
-fn trust_keys(root: &Path) -> Vec<PathBuf> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let Some(project) = root.ancestors().find(|d| d.join(".git").exists()) else {
-        return vec![root];
-    };
-    let mut keys = vec![project.to_path_buf()];
-    if let Some(main) = main_checkout(project).filter(|m| m != project) {
-        keys.push(main);
-    }
-    keys
-}
-
-/// The main checkout of a linked worktree: its `.git` is a file naming the
-/// worktree's git directory, whose `commondir` names the main `.git`.
-fn main_checkout(project: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(project.join(".git")).ok()?;
-    let gitdir = project.join(text.strip_prefix("gitdir:")?.trim());
-    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-    let common = gitdir.join(common.trim()).canonicalize().ok()?;
-    common.parent().map(Path::to_path_buf)
-}
-
-/// Codex's rule: the first key with a `[projects."<key>"]` entry decides,
-/// and only `trust_level = "trusted"` trusts.
-fn trusts(config: &toml::Table, keys: &[PathBuf]) -> bool {
-    let Some(projects) = config.get("projects").and_then(toml::Value::as_table) else {
-        return false;
-    };
-    let entry = (keys.iter())
-        .filter_map(|k| k.to_str())
-        .find_map(|k| projects.get(k));
-    entry
-        .and_then(|e| e.get("trust_level"))
-        .and_then(toml::Value::as_str)
-        == Some("trusted")
 }
 
 #[cfg(test)]

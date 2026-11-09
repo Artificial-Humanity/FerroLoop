@@ -258,6 +258,16 @@ pub enum LocalResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecipientPendingSummary {
+    pub recipient: String,
+    pub pending_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_at: Option<At>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub node_id: String,
     pub host: String,
@@ -267,6 +277,64 @@ pub struct DaemonStatus {
     pub routes: Vec<RouteEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_diagnostics: Option<DispatchDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_recipients: Vec<RecipientPendingSummary>,
+}
+
+pub fn collect_pending_recipient_summaries<S: MessageStore>(
+    store: &S,
+    now: &At,
+) -> Vec<RecipientPendingSummary> {
+    summarize_pending_map(&seed_pending_map_from_store(store), now)
+}
+
+fn seed_pending_map_from_store<S: MessageStore>(
+    store: &S,
+) -> BTreeMap<String, BTreeMap<MessageId, At>> {
+    let Ok(items) = store.list_wire_inbox(&WireFilter {
+        unread_only: true,
+        ..Default::default()
+    }) else {
+        return BTreeMap::new();
+    };
+    let mut by_recipient = BTreeMap::<String, BTreeMap<MessageId, At>>::new();
+    for item in items {
+        if matches!(
+            item.receipt.status,
+            DeliveryStatus::Pending | DeliveryStatus::Delivered
+        ) {
+            let key = normalize_persona(&item.receipt.recipient_name)
+                .unwrap_or_else(|| item.receipt.recipient_name.trim().to_ascii_lowercase());
+            if !key.is_empty() {
+                by_recipient
+                    .entry(key)
+                    .or_default()
+                    .insert(item.message.id, item.message.created_at);
+            }
+        }
+    }
+    by_recipient
+}
+
+fn summarize_pending_map(
+    by_recipient: &BTreeMap<String, BTreeMap<MessageId, At>>,
+    now: &At,
+) -> Vec<RecipientPendingSummary> {
+    let now_ms = now.unix_millis();
+    let mut out = Vec::new();
+    for (recipient, messages) in by_recipient {
+        if messages.is_empty() {
+            continue;
+        }
+        let oldest_ms = messages.values().map(At::unix_millis).min();
+        out.push(RecipientPendingSummary {
+            recipient: recipient.clone(),
+            pending_count: messages.len(),
+            oldest_pending_at: oldest_ms.map(At::from_unix_millis),
+            oldest_pending_age_ms: oldest_ms.map(|ms| now_ms.saturating_sub(ms)),
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +642,7 @@ struct DaemonInner<S> {
     /// At the hard metadata limit we can no longer distinguish additional recipients safely.
     overflow_capacity_exhausted: AtomicBool,
     dispatch_diagnostics: Mutex<DiagnosticsState>,
+    pending_by_recipient: Mutex<BTreeMap<String, BTreeMap<MessageId, At>>>,
     #[cfg(test)]
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
@@ -713,11 +782,19 @@ where
                 None
             }
         };
+        if let Some(ref rcpt) = receipt
+            && !matches!(
+                rcpt.status,
+                DeliveryStatus::Pending | DeliveryStatus::Delivered
+            )
+        {
+            self.clear_pending_receipt(&rcpt.recipient_name, &msg.id);
+        }
         match receipt {
             Some(receipt)
                 if matches!(
                     receipt.status,
-                    DeliveryStatus::Acked | DeliveryStatus::Expired
+                    DeliveryStatus::Delivered | DeliveryStatus::Acked | DeliveryStatus::Expired
                 ) =>
             {
                 DispatchOutcome::Resolved
@@ -735,6 +812,46 @@ where
                 DispatchOutcome::Unconfirmed
             }
         }
+    }
+
+    fn admit_pending_receipts(&self, msg: &WireMessage, receipts: &[DeliveryReceipt]) {
+        let mut pending = lock(&self.pending_by_recipient);
+        for rcpt in receipts {
+            if matches!(
+                rcpt.status,
+                DeliveryStatus::Pending | DeliveryStatus::Delivered
+            ) {
+                let key = normalize_persona(&rcpt.recipient_name)
+                    .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
+                if !key.is_empty() {
+                    pending
+                        .entry(key)
+                        .or_default()
+                        .entry(msg.id.clone())
+                        .or_insert_with(|| msg.created_at.clone());
+                }
+            }
+        }
+    }
+
+    fn clear_pending_receipt(&self, recipient_name: &str, msg_id: &MessageId) {
+        let key = normalize_persona(recipient_name)
+            .unwrap_or_else(|| recipient_name.trim().to_ascii_lowercase());
+        if key.is_empty() {
+            return;
+        }
+        let mut pending = lock(&self.pending_by_recipient);
+        if let Some(map) = pending.get_mut(&key) {
+            map.remove(msg_id);
+            if map.is_empty() {
+                pending.remove(&key);
+            }
+        }
+    }
+
+    fn pending_recipients_snapshot(&self, now: &At) -> Vec<RecipientPendingSummary> {
+        let merged = lock(&self.pending_by_recipient).clone();
+        summarize_pending_map(&merged, now)
     }
 
     /// Start one queued worker, or retain it until an active slot becomes available.
@@ -879,7 +996,7 @@ where
         for (receipt, evidence) in recipients.iter().zip(evidence) {
             if matches!(
                 receipt.status,
-                DeliveryStatus::Acked | DeliveryStatus::Expired
+                DeliveryStatus::Delivered | DeliveryStatus::Acked | DeliveryStatus::Expired
             ) {
                 continue;
             }
@@ -1256,6 +1373,7 @@ where
                 }
                 match self.store.send_wire(args) {
                     Ok((msg, receipts)) => {
+                        self.admit_pending_receipts(&msg, &receipts);
                         self.notify_subscribers_message(&msg, &receipts);
                         self.broadcast_to_peers(
                             None,
@@ -1287,43 +1405,60 @@ where
                     ),
                 }
             }
-            LocalRequest::Read { filter, ack } => match self.store.list_wire_inbox(&filter) {
-                Ok(mut items) => {
-                    if ack && let Some(ref rec) = filter.recipient {
-                        for item in &mut items {
-                            if item.receipt.status != DeliveryStatus::Acked
-                                && let Ok(Some(updated)) = self.store.update_wire_receipt(
-                                    &item.message.id,
-                                    rec,
-                                    DeliveryStatus::Acked,
-                                    false,
-                                    now.clone(),
-                                )
-                            {
-                                item.receipt = updated.clone();
-                                self.notify_subscribers_receipt(&updated);
-                                self.broadcast_to_peers(
-                                    None,
-                                    &PeerFrame::ReceiptUpdate { receipt: updated },
-                                );
-                            }
+            LocalRequest::Read { filter, ack } => {
+                if ack && let Some(ref rec) = filter.recipient {
+                    let _order = lock(&self.enqueue_gate);
+                    let mut items = match self.store.list_wire_inbox(&filter) {
+                        Ok(items) => items,
+                        Err(e) => {
+                            return (
+                                LocalResponse::Error {
+                                    message: e.to_string(),
+                                },
+                                None,
+                            );
                         }
-                        self.maybe_unfence_and_resume(rec, now);
+                    };
+                    for item in &mut items {
+                        if item.receipt.status != DeliveryStatus::Acked
+                            && let Ok(Some(updated)) = self.store.update_wire_receipt(
+                                &item.message.id,
+                                rec,
+                                DeliveryStatus::Acked,
+                                false,
+                                now.clone(),
+                            )
+                        {
+                            self.clear_pending_receipt(&updated.recipient_name, &item.message.id);
+                            item.receipt = updated.clone();
+                            self.notify_subscribers_receipt(&updated);
+                            self.broadcast_to_peers(
+                                None,
+                                &PeerFrame::ReceiptUpdate { receipt: updated },
+                            );
+                        }
                     }
+                    drop(_order);
+                    self.maybe_unfence_and_resume(rec, now);
                     (LocalResponse::Inbox { items }, None)
+                } else {
+                    match self.store.list_wire_inbox(&filter) {
+                        Ok(items) => (LocalResponse::Inbox { items }, None),
+                        Err(e) => (
+                            LocalResponse::Error {
+                                message: e.to_string(),
+                            },
+                            None,
+                        ),
+                    }
                 }
-                Err(e) => (
-                    LocalResponse::Error {
-                        message: e.to_string(),
-                    },
-                    None,
-                ),
-            },
+            }
             LocalRequest::Ack {
                 message_ids,
                 recipient,
             } => {
                 let mut out = Vec::new();
+                let _order = lock(&self.enqueue_gate);
                 for mid in message_ids {
                     match self.store.update_wire_receipt(
                         &mid,
@@ -1333,6 +1468,7 @@ where
                         now.clone(),
                     ) {
                         Ok(Some(rcpt)) => {
+                            self.clear_pending_receipt(&rcpt.recipient_name, &rcpt.message_id);
                             self.notify_subscribers_receipt(&rcpt);
                             self.broadcast_to_peers(
                                 None,
@@ -1353,6 +1489,7 @@ where
                         }
                     }
                 }
+                drop(_order);
                 if !out.is_empty() {
                     self.maybe_unfence_and_resume(&recipient, now);
                 }
@@ -1483,7 +1620,9 @@ where
                     .values()
                     .map(|(label, _)| label.clone())
                     .collect();
-                let routes = lock(&self.routes).entries.values().cloned().collect();
+                let routes: Vec<RouteEntry> =
+                    lock(&self.routes).entries.values().cloned().collect();
+                let pending_recipients = self.pending_recipients_snapshot(&now);
                 (
                     LocalResponse::Status(DaemonStatus {
                         node_id: self.config.node_id.clone(),
@@ -1493,6 +1632,7 @@ where
                         connected_peers,
                         routes,
                         dispatch_diagnostics: Some(self.diagnostics_snapshot()),
+                        pending_recipients,
                     }),
                     None,
                 )
@@ -1680,6 +1820,7 @@ where
                     new_msgs.retain(|m| !report.rejects_message(&m.id));
                     for m in new_msgs {
                         let rcpts = self.store.list_wire_receipts(&m.id).unwrap_or_default();
+                        self.admit_pending_receipts(&m, &rcpts);
                         self.notify_subscribers_message(&m, &rcpts);
                         self.broadcast_to_peers(
                             Some(from_peer_id),
@@ -1696,6 +1837,12 @@ where
                     }
                     for r in receipts {
                         if !report.rejects(&r.message_id) {
+                            if !matches!(
+                                r.status,
+                                DeliveryStatus::Pending | DeliveryStatus::Delivered
+                            ) {
+                                self.clear_pending_receipt(&r.recipient_name, &r.message_id);
+                            }
                             self.notify_subscribers_receipt(&r);
                         }
                     }
@@ -1728,6 +1875,7 @@ where
                         .store
                         .list_wire_receipts(&message.id)
                         .unwrap_or(receipts);
+                    self.admit_pending_receipts(&message, &rcpts);
                     self.notify_subscribers_message(&message, &rcpts);
                     self.broadcast_to_peers(
                         Some(from_peer_id),
@@ -1740,6 +1888,17 @@ where
                         self.schedule_dispatch(&message, &rcpts, now, &mut first_holds)
                     {
                         warn(&format!("peer message scheduling failed: {error}"));
+                    }
+                } else if let Ok(ref report) = imported {
+                    for r in &receipts {
+                        if !report.rejects(&r.message_id)
+                            && !matches!(
+                                r.status,
+                                DeliveryStatus::Pending | DeliveryStatus::Delivered
+                            )
+                        {
+                            self.clear_pending_receipt(&r.recipient_name, &r.message_id);
+                        }
                     }
                 }
                 drop(_order);
@@ -1767,6 +1926,12 @@ where
                 if imported.as_ref().is_ok_and(WireImportReport::is_clean)
                     && receipt.status.rank() > prev_rank
                 {
+                    if !matches!(
+                        receipt.status,
+                        DeliveryStatus::Pending | DeliveryStatus::Delivered
+                    ) {
+                        self.clear_pending_receipt(&receipt.recipient_name, &receipt.message_id);
+                    }
                     self.notify_subscribers_receipt(&receipt);
                     self.broadcast_to_peers(
                         Some(from_peer_id),
@@ -1885,6 +2050,7 @@ where
     };
 
     let initial_routes = RouteTable::load(config.routes_path.as_deref());
+    let initial_pending = seed_pending_map_from_store(store.as_ref());
     let inner = Arc::new(DaemonInner {
         store,
         config: config.clone(),
@@ -1894,6 +2060,7 @@ where
         overflow_recipients: Mutex::new(BTreeSet::new()),
         overflow_capacity_exhausted: AtomicBool::new(false),
         dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
+        pending_by_recipient: Mutex::new(initial_pending),
         #[cfg(test)]
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
@@ -2113,6 +2280,7 @@ mod tests {
             overflow_recipients: Mutex::new(BTreeSet::new()),
             overflow_capacity_exhausted: AtomicBool::new(false),
             dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
+            pending_by_recipient: Mutex::new(BTreeMap::new()),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
             fail_next_worker_spawn: AtomicBool::new(false),

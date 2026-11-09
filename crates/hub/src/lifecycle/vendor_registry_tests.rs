@@ -267,6 +267,7 @@ fn every_registered_vendor_with_its_longest_persona_persists_a_valid_slug() {
     custom_cli("hubreg-slug-cli");
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = env_with(&home, &fake, &ProvisionedKeys);
     let mut hosted = 0;
@@ -338,6 +339,7 @@ fn a_cli_vendor_still_opens_its_window() {
     ] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let fake = FakeRuntime::default();
         let env = env_with(&home, &fake, &ProvisionedKeys);
         let out = spin(&store, &env, "ada", vendor).unwrap();
@@ -393,6 +395,7 @@ fn an_api_session_does_not_inherit_a_runtime_flag() {
 fn remodel_between_a_cli_and_an_api_vendor_in_both_directions() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let env = env_with(&home, &fake, &ProvisionedKeys);
     spin(&store, &env, "ada", "claude").unwrap();
@@ -823,6 +826,7 @@ fn the_restore_after_a_failed_remodel_does_not_need_the_old_vendors_key() {
     let old = custom_http("hubreg-restore", Some("HUBREG_RESTORE_ENV"), None);
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let fake = FakeRuntime::default();
     let with_key = FakeKeys {
         have: vec!["HUBREG_RESTORE_ENV".into()],

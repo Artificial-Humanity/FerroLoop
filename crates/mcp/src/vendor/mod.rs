@@ -14,7 +14,7 @@ mod muse;
 
 pub use antigravity::Antigravity;
 pub use claude::Claude;
-pub use codex::Codex;
+pub use codex::{Codex, CodexProjectTrust, CodexTrustError, check_codex_project_trust};
 #[cfg(test)]
 pub(crate) use custom::unregister_target;
 pub use custom::{

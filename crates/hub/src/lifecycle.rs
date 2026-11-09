@@ -561,6 +561,121 @@ pub(crate) use fl_wire::vendor_adapter::{
     resolve_vendor_bin, split_window_tag, with_local_bin,
 };
 
+/// Read-only launch checks run independently of adapter selection. Return the checked
+/// configuration directory so a daemon child cannot inherit a different CODEX_HOME.
+fn preflight_vendor_launch(
+    env: &LifecycleEnv<'_>,
+    vendor: &str,
+    hosted: bool,
+    cwd: &mut Option<String>,
+) -> Result<Option<PathBuf>, LifecycleError> {
+    if vendor != "codex" || !hosted || !env.spawn_runtime {
+        return Ok(None);
+    }
+    let base = std::env::current_dir()
+        .map_err(|_| invalid_field("cwd", "cannot resolve current directory"))?;
+    let explicit = std::env::var_os("CODEX_HOME");
+    #[cfg(test)]
+    let explicit = TEST_CODEX_HOME.with(|slot| slot.borrow().clone().unwrap_or(explicit));
+    let home = std::env::var_os("HOME");
+    let config_home = codex_config_home(
+        &base,
+        explicit.as_deref(),
+        env.home_override,
+        home.as_deref(),
+    )?;
+    if config_home.to_str().is_none() {
+        return Err(LifecycleError::Invalid(
+            "Codex config home must be valid UTF-8".into(),
+        ));
+    }
+    let effective = cwd.as_ref().map(PathBuf::from).unwrap_or(base);
+    let checked =
+        fl_mcp::vendor::check_codex_project_trust(&effective, &config_home.join("config.toml"))
+            .map_err(|e| LifecycleError::Invalid(e.to_string()))?;
+    *cwd = Some(
+        checked
+            .cwd
+            .to_str()
+            .ok_or_else(|| invalid_field("cwd", "must be valid UTF-8"))?
+            .to_string(),
+    );
+    Ok(Some(config_home))
+}
+
+fn codex_config_home(
+    base: &Path,
+    explicit: Option<&std::ffi::OsStr>,
+    home_override: Option<&Path>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, LifecycleError> {
+    let home = explicit
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_override.map(|home| home.join(".codex")))
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|home| Path::new(home).join(".codex"))
+        })
+        .ok_or_else(|| {
+            LifecycleError::Invalid(
+                "Codex trust check requires CODEX_HOME or HOME to locate config.toml".into(),
+            )
+        })?;
+    Ok(base.join(home))
+}
+
+#[cfg(test)]
+thread_local! {
+    // Scoped ambient input replacement, not a trust bypass or process environment edit.
+    static TEST_CODEX_HOME: std::cell::RefCell<Option<Option<std::ffi::OsString>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct IsolatedCodexHome(Option<Option<std::ffi::OsString>>);
+#[cfg(test)]
+impl IsolatedCodexHome {
+    pub(crate) fn new() -> Self {
+        Self(TEST_CODEX_HOME.with(|slot| slot.replace(Some(None))))
+    }
+}
+#[cfg(test)]
+impl Drop for IsolatedCodexHome {
+    fn drop(&mut self) {
+        TEST_CODEX_HOME.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn pin_launch_config(launch: &mut Option<LaunchSpec>, config_home: Option<&Path>) {
+    if let (Some(launch), Some(home)) = (launch, config_home) {
+        launch.env.retain(|(key, _)| key != "CODEX_HOME");
+        // preflight accepted only UTF-8 paths.
+        launch.env.push((
+            "CODEX_HOME".into(),
+            home.to_str().expect("checked config home").into(),
+        ));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn trusted_codex_home(home: &Path, cwd: &Path) -> IsolatedCodexHome {
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    let root = cwd.canonicalize().unwrap();
+    let project = root
+        .ancestors()
+        .find(|p| p.join(".git").exists())
+        .unwrap_or(&root);
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(project.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    IsolatedCodexHome::new()
+}
+
 /// Build a launch command for built-in CLI vendors; custom vendors use prompt delivery.
 #[cfg(test)]
 fn launch_spec_for(
@@ -1219,6 +1334,7 @@ pub(crate) struct FakeRuntime {
     pub(crate) calls: std::cell::RefCell<Vec<String>>,
     /// The launch command of each `spawn` call that was not refused, by `session:window`.
     pub(crate) launches: std::cell::RefCell<Vec<(String, Option<LaunchSpec>)>>,
+    pub(crate) spawn_cwds: std::cell::RefCell<Vec<Option<String>>>,
     /// Windows whose runtime is gone right after its spawn (a launched command that exits).
     pub(crate) vanish_windows: std::cell::RefCell<Vec<String>>,
     /// How many times `exists` was asked.
@@ -1394,10 +1510,11 @@ impl SessionRuntime for FakeRuntime {
         &self,
         session: &str,
         window: &str,
-        _cwd: Option<&str>,
+        cwd: Option<&str>,
         launch: Option<&LaunchSpec>,
         hosted_id: &str,
     ) -> bool {
+        self.spawn_cwds.borrow_mut().push(cwd.map(str::to_string));
         self.calls
             .borrow_mut()
             .push(format!("spawn {session}:{window}"));
@@ -3469,8 +3586,9 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         previous.as_ref(),
         OwnerGate::SpinUp,
     )?;
+    let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
     let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
-    let launch = if has_runtime && v.hosted && env.spawn_runtime {
+    let mut launch = if has_runtime && v.hosted && env.spawn_runtime {
         env.runtime.preflight_spawn(&session_id)?;
         launch_spec_for_with_session(
             env,
@@ -3486,6 +3604,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     } else {
         None
     };
+    pin_launch_config(&mut launch, config_home.as_deref());
     register_spun_up_agent(store, &v, by)?;
 
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
@@ -4852,6 +4971,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         record.project = agent.project;
         record.role = role_label_of(&agent.role);
     }
+    let config_home = preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
     if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
         env.runtime.preflight_spawn(&record.session_id)?;
     }
@@ -4907,7 +5027,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         // this point is someone else's.
         record.runtime_spawned = false;
     }
-    let launch = if record.hosted
+    let mut launch = if record.hosted
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
@@ -4926,6 +5046,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
     } else {
         None
     };
+    pin_launch_config(&mut launch, config_home.as_deref());
     let mut launched_with_prompt = false;
     let mut launch_died = false;
     if record.hosted
@@ -5253,7 +5374,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             old_cwd.clone()
         }
     };
-    let to = SpinUpRequest {
+    let mut to = SpinUpRequest {
         persona: target.persona.clone(),
         project: project.clone(),
         role: role.clone(),
@@ -5325,6 +5446,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         preflight_teardown_runtime(store, env, target, caller)?;
         check_old_runtime_stoppable(store, env, target, &to)?;
     }
+    preflight_vendor_launch(env, &to.vendor, to.hosted, &mut to.cwd)?;
     Ok(RemodelPlan {
         mode,
         persona: target.persona.clone(),
@@ -5796,6 +5918,184 @@ mod tests {
     use fl_core::MemStore;
     use fl_core::at::At;
     use tempfile::TempDir;
+
+    #[test]
+    fn codex_config_home_uses_explicit_then_selected_home_and_resolves_relative_paths() {
+        use std::ffi::OsStr;
+        let base = Path::new("/base");
+        for (explicit, override_home, home, expected) in [
+            (
+                Some("/configured"),
+                Some("/isolated"),
+                Some("/ambient"),
+                "/configured",
+            ),
+            (Some("relative"), None, Some("/ambient"), "/base/relative"),
+            (
+                Some(""),
+                Some("/isolated"),
+                Some("/ambient"),
+                "/isolated/.codex",
+            ),
+            (None, None, Some("/ambient"), "/ambient/.codex"),
+        ] {
+            assert_eq!(
+                codex_config_home(
+                    base,
+                    explicit.map(OsStr::new),
+                    override_home.map(Path::new),
+                    home.map(OsStr::new)
+                )
+                .unwrap(),
+                Path::new(expected)
+            );
+        }
+        assert!(codex_config_home(base, None, None, None).is_err());
+    }
+
+    #[test]
+    fn codex_trust_refuses_spinup_before_registration_without_host_registry() {
+        let home = TempDir::new().unwrap();
+        let _config_env = IsolatedCodexHome::new();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let store = MemStore::default();
+        let mut request = req("ada", "assistant", "codex");
+        request.cwd = Some(home.path().display().to_string());
+        let route = webhook_route_file(home.path(), "ada");
+        let before_route = std::fs::read(&route).unwrap();
+        for config in ["", "token = \"PRIVATE_TOKEN\n"] {
+            std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+            std::fs::write(home.path().join(".codex/config.toml"), config).unwrap();
+            let err = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap_err();
+            assert!(matches!(err, LifecycleError::Invalid(_)), "{err}");
+            assert!(err.to_string().contains("trust_level"));
+            assert!(!err.to_string().contains("PRIVATE_TOKEN"));
+            assert!(store.agent_by_name("ada").unwrap().is_none());
+            assert!(list_hosted_sessions(&store).unwrap().is_empty());
+            assert!(fake.calls.borrow().is_empty());
+            assert_eq!(std::fs::read(&route).unwrap(), before_route);
+        }
+    }
+
+    #[test]
+    fn codex_trust_refuses_restart_and_remodel_before_any_mutation() {
+        for vendor in ["codex", "claude"] {
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let store = MemStore::default();
+            let _config_env = trusted_codex_home(home.path(), home.path());
+            let mut request = req("ada", "assistant", vendor);
+            request.cwd = Some(home.path().display().to_string());
+            spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            std::fs::write(home.path().join(".codex/config.toml"), "").unwrap();
+            let before = serde_json::to_value(list_hosted_sessions(&store).unwrap()).unwrap();
+            let agent = serde_json::to_value(store.agent_by_name("ada").unwrap()).unwrap();
+            let route = webhook_route_file(home.path(), "ada");
+            let routes = std::fs::read(&route).unwrap();
+            let calls = fake.calls.borrow().clone();
+            let id = format!("{vendor}:ada");
+            if vendor == "codex" {
+                assert!(matches!(
+                    restart_hosted_session(&store, &env, &id, "owner"),
+                    Err(LifecycleError::Invalid(_))
+                ));
+            } else {
+                let target = SessionTarget::resolve(&store, &id, None).unwrap();
+                for mode in ["prepare", "execute"] {
+                    let request = RemodelRequest {
+                        vendor: "codex".into(),
+                        mode: Some(mode.into()),
+                        ..Default::default()
+                    };
+                    assert!(matches!(
+                        remodel_session(
+                            &store,
+                            &env,
+                            &target,
+                            &request,
+                            "owner",
+                            Caller::Owner,
+                            |_| panic!("queue changed")
+                        ),
+                        Err(LifecycleError::Invalid(_))
+                    ));
+                    assert!(
+                        store
+                            .list_state(None, None)
+                            .unwrap()
+                            .iter()
+                            .all(|entry| entry.slug != remodel_handoff_slug("ada"))
+                    );
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(list_hosted_sessions(&store).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(store.agent_by_name("ada").unwrap()).unwrap(),
+                agent
+            );
+            assert_eq!(std::fs::read(&route).unwrap(), routes);
+            assert_eq!(*fake.calls.borrow(), calls);
+        }
+    }
+
+    #[test]
+    fn codex_trust_pins_launch_inputs_and_rejects_invalid_explicit_cwd() {
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        for cwd in [None, Some(home.path().join(".").display().to_string())] {
+            let store = MemStore::default();
+            let expected = cwd
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap())
+                .canonicalize()
+                .unwrap();
+            let _config_env = trusted_codex_home(home.path(), &expected);
+            let mut request = req("ada", "assistant", "codex");
+            request.cwd = cwd;
+            fake.live.borrow_mut().clear();
+            let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            assert_eq!(
+                find_hosted_session(&store, &[&out.session_id])
+                    .unwrap()
+                    .unwrap()
+                    .cwd
+                    .as_deref(),
+                expected.to_str()
+            );
+            assert_eq!(
+                fake.spawn_cwds.borrow().last().unwrap().as_deref(),
+                expected.to_str()
+            );
+            let launches = fake.launches.borrow();
+            let launch = launches.last().unwrap().1.as_ref().unwrap();
+            assert_eq!(
+                launch
+                    .env
+                    .iter()
+                    .filter(|(key, _)| key == "CODEX_HOME")
+                    .collect::<Vec<_>>(),
+                vec![&(
+                    "CODEX_HOME".to_string(),
+                    home.path().join(".codex").display().to_string()
+                )]
+            );
+        }
+        let store = MemStore::default();
+        let mut request = req("bad", "assistant", "codex");
+        request.cwd = Some(home.path().join("missing").display().to_string());
+        assert!(matches!(
+            spin_up(&store, &env, &request, "owner", Caller::Owner),
+            Err(LifecycleError::Invalid(_))
+        ));
+        assert!(store.agent_by_name("bad").unwrap().is_none());
+    }
 
     #[test]
     fn reforge_role_label_round_trips_through_agent_role_from_label() {
@@ -9114,6 +9414,7 @@ mod tests {
      {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let fake = FakeRuntime::default();
         let env = LifecycleEnv {
             runtime: &fake,
@@ -10089,7 +10390,7 @@ mod tests {
         #[derive(Debug)]
         struct StubHostAdapter {
             vendor: &'static str,
-            err: VendorAdapterError,
+            err: Option<VendorAdapterError>,
         }
 
         impl VendorHostAdapter for StubHostAdapter {
@@ -10103,7 +10404,18 @@ mod tests {
                 &self,
                 _req: &VendorLaunchRequest,
             ) -> Result<VendorLaunchPlan, VendorAdapterError> {
-                Err(self.err.clone())
+                match &self.err {
+                    Some(err) => Err(err.clone()),
+                    None => Ok(VendorLaunchPlan {
+                        vendor_id: self.vendor.into(),
+                        binary: self.vendor.into(),
+                        argv: vec![self.vendor.into()],
+                        env: vec![("CODEX_HOME".into(), "/wrong-adapter-default".into())],
+                        cwd: _req.cwd.clone(),
+                        remote_control: false,
+                        startup_rules: Vec::new(),
+                    }),
+                }
             }
             fn validate_config(
                 &self,
@@ -10190,10 +10502,10 @@ mod tests {
         let reg = VendorHostAdapterRegistry::new();
         reg.register(Arc::new(StubHostAdapter {
             vendor: "claude",
-            err: VendorAdapterError::PermissionRefused {
+            err: Some(VendorAdapterError::PermissionRefused {
                 vendor: "claude".into(),
                 reason: "host adapter refused posture".into(),
-            },
+            }),
         }));
         TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg));
 
@@ -10216,16 +10528,22 @@ mod tests {
         let reg2 = VendorHostAdapterRegistry::new();
         reg2.register(Arc::new(StubHostAdapter {
             vendor: "codex",
-            err: VendorAdapterError::InvalidConfig {
+            err: Some(VendorAdapterError::InvalidConfig {
                 vendor: "codex".into(),
                 reason: "invalid Codex model id `opus[1m]`".into(),
-            },
+            }),
         }));
         TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg2));
 
         let mut codex_req = req("ada", "assistant", "codex");
         codex_req.model = Some("opus[1m]".into());
         codex_req.posture = Posture::Bypass;
+        let _config_env = IsolatedCodexHome::new();
+        let err = spin_up(&store, &env, &codex_req, "owner", Caller::Owner).unwrap_err();
+        assert!(err.to_string().contains("trust_level"));
+        assert!(store.agent_by_name("ada").unwrap().is_none());
+        assert!(fake.launches.borrow().is_empty());
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
         let out = spin_up(&store, &env, &codex_req, "owner", Caller::Owner).unwrap();
         assert!(out.runtime_spawned);
         let launches = fake.launches.borrow();
@@ -10243,6 +10561,18 @@ mod tests {
             !spec.argv.iter().any(|a| a == "--model"),
             "CLI fallback must normalize out window-tagged model on codex: {:?}",
             spec.argv
+        );
+        assert!(spec.env.contains(&(
+            "CODEX_HOME".into(),
+            home.path().join(".codex").display().to_string()
+        )));
+        assert_eq!(
+            fake.spawn_cwds.borrow().last().unwrap().as_deref(),
+            std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .to_str()
         );
         drop(launches);
 
@@ -10262,15 +10592,39 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err_ask, LifecycleError::Invalid(_)), "{err_ask:?}");
 
+        // A successful host adapter cannot override the checked configuration either.
+        let successful = VendorHostAdapterRegistry::new();
+        successful.register(Arc::new(StubHostAdapter {
+            vendor: "codex",
+            err: None,
+        }));
+        TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(successful));
+        let host_request = req("pat", "assistant", "codex");
+        spin_up(&store, &env, &host_request, "owner", Caller::Owner).unwrap();
+        let launches = fake.launches.borrow();
+        let host_spec = launches.last().unwrap().1.as_ref().unwrap();
+        assert_eq!(
+            host_spec
+                .env
+                .iter()
+                .filter(|(key, _)| key == "CODEX_HOME")
+                .collect::<Vec<_>>(),
+            vec![&(
+                "CODEX_HOME".into(),
+                home.path().join(".codex").display().to_string()
+            )]
+        );
+        drop(launches);
+
         // 4. Non-permission error from a host adapter that has no CLI adapter fallback surfaces
         //    `LifecycleError::Invalid` instead of `Ok(None)`.
         let reg3 = VendorHostAdapterRegistry::new();
         reg3.register(Arc::new(StubHostAdapter {
             vendor: "host-only-vendor",
-            err: VendorAdapterError::Transport {
+            err: Some(VendorAdapterError::Transport {
                 vendor: "host-only-vendor".into(),
                 reason: "control socket unreachable".into(),
-            },
+            }),
         }));
         TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg3));
         let err_no_cli = launch_spec_for_with_session(
@@ -10301,10 +10655,10 @@ mod tests {
         let reg4 = VendorHostAdapterRegistry::new();
         reg4.register(Arc::new(StubHostAdapter {
             vendor: "claude",
-            err: VendorAdapterError::InvalidConfig {
+            err: Some(VendorAdapterError::InvalidConfig {
                 vendor: "claude".into(),
                 reason: "invalid Claude model id".into(),
-            },
+            }),
         }));
         TEST_HOST_ADAPTER_REGISTRY.with(|slot| *slot.borrow_mut() = Some(reg4));
 
