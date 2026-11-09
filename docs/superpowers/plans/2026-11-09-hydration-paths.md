@@ -120,3 +120,24 @@ HostedSessionRecord. Preserve D3's host_session_id if it lands meanwhile.
 - [ ] Note automatic-restart historical UI visibility in #406. Open the PR through
       `fl github pr create`, name top-level response `warnings` fields for Felix, and
       obtain current-head Ferris approval/current CI before author merge.
+
+### Task 2 WIP checkpoint — 2026-11-09 priority preemption
+
+Task 2 is parked at Ferris's direction for critical #408 work; this checkpoint is
+not complete or green. Initial RED (`paths-task2-red.log`) demonstrated missing
+absolute registered/worktree instructions and missing lifecycle warning arrays.
+Partial implementation adds `hydration.rs` with config-entry resolution, Git
+identity guarding, explicit file/catalog guidance and warning logging; connects
+spin-up/restart/remodel, canonical reforge fallback and human CLI warnings.
+
+The in-flight focused check (`paths-task2-focused.log`, `cargo test -p fl-hub
+hydration_`) failed compilation: `lifecycle.rs` imports `canonical_reforge_prompt`
+unconditionally although its compatibility helper is now `#[cfg(test)]`. No full
+suite or independent Task 2 review has run. `git diff --check` passed.
+
+Resume by fixing that import boundary, compiling, updating old relative-path test
+expectations, and completing the planned path/role/malformed-layout matrix,
+default-response and automatic-restart log capture tests. The new log capture hook
+is present but its assertion is not yet written. Verify config/catalog ambiguity
+and workspace provenance policies, final cwd ordering, external-helper lock scope,
+and CLI fixtures before the full verification and independent review gates.

@@ -18,6 +18,7 @@ mod direct_quota;
 pub mod discovery;
 mod doctor_api;
 pub mod github_pr;
+mod hydration;
 pub mod lifecycle;
 mod mcp_api;
 pub mod nodes;

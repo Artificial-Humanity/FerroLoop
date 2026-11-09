@@ -634,3 +634,12 @@ fn hydration_status_legacy_record_decodes_as_unconfirmed_when_saved_again() {
     assert_eq!(record["hydration_dispatched"], true);
     assert_eq!(record["hydration_status"], "unconfirmed");
 }
+
+#[test]
+fn hydration_guidance_warnings_keep_json_stdout_and_human_diagnostics() {
+    let e = Env::new();
+    let json = Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    assert!(json["warnings"].as_array().is_some_and(|w| !w.is_empty()));
+    e.fl().args(["agent", "spin-up", "bea", "--project", "FerroLoop", "--role", "assistant", "--vendor", "claude", "--by", "owner"])
+        .assert().success().stderr(contains("warning: "));
+}
