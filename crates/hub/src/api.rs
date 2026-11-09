@@ -7265,58 +7265,99 @@ fn build_reforge_prompt_with_hydrate(
         .collect();
     agents.sort_by_key(|agent| agent.status != AgentStatus::Active);
     let agent = agents.into_iter().next();
-    if let Some(agent) = &agent {
-        let required = lifecycle::recast_guidance_required(&*store, agent)?;
-        let catalog_custom = match &agent.role {
-            AgentRole::Custom(slug) => lifecycle::has_catalog_guidance(&*store, slug)?,
-            _ => false,
-        };
-        if required || catalog_custom {
-            return contextual_reforge_prompt(state, &*store, agent);
-        }
-    }
-    // The external helper may itself read FerroState. Never hold the hub store
-    // serialization lock across that subprocess boundary.
+    let snapshot = agent
+        .map(|agent| {
+            let persona = agent.name_key.clone();
+            snapshot_reforge_prompt(&*store, agent, || {
+                lifecycle::find_hosted_session(&*store, &[&persona])
+            })
+        })
+        .transpose()?;
+    // Both the external helper and local filesystem renderer run without the store
+    // serialization lock. Authority and metadata use the single snapshot above.
     drop(store);
-    if let Some(prompt) = hydrate()
+    if !snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.current_guidance_required)
+        && let Some(prompt) = hydrate()
         && !prompt.trim().is_empty()
     {
         return Ok(prompt);
     }
-    let agent = agent.ok_or_else(|| {
+    let snapshot = snapshot.ok_or_else(|| {
         LifecycleError::NotFound(format!("no agent record for reforge of `{persona}`"))
     })?;
-    let store = state
-        .open_store()
-        .map_err(|e| LifecycleError::Store(e.to_string()))?;
-    contextual_reforge_prompt(state, &*store, &agent)
+    Ok(contextual_reforge_prompt(state, snapshot))
 }
 
-fn contextual_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catalog>(
-    state: &HubState,
+struct ReforgePromptSnapshot {
+    agent: AgentRecord,
+    guidance: lifecycle::RegisteredRoleGuidance,
+    projects: crate::hydration::ProjectRoots,
+    hosted: Option<lifecycle::HostedSessionRecord>,
+    current_guidance_required: bool,
+    warnings: Vec<String>,
+}
+
+fn snapshot_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catalog>(
     store: &S,
-    agent: &AgentRecord,
-) -> Result<String, LifecycleError> {
-    let record = lifecycle::find_hosted_session(store, &[&agent.name_key])?;
-    let cwd = record
+    agent: AgentRecord,
+    hosted: impl FnOnce() -> Result<Option<lifecycle::HostedSessionRecord>, LifecycleError>,
+) -> Result<ReforgePromptSnapshot, LifecycleError> {
+    let recast_required = lifecycle::recast_guidance_required(store, &agent)?;
+    let catalog_custom = match &agent.role {
+        AgentRole::Custom(slug) => lifecycle::has_catalog_guidance(store, slug)?,
+        _ => false,
+    };
+    let guidance = lifecycle::prepare_registered_role_guidance(store, &agent.role)?;
+    let (hosted, warnings) = match hosted() {
+        Ok(record) => (record, Vec::new()),
+        Err(_) => (
+            None,
+            vec!["hosted-session context unavailable; continuing with registered guidance".into()],
+        ),
+    };
+    Ok(ReforgePromptSnapshot {
+        agent,
+        guidance,
+        projects: crate::hydration::project_roots(store),
+        hosted,
+        current_guidance_required: recast_required || catalog_custom,
+        warnings,
+    })
+}
+
+fn contextual_reforge_prompt(state: &HubState, snapshot: ReforgePromptSnapshot) -> String {
+    let ReforgePromptSnapshot {
+        agent,
+        guidance,
+        projects,
+        hosted,
+        warnings,
+        ..
+    } = snapshot;
+    let env = lifecycle_env(state);
+    let workspace = env.workspace_root.and_then(fl_core::find_workspace_root);
+    let cwd = hosted
         .as_ref()
-        .and_then(|r| r.cwd.as_deref())
-        .map(Path::new)
-        .unwrap_or(&state.config.repo_root);
-    let guidance = lifecycle::registered_role_prompt(
-        store,
-        &lifecycle_env(state),
-        Some(cwd),
-        &agent.display_name,
+        .filter(|record| record.hosted)
+        .and_then(|record| record.cwd.as_deref())
+        .map(Path::new);
+    let context = crate::hydration::Context::resolve_with_catalog(
+        projects,
+        env.home_override,
+        workspace.as_deref(),
+        cwd,
         &agent.project,
-        &agent.role,
-    )?;
-    let session_id = record
+    );
+    let mut guidance = guidance.render(context, &agent.display_name, &agent.project);
+    guidance.warnings.extend(warnings);
+    let session_id = hosted
         .as_ref()
-        .map(|r| r.session_id.as_str())
+        .map(|record| record.session_id.as_str())
         .unwrap_or(&agent.name_key);
     crate::hydration::log_warnings(&agent.name_key, session_id, &guidance.warnings);
-    Ok(guidance.text)
+    guidance.text
 }
 
 pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
@@ -9710,6 +9751,167 @@ mod council_guidance_tests {
             "Read `{}`",
             tmp.path().join(".agents/AGENTS.md").display()
         )));
+    }
+
+    #[test]
+    fn hydration_reforge_optional_session_failure_warns_but_authority_failures_remain_errors() {
+        use fl_core::store::AgentRegistry;
+        let store = fl_core::MemStore::default();
+        let agent = store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        let snapshot = snapshot_reforge_prompt(&store, agent.clone(), || {
+            Err(LifecycleError::Store("PRIVATE backend details".into()))
+        })
+        .unwrap();
+        assert!(snapshot.hosted.is_none());
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert!(snapshot.warnings[0].contains("hosted-session context unavailable"));
+        assert!(!snapshot.warnings[0].contains("PRIVATE"));
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        crate::hydration::WARNING_LOG.with_borrow_mut(Vec::clear);
+        let prompt = contextual_reforge_prompt(&state, snapshot);
+        assert!(prompt.contains("--project ferroloop --role assistant"));
+        let logs = crate::hydration::WARNING_LOG.with_borrow(Clone::clone);
+        assert!(logs.iter().any(|line| {
+            line.contains("persona=ada session=ada: hosted-session context unavailable")
+        }));
+        assert!(!logs.iter().any(|line| line.contains("PRIVATE")));
+        let mut invalid = agent.clone();
+        invalid.role = AgentRole::Custom("../invalid".into());
+        assert!(
+            snapshot_reforge_prompt(&store, invalid, || panic!("authority must fail first"))
+                .is_err()
+        );
+        let mut catalog = agent;
+        catalog.role = AgentRole::Custom("council-chair".into());
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "role-council-chair".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: json!({"invalid":"guidance"}),
+                    merge_mode: fl_core::state::MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        assert!(
+            snapshot_reforge_prompt(&store, catalog, || panic!(
+                "catalog failure must remain hard"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hydration_reforge_resolves_files_after_releasing_the_store_lock() {
+        for role in [
+            AgentRole::Assistant,
+            AgentRole::Custom("council-chair".into()),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().join("unrelated-hub"),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            state
+                .open_store()
+                .unwrap()
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Ada".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+            let lock = state.store_lock.clone();
+            let called = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = called.clone();
+            crate::hydration::RESOLVE_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    observed.set(true);
+                    assert!(
+                        lock.try_lock().is_ok(),
+                        "filesystem resolution must not hold the store guard"
+                    );
+                }))
+            });
+            build_reforge_prompt_with_hydrate(&state, "ada", || None).unwrap();
+            assert!(called.get());
+        }
+    }
+
+    #[test]
+    fn hydration_nonhosted_reforge_does_not_invent_an_unrelated_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("registered");
+        std::fs::create_dir(&root).unwrap();
+        let config = tmp.path().join(".config/fl");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            format!(
+                "[[project]]\nname = 'ferroloop'\nroot = {:?}\n",
+                root.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().join("unrelated-hub"),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        crate::hydration::WARNING_LOG.with_borrow_mut(Vec::clear);
+        build_reforge_prompt_with_hydrate(&state, "ada", || None).unwrap();
+        let logs = crate::hydration::WARNING_LOG.with_borrow(Clone::clone);
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("cwd is outside project")),
+            "{logs:?}"
+        );
     }
 
     #[test]
