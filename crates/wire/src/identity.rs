@@ -3141,7 +3141,14 @@ fn response_item_tool_input_text(val: &serde_json::Value) -> String {
 fn is_tool_output_type(kind: Option<&str>) -> bool {
     matches!(
         kind,
-        Some("tool_result" | "TOOL_RESULT" | "custom_tool_call_output" | "function_call_output")
+        Some(
+            "tool_result"
+                | "TOOL_RESULT"
+                | "custom_tool_call_output"
+                | "function_call_output"
+                | "GENERIC"
+                | "generic"
+        )
     )
 }
 
@@ -3187,93 +3194,83 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
         if line.trim().is_empty() {
             continue;
         }
-        let candidate_text: String =
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                for field in ["agentName", "customTitle", "persona"] {
-                    if let Some(s) = val.get(field).and_then(|v| v.as_str())
-                        && let Some(norm) = normalize_claude_session_name(s)
-                    {
-                        latest_field = Some(norm);
-                    }
-                }
-                if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
-                    || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
-                    || val.get("synthetic_reason").is_some()
+        let candidate_text: String = if let Ok(val) =
+            serde_json::from_str::<serde_json::Value>(line)
+        {
+            if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("synthetic_reason").is_some()
+            {
+                continue;
+            }
+            let t = val.get("type").and_then(|v| v.as_str());
+            let pt = val.pointer("/payload/type").and_then(|v| v.as_str());
+            // Tool output includes repository source and test fixtures that name
+            // other personas. Reject the whole row before reading even identity fields.
+            if is_tool_output_type(t) || (t == Some("response_item") && is_tool_output_type(pt)) {
+                continue;
+            }
+            for field in ["agentName", "customTitle", "persona"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str())
+                    && let Some(norm) = normalize_claude_session_name(s)
                 {
-                    continue;
+                    latest_field = Some(norm);
                 }
-                let t = val.get("type").and_then(|v| v.as_str());
-                // Tool output includes repository source and test fixtures that name
-                // other personas. Do not read those rows.
-                if is_tool_output_type(t) {
-                    continue;
-                }
-                if t == Some("response_item") {
-                    let pt = val.pointer("/payload/type").and_then(|v| v.as_str());
-                    if is_tool_output_type(pt) {
+            }
+            if t == Some("response_item") {
+                if matches!(pt, Some("custom_tool_call" | "function_call")) {
+                    let args = response_item_tool_input_text(&val);
+                    if args.is_empty() {
                         continue;
                     }
-                    if matches!(pt, Some("custom_tool_call" | "function_call")) {
-                        let args = response_item_tool_input_text(&val);
-                        if args.is_empty() {
-                            continue;
-                        }
-                        args
-                    } else if pt == Some("message")
-                        && val.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user")
-                        && let Some(c) = val
-                            .pointer("/payload/content")
-                            .and_then(extract_text_from_json_content)
+                    args
+                } else if pt == Some("message")
+                    && val.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user")
+                    && let Some(c) = val
+                        .pointer("/payload/content")
+                        .and_then(extract_text_from_json_content)
+                {
+                    let trimmed_c = c.trim_start();
+                    if trimmed_c.starts_with("# AGENTS.md instructions for ")
+                        || trimmed_c.starts_with("<environment_context>")
+                        || trimmed_c.starts_with("<INSTRUCTIONS>")
+                        || trimmed_c.starts_with("<permissions instructions>")
+                        || trimmed_c.starts_with("<user_shell_command>")
                     {
-                        let trimmed_c = c.trim_start();
-                        if trimmed_c.starts_with("# AGENTS.md instructions for ")
-                            || trimmed_c.starts_with("<environment_context>")
-                            || trimmed_c.starts_with("<INSTRUCTIONS>")
-                            || trimmed_c.starts_with("<permissions instructions>")
-                            || trimmed_c.starts_with("<user_shell_command>")
-                        {
-                            continue;
-                        }
-                        c
-                    } else {
                         continue;
                     }
-                } else if matches!(t, Some("GENERIC" | "generic")) {
-                    if line.contains("Showing lines ") {
-                        continue;
-                    }
-                    let Some(s) = row_text(&val) else {
-                        continue;
-                    };
-                    s
-                } else if matches!(
-                    t,
-                    Some("assistant" | "PLANNER_RESPONSE" | "planner_response")
-                ) {
-                    let mut parts = Vec::new();
-                    if let Some(s) = row_text(&val) {
-                        parts.push(s);
-                    }
-                    let args = tool_call_argument_text(&val);
-                    if !args.is_empty() {
-                        parts.push(args);
-                    }
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    parts.join("\n")
+                    c
                 } else {
-                    if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
-                        continue;
-                    }
-                    let Some(s) = row_text(&val) else {
-                        continue;
-                    };
-                    s
+                    continue;
                 }
+            } else if matches!(
+                t,
+                Some("assistant" | "PLANNER_RESPONSE" | "planner_response")
+            ) {
+                let mut parts = Vec::new();
+                if let Some(s) = row_text(&val) {
+                    parts.push(s);
+                }
+                let args = tool_call_argument_text(&val);
+                if !args.is_empty() {
+                    parts.push(args);
+                }
+                if parts.is_empty() {
+                    continue;
+                }
+                parts.join("\n")
             } else {
-                line.to_string()
-            };
+                if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
+                    continue;
+                }
+                let Some(s) = row_text(&val) else {
+                    continue;
+                };
+                s
+            }
+        } else {
+            line.to_string()
+        };
         let lower = candidate_text.to_ascii_lowercase();
         for marker in [
             "agent-msg register ",
@@ -4777,6 +4774,81 @@ mod tests {
     }
 
     #[test]
+    fn scan_rejects_generic_output_identity_text() {
+        for kind in ["GENERIC", "generic"] {
+            for content in [
+                "agent-msg register Kayla",
+                "diff --git a/example b/example\n+fl wire register Kayla --replace\n",
+                "Showing lines 1-20 of example\nYou are Kayla",
+                "Command output:\n\"Take the name of Kayla\"\n",
+            ] {
+                let row = serde_json::json!({"type": kind, "content": content});
+                assert_eq!(scan_text_for_persona(&row.to_string(), 50), None);
+            }
+        }
+    }
+
+    #[test]
+    fn scan_rejects_tool_output_identity_fields_before_reading_them() {
+        for kind in [
+            "GENERIC",
+            "generic",
+            "tool_result",
+            "TOOL_RESULT",
+            "custom_tool_call_output",
+            "function_call_output",
+        ] {
+            for field in ["agentName", "customTitle", "persona"] {
+                let mut output = serde_json::json!({"type": kind, "content": "completed"});
+                output[field] = serde_json::json!("Kayla");
+                assert_eq!(scan_text_for_persona(&output.to_string(), 50), None);
+
+                let mut wrapped = serde_json::json!({
+                    "type": "response_item",
+                    "payload": output,
+                });
+                wrapped[field] = serde_json::json!("Kayla");
+                assert_eq!(scan_text_for_persona(&wrapped.to_string(), 50), None);
+            }
+        }
+    }
+
+    #[test]
+    fn scan_preserves_agy_bootstrap_and_command_input_despite_output_identity() {
+        for legitimate in [
+            serde_json::json!({
+                "type": "USER_INPUT",
+                "content": "Take the name of Fiona and take up residence as the assistant.",
+            }),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{
+                    "name": "run_command",
+                    "args": {"CommandLine": "fl wire register Fiona --project ferroloop --role assistant --replace"},
+                }],
+            }),
+        ] {
+            let text = [
+                legitimate.to_string(),
+                serde_json::json!({
+                    "type": "GENERIC",
+                    "content": "diff --git a/example b/example\n+agent-msg register Kayla\n",
+                    "persona": "Kayla",
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "response_item",
+                    "agentName": "Kayla",
+                    "payload": {"type": "generic", "content": "You are Kayla"},
+                })
+                .to_string(),
+            ]
+            .join("\n");
+            assert_eq!(scan_text_for_persona(&text, 50).as_deref(), Some("fiona"));
+        }
+    }
+
+    #[test]
     fn scan_ignores_tool_output_subagents_and_read_file_dumps() {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("sub.jsonl");
@@ -4834,10 +4906,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert_eq!(
-            scan_transcript_for_persona(&generic, 20).as_deref(),
-            Some("wesley")
-        );
+        assert_eq!(scan_transcript_for_persona(&generic, 20), None);
 
         let assistant = tmp.path().join("assistant.jsonl");
         fs::write(
