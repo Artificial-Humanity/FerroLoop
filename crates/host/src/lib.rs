@@ -50,7 +50,10 @@ pub use identity::{
     LeaderAnchor, ProcessIdentity, check_pidfd_support, process_identity,
     set_pidfd_kill_unavailable, set_pidfd_probe_unavailable, signal_anchored_group,
 };
-pub use limits::{CLEANUP_DEADLINE, HANDOFF_TIMEOUT, STARTUP_CLEANUP_DEADLINE, TERM_GRACE};
+pub use limits::{
+    CLEANUP_DEADLINE, HANDOFF_TIMEOUT, HOSTED_LEADER_EXIT_GRACE, STARTUP_CLEANUP_DEADLINE,
+    TERM_GRACE,
+};
 pub use refusal::refusal;
 pub use survivor_registry::{
     CrashPoint, Registry, SessionPhase, SurvivorRecord, load_registry as read_registry,
@@ -754,14 +757,7 @@ impl Host {
             .take();
         let path = host.path.clone();
         let fail_after_publish = host.fail_handshake_after_publish;
-        let hosted_owner = env
-            .iter()
-            .find(|(key, _)| key == "FL_HOSTED_ID")
-            .filter(|(_, value)| {
-                spec.env.contains_key("FL_HOSTED_ID")
-                    && value.len() <= fl_host_proto::MAX_HOSTED_OWNER_BYTES
-            })
-            .map(|(_, value)| value.clone());
+        let hosted_owner = explicit_hosted_owner(spec, &env).map(str::to_owned);
         let supervised = child::unix::spawn_supervised(
             &host.supervisor_bin,
             spec.kind,
@@ -771,6 +767,7 @@ impl Host {
             env,
             spec.session.as_str(),
             epoch,
+            hosted_owner.is_some(),
             |vendor_pid, vendor_start, supervisor_pid, supervisor_start, pgid| {
                 let record = SurvivorRecord {
                     session: spec.session.as_str().to_owned(),
@@ -933,14 +930,7 @@ impl Host {
             control: None,
             stdin: Some(spawned.stdin),
         };
-        let hosted_owner = env
-            .iter()
-            .find(|(key, _)| key == "FL_HOSTED_ID")
-            .filter(|(_, value)| {
-                spec.env.contains_key("FL_HOSTED_ID")
-                    && value.len() <= fl_host_proto::MAX_HOSTED_OWNER_BYTES
-            })
-            .map(|(_, value)| value.as_str());
+        let hosted_owner = explicit_hosted_owner(spec, &env);
         let session = Arc::new(
             (match admission.as_ref() {
                 Some(admission) => {
@@ -1269,6 +1259,57 @@ impl HostInner {
     }
 }
 
+fn explicit_hosted_owner<'a>(spec: &SpawnSpec, env: &'a [(String, String)]) -> Option<&'a str> {
+    env.iter()
+        .find(|(key, _)| key == "FL_HOSTED_ID")
+        .map(|(_, value)| value.as_str())
+        .filter(|value| {
+            spec.env.contains_key("FL_HOSTED_ID")
+                && !value.is_empty()
+                && value.len() <= fl_host_proto::MAX_HOSTED_OWNER_BYTES
+        })
+}
+
+#[cfg(unix)]
+fn write_if_pollout(fd: libc::c_int, bytes: &[u8]) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one pollfd with zero timeout so an unresponsive or full stderr pipe
+    // never blocks status draining or epoch retirement, without mutating fd flags.
+    if unsafe { libc::poll(&mut pfd, 1, 0) } > 0
+        && (pfd.revents & libc::POLLOUT) != 0
+        && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) == 0
+    {
+        let _ = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn emit_hosted_cleanup_notice_unix(session: &Session, descendants: usize) {
+    use std::io::Write;
+    let mut raw = [0u8; 256];
+    let mut cursor = std::io::Cursor::new(raw.as_mut_slice());
+    if writeln!(
+        cursor,
+        "fl-host: hosted session {} (epoch {}) armed post-leader-exit cleanup after {}ms (descendants={descendants})",
+        session.session.as_str(),
+        session.epoch,
+        HOSTED_LEADER_EXIT_GRACE.as_millis(),
+    )
+    .is_err()
+    {
+        return;
+    }
+    let len = cursor.position() as usize;
+    let _ = write_if_pollout(libc::STDERR_FILENO, &raw[..len]);
+}
+
 #[cfg(unix)]
 fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
     while let Ok(Some(line)) = child::unix::read_line_blocking(&mut status) {
@@ -1294,6 +1335,11 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
                     signal,
                     adopted,
                 });
+            }
+            protocol::SupervisorMsg::HostedLeaderExitCleanup { descendants } => {
+                if session.has_hosted_owner() {
+                    emit_hosted_cleanup_notice_unix(&session, descendants);
+                }
             }
             protocol::SupervisorMsg::Cleanup { complete } => {
                 if complete {
@@ -1362,17 +1408,34 @@ fn windows_watch_until(
     host: Arc<HostInner>,
     mut observe: impl FnMut(&Session) -> WatchTick,
 ) {
+    windows_watch_until_log(session, host, &mut std::io::stderr(), &mut observe);
+}
+
+#[cfg(any(windows, test))]
+fn windows_watch_until_log(
+    session: Arc<Session>,
+    host: Arc<HostInner>,
+    sink: &mut dyn std::io::Write,
+    observe: &mut dyn FnMut(&Session) -> WatchTick,
+) {
     let mut cleanup_started: Option<Instant> = None;
+    let mut leader_exited_at: Option<Instant> = None;
     loop {
         match observe(&session) {
             WatchTick::Stop => break,
             WatchTick::Leader(code) => {
+                if session.has_hosted_owner() {
+                    leader_exited_at = Some(Instant::now());
+                }
                 let exit = ChildExit { code, signal: None };
                 host.mark_leader(session.session.as_str(), &exit);
                 session.note_leader(exit);
                 continue;
             }
-            WatchTick::Poll { requested, quiet } => {
+            WatchTick::Poll {
+                mut requested,
+                quiet,
+            } => {
                 if requested && cleanup_started.is_none() {
                     cleanup_started = Some(Instant::now());
                 }
@@ -1383,7 +1446,19 @@ fn windows_watch_until(
                     session.note_cleanup(CleanupReport { complete: true });
                     break;
                 }
-                if requested && cleanup_deadline_expired(cleanup_started, Instant::now()) {
+                if !requested
+                    && cleanup_started.is_none()
+                    && session.has_hosted_owner()
+                    && leader_exited_at.is_some_and(|t| t.elapsed() >= HOSTED_LEADER_EXIT_GRACE)
+                {
+                    cleanup_started = Some(Instant::now());
+                    let _ = session.request_cleanup();
+                    requested = true;
+                    let _ = emit_hosted_cleanup_notice_windows(&session, sink);
+                }
+                if (requested || cleanup_started.is_some())
+                    && cleanup_deadline_expired(cleanup_started, Instant::now())
+                {
                     host.alert("cleanup unresolved");
                     session.note_cleanup(CleanupReport { complete: false });
                     break;
@@ -1392,6 +1467,25 @@ fn windows_watch_until(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(any(windows, test))]
+fn emit_hosted_cleanup_notice_windows(
+    session: &Session,
+    sink: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut raw = [0u8; 256];
+    let mut cursor = std::io::Cursor::new(raw.as_mut_slice());
+    writeln!(
+        cursor,
+        "fl-host: hosted session {} (epoch {}) armed post-leader-exit cleanup after {}ms",
+        session.session.as_str(),
+        session.epoch,
+        HOSTED_LEADER_EXIT_GRACE.as_millis(),
+    )?;
+    let len = cursor.position() as usize;
+    sink.write_all(&raw[..len])
 }
 
 #[cfg(any(windows, test))]
@@ -1518,8 +1612,9 @@ mod deadline_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CLEANUP_DEADLINE, CleanupReport, Host, OpenOptions, Session, SessionParts, SessionPhase,
-        SurvivorRecord, WatchTick, cleanup_deadline_expired, load_registry, windows_watch_until,
+        CLEANUP_DEADLINE, CleanupReport, HOSTED_LEADER_EXIT_GRACE, Host, OpenOptions, Session,
+        SessionParts, SessionPhase, SurvivorRecord, WatchTick, cleanup_deadline_expired,
+        load_registry, windows_watch_until, windows_watch_until_log,
     };
     use fl_host_proto::{HostConfig, HostEndpoint, SessionId};
 
@@ -1602,6 +1697,359 @@ mod deadline_tests {
         let sink: Arc<dyn super::session::StdoutSink> = events.clone();
         session.set_sink(Arc::downgrade(&sink));
         (dir, host, session, events)
+    }
+
+    #[test]
+    fn windows_hosted_owner_arms_cleanup_after_leader_exit_grace_and_logs() {
+        {
+            let (_dir, host, _, _) = watch_fixture();
+            let session = Arc::new(
+                Session::new(SessionParts {
+                    session: SessionId::new("race").unwrap(),
+                    epoch: 1,
+                    vendor_pid: 0,
+                    vendor_start: 0,
+                    supervisor_pid: 0,
+                    supervisor_start: 0,
+                    pgid: 0,
+                    control_inode: 0,
+                    control: None,
+                    stdin: None,
+                })
+                .with_hosted_owner(Some("hosted-409")),
+            );
+            assert!(session.has_hosted_owner());
+            let events = Arc::new(WatchEvents::default());
+            let sink_events: Arc<dyn super::session::StdoutSink> = events.clone();
+            session.set_sink(Arc::downgrade(&sink_events));
+            let mut log = Vec::new();
+            let started = Instant::now();
+            let mut leader_sent = false;
+            let mut armed_at = None;
+            windows_watch_until_log(
+                Arc::clone(&session),
+                Arc::clone(&host.inner),
+                &mut log,
+                &mut |s| {
+                    if !leader_sent {
+                        leader_sent = true;
+                        return WatchTick::Leader(Some(0));
+                    }
+                    if s.cleanup_requested() {
+                        armed_at.get_or_insert_with(|| started.elapsed());
+                        return WatchTick::Poll {
+                            requested: true,
+                            quiet: true,
+                        };
+                    }
+                    if started.elapsed() > HOSTED_LEADER_EXIT_GRACE + Duration::from_secs(1) {
+                        return WatchTick::Stop;
+                    }
+                    WatchTick::Poll {
+                        requested: false,
+                        quiet: false,
+                    }
+                },
+            );
+            let armed = armed_at.expect("hosted-owner session never armed cleanup");
+            assert!(
+                armed >= HOSTED_LEADER_EXIT_GRACE,
+                "armed before grace: {armed:?}"
+            );
+            assert!(session.cleanup_requested());
+            assert_eq!(
+                session.cleanup_report(),
+                Some(CleanupReport { complete: true })
+            );
+            assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
+            assert_eq!(*events.0.lock().unwrap(), ["exit:Some(0)", "cleanup:true"]);
+            assert_eq!(
+                String::from_utf8(log).unwrap(),
+                "fl-host: hosted session race (epoch 1) armed post-leader-exit cleanup after 500ms\n"
+            );
+            host.shutdown().unwrap();
+        }
+
+        // A failing io::Write sink must run outside all host locks and still complete cleanup.
+        struct FailingSink<'a> {
+            host: &'a super::HostInner,
+            calls: usize,
+            locks_free: bool,
+        }
+        impl std::io::Write for FailingSink<'_> {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.locks_free = self.host.registry.try_lock().is_ok()
+                    && self.host.sessions.try_lock().is_ok()
+                    && self.host.outputs.try_lock().is_ok()
+                    && self.host.spawn_gate.try_lock().is_ok();
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let (_dir, host, _, _) = watch_fixture();
+        let session = Arc::new(
+            Session::new(SessionParts {
+                session: SessionId::new("race").unwrap(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            })
+            .with_hosted_owner(Some("hosted-409")),
+        );
+        let started = Instant::now();
+        let mut leader_sent = false;
+        let mut sink = FailingSink {
+            host: &host.inner,
+            calls: 0,
+            locks_free: false,
+        };
+        windows_watch_until_log(
+            Arc::clone(&session),
+            Arc::clone(&host.inner),
+            &mut sink,
+            &mut |s| {
+                if !leader_sent {
+                    leader_sent = true;
+                    return WatchTick::Leader(Some(0));
+                }
+                if s.cleanup_requested() {
+                    return WatchTick::Poll {
+                        requested: true,
+                        quiet: true,
+                    };
+                }
+                if started.elapsed() > HOSTED_LEADER_EXIT_GRACE + Duration::from_secs(1) {
+                    return WatchTick::Stop;
+                }
+                WatchTick::Poll {
+                    requested: false,
+                    quiet: false,
+                }
+            },
+        );
+        assert_eq!(sink.calls, 1);
+        assert!(sink.locks_free, "log write held a host lock");
+        assert!(session.cleanup_requested());
+        assert_eq!(
+            session.cleanup_report(),
+            Some(CleanupReport { complete: true })
+        );
+        assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn windows_unmarked_session_does_not_auto_cleanup_after_leader_exit_grace() {
+        let make_spec = |value: Option<&str>, allow: bool| {
+            let mut spec = fl_host_proto::SpawnSpec {
+                session: SessionId::new("race").unwrap(),
+                kind: fl_host_proto::SpawnKind::Pipe,
+                argv: vec!["bin".into()],
+                cwd: std::env::temp_dir(),
+                env: Default::default(),
+                env_allow: Default::default(),
+            };
+            if allow {
+                spec.env_allow.insert("FL_HOSTED_ID".into());
+            }
+            if let Some(value) = value {
+                spec.env.insert("FL_HOSTED_ID".into(), value.to_owned());
+            }
+            spec
+        };
+        let valid = "x".repeat(fl_host_proto::MAX_HOSTED_OWNER_BYTES);
+        let oversized = "x".repeat(fl_host_proto::MAX_HOSTED_OWNER_BYTES + 1);
+        assert_eq!(
+            super::explicit_hosted_owner(
+                &make_spec(Some(&valid), true),
+                &[("FL_HOSTED_ID".into(), valid.clone())]
+            ),
+            Some(valid.as_str())
+        );
+        assert_eq!(
+            super::explicit_hosted_owner(
+                &make_spec(None, true),
+                &[("FL_HOSTED_ID".into(), "inherited".into())]
+            ),
+            None
+        );
+        assert_eq!(
+            super::explicit_hosted_owner(
+                &make_spec(Some(""), true),
+                &[("FL_HOSTED_ID".into(), String::new())]
+            ),
+            None
+        );
+        assert_eq!(
+            super::explicit_hosted_owner(
+                &make_spec(Some(&oversized), true),
+                &[("FL_HOSTED_ID".into(), oversized)]
+            ),
+            None
+        );
+
+        let (_dir, host, session, events) = watch_fixture();
+        assert!(!session.has_hosted_owner());
+        let mut log = Vec::new();
+        let started = Instant::now();
+        let mut leader_sent = false;
+        windows_watch_until_log(
+            Arc::clone(&session),
+            Arc::clone(&host.inner),
+            &mut log,
+            &mut |s| {
+                if !leader_sent {
+                    leader_sent = true;
+                    return WatchTick::Leader(Some(0));
+                }
+                if started.elapsed() >= HOSTED_LEADER_EXIT_GRACE + Duration::from_millis(200) {
+                    return WatchTick::Stop;
+                }
+                WatchTick::Poll {
+                    requested: s.cleanup_requested(),
+                    quiet: false,
+                }
+            },
+        );
+        assert!(!session.cleanup_requested());
+        assert!(session.cleanup_report().is_none());
+        assert_eq!(session.leader_exit().unwrap().code, Some(0));
+        assert_eq!(*events.0.lock().unwrap(), ["exit:Some(0)"]);
+        assert!(log.is_empty());
+        let registry = host.inner.registry.lock().unwrap();
+        assert_eq!(registry.sessions.len(), 1);
+        assert_eq!(registry.sessions[0].phase, SessionPhase::LeaderExited);
+        drop(registry);
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn windows_hosted_owner_unresolved_cleanup_expires_after_deadline() {
+        let (_dir, host, _, _) = watch_fixture();
+        let session = Arc::new(
+            Session::new(SessionParts {
+                session: SessionId::new("race").unwrap(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            })
+            .with_hosted_owner(Some("hosted-409")),
+        );
+        let events = Arc::new(WatchEvents::default());
+        let sink_events: Arc<dyn super::session::StdoutSink> = events.clone();
+        session.set_sink(Arc::downgrade(&sink_events));
+        let mut log = Vec::new();
+        let started = Instant::now();
+        let mut leader_sent = false;
+        windows_watch_until_log(
+            Arc::clone(&session),
+            Arc::clone(&host.inner),
+            &mut log,
+            &mut |_| {
+                if !leader_sent {
+                    leader_sent = true;
+                    return WatchTick::Leader(Some(0));
+                }
+                if started.elapsed()
+                    > HOSTED_LEADER_EXIT_GRACE + CLEANUP_DEADLINE + Duration::from_secs(2)
+                {
+                    return WatchTick::Stop;
+                }
+                // Even if requested stays false in the poll snapshot, cleanup_started must bound wait.
+                WatchTick::Poll {
+                    requested: false,
+                    quiet: false,
+                }
+            },
+        );
+        assert_eq!(
+            session.cleanup_report(),
+            Some(CleanupReport { complete: false })
+        );
+        assert_eq!(*events.0.lock().unwrap(), ["exit:Some(0)", "cleanup:false"]);
+        assert_eq!(log.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert!(
+            host.inner
+                .registry
+                .lock()
+                .unwrap()
+                .alerts
+                .iter()
+                .any(|a| a == "cleanup unresolved")
+        );
+        host.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_hosted_cleanup_log_and_protocol_defaults_stay_bounded() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let legacy = br#"{"op":"spawn","argv":["a"],"cwd":[47],"env":[],"session":"s","epoch":1}"#;
+        let parsed: super::protocol::DaemonMsg = super::protocol::from_line(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            super::protocol::DaemonMsg::Spawn {
+                argv: vec!["a".into()],
+                cwd: vec![b'/'],
+                env: Vec::new(),
+                session: "s".into(),
+                epoch: 1,
+                hosted_owner: false,
+            }
+        );
+        let msg = super::protocol::SupervisorMsg::HostedLeaderExitCleanup { descendants: 3 };
+        let line = super::protocol::to_line(&msg).unwrap();
+        assert_eq!(
+            super::protocol::from_line::<super::protocol::SupervisorMsg>(&line[..line.len() - 1])
+                .unwrap(),
+            msg
+        );
+
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        assert!(super::write_if_pollout(writer.as_raw_fd(), b"hello\n"));
+        let mut got = [0u8; 6];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello\n");
+
+        // Fill the pipe with O_NONBLOCK, then restore blocking flags like STDERR_FILENO.
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let chunk = [b'x'; 4096];
+        while unsafe { libc::write(writer.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+            0
+        );
+        let started = Instant::now();
+        assert!(!super::write_if_pollout(
+            writer.as_raw_fd(),
+            b"must-not-block\n"
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

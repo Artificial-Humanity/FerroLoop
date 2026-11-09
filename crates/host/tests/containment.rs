@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use fl_host::check_pidfd_support;
 use fl_host::{
-    CLEANUP_DEADLINE, CleanupReport, ContainmentRefusal, Host, OpenOptions, ProcessIdentity,
-    SessionHandle, SessionPhase, process_identity, read_registry,
+    CLEANUP_DEADLINE, CleanupReport, ContainmentRefusal, HOSTED_LEADER_EXIT_GRACE, Host,
+    OpenOptions, ProcessIdentity, SessionHandle, SessionPhase, TERM_GRACE, process_identity,
+    read_registry,
 };
 #[cfg(unix)]
 use fl_host::{
@@ -2123,6 +2124,7 @@ fn windows_cleanup_deadline_starts_when_cleanup_is_requested() {
 fn containment_types_stay_public() {
     let _ = (
         Duration::from_secs(1),
+        HOSTED_LEADER_EXIT_GRACE,
         CleanupReport { complete: false },
         ContainmentRefusal::PidfdUnavailable,
         Host::open,
@@ -2327,4 +2329,130 @@ fn shutdown_cancels_retained_epoch_stderr_pump() {
 #[test]
 fn shutdown_cancels_retained_epoch_both_pumps() {
     retained_epoch_shutdown("both");
+}
+
+#[test]
+fn hosted_owner_leader_exit_cleans_up_lingering_descendants() {
+    let (_dir, endpoint) = harness();
+    let host = open_host(&endpoint);
+    for (idx, mode) in ["orphan", "orphan-linger"].into_iter().enumerate() {
+        let name = format!("hosted-auto-{idx}");
+        let mut child_spec = spec(&name, &[mode]);
+        child_spec
+            .env
+            .insert("FL_HOSTED_ID".into(), format!("hosted-owner-{idx}"));
+        child_spec.env_allow.insert("FL_HOSTED_ID".into());
+        let spawned_at = Instant::now();
+        let session = host.spawn(&child_spec).expect("spawn hosted");
+        let text = session
+            .read_stdout_until(b" END", Duration::from_secs(5))
+            .expect("child");
+        let pid = child_pid(&String::from_utf8_lossy(&text));
+        let start = process_identity(pid).expect("grandchild").start;
+        #[cfg(unix)]
+        let supervisor_start = process_identity(session.supervisor_pid())
+            .expect("supervisor")
+            .start;
+        let exit = session.wait_leader(Duration::from_secs(5)).expect("leader");
+        assert_eq!(exit.code, Some(0));
+        let report = session
+            .wait_cleanup(HOSTED_LEADER_EXIT_GRACE + CLEANUP_DEADLINE + Duration::from_secs(2))
+            .expect("auto cleanup after grace");
+        assert!(report.complete);
+        assert!(spawned_at.elapsed() >= HOSTED_LEADER_EXIT_GRACE);
+        assert!(matches!(session.state(), ChildState::CleanupComplete(_)));
+        assert!(host.session_phase(session.session()).is_none());
+        let registry = read_registry(host.endpoint()).expect("registry");
+        assert!(
+            registry
+                .sessions
+                .iter()
+                .all(|record| record.session != session.session().as_str())
+        );
+        #[cfg(unix)]
+        assert!(wait_gone(
+            session.supervisor_pid(),
+            supervisor_start,
+            Duration::from_secs(2)
+        ));
+        #[cfg(any(target_os = "linux", windows))]
+        assert!(
+            wait_gone(pid, start, Duration::from_secs(2)),
+            "lingering child ({mode}) was not reaped after hosted leader exit"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            if same_process(pid, start) {
+                kill_if_same(pid, start);
+            }
+        }
+    }
+}
+
+#[test]
+fn unmarked_and_invalid_hosted_id_keep_leader_exited_past_grace() {
+    let (_dir, endpoint) = harness();
+    let mut worker = Worker::start(&endpoint, &[("FL_HOSTED_ID", "inherited-parent-owner")]);
+
+    let unmarked = spec("unmarked-linger", &["orphan"]);
+
+    let mut inherited = spec("inherited-linger", &["orphan"]);
+    inherited.env_allow.insert("FL_HOSTED_ID".into());
+
+    let mut empty = spec("empty-linger", &["orphan"]);
+    empty.env.insert("FL_HOSTED_ID".into(), String::new());
+    empty.env_allow.insert("FL_HOSTED_ID".into());
+
+    let mut oversized = spec("oversized-linger", &["orphan"]);
+    oversized.env.insert(
+        "FL_HOSTED_ID".into(),
+        "x".repeat(fl_host_proto::MAX_HOSTED_OWNER_BYTES + 1),
+    );
+    oversized.env_allow.insert("FL_HOSTED_ID".into());
+
+    let mut tracked = Vec::new();
+    for case in [unmarked, inherited, empty, oversized] {
+        let name = case.session.as_str().to_owned();
+        let spawned = worker.spawn_spec(&case);
+        let text = worker.cmd(&format!("stdout {name} 5000 END"));
+        let pid = child_pid(&text.replace("\\n", "\n"));
+        let start = process_identity(pid).expect("grandchild").start;
+        let leader = worker.cmd(&format!("leader {name} 5000"));
+        assert!(leader.contains("Some(0)"), "{name}: {leader}");
+        tracked.push((name, spawned.epoch, pid, start));
+    }
+
+    std::thread::sleep(HOSTED_LEADER_EXIT_GRACE + TERM_GRACE + Duration::from_millis(300));
+
+    let registry = read_registry(&endpoint).expect("registry");
+    for (name, epoch, pid, start) in &tracked {
+        assert_eq!(
+            worker.cmd(&format!("phase {name}")),
+            "ok leader_exited",
+            "{name} auto-cleaned unexpectedly"
+        );
+        assert!(
+            same_process(*pid, *start),
+            "{name} lingering child was killed without explicit cleanup"
+        );
+        assert!(registry.sessions.iter().any(|record| {
+            record.session == *name
+                && record.epoch == *epoch
+                && record.phase == SessionPhase::LeaderExited
+        }));
+    }
+
+    for (name, epoch, pid, start) in tracked {
+        assert_eq!(worker.cmd(&format!("kill {name} {epoch}")), "ok");
+        assert_eq!(worker.cmd(&format!("cleanup {name} 8000")), "ok true");
+        assert_eq!(worker.cmd(&format!("phase {name}")), "ok absent");
+        #[cfg(any(target_os = "linux", windows))]
+        assert!(wait_gone(pid, start, Duration::from_secs(2)));
+        #[cfg(target_os = "macos")]
+        {
+            if same_process(pid, start) {
+                kill_if_same(pid, start);
+            }
+        }
+    }
 }
