@@ -367,7 +367,11 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
       return `Scope: Agent · ${selectedAgent?.display_name ?? "Unassigned"}`;
     }
     if (activeTier === "project") {
-      return `Scope: Project · ${selectedAgent?.project ?? "Workspace"}`;
+      return selectedAgent
+        ? selectedAgent.project
+          ? `Scope: Project · ${selectedAgent.project}`
+          : "Scope: Project"
+        : "Scope: Project · Workspace";
     }
     return "Scope: System · AI-Lab-0";
   }, [activeTier, selectedAgent]);

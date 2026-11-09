@@ -79,8 +79,8 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const activeCurrency = useActiveCurrency();
 
   const [project, setProject] = useState<string>(() =>
-    selectedProject && selectedProject.trim().length > 0
-      ? selectedProject.trim().toLowerCase()
+    selectedProject !== undefined
+      ? (selectedProject ?? "").trim().toLowerCase()
       : "ferroloop",
   );
   const listedProjects = useMemo(
@@ -174,14 +174,24 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   useEffect(() => {
     if (selectedProject !== prevSelectedProjectRef.current) {
       prevSelectedProjectRef.current = selectedProject;
-      if (selectedProject && selectedProject.trim().length > 0) {
-        setProject(selectedProject.trim().toLowerCase());
-      }
+      setProject(
+        selectedProject !== undefined
+          ? (selectedProject ?? "").trim().toLowerCase()
+          : "ferroloop",
+      );
     }
   }, [selectedProject]);
 
   const loadRecords = useCallback(
     async (targetProject: string) => {
+      if (!targetProject.trim()) {
+        ++loadSeqRef.current;
+        setRecords([]);
+        setSummary(null);
+        setLoading(false);
+        setError(null);
+        return;
+      }
       const seq = ++loadSeqRef.current;
       setLoading(true);
       setError(null);
@@ -266,7 +276,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const handleCreateRecord = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmedTitle = newTitle.trim();
-    if (!trimmedTitle) {
+    if (!trimmedTitle || !project.trim()) {
       return;
     }
     setCreating(true);
@@ -458,6 +468,9 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
               value={project}
               onChange={(e) => setProject(e.target.value)}
             >
+              {(!project || projectOptions.length === 0) && (
+                <option value="">None</option>
+              )}
               {projectOptions.map((proj) => (
                 <option key={proj} value={proj}>
                   {proj}
@@ -483,6 +496,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
                 className={`fd-btn${showCreateForm ? " fd-btn-active" : " fd-btn-primary"}`}
                 style={{ padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
                 onClick={() => setShowCreateForm((prev) => !prev)}
+                disabled={!project.trim()}
               >
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <line
@@ -513,7 +527,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
                 className="fd-btn"
                 style={{ padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
                 onClick={() => void loadRecords(project)}
-                disabled={loading}
+                disabled={loading || !project.trim()}
               >
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path
@@ -843,7 +857,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
             type="submit"
             data-testid="submit-new-record-btn"
             className="fd-btn fd-btn-primary"
-            disabled={creating || !newTitle.trim()}
+            disabled={creating || !newTitle.trim() || !project.trim()}
           >
             {creating ? "Creating..." : "Create Record"}
           </button>

@@ -413,6 +413,24 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
           { status: 200 },
         );
       }
+      if (url.endsWith("/api/v1/agents")) {
+        return new Response(
+          JSON.stringify({
+            agents: [
+              {
+                id: "urn:fl:agent:ferris",
+                name_key: "ferris",
+                display_name: "Ferris",
+                project: "FerroLoop",
+                role: "lead",
+                status: "active",
+              },
+            ],
+            routes: [],
+          }),
+          { status: 200 },
+        );
+      }
       if (url.includes("/api/v1/records")) {
         return new Response(JSON.stringify(makeBoardResponse()), {
           status: 200,

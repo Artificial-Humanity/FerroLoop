@@ -388,7 +388,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toEqual(["ferroloop"]);
+    expect(spinUpOptions()).toEqual([""]);
   });
 
   it("shows the virtual group in the roster, Settings and Spin-Up at phone width", async () => {
@@ -436,7 +436,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toEqual(["ferroloop"]);
+    expect(spinUpOptions()).toEqual([""]);
   });
 
   it("shows the cards and no notice for a new-style reply", async () => {

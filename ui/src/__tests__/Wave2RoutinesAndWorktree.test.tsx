@@ -114,6 +114,7 @@ describe("Record #87 — Worktree Bootstrap & Port Allocation UI (SpinUpAgentMod
       <SpinUpAgentModal
         isOpen={true}
         initialProject="ferroloop"
+        projects={[{ id: "ferroloop", slug: "ferroloop", name: "FerroLoop", kind: "project", path: "/work/ferroloop", has_git: true, purpose: null, tracker: null, store_path: null, active_agent_count: 0 }]}
         onClose={vi.fn()}
         onSpinUp={onSpinUp}
       />,
