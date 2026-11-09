@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use fl_host_proto::HostError;
 
 use crate::identity::{LeaderAnchor, process_identity, signal_anchored_group};
-use crate::limits::{CLEANUP_DEADLINE, HANDOFF_TIMEOUT, TERM_GRACE};
+use crate::limits::{CLEANUP_DEADLINE, HANDOFF_TIMEOUT, HOSTED_LEADER_EXIT_GRACE, TERM_GRACE};
 use crate::protocol::{DaemonMsg, SupervisorMsg, from_line, to_line};
 
 const CONTROL_R: i32 = 3;
@@ -62,7 +62,8 @@ pub fn run() -> Result<(), HostError> {
             env,
             session: _,
             epoch: _,
-        }) => (argv, cwd, env),
+            hosted_owner,
+        }) => (argv, cwd, env, hosted_owner),
         _ => {
             let _ = write_msg(&SupervisorMsg::Fail {
                 error: "spawn envelope".into(),
@@ -70,6 +71,7 @@ pub fn run() -> Result<(), HostError> {
             return Err(HostError::Protocol("spawn envelope".into()));
         }
     };
+    let hosted_owner = spawn.3;
     let prep = match prep_exec(spawn.0, spawn.1, spawn.2) {
         Ok(prep) => prep,
         Err(err) => {
@@ -161,11 +163,16 @@ pub fn run() -> Result<(), HostError> {
         ok: true,
         error: String::new(),
     })?;
-    supervise(vendor_pid, ident.start, ident.pgid)?;
+    supervise(vendor_pid, ident.start, ident.pgid, hosted_owner)?;
     Ok(())
 }
 
-fn supervise(vendor_pid: u32, vendor_start: u64, pgid: u32) -> Result<(), HostError> {
+fn supervise(
+    vendor_pid: u32,
+    vendor_start: u64,
+    pgid: u32,
+    hosted_owner: bool,
+) -> Result<(), HostError> {
     let mut anchor = LeaderAnchor {
         pid: vendor_pid,
         start: vendor_start,
@@ -175,6 +182,7 @@ fn supervise(vendor_pid: u32, vendor_start: u64, pgid: u32) -> Result<(), HostEr
     let mut reported_leader = false;
     let mut reported: BTreeSet<u32> = BTreeSet::new();
     reported.insert(vendor_pid);
+    let mut leader_exited_at: Option<Instant> = None;
     let mut cleanup_started: Option<Instant> = None;
     let mut control_buf = Vec::new();
     let mut control_eof = false;
@@ -191,6 +199,16 @@ fn supervise(vendor_pid: u32, vendor_start: u64, pgid: u32) -> Result<(), HostEr
         }
         if (CLEANUP.load(Ordering::Relaxed) || control_eof) && cleanup_started.is_none() {
             cleanup_started = Some(Instant::now());
+        }
+        if cleanup_started.is_none()
+            && leader_exited_at.is_some_and(|t| t.elapsed() >= HOSTED_LEADER_EXIT_GRACE)
+        {
+            cleanup_started = Some(Instant::now());
+            let descendants = direct_children()
+                .into_iter()
+                .filter(|&pid| pid != vendor_pid)
+                .count();
+            let _ = write_msg(&SupervisorMsg::HostedLeaderExitCleanup { descendants });
         }
         if let Some(started) = cleanup_started {
             let signal = if started.elapsed() >= TERM_GRACE {
@@ -212,6 +230,9 @@ fn supervise(vendor_pid: u32, vendor_start: u64, pgid: u32) -> Result<(), HostEr
                 if pid == vendor_pid && !reported_leader {
                     reported_leader = true;
                     anchor.reaped = true;
+                    if hosted_owner {
+                        leader_exited_at = Some(Instant::now());
+                    }
                     let _ = write_msg(&SupervisorMsg::Leader { code, signal });
                 } else if reported.insert(pid) {
                     let _ = write_msg(&SupervisorMsg::Descendant {
