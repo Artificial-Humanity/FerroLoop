@@ -177,7 +177,11 @@ fn execute_moves_vendor_and_keeps_persona_project_role_email_extra_areas_and_cwd
     // Runtime calls are off: no runtime was started, so none is reported stopped.
     assert!(!out.runtime_stopped);
     assert_eq!(out.handoff.as_deref(), Some("remodel-felicity"));
-    assert!(out.warnings.is_empty());
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("project AGENTS.md unavailable"))
+    );
     assert!(cleared.contains(&"claude:felicity".to_string()));
 
     let after = agent(&store, "felicity");
@@ -1011,7 +1015,12 @@ fn a_remodel_that_could_not_be_restored_needs_the_owner_and_warns() {
 
     let out = remodel(&store, &env, "jarvis", &remodel_req("codex"), Caller::Owner).unwrap();
     assert_eq!(out.session_id, "codex:jarvis");
-    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings.len() >= 6, "{:?}", out.warnings);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("project AGENTS.md unavailable"))
+    );
     assert!(out.warnings[0].starts_with("no restore was possible"));
 }
 

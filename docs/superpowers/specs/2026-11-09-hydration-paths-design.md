@@ -129,3 +129,33 @@ CLI warning/JSON behavior with private fixtures.
 Run the full Rust verification trio and fresh independent task/branch reviews.
 No live agent launches, service changes, config writes, file creation to conceal
 missing guidance, new vendor behavior, or hard-coded role aliases.
+
+
+## Implementation notes — 2026-11-09
+
+Configuration bindings take precedence over catalog roots. A configured root must
+be absolute and resolve to a directory; relative roots have no defined base and
+produce an unavailable-root warning instead of borrowing the hub process cwd.
+Canonical duplicates collapse to one root. Lifecycle runtime cwd hints remain
+unchanged; the hydration boundary separately proves workspace markers before
+using those hints for guidance. Without explicit workspace context,
+workspace discovery uses registered roots and requires one canonical workspace.
+A bound project never borrows workspace guidance from an unrelated cwd. Conflicting
+project or workspace roots remain unresolved with warnings. Case-insensitive role
+directory collisions fall back to global role guidance with a warning.
+
+The renderer uses the selected project checkout for its three project files and
+the umbrella workspace for role files and legacy notes. Catalog roles retain their
+`custom:<slug>` registration spelling and authored text. Legacy unknown file roles
+retain their original spelling. The external hydrate helper runs after releasing
+the hub store guard; canonical fallback reopens the store only when needed.
+
+Warnings are logged at the spin-up/restart/reforge lifecycle boundary, independently
+of whether a caller consumes response warnings. The restart regression captures each
+warning with persona and session identity, and checks that records do not persist
+warnings. Current Rust callers of `restart_hosted_session` consist of the owner HTTP
+handler; `boot_reconcile` sends a fixed host-restart notice and does not generate
+hydration guidance. Thus this is boundary-level logging coverage, not an end-to-end
+automatic boot-reconciliation hydration test. No new replay or automatic restart
+behavior is introduced. Historical UI visibility is already tracked in
+[#406](https://github.com/Artificial-Humanity/FerroLoop/issues/406#issuecomment-6731954317).

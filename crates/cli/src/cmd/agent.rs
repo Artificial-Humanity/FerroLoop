@@ -776,7 +776,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             .with_default_cwd(store, &ws_root);
             let _ = composed_vendor_host_adapters();
             let mut env = LifecycleEnv::new(None);
-            env.workspace_root = fl_core::is_workspace_root(&ws_root).then_some(ws_root.as_path());
+            env.workspace_root = Some(&ws_root);
             let out = lifecycle::spin_up(store, &env, &req, &by, lifecycle::Caller::Owner)
                 .map_err(lifecycle_failure)?;
             if json {
@@ -807,7 +807,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let ws_root =
                 fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
             let mut env = LifecycleEnv::new(None);
-            env.workspace_root = fl_core::is_workspace_root(&ws_root).then_some(ws_root.as_path());
+            env.workspace_root = Some(&ws_root);
             let target =
                 SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
             // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
@@ -881,7 +881,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let ws_root =
                 fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
             let mut env = LifecycleEnv::new(None);
-            env.workspace_root = fl_core::is_workspace_root(&ws_root).then_some(ws_root.as_path());
+            env.workspace_root = Some(&ws_root);
             let out = lifecycle::remodel_session(
                 store,
                 &env,

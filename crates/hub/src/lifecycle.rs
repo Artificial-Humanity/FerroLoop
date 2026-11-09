@@ -31,10 +31,7 @@ use fl_wire::identity::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::{
-    reforge_role_label, route_matches_session_id,
-    synthesize_decommission_prompt,
-};
+use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decommission_prompt};
 
 #[cfg(test)]
 use crate::api::canonical_reforge_prompt;
@@ -2369,16 +2366,36 @@ pub(crate) fn registered_role_prompt<S: StateStore + Catalog>(
     role: &AgentRole,
 ) -> Result<crate::hydration::HydrationPrompt, LifecycleError> {
     use crate::hydration::{Context, RoleGuidance, render};
-    let context = Context::resolve(store, env.home_override, env.workspace_root, cwd, project);
+    // workspace_root also supplies legacy runtime cwd defaults. Preserve that hint
+    // for launching, but require workspace markers before using it for guidance.
+    let workspace = env.workspace_root.and_then(fl_core::find_workspace_root);
+    let context = Context::resolve(store, env.home_override, workspace.as_deref(), cwd, project);
     let label = reforge_role_label(role);
     let guidance = match role {
-        AgentRole::Custom(slug) if matches!(slug.as_str(), "lead" | "assistant" | "lab_manager" | "lab-manager") => RoleGuidance::StructuralCustom,
+        AgentRole::Custom(slug)
+            if matches!(
+                slug.as_str(),
+                "lead" | "assistant" | "lab_manager" | "lab-manager"
+            ) =>
+        {
+            RoleGuidance::StructuralCustom
+        }
         AgentRole::Custom(slug) => {
-            if let Some(record) = get_role(store, slug).map_err(|e| LifecycleError::Store(e.to_string()))? {
-                return Ok(render(context, display, project, &label, RoleGuidance::Catalog(&record.prompt_template)));
+            if let Some(record) =
+                get_role(store, slug).map_err(|e| LifecycleError::Store(e.to_string()))?
+            {
+                return Ok(render(
+                    context,
+                    display,
+                    project,
+                    &role.as_wire(),
+                    RoleGuidance::Catalog(&record.prompt_template),
+                ));
             }
             if has_catalog_guidance(store, slug)? {
-                return Err(LifecycleError::Invalid(format!("catalog guidance for `{label}` is missing or deleted; restore the role before hydration")));
+                return Err(LifecycleError::Invalid(format!(
+                    "catalog guidance for `{label}` is missing or deleted; restore the role before hydration"
+                )));
             }
             RoleGuidance::File
         }
@@ -3693,7 +3710,14 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         OwnerGate::SpinUp,
     )?;
     let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
-    let guidance = registered_role_prompt(store, env, v.cwd.as_deref().map(Path::new), &display, &v.project, &agent_role_from_label(&v.role))?;
+    let guidance = registered_role_prompt(
+        store,
+        env,
+        v.cwd.as_deref().map(Path::new),
+        &display,
+        &v.project,
+        &agent_role_from_label(&v.role),
+    )?;
     crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
     let prompt = guidance.text;
 
@@ -5216,7 +5240,11 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     record.decommission_prepared_at_ms = None;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
-    Ok(RestartResponse { record, prompt, warnings: guidance.warnings })
+    Ok(RestartResponse {
+        record,
+        prompt,
+        warnings: guidance.warnings,
+    })
 }
 
 /// Remodel phase named by the request body.
@@ -6890,6 +6918,7 @@ mod tests {
         ] {
             json["hydration_dispatched"] = true.into();
             json.as_object_mut().unwrap().remove("hydration_status");
+            json.as_object_mut().unwrap().remove("warnings");
             for status in [None, Some("confirmed"), Some("unconfirmed"), Some("failed")] {
                 if let Some(status) = status {
                     json["hydration_status"] = status.into();
@@ -6906,6 +6935,7 @@ mod tests {
                     .unwrap()
                 };
                 assert_eq!(encoded["hydration_status"], status.unwrap_or("unconfirmed"));
+                assert_eq!(encoded["warnings"], serde_json::json!([]));
             }
         }
     }
@@ -7087,7 +7117,7 @@ mod tests {
             Caller::Owner,
         )
         .unwrap();
-        assert!(spun.prompt.unwrap().contains("sonora/"));
+        assert!(spun.prompt.unwrap().contains("--project sonora"));
         assert_eq!(
             store.agent_by_name("ada").unwrap().unwrap().role,
             target_role
@@ -7142,7 +7172,7 @@ mod tests {
         assert_eq!(agent.role, AgentRole::Tester);
         assert_eq!(agent.status, AgentStatus::Active);
         let prompt = spun.prompt.unwrap();
-        assert!(prompt.contains("new-project/"), "{prompt}");
+        assert!(prompt.contains("--project new-project"), "{prompt}");
         assert!(prompt.contains("--role tester --replace"), "{prompt}");
         assert!(spun.hydration_dispatched);
         let launches = runtime.launches.borrow();
@@ -7156,20 +7186,45 @@ mod tests {
         let ws = home.path().join("workspace");
         let root = ws.join("Actual-Checkout");
         let worktree = ws.join("scratch/renamed");
-        for dir in [root.join(".git/worktrees/topic"), worktree.join("src"), ws.join(".agents/roles/Logical-Name"), ws.join("Notes")] {
+        for dir in [
+            root.join(".git/worktrees/topic"),
+            worktree.join("src"),
+            ws.join(".agents/roles/Logical-Name"),
+            ws.join("Notes"),
+        ] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        std::fs::write(worktree.join(".git"), format!("gitdir: {}", root.join(".git/worktrees/topic").display())).unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let root = root.canonicalize().unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", root.join(".git/worktrees/topic").display()),
+        )
+        .unwrap();
         std::fs::write(root.join(".git/worktrees/topic/commondir"), "../..").unwrap();
         for base in [&root, &worktree] {
-            for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] { std::fs::write(base.join(file), "guidance").unwrap(); }
+            for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+                std::fs::write(base.join(file), "guidance").unwrap();
+            }
         }
         std::fs::write(ws.join(".agents/AGENTS.md"), "workspace").unwrap();
         std::fs::write(ws.join(".agents/roles/Logical-Name/assistant.md"), "role").unwrap();
         let config = home.path().join(".config/fl");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("config.toml"), format!("[[project]]\nname = 'logical-name'\nroot = '{}'\n", root.display())).unwrap();
-        for (cwd, expected, outside) in [(&root, &root, false), (&worktree.join("src"), &worktree, false), (&ws, &root, true)] {
+        std::fs::write(
+            config.join("config.toml"),
+            format!(
+                "[[project]]\nname = 'logical-name'\nroot = '{}'\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        for (cwd, expected, outside) in [
+            (&root, &root, false),
+            (&worktree.join("src"), &worktree, false),
+            (&ws, &root, true),
+        ] {
             let store = MemStore::default();
             let mut test_env = env(&home);
             test_env.workspace_root = Some(&ws);
@@ -7178,12 +7233,28 @@ mod tests {
             request.cwd = Some(cwd.display().to_string());
             let out = spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
             let prompt = out.prompt.as_ref().unwrap();
-            assert!(prompt.contains(&format!("`{}`", expected.join("AGENTS.md").display())), "{prompt}");
-            assert!(prompt.contains(&ws.join(".agents/roles/Logical-Name/assistant.md").display().to_string()), "{prompt}");
+            assert!(
+                prompt.contains(&format!("`{}`", expected.join("AGENTS.md").display())),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains(
+                    &ws.join(".agents/roles/Logical-Name/assistant.md")
+                        .display()
+                        .to_string()
+                ),
+                "{prompt}"
+            );
             assert!(!prompt.contains("STATE.md"));
             let json = serde_json::to_value(&out).unwrap();
             let warnings = json["warnings"].as_array().unwrap();
-            assert_eq!(warnings.iter().any(|w| w.as_str().unwrap().contains("cwd is outside project logical-name")), outside);
+            assert_eq!(
+                warnings.iter().any(|w| w
+                    .as_str()
+                    .unwrap()
+                    .contains("cwd is outside project logical-name")),
+                outside
+            );
         }
     }
 
@@ -7192,13 +7263,66 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let test_env = env(&home);
-        let spun = spin_up(&store, &test_env, &req("ada", "assistant", "claude"), "owner", Caller::Owner).unwrap();
-        let restarted = restart_hosted_session(&store, &test_env, &spun.session_id, "hub-reconcile").unwrap();
+        let spun = spin_up(
+            &store,
+            &test_env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        crate::hydration::WARNING_LOG.with_borrow_mut(Vec::clear);
+        let restarted =
+            restart_hosted_session(&store, &test_env, &spun.session_id, "owner").unwrap();
+        let logged = crate::hydration::WARNING_LOG.with_borrow(Clone::clone);
+        assert_eq!(logged.len(), restarted.warnings.len());
+        for (line, warning) in logged.iter().zip(&restarted.warnings) {
+            assert!(line.contains("persona=ada session=claude:ada"), "{line}");
+            assert!(line.ends_with(warning), "{line}");
+        }
+        assert!(
+            serde_json::to_value(&restarted.record)
+                .unwrap()
+                .get("warnings")
+                .is_none()
+        );
+        let mut legacy = serde_json::to_value(&restarted).unwrap();
+        legacy.as_object_mut().unwrap().remove("warnings");
+        assert!(
+            serde_json::from_value::<RestartResponse>(legacy)
+                .unwrap()
+                .warnings
+                .is_empty()
+        );
         let target = SessionTarget::resolve(&store, &spun.session_id, None).unwrap();
-        let remodeled = remodel_session(&store, &test_env, &target, &RemodelRequest { vendor: "claude".into(), ..Default::default() }, "owner", Caller::Owner, |_| {}).unwrap();
-        for value in [serde_json::to_value(spun).unwrap(), serde_json::to_value(restarted).unwrap(), serde_json::to_value(remodeled).unwrap()] {
-            assert!(value["warnings"].as_array().is_some_and(|w| w.len() >= 5), "{value}");
-            assert!(value["prompt"].as_str().unwrap().contains("Missing guidance"));
+        let remodeled = remodel_session(
+            &store,
+            &test_env,
+            &target,
+            &RemodelRequest {
+                vendor: "claude".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        for value in [
+            serde_json::to_value(spun).unwrap(),
+            serde_json::to_value(restarted).unwrap(),
+            serde_json::to_value(remodeled).unwrap(),
+        ] {
+            assert!(
+                value["warnings"].as_array().is_some_and(|w| w.len() >= 5),
+                "{value}"
+            );
+            assert!(
+                value["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Missing guidance")
+            );
         }
     }
 
@@ -7207,8 +7331,17 @@ mod tests {
         let store = MemStore::default();
         let role = AgentRole::Custom("legacy-reviewer".into());
         assert!(!has_catalog_guidance(&store, "legacy-reviewer").unwrap());
-        let prompt = registered_role_prompt(&store, &env(&TempDir::new().unwrap()), None, "Ada", "ferroloop", &role).unwrap().text;
-        assert!(prompt.contains("roles/legacy-reviewer.md"));
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir(home.path().join("Notes")).unwrap();
+        let file = home.path().join(".agents/roles/legacy-reviewer.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "legacy role").unwrap();
+        let mut env = env(&home);
+        env.workspace_root = Some(home.path());
+        let prompt = registered_role_prompt(&store, &env, None, "Ada", "ferroloop", &role)
+            .unwrap()
+            .text;
+        assert!(prompt.contains(&format!("Read your role file(s): `{}`", file.display())));
         assert!(prompt.contains("--role legacy-reviewer --replace"));
     }
 
@@ -7332,7 +7465,7 @@ mod tests {
         assert_eq!(out.status, "running");
         let prompt = out.prompt.as_deref().unwrap();
         assert!(prompt.starts_with(
-            "Take the name of Felicity and take up residence in FerroLoop/ as the ui-developer."
+            "Take the name of Felicity and take up residence in the unresolved project context as the ui-developer."
         ));
 
         let agent = store.agent_by_name("felicity").unwrap().unwrap();
@@ -7490,19 +7623,6 @@ mod tests {
     }
 
     #[test]
-    fn reforge_prompt_maps_web_and_mobile_roles_to_ui_developer_file() {
-        for role in ["web-developer", "mobile-developer"] {
-            let p = canonical_reforge_prompt("Ada", "FerroLoop", role);
-            assert!(p.contains("`.agents/roles/ui-developer.md`"), "{p}");
-            assert!(!p.contains(&format!("`.agents/roles/{role}.md`")), "{p}");
-            assert!(p.contains(&format!("as the {role}.")), "{p}");
-            assert!(p.contains(&format!("--role {role} --replace")), "{p}");
-        }
-        let p = canonical_reforge_prompt("Ada", "FerroLoop", "tester");
-        assert!(p.contains("`.agents/roles/tester.md`"), "{p}");
-    }
-
-    #[test]
     fn reforge_prompt_reads_ferrostate_first_and_state_md_only_as_legacy() {
         let p = canonical_reforge_prompt("Felicity", "FerroLoop", "assistant");
         assert!(
@@ -7519,14 +7639,8 @@ mod tests {
             "{p}"
         );
         assert!(p.contains("primary state source"), "{p}");
-        let state_md: Vec<&str> = p.lines().filter(|l| l.contains("STATE.md")).collect();
-        assert_eq!(state_md.len(), 1, "{p}");
-        assert!(
-            state_md[0].contains("Optional legacy") && state_md[0].contains("if "),
-            "{p}"
-        );
-        // FerroState is read before the legacy note.
-        assert!(p.find("fl state render").unwrap() < p.find("STATE.md").unwrap());
+        // A context without an existing legacy file must not invent one.
+        assert!(!p.contains("STATE.md"));
         // Registration and inbox steps stay.
         assert!(p.contains("fl agent roster"), "{p}");
         assert!(!p.contains("REGISTRY.md"), "{p}");
@@ -8665,7 +8779,7 @@ mod tests {
         assert_eq!(out.record.restart_count, 1);
         assert_eq!(out.record.status, "running");
         assert_eq!(out.record.decommission_prepared_at_ms, None);
-        assert!(out.prompt.contains("take up residence in FerroLoop/"));
+        assert!(out.prompt.contains("--project FerroLoop"));
         let out = restart_hosted_session(&store, &env, "felicity", "owner").unwrap();
         assert_eq!(out.record.restart_count, 2);
         assert_eq!(

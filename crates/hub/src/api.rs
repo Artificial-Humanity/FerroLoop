@@ -6841,7 +6841,7 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
 
 pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
     let mut env = LifecycleEnv::new(state.config.home_override.as_deref());
-    env.workspace_root = state.config.repo_root.ancestors().find(|root| fl_core::is_workspace_root(root));
+    env.workspace_root = state.config.repo_root.parent();
     env
 }
 
@@ -7242,6 +7242,16 @@ fn handle_post_hosted_session_restart(
 }
 
 fn build_reforge_prompt(state: &HubState, persona: &str) -> Result<String, LifecycleError> {
+    build_reforge_prompt_with_hydrate(state, persona, || {
+        reforge_prompt_from_hydrate(state, persona)
+    })
+}
+
+fn build_reforge_prompt_with_hydrate(
+    state: &HubState,
+    persona: &str,
+    hydrate: impl FnOnce() -> Option<String>,
+) -> Result<String, LifecycleError> {
     let store = state
         .open_store()
         .map_err(|e| LifecycleError::Store(e.to_string()))?;
@@ -7265,7 +7275,10 @@ fn build_reforge_prompt(state: &HubState, persona: &str) -> Result<String, Lifec
             return contextual_reforge_prompt(state, &*store, agent);
         }
     }
-    if let Some(prompt) = reforge_prompt_from_hydrate(state, persona)
+    // The external helper may itself read FerroState. Never hold the hub store
+    // serialization lock across that subprocess boundary.
+    drop(store);
+    if let Some(prompt) = hydrate()
         && !prompt.trim().is_empty()
     {
         return Ok(prompt);
@@ -7273,14 +7286,35 @@ fn build_reforge_prompt(state: &HubState, persona: &str) -> Result<String, Lifec
     let agent = agent.ok_or_else(|| {
         LifecycleError::NotFound(format!("no agent record for reforge of `{persona}`"))
     })?;
+    let store = state
+        .open_store()
+        .map_err(|e| LifecycleError::Store(e.to_string()))?;
     contextual_reforge_prompt(state, &*store, &agent)
 }
 
-fn contextual_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catalog>(state: &HubState, store: &S, agent: &AgentRecord) -> Result<String, LifecycleError> {
+fn contextual_reforge_prompt<S: fl_core::store::StateStore + fl_core::store::Catalog>(
+    state: &HubState,
+    store: &S,
+    agent: &AgentRecord,
+) -> Result<String, LifecycleError> {
     let record = lifecycle::find_hosted_session(store, &[&agent.name_key])?;
-    let cwd = record.as_ref().and_then(|r| r.cwd.as_deref()).map(Path::new).unwrap_or(&state.config.repo_root);
-    let guidance = lifecycle::registered_role_prompt(store, &lifecycle_env(state), Some(cwd), &agent.display_name, &agent.project, &agent.role)?;
-    let session_id = record.as_ref().map(|r| r.session_id.as_str()).unwrap_or(&agent.name_key);
+    let cwd = record
+        .as_ref()
+        .and_then(|r| r.cwd.as_deref())
+        .map(Path::new)
+        .unwrap_or(&state.config.repo_root);
+    let guidance = lifecycle::registered_role_prompt(
+        store,
+        &lifecycle_env(state),
+        Some(cwd),
+        &agent.display_name,
+        &agent.project,
+        &agent.role,
+    )?;
+    let session_id = record
+        .as_ref()
+        .map(|r| r.session_id.as_str())
+        .unwrap_or(&agent.name_key);
     crate::hydration::log_warnings(&agent.name_key, session_id, &guidance.warnings);
     Ok(guidance.text)
 }
@@ -7319,7 +7353,14 @@ pub(crate) fn project_state_scope(project: &str) -> String {
 
 #[cfg(test)]
 pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) -> String {
-    crate::hydration::render(crate::hydration::Context::default(), name, project, role, crate::hydration::RoleGuidance::File).text
+    crate::hydration::render(
+        crate::hydration::Context::default(),
+        name,
+        project,
+        role,
+        crate::hydration::RoleGuidance::File,
+    )
+    .text
 }
 
 /// Prompt that tells an agent it is being prepared for decommission and must save and hand off
@@ -9628,6 +9669,70 @@ mod council_guidance_tests {
     use tempfile::TempDir;
 
     #[test]
+    fn hydration_provenance_does_not_change_the_runtime_workspace_hint() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(tmp.path().join(".agents")).unwrap();
+        std::fs::write(
+            tmp.path().join(".agents/AGENTS.md"),
+            "not a proven workspace",
+        )
+        .unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: repo.clone(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let env = lifecycle_env(&state);
+        assert_eq!(
+            env.workspace_root,
+            Some(tmp.path()),
+            "preserve the pre-existing launch hint"
+        );
+        let result = lifecycle::registered_role_prompt(
+            &fl_core::MemStore::default(),
+            &env,
+            Some(&repo),
+            "Ada",
+            "ferroloop",
+            &AgentRole::Assistant,
+        )
+        .unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("workspace AGENTS.md unavailable"))
+        );
+        assert!(!result.text.contains(&format!(
+            "Read `{}`",
+            tmp.path().join(".agents/AGENTS.md").display()
+        )));
+    }
+
+    #[test]
+    fn hydration_external_override_runs_without_holding_the_store_lock() {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let prompt = build_reforge_prompt_with_hydrate(&state, "ada", || {
+            assert!(
+                state.store_lock.try_lock().is_ok(),
+                "external hydrate must be free to read the store"
+            );
+            Some("AUTHORED OVERRIDE".into())
+        })
+        .unwrap();
+        assert_eq!(prompt, "AUTHORED OVERRIDE");
+    }
+
+    #[test]
     fn catalog_chair_explicit_hydration_reads_edits_and_refuses_deleted_guidance() {
         let tmp = TempDir::new().unwrap();
         let state = HubState::new(HubServerConfig {
@@ -9816,7 +9921,7 @@ mod council_guidance_tests {
                 );
                 assert_eq!(response.status, 200);
                 let prompt = build_reforge_prompt(&state, "ada").unwrap();
-                assert!(prompt.contains("new-project/"), "{prompt}");
+                assert!(prompt.contains("--project new-project"), "{prompt}");
                 assert!(!prompt.contains("STALE OPAQUE"), "{prompt}");
                 assert!(
                     prompt.contains(&format!("--role {role} --replace")),

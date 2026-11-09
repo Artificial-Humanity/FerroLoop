@@ -141,7 +141,7 @@ fn spin_up_registers_the_agent_and_persists_a_hosted_record() {
         out["prompt"]
             .as_str()
             .unwrap()
-            .contains("take up residence in FerroLoop/ as the ui-developer")
+            .contains("take up residence in the unresolved project context as the ui-developer")
     );
 
     let roster = env.roster(false);
@@ -640,6 +640,21 @@ fn hydration_guidance_warnings_keep_json_stdout_and_human_diagnostics() {
     let e = Env::new();
     let json = Env::json_of(e.spin_up("ada", "assistant", "claude"));
     assert!(json["warnings"].as_array().is_some_and(|w| !w.is_empty()));
-    e.fl().args(["agent", "spin-up", "bea", "--project", "FerroLoop", "--role", "assistant", "--vendor", "claude", "--by", "owner"])
-        .assert().success().stderr(contains("warning: "));
+    e.fl()
+        .args([
+            "agent",
+            "spin-up",
+            "bea",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+        ])
+        .assert()
+        .success()
+        .stderr(contains("warning: "));
 }

@@ -136,15 +136,19 @@ fn execute_returns_the_new_session_sets_the_model_override_and_broadcasts() {
         ("runtime_stopped", json!(false)),
         ("tmux_target", json!("Felicity:codex")),
         ("handoff", json!("remodel-felicity")),
-        ("warnings", json!([])),
     ] {
         assert_eq!(out[key], want, "{key}");
     }
+    assert!(out["warnings"].as_array().unwrap().iter().any(|w| {
+        w.as_str()
+            .unwrap()
+            .contains("project AGENTS.md unavailable")
+    }));
     assert!(
         out["prompt"]
             .as_str()
             .unwrap()
-            .contains("take up residence in FerroLoop/")
+            .contains("--project FerroLoop")
     );
 
     // The old run's override and queue are gone; the new model shows under the persona.
