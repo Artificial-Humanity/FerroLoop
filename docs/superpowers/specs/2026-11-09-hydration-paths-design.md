@@ -1,7 +1,7 @@
 # Hydration paths and missing guidance (Issue 383 D6+D5)
 
-Status: proposed implementation design after Ferris's path and warning policy
-decisions. Implement after D2b merges. No production changes yet.
+Status: approved by Ferris on 2026-11-09, including the automatic-restart logging
+addition below. D2b merged in #407; implementation may proceed.
 
 ## Problem and outcome
 
@@ -101,6 +101,12 @@ Ferris assigned FerroDeck warning display to Felix, alongside hydration_status.
 This backend PR names the response fields for that follow-up and does not change UI.
 Warnings are response data; this does not add a durable warnings field to hosted
 records or alter hydration_status/dispatch evidence.
+
+Log every guidance warning through the hub's existing logging convention with the
+persona and session id. Boot reconciliation and rehydration after a host restart
+must therefore leave a trace even when no human receives the response. Do not add
+a persistent warnings field. Record the remaining historical UI visibility gap in
+the existing follow-up #406.
 
 ## Verification and boundaries
 
