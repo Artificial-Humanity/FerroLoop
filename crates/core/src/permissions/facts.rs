@@ -1,7 +1,7 @@
 //! The caller-supplied facts a compile depends on. The compiler never probes a vendor, a
 //! filesystem or a version: everything it may rely on beyond the policy is in [`VendorFacts`].
 
-use super::policy::Capability;
+use super::policy::{AutoApproval, Capability};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -26,7 +26,7 @@ impl Vendor {
         Vendor::Antigravity,
     ];
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Vendor::Claude => "claude",
             Vendor::Codex => "codex",
@@ -46,6 +46,55 @@ impl Vendor {
             ),
             Vendor::Muse => matches!(transport, Transport::Pty | Transport::Msp),
             Vendor::Grok | Vendor::Antigravity => matches!(transport, Transport::Pty),
+        }
+    }
+
+    /// The [`AutoApproval`] choices this vendor's compiler supports when `posture == Posture::Auto`.
+    /// The first entry is the vendor's default choice ([`Self::default_auto_approval`]).
+    pub const fn supported_auto_approvals(self) -> &'static [AutoApproval] {
+        match self {
+            Vendor::Codex | Vendor::Muse => &[AutoApproval::VendorReviewer, AutoApproval::AskHuman],
+            Vendor::Claude | Vendor::Grok | Vendor::Antigravity => &[AutoApproval::Native],
+        }
+    }
+
+    /// The default [`AutoApproval`] choice for this vendor (`VendorReviewer` for vendors that
+    /// support it, `Native` for vendors whose `auto` posture is natively unattended).
+    pub const fn default_auto_approval(self) -> AutoApproval {
+        match self {
+            Vendor::Codex | Vendor::Muse => AutoApproval::VendorReviewer,
+            Vendor::Claude | Vendor::Grok | Vendor::Antigravity => AutoApproval::Native,
+        }
+    }
+
+    /// `true` when `choice` is in [`Self::supported_auto_approvals`].
+    pub fn supports_auto_approval(self, choice: AutoApproval) -> bool {
+        self.supported_auto_approvals().contains(&choice)
+    }
+
+    /// `true` when this vendor offers more than one [`AutoApproval`] choice.
+    pub const fn is_auto_approval_configurable(self) -> bool {
+        self.supported_auto_approvals().len() > 1
+    }
+}
+
+impl std::fmt::Display for Vendor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Vendor {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "muse" => Ok(Self::Muse),
+            "grok" => Ok(Self::Grok),
+            "antigravity" => Ok(Self::Antigravity),
+            _ => Err("vendor must be claude, codex, muse, grok or antigravity".to_string()),
         }
     }
 }

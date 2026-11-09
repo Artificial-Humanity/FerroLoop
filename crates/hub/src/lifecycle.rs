@@ -245,7 +245,37 @@ impl<'a> LifecycleEnv<'a> {
         fl_wire::vendor_adapter::VendorLaunchOptions {
             remote_control,
             posture,
+            auto_approval: None,
         }
+    }
+
+    /// Resolve the effective [`fl_core::permissions::AutoApproval`] choice for `vendor` from the
+    /// hub's saved settings (or the compiler default when no settings file exists).
+    pub fn auto_approval_for(&self, vendor: &str) -> Option<fl_core::permissions::AutoApproval> {
+        let home = self
+            .home_override
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        match home {
+            Some(home) => crate::settings::load(&home).effective_auto_approval_for(vendor),
+            None => vendor
+                .trim()
+                .parse::<fl_core::permissions::Vendor>()
+                .ok()
+                .map(|v| v.default_auto_approval()),
+        }
+    }
+
+    /// Adapter-layer launch options for a specific `vendor` and permission `posture`, including
+    /// the configured per-vendor [`fl_core::permissions::AutoApproval`] choice.
+    pub fn vendor_launch_options_for_vendor(
+        &self,
+        vendor: &str,
+        posture: fl_core::permissions::Posture,
+    ) -> fl_wire::vendor_adapter::VendorLaunchOptions {
+        let mut opts = self.vendor_launch_options_for(posture);
+        opts.auto_approval = self.auto_approval_for(vendor);
+        opts
     }
 }
 
@@ -720,7 +750,7 @@ fn launch_spec_for_with_session(
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let options = env.vendor_launch_options_for(posture);
+    let options = env.vendor_launch_options_for_vendor(vendor, posture);
     if let Some(host_adapter) = env.host_vendor_adapter(vendor) {
         let mut binding = fl_core::AdapterIdentityBinding::new(
             format!("{vendor}:{persona}"),
@@ -741,6 +771,7 @@ fn launch_spec_for_with_session(
             home_dir: home.clone(),
             remote_control: options.remote_control,
             posture,
+            auto_approval: options.auto_approval,
         };
         match host_adapter.prepare_launch(&req) {
             Ok(plan) => {
@@ -3613,6 +3644,13 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let mut v = req.validate()?;
+    v.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+        &v.vendor,
+        v.posture,
+        env.auto_approval_for(&v.vendor),
+    )
+    .map_err(|msg| LifecycleError::Invalid(format!("posture: {msg}")))?
+    .receipts;
     if let Some(agent) = current_recast_assignment(store, &v.persona)? {
         v.project = agent.project;
         v.role = role_label_of(&agent.role);
@@ -5056,8 +5094,12 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         &record.project,
         &agent_role_from_label(&record.role),
     )?;
-    fl_wire::vendor_adapter::launch_permissions(&record.vendor, record.posture)
-        .map_err(|why| invalid_field("posture", &why))?;
+    fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+        &record.vendor,
+        record.posture,
+        env.auto_approval_for(&record.vendor),
+    )
+    .map_err(|why| invalid_field("posture", &why))?;
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = env.runtime.unit(&want_target).to_string();
@@ -5467,6 +5509,13 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         posture: req.posture,
     }
     .validate()?;
+    to.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+        &to.vendor,
+        to.posture,
+        env.auto_approval_for(&to.vendor),
+    )
+    .map_err(|msg| LifecycleError::Invalid(format!("posture: {msg}")))?
+    .receipts;
     validate_catalog_role(store, &to.role)?;
     registered_role_prompt(
         store,
@@ -5483,7 +5532,12 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     // The restore puts back what was there: a session with no record was not hosted, and a
     // restore must not turn it into a managed one.
     let restore = if lookup_vendor(&from_vendor).is_some() {
-        fl_wire::vendor_adapter::launch_permissions(&from_vendor, from_posture).map_err(|why| {
+        fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+            &from_vendor,
+            from_posture,
+            env.auto_approval_for(&from_vendor),
+        )
+        .map_err(|why| {
             LifecycleError::Invalid(format!(
                 "cannot build restore plan for `{}` on `{from_vendor}` with recorded posture `{from_posture}`: {why}",
                 target.session_id
@@ -6445,10 +6499,7 @@ mod tests {
         assert_eq!(
             launch_args("codex", Some("gpt-6-sol")),
             strings(&[
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
+                "--approve-for-me",
                 "--remote",
                 "unix://",
                 "--model",
@@ -6468,7 +6519,7 @@ mod tests {
                 "--approval-mode",
                 "on-request",
                 "--approval-judge",
-                "off",
+                "on",
                 "hello"
             ])
         );
@@ -11018,5 +11069,135 @@ mod tests {
         assert!(claude_fake.live.borrow().is_empty());
         assert!(claude_fake.calls.borrow().is_empty());
         assert!(claude_fake.launches.borrow().is_empty());
+    }
+
+    #[test]
+    fn spin_up_restart_and_remodel_read_configured_auto_approval_setting() {
+        use fl_core::permissions::ReceiptClass;
+
+        let home = tempfile::tempdir().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+
+        // 1. Default settings (`vendor-reviewer`): Codex `Posture::Auto` launches with
+        //    `--approve-for-me` (never `-a` or `-s`) and returns `Exact` receipts.
+        let codex_req = req("ada", "assistant", "codex");
+        let spun = spin_up(&store, &env, &codex_req, "owner", Caller::Owner).unwrap();
+        assert!(
+            spun.permission_receipts
+                .iter()
+                .all(|r| r.class == ReceiptClass::Exact),
+            "default vendor-reviewer receipts must be Exact: {:?}",
+            spun.permission_receipts
+        );
+        {
+            let launches = fake.launches.borrow();
+            assert_eq!(launches.len(), 1);
+            let spec = launches[0].1.as_ref().unwrap();
+            assert!(
+                spec.argv.iter().any(|a| a == "--approve-for-me"),
+                "expected --approve-for-me in {:?}",
+                spec.argv
+            );
+            assert!(
+                spec.argv.iter().all(|a| !matches!(
+                    a.as_str(),
+                    "-a" | "--ask-for-approval" | "-s" | "--sandbox"
+                )),
+                "Codex vendor-reviewer must never emit -a or -s: {:?}",
+                spec.argv
+            );
+        }
+
+        // 2. Update settings to `ask-human` for Codex and Muse; restart reads the updated setting.
+        let patch: crate::settings::SettingsPatch = serde_json::from_value(serde_json::json!({
+            "auto_approval": {
+                "codex": "ask-human",
+                "muse": "ask-human"
+            }
+        }))
+        .unwrap();
+        crate::settings::update(home.path(), patch).unwrap();
+
+        fake.live.borrow_mut().clear();
+        restart_hosted_session(&store, &env, "codex:ada", "owner").unwrap();
+        {
+            let launches = fake.launches.borrow();
+            assert_eq!(launches.len(), 2);
+            let spec = launches[1].1.as_ref().unwrap();
+            assert!(
+                spec.argv.windows(2).any(|w| w == ["-a", "on-request"]),
+                "restart with ask-human must emit -a on-request: {:?}",
+                spec.argv
+            );
+            assert!(
+                spec.argv.windows(2).any(|w| w == ["-s", "workspace-write"]),
+                "restart with ask-human must emit -s workspace-write: {:?}",
+                spec.argv
+            );
+            assert!(!spec.argv.iter().any(|a| a == "--approve-for-me"));
+        }
+
+        // 3. Remodel onto Muse with `ask-human` configured emits `--approval-judge off` and
+        //    records `StricterDowngrade` on the Posture receipt (both Prepare and Execute).
+        let remodel_target = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
+        let prepared = remodel_session(
+            &store,
+            &env,
+            &remodel_target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .permission_receipts
+                .iter()
+                .any(|r| r.class == ReceiptClass::StricterDowngrade
+                    && r.requested.contains("ask-human")),
+            "Muse Prepare ask-human receipt must record StricterDowngrade: {:?}",
+            prepared.permission_receipts
+        );
+        let remodeled = remodel_session(
+            &store,
+            &env,
+            &remodel_target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            remodeled
+                .permission_receipts
+                .iter()
+                .any(|r| r.class == ReceiptClass::StricterDowngrade
+                    && r.requested.contains("ask-human")),
+            "Muse ask-human receipt must record StricterDowngrade: {:?}",
+            remodeled.permission_receipts
+        );
+        {
+            let launches = fake.launches.borrow();
+            let spec = launches.last().unwrap().1.as_ref().unwrap();
+            assert!(
+                spec.argv
+                    .windows(2)
+                    .any(|w| w == ["--approval-judge", "off"]),
+                "Muse ask-human must emit --approval-judge off: {:?}",
+                spec.argv
+            );
+        }
     }
 }

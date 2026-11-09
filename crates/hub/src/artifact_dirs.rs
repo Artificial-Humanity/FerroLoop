@@ -160,6 +160,14 @@ pub(crate) fn settings_view(state: &HubState, s: &Settings) -> Value {
             "effective_artifacts_dir".into(),
             json!(display(&system_dir_in(state, s))),
         );
+        map.insert(
+            "auto_approval".into(),
+            json!(s.effective_auto_approval_map()),
+        );
+        map.insert(
+            "auto_approval_capabilities".into(),
+            json!(crate::settings::auto_approval_capabilities()),
+        );
     }
     view
 }

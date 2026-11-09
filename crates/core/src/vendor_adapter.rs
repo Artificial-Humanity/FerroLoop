@@ -124,6 +124,8 @@ pub struct VendorLaunchRequest {
     pub remote_control: bool,
     #[serde(default)]
     pub posture: crate::permissions::Posture,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approval: Option<crate::permissions::AutoApproval>,
 }
 
 /// Prepared command-line and environment plan for launching a vendor CLI in a runtime session.
@@ -156,6 +158,8 @@ pub struct AttachOrResumeRequest {
     pub remote_control: bool,
     #[serde(default)]
     pub posture: crate::permissions::Posture,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approval: Option<crate::permissions::AutoApproval>,
 }
 
 impl AttachOrResumeRequest {
@@ -171,6 +175,7 @@ impl AttachOrResumeRequest {
             thinking_effort: None,
             remote_control: true,
             posture: crate::permissions::Posture::default(),
+            auto_approval: None,
         }
     }
 }

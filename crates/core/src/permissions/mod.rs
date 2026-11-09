@@ -28,7 +28,8 @@ pub use plan::{
     ReceiptSubject, UnenforcedItem, evidence_for,
 };
 pub use policy::{
-    Capability, Effect, MAX_ARGV_TOKENS, MAX_PATH_SEGMENTS, MAX_PATTERN_BYTES, MAX_RULES,
-    MAX_SHELL_GLOB_STARS, MAX_TOKEN_BYTES, PathClass, Pattern, PermissionPolicy, PolicyError,
-    Posture, Preset, Rule, SCHEMA_VERSION, SandboxChoice, UnenforcedDefaults, canonical_default,
+    AutoApproval, Capability, Effect, MAX_ARGV_TOKENS, MAX_PATH_SEGMENTS, MAX_PATTERN_BYTES,
+    MAX_RULES, MAX_SHELL_GLOB_STARS, MAX_TOKEN_BYTES, PathClass, Pattern, PermissionPolicy,
+    PolicyError, Posture, Preset, Rule, SCHEMA_VERSION, SandboxChoice, UnenforcedDefaults,
+    canonical_default,
 };

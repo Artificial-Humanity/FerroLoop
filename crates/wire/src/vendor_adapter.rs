@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use fl_core::permissions::{
-    Effect, EvidenceClass, Origin, Posture, ReceiptClass, ReceiptLine, ReceiptSubject, Transport,
-    Vendor, VendorFacts, compile_posture,
+    AutoApproval, Effect, EvidenceClass, Origin, Posture, ReceiptClass, ReceiptLine,
+    ReceiptSubject, Transport, Vendor, VendorFacts, compile_posture,
 };
 use fl_host_proto::{ChildState, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,9 @@ pub struct VendorLaunchOptions {
     pub remote_control: bool,
     /// Permission posture compiled into the vendor's launch flags (`Posture::Auto` by default).
     pub posture: Posture,
+    /// Explicit [`AutoApproval`] choice used when `posture == Posture::Auto`. When `None`, the
+    /// vendor's compiler default ([`Vendor::default_auto_approval`]) is used.
+    pub auto_approval: Option<AutoApproval>,
 }
 
 impl Default for VendorLaunchOptions {
@@ -42,6 +45,7 @@ impl Default for VendorLaunchOptions {
         Self {
             remote_control: true,
             posture: Posture::Auto,
+            auto_approval: None,
         }
     }
 }
@@ -98,24 +102,28 @@ pub struct LaunchPermissions {
     pub receipts: Vec<PermissionReceipt>,
 }
 
-/// Compile the launch permission arguments and receipts for `vendor` and `posture`.
+/// Compile the launch permission arguments and receipts for `vendor` and `posture` using the
+/// vendor's default [`AutoApproval`] choice.
 ///
 /// The five permission-compiler vendors (`claude`, `codex`, `muse`, `grok`, `antigravity`) run
 /// [`compile_posture`]. Vendors without a permission compiler (`lemonade`, `ollama`, and custom
 /// prompt-delivery or API vendors) accept only [`Posture::Auto`] with an `unsupported` receipt and
 /// refuse any other posture with an actionable error.
 pub fn launch_permissions(vendor: &str, posture: Posture) -> Result<LaunchPermissions, String> {
+    launch_permissions_with_auto_approval(vendor, posture, None)
+}
+
+/// Compile the launch permission arguments and receipts for `vendor`, `posture`, and an optional
+/// explicit [`AutoApproval`] choice (defaulting to [`Vendor::default_auto_approval`] when `None`).
+pub fn launch_permissions_with_auto_approval(
+    vendor: &str,
+    posture: Posture,
+    auto_approval: Option<AutoApproval>,
+) -> Result<LaunchPermissions, String> {
     let v = vendor.trim().to_ascii_lowercase();
-    let compiler_vendor = match v.as_str() {
-        "claude" => Some(Vendor::Claude),
-        "codex" => Some(Vendor::Codex),
-        "muse" => Some(Vendor::Muse),
-        "grok" => Some(Vendor::Grok),
-        "antigravity" => Some(Vendor::Antigravity),
-        _ => None,
-    };
-    if let Some(cv) = compiler_vendor {
-        let plan = compile_posture(cv, &VendorFacts::new(Transport::Pty), posture)
+    if let Ok(cv) = v.parse::<Vendor>() {
+        let choice = auto_approval.unwrap_or_else(|| cv.default_auto_approval());
+        let plan = compile_posture(cv, &VendorFacts::new(Transport::Pty), posture, choice)
             .map_err(|e| e.to_string())?;
         return Ok(LaunchPermissions {
             args: plan.launch_args,
@@ -238,6 +246,16 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
     /// and receipts when supported.
     fn check_posture(&self, posture: Posture) -> Result<LaunchPermissions, String> {
         launch_permissions(self.vendor_id(), posture)
+    }
+
+    /// Whether a launch on this vendor can express `posture` with `auto_approval`, returning the
+    /// compiled CLI flags and receipts when supported.
+    fn check_posture_with_auto_approval(
+        &self,
+        posture: Posture,
+        auto_approval: Option<AutoApproval>,
+    ) -> Result<LaunchPermissions, String> {
+        launch_permissions_with_auto_approval(self.vendor_id(), posture, auto_approval)
     }
 
     /// Interactive startup prompts to poll and answer right after spawning.
@@ -523,7 +541,8 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         // (which accepts an optional name in Commander.js) is always followed by a `--` flag
         // and never consumes the trailing positional `<prompt>` when `model` and
         // `thinking_level` are both `None`.
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         if options.remote_control {
             argv.extend(self.remote_control_args(persona));
@@ -594,7 +613,8 @@ impl VendorCliAdapter for CodexCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if options.remote_control {
@@ -685,7 +705,8 @@ impl VendorCliAdapter for AntigravityCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if options.remote_control {
@@ -740,7 +761,8 @@ impl VendorCliAdapter for GrokCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if let Some(m) = self.normalize_model(model) {
@@ -787,7 +809,8 @@ impl VendorCliAdapter for MuseCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![
             self.resolve_binary(home),
             "--model".to_string(),
@@ -837,7 +860,8 @@ impl VendorCliAdapter for LemonadeCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let host = std::env::var("FL_LEMONADE_HOST")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -920,7 +944,8 @@ impl VendorCliAdapter for OllamaCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![
             self.resolve_binary(home),
             "run".to_string(),
@@ -1193,10 +1218,7 @@ mod tests {
         assert_eq!(
             &spec.argv[1..],
             &[
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
+                "--approve-for-me",
                 "--remote",
                 "unix://",
                 "--model",
@@ -1237,6 +1259,7 @@ mod tests {
         let off = VendorLaunchOptions {
             remote_control: false,
             posture: Posture::Auto,
+            auto_approval: None,
         };
         let claude = lookup_vendor_cli_adapter("claude").unwrap();
         assert!(claude.supports_remote_control());
@@ -1255,15 +1278,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             &spec_off.argv[1..],
-            &[
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
-                "--model",
-                "gpt-5",
-                "Hi"
-            ]
+            &["--approve-for-me", "--model", "gpt-5", "Hi"]
         );
 
         let agy = lookup_vendor_cli_adapter("antigravity").unwrap();
@@ -1332,6 +1347,31 @@ mod tests {
         assert_eq!(
             &spec.argv[1..],
             &[
+                "--approve-for-me",
+                "--remote",
+                "unix://",
+                "--model",
+                "gpt-5",
+                "Hello"
+            ]
+        );
+        let spec_ask = codex
+            .build_launch_spec_with_options(
+                "ada",
+                Some("gpt-5"),
+                None,
+                "Hello",
+                None,
+                VendorLaunchOptions {
+                    remote_control: true,
+                    posture: Posture::Auto,
+                    auto_approval: Some(AutoApproval::AskHuman),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            &spec_ask.argv[1..],
+            &[
                 "-a",
                 "on-request",
                 "-s",
@@ -1399,6 +1439,32 @@ mod tests {
         let spec = muse.build_launch_spec("ada", None, None, "Hello", None);
         assert_eq!(
             &spec.argv[1..],
+            &[
+                "--model",
+                MUSE_DEFAULT_MODEL,
+                "--approval-mode",
+                "on-request",
+                "--approval-judge",
+                "on",
+                "Hello"
+            ]
+        );
+        let spec_muse_ask = muse
+            .build_launch_spec_with_options(
+                "ada",
+                None,
+                None,
+                "Hello",
+                None,
+                VendorLaunchOptions {
+                    remote_control: true,
+                    posture: Posture::Auto,
+                    auto_approval: Some(AutoApproval::AskHuman),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            &spec_muse_ask.argv[1..],
             &[
                 "--model",
                 MUSE_DEFAULT_MODEL,
@@ -1515,6 +1581,7 @@ mod tests {
                     VendorLaunchOptions {
                         remote_control: true,
                         posture,
+                        auto_approval: None,
                     },
                 );
                 if unsupported {

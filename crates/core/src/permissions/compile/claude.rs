@@ -299,11 +299,16 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         note = "bypass maps to bypassPermissions and needs the launch offer";
     }
     cx.args.extend(args.iter().cloned());
+    let posture_requested = if posture == Posture::Auto {
+        format!("posture Auto (auto_approval={})", cx.auto_approval.as_str())
+    } else {
+        format!("posture {posture:?}")
+    };
     cx.push(
         ReceiptSubject::Posture,
         Origin::Axis,
         None,
-        format!("posture {posture:?}"),
+        posture_requested,
         args,
         ReceiptClass::Exact,
         Surface::Posture,

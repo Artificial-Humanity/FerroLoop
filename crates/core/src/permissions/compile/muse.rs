@@ -9,7 +9,7 @@
 use super::{Cx, surface_of};
 use crate::permissions::facts::{ProfileCeiling, ProvenFact, Surface};
 use crate::permissions::plan::{CompileRefusal, Origin, ReceiptClass, ReceiptSubject};
-use crate::permissions::policy::{Capability, Effect, Posture, Rule, SandboxChoice};
+use crate::permissions::policy::{AutoApproval, Capability, Effect, Posture, Rule, SandboxChoice};
 
 pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     let vendor = cx.vendor;
@@ -114,10 +114,16 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         }
         Posture::Auto => {
             args.extend(["--approval-mode".to_owned(), "on-request".to_owned()]);
-            (
-                "the approval judge stays off: a reviewer spends tokens and needs admission",
-                ReceiptClass::StricterDowngrade,
-            )
+            match cx.auto_approval {
+                AutoApproval::VendorReviewer => (
+                    "approval requests are reviewed automatically by the vendor approval judge (auto_approval=vendor-reviewer)",
+                    ReceiptClass::Exact,
+                ),
+                AutoApproval::AskHuman | AutoApproval::Native => (
+                    "the approval judge stays off (auto_approval=ask-human): approval requests ask a human",
+                    ReceiptClass::StricterDowngrade,
+                ),
+            }
         }
         Posture::Plan => {
             args.extend(["--approval-mode".to_owned(), "untrusted".to_owned()]);
@@ -128,14 +134,27 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         }
     };
     if !bypass {
-        args.extend(["--approval-judge".to_owned(), "off".to_owned()]);
+        let judge = if posture == Posture::Auto
+            && !shell_ask
+            && cx.auto_approval == AutoApproval::VendorReviewer
+        {
+            "on"
+        } else {
+            "off"
+        };
+        args.extend(["--approval-judge".to_owned(), judge.to_owned()]);
     }
     cx.args.extend(args.iter().cloned());
+    let posture_requested = if posture == Posture::Auto {
+        format!("posture Auto (auto_approval={})", cx.auto_approval.as_str())
+    } else {
+        format!("posture {posture:?}")
+    };
     cx.push(
         ReceiptSubject::Posture,
         Origin::Axis,
         None,
-        format!("posture {posture:?}"),
+        posture_requested,
         args,
         class,
         Surface::Posture,

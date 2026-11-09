@@ -10036,6 +10036,40 @@ default_target = "connector:parity:get_thing"
             "home_dir": tmp.path().display().to_string(),
             "default_artifacts_dir": tmp.path().join("artifacts").display().to_string(),
             "effective_artifacts_dir": tmp.path().join("artifacts").display().to_string(),
+            "auto_approval": {
+                "claude": "native",
+                "antigravity": "native",
+                "codex": "vendor-reviewer",
+                "grok": "native",
+                "muse": "vendor-reviewer",
+            },
+            "auto_approval_capabilities": {
+                "claude": {
+                    "supported": ["native"],
+                    "default": "native",
+                    "configurable": false,
+                },
+                "antigravity": {
+                    "supported": ["native"],
+                    "default": "native",
+                    "configurable": false,
+                },
+                "codex": {
+                    "supported": ["vendor-reviewer", "ask-human"],
+                    "default": "vendor-reviewer",
+                    "configurable": true,
+                },
+                "grok": {
+                    "supported": ["native"],
+                    "default": "native",
+                    "configurable": false,
+                },
+                "muse": {
+                    "supported": ["vendor-reviewer", "ask-human"],
+                    "default": "vendor-reviewer",
+                    "configurable": true,
+                },
+            },
         })
     }
 
@@ -10116,12 +10150,15 @@ default_target = "connector:parity:get_thing"
             &fs::read(tmp.path().join(".config/fl/ferrodeck-settings.json")).unwrap(),
         )
         .unwrap();
-        // The file holds the stored settings only; the directories are computed on the way out.
+        // The file holds the stored settings only; the directories and effective auto_approval
+        // views are computed on the way out when no non-default auto_approval override is stored.
         let mut stored = expected.clone();
         for computed in [
             "home_dir",
             "default_artifacts_dir",
             "effective_artifacts_dir",
+            "auto_approval",
+            "auto_approval_capabilities",
         ] {
             stored.as_object_mut().unwrap().remove(computed);
         }
