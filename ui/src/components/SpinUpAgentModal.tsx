@@ -5,7 +5,7 @@ import {
   formatModelOptionLabel,
   getVendorModelOptions,
 } from "./ChatPane";
-import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
+import { projectLabel } from "../hooks/useProjects";
 import {
   normalizeHydrationStatus,
   normalizeHydrationWarnings,
@@ -80,7 +80,7 @@ export function resolveSpinUpNodeId(
 
 export function resolveSpinUpProject(
   rawProject?: string | null,
-  projects: readonly ProjectSummary[] = FALLBACK_PROJECTS,
+  projects: readonly ProjectSummary[] = [],
 ): string {
   const options = spinUpProjectOptions(projects);
   // The default is ferroloop, or the first listed project when the list has no ferroloop.
@@ -94,7 +94,8 @@ export function resolveSpinUpProject(
   const matched =
     options.find((p) => p.value === trimmed) ??
     options.find((p) => p.label.toLowerCase().includes(trimmed));
-  return matched ? matched.value : fallback;
+  if (matched) return matched.value;
+  return options.length === 0 ? trimmed : fallback;
 }
 
 // Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Conflict-Free Port Allocation
@@ -831,7 +832,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   isOpen,
   onClose,
   initialProject = null,
-  projects = FALLBACK_PROJECTS,
+  projects = [],
   nodes = [],
   defaultNodeId = null,
   onSpinUp,

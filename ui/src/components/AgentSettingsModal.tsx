@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
-import { FALLBACK_PROJECTS, projectChoices } from "../hooks/useProjects";
+import { projectChoices } from "../hooks/useProjects";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
 import {
   canonicalizeDefaultRole,
@@ -477,7 +477,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   initialTab = "overview",
   returnToSettingsLabel = null,
   onReturnToSettings,
-  projects = FALLBACK_PROJECTS,
+  projects = [],
   authority = null,
 }) => {
   const { pinnedAgents } = usePinnedState();

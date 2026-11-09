@@ -1,16 +1,24 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
+import { TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function makeStubApiClient(): HubApiClient {
-  const fetchImpl = vi.fn(async () =>
-    new Response(JSON.stringify({}), {
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/v1/agents")) {
+      return new Response(
+        JSON.stringify({ agents: TEST_WORKSPACE_AGENTS, routes: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({}), {
       status: 200,
       headers: { "Content-Type": "application/json" },
-    }),
-  );
+    });
+  });
   return new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
 }
 
@@ -148,9 +156,10 @@ describe("Tablet master-detail (768 - 1023)", () => {
     expect(roster()).toHaveAttribute("data-mobile-open", "true");
   });
 
-  it("closes the drawer after an agent is selected", () => {
+  it("closes the drawer after an agent is selected", async () => {
     renderAt(800, 1100);
     fireEvent.click(toggle());
+    await waitFor(() => expect(agentRows().length).toBeGreaterThan(0));
     fireEvent.click(firstAgentRow());
     expect(roster()).toHaveAttribute("data-mobile-open", "false");
     expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
@@ -164,10 +173,11 @@ describe("Tablet master-detail (768 - 1023)", () => {
     expect(roster()).toHaveAttribute("data-mobile-open", "false");
   });
 
-  it("flips the mode on rotation and keeps the selected agent", () => {
+  it("flips the mode on rotation and keeps the selected agent", async () => {
     renderAt(1000, 1300);
     expect(cockpit()).toHaveAttribute("data-tablet-master", "overlay");
     fireEvent.click(toggle());
+    await waitFor(() => expect(agentRows().length).toBeGreaterThan(1));
     const rows = agentRows();
     expect(rows.length).toBeGreaterThan(1);
     fireEvent.click(rows[rows.length - 1]);
