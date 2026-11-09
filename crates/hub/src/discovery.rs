@@ -3066,13 +3066,6 @@ pub(crate) fn codex_account_quota(home_override: Option<&Path>) -> Option<Sessio
     })
 }
 
-pub(crate) fn codex_tier_matches(a: Option<&str>, b: Option<&str>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => normalize_codex_plan(a) == normalize_codex_plan(b),
-        _ => true,
-    }
-}
-
 /// Whether `session` and `reading` belong to the Codex account in `home_override` (checking
 /// both `codex_session_matches_account` and `account_tier` from `auth.json` when available).
 pub(crate) fn codex_reading_matches_account(
@@ -3134,35 +3127,32 @@ pub(crate) fn propagate_codex_sibling_quota(
 ) {
     let now_ms = fl_exec::stamp::now().unix_millis();
     let account_tier = codex_auth_plan(home_override);
-    let matches_home = |s: &DiscoveredSessionSummary| {
-        s.adapter == "codex" && codex_session_matches_account(s, home_override)
-    };
-    let matches_tier = |tier: Option<&str>| match account_tier.as_deref() {
-        Some(auth_tier) => {
-            tier.is_none_or(|t| normalize_codex_plan(t) == normalize_codex_plan(auth_tier))
-        }
-        None => true,
-    };
 
     // Determine the common tier among account-matching sessions when auth.json is absent.
-    let inferred_tier: Option<String> = account_tier.clone().or_else(|| {
-        let mut seen: Option<String> = None;
-        for s in sessions.iter().filter(|s| matches_home(s)) {
-            if let Some(t) = s
-                .quota_usage
-                .as_ref()
-                .and_then(|q| q.tier.as_deref())
-                .map(normalize_codex_plan)
+    let effective_tier: Option<String> = match account_tier.clone() {
+        Some(tier) => Some(tier),
+        None => {
+            let mut seen: Option<String> = None;
+            for s in sessions
+                .iter()
+                .filter(|s| s.adapter == "codex" && codex_session_matches_account(s, home_override))
             {
-                match &seen {
-                    None => seen = Some(t),
-                    Some(prev) if prev == &t => {}
-                    Some(_) => return None,
+                if let Some(t) = s
+                    .quota_usage
+                    .as_ref()
+                    .and_then(|q| q.tier.as_deref())
+                    .map(normalize_codex_plan)
+                {
+                    match &seen {
+                        None => seen = Some(t),
+                        Some(prev) if prev == &t => {}
+                        Some(_) => return,
+                    }
                 }
             }
+            seen
         }
-        seen
-    });
+    };
 
     struct BestCodexQuota {
         score: (usize, u64, usize),
@@ -3172,18 +3162,13 @@ pub(crate) fn propagate_codex_sibling_quota(
 
     let mut best: Option<BestCodexQuota> = None;
     for session in sessions.iter() {
-        if !matches_home(session) {
+        if session.adapter != "codex" || !codex_session_matches_account(session, home_override) {
             continue;
         }
         let Some(q) = session.quota_usage.as_ref() else {
             continue;
         };
-        if !matches_tier(q.tier.as_deref()) {
-            continue;
-        }
-        if let Some(expected) = inferred_tier.as_deref()
-            && !codex_tier_matches(Some(expected), q.tier.as_deref())
-        {
+        if !codex_reading_matches_account(session, q, effective_tier.as_deref(), home_override) {
             continue;
         }
         let live_windows = quota_live_window_count(q, now_ms);
@@ -3209,18 +3194,18 @@ pub(crate) fn propagate_codex_sibling_quota(
     };
 
     for session in sessions.iter_mut() {
-        if !matches_home(session) {
+        if session.adapter != "codex" || !codex_session_matches_account(session, home_override) {
             continue;
         }
-        if let Some(existing) = session.quota_usage.as_ref() {
-            if !matches_tier(existing.tier.as_deref()) {
-                continue;
-            }
-            if let Some(expected) = inferred_tier.as_deref()
-                && !codex_tier_matches(Some(expected), existing.tier.as_deref())
-            {
-                continue;
-            }
+        if let Some(existing) = session.quota_usage.as_ref()
+            && !codex_reading_matches_account(
+                session,
+                existing,
+                effective_tier.as_deref(),
+                home_override,
+            )
+        {
+            continue;
         }
         let existing_exhausted = session
             .quota_usage
@@ -3282,27 +3267,58 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let raw_primary = codex_window(limits.get("primary"), 300);
-        let raw_secondary = codex_window(limits.get("secondary"), 10_080);
-        let had_any_window_with_reset = raw_primary.as_ref().and_then(|w| w.resets_at_ms).is_some()
-            || raw_secondary
-                .as_ref()
-                .and_then(|w| w.resets_at_ms)
-                .is_some();
-        let mut primary_window =
-            raw_primary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
-        let mut secondary_window =
-            raw_secondary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
-        if secondary_window.is_none()
-            && primary_window
+        let mut raw_primary = codex_window(limits.get("primary"), 300);
+        let mut raw_secondary = codex_window(limits.get("secondary"), 10_080);
+        if raw_secondary.is_none()
+            && raw_primary
                 .as_ref()
                 .and_then(|window| window.window_minutes)
                 .is_some_and(|minutes| minutes >= 1440)
         {
-            secondary_window = primary_window.take();
+            raw_secondary = raw_primary.take();
         }
-        if had_any_window_with_reset && primary_window.is_none() && secondary_window.is_none() {
-            exhausted_reason = None;
+        let had_window_with_reset = raw_primary.as_ref().and_then(|w| w.resets_at_ms).is_some()
+            || raw_secondary
+                .as_ref()
+                .and_then(|w| w.resets_at_ms)
+                .is_some();
+        let primary_expired = raw_primary
+            .as_ref()
+            .and_then(|w| w.resets_at_ms)
+            .is_some_and(|reset| reset <= now_ms);
+        let secondary_expired = raw_secondary
+            .as_ref()
+            .and_then(|w| w.resets_at_ms)
+            .is_some_and(|reset| reset <= now_ms);
+        let primary_window =
+            raw_primary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
+        let secondary_window =
+            raw_secondary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
+        if had_window_with_reset {
+            let reason_lower = exhausted_reason
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let names_expired_primary = primary_expired
+                && ["primary", "five_hour", "5h"]
+                    .iter()
+                    .any(|token| reason_lower.contains(token));
+            let names_expired_secondary = secondary_expired
+                && ["secondary", "weekly", "7d"]
+                    .iter()
+                    .any(|token| reason_lower.contains(token));
+            let any_active_exhausted = primary_window
+                .as_ref()
+                .is_some_and(|w| w.used_percent >= 100.0)
+                || secondary_window
+                    .as_ref()
+                    .is_some_and(|w| w.used_percent >= 100.0);
+            if (primary_window.is_none() && secondary_window.is_none())
+                || ((primary_expired || secondary_expired)
+                    && (names_expired_primary || names_expired_secondary || !any_active_exhausted))
+            {
+                exhausted_reason = None;
+            }
         }
         if tier.is_none()
             && exhausted_reason.is_none()
@@ -13080,7 +13096,8 @@ mod tests {
         let past_sec = now_sec - 60;
         let future_sec = now_sec + 3600;
 
-        // 1. Codex: primary window expired, secondary active -> primary dropped, secondary kept.
+        // 1. Codex: primary window expired, secondary active at 42% -> primary dropped, secondary kept,
+        // and exhausted_reason ("primary") tied to the expired primary window is cleared.
         let partial_expired = serde_json::json!({
             "type": "event_msg",
             "payload": {
@@ -13099,7 +13116,30 @@ mod tests {
             "expired primary window must be dropped"
         );
         assert_eq!(q.secondary_window.unwrap().used_percent, 42.0);
-        assert_eq!(q.exhausted_reason.as_deref(), Some("primary"));
+        assert!(
+            q.exhausted_reason.is_none(),
+            "exhausted_reason naming the expired primary window must be cleared"
+        );
+
+        // 1b. Codex: primary window expired (100%), secondary active at 100% with
+        // rate_limit_reached_type = "secondary" -> primary dropped, secondary and its
+        // exhausted_reason are retained.
+        let secondary_still_exhausted = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "plus",
+                    "rate_limit_reached_type": "secondary",
+                    "primary": { "used_percent": 100.0, "window_minutes": 300, "resets_at": past_sec },
+                    "secondary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": future_sec }
+                }
+            }
+        });
+        let q_sec = codex_quota_from_rollout(&format!("{secondary_still_exhausted}\n")).unwrap();
+        assert!(q_sec.primary_window.is_none());
+        assert_eq!(q_sec.secondary_window.unwrap().used_percent, 100.0);
+        assert_eq!(q_sec.exhausted_reason.as_deref(), Some("secondary"));
 
         // 2. Codex: all windows expired -> windows dropped AND exhausted_reason cleared, tier retained.
         let all_expired = serde_json::json!({
@@ -13166,7 +13206,7 @@ mod tests {
         )
         .unwrap();
 
-        // Session A: fresh rollout in home with 2 live windows and observed_at_ms = 2000.
+        // Session A: fresh rollout in home with 2 live windows and its own exhausted_reason ("primary").
         let rollout_a = write_codex_rollout(
             home.path(),
             "codex-fresh",
@@ -13177,6 +13217,7 @@ mod tests {
                     "type": "token_count",
                     "rate_limits": {
                         "plan_type": "plus",
+                        "rate_limit_reached_type": "primary",
                         "primary": { "used_percent": 33.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
                         "secondary": { "used_percent": 55.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
                     }
@@ -13184,7 +13225,7 @@ mod tests {
             })
             .to_string(),
         );
-        // Session B: older rollout in same home with stale/older values and its own exhausted_reason.
+        // Session B: older rollout in same home with stale/older values and its own exhausted_reason ("secondary").
         let rollout_b = write_codex_rollout(
             home.path(),
             "codex-stale",
@@ -13195,9 +13236,27 @@ mod tests {
                     "type": "token_count",
                     "rate_limits": {
                         "plan_type": "plus",
-                        "rate_limit_reached_type": "primary",
+                        "rate_limit_reached_type": "secondary",
                         "primary": { "used_percent": 9.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
                         "secondary": { "used_percent": 11.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        // Session B2: older rollout in same home with stale values and exhausted_reason = None.
+        let rollout_b2 = write_codex_rollout(
+            home.path(),
+            "codex-non-exhausted",
+            &serde_json::json!({
+                "timestamp": "2026-11-07T09:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "primary": { "used_percent": 12.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
+                        "secondary": { "used_percent": 19.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
                     }
                 }
             })
@@ -13252,6 +13311,11 @@ mod tests {
                     "updated_at": "2026-11-07T10:00:00.000Z",
                     "route": { "kind": "codex", "thread_id": "codex-stale", "transcript_path": rollout_b }
                 },
+                "agent-b2": {
+                    "persona": "agent-b2",
+                    "updated_at": "2026-11-07T09:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-non-exhausted", "transcript_path": rollout_b2 }
+                },
                 "agent-c": {
                     "persona": "agent-c",
                     "updated_at": "2026-11-06T10:00:00.000Z",
@@ -13282,13 +13346,25 @@ mod tests {
             .unwrap()
             .unix_millis();
 
-        // Sibling B gets A's fresh windows and observed_at_ms, while keeping its own exhausted_reason.
+        // Donor A keeps its own exhausted_reason ("primary").
+        let a = find("codex-fresh").quota_usage.as_ref().unwrap();
+        assert_eq!(a.exhausted_reason.as_deref(), Some("primary"));
+
+        // Sibling B gets A's fresh windows and observed_at_ms, while keeping its own exhausted_reason ("secondary").
         let b = find("codex-stale").quota_usage.as_ref().unwrap();
         assert_eq!(b.tier.as_deref(), Some("plus"));
         assert_eq!(b.primary_window.as_ref().unwrap().used_percent, 33.0);
         assert_eq!(b.secondary_window.as_ref().unwrap().used_percent, 55.0);
         assert_eq!(b.observed_at_ms, Some(expected_obs));
-        assert_eq!(b.exhausted_reason.as_deref(), Some("primary"));
+        assert_eq!(b.exhausted_reason.as_deref(), Some("secondary"));
+
+        // Non-exhausted sibling B2 inherits A's fresh windows, tier, and observed_at_ms without inheriting A's exhausted_reason.
+        let b2 = find("codex-non-exhausted").quota_usage.as_ref().unwrap();
+        assert_eq!(b2.tier.as_deref(), Some("plus"));
+        assert_eq!(b2.primary_window.as_ref().unwrap().used_percent, 33.0);
+        assert_eq!(b2.secondary_window.as_ref().unwrap().used_percent, 55.0);
+        assert_eq!(b2.observed_at_ms, Some(expected_obs));
+        assert!(b2.exhausted_reason.is_none());
 
         // Sibling C (previously None) inherits A's fresh windows, tier, and observed_at_ms, with no exhausted_reason.
         let c = find("codex-idle").quota_usage.as_ref().unwrap();
