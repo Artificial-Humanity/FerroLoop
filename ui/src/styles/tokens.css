@@ -588,8 +588,8 @@ button.fd-badge:hover:not(:disabled) {
 }
 
 .fd-dot-quota-yellow {
-  background-color: #EAB308;
-  box-shadow: 0 0 6px rgba(234, 179, 8, 0.55);
+  background-color: #F59E0B;
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.55);
 }
 
 .fd-dot-quota-orange {
@@ -600,6 +600,21 @@ button.fd-badge:hover:not(:disabled) {
 .fd-dot-quota-red {
   background-color: var(--status-danger);
   box-shadow: 0 0 6px rgba(239, 68, 68, 0.7);
+}
+
+.fd-dot-dead.fd-dot-quota-yellow {
+  background-color: var(--status-dead);
+  box-shadow: 0 0 0 2px #F59E0B;
+}
+
+.fd-dot-dead.fd-dot-quota-orange {
+  background-color: var(--status-dead);
+  box-shadow: 0 0 0 2px #F97316;
+}
+
+.fd-dot-dead.fd-dot-quota-red {
+  background-color: var(--status-danger);
+  box-shadow: 0 0 0 2px var(--status-dead);
 }
 
 .fd-adapter-muse {

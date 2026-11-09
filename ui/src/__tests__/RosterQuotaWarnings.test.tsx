@@ -283,6 +283,71 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(expired.limitingWindow).toBeNull();
     });
 
+    it("clears a generic exhausted_reason (e.g. usage_limit_reached) when primary_window expired and secondary_window is <100%, but keeps it when secondary_window is 100%", () => {
+      const clearedWithGenericReason = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "codex",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 60_000,
+          exhausted_reason: "usage_limit_reached",
+          primary_window: {
+            used_percent: 100,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS - 5_000,
+          },
+          secondary_window: {
+            used_percent: 40,
+            window_minutes: 10080,
+            resets_at_ms: FIXED_NOW_MS + 86_400_000,
+          },
+        },
+      });
+      expect(clearedWithGenericReason.status).toBe("normal");
+      expect(clearedWithGenericReason.reasonKind).toBe("normal");
+      expect(clearedWithGenericReason.exhaustedReason).toBeNull();
+      expect(clearedWithGenericReason.limitingWindow?.key).toBe("secondary");
+      expect(clearedWithGenericReason.limitingWindow?.remainingPercent).toBe(60);
+
+      const keptWhenSecondaryAt100 = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "codex",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 60_000,
+          exhausted_reason: "usage_limit_reached",
+          primary_window: {
+            used_percent: 100,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS - 5_000,
+          },
+          secondary_window: {
+            used_percent: 100,
+            window_minutes: 10080,
+            resets_at_ms: FIXED_NOW_MS + 86_400_000,
+          },
+        },
+      });
+      expect(keptWhenSecondaryAt100.status).toBe("red");
+      expect(keptWhenSecondaryAt100.reasonKind).toBe("exhausted");
+      expect(keptWhenSecondaryAt100.exhaustedReason).toBe("usage_limit_reached");
+    });
+
+    it("reports usedPercent: null and summaryLabel 'exhausted, <age>' on windowless stale exhaustion without fabricating 100%", () => {
+      const threeHoursAgo = FIXED_NOW_MS - 3 * QUOTA_STALE_MS;
+      const staleWindowless = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "claude",
+        quotaUsage: {
+          observed_at_ms: threeHoursAgo,
+          exhausted_reason: "rate_limit_exceeded",
+        },
+      });
+      expect(staleWindowless.status).toBe("unknown");
+      expect(staleWindowless.reasonKind).toBe("stale");
+      expect(staleWindowless.staleReading?.usedPercent).toBeNull();
+      expect(staleWindowless.staleReading?.remainingPercent).toBeNull();
+      expect(staleWindowless.staleReading?.summaryLabel).toBe("exhausted, 3 h ago");
+    });
+
     it("treats telemetry older than QUOTA_STALE_MS (1h) as unknown on the dot and records staleReading with age", () => {
       const threeHoursAgo = FIXED_NOW_MS - 3 * QUOTA_STALE_MS;
       const stale = evaluateQuotaStatus({
@@ -430,7 +495,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(felixDot).toHaveAttribute("data-liveness-state", "alive");
       expect(felixDot).toHaveAttribute("data-quota-state", "yellow");
       expect(felixDot).toHaveAttribute("data-quota-reason", "approaching_yellow");
-      expect(felixDot.className).toContain("fd-dot-quota-yellow");
+      expect(felixDot.className).toBe("fd-dot fd-dot-alive fd-dot-quota-yellow");
       expect(felixDot.getAttribute("title")).toContain("Liveness: alive");
       expect(felixDot.getAttribute("title")).toContain(
         "Quota warning: 15% remaining (5h window, 85% used, resets in 1h 20m)",
@@ -440,7 +505,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(ferrisDot).toHaveAttribute("data-liveness-state", "alive");
       expect(ferrisDot).toHaveAttribute("data-quota-state", "orange");
       expect(ferrisDot).toHaveAttribute("data-quota-reason", "approaching_orange");
-      expect(ferrisDot.className).toContain("fd-dot-quota-orange");
+      expect(ferrisDot.className).toBe("fd-dot fd-dot-alive fd-dot-quota-orange");
       expect(ferrisDot.getAttribute("title")).toContain("Liveness: alive");
       expect(ferrisDot.getAttribute("title")).toContain(
         "Quota warning: 5% remaining (5h window, 95% used, resets in 45m)",
@@ -450,7 +515,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(jarvisDot).toHaveAttribute("data-liveness-state", "alive");
       expect(jarvisDot).toHaveAttribute("data-quota-state", "red");
       expect(jarvisDot).toHaveAttribute("data-quota-reason", "below_1_percent");
-      expect(jarvisDot.className).toContain("fd-dot-quota-red");
+      expect(jarvisDot.className).toBe("fd-dot fd-dot-alive fd-dot-quota-red");
       expect(jarvisDot.getAttribute("title")).toContain(
         "Liveness: alive · Quota critical: <1% remaining (0.4% remaining, 5h window, 99.6% used, resets in 30m)",
       );
@@ -459,8 +524,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(athenaDot).toHaveAttribute("data-liveness-state", "alive");
       expect(athenaDot).toHaveAttribute("data-quota-state", "unknown");
       expect(athenaDot).toHaveAttribute("data-quota-reason", "stale");
-      expect(athenaDot.className).toContain("fd-dot-alive");
-      expect(athenaDot.className).not.toContain("fd-dot-quota-orange");
+      expect(athenaDot.className).toBe("fd-dot fd-dot-alive");
       expect(athenaDot.getAttribute("title")).toContain(
         "Liveness: alive · Quota: unknown (92% used, 3 h ago, 5h window)",
       );
@@ -469,8 +533,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(hermesDot).toHaveAttribute("data-liveness-state", "dead");
       expect(hermesDot).toHaveAttribute("data-quota-state", "red");
       expect(hermesDot).toHaveAttribute("data-quota-reason", "exhausted");
-      expect(hermesDot.className).toContain("fd-dot-dead");
-      expect(hermesDot.className).toContain("fd-dot-quota-red");
+      expect(hermesDot.className).toBe("fd-dot fd-dot-dead fd-dot-quota-red");
       expect(hermesDot.getAttribute("title")).toContain("Liveness: dead (process offline)");
       expect(hermesDot.getAttribute("title")).toContain(
         "Quota exhausted (5h window, 0% remaining, 100% used, resets in 30m, reason: 5h limit reached)",
@@ -627,9 +690,11 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(screen.getByTestId("agent-settings-liveness-detail")).toHaveTextContent(
         "Process: Offline (dead)",
       );
-      expect(screen.getByTestId("agent-settings-allowance-detail")).toHaveTextContent(
+      const allowanceDetail = screen.getByTestId("agent-settings-allowance-detail");
+      expect(allowanceDetail).toHaveTextContent(
         "Allowance: Quota exhausted · 5h window, 0% remaining, 100% used, resets in 40m, reason: 3p_pool_exhausted",
       );
+      expect(allowanceDetail.style.color).toBe("var(--status-danger)");
       expect(screen.getByTestId("agent-settings-offline-quota-note")).toHaveTextContent(
         "Process is offline; usage allowance is reported separately (quota exhausted).",
       );
@@ -704,11 +769,37 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(screen.getByTestId("agent-settings-allowance-detail")).toHaveTextContent(
         "Allowance: Approaching limit (10–20% remaining) · 12% remaining (5h window, 88% used, resets in 30m)",
       );
+
+      // Switching adapter across vendors without a new quota reading resets quota to unknown for the new vendor
+      rerender(
+        <AgentSettingsModal
+          {...baseModalProps}
+          livenessState="alive"
+          adapter="codex"
+          selectedModel="gpt-5.4"
+          quotaUsage={{
+            tier: "ultra",
+            observed_at_ms: FIXED_NOW_MS - 30_000,
+            primary_window: {
+              used_percent: 88,
+              window_minutes: 300,
+              resets_at_ms: FIXED_NOW_MS + 1_800_000,
+            },
+          }}
+        />,
+      );
+      expect(screen.getByTestId("agent-settings-status-detail")).toHaveAttribute(
+        "data-quota-state",
+        "unknown",
+      );
+      expect(screen.getByTestId("agent-settings-allowance-pool")).toHaveTextContent(
+        "Pool: codex",
+      );
     });
   });
 
   describe("resolveRosterStatusDot precedence", () => {
-    it("prioritizes dead liveness while preserving quota classes and attributes", () => {
+    it("emits true liveness base class and only the matching quota class", () => {
       const quotaEval = evaluateQuotaStatus({
         nowMs: FIXED_NOW_MS,
         vendor: "claude",
@@ -722,8 +813,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
         },
       });
       const resolved = resolveRosterStatusDot("dead", quotaEval);
-      expect(resolved.className).toContain("fd-dot-dead");
-      expect(resolved.className).toContain("fd-dot-quota-orange");
+      expect(resolved.className).toBe("fd-dot fd-dot-dead fd-dot-quota-orange");
       expect(resolved.accessibleLabel).toContain("Liveness: dead (process offline)");
       expect(resolved.accessibleLabel).toContain(
         "Quota warning: 6% remaining (5h window, 94% used, resets in 30m)",

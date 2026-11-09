@@ -162,6 +162,34 @@ export function sameContextUsage(
   );
 }
 
+function sameQuotaWindow(
+  a: SessionQuotaUsage["primary_window"],
+  b: SessionQuotaUsage["primary_window"],
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.used_percent === b.used_percent &&
+    a.window_minutes === b.window_minutes &&
+    a.resets_at_ms === b.resets_at_ms
+  );
+}
+
+export function sameQuotaUsage(
+  a: SessionQuotaUsage | null | undefined,
+  b: SessionQuotaUsage | null | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.tier === b.tier &&
+    a.observed_at_ms === b.observed_at_ms &&
+    a.exhausted_reason === b.exhausted_reason &&
+    sameQuotaWindow(a.primary_window, b.primary_window) &&
+    sameQuotaWindow(a.secondary_window, b.secondary_window)
+  );
+}
+
 export function resolveTabletDockedWidth(viewportWidth: number): number {
   return Math.min(
     TABLET_MASTER_MAX_WIDTH_PX,
@@ -1237,6 +1265,9 @@ export const App: React.FC<AppProps> = ({
   const [contextUsageByAgent, setContextUsageByAgent] = useState<
     Record<string, SessionContextUsage | null>
   >({});
+  const [quotaUsageByAgent, setQuotaUsageByAgent] = useState<
+    Record<string, SessionQuotaUsage | null>
+  >({});
 
   const advanceTranscriptAuth = () => {
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
@@ -1253,7 +1284,7 @@ export const App: React.FC<AppProps> = ({
     setTranscriptSnapshot(null);
     setSessionMetadataOwner(null);
     setBackgroundTranscripts({});
-    setBusyByAgent({}); setContextUsageByAgent({});
+    setBusyByAgent({}); setContextUsageByAgent({}); setQuotaUsageByAgent({});
     setSessionQueue([]); setIsSessionBusy(false);
     setSessionContextUsage(null); setSessionQuotaUsage(null);
     setUnconfirmedBySession({});
@@ -1288,6 +1319,26 @@ export const App: React.FC<AppProps> = ({
       setContextUsageByAgent((prev) => {
         const existing = prev[key];
         if (sameContextUsage(existing, usage)) {
+          return prev;
+        }
+        return { ...prev, [key]: usage };
+      });
+    },
+    [],
+  );
+
+  const recordAgentQuotaUsage = useCallback(
+    (
+      agentKey: string | undefined | null,
+      usage: SessionQuotaUsage | null | undefined,
+    ) => {
+      const key = (agentKey ?? "").trim().toLowerCase();
+      if (!key || usage === undefined) {
+        return;
+      }
+      setQuotaUsageByAgent((prev) => {
+        const existing = prev[key];
+        if (sameQuotaUsage(existing, usage)) {
           return prev;
         }
         return { ...prev, [key]: usage };
@@ -1434,9 +1485,11 @@ export const App: React.FC<AppProps> = ({
         setSessionContextUsage(null);
         setSessionQuotaUsage(null);
         recordAgentContextUsage(owner.agentKey, null);
+        recordAgentQuotaUsage(owner.agentKey, null);
       }
       setSessionMetadataOwner(owner);
       recordAgentContextUsage(owner.agentKey, result.context_usage);
+      recordAgentQuotaUsage(owner.agentKey, result.quota_usage);
       recordAgentBusy(owner.agentKey, typeof result.is_busy === "boolean" ? result.is_busy : hasTrailingIncompleteWork(result.turns));
       if (Array.isArray(result.queue)) setSessionQueue(result.queue);
       if (typeof result.is_busy === "boolean") setIsSessionBusy(result.is_busy);
@@ -1447,6 +1500,10 @@ export const App: React.FC<AppProps> = ({
       if (!accepts()) return;
       const transient = isTransientTranscriptReadError(error);
       const denied = error instanceof HubApiError && (error.status === 401 || error.status === 403);
+      if (denied) {
+        recordAgentContextUsage(owner.agentKey, null);
+        recordAgentQuotaUsage(owner.agentKey, null);
+      }
       setTranscriptSnapshot((previous) => {
         const retain = transient && owner.sessionId && previous && sameTranscriptOwner(previous.owner, owner) && (previous.status === "ready" || previous.status === "stale");
         return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
@@ -1455,7 +1512,7 @@ export const App: React.FC<AppProps> = ({
         setAuthority(null); setAuthRequired(true); setPairingOpen(true);
       }
     }
-  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, isTranscriptResetPending, setSessionMetadataOwner]);
+  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, recordAgentQuotaUsage, isTranscriptResetPending, setSessionMetadataOwner]);
 
   const [worktrees, setWorktrees] = useState<WorktreeSummary[]>([]);
   const [selectedWorktreeId, setSelectedWorktreeId] = useState<string | null>(null);
@@ -1641,6 +1698,9 @@ export const App: React.FC<AppProps> = ({
           if (bgRes.context_usage !== undefined) {
             recordAgentContextUsage(persona, bgRes.context_usage);
           }
+          if (bgRes.quota_usage !== undefined) {
+            recordAgentQuotaUsage(persona, bgRes.quota_usage);
+          }
           const busy =
             typeof bgRes.is_busy === "boolean"
               ? bgRes.is_busy
@@ -1649,7 +1709,7 @@ export const App: React.FC<AppProps> = ({
         }
       }
     },
-    [apiClient, recordTranscript, recordAgentBusy, recordAgentContextUsage, isTranscriptResetPending],
+    [apiClient, recordTranscript, recordAgentBusy, recordAgentContextUsage, recordAgentQuotaUsage, isTranscriptResetPending],
   );
 
   // A refresh requested while one is in flight is coalesced into a single
@@ -2630,6 +2690,7 @@ export const App: React.FC<AppProps> = ({
     setBackgroundTranscripts({});
     setBusyByAgent({});
     setContextUsageByAgent({});
+    setQuotaUsageByAgent({});
     setTranscriptTurns([]);
     setSessionQueue([]);
     setIsSessionBusy(false);
@@ -2875,6 +2936,7 @@ export const App: React.FC<AppProps> = ({
       if (teardown) {
         setBusyByAgent((previous) => { const next = { ...previous }; delete next[agentKey]; return next; });
         setContextUsageByAgent((previous) => { const next = { ...previous }; delete next[agentKey]; return next; });
+        setQuotaUsageByAgent((previous) => { const next = { ...previous }; delete next[agentKey]; return next; });
       }
     }
     setTranscriptSnapshot((previous) => previous && sameTranscriptTarget(previous.owner, resetOwner) ? null : previous);
@@ -3062,7 +3124,7 @@ export const App: React.FC<AppProps> = ({
                 setSessionQueue([]);
                 setIsSessionBusy(false);
                 setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
-                setSessionQuotaUsage(null);
+                setSessionQuotaUsage(quotaUsageByAgent[nextKey] ?? null);
               }
               setSelectedAgentName(nameKey);
               setSelectedSessionId(null);
@@ -3327,7 +3389,7 @@ export const App: React.FC<AppProps> = ({
           setSessionQueue([]);
           setIsSessionBusy(false);
           setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
-          setSessionQuotaUsage(null);
+          setSessionQuotaUsage(quotaUsageByAgent[nextKey] ?? null);
         }
         setSelectedAgentName(nameKey);
         setSelectedSessionId(null);
@@ -3350,7 +3412,7 @@ export const App: React.FC<AppProps> = ({
         void refreshSessionsAndTranscript();
       }
     },
-    [splitView, activeTab, refreshSessionsAndTranscript, contextUsageByAgent, selectTranscriptAgent],
+    [splitView, activeTab, refreshSessionsAndTranscript, contextUsageByAgent, quotaUsageByAgent, selectTranscriptAgent],
   );
 
   const effectiveBusyByAgent = useMemo<Record<string, boolean>>(() => {
@@ -3382,6 +3444,26 @@ export const App: React.FC<AppProps> = ({
   }, [
     contextUsageByAgent,
     sessionContextUsage,
+    selectedAgent?.name_key,
+    selectedAgentName,
+  ]);
+
+  const effectiveQuotaUsageByAgent = useMemo<
+    Record<string, SessionQuotaUsage | null>
+  >(() => {
+    const selectedKey = (selectedAgent?.name_key ?? selectedAgentName)
+      .trim()
+      .toLowerCase();
+    if (!selectedKey || !sessionQuotaUsage) {
+      return quotaUsageByAgent;
+    }
+    if (quotaUsageByAgent[selectedKey] === sessionQuotaUsage) {
+      return quotaUsageByAgent;
+    }
+    return { ...quotaUsageByAgent, [selectedKey]: sessionQuotaUsage };
+  }, [
+    quotaUsageByAgent,
+    sessionQuotaUsage,
     selectedAgent?.name_key,
     selectedAgentName,
   ]);
@@ -3585,10 +3667,14 @@ export const App: React.FC<AppProps> = ({
       onResetSession={handleResetSession}
       contextUsage={metadataMatches ? sessionContextUsage : null}
       quotaUsage={
-        (metadataMatches ? sessionQuotaUsage : null) ??
-        activeSession?.quota_usage ??
-        activeRoute?.quota_usage ??
-        null
+        transcriptRefreshState === "denied"
+          ? null
+          : ((metadataMatches ? sessionQuotaUsage : null) ??
+              activeSession?.quota_usage ??
+              (!activeSession || activeRoute?.id === activeSession.id
+                ? activeRoute?.quota_usage
+                : null) ??
+              null)
       }
       livenessState={activeLivenessState}
       isBusy={metadataMatches ? isSessionBusy : false}
@@ -3647,6 +3733,7 @@ export const App: React.FC<AppProps> = ({
       unreadSeverityByAgent={unreadSeverityByAgent}
       busyByAgent={effectiveBusyByAgent}
       contextUsageByAgent={effectiveContextUsageByAgent}
+      quotaUsageByAgent={effectiveQuotaUsageByAgent}
       transcriptsByAgent={transcriptsByAgent}
       selectedAgentName={selectedAgent?.name_key ?? null}
       onSelectAgent={(nameKey) => {
@@ -3659,7 +3746,7 @@ export const App: React.FC<AppProps> = ({
           setSessionQueue([]);
           setIsSessionBusy(false);
           setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
-          setSessionQuotaUsage(null);
+          setSessionQuotaUsage(quotaUsageByAgent[nextKey] ?? null);
         }
         setSelectedAgentName(nameKey);
         setSelectedSessionId(null);

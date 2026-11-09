@@ -441,6 +441,7 @@ interface SessionPropSnapshot {
   model?: string;
   thinkingLevel?: string;
   executionMode?: string | null;
+  quotaUsage?: SessionQuotaUsage | null;
 }
 
 /** Fields whose prop value is newer than the fetched session value. */
@@ -449,6 +450,7 @@ interface OverrideLatch {
   thinkingLevel: boolean;
   executionMode: boolean;
   adapter: boolean;
+  quotaUsage: boolean;
 }
 
 const NO_OVERRIDES: OverrideLatch = {
@@ -456,7 +458,27 @@ const NO_OVERRIDES: OverrideLatch = {
   thinkingLevel: false,
   executionMode: false,
   adapter: false,
+  quotaUsage: false,
 };
+
+function sameModalQuotaUsage(
+  a: SessionQuotaUsage | null | undefined,
+  b: SessionQuotaUsage | null | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.tier === b.tier &&
+    a.observed_at_ms === b.observed_at_ms &&
+    a.exhausted_reason === b.exhausted_reason &&
+    a.primary_window?.used_percent === b.primary_window?.used_percent &&
+    a.primary_window?.window_minutes === b.primary_window?.window_minutes &&
+    a.primary_window?.resets_at_ms === b.primary_window?.resets_at_ms &&
+    a.secondary_window?.used_percent === b.secondary_window?.used_percent &&
+    a.secondary_window?.window_minutes === b.secondary_window?.window_minutes &&
+    a.secondary_window?.resets_at_ms === b.secondary_window?.resets_at_ms
+  );
+}
 
 export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   isOpen,
@@ -541,6 +563,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const [contextWindowNotice, setContextWindowNotice] =
     useState<ContextWindowNotice | null>(null);
   const [pendingAgyModel, setPendingAgyModel] = useState<string | null>(null);
+  const [pickedModel, setPickedModel] = useState<string | null>(null);
   const contextWindowSelectRef = useRef<HTMLSelectElement | null>(null);
   const contextWindowRequestRef = useRef(0);
   const contextWindowRefocusRef = useRef(false);
@@ -553,6 +576,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setContextWindowSending(false);
     setContextWindowNotice(null);
     setPendingAgyModel(null);
+    setPickedModel(null);
   }, [isOpen, sessionId, agentName, selectedModel, selectedThinkingLevel]);
   useEffect(() => {
     // The hub reported a different window: follow the server from here on.
@@ -615,12 +639,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     model: selectedModel,
     thinkingLevel: selectedThinkingLevel,
     executionMode,
+    quotaUsage,
   });
   latestPropsRef.current = {
     adapter,
     model: selectedModel,
     thinkingLevel: selectedThinkingLevel,
     executionMode,
+    quotaUsage,
     apiClient,
   };
   const requestSnapshotRef = useRef<SessionPropSnapshot>({
@@ -628,13 +654,25 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     model: selectedModel,
     thinkingLevel: selectedThinkingLevel,
     executionMode,
+    quotaUsage,
   });
   const canFetchSessions =
     Boolean(apiClient) && typeof apiClient?.getSessions === "function";
+  const lastVendorStateRef = useRef<{
+    vendor: string;
+    quotaUsage: SessionQuotaUsage | null | undefined;
+  }>({
+    vendor: canonicalAdapter(adapter ?? ""),
+    quotaUsage,
+  });
   useEffect(() => {
     setFetchedSession(null);
     const { apiClient: client, ...propsAtRequest } = latestPropsRef.current;
     requestSnapshotRef.current = propsAtRequest;
+    lastVendorStateRef.current = {
+      vendor: canonicalAdapter(propsAtRequest.adapter ?? ""),
+      quotaUsage: propsAtRequest.quotaUsage,
+    };
     setOverridden((prev) => (prev === NO_OVERRIDES ? prev : NO_OVERRIDES));
     if (!isOpen || !canFetchSessions || !client || (!sessionId && !agentName)) {
       return;
@@ -675,6 +713,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       thinkingLevel: selectedThinkingLevel !== snap.thinkingLevel,
       executionMode: executionMode !== snap.executionMode,
       adapter: adapter !== snap.adapter,
+      quotaUsage: !sameModalQuotaUsage(quotaUsage, snap.quotaUsage),
     };
     setOverridden((prev) => {
       const next = {
@@ -682,15 +721,17 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         thinkingLevel: prev.thinkingLevel || changed.thinkingLevel,
         executionMode: prev.executionMode || changed.executionMode,
         adapter: prev.adapter || changed.adapter,
+        quotaUsage: prev.quotaUsage || changed.quotaUsage,
       };
       return next.model === prev.model &&
         next.thinkingLevel === prev.thinkingLevel &&
         next.executionMode === prev.executionMode &&
-        next.adapter === prev.adapter
+        next.adapter === prev.adapter &&
+        next.quotaUsage === prev.quotaUsage
         ? prev
         : next;
     });
-  }, [isOpen, adapter, selectedModel, selectedThinkingLevel, executionMode]);
+  }, [isOpen, adapter, selectedModel, selectedThinkingLevel, executionMode, quotaUsage]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -761,7 +802,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     effectiveAvailableModels,
   );
   const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
-  const shownModel = pendingAgyModel || effectiveModel;
+  const shownModel = pendingAgyModel || pickedModel || effectiveModel;
   const effectiveThinkingLevel =
     fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
     selectedThinkingLevel;
@@ -906,7 +947,56 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     (executionMode !== undefined ? executionMode : null);
   const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
   const executionModeIsYolo = executionModeKey === "yolo";
-  const effectiveQuotaUsage = quotaUsage ?? fetchedSession?.quotaUsage ?? null;
+  const isQuotaOverridden =
+    overridden.quotaUsage ||
+    !sameModalQuotaUsage(
+      quotaUsage,
+      fetchedSession !== null ? fetchedSession.props.quotaUsage : requestSnapshotRef.current.quotaUsage,
+    );
+  const isAdapterOverridden =
+    isOverridden("adapter", adapter) ||
+    adapter !== requestSnapshotRef.current.adapter;
+  const sessionVendor = canonicalAdapter(
+    (fetchedSession?.adapter && fetchedSession.adapter.trim().toLowerCase() !== "unknown"
+      ? fetchedSession.adapter
+      : requestSnapshotRef.current.adapter) ?? "",
+  );
+  const effectiveVendor = canonicalAdapter(effectiveAdapter ?? "");
+  if (effectiveVendor && effectiveVendor === lastVendorStateRef.current.vendor) {
+    lastVendorStateRef.current.quotaUsage = quotaUsage;
+  }
+  const quotaUnchangedAcrossVendorSwitch =
+    effectiveVendor !== lastVendorStateRef.current.vendor &&
+    sameModalQuotaUsage(quotaUsage, lastVendorStateRef.current.quotaUsage);
+  const adapterChangedAcrossVendors =
+    isAdapterOverridden &&
+    Boolean(sessionVendor && effectiveVendor && sessionVendor !== effectiveVendor) &&
+    (!isQuotaOverridden || quotaUnchangedAcrossVendorSwitch);
+  const effectiveQuotaUsage = (() => {
+    if (adapterChangedAcrossVendors) {
+      return null;
+    }
+    const fetchedQuota = fetchedSession?.quotaUsage ?? null;
+    const propQuota = quotaUsage ?? null;
+    if (propQuota && fetchedQuota) {
+      const propTs = propQuota.observed_at_ms;
+      const fetchedTs = fetchedQuota.observed_at_ms;
+      if (
+        typeof propTs === "number" &&
+        Number.isFinite(propTs) &&
+        typeof fetchedTs === "number" &&
+        Number.isFinite(fetchedTs) &&
+        propTs !== fetchedTs
+      ) {
+        return propTs > fetchedTs ? propQuota : fetchedQuota;
+      }
+      return isQuotaOverridden ? propQuota : fetchedQuota;
+    }
+    if (fetchedSession !== null && !isQuotaOverridden) {
+      return fetchedQuota ?? propQuota;
+    }
+    return propQuota ?? fetchedQuota;
+  })();
   const effectiveLivenessState: "alive" | "stale" | "dead" =
     livenessState ??
     (fetchedSession?.status
@@ -1320,6 +1410,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   onChange={(e) => {
                     const nextModel = e.target.value;
                     setOverridden((prev) => (prev.model ? prev : { ...prev, model: true }));
+                    setPickedModel(nextModel);
                     if (
                       isAgySession &&
                       !effectiveThinking &&
@@ -1378,7 +1469,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     setOverridden((prev) =>
                       prev.thinkingLevel ? prev : { ...prev, thinkingLevel: true },
                     );
-                    const modelToApply = pendingAgyModel || effectiveModel;
+                    const modelToApply = pendingAgyModel || pickedModel || effectiveModel;
                     setPendingAgyModel(null);
                     onChangeModelAndThinking(modelToApply, nextThinking);
                   }}
@@ -1785,7 +1876,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     fontSize: "12px",
                     color:
                       quotaEval.status === "red"
-                        ? "var(--status-dead)"
+                        ? "var(--status-danger)"
                         : quotaEval.status === "orange"
                           ? "#F97316"
                           : quotaEval.status === "yellow"

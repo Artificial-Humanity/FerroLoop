@@ -255,7 +255,7 @@ function selectLimitingWindow(
 }
 
 function isExhaustedReasonExpired(
-  rawReason: string,
+  _rawReason: string,
   primary: ParsedWindowState,
   secondary: ParsedWindowState,
 ): boolean {
@@ -266,21 +266,13 @@ function isExhaustedReasonExpired(
     return false;
   }
   const windowsWithReset = [primary, secondary].filter((w) => w.hasResetTimestamp);
-  if (
-    windowsWithReset.length > 0 &&
-    windowsWithReset.every((w) => w.expired)
-  ) {
-    return true;
+  if (windowsWithReset.length === 0) {
+    return false;
   }
-  const namesPrimary = /\b(primary|5h|five_hour|5-hour|5 hour)\b/i.test(rawReason);
-  const namesSecondary = /\b(secondary|7d|weekly|7-day|7 day)\b/i.test(rawReason);
-  if (namesPrimary && primary.expired) {
-    return true;
-  }
-  if (namesSecondary && secondary.expired) {
-    return true;
-  }
-  return false;
+  return (
+    windowsWithReset.every((w) => w.expired) ||
+    (windowsWithReset.some((w) => w.expired) && !anyActiveAt100)
+  );
 }
 
 export function evaluateQuotaStatus(
@@ -355,16 +347,8 @@ export function evaluateQuotaStatus(
     hasValidObservedAt && nowMs - observedAtMs! <= QUOTA_STALE_MS;
 
   if (!isFresh) {
-    const usedPercent = limitingWindow
-      ? limitingWindow.usedPercent
-      : activeExhaustedReason
-        ? 100
-        : null;
-    const remainingPercent = limitingWindow
-      ? limitingWindow.remainingPercent
-      : activeExhaustedReason
-        ? 0
-        : null;
+    const usedPercent = limitingWindow?.usedPercent ?? null;
+    const remainingPercent = limitingWindow?.remainingPercent ?? null;
     const windowLabel = limitingWindow?.windowLabel ?? null;
     const resetsAtMs = limitingWindow?.resetsAtMs ?? null;
     const ageLabel = formatQuotaAge(ageMs);
@@ -491,31 +475,14 @@ export function resolveRosterStatusDot(
   livenessState: "alive" | "stale" | "dead",
   quotaEval: QuotaStatusEvaluation,
 ): RosterStatusDotPresentation {
-  let className = "fd-dot fd-dot-alive";
-  if (livenessState === "dead") {
-    if (
-      quotaEval.status === "red" ||
-      quotaEval.status === "orange" ||
-      quotaEval.status === "yellow"
-    ) {
-      className =
-        quotaEval.status === "red"
-          ? "fd-dot fd-dot-dead fd-dot-quota-red"
-          : `fd-dot fd-dot-dead fd-dot-quota-${quotaEval.status} fd-dot-quota-red`;
-    } else {
-      className = "fd-dot fd-dot-dead";
-    }
-  } else if (quotaEval.status === "red") {
-    className = "fd-dot fd-dot-dead fd-dot-quota-red";
-  } else if (quotaEval.status === "orange") {
-    className = "fd-dot fd-dot-quota-orange";
-  } else if (quotaEval.status === "yellow") {
-    className = "fd-dot fd-dot-stale fd-dot-quota-yellow";
-  } else if (livenessState === "stale") {
-    className = "fd-dot fd-dot-stale";
-  } else {
-    className = "fd-dot fd-dot-alive";
-  }
+  const baseClass = `fd-dot fd-dot-${livenessState}`;
+  const quotaClass =
+    quotaEval.status === "yellow" ||
+    quotaEval.status === "orange" ||
+    quotaEval.status === "red"
+      ? ` fd-dot-quota-${quotaEval.status}`
+      : "";
+  const className = `${baseClass}${quotaClass}`;
 
   const livenessPart =
     livenessState === "dead"
