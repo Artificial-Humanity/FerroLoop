@@ -4429,22 +4429,23 @@ pub fn authorize_teardown<S: AgentRegistry>(
     )
 }
 
-/// Phase two: drop queued prompts and routes, stop the runtime this lifecycle started, retire
-/// the agent, and mark the record `decommissioned`. Safe to repeat.
-///
-/// `caller` gates adopting a session that has no hosted record (owner only). `clear_queue` is
-/// called with each id the session may be queued under. Another running session of the same
-/// persona keeps the persona key and the persona route; the session ids are still cleared.
-/// Everything that can fail on a lookup runs before the first side effect.
-pub fn teardown_session<S: AgentRegistry + StateStore>(
+/// Resolve and preflight exactly the runtime teardown would stop, without changing state.
+/// Remodel also calls this during planning, before writing its handoff or entering rollback.
+struct TeardownRuntimePlan {
+    record: HostedSessionRecord,
+    same_vendor_siblings: Vec<HostedSessionRecord>,
+    runtime_owner_id: String,
+    sharing: Vec<HostedSessionRecord>,
+    shared_runtime: bool,
+    persona_still_running: bool,
+}
+
+fn preflight_teardown_runtime<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
-    by: &str,
     caller: Caller,
-    mut clear_queue: impl FnMut(&str),
-) -> Result<DecommissionResponse, LifecycleError> {
-    authorize_teardown(store, target, caller)?;
+) -> Result<TeardownRuntimePlan, LifecycleError> {
     let mut record = record_for_target(store, target)?;
     if record.vendor == "unknown"
         && let Some(vendor) = infer_vendor_from_routes(env.home_override, &record, target)
@@ -4472,7 +4473,6 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             runtime_owner_id = sib.session_id.clone();
         }
     }
-    let agent = store.agent_by_name(&target.persona)?;
     let sharing = runtime_sharers(store, env.runtime, &record)?;
     let shared_runtime = record.runtime_spawned && !sharing.is_empty();
     // Another running session of this persona (a second vendor) still owns the registry
@@ -4502,6 +4502,41 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
                 .preflight_stop(env.runtime.unit(&target), &runtime_owner_id, false)?;
         }
     }
+    Ok(TeardownRuntimePlan {
+        record,
+        same_vendor_siblings,
+        runtime_owner_id,
+        sharing,
+        shared_runtime,
+        persona_still_running,
+    })
+}
+
+/// Phase two: drop queued prompts and routes, stop the runtime this lifecycle started, retire
+/// the agent, and mark the record `decommissioned`. Safe to repeat.
+///
+/// `caller` gates adopting a session that has no hosted record (owner only). `clear_queue` is
+/// called with each id the session may be queued under. Another running session of the same
+/// persona keeps the persona key and the persona route; the session ids are still cleared.
+/// Everything that can fail on a lookup runs before the first side effect.
+pub fn teardown_session<S: AgentRegistry + StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    by: &str,
+    caller: Caller,
+    mut clear_queue: impl FnMut(&str),
+) -> Result<DecommissionResponse, LifecycleError> {
+    authorize_teardown(store, target, caller)?;
+    let TeardownRuntimePlan {
+        mut record,
+        same_vendor_siblings,
+        runtime_owner_id,
+        sharing,
+        shared_runtime,
+        persona_still_running,
+    } = preflight_teardown_runtime(store, env, target, caller)?;
+    let agent = store.agent_by_name(&target.persona)?;
     if shared_runtime {
         // The runtime stays up for the other sessions, so ownership of it moves to them: the
         // last one torn down then stops it.
@@ -5160,6 +5195,8 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             env.runtime
                 .preflight_spawn(&format!("{}:{}", to.vendor, to.persona))?;
         }
+        // The old session is torn down even when the destination has no hosted runtime.
+        preflight_teardown_runtime(store, env, target, caller)?;
         check_old_runtime_stoppable(store, env, target, &to)?;
     }
     Ok(RemodelPlan {

@@ -705,3 +705,98 @@ fn hub_old_host_refusal_child() {
     }
     assert_eq!(before, lifecycle::list_hosted_sessions(&store).unwrap());
 }
+
+// Each HTTP request runs in a subprocess so its host endpoint cannot affect parallel tests.
+#[test]
+fn hub_refuses_remodel_of_foreign_or_unmarked_replacement_before_any_effect() {
+    for owner in [Some("foreign:ada"), None] {
+        for hosted in [true, false] {
+            let f = Fixture::new();
+            f.spin("claude", true);
+            f.raw_spawn("Ada.claude", owner);
+            let sessions = serde_json::to_value(f.rpc().list_sessions().unwrap()).unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("HOME", f.root.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("FL_HOST_SOCK", f.endpoint.socket_path())
+                .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+                .env("F397_REMODEL_CHILD", f.root.path())
+                .env("F397_REMODEL_HOSTED", hosted.to_string())
+                .args(["--exact", "hub_remodel_owner_refusal_child", "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "owner={owner:?}, hosted={hosted}: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // The original epoch remains running, and no destination or restore was spawned.
+            assert_eq!(
+                sessions,
+                serde_json::to_value(f.rpc().list_sessions().unwrap()).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn hub_remodel_owner_refusal_child() {
+    use fl_core::store::{AgentRegistry, StateStore};
+    use fl_hub::lifecycle;
+    let Some(root) = std::env::var_os("F397_REMODEL_CHILD").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let hosted: bool = std::env::var("F397_REMODEL_HOSTED")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let path = root.join("fl.fls");
+    let store = fl_store::open_store(&path).unwrap();
+    let mut record = lifecycle::list_hosted_sessions(&store).unwrap().remove(0);
+    // The record describes the prior owned child, which has since been replaced.
+    record.runtime_spawned = true;
+    lifecycle::persist_hosted_session(&store, &record, "owner").unwrap();
+    let routes_path = root.join(".cache/agent-bus/routes.json");
+    let mut routes = fl_wire::identity::RouteTable::default();
+    routes.upsert(
+        "ada",
+        fl_wire::identity::VendorRoute::Webhook {
+            socket_path: root.join("none.sock"),
+        },
+        fl_core::At::from_unix_millis(1),
+    );
+    routes.save(Some(&routes_path)).unwrap();
+    let before_routes = std::fs::read(&routes_path).unwrap();
+    let before_state = store.list_state(None, None).unwrap();
+    let before_agents = store.list_agents(None, true).unwrap();
+    let before_registry = store.registry_events_after(0).unwrap();
+    let state = fl_hub::HubState::new(fl_hub::HubServerConfig {
+        store_path: path,
+        repo_root: root.clone(),
+        home_override: Some(root),
+        owner_token: Some("test-owner".into()),
+        ..Default::default()
+    });
+    let req = fl_hub::HttpRequest::new("POST", "/api/v1/sessions/claude:ada/remodel")
+        .with_header("authorization", "Bearer test-owner")
+        .with_json_body(&serde_json::json!({"vendor":"codex", "mode":"execute", "hosted":hosted}));
+    let response = fl_hub::handle_http_request(&state, &req);
+    assert_eq!(
+        response.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let error = String::from_utf8_lossy(&response.body);
+    assert!(
+        error.contains("Ada.claude") && error.contains("fl host kill"),
+        "{error}"
+    );
+    // Includes hosted records and the durable remodel handoff: no rollback/restore revisions.
+    assert_eq!(before_state, store.list_state(None, None).unwrap());
+    assert_eq!(before_agents, store.list_agents(None, true).unwrap());
+    assert_eq!(before_registry, store.registry_events_after(0).unwrap());
+    assert_eq!(before_routes, std::fs::read(&routes_path).unwrap());
+}
