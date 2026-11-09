@@ -538,6 +538,7 @@ export interface SessionQuotaUsage {
   primary_window?: QuotaWindowUsage | null;
   secondary_window?: QuotaWindowUsage | null;
   exhausted_reason?: string | null;
+  observed_at_ms?: number | null;
 }
 
 export interface DiscoveredSessionSummary {
