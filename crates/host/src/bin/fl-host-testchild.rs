@@ -130,7 +130,8 @@ fn main() {
         }
         "grandchild" => grandchild(false),
         "detach" => grandchild(true),
-        "orphan" => orphan(),
+        "orphan" => orphan(false),
+        "orphan-linger" => orphan(true),
         "term-ignore" => term_ignore(),
         "dual-exit" => dual_exit(),
         "survive-eof" => {
@@ -612,7 +613,7 @@ fn grandchild(detach: bool) {
 }
 
 #[cfg(unix)]
-fn orphan() {
+fn orphan(ignore_signals: bool) {
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         exit(2);
@@ -623,6 +624,12 @@ fn orphan() {
     }
     if pid == 0 {
         unsafe { libc::close(fds[0]) };
+        if ignore_signals {
+            unsafe {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+        }
         let text = format!("{}\n", unsafe { libc::getpid() });
         let _ = unsafe { libc::write(fds[1], text.as_ptr().cast(), text.len()) };
         unsafe { libc::close(fds[1]) };
@@ -640,9 +647,14 @@ fn orphan() {
 
 #[cfg(not(unix))]
 #[allow(clippy::zombie_processes)] // The fixture deliberately orphans a live descendant.
-fn orphan() {
+fn orphan(ignore_signals: bool) {
+    let mode = if ignore_signals {
+        "term-ignore"
+    } else {
+        "survive-eof"
+    };
     let child = std::process::Command::new(std::env::current_exe().unwrap_or_default())
-        .arg("survive-eof")
+        .arg(mode)
         .spawn()
         .expect("grandchild");
     ready();
