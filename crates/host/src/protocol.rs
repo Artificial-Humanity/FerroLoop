@@ -59,7 +59,8 @@ pub enum SupervisorMsg {
         adopted: bool,
     },
     HostedLeaderExitCleanup {
-        descendants: usize,
+        #[serde(alias = "descendants")]
+        direct_children: usize,
     },
     Cleanup {
         complete: bool,
