@@ -38,20 +38,36 @@ old non-projection headroom. `Session::note_cleanup` is the existing cleanup ent
 Keep public interfaces unchanged in this task. Task 2 consumes these limit helpers
 and `SliceBudget::used(ChargeKind::Projection)` for diagnostics.
 
-- [ ] Add failing tests: 64 default projections admitted and release to baseline;
+- [x] Add failing tests: 64 default projections admitted and release to baseline;
       65th refused; successful cleanup drops projection; incomplete cleanup retains
       it; output can still update 64 KiB raw tail after release; Ack unchanged.
-- [ ] Observe RED. Implement derived global projection/additional limits while
+- [x] Observe RED. Implement derived global projection/additional limits while
       preserving finite per-epoch/category admission and overflow checking.
-- [ ] Release projection on successful cleanup outside the cleanup lock. Serialize
+- [x] Release projection on successful cleanup outside the cleanup lock. Serialize
       with output/resize through the existing projection mutex, and make completed
       rendered access refuse explicitly without recreating the parser.
-- [ ] Add a real isolated-daemon test for at least 16 simultaneous default PTYs,
+- [x] Add a real isolated-daemon test for at least 16 simultaneous default PTYs,
       synthetic gated children and cleanup; update tests that intentionally capture
       a completed screen to assert the new raw-tail-only policy.
-- [ ] Run `cargo test -p fl-host` and affected strict Clippy/fmt/diff checks. Document
+- [x] Run `cargo test -p fl-host` and affected strict Clippy/fmt/diff checks. Document
       accounting reservation versus actual allocation and new completed capture rule.
-- [ ] Commit with Fiona trailer; fresh independent task review before Task 2.
+- [x] Commit with Fiona trailer.
+- [ ] Fresh independent task review before Task 2.
+
+Implementation notes: RED reproduced projection admission failure at zero-based
+session 14, retained projection charge after successful cleanup, and refusal of
+the isolated sixteen-PTY fixture. The fixture uses existing gated synthetic
+children; completed raw capture is asserted before same-name replacement while
+live rendered assertions remain unchanged. Existing projection exhaustion tests
+now use epoch budgets to preserve their original 128 MiB constraint. A narrow
+`input.rs` resize error mapping preserves `SessionFenced` if cleanup releases the
+projection between the writer's completion check and resize. This is the only
+source-file scope addition. The first host-suite run caught mixed manual/typed
+request IDs in the new fixture; it now uses typed IDs consistently.
+Final validation: `cargo test -p fl-host` passed 229 tests (98 unit, 30 foundation,
+84 IPC, 17 reliable events), strict host all-target Clippy, workspace formatting
+and diff checks passed. Workspace verification remains scheduled after Task 2.
+
 
 ### Task 2: Completed retention, diagnostics and operator errors
 

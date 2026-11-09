@@ -85,11 +85,18 @@ The host advances its Ack before replying, so a lost reply permits Ack-only retr
 | Reliable data across the host | 512 MiB |
 | Lifecycle reservation per epoch | 16 KiB and 16 records |
 | Lifecycle reservation across the host | 1 MiB |
-| Additional slice charge / metadata category | 192 MiB / 8 MiB |
+| Projection charge across the host | 64 × default PTY storage bound (approximately 593 MB decimal) |
+| Additional slice charge / metadata category | Projection allowance + 64 MiB / 8 MiB |
 | Active RPC registry entries | 128 |
 | Outstanding Extended operations per RPC | 64, subject to metadata admission |
 
 These are logical owned-allocation charges, not a claim about total process RSS.
+Projection reservations update counters rather than eagerly allocating the full
+bound; vt100 allocates visible rows and grows scrollback as output arrives.
+Successful PTY cleanup releases the projection independently of Ack, retaining
+the existing 64 KiB raw tail, including any later drain. Completed rendered
+capture and resize explicitly refuse; see [rendered capture](host-rendered-capture.md).
+ReliablePipe and LegacyPipe retention and acknowledgment behavior is unchanged.
 Read buffers, copies, envelopes and retained references are admitted before their
 new ownership. Shared event bodies are charged until their last actual reference
 retires, even after Ack removes the journal entry. Pending operations retain their

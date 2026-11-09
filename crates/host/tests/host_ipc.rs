@@ -4195,6 +4195,73 @@ fn rendered_spawn(rpc: &mut Rpc, name: &str) -> StreamId {
     }
 }
 
+// More than the former projection limit must coexist, without consumers or Ack.
+#[cfg(unix)]
+#[test]
+fn default_pty_capacity_supports_sixteen_live_gated_children() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let gate = daemon.paths.barrier.join("capacity-go");
+    let mut streams = Vec::new();
+    for index in 0..16 {
+        let mut child = spec(
+            &format!("capacity-{index}"),
+            &["gated-line-burst", gate.to_str().unwrap()],
+        );
+        child.kind = SpawnKind::Pty;
+        let stream = rpc.inner.spawn_pty_session(child, None).unwrap().0;
+        streams.push(stream);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for stream in &streams {
+        loop {
+            let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+            if screen.contents.contains("READY") {
+                assert_eq!((screen.rows, screen.cols), (40, 120));
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not reach its gate");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let records = rpc.inner.list_sessions().unwrap();
+    assert_eq!(records.len(), 16);
+    assert!(
+        records
+            .iter()
+            .all(|r| matches!(r.state, ChildState::Running(_)))
+    );
+    std::fs::write(gate, b"go").unwrap();
+    for stream in &streams {
+        let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+        rpc.inner.kill_session(stream.clone(), lease).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let records = rpc.inner.list_sessions().unwrap();
+        if records
+            .iter()
+            .all(|r| matches!(r.state, ChildState::CleanupComplete(_)))
+        {
+            assert_eq!(records.len(), 16);
+            assert!(records.iter().all(|r| r.acked == 0));
+            break;
+        }
+        assert!(Instant::now() < deadline, "PTY cleanup incomplete");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for stream in streams {
+        assert_eq!(
+            rpc.inner
+                .extension_request(XReq::CaptureRendered { stream })
+                .unwrap(),
+            XResp::Refused {
+                code: Refuse::SessionFenced
+            }
+        );
+    }
+}
+
 // Catches missing opt-in host support, name-based identity fallback and ioctl/parser divergence.
 #[cfg(unix)]
 #[test]
@@ -4453,6 +4520,7 @@ fn rendered_old_epoch_never_selects_respawned_session() {
     let old = rendered_spawn(&mut rpc, "rendered-respawn");
     let lease = controller(&mut rpc, &old);
     let before = rendered_ready(&mut rpc, &old);
+    assert_eq!((before.rows, before.cols), (40, 120));
     assert_eq!(
         extended(
             &mut rpc,
@@ -4477,14 +4545,23 @@ fn rendered_old_epoch_never_selects_respawned_session() {
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
+    assert!(matches!(
+        extended(&mut rpc, XReq::CaptureOutput { session: old.session.clone(), max_bytes: 64 * 1024 }),
+        XResp::CapturedOutput { text } if text.ends_with("ready")
+    ));
     let new = rendered_spawn(&mut rpc, "rendered-respawn");
     assert_ne!(old.epoch, new.epoch);
     assert_eq!(rendered_ready(&mut rpc, &new).stream, new);
-    let historical = rendered_screen(&mut rpc, &old);
-    assert_eq!(historical.stream, old);
     assert_eq!(
-        (historical.rows, historical.cols),
-        (before.rows, before.cols)
+        extended(
+            &mut rpc,
+            XReq::CaptureRendered {
+                stream: old.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::SessionFenced
+        }
     );
     assert!(matches!(
         extended(

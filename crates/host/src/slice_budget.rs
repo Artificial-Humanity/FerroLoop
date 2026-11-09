@@ -7,7 +7,21 @@ pub(crate) const EPOCH_DATA: usize = 8 * 1024 * 1024;
 pub(crate) const EPOCH_LIFECYCLE: usize = 16 * 1024;
 pub(crate) const GLOBAL_DATA: usize = 512 * 1024 * 1024;
 pub(crate) const GLOBAL_LIFECYCLE: usize = 1024 * 1024;
-pub(crate) const ADDITIONAL: usize = 192 * 1024 * 1024;
+const EPOCH_ADDITIONAL: usize = 192 * 1024 * 1024;
+const EPOCH_PROJECTION: usize = 128 * 1024 * 1024;
+
+// Reservations count a conservative storage bound; they do not eagerly allocate
+// it. Keep the old non-projection headroom while admitting every default session.
+pub(crate) fn projection_limit() -> usize {
+    fl_host_proto::DEFAULT_MAX_SESSIONS
+        .checked_mul(crate::projection::default_storage_bound())
+        .expect("default projection allowance fits usize")
+}
+pub(crate) fn additional_limit() -> usize {
+    projection_limit()
+        .checked_add(EPOCH_ADDITIONAL - EPOCH_PROJECTION)
+        .expect("additional allowance fits usize")
+}
 pub(crate) const METADATA: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,7 +96,8 @@ impl SliceBudget {
             (ChargeKind::Lifecycle, true) => EPOCH_LIFECYCLE,
             (ChargeKind::Lifecycle, false) => GLOBAL_LIFECYCLE,
             (ChargeKind::Metadata, _) => METADATA,
-            (ChargeKind::Projection, _) => 128 * 1024 * 1024,
+            (ChargeKind::Projection, true) => EPOCH_PROJECTION,
+            (ChargeKind::Projection, false) => projection_limit(),
             (ChargeKind::Ring, _) => 8 * 1024 * 1024,
             (ChargeKind::Snapshot, _) => 32 * 1024 * 1024,
             (ChargeKind::Viewer, _) => 8 * 1024 * 1024,
@@ -91,13 +106,18 @@ impl SliceBudget {
             .checked_add(bytes)
             .filter(|v| *v <= limit)
             .ok_or(ExtensionRefusal::ResourceLimit)?;
+        let additional = if self.parent.is_some() {
+            EPOCH_ADDITIONAL
+        } else {
+            additional_limit()
+        };
         let extra = if kind == ChargeKind::ReliableData {
             usage.additional
         } else {
             usage
                 .additional
                 .checked_add(bytes)
-                .filter(|v| *v <= ADDITIONAL)
+                .filter(|v| *v <= additional)
                 .ok_or(ExtensionRefusal::ResourceLimit)?
         };
         usage.categories[kind as usize] = next;
@@ -213,7 +233,7 @@ mod tests {
         assert!(reserve(&root, ChargeKind::ReliableData, 1).is_err());
         drop(data);
         for (kind, max) in [
-            (ChargeKind::Projection, 128 * 1024 * 1024),
+            (ChargeKind::Projection, projection_limit()),
             (ChargeKind::Ring, 8 * 1024 * 1024),
             (ChargeKind::Snapshot, 32 * 1024 * 1024),
             (ChargeKind::Viewer, 8 * 1024 * 1024),

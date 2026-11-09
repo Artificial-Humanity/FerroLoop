@@ -123,7 +123,17 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .ok_or(fl_host_proto::ExtensionRefusal::WrongMode)?
+            .ok_or_else(|| {
+                if self
+                    .reliable
+                    .as_ref()
+                    .is_some_and(|journal| journal.pty_mode())
+                {
+                    fl_host_proto::ExtensionRefusal::SessionFenced
+                } else {
+                    fl_host_proto::ExtensionRefusal::WrongMode
+                }
+            })?
             .snapshot()
     }
     pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> Result<u64, HostError> {
@@ -131,9 +141,20 @@ impl Session {
         {
             use std::os::fd::AsRawFd;
             let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
-            let projection = projection
-                .as_mut()
-                .ok_or_else(|| HostError::Protocol("wrong session mode".into()))?;
+            let projection = projection.as_mut().ok_or_else(|| {
+                HostError::Protocol(
+                    if self
+                        .reliable
+                        .as_ref()
+                        .is_some_and(|journal| journal.pty_mode())
+                    {
+                        "SessionFenced"
+                    } else {
+                        "wrong session mode"
+                    }
+                    .into(),
+                )
+            })?;
             projection.resize(cols, rows, || {
                 let master = self
                     .resize_master
@@ -418,6 +439,15 @@ impl Session {
                 false
             }
         };
+        // Publish cleanup before notifying downstream owners, without nesting the
+        // cleanup mutex with projection/journal locks. The projection mutex also
+        // serializes pump/capture/resize; later drain updates only the raw tail.
+        if fresh && report.complete {
+            self.projection
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .take();
+        }
         self.cleanup_cv.notify_all();
         if fresh && let Some(sink) = self.sink() {
             sink.on_cleanup(report.complete);
@@ -1237,6 +1267,55 @@ mod tests {
         );
         (session, journal, sink)
     }
+    #[cfg(unix)]
+    #[test]
+    fn successful_pty_cleanup_releases_projection_without_ack_and_drain_keeps_raw_tail() {
+        use crate::slice_budget::ChargeKind;
+        let (session, journal, sink) = pty_fixture();
+        assert!(journal.budget().used(ChargeKind::Projection) > 0);
+        session.note_cleanup(CleanupReport { complete: true });
+        assert_eq!(journal.budget().used(ChargeKind::Projection), 0);
+        assert!(matches!(
+            session.capture_screen(),
+            Err(fl_host_proto::ExtensionRefusal::SessionFenced)
+        ));
+        assert!(
+            matches!(session.resize_pty(80, 24), Err(HostError::Protocol(reason)) if reason == "SessionFenced")
+        );
+        // Cleanup can precede EOF. Both admitted output and forced replay drops
+        // must drain into the bounded raw tail without recreating the parser.
+        let mut left = 80 * 1024;
+        pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
+            let len = left.min(buf.len());
+            buf[..len].fill(b'x');
+            left -= len;
+            Ok(len)
+        });
+        session.drop_pty_output(&journal, b"final-tail");
+        let tail = session.stdout_tail(usize::MAX);
+        assert_eq!(tail.len(), 64 * 1024);
+        assert!(tail.ends_with("final-tail"));
+        assert_eq!(journal.position().0, 0);
+        assert_eq!(journal.budget().used(ChargeKind::Projection), 0);
+        assert!(matches!(
+            session.capture_screen(),
+            Err(fl_host_proto::ExtensionRefusal::SessionFenced)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_pty_cleanup_preserves_projection_and_charge() {
+        use crate::slice_budget::ChargeKind;
+        let (session, journal, _sink) = pty_fixture();
+        let charged = journal.budget().used(ChargeKind::Projection);
+        session.note_cleanup(CleanupReport { complete: false });
+        session.drop_pty_output(&journal, b"still-visible");
+        assert_eq!(session.capture_screen().unwrap().contents, "still-visible");
+        assert_eq!(journal.budget().used(ChargeKind::Projection), charged);
+        assert_eq!(journal.position().0, 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn pty_projection_precedes_forced_unadmitted_drop_and_retains_raw_bytes() {
