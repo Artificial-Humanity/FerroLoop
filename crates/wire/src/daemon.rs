@@ -268,18 +268,6 @@ pub struct RecipientPendingSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexQueueSummary {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipient: Option<String>,
-    pub thread_id: String,
-    pub queued_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oldest_queued_at: Option<At>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oldest_queued_age_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub node_id: String,
     pub host: String,
@@ -291,8 +279,6 @@ pub struct DaemonStatus {
     pub dispatch_diagnostics: Option<DispatchDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_recipients: Vec<RecipientPendingSummary>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub codex_queues: Vec<CodexQueueSummary>,
 }
 
 pub fn collect_pending_recipient_summaries<S: MessageStore>(
@@ -349,43 +335,6 @@ fn summarize_pending_map(
         });
     }
     out
-}
-
-pub fn collect_codex_queue_summaries(
-    routes: &[RouteEntry],
-    home_override: Option<&Path>,
-    now: &At,
-) -> Vec<CodexQueueSummary> {
-    let Some(db_path) = crate::codex_control::resolve_codex_queue_sqlite_path(
-        std::env::var_os("CODEX_HOME").as_deref(),
-        home_override,
-        std::env::var_os("HOME").as_deref(),
-    ) else {
-        return Vec::new();
-    };
-    let rows = crate::codex_control::inspect_codex_queue_sqlite(
-        &db_path,
-        crate::codex_control::QUEUE_INSPECT_TIMEOUT,
-    );
-    let now_ms = now.unix_millis();
-    rows.into_iter()
-        .map(|(thread_id, queued_count, oldest_ms)| {
-            let recipient = routes.iter().find_map(|entry| match &entry.route {
-                VendorRoute::Codex {
-                    thread_id: route_tid,
-                    ..
-                } if route_tid == &thread_id => Some(entry.persona.clone()),
-                _ => None,
-            });
-            CodexQueueSummary {
-                recipient,
-                thread_id,
-                queued_count,
-                oldest_queued_at: Some(At::from_unix_millis(oldest_ms)),
-                oldest_queued_age_ms: Some(now_ms.saturating_sub(oldest_ms)),
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1674,11 +1623,6 @@ where
                 let routes: Vec<RouteEntry> =
                     lock(&self.routes).entries.values().cloned().collect();
                 let pending_recipients = self.pending_recipients_snapshot(&now);
-                let codex_queues = collect_codex_queue_summaries(
-                    &routes,
-                    self.config.home_override.as_deref(),
-                    &now,
-                );
                 (
                     LocalResponse::Status(DaemonStatus {
                         node_id: self.config.node_id.clone(),
@@ -1689,7 +1633,6 @@ where
                         routes,
                         dispatch_diagnostics: Some(self.diagnostics_snapshot()),
                         pending_recipients,
-                        codex_queues,
                     }),
                     None,
                 )

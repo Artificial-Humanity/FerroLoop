@@ -1228,7 +1228,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     println!("{}", serde_json::to_string_pretty(&st).unwrap());
                 } else {
                     println!(
-                        "daemon=active\tnode={}\thost={}\tsocket={}\tpeers={}\troutes={}\t{}{}{}",
+                        "daemon=active\tnode={}\thost={}\tsocket={}\tpeers={}\troutes={}\t{}{}",
                         st.node_id,
                         st.host,
                         st.socket_path.display(),
@@ -1236,7 +1236,6 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                         st.routes.len(),
                         dispatch_diagnostics_summary(st.dispatch_diagnostics.as_ref()),
                         pending_recipients_summary(&st.pending_recipients),
-                        codex_queues_summary(&st.codex_queues),
                     );
                 }
                 return Ok(0);
@@ -1250,8 +1249,6 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 .ok()
                 .map(|store| fl_wire::daemon::collect_pending_recipient_summaries(&store, &now))
                 .unwrap_or_default();
-            let codex_queues =
-                fl_wire::daemon::collect_codex_queue_summaries(&route_entries, None, &now);
             if json {
                 let mut payload = json!({
                     "daemon": "inactive",
@@ -1263,17 +1260,13 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     payload["pending_recipients"] =
                         serde_json::to_value(&pending_recipients).unwrap();
                 }
-                if !codex_queues.is_empty() {
-                    payload["codex_queues"] = serde_json::to_value(&codex_queues).unwrap();
-                }
                 println!("{}", serde_json::to_string_pretty(&payload).unwrap());
             } else {
                 println!(
-                    "daemon=inactive\tsocket={}\troutes={}\tdispatch_diagnostics=unavailable{}{}",
+                    "daemon=inactive\tsocket={}\troutes={}\tdispatch_diagnostics=unavailable{}",
                     sock.display(),
                     route_entries.len(),
                     pending_recipients_summary(&pending_recipients),
-                    codex_queues_summary(&codex_queues),
                 );
             }
             Ok(0)
@@ -1934,25 +1927,6 @@ fn pending_recipients_summary(pending: &[fl_wire::daemon::RecipientPendingSummar
         .collect::<Vec<_>>()
         .join(",");
     format!("\tpending_recipients={formatted}")
-}
-
-fn codex_queues_summary(queues: &[fl_wire::daemon::CodexQueueSummary]) -> String {
-    if queues.is_empty() {
-        return String::new();
-    }
-    let formatted = queues
-        .iter()
-        .map(|row| {
-            let label = row.recipient.as_deref().unwrap_or(&row.thread_id);
-            let age = row
-                .oldest_queued_age_ms
-                .map(|ms| format!("{ms}ms"))
-                .unwrap_or_else(|| "unknown".into());
-            format!("{label}:{}(oldest_age={age})", row.queued_count)
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("\tcodex_queues={formatted}")
 }
 
 #[cfg(test)]
