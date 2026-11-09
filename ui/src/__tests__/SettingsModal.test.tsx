@@ -1439,4 +1439,253 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     fireEvent.change(projectSelect, { target: { value: "agents" } });
     expect(screen.getByTestId("project-subpanel-agents")).toHaveStyle({ display: "flex" });
   });
+
+  it("renders per-vendor auto approval rows from auto_approval_capabilities, supports PUT updates and null reset, shows 400 errors inline, and applies WebSocket settings.updated", async () => {
+    const putBodies: Array<Record<string, unknown>> = [];
+    let nextPutError: string | null = null;
+    let currentAutoApproval: Record<string, string> = {
+      claude: "native",
+      antigravity: "native",
+      grok: "native",
+      codex: "vendor-reviewer",
+      muse: "vendor-reviewer",
+      "acme-agent": "ask-human",
+    };
+    const capabilities = {
+      claude: {
+        supported: ["native"],
+        default: "native",
+        configurable: false,
+      },
+      antigravity: {
+        supported: ["native"],
+        default: "native",
+        configurable: false,
+      },
+      grok: {
+        supported: ["native"],
+        default: "native",
+        configurable: false,
+      },
+      codex: {
+        supported: ["vendor-reviewer", "ask-human"],
+        default: "vendor-reviewer",
+        configurable: true,
+      },
+      muse: {
+        supported: ["vendor-reviewer", "ask-human"],
+        default: "vendor-reviewer",
+        configurable: true,
+      },
+      "acme-agent": {
+        supported: ["vendor-reviewer", "ask-human"],
+        default: "vendor-reviewer",
+        configurable: true,
+      },
+    };
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method || "GET").toUpperCase();
+      const parsedBody =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as Record<string, unknown>)
+          : undefined;
+
+      if (url.endsWith("/api/v1/settings") && method === "GET") {
+        return new Response(
+          JSON.stringify({
+            ...DEFAULT_HUB_SETTINGS,
+            auto_approval: currentAutoApproval,
+            auto_approval_capabilities: capabilities,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (url.endsWith("/api/v1/settings") && method === "PUT") {
+        if (parsedBody) {
+          putBodies.push(parsedBody);
+        }
+        if (nextPutError) {
+          const errText = nextPutError;
+          nextPutError = null;
+          return new Response(JSON.stringify({ error: errText }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const incomingAuto =
+          parsedBody?.auto_approval &&
+          typeof parsedBody.auto_approval === "object"
+            ? (parsedBody.auto_approval as Record<string, string | null>)
+            : {};
+        const nextAuto = { ...currentAutoApproval };
+        for (const [vendor, val] of Object.entries(incomingAuto)) {
+          if (val === null) {
+            const cap =
+              capabilities[vendor as keyof typeof capabilities];
+            nextAuto[vendor] = cap ? cap.default : "vendor-reviewer";
+          } else if (typeof val === "string") {
+            nextAuto[vendor] = val;
+          }
+        }
+        currentAutoApproval = nextAuto;
+        return new Response(
+          JSON.stringify({
+            ...DEFAULT_HUB_SETTINGS,
+            ...parsedBody,
+            auto_approval: currentAutoApproval,
+            auto_approval_capabilities: capabilities,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const settingsListeners = new Set<
+      (frame: { channel: string; event: string; data: unknown }) => void
+    >();
+    const wsClient = {
+      ...makeStubWsClient(),
+      subscribe: vi.fn(
+        (
+          channel: string,
+          cb: (frame: { channel: string; event: string; data: unknown }) => void,
+        ) => {
+          if (channel === "settings") {
+            settingsListeners.add(cb);
+          }
+          return () => {
+            settingsListeners.delete(cb);
+          };
+        },
+      ),
+    } as unknown as HubWsClient;
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        initialTab="system"
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        wsClient={wsClient}
+      />,
+    );
+
+    const vendorList = await screen.findByTestId("auto-approval-vendor-list");
+    expect(vendorList).toBeInTheDocument();
+
+    // Explanatory note mentions spending tokens and next launch or restart
+    const note = screen.getByTestId("auto-approval-note");
+    expect(note).toHaveTextContent(/spends tokens/i);
+    expect(note).toHaveTextContent(/next launch or restart/i);
+
+    // Dynamic vendor rows built from auto_approval_capabilities (including custom 'acme-agent')
+    expect(screen.getByTestId("auto-approval-row-claude")).toBeInTheDocument();
+    expect(screen.getByTestId("auto-approval-row-antigravity")).toBeInTheDocument();
+    expect(screen.getByTestId("auto-approval-row-grok")).toBeInTheDocument();
+    expect(screen.getByTestId("auto-approval-row-codex")).toBeInTheDocument();
+    expect(screen.getByTestId("auto-approval-row-muse")).toBeInTheDocument();
+    expect(screen.getByTestId("auto-approval-row-acme-agent")).toBeInTheDocument();
+
+    // Non-configurable vendors are read-only and show "native"
+    expect(screen.getByTestId("auto-approval-readonly-claude")).toHaveTextContent(
+      "native",
+    );
+    expect(
+      screen.queryByTestId("auto-approval-select-claude"),
+    ).not.toBeInTheDocument();
+
+    // Configurable vendors render a select and a reset button
+    const codexSelect = screen.getByTestId(
+      "auto-approval-select-codex",
+    ) as HTMLSelectElement;
+    expect(codexSelect.value).toBe("vendor-reviewer");
+
+    // Saving unrelated settings when no auto_approval draft change was made does not send auto_approval
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    await screen.findByTestId("settings-saved-banner");
+    expect(putBodies.length).toBe(1);
+    expect(putBodies[0]).not.toHaveProperty("auto_approval");
+    expect(putBodies[0]).not.toHaveProperty("auto_approval_capabilities");
+
+    // Change codex to ask-human and save
+    fireEvent.change(codexSelect, { target: { value: "ask-human" } });
+    expect(codexSelect.value).toBe("ask-human");
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    await screen.findByTestId("settings-saved-banner");
+
+    expect(putBodies.length).toBe(2);
+    expect(putBodies[1]).not.toHaveProperty("auto_approval_capabilities");
+    expect(putBodies[1].auto_approval).toEqual({ codex: "ask-human" });
+
+    // Reset codex to default (<vendor>: null)
+    fireEvent.click(screen.getByTestId("auto-approval-reset-codex"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(putBodies.length).toBe(3);
+    expect(putBodies[2].auto_approval).toEqual({ codex: null });
+    expect(
+      (screen.getByTestId("auto-approval-select-codex") as HTMLSelectElement)
+        .value,
+    ).toBe("vendor-reviewer");
+
+    // Saving unrelated settings after reset does not re-send { codex: null }
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    await screen.findByTestId("settings-saved-banner");
+    expect(putBodies.length).toBe(4);
+    expect(putBodies[3]).not.toHaveProperty("auto_approval");
+
+    // 400 error is displayed inline inside settings-auto-approval-section
+    nextPutError = "choice 'invalid' is not supported for vendor 'muse'";
+    fireEvent.change(screen.getByTestId("auto-approval-select-muse"), {
+      target: { value: "ask-human" },
+    });
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    const inlineErr = await screen.findByTestId("auto-approval-error");
+    expect(inlineErr).toHaveTextContent(
+      "choice 'invalid' is not supported for vendor 'muse'",
+    );
+
+    // WebSocket settings.updated event on channel "settings" updates the UI live
+    await act(async () => {
+      for (const listener of settingsListeners) {
+        listener({
+          channel: "settings",
+          event: "settings.updated",
+          data: {
+            ...DEFAULT_HUB_SETTINGS,
+            auto_approval: {
+              ...currentAutoApproval,
+              codex: "ask-human",
+              muse: "ask-human",
+            },
+            auto_approval_capabilities: capabilities,
+          },
+        });
+      }
+    });
+
+    expect(
+      (screen.getByTestId("auto-approval-select-codex") as HTMLSelectElement)
+        .value,
+    ).toBe("ask-human");
+    expect(
+      (screen.getByTestId("auto-approval-select-muse") as HTMLSelectElement)
+        .value,
+    ).toBe("ask-human");
+    expect(screen.queryByTestId("auto-approval-error")).not.toBeInTheDocument();
+  });
 });

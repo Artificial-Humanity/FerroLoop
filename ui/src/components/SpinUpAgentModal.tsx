@@ -6,12 +6,13 @@ import {
   getVendorModelOptions,
 } from "./ChatPane";
 import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
-import type {
-  EnrolledNode,
-  PermissionPosture,
-  ProjectSummary,
-  SpinUpSessionRequest,
-  SpinUpSessionResponse,
+import {
+  normalizeHydrationStatus,
+  type EnrolledNode,
+  type PermissionPosture,
+  type ProjectSummary,
+  type SpinUpSessionRequest,
+  type SpinUpSessionResponse,
 } from "../types/api";
 
 export interface SpinUpProjectOption {
@@ -858,6 +859,8 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [permissionsTouched, setPermissionsTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastSpinUpResult, setLastSpinUpResult] =
+    useState<SpinUpSessionResponse | null>(null);
 
   useEffect(() => {
     if (isOpen) {
@@ -865,6 +868,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       setPosture("auto");
       setWorktreePolicyTouched(false);
       setPermissionsTouched(false);
+      setLastSpinUpResult(null);
     }
   }, [initialProject, isOpen]);
 
@@ -952,7 +956,12 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
         const client = new HubApiClient();
         res = await client.spinUpSession(payload);
       }
-      onSpunUp?.(res);
+      const normalizedRes: SpinUpSessionResponse = {
+        ...res,
+        hydration_status: normalizeHydrationStatus(res.hydration_status),
+      };
+      setLastSpinUpResult(normalizedRes);
+      onSpunUp?.(normalizedRes);
       setPersona("");
       setModel("");
       onClose();
@@ -1857,6 +1866,48 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
             />
             <span>Supervised (Subscription Hosting)</span>
           </label>
+
+          {lastSpinUpResult && (() => {
+            const hydrationStatus = normalizeHydrationStatus(
+              lastSpinUpResult.hydration_status,
+            );
+            const isFailed = hydrationStatus === "failed";
+            const isConfirmed = hydrationStatus === "confirmed";
+            return (
+              <div
+                role={isFailed ? "status" : undefined}
+                data-testid="spin-up-hydration-status"
+                data-hydration-status={hydrationStatus}
+                data-hydration-dispatched={String(
+                  Boolean(lastSpinUpResult.hydration_dispatched),
+                )}
+                className="fd-mono"
+                style={{
+                  padding: "6px 8px",
+                  borderRadius: "4px",
+                  fontSize: "11px",
+                  border: isFailed
+                    ? "1px solid rgba(245, 158, 11, 0.45)"
+                    : isConfirmed
+                      ? "1px solid rgba(16, 185, 129, 0.4)"
+                      : "1px solid var(--border-subtle)",
+                  backgroundColor: isFailed
+                    ? "rgba(245, 158, 11, 0.14)"
+                    : isConfirmed
+                      ? "rgba(16, 185, 129, 0.12)"
+                      : "var(--bg-elevated)",
+                  color: isFailed
+                    ? "#FBBF24"
+                    : isConfirmed
+                      ? "#34D399"
+                      : "var(--text-secondary)",
+                }}
+              >
+                Hydration: <strong>{hydrationStatus}</strong> (dispatched:{" "}
+                {lastSpinUpResult.hydration_dispatched ? "true" : "false"})
+              </div>
+            );
+          })()}
 
           <div
             style={{
