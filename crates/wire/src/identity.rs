@@ -2625,6 +2625,10 @@ const MUSE_MAX_TRANSCRIPTS: usize = 2000;
 const MUSE_MAX_DEPTH: usize = 5;
 
 /// Locate the transcript file on disk for a Muse session by explicit `session_id` or `persona`.
+///
+/// When a non-empty `session_id` is supplied, only an exact session-id match is returned; it does
+/// not fall back to the newest transcript for `persona`, which may belong to another session. The
+/// `persona` mtime fallback is used only when `session_id` is `None` or empty.
 pub(crate) fn find_muse_transcript_path(
     home: &Path,
     session_id: Option<&str>,
@@ -2649,14 +2653,15 @@ pub(crate) fn find_muse_transcript_path(
     if transcripts.is_empty() {
         return None;
     }
-    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty())
-        && let Some(found) = transcripts.iter().find(|t| {
-            t.dir_session_id.as_deref() == Some(sid)
-                || t.stem == sid
-                || extract_session_id_and_cwd(&t.path, &t.stem).0 == sid
-        })
-    {
-        return Some(found.path.clone());
+    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return transcripts
+            .iter()
+            .find(|t| {
+                t.dir_session_id.as_deref() == Some(sid)
+                    || t.stem == sid
+                    || extract_session_id_and_cwd(&t.path, &t.stem).0 == sid
+            })
+            .map(|t| t.path.clone());
     }
     if let Some(norm_persona) = persona.and_then(normalize_persona) {
         transcripts.sort_by_key(|t| std::cmp::Reverse(mtime_ms(&t.path)));

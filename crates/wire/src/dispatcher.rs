@@ -1060,6 +1060,7 @@ fn deliver_to_muse_route(
                     text,
                     false,
                     Some(session_id).filter(|s| !s.trim().is_empty()),
+                    true,
                 );
             }
         }
@@ -2409,7 +2410,7 @@ pub fn host_write_text_then_enter(
     text: &str,
 ) -> Result<(), String> {
     let trimmed = text.trim();
-    let mut transcript = MuseTranscriptTracker::capture(stream.session.as_str(), None);
+    let transcript = MuseTranscriptTracker::capture(stream.session.as_str(), None, false);
     if !text.is_empty() {
         let outcome = client
             .write_raw(stream.clone(), lease, text.as_bytes().to_vec())
@@ -2432,14 +2433,19 @@ pub fn host_write_text_then_enter(
     let session_cap = stream.session.clone();
     confirm_paste_submission(
         trimmed,
-        || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
+        std::thread::sleep,
         || {
             let mut client = client_cell.borrow_mut();
             client
                 .capture_rendered(stream.clone())
-                .map(|screen| screen.contents)
+                .map(|screen| ScreenCapture::Rendered(screen.contents))
                 .ok()
-                .or_else(|| client.capture_output(session_cap.clone(), 4096).ok())
+                .or_else(|| {
+                    client
+                        .capture_output(session_cap.clone(), 4096)
+                        .ok()
+                        .map(ScreenCapture::RawFallback)
+                })
         },
         || transcript.confirmed(trimmed),
         || {
@@ -2460,17 +2466,37 @@ pub fn host_write_text_then_enter(
 /// Pause around the Enter key so the terminal can receive the paste and show its state.
 const TMUX_PASTE_SETTLE_DELAY: Duration = Duration::from_millis(50);
 const TMUX_ENTER_SETTLE_DELAY: Duration = Duration::from_millis(50);
+/// Maximum polls when no unsubmitted payload is seen in the composer (6 × 50ms = 300ms).
 const MAX_WATCH_POLLS: u32 = 6;
-const MAX_ENTER_RETRIES: u32 = 5;
+/// Backoff schedule between retry `Enter` presses while the composer still holds the pasted
+/// payload (100 + 200 + 400 + 600 + 800 + 1000 = 3100ms of backoff; with two consecutive 50ms
+/// confirmation captures per attempt, the bounded retry window is ~3.8s total).
+const ENTER_RETRY_BACKOFFS: [Duration; 6] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(600),
+    Duration::from_millis(800),
+    Duration::from_millis(1000),
+];
+const MAX_ENTER_RETRIES: u32 = ENTER_RETRY_BACKOFFS.len() as u32;
 const MAX_PAYLOAD_PROBE_CHARS: usize = 36;
 const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScreenCapture {
+    /// Current terminal screen (`CaptureRendered` or `tmux capture-pane`).
+    Rendered(String),
+    /// Raw output history tail (`CaptureOutput`) when rendered screen capture is unavailable.
+    RawFallback(String),
+}
 
 /// Paste `text` into `target` and press Enter. With `bracketed`, the paste is a tmux bracketed
 /// paste (`paste-buffer -p`), so the pane's application receives the newlines as pasted text
 /// rather than as Enter presses, and a failed Enter clears the prompt line (`C-u`) so a retry
 /// does not paste the message a second time.
 fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Result<(), String> {
-    deliver_via_tmux_paste_with_session(target, text, bracketed, None)
+    deliver_via_tmux_paste_with_session(target, text, bracketed, None, false)
 }
 
 fn deliver_via_tmux_paste_with_session(
@@ -2478,9 +2504,10 @@ fn deliver_via_tmux_paste_with_session(
     text: &str,
     bracketed: bool,
     session_id: Option<&str>,
+    is_muse_route: bool,
 ) -> Result<(), String> {
     let trimmed = text.trim();
-    let mut transcript = MuseTranscriptTracker::capture(target, session_id);
+    let transcript = MuseTranscriptTracker::capture(target, session_id, is_muse_route);
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
         && let Some((client, stream)) = resolve_live_host_session(target)
     {
@@ -2514,14 +2541,19 @@ fn deliver_via_tmux_paste_with_session(
         let session_cap = stream.session.clone();
         return confirm_paste_submission(
             trimmed,
-            || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
+            std::thread::sleep,
             || {
                 let mut client = client_cell.borrow_mut();
                 client
                     .capture_rendered(stream.clone())
-                    .map(|screen| screen.contents)
+                    .map(|screen| ScreenCapture::Rendered(screen.contents))
                     .ok()
-                    .or_else(|| client.capture_output(session_cap.clone(), 4096).ok())
+                    .or_else(|| {
+                        client
+                            .capture_output(session_cap.clone(), 4096)
+                            .ok()
+                            .map(ScreenCapture::RawFallback)
+                    })
             },
             || transcript.confirmed(trimmed),
             || {
@@ -2612,16 +2644,17 @@ fn deliver_via_tmux_paste_with_session(
         return Err(format!("tmux send-keys exited with {enter_status}"));
     }
 
-    // Poll for up to 300ms to confirm submission and retry Enter up to MAX_ENTER_RETRIES times
-    // when the composer still holds the payload (including Claude's "[Pasted Content" placeholder
-    // or Muse's inline composer box). `FL_WIRE_TMUX_BIN` (fake-tmux script tests) skips polling.
+    // Confirm submission and retry Enter with bounded backoff up to MAX_ENTER_RETRIES times
+    // when the composer still holds the payload. `FL_WIRE_TMUX_BIN` (fake-tmux script tests)
+    // skips polling. On an unconfirmed exit, clear the composer (`C-u`) so a retry does not
+    // leave the payload twice.
     if !skip_sleep {
         let tmux_cap = tmux.clone();
         let target_cap = target.to_string();
-        confirm_paste_submission(
+        if let Err(err) = confirm_paste_submission(
             trimmed,
-            || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
-            || capture_pane_tail(&tmux_cap, &target_cap),
+            std::thread::sleep,
+            || capture_pane_tail(&tmux_cap, &target_cap).map(ScreenCapture::Rendered),
             || transcript.confirmed(trimmed),
             || {
                 let status = Command::new(&tmux)
@@ -2635,17 +2668,32 @@ fn deliver_via_tmux_paste_with_session(
                 }
                 Ok(())
             },
-        )?;
+        ) {
+            let _ = Command::new(&tmux)
+                .args(["send-keys", "-t", target, "C-u"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            return Err(err);
+        }
     }
 
     Ok(())
 }
 
 /// Bounded confirmation and Enter retry loop after a paste and initial Enter.
+///
+/// Before any retry `Enter` is sent, two consecutive captures (separated by at least
+/// [`TMUX_ENTER_SETTLE_DELAY`]) must both show the payload (or `[Pasted Content` placeholder)
+/// in the composer region, preventing a double `Enter` when a vendor redraws slightly late.
+/// While the framed composer continues to hold the payload (for example, while a busy vendor
+/// finishes a turn), retry `Enter`s follow [`ENTER_RETRY_BACKOFFS`] (~3.8s total bound).
+/// On raw `CaptureOutput` fallback captures or `[Pasted Content` placeholders, at most one
+/// extra `Enter` is sent and screen text alone never concludes `"unconfirmed"`.
 fn confirm_paste_submission(
     trimmed: &str,
-    mut wait: impl FnMut(),
-    mut capture_screen: impl FnMut() -> Option<String>,
+    mut wait: impl FnMut(Duration),
+    mut capture_screen: impl FnMut() -> Option<ScreenCapture>,
     mut transcript_confirmed: impl FnMut() -> bool,
     mut send_enter: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
@@ -2654,13 +2702,16 @@ fn confirm_paste_submission(
     }
     let mut watch_polls = 0u32;
     let mut enter_retries = 0u32;
+    let mut consecutive_payload_polls = 0u32;
+    let mut consecutive_placeholder_polls = 0u32;
     let mut saw_unsubmitted_composer = false;
+    let mut pending_backoff: Option<Duration> = None;
     loop {
-        wait();
+        wait(pending_backoff.take().unwrap_or(TMUX_ENTER_SETTLE_DELAY));
         if transcript_confirmed() {
             return Ok(());
         }
-        let Some(screen) = capture_screen() else {
+        let Some(capture) = capture_screen() else {
             if !saw_unsubmitted_composer {
                 return Ok(());
             }
@@ -2673,8 +2724,22 @@ fn confirm_paste_submission(
             }
             continue;
         };
-        if composer_holds_payload(&screen, trimmed) {
+        let (screen, is_raw_fallback) = match capture {
+            ScreenCapture::Rendered(s) => (s, false),
+            ScreenCapture::RawFallback(s) => (s, true),
+        };
+        let holds_payload = composer_holds_payload(&screen, trimmed);
+        let holds_placeholder = !holds_payload && composer_shows_pasted_placeholder(&screen);
+        if holds_payload {
+            if is_raw_fallback && enter_retries >= 1 {
+                return Ok(());
+            }
             saw_unsubmitted_composer = true;
+            consecutive_payload_polls += 1;
+            consecutive_placeholder_polls = 0;
+            if consecutive_payload_polls < 2 {
+                continue;
+            }
             if enter_retries >= MAX_ENTER_RETRIES {
                 return Err(format!(
                     "prompt submission unconfirmed after {enter_retries} Enter retries: \
@@ -2682,8 +2747,21 @@ fn confirm_paste_submission(
                 ));
             }
             send_enter()?;
+            let backoff = ENTER_RETRY_BACKOFFS[enter_retries as usize];
             enter_retries += 1;
+            consecutive_payload_polls = 0;
+            pending_backoff = Some(backoff);
             continue;
+        }
+        if holds_placeholder {
+            saw_unsubmitted_composer = true;
+            consecutive_placeholder_polls += 1;
+            consecutive_payload_polls = 0;
+            if consecutive_placeholder_polls < 2 {
+                continue;
+            }
+            send_enter()?;
+            return Ok(());
         }
         if saw_unsubmitted_composer {
             return Ok(());
@@ -2691,6 +2769,8 @@ fn confirm_paste_submission(
         if composer_visibly_submitted(&screen, trimmed) {
             return Ok(());
         }
+        consecutive_payload_polls = 0;
+        consecutive_placeholder_polls = 0;
         watch_polls += 1;
         if watch_polls >= MAX_WATCH_POLLS {
             return Ok(());
@@ -2698,20 +2778,17 @@ fn confirm_paste_submission(
     }
 }
 
-/// `true` when `screen` (either rendered screen text or raw ANSI terminal output) still shows
-/// `trimmed` inside the composer input region or as a `[Pasted Content` placeholder.
+/// `true` when `screen` shows `trimmed` inside the framed composer input region at the bottom
+/// of the terminal screen.
 fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
     if trimmed.is_empty() {
         return false;
-    }
-    let cleaned = normalize_terminal_screen(screen);
-    if cleaned.contains("[Pasted Content") {
-        return true;
     }
     let probes = payload_probes(trimmed);
     if probes.is_empty() {
         return false;
     }
+    let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
     let Some((composer_lines, _top_rule)) = composer_region_lines(&lines) else {
         return false;
@@ -2728,6 +2805,35 @@ fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
         .any(|probe| composer_text.contains(probe.as_str()))
 }
 
+/// `true` when the bottom composer region shows a `[Pasted Content` bracketed-paste placeholder.
+///
+/// When the capture has horizontal rule lines, only the framed composer region at the bottom of
+/// the screen is checked (ignoring stale placeholders in scrollback). When the capture has no
+/// horizontal rules, only the last 3 non-empty lines after any assistant output marker count.
+fn composer_shows_pasted_placeholder(screen: &str) -> bool {
+    let cleaned = normalize_terminal_screen(screen);
+    if !cleaned.contains("[Pasted Content") {
+        return false;
+    }
+    let lines: Vec<&str> = cleaned.lines().collect();
+    if lines.iter().any(|l| is_horizontal_rule_line(l)) {
+        let Some((composer_lines, _)) = composer_region_lines(&lines) else {
+            return false;
+        };
+        return composer_lines.iter().any(|l| l.contains("[Pasted Content"));
+    }
+    let tail_start = lines
+        .iter()
+        .rposition(|l| line_starts_with_output_marker(l))
+        .map_or(0, |idx| idx + 1);
+    lines[tail_start..]
+        .iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .any(|l| l.contains("[Pasted Content"))
+}
+
 /// `true` when `screen` shows an empty framed composer box and the scrollback above that box
 /// already contains `trimmed`.
 fn composer_visibly_submitted(screen: &str, trimmed: &str) -> bool {
@@ -2740,7 +2846,7 @@ fn composer_visibly_submitted(screen: &str, trimmed: &str) -> bool {
     }
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
-    let Some((composer_lines, Some(top_rule))) = composer_region_lines(&lines) else {
+    let Some((composer_lines, top_rule)) = composer_region_lines(&lines) else {
         return false;
     };
     let has_empty_prompt = composer_lines.iter().any(|l| line_starts_with_prompt(l))
@@ -2849,55 +2955,81 @@ fn is_horizontal_rule_line(line: &str) -> bool {
 }
 
 fn line_starts_with_prompt(line: &str) -> bool {
-    line.trim_start().starts_with(['❯', '>'])
+    line.trim_start().starts_with(['❯', '›', '>'])
+}
+
+fn line_starts_with_output_marker(line: &str) -> bool {
+    line.trim_start().starts_with(['⏺', '◆', '●', '•', '✓'])
 }
 
 fn strip_composer_prompt_prefix(line: &str) -> &str {
     let trimmed = line.trim_start();
     trimmed
         .strip_prefix('❯')
+        .or_else(|| trimmed.strip_prefix('›'))
         .or_else(|| trimmed.strip_prefix('>'))
         .unwrap_or(trimmed)
 }
 
-/// Locate the composer lines in `lines` and, when framed by a horizontal rule, the index of the
-/// top rule line bounding the composer box.
-fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], Option<usize>)> {
+/// Locate the framed composer lines at the bottom of `lines` and the index of the top horizontal
+/// rule bounding the composer box.
+///
+/// Only the last pair of horizontal rules at the bottom of the screen qualifies, and only when the
+/// lines between them hold a prompt (`❯`, `›`, `>`) or `[Pasted Content` placeholder with no
+/// assistant/tool output markers, followed by at most a short status bar below the bottom rule.
+fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], usize)> {
     let rule_indices: Vec<usize> = lines
         .iter()
         .enumerate()
         .filter_map(|(i, line)| is_horizontal_rule_line(line).then_some(i))
         .collect();
-    if rule_indices.len() >= 2 {
-        let top = rule_indices[rule_indices.len() - 2];
-        let bottom = rule_indices[rule_indices.len() - 1];
-        let between = &lines[top + 1..bottom];
-        let after = &lines[bottom + 1..];
-        if !between.iter().any(|l| line_starts_with_prompt(l))
-            && after.iter().any(|l| line_starts_with_prompt(l))
-        {
-            return Some((after, Some(bottom)));
-        }
-        return Some((between, Some(top)));
+    if rule_indices.len() < 2 {
+        return None;
     }
-    if rule_indices.len() == 1 {
-        let top = rule_indices[0];
-        return Some((&lines[top + 1..], Some(top)));
-    }
-    let last_prompt = lines.iter().rposition(|l| line_starts_with_prompt(l))?;
-    if lines[last_prompt + 1..]
+    let top = rule_indices[rule_indices.len() - 2];
+    let bottom = rule_indices[rule_indices.len() - 1];
+    let between = &lines[top + 1..bottom];
+    let after = &lines[bottom + 1..];
+    let has_prompt_or_paste = between
         .iter()
-        .any(|l| l.trim_start().starts_with(['◆', '●', '✓']))
+        .any(|l| line_starts_with_prompt(l) || l.contains("[Pasted Content"));
+    if !has_prompt_or_paste || between.iter().any(|l| line_starts_with_output_marker(l)) {
+        return None;
+    }
+    let non_empty_after = after.iter().filter(|l| !l.trim().is_empty()).count();
+    if non_empty_after > 4
+        || after
+            .iter()
+            .any(|l| line_starts_with_output_marker(l) || line_starts_with_prompt(l))
     {
         return None;
     }
-    Some((&lines[last_prompt..], None))
+    Some((between, top))
 }
 
-/// First and last non-empty lines of `trimmed`, whitespace-collapsed and capped to
-/// [`MAX_PAYLOAD_PROBE_CHARS`] characters so terminal wrapping never splits a probe.
+/// Strip a leading FerroWire (`[fl-wire ...`) or FerroDeck (`[Operator Prompt via FerroDeck...`)
+/// delivery header line so payload probes match the message body rather than a shared sender header.
+fn strip_delivery_header(trimmed: &str) -> &str {
+    let trimmed = trimmed.trim();
+    if trimmed.starts_with("[fl-wire ") || trimmed.starts_with("[Operator Prompt via FerroDeck") {
+        if let Some((_header, rest)) = trimmed.split_once('\n') {
+            let body = rest.trim();
+            if !body.is_empty() {
+                return body;
+            }
+        }
+        if let Some((_, after_id)) = trimmed.split_once("(id: ") {
+            return after_id.trim();
+        }
+    }
+    trimmed
+}
+
+/// First and last non-empty lines of the message body in `trimmed`, whitespace-collapsed and
+/// capped to [`MAX_PAYLOAD_PROBE_CHARS`] characters so terminal wrapping never splits a probe.
 fn payload_probes(trimmed: &str) -> Vec<String> {
-    let non_empty: Vec<&str> = trimmed
+    let source = strip_delivery_header(trimmed);
+    let non_empty: Vec<&str> = source
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -2907,13 +3039,13 @@ fn payload_probes(trimmed: &str) -> Vec<String> {
     };
     let mut probes = Vec::new();
     for raw in [first, *non_empty.last().unwrap_or(&first)] {
-        let unprompted = raw
-            .strip_prefix('❯')
-            .or_else(|| raw.strip_prefix('>'))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(raw);
-        let collapsed = collapse_whitespace(unprompted);
+        let unprompted = strip_composer_prompt_prefix(raw).trim();
+        let candidate = if unprompted.is_empty() {
+            raw
+        } else {
+            unprompted
+        };
+        let collapsed = collapse_whitespace(candidate);
         let capped: String = collapsed.chars().take(MAX_PAYLOAD_PROBE_CHARS).collect();
         let probe = capped.trim().to_string();
         if !probe.is_empty() && !probes.contains(&probe) {
@@ -2924,49 +3056,36 @@ fn payload_probes(trimmed: &str) -> Vec<String> {
 }
 
 struct MuseTranscriptTracker {
-    target: String,
-    session_id: Option<String>,
     initial: Option<(PathBuf, u64)>,
 }
 
 impl MuseTranscriptTracker {
-    fn capture(target: &str, session_id: Option<&str>) -> Self {
-        let sid = session_id
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let initial = resolve_muse_transcript_for_target(target, sid.as_deref()).and_then(|path| {
-            let len = fs::metadata(&path).ok()?.len();
-            Some((path, len))
-        });
-        Self {
-            target: target.to_string(),
-            session_id: sid,
-            initial,
-        }
+    fn capture(target: &str, session_id: Option<&str>, is_muse_route: bool) -> Self {
+        let sid = session_id.map(str::trim).filter(|s| !s.is_empty());
+        let initial =
+            resolve_muse_transcript_for_target(target, sid, is_muse_route).and_then(|path| {
+                let len = fs::metadata(&path).ok()?.len();
+                Some((path, len))
+            });
+        Self { initial }
     }
 
-    fn confirmed(&mut self, trimmed: &str) -> bool {
-        let (path, initial_len) = match &self.initial {
-            Some(pair) => pair.clone(),
-            None => {
-                let Some(path) =
-                    resolve_muse_transcript_for_target(&self.target, self.session_id.as_deref())
-                else {
-                    return false;
-                };
-                self.initial = Some((path.clone(), 0));
-                (path, 0)
-            }
+    fn confirmed(&self, trimmed: &str) -> bool {
+        let Some((ref path, initial_len)) = self.initial else {
+            return false;
         };
-        let Ok(meta) = fs::metadata(&path) else {
+        let probes = payload_probes(trimmed);
+        if probes.is_empty() {
+            return false;
+        }
+        let Ok(meta) = fs::metadata(path) else {
             return false;
         };
         let len = meta.len();
         if len <= initial_len {
             return false;
         }
-        let Ok(mut file) = fs::File::open(&path) else {
+        let Ok(mut file) = fs::File::open(path) else {
             return false;
         };
         use std::io::Seek;
@@ -2983,40 +3102,60 @@ impl MuseTranscriptTracker {
             return false;
         }
         let appended = String::from_utf8_lossy(&buf);
-        if appended.contains("runtime.user_intent.accepted") {
-            return true;
-        }
-        let collapsed = collapse_whitespace(&appended);
-        payload_probes(trimmed)
-            .iter()
-            .any(|probe| collapsed.contains(probe.as_str()))
+        appended.lines().any(|line| {
+            if !line.contains("runtime.user_intent.accepted") {
+                return false;
+            }
+            let normalized = line
+                .replace("\\n", " ")
+                .replace("\\r", " ")
+                .replace("\\t", " ")
+                .replace("\\\"", "\"");
+            let collapsed = collapse_whitespace(&normalized);
+            probes
+                .iter()
+                .any(|probe| collapsed.contains(probe.as_str()))
+        })
     }
 }
 
 fn resolve_muse_transcript_for_target(
     target: &str,
     explicit_session_id: Option<&str>,
+    is_muse_route: bool,
 ) -> Option<PathBuf> {
     if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1") {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let cleaned = target.replace('=', "");
-    let persona = if let Some((first, second)) = cleaned.trim().split_once(['.', ':']) {
-        if first.eq_ignore_ascii_case("muse") {
-            normalize_persona(second)
-        } else if second.eq_ignore_ascii_case("muse") {
-            normalize_persona(first)
+    let cleaned_trimmed = cleaned.trim();
+    let explicit_muse_persona =
+        if let Some((first, second)) = cleaned_trimmed.split_once(['.', ':']) {
+            if first.eq_ignore_ascii_case("muse") {
+                normalize_persona(second)
+            } else if second.eq_ignore_ascii_case("muse") {
+                normalize_persona(first)
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        normalize_persona(&cleaned).filter(|p| p != "muse")
-    };
-    let mut session_id = explicit_session_id
+        };
+    let session_id_arg = explicit_session_id
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    if !is_muse_route && session_id_arg.is_none() && explicit_muse_persona.is_none() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let persona = explicit_muse_persona.or_else(|| {
+        (is_muse_route && !cleaned_trimmed.contains(['.', ':']))
+            .then(|| normalize_persona(cleaned_trimmed))
+            .flatten()
+            .filter(|p| p != "muse")
+    });
+    let mut session_id = session_id_arg;
     if session_id.is_none() {
         #[cfg(not(test))]
         let route_path = std::env::var_os("FL_WIRE_ROUTES")
@@ -3044,8 +3183,8 @@ fn resolve_muse_transcript_for_target(
                         ..
                     } = &entry.route
                         && !sid.trim().is_empty()
-                        && (tmux_target.as_deref() == Some(cleaned.trim())
-                            || tmux_pane.as_deref() == Some(cleaned.trim()))
+                        && (tmux_target.as_deref() == Some(cleaned_trimmed)
+                            || tmux_pane.as_deref() == Some(cleaned_trimmed))
                     {
                         session_id = Some(sid.trim().to_string());
                         break;
@@ -8065,16 +8204,7 @@ exit 1"#,
                                     }
                                 }
                                 ExtensionRequest::Write { bytes, .. } => {
-                                    let mut w = writes.lock().unwrap();
-                                    if bytes.as_slice() == b"\r"
-                                        && w.iter().any(|prev| prev.as_slice() == b"\r")
-                                    {
-                                        paste.store(false, Ordering::SeqCst);
-                                        if let Ok(contents) = &mut *rendered.lock().unwrap() {
-                                            *contents = String::new();
-                                        }
-                                    }
-                                    w.push(bytes.into_vec());
+                                    writes.lock().unwrap().push(bytes.into_vec());
                                     ExtensionResponse::Input {
                                         outcome: SendOutcome::Written,
                                     }
@@ -8145,7 +8275,6 @@ exit 1"#,
         // Old daemons lack the rendered capability; pipe sessions refuse it with WrongMode.
         // Both must still use the raw capture to decide whether another Enter is needed.
         for refusal in [ExtensionRefusal::Unsupported, ExtensionRefusal::WrongMode] {
-            show_paste.store(true, Ordering::SeqCst);
             *rendered.lock().unwrap() = Err(refusal);
             assert_eq!(
                 run("long", true),
@@ -9155,8 +9284,15 @@ exit 1"#,
             &format!("history\n❯ {prompt}\n{rule}\n❯ \n{rule}\nstatus"),
             prompt,
         ));
-        // Unframed prompt line at bottom vs followed by turn-progress marker.
-        assert!(composer_holds_payload(
+
+        // False-positive checks for Claude, Codex, and Grok:
+        // 1. Unframed Claude history ("> payload" followed by "⏺ reply" or unframed prompt)
+        // must never match composer_holds_payload.
+        assert!(!composer_holds_payload(
+            &format!("previous output\n> {prompt}\n⏺ I am here and ready."),
+            prompt,
+        ));
+        assert!(!composer_holds_payload(
             &format!("previous output\n❯ {prompt}"),
             prompt,
         ));
@@ -9164,6 +9300,291 @@ exit 1"#,
             &format!("❯ {prompt}\n◆ Running command · git status"),
             prompt,
         ));
+
+        // 2. Codex "›" prompt is recognized inside a bottom framed composer, but rejected in
+        // unframed history or below a single horizontal rule.
+        assert!(composer_holds_payload(
+            &format!("• Ran cargo test\n{rule}\n› {prompt}\n{rule}\n  gpt-5.4 · 85% context left"),
+            prompt,
+        ));
+        assert!(!composer_holds_payload(
+            &format!("› {prompt}\n• Ran cargo test\n{rule}\n› \n{rule}\n  gpt-5.4"),
+            prompt,
+        ));
+        assert!(composer_visibly_submitted(
+            &format!("› {prompt}\n• Ran cargo test\n{rule}\n› \n{rule}\n  gpt-5.4"),
+            prompt,
+        ));
+        assert!(!composer_holds_payload(
+            &format!("{rule}\n› {prompt}\n• Working..."),
+            prompt,
+        ));
+
+        // 3. Grok / single-rule screens or framed history above assistant output must not match.
+        assert!(!composer_holds_payload(
+            &format!("Grok 4\n{rule}\n> {prompt}\nThinking..."),
+            prompt,
+        ));
+        assert!(!composer_holds_payload(
+            &format!("{rule}\n> {prompt}\n{rule}\n⏺ Assistant output after earlier box\n> "),
+            prompt,
+        ));
+
+        // 4. Stale "[Pasted Content" marker in scrollback above an empty framed composer must not
+        // trigger composer_shows_pasted_placeholder, whereas a marker inside the bottom composer does.
+        assert!(!composer_shows_pasted_placeholder(&format!(
+            "❯ [Pasted Content 42 chars]\n⏺ Processed.\n{rule}\n❯ \n{rule}\nstatus"
+        )));
+        assert!(composer_shows_pasted_placeholder(&format!(
+            "⏺ Ready.\n{rule}\n❯ [Pasted Content 42 chars]\n{rule}\nstatus"
+        )));
+        assert!(!composer_shows_pasted_placeholder(
+            "> [Pasted Content 42 chars]\n⏺ Handled that paste already."
+        ));
+    }
+
+    #[test]
+    fn late_redraw_does_not_send_extra_enter() {
+        let rule = "─".repeat(80);
+        let prompt = "Hello Melisandre. Are you there?";
+        let unsubmitted = format!("◆ Ready.\n{rule}\n❯ {prompt}\n{rule}\n  muse-wonder-full-1.0");
+        let submitted = format!("◆ Ready.\n❯ {prompt}\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0");
+
+        let mut polls = 0u32;
+        let mut retry_enters = 0u32;
+        let mut waits = Vec::new();
+        confirm_paste_submission(
+            prompt,
+            |d| waits.push(d),
+            || {
+                polls += 1;
+                if polls == 1 {
+                    // Poll 1: vendor has not redrawn yet; payload is still in composer.
+                    Some(ScreenCapture::Rendered(unsubmitted.clone()))
+                } else {
+                    // Poll 2: vendor finished redrawing after the initial Enter; composer is clear.
+                    Some(ScreenCapture::Rendered(submitted.clone()))
+                }
+            },
+            || false,
+            || {
+                retry_enters += 1;
+                Ok(())
+            },
+        )
+        .expect("late redraw on poll 2 must confirm without extra Enter");
+
+        assert_eq!(
+            retry_enters, 0,
+            "single poll showing payload followed by redraw must not send a retry Enter"
+        );
+        assert_eq!(polls, 2);
+        assert_eq!(
+            waits,
+            vec![TMUX_ENTER_SETTLE_DELAY, TMUX_ENTER_SETTLE_DELAY]
+        );
+    }
+
+    #[test]
+    fn non_muse_targets_skip_transcript_scan_and_cache_failed_lookup() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        // Create a Muse transcript whose persona matches a non-Muse target name ("fay" / "claudette").
+        let session_dir = home
+            .join(".local/share/muse/sessions")
+            .join("2026/11/09/session-fay");
+        fs::create_dir_all(&session_dir).unwrap();
+        let transcript_path = session_dir.join("session.jsonl");
+        fs::write(
+            &transcript_path,
+            "{\"session_id\":\"session-fay\",\"cwd\":\"/tmp\"}\n\
+             {\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{\"model_messages\":[{\"role\":\"user\",\"content\":\"AGENT_PERSONA=fay fl wire register Fay\"}]}}\n",
+        )
+        .unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+
+        // Non-Muse routes (`is_muse_route == false`) with Claude/Codex/lemonade targets must not
+        // resolve or scan Muse transcripts.
+        for non_muse_target in ["Fay.lemonade", "fay", "Feira.antigravity", "%12"] {
+            let tracker = MuseTranscriptTracker::capture(non_muse_target, None, false);
+            assert!(
+                tracker.initial.is_none(),
+                "non-Muse target {non_muse_target} must not bind a Muse transcript"
+            );
+            assert!(!tracker.confirmed("any prompt"));
+        }
+
+        // Explicit Muse target or `is_muse_route == true` DOES resolve the transcript.
+        let muse_tracker = MuseTranscriptTracker::capture("muse.fay", None, false);
+        assert_eq!(
+            muse_tracker.initial.as_ref().map(|(p, _)| p),
+            Some(&transcript_path)
+        );
+
+        // And `find_muse_transcript_path` with an explicit non-matching `session_id` returns `None`
+        // rather than falling back to the persona's newest transcript from another session.
+        assert_eq!(
+            crate::identity::find_muse_transcript_path(
+                &home,
+                Some("other-session-uuid"),
+                Some("fay")
+            ),
+            None
+        );
+        assert_eq!(
+            crate::identity::find_muse_transcript_path(&home, Some("session-fay"), Some("fay")),
+            Some(transcript_path)
+        );
+    }
+
+    #[test]
+    fn mail_body_probes_and_transcript_confirmation_require_matching_payload() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let store = MemStore::default();
+
+        let mut msg1 = mail_to(&store, "melisandre");
+        msg1.sender_name = "ferris".into();
+        msg1.subject = "status check".into();
+        msg1.body = "First mail body from Ferris".into();
+
+        let mut msg2 = mail_to(&store, "melisandre");
+        msg2.sender_name = "ferris".into();
+        msg2.subject = "status check".into();
+        msg2.body = "Second mail body with distinct question".into();
+
+        let formatted1 = format_push_message(&msg1);
+        let formatted2 = format_push_message(&msg2);
+
+        let probes2 = payload_probes(&formatted2);
+        assert_eq!(
+            probes2,
+            vec!["Second mail body with distinct quest".to_string()],
+            "mail probes must be built from the message body after the [fl-wire ...] header"
+        );
+
+        let rule = "─".repeat(80);
+        // Composer holding msg1 must NOT match msg2 even though both share the same sender header.
+        let composer_with_msg1 = format!("◆ Ready.\n{rule}\n❯ {formatted1}\n{rule}\nstatus");
+        assert!(!composer_holds_payload(&composer_with_msg1, &formatted2));
+
+        // Composer holding msg2 DOES match msg2.
+        let composer_with_msg2 = format!("◆ Ready.\n{rule}\n❯ {formatted2}\n{rule}\nstatus");
+        assert!(composer_holds_payload(&composer_with_msg2, &formatted2));
+
+        // Scrollback containing msg1 above an empty composer must NOT count as visibly submitted for msg2.
+        let scrollback_with_msg1 = format!("❯ {formatted1}\n{rule}\n❯ \n{rule}\nstatus");
+        assert!(!composer_visibly_submitted(
+            &scrollback_with_msg1,
+            &formatted2
+        ));
+        let scrollback_with_msg2 = format!("❯ {formatted2}\n{rule}\n❯ \n{rule}\nstatus");
+        assert!(composer_visibly_submitted(
+            &scrollback_with_msg2,
+            &formatted2
+        ));
+
+        // Transcript confirmation must ignore an unrelated `runtime.user_intent.accepted` event
+        // and confirm only when an accepted intent appended after capture matches msg2's probe.
+        let home = tmp.path().join("home");
+        let transcript_dir = home.join(".local/share/muse/sessions/sid-mail-test");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join("session.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":{:?}}}}}\n",
+                formatted1
+            ),
+        )
+        .unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+
+        let tracker =
+            MuseTranscriptTracker::capture("muse:melisandre", Some("sid-mail-test"), true);
+        assert!(tracker.initial.is_some());
+        // Pre-existing msg1 before capture does not confirm msg2.
+        assert!(!tracker.confirmed(&formatted2));
+
+        // Appending an unrelated accepted intent after capture still does not confirm msg2.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        writeln!(
+            f,
+            "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":\"unrelated user prompt\"}}}}"
+        )
+        .unwrap();
+        assert!(!tracker.confirmed(&formatted2));
+
+        // Appending a non-accepted log line containing msg2's text does not confirm msg2.
+        writeln!(
+            f,
+            "{{\"payload_type\":\"tui.draft.updated\",\"payload\":{{\"text\":{:?}}}}}",
+            formatted2
+        )
+        .unwrap();
+        assert!(!tracker.confirmed(&formatted2));
+
+        // Appending `runtime.user_intent.accepted` carrying msg2's body confirms submission.
+        writeln!(
+            f,
+            "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":{:?}}}}}",
+            formatted2
+        )
+        .unwrap();
+        assert!(tracker.confirmed(&formatted2));
+    }
+
+    #[test]
+    fn confirm_paste_submission_backoff_schedule_and_raw_fallback_safety() {
+        let rule = "─".repeat(80);
+        let prompt = "Council vote on petition P4";
+        let stuck_composer =
+            format!("◆ Ready.\n{rule}\n❯ {prompt}\n{rule}\n  muse-wonder-full-1.0");
+
+        // 1. Rendered screen keeping payload in composer across all 6 retries follows the full
+        // multi-second backoff schedule (>3.5s simulated time) and then returns Err.
+        let mut waits = Vec::new();
+        let mut retries = 0u32;
+        let err = confirm_paste_submission(
+            prompt,
+            |d| waits.push(d),
+            || Some(ScreenCapture::Rendered(stuck_composer.clone())),
+            || false,
+            || {
+                retries += 1;
+                Ok(())
+            },
+        )
+        .expect_err("rendered composer holding payload across all retries must return Err");
+        assert!(err.contains("unconfirmed"), "got {err}");
+        assert_eq!(retries, MAX_ENTER_RETRIES);
+        let total_wait: Duration = waits.iter().copied().sum();
+        assert!(
+            total_wait >= Duration::from_millis(3500),
+            "expected multi-second total retry window (>=3.5s), got {total_wait:?} ({waits:?})"
+        );
+
+        // 2. Raw fallback capture (`CaptureOutput`) with persistent payload or placeholder sends at
+        // most 1 retry Enter and returns Ok(()), never concluding "unconfirmed" from raw history.
+        let mut raw_retries = 0u32;
+        confirm_paste_submission(
+            prompt,
+            |_| {},
+            || Some(ScreenCapture::RawFallback(stuck_composer.clone())),
+            || false,
+            || {
+                raw_retries += 1;
+                Ok(())
+            },
+        )
+        .expect("raw fallback must never return unconfirmed from screen text alone");
+        assert_eq!(raw_retries, 1);
     }
 
     #[test]
@@ -9176,7 +9597,7 @@ exit 1"#,
         };
         use std::os::unix::fs::PermissionsExt;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9218,12 +9639,17 @@ exit 1"#,
             "◆ Hydration complete.\n\n❯ Council vote on petition P4\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0 · busy"
         );
 
+        // Vendor stays busy for 1.2s after the initial Enter, ignoring early retry Enters while
+        // the pasted payload sits in the composer, then accepts the next retry Enter once idle.
+        let busy_window = Duration::from_millis(1200);
         let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let captures = Arc::new(AtomicUsize::new(0));
-        let enter_writes = Arc::new(AtomicUsize::new(0));
+        let first_enter_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let submitted = Arc::new(AtomicBool::new(false));
         let writes_srv = Arc::clone(&writes);
         let captures_srv = Arc::clone(&captures);
-        let enters_srv = Arc::clone(&enter_writes);
+        let first_enter_srv = Arc::clone(&first_enter_at);
+        let submitted_srv = Arc::clone(&submitted);
         let ep_srv = endpoint.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -9245,7 +9671,8 @@ exit 1"#,
                     let summary = summary.clone();
                     let writes = Arc::clone(&writes_srv);
                     let captures = Arc::clone(&captures_srv);
-                    let enters = Arc::clone(&enters_srv);
+                    let first_enter_at = Arc::clone(&first_enter_srv);
+                    let submitted = Arc::clone(&submitted_srv);
                     let busy_screen = busy_screen.clone();
                     let buffered_composer_screen = buffered_composer_screen.clone();
                     let submitted_screen = submitted_screen.clone();
@@ -9272,7 +9699,16 @@ exit 1"#,
                                 }
                                 ExtensionRequest::Write { bytes, .. } => {
                                     if bytes.as_slice() == b"\r" {
-                                        enters.fetch_add(1, Ordering::SeqCst);
+                                        let mut guard = first_enter_at.lock().unwrap();
+                                        match *guard {
+                                            None => {
+                                                *guard = Some(Instant::now());
+                                            }
+                                            Some(start) if start.elapsed() >= busy_window => {
+                                                submitted.store(true, Ordering::SeqCst);
+                                            }
+                                            Some(_) => {}
+                                        }
                                     }
                                     writes.lock().unwrap().push(bytes.into_vec());
                                     ExtensionResponse::Input {
@@ -9281,15 +9717,15 @@ exit 1"#,
                                 }
                                 ExtensionRequest::CaptureRendered { stream } => {
                                     let poll_idx = captures.fetch_add(1, Ordering::SeqCst);
-                                    let contents = if enters.load(Ordering::SeqCst) >= 2 {
+                                    let contents = if submitted.load(Ordering::SeqCst) {
                                         submitted_screen.clone()
                                     } else if poll_idx == 0 {
                                         // Poll 0: vendor is still finishing its turn; buffered
                                         // paste has not rendered in the composer yet.
                                         busy_screen.clone()
                                     } else {
-                                        // Poll 1+: turn finished and buffered paste flushed into
-                                        // the composer waiting for a retry Enter.
+                                        // Poll 1+: pasted prompt sits in the composer while the
+                                        // vendor finishes its multi-second busy window.
                                         buffered_composer_screen.clone()
                                     };
                                     ExtensionResponse::RenderedCapture {
@@ -9331,17 +9767,21 @@ exit 1"#,
         let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
         let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
 
+        let started = Instant::now();
         deliver_via_tmux_paste_opts("muse.melisandre", "Council vote on petition P4", false)
-            .expect("busy vendor flushing paste on poll 2 must be retried and confirmed");
-        assert_eq!(
-            writes.lock().unwrap().clone(),
-            vec![
-                b"Council vote on petition P4".to_vec(),
-                b"\r".to_vec(),
-                b"\r".to_vec(),
-            ]
+            .expect("busy vendor keeping paste in composer across >1.2s window must be retried and confirmed");
+        assert!(
+            started.elapsed() >= busy_window,
+            "delivery must span the multi-second busy window"
         );
-        assert!(captures.load(Ordering::SeqCst) >= 3);
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(recorded[0], b"Council vote on petition P4".to_vec());
+        // Initial CR + multiple backoff retries before the 1.2s busy window elapsed.
+        assert!(
+            recorded.len() >= 5 && recorded[1..].iter().all(|w| w.as_slice() == b"\r"),
+            "expected initial CR plus multiple backoff retry CRs across busy window, got {recorded:?}"
+        );
+        assert!(submitted.load(Ordering::SeqCst));
 
         let _ = stop_tx.send(());
         server_thread.join().unwrap();
