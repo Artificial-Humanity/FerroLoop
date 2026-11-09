@@ -7,6 +7,7 @@ pub mod catalog;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 pub mod freeze;
+pub mod project_paths;
 pub mod registry;
 pub mod sync;
 pub mod vendor;

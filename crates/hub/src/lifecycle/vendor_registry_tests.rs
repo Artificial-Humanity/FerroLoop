@@ -438,7 +438,11 @@ fn remodel_accepts_a_custom_vendor_as_target_and_as_source() {
     spin(&store, &env, "ada", "claude").unwrap();
     let out = remodel(&store, &env, "claude:ada", &custom).unwrap();
     assert_eq!(out.session_id, format!("{custom}:ada"));
-    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("project AGENTS.md unavailable"))
+    );
     // The custom id, hyphenated, is read back as the source of the next remodel, and a failed
     // remodel can be restored onto it.
     let target = SessionTarget::resolve(&store, &format!("{custom}:ada"), None).unwrap();

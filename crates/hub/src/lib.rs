@@ -18,6 +18,7 @@ mod direct_quota;
 pub mod discovery;
 mod doctor_api;
 pub mod github_pr;
+mod hydration;
 pub mod lifecycle;
 mod mcp_api;
 pub mod nodes;
@@ -4215,7 +4216,7 @@ mod tests {
         // No live route exists, so nothing took the hydration prompt.
         assert_eq!(out["hydration_dispatched"], false);
         assert!(out["prompt"].as_str().unwrap().starts_with(
-            "Take the name of Felicity and take up residence in FerroLoop/ as the assistant."
+            "Take the name of Felicity and take up residence in the unresolved project context as the assistant."
         ));
 
         {
@@ -5040,7 +5041,7 @@ mod tests {
             out["prompt"]
                 .as_str()
                 .unwrap()
-                .contains("take up residence in FerroLoop/")
+                .contains("--project FerroLoop")
         );
         let second = restart(Some("owner-tok-secret"), "claude:bob")
             .json_value()
@@ -5105,7 +5106,7 @@ mod tests {
         assert!(expected.contains("Co-authored-by: Felicia <felicia@artificialhumanity.io>"));
         assert!(
             api::canonical_reforge_prompt("Journalist", "ferroloop", "journalist")
-                .contains(".agents/roles/journalist.md")
+                .contains("Missing guidance: role file not found")
         );
 
         state.enqueue_session_prompt(

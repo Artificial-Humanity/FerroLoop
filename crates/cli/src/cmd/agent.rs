@@ -790,6 +790,9 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                     out.hydration_dispatched,
                     out.hydration_status
                 );
+                for warning in &out.warnings {
+                    eprintln!("warning: {warning}");
+                }
             }
             Ok(())
         }
