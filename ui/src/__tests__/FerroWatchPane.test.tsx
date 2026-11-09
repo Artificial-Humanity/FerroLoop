@@ -1628,4 +1628,139 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
       Element.prototype.scrollIntoView = origScrollIntoView;
     }
   });
+
+  it("renders plain-text hydration warnings when present and omits them when empty or absent on remodel actions (#419)", async () => {
+    const summaryData = makeSampleWatchSummary();
+    let nextRemodelWarnings: string[] | undefined = undefined;
+
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.includes("/api/v1/watch/summary")) {
+          return json(summaryData);
+        }
+        if (url.endsWith("/api/v1/hosted-sessions")) {
+          return json({ sessions: [] });
+        }
+        if (url.includes("/api/v1/sessions/") && url.endsWith("/remodel") && method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          return json({
+            mode: body.mode ?? "execute",
+            session_id: "codex:feira",
+            previous_session_id: "claude:feira",
+            persona: "feira",
+            project: "FerroLoop",
+            role: "assistant",
+            from_vendor: "claude",
+            vendor: body.vendor ?? "codex",
+            model: body.model ?? "gpt-5.4",
+            node_id: "local",
+            hosted: true,
+            cwd: "/workspace/FerroLoop",
+            status: "running",
+            handshake_dispatched: true,
+            hydration_dispatched: true,
+            hydration_status: "confirmed",
+            runtime_stopped: true,
+            tmux_target: "feira.codex:0.0",
+            prompt: "remodel prompt",
+            handoff: "remodel-feira",
+            ...(nextRemodelWarnings !== undefined
+              ? { warnings: nextRemodelWarnings }
+              : {}),
+          });
+        }
+        return json({});
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const onAfterRemodel = vi.fn();
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        onAfterRemodel={onAfterRemodel}
+      />,
+    );
+
+    await screen.findByTestId("ferrowatch-pane-title");
+
+    // --- Remodel action: absent (undefined), empty ([]), and present warnings ---
+    const agentSelect = screen.getByTestId("watch-remodel-agent-select");
+    fireEvent.change(agentSelect, { target: { value: "feira" } });
+
+    // 1. Remodel with absent warnings (undefined)
+    nextRemodelWarnings = undefined;
+    fireEvent.click(screen.getByTestId("watch-remodel-submit-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("watch-remodel-status")).toHaveTextContent(
+        /Remodeled feira: claude → codex/i,
+      );
+    });
+    expect(onAfterRemodel).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        persona: "feira",
+        hydration_status: "confirmed",
+        warnings: [],
+      }),
+    );
+    expect(
+      screen.queryByTestId("watch-remodel-warnings"),
+    ).not.toBeInTheDocument();
+
+    // 2. Remodel with empty warnings ([])
+    nextRemodelWarnings = [];
+    fireEvent.click(screen.getByTestId("watch-remodel-submit-btn"));
+
+    await waitFor(() => {
+      expect(onAfterRemodel).toHaveBeenCalledTimes(2);
+    });
+    expect(
+      screen.queryByTestId("watch-remodel-warnings"),
+    ).not.toBeInTheDocument();
+
+    // 3. Remodel with present warnings (including HTML-like string)
+    nextRemodelWarnings = [
+      "role file not found: looked in /workspace/.agents/roles/assistant.md",
+      "<script>alert('xss')</script> cwd is outside project ferroloop",
+    ];
+    fireEvent.click(screen.getByTestId("watch-remodel-submit-btn"));
+
+    const remodelWarningsList = await screen.findByTestId(
+      "watch-remodel-warnings",
+    );
+    expect(remodelWarningsList).toHaveAttribute("role", "status");
+    const remodelWarningItems = screen.getAllByTestId(
+      "watch-remodel-warning-item",
+    );
+    expect(remodelWarningItems).toHaveLength(2);
+    expect(remodelWarningItems[0]).toHaveTextContent(
+      "role file not found: looked in /workspace/.agents/roles/assistant.md",
+    );
+    expect(remodelWarningItems[1].textContent).toBe(
+      "<script>alert('xss')</script> cwd is outside project ferroloop",
+    );
+    expect(remodelWarningItems[1].querySelector("script")).toBeNull();
+    // Remodel status still reads as succeeded
+    expect(screen.getByTestId("watch-remodel-status")).toHaveTextContent(
+      /Remodeled feira: claude → codex/i,
+    );
+    expect(
+      screen.getByTestId("watch-remodel-hydration-status"),
+    ).toHaveAttribute("data-hydration-status", "confirmed");
+
+    unmount();
+  });
 });

@@ -5,6 +5,7 @@ import {
   codexSendNowReceipt,
   isPromptDeliveryFailure,
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   promptDeliveryStatus,
   type ClearSessionMode,
   type DecommissionMode,
@@ -1087,6 +1088,8 @@ export interface ChatPaneProps {
   hydrationStatus?: HydrationStatus | null;
   /** Whether the startup/remodel hydration prompt was handed to the vendor adapter. */
   hydrationDispatched?: boolean;
+  /** Ephemeral hydration guidance warnings from the most recent spin-up, restart, or remodel response. */
+  hydrationWarnings?: string[];
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
@@ -1176,6 +1179,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   executionMode,
   hydrationStatus,
   hydrationDispatched,
+  hydrationWarnings,
   sessionId,
   turns,
   contextUsage = null,
@@ -2944,6 +2948,45 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </button>
         </div>
       </div>
+
+      {(() => {
+        const normalizedHydrationWarnings =
+          normalizeHydrationWarnings(hydrationWarnings);
+        if (normalizedHydrationWarnings.length === 0) {
+          return null;
+        }
+        return (
+          <div
+            role="status"
+            data-testid="session-hydration-warnings"
+            className="fd-mono"
+            style={{
+              backgroundColor: "rgba(245, 158, 11, 0.14)",
+              borderBottom: "1px solid rgba(245, 158, 11, 0.45)",
+              color: "#FBBF24",
+              padding: "6px clamp(8px, 1.4vw, 14px)",
+              fontSize: "11px",
+              flexShrink: 0,
+            }}
+          >
+            <ul
+              style={{
+                margin: 0,
+                paddingLeft: "18px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "2px",
+              }}
+            >
+              {normalizedHydrationWarnings.map((warning, idx) => (
+                <li key={idx} data-testid="session-hydration-warning-item">
+                  {warning}
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })()}
 
       {/* Docked "Since Your Last Prompt" Activity Bar */}
       {sinceLastPrompt && (

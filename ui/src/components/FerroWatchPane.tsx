@@ -5,6 +5,7 @@ import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_WATCH_THRESHOLDS,
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   type AgentRecord,
   type DiscoveredSessionSummary,
   type HostedSessionSummary,
@@ -713,6 +714,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     useState<HydrationStatus | null>(null);
   const [remodelHydrationDispatched, setRemodelHydrationDispatched] =
     useState<boolean | null>(null);
+  const [remodelWarnings, setRemodelWarnings] = useState<string[]>([]);
   const [remodelError, setRemodelError] = useState<string | null>(null);
   const remodelControlsRef = useRef<HTMLDivElement | null>(null);
   const remodelAgentSelectRef = useRef<HTMLSelectElement | null>(null);
@@ -1154,6 +1156,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     setRemodelStatus(null);
     setRemodelHydrationStatus(null);
     setRemodelHydrationDispatched(null);
+    setRemodelWarnings([]);
     setRemodelError(null);
     try {
       const res = await apiClient.remodelSession(remodelTarget.trim(), {
@@ -1163,12 +1166,15 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         mode: remodelMode,
       });
       const hydrationStatus = normalizeHydrationStatus(res.hydration_status);
+      const warnings = normalizeHydrationWarnings(res.warnings);
       const normalizedRes: RemodelSessionResponse = {
         ...res,
         hydration_status: hydrationStatus,
+        warnings,
       };
       setRemodelHydrationStatus(hydrationStatus);
       setRemodelHydrationDispatched(Boolean(res.hydration_dispatched));
+      setRemodelWarnings(warnings);
       setRemodelStatus(
         res.mode === "prepare"
           ? `Prepared handoff for ${res.persona} → ${res.vendor} (${res.session_id}).`
@@ -2403,6 +2409,32 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     </span>
                   )}
                 </div>
+              )}
+
+              {remodelWarnings.length > 0 && (
+                <ul
+                  role="status"
+                  data-testid="watch-remodel-warnings"
+                  className="fd-mono"
+                  style={{
+                    margin: 0,
+                    padding: "6px 8px 6px 22px",
+                    borderRadius: "4px",
+                    fontSize: "11px",
+                    border: "1px solid rgba(245, 158, 11, 0.45)",
+                    backgroundColor: "rgba(245, 158, 11, 0.14)",
+                    color: "#FBBF24",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "2px",
+                  }}
+                >
+                  {remodelWarnings.map((warning, idx) => (
+                    <li key={idx} data-testid="watch-remodel-warning-item">
+                      {warning}
+                    </li>
+                  ))}
+                </ul>
               )}
 
               {remodelError && (
