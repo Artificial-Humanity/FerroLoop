@@ -33,7 +33,7 @@ The Council's chosen contract rules out an uncoordinated live file copy and a
 project manifest export. A copy may mix generations; `export_manifest` covers a
 project definition, not the entire store and its recovery state.
 
-Fiona proposes serializing an immutable committed engine state captured by the
+Fiona proposes serializing an immutable published engine state captured by the
 owner into a fresh standalone image, using existing snapshot/container primitives
 where their invariants fit. A second option is a physical copy under a barrier
 held for the entire copy. It can be correct but delays writers for storage I/O
@@ -172,9 +172,14 @@ read. Measure bounded retry behavior without reissuing external effects.
 
 ## 2. Backup contract and state machine
 
-A successful artifact is one recoverable store at committed sequence **S**.
+A successful artifact is one self-consistent recoverable store at published
+sequence **S**, observed under the existing commit barrier and current-file lock.
 S is the store commit sequence, not a WAL byte offset, superblock epoch, MQ topic
-sequence or wall-clock time. Recovery point is the last completed verified backup.
+sequence or wall-clock time. S includes all commits acknowledged before the capture
+cut. Before P1 single ownership, it may also include an external publication whose
+writer reported failed sync: its outcome is unknown even though live openers can
+already see it. Capture does not claim to exclude such writes. Recovery point is
+the last completed verified backup.
 No point-in-time recovery, zero media-failure loss, or multi-store atomic cut is
 promised. A backup set carries a vector of per-store identities/sequences and
 cross-store dependencies; global consistency needs coordinated quiescence or an
@@ -185,12 +190,16 @@ explicit reconciliation plan.
    source/destination aliases. Allocate a bounded operation with cancellation,
    deadline, byte/memory/disk quotas and one concurrent backup per physical store.
    Destination space must cover the image, verification copy, metadata and margin.
-2. **Capture.** On the physical owner, reject poisoned or outcome-unknown source
-   state. Capture a refreshed immutable state plus S under the correct commit
-   barrier, after prior acknowledged commits are durable. Bind all logical hashes
-   and expected query results to this same captured state. Later writes may proceed
-   only after the pin is independent of mutable live structures. If that property
-   cannot be proved, hold a bounded copy barrier or refuse; never mix separately
+2. **Capture.** On the physical owner, reject poison or outcome-unknown state
+   on the capturing handle. Refresh and pin the immutable published state plus S
+   under the existing commit barrier and current-file lock, including all commits
+   acknowledged before the capture cut. A healthy handle cannot detect another
+   opener's failed-sync outcome from its own poison status (engine hazard #456);
+   record that exclusion proof is unavailable before single ownership. Do not
+   add a source fsync or engine/schema/persistent-poison change. Bind all logical
+   hashes and expected query results to this same captured state. Later writes may
+   proceed only after the pin is independent of mutable live structures. If that
+   property cannot be proved, hold a bounded copy barrier or refuse; never mix separately
    sampled “current” collections. Preserve documents, tables, vector data/config,
    metadata and committed receipts. Do not force memory-only MQ data into the
    source as a side effect: report non-durable/ephemeral exclusions explicitly.
@@ -221,11 +230,13 @@ explicit reconciliation plan.
 
 Current multiple-opener behavior complicates “owner-side.” A service-local mutex
 alone is insufficient. The capture seam must refresh under the engine's existing
-cross-process commit lock and pin one immutable committed state across all writers,
-including group commit and sync publication; fixture tests must prove it. If this
-cannot be established before P1, P0's recovery operation is available only under
-explicit administrative quiescence of every physical opener. No claim of enforced
-single ownership is made. Offline restore always requires quiescence.
+cross-process current-file lock and pin one immutable published state across all
+writers, including group commit and sync publication; fixture tests must prove it.
+If pin independence cannot be established before P1, P0's recovery operation is
+available only under explicit administrative quiescence of every physical opener.
+Quiescence alone cannot prove exclusion of historical external outcome-unknown
+writes; this amendment adds no quiescence requirement. No claim of enforced single
+ownership is made. Offline restore always requires quiescence.
 
 Existing serialization, private-file and durability primitives are candidates for
 reuse; `compact_disk`'s live rename, epoch changes and cleanup policy are not the
@@ -239,12 +250,15 @@ quarantined by operation ID, never swept using a broad pattern over live paths.
 The versioned manifest records: backup operation ID; catalog store identity and
 available intrinsic lineage; source alias map digest; format/container, snapshot
 and application schema versions (absence is explicit); engine/feature bits;
-source committed sequence; capture/publication times; creator and verifier build
-identities; image length and SHA-256; checksums of each retained configuration and
-validation member; logical content digest and validation profile version; per-store
+source published sequence; typed `external_publish_status`; capture/publication
+times; creator and verifier build identities; image length and SHA-256; checksums
+of each retained configuration and validation member; logical content digest and validation profile version; per-store
 reference dependencies; exclusions; and separate local/independent-copy status.
-The report must bind to this exact image digest. Checksums detect corruption, not
-malicious substitution: protect the catalog and storage access; any signed manifest
+Every pre-P1 capture records
+`ExternalPublishStatus::ExclusionUnprovenBeforeSingleOwnership` in both the image
+descriptor and manifest. This typed enum reports unavailable exclusion proof, not
+a detected failed write. The report must bind to this exact image digest. Checksums
+detect corruption, not malicious substitution: protect the catalog and storage access; any signed manifest
 or encrypted off-host copy requires an explicit key/recovery policy.
 
 Verification compares the restored copy with expectations computed from the pin:
@@ -319,6 +333,8 @@ report lexical-only degraded readiness separately from full index readiness.
    vendor-side effects against the restored horizon before enabling dispatch.
    Receipts newer than S may have been lost while their effects occurred: mark
    outcome-unknown and reconcile; never blindly replay or promise exactly-once.
+   Images that may include outcome-unknown writes retain explicit unknown outcomes;
+   no automatic resend is allowed, and existing effect reconciliation is required.
 6. Rebind confirmed aliases, rebuild derived indexes within budgets, run readiness
    checks and resume admission. Keep an audit record of selected backup, data-loss
    horizon, reconciliation decisions and rollback point. Any unresolved identity,
