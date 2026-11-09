@@ -40,13 +40,36 @@ contract, not an unattended-progress guarantee. List/capture and containment
 cleanup must remain responsive during the stall. ReliablePipe also intentionally
 stalls with an active cursor that cannot progress. Neither mode fabricates ACKs.
 
-The flood regression exposed a LegacyPipe catch-up admission bug: records
-published after subscription could be treated as fresh overflow when replaying
-the backlog, shedding a progressing reader. Admission now distinguishes a new
-publication from a later catch-up pass. A deterministic module test crosses that
-boundary and then verifies that a genuinely full live queue still marks its
-subscriber slow. Terminal-slot limits and never-written byte retention remain
+LegacyPipe admission distinguishes a fresh publication from a catch-up pass.
+The first fresh record refused by a subscriber's 64-record / 2 MiB queue starts
+one second of overflow grace. Deferred records stay in the existing shared
+backlog, so a brief producer burst can drain losslessly. Successful writes do not
+renew the episode: it resets only after the queue falls below both 32 records
+and 1 MiB and its cursors have caught up to the published records. A permanently
+slower consumer can still be shed.
+
+The shared 4096-record / 8 MiB limit takes priority over grace. Capacity pressure
+ends affected subscribers' graces immediately; held references stay charged
+until released, and bytes nobody wrote remain retained. Pressure from one session
+can end an unfiltered subscriber's grace, even when it also follows other sessions.
+The existing LegacyPipe producer pacing remains: each record yields for at most
+20 ms while a subscriber is backlogged, without holding fanout/order locks or
+waiting on socket I/O. Grace applies in addition to this bounded pacing; there is
+no unbounded subscriber wait. A shed viewer gets a best-effort `SlowSubscriber`
+notice and disconnect; the notice can be its first frame, and it does not receive
+a fabricated complete stream. Notice
+and data writes share an absolute cutoff of grace expiry plus the existing
+five-second transport timeout (or pressure-triggered shedding plus that timeout).
+Fragmentation and the notice cannot restart this allowance. Terminal-slot
+refusals remain immediate. PTY, ReliablePipe journal and capture behavior are
 unchanged.
+
+Injected-clock module tests cover burst reconstruction, nonrenewing episodes,
+expiry without another publication, both capacity limits, multiple subscribers,
+and the notice/fragment disconnect cutoff, including expiry during the final write
+with an empty queue. A deterministic reader-like 16,384-record flood verifies that
+bounded pacing preserves a slower draining subscriber's exact sequence. The
+original unattended flood subprocess regression remains unchanged.
 
 ## Build identity and device truth
 
