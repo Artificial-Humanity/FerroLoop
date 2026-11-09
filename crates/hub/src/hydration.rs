@@ -233,12 +233,24 @@ fn regular_file(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok().filter(|p| p.is_file())
 }
 
+#[cfg(test)]
 pub(crate) fn render(
+    context: Context,
+    name: &str,
+    project: &str,
+    role: &str,
+    guidance: RoleGuidance<'_>,
+) -> HydrationPrompt {
+    render_with_generation(context, name, project, role, guidance, None)
+}
+
+pub(crate) fn render_with_generation(
     mut context: Context,
     name: &str,
     project: &str,
     role: &str,
     guidance: RoleGuidance<'_>,
+    generation: Option<&str>,
 ) -> HydrationPrompt {
     let residence = context
         .project
@@ -315,6 +327,10 @@ pub(crate) fn render(
         (dirs.len() == 1).then(|| regular_file(&dirs[0].join("STATE.md"))).flatten()
     }).map(|path| format!("Optional legacy reference: skim `{}`; FerroState wins wherever the two disagree. Do not require it.\n", path.display())).unwrap_or_default();
     let name_lower = name.to_ascii_lowercase();
+    let register_env = match generation.map(str::trim).filter(|g| !g.is_empty()) {
+        Some(g) => format!("AGENT_PERSONA={name_lower} AGENT_HYDRATION_GENERATION={g}"),
+        None => format!("AGENT_PERSONA={name_lower}"),
+    };
     let scope = crate::api::project_state_scope(project);
     let render_scopes = if scope == "workspace" {
         "--scope workspace".into()
@@ -330,7 +346,7 @@ pub(crate) fn render(
          4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state handoff get --scope {scope} --key {name_lower}` for your own latest handoff (if it reports none, `fl state handoff get --scope {scope}` reads the shared `current` handoff), and `fl state search \"<query>\"` to look up anything specific.\n\
          {legacy}\
          5. Re-register your active session route so FerroWire and FerroDeck track this fresh session:\n\
-         ```bash\nAGENT_PERSONA={name_lower} fl wire register {name} --project {project} --role {role} --replace\n```\n\
+         ```bash\n{register_env} fl wire register {name} --project {project} --role {role} --replace\n```\n\
          6. Check and acknowledge any pending FerroWire messages:\n\
          ```bash\nAGENT_PERSONA={name_lower} fl wire read --ack\n```\n\n\
          Identity summary: `{name}` | Co-author trailer: `Co-authored-by: {name} <{name_lower}@artificialhumanity.io>`"

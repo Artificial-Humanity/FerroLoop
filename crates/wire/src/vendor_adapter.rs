@@ -459,9 +459,26 @@ pub fn launch_env_for_vendor(
     persona: &str,
     home: Option<&Path>,
 ) -> Vec<(String, String)> {
+    launch_env_for_vendor_with_generation(vendor, persona, home, None)
+}
+
+/// Same as [`launch_env_for_vendor`], plus `AGENT_HYDRATION_GENERATION=<G>` for per-session CLI
+/// vendors (omitted for `codex`, which shares one `codex app-server` daemon across sessions).
+pub fn launch_env_for_vendor_with_generation(
+    vendor: &str,
+    persona: &str,
+    home: Option<&Path>,
+    hydration_generation: Option<&str>,
+) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if vendor != "codex" {
         env.push(("AGENT_PERSONA".into(), persona.into()));
+        if let Some(generation) = hydration_generation
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+        {
+            env.push(("AGENT_HYDRATION_GENERATION".into(), generation.into()));
+        }
     }
     if vendor == "muse" {
         env.push(("MUSE_NO_AUTO_UPDATE".into(), "1".into()));

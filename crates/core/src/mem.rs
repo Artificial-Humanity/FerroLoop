@@ -1671,6 +1671,26 @@ impl StateStore for MemStore {
         Ok(s.state_entries.get(&resolved).cloned())
     }
 
+    fn delete_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<bool, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let key = (scope.as_wire(), concern.as_wire().to_string(), slug);
+        let mut s = self.inner.borrow_mut();
+        let Some(id) = s.state_by_key.remove(&key) else {
+            return Ok(false);
+        };
+        let resolved = StateId(s.resolve(id.iri()));
+        s.state_entries.remove(&id);
+        s.state_entries.remove(&resolved);
+        s.state_conflicts.remove(&id);
+        s.state_conflicts.remove(&resolved);
+        Ok(true)
+    }
+
     fn list_state(
         &self,
         scope: Option<&StateScope>,

@@ -799,6 +799,12 @@ pub trait StateStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<Option<StateEntry>, StoreError>;
+    fn delete_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<bool, StoreError>;
     fn list_state(
         &self,
         scope: Option<&StateScope>,
