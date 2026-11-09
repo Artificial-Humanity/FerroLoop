@@ -783,11 +783,12 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
                 println!(
-                    "{}\t{}\t{}\thydration_dispatched={}",
+                    "{}\t{}\t{}\thydration_dispatched={}\thydration_status={}",
                     out.session_id,
                     out.status,
                     out.tmux_target.as_deref().unwrap_or("-"),
-                    out.hydration_dispatched
+                    out.hydration_dispatched,
+                    out.hydration_status
                 );
             }
             Ok(())
@@ -902,12 +903,13 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 }
             } else {
                 println!(
-                    "{}\t{}\t{}\thydration_dispatched={}\tremodeled_from={}",
+                    "{}\t{}\t{}\thydration_dispatched={}\tremodeled_from={}\thydration_status={}",
                     out.session_id,
                     out.status,
                     out.tmux_target.as_deref().unwrap_or("-"),
                     out.hydration_dispatched,
-                    out.previous_session_id
+                    out.previous_session_id,
+                    out.hydration_status
                 );
                 for warning in &out.warnings {
                     eprintln!("warning: {warning}");

@@ -1,4 +1,4 @@
-# Hydration outcome (Issue 383 D2b) — proposed design
+# Hydration outcome (Issue 383 D2b) — approved design
 
 Status: Ferris approved the small truthful-status scope on 2026-11-09, with the
 compatibility correction below. Implement after D2a, as a separate PR.
@@ -72,9 +72,31 @@ instruction, not that it completed the rest of hydration.
 ## Delivery boundary
 
 Implement A after D2a. Keep the new field additive and retain the existing boolean
-behavior for compatibility. In the PR, create and link a follow-up issue for
-confirmation. Evaluate registration from the launched session, fenced by launch
-generation, as one candidate signal; route discovery alone is insufficient. Do
+behavior for compatibility. Link existing follow-up
+[#406](https://github.com/Artificial-Humanity/FerroLoop/issues/406) for eventual
+confirmation; do not create a duplicate. Evaluate registration from the launched
+session, fenced by launch generation, as one candidate signal; route discovery
+alone is insufficient. Do
 not add the callback, fencing mechanism or new acknowledgement command here.
 Felix owns FerroDeck presentation after this PR merges. No live launches, service
 changes or trust-config writes are part of this work.
+
+## Implemented interfaces
+
+`HydrationStatus::{Confirmed, Unconfirmed, Failed}` uses serde snake-case values
+and defaults to `Unconfirmed`. `HostedSessionRecord`, `SpinUpResponse` and
+`RemodelResponse` carry a defaulted `hydration_status: HydrationStatus` immediately
+after `hydration_dispatched`; `RestartResponse` exposes it through its flattened
+record. Missing legacy fields never derive confirmation from the old boolean.
+
+The private `HydrationOutcome { dispatched: bool, status: HydrationStatus }`
+keeps handoff and acceptance separate. Typed dispatch retains `NotConnected` for
+safe rediscovery and classifies `Failed` as ambiguous. Prepare-only remodels and
+adopted records have no hydration acceptance evidence and remain unconfirmed;
+an attempted hydration with no route is failed. Restart and remodel execution
+replace earlier confirmation with the current submission's evidence.
+
+Human CLI output appends `hydration_status=<value>` after the existing fields.
+Private-host black-box fixtures cover both an interactive dialog and delayed
+initialization, including progression after release without an acknowledgement.
+Ordinary fresh launches remain unconfirmed until the signal tracked by #406 exists.

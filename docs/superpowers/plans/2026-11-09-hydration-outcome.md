@@ -33,7 +33,9 @@ integrating main, and leave host addressing to her branch.
 ### Task 1: Additive hydration status through lifecycle and CLI
 
 **Files:** Modify `crates/hub/src/lifecycle.rs`, `crates/cli/src/cmd/agent.rs`,
-and `crates/cli/tests/agent_lifecycle.rs`. Keep unit fixtures inline in lifecycle.
+`crates/cli/tests/agent_lifecycle.rs` and `crates/cli/tests/host_lifecycle.rs`.
+Keep unit fixtures inline in lifecycle; reuse the private-host black-box fixture
+for dialog and delayed-start subprocess scenarios.
 Update existing record literals in other test modules only as required. Consume
 existing wire typed outcomes; do not change dispatcher behavior.
 
@@ -44,34 +46,49 @@ SpinUpResponse and RemodelResponse (RestartResponse already contains the record)
 Use a private outcome carrying both `dispatched: bool` and `status` so existing
 callers cannot accidentally derive the boolean from confirmation.
 
-- [ ] Add failing serialization tests: missing field defaults to unconfirmed even
+- [x] Add failing serialization tests: missing field defaults to unconfirmed even
       with legacy boolean true; each status round-trips using the exact strings.
-- [ ] Add failing lifecycle tests for live dialog and delayed startup fixtures:
+- [x] Add failing lifecycle tests for live dialog and delayed startup fixtures:
       legacy dispatched remains true when handed off, new status is unconfirmed,
       and delivery count is one. Known immediate exit reports false/failed.
-- [ ] Add failing delivery tests: AppServerAccepted for the exact submission is
+- [x] Add failing delivery tests: AppServerAccepted for the exact submission is
       confirmed; VendorQueued, TransportAccepted and CompactionAccepted are
       unconfirmed; no route/NotConnected are failed; ambiguous Failed is
       unconfirmed. An ambiguous error or accepted queue never triggers resend.
       Keep existing rediscovery retry only for proven NotConnected.
-- [ ] Add restart/remodel coverage showing previous confirmation does not survive
+- [x] Add restart/remodel coverage showing previous confirmation does not survive
       into a new attempt, including the no-runtime/non-spawned path.
-- [ ] Observe focused test failures, then implement the enum, fields and private
+- [x] Observe focused test failures, then implement the enum, fields and private
       outcome. Preserve boolean results and ordinary intent. Use existing typed
       dispatch instead of flattening success/errors to strings too early; never
       infer acceptance from PID, argv, echo, route discovery or idle status.
-- [ ] Expose status in CLI JSON and append a `hydration_status=<value>` field to
+- [x] Expose status in CLI JSON and append a `hydration_status=<value>` field to
       human-readable spin-up/remodel output without reordering existing fields.
       Update black-box assertions and test legacy record decoding.
-- [ ] Run focused lifecycle/CLI checks, then `cargo test --workspace`,
+- [x] Run focused lifecycle/CLI checks, then `cargo test --workspace`,
       `cargo clippy --all-targets --workspace -- -D warnings`,
       `cargo fmt --all --check`, and `git diff --check`. Private fixtures must
       create their own prerequisites and pass in CI without live sockets.
-- [ ] Commit with Fiona coauthor trailer, verify clean worktree and return exact
-      commit and validation evidence. Fresh independent task and branch review.
-- [ ] Link existing follow-up [#406](https://github.com/Artificial-Humanity/FerroLoop/issues/406)
+- [x] Commit with Fiona coauthor trailer, verify clean worktree and return exact
+      commit and validation evidence.
+- [ ] Fresh independent task and whole-branch review (coordinator).
+- [x] Link existing follow-up [#406](https://github.com/Artificial-Humanity/FerroLoop/issues/406)
       for eventual confirmation and generation-fenced registration; do not create
-      a duplicate. Explain in the PR
-      that ordinary fresh launches remain unconfirmed until such a signal exists.
+      a duplicate.
+- [ ] Explain in the PR that ordinary fresh launches remain unconfirmed until
+      such a signal exists.
 - [ ] Open a separate PR with `fl github pr create`, request Ferris exact-head
       review and merge only after current-head approval and green CI.
+
+## Implementation verification (2026-11-09)
+
+- Behavioral RED: four lifecycle tests and two private-host dialog/initialization
+  tests failed on the absent status field before implementation.
+- Focused GREEN: six lifecycle tests, fourteen CLI lifecycle tests and fourteen
+  private-host lifecycle tests passed.
+- `cargo test --workspace`: 6,647 passed, 0 failed, 33 ignored.
+- `cargo clippy --all-targets --workspace -- -D warnings`,
+  `cargo fmt --all --check` and `git diff --check`: exit 0.
+- Evidence logs: `scratch/ferroloop/fiona-383-artifacts/d2b-*` in the umbrella
+  workspace (private artifacts, outside this repository), including exit codes.
+- Independent review and publication remain pending with the coordinator.
