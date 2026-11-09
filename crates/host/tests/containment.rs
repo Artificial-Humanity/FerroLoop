@@ -2456,3 +2456,62 @@ fn unmarked_and_invalid_hosted_id_keep_leader_exited_past_grace() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn unix_child_inherits_unblocked_default_sigpipe() {
+    let (_dir, endpoint) = harness();
+    let host = open_host(&endpoint);
+
+    let report_spec = spec("sigpipe-report-pipe", &["report"]);
+    let session = host.spawn(&report_spec).expect("spawn report");
+    let value = report_value(&stdout_text(&session));
+    assert_eq!(
+        value["sigpipe_blocked"],
+        serde_json::Value::Bool(false),
+        "sigpipe-report-pipe inherited blocked SIGPIPE: {value}"
+    );
+    let exit = session.wait_leader(Duration::from_secs(5)).expect("leader");
+    assert_eq!(exit.code, Some(0));
+
+    let shell_spec = SpawnSpec {
+        session: SessionId::new("sigpipe-default-sh").expect("session"),
+        kind: SpawnKind::Pipe,
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'READY\\n'; kill -PIPE $$".into(),
+        ],
+        cwd: std::env::temp_dir(),
+        env: BTreeMap::new(),
+        env_allow: BTreeSet::new(),
+    };
+    let shell = host.spawn(&shell_spec).expect("spawn sh");
+    let exit = shell
+        .wait_leader(Duration::from_secs(5))
+        .expect("sh leader");
+    assert_eq!(
+        exit.code, None,
+        "expected SIGPIPE termination, got {exit:?}"
+    );
+    assert_eq!(exit.signal, Some(libc::SIGPIPE));
+
+    let pipeline_spec = SpawnSpec {
+        session: SessionId::new("sigpipe-pipeline-sh").expect("session"),
+        kind: SpawnKind::Pipe,
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "yes x | head -c 16 >/dev/null".into(),
+        ],
+        cwd: std::env::temp_dir(),
+        env: BTreeMap::new(),
+        env_allow: BTreeSet::new(),
+    };
+    let pipeline = host.spawn(&pipeline_spec).expect("spawn pipeline");
+    let exit = pipeline
+        .wait_leader(Duration::from_secs(5))
+        .expect("pipeline leader");
+    assert_eq!(exit.code, Some(0));
+    assert_eq!(exit.signal, None);
+}
