@@ -1693,6 +1693,37 @@ fn execute_register(
     extra_areas: Option<String>,
     replace: bool,
 ) -> Result<i32, (i32, String)> {
+    let caller_generation = std::env::var("AGENT_HYDRATION_GENERATION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let hosted_id = std::env::var("FL_HOSTED_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    execute_register_with_hydration_env(
+        env,
+        name,
+        project,
+        role,
+        extra_areas,
+        replace,
+        caller_generation.as_deref(),
+        hosted_id.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_register_with_hydration_env(
+    env: &StateEnv<'_>,
+    name: String,
+    project: String,
+    role: String,
+    extra_areas: Option<String>,
+    replace: bool,
+    caller_generation: Option<&str>,
+    hosted_id: Option<&str>,
+) -> Result<i32, (i32, String)> {
     let parsed_role = parse_role_selector(&role).map_err(|e| (1, e.to_string()))?;
     let extras: Vec<String> = extra_areas
         .as_deref()
@@ -1705,9 +1736,32 @@ fn execute_register(
         })
         .unwrap_or_default();
     let by = name.trim().to_ascii_lowercase();
+    let env_persona = std::env::var("AGENT_PERSONA")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let persona_mismatch = env_persona
+        .as_deref()
+        .is_some_and(|p| !p.eq_ignore_ascii_case(&by))
+        || hosted_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some_and(|hid| {
+                let Some((vendor, hid_persona)) = hid.split_once(':') else {
+                    return true;
+                };
+                vendor.trim().is_empty() || !hid_persona.trim().eq_ignore_ascii_case(&by)
+            });
+    let caller_generation = if persona_mismatch {
+        None
+    } else {
+        caller_generation
+    };
     let store = env
         .open_for_scope(Some(&StateScope::Workspace))
         .map_err(|e| (1, e))?;
+    fl_hub::lifecycle::fence_hydration_register(&store, &by, caller_generation)
+        .map_err(|msg| (1, msg))?;
     let existing = if replace {
         store.agent_by_name(&by).map_err(|e| (1, e.to_string()))?
     } else {
@@ -1742,6 +1796,15 @@ fn execute_register(
                         )
                     },
                 )?;
+            }
+            if let Err(e) = fl_hub::lifecycle::record_hydration_ack(
+                &store,
+                &rec.name_key,
+                replace,
+                caller_generation,
+                hosted_id,
+            ) {
+                eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
             }
             let all_active = store.list_agents(None, false).unwrap_or_default();
             let mgr = reports_to(&rec, &all_active);
@@ -2306,11 +2369,13 @@ pub(crate) mod tests {
         HOOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    const HOOK_ENV_VARS: [&str; 16] = [
+    const HOOK_ENV_VARS: [&str; 18] = [
         "HOME",
         "XDG_RUNTIME_DIR",
         "AGENT_PERSONA",
         "AGENT_NAME",
+        "AGENT_HYDRATION_GENERATION",
+        "FL_HOSTED_ID",
         "FL_WIRE_ROUTES",
         "FL_WIRE_SOCKET",
         "FL_WIRE_DISABLE_HOST_DISCOVERY",
@@ -3116,5 +3181,368 @@ pub(crate) mod tests {
             &replaced_entry.route,
             VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-2"
         ));
+    }
+
+    #[test]
+    fn hooks_discovery_and_resolve_caller_never_write_hydration_ack_receipts_and_stale_register_is_refused()
+     {
+        let rig = HookRig::new(Some("feira"));
+        let dir = &rig.dir;
+        let db = dir.path().join("hydration-fence.redb");
+        let sock = dir.path().join("wire.sock");
+        let cfg = Config {
+            wire: Some(WireConfig {
+                socket: Some(sock),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = StateEnv {
+            explicit_db: Some(&db),
+            default_store: &db,
+            cfg: &cfg,
+            cwd: dir.path(),
+        };
+
+        let g1 = fl_hub::lifecycle::next_hydration_generation();
+        // Seed a running hosted session with generation g1 and register Feira.
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Feira".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: now_at(),
+                    by: "feira".into(),
+                })
+                .unwrap();
+            let rec = fl_hub::lifecycle::HostedSessionRecord {
+                session_id: "codex:feira".into(),
+                persona: "feira".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                vendor: "codex".into(),
+                model: None,
+                thinking_level: None,
+                node_id: "local".into(),
+                hosted: true,
+                status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                restart_policy: "on-failure".into(),
+                restart_count: 0,
+                tmux_target: Some("Feira:codex".into()),
+                host_session_id: Some("Feira.codex".into()),
+                cwd: None,
+                context_window: None,
+                posture: fl_core::permissions::Posture::Auto,
+                hydration_dispatched: true,
+                hydration_status: fl_hub::lifecycle::HydrationStatus::Unconfirmed,
+                hydration_generation: Some(g1.clone()),
+                runtime_spawned: true,
+                tombstone_ids: Vec::new(),
+                vendor_session_id: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                decommission_prepared_at_ms: None,
+            };
+            fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+        }
+
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores env vars on drop.
+        unsafe {
+            std::env::set_var("AGENT_PERSONA", "feira");
+            std::env::set_var("AGENT_HYDRATION_GENERATION", &g1);
+            std::env::set_var("CODEX_THREAD_ID", "thread-feira-live");
+        }
+
+        // Item 3: vendor hooks, resolve_caller_with_source, and read --ack never write hydration-ack-*.
+        let _ = vendor_hook_response(&env, Some("claude"), r#"{"session_id":"s-1"}"#);
+        let _ = resolve_caller_with_source(&env, None, None);
+        let _ = execute_read(
+            &env,
+            WireFilter {
+                recipient: Some("feira".into()),
+                unread_only: true,
+                thread_id: None,
+                correlation_id: None,
+                limit: None,
+            },
+            true,
+        );
+        {
+            use fl_core::StateStore;
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let acks: Vec<_> = store
+                .list_state(
+                    Some(&StateScope::Workspace),
+                    Some(fl_core::state::StateConcern::Runtime),
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|e| {
+                    e.slug
+                        .starts_with(fl_hub::lifecycle::HYDRATION_ACK_SLUG_PREFIX)
+                })
+                .collect();
+            assert!(
+                acks.is_empty(),
+                "hooks, resolve_caller_with_source, and read --ack must never write hydration-ack-*: {acks:?}"
+            );
+            let session = fl_hub::lifecycle::find_hosted_session(&store, &["codex:feira"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                session.hydration_status,
+                fl_hub::lifecycle::HydrationStatus::Unconfirmed
+            );
+        }
+
+        // Explicit `fl wire register ... --replace` with g1 writes hydration-ack-<g1> and confirms.
+        assert_eq!(
+            execute_register_with_hydration_env(
+                &env,
+                "Feira".into(),
+                "ferroloop".into(),
+                "assistant".into(),
+                None,
+                true,
+                Some(&g1),
+                None,
+            )
+            .unwrap(),
+            0
+        );
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let session = fl_hub::lifecycle::find_hosted_session(&store, &["codex:feira"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                session.hydration_status,
+                fl_hub::lifecycle::HydrationStatus::Confirmed
+            );
+        }
+
+        // Advance the session record to g2 (g1 < g2).
+        let g2 = fl_hub::lifecycle::next_hydration_generation();
+        assert!(g1 < g2);
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let mut rec = fl_hub::lifecycle::find_hosted_session(&store, &["codex:feira"])
+                .unwrap()
+                .unwrap();
+            rec.hydration_status = fl_hub::lifecycle::HydrationStatus::Unconfirmed;
+            rec.hydration_generation = Some(g2.clone());
+            fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+        }
+
+        // Stale generation g1 must be refused before touching agent registry, route table, or receipts.
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK`.
+        unsafe {
+            std::env::set_var("CODEX_THREAD_ID", "thread-feira-stale-zombie");
+        }
+        let err = execute_register_with_hydration_env(
+            &env,
+            "Feira".into(),
+            "ferroloop".into(),
+            "lead".into(),
+            None,
+            true,
+            Some(&g1),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 1);
+        assert_eq!(
+            err.1,
+            format!(
+                "registration refused for `feira`: session launch generation `{g1}` was superseded by a newer launch; this process should exit"
+            )
+        );
+        let routes_after_stale = RouteTable::load(Some(&rig.routes_path()));
+        let route_entry = routes_after_stale.get("feira").expect("route preserved");
+        assert!(matches!(
+            &route_entry.route,
+            VendorRoute::Codex { thread_id, .. } if thread_id == "thread-feira-live"
+        ));
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let agent = store.agent_by_name("feira").unwrap().unwrap();
+            assert_eq!(
+                agent.role,
+                AgentRole::Assistant,
+                "stale register must not mutate agent role"
+            );
+        }
+
+        // Registration without AGENT_HYDRATION_GENERATION is not subject to generation fencing.
+        assert_eq!(
+            execute_register_with_hydration_env(
+                &env,
+                "Feira".into(),
+                "ferroloop".into(),
+                "assistant".into(),
+                None,
+                true,
+                None,
+                None,
+            )
+            .unwrap(),
+            0
+        );
+
+        // I1: Inherited token for `feira` (via AGENT_PERSONA=feira or FL_HOSTED_ID=claude:feira)
+        // must not fence or write a receipt when registering a different persona `Kacey`, even
+        // when `Kacey` has a decommissioned record or a newer generation.
+        {
+            use fl_core::StateStore;
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let kacey_decom = fl_hub::lifecycle::HostedSessionRecord {
+                session_id: "claude:kacey".into(),
+                persona: "kacey".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                vendor: "claude".into(),
+                model: None,
+                thinking_level: None,
+                node_id: "local".into(),
+                hosted: true,
+                status: fl_hub::lifecycle::STATUS_DECOMMISSIONED.into(),
+                restart_policy: "on-failure".into(),
+                restart_count: 0,
+                tmux_target: Some("Kacey:claude".into()),
+                host_session_id: Some("Kacey.claude".into()),
+                cwd: None,
+                context_window: None,
+                posture: fl_core::permissions::Posture::Auto,
+                hydration_dispatched: true,
+                hydration_status: fl_hub::lifecycle::HydrationStatus::Unconfirmed,
+                hydration_generation: None,
+                runtime_spawned: false,
+                tombstone_ids: Vec::new(),
+                vendor_session_id: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                decommission_prepared_at_ms: None,
+            };
+            fl_hub::lifecycle::persist_hosted_session(&store, &kacey_decom, "owner").unwrap();
+            assert_eq!(
+                execute_register_with_hydration_env(
+                    &env,
+                    "Kacey".into(),
+                    "ferroloop".into(),
+                    "assistant".into(),
+                    None,
+                    true,
+                    Some(&g1),
+                    None,
+                )
+                .unwrap(),
+                0
+            );
+            let mut kacey_newer = kacey_decom;
+            kacey_newer.status = fl_hub::lifecycle::STATUS_RUNNING.into();
+            kacey_newer.hydration_generation = Some(g2.clone());
+            fl_hub::lifecycle::persist_hosted_session(&store, &kacey_newer, "owner").unwrap();
+            // Even if AGENT_PERSONA is unset, FL_HOSTED_ID=claude:feira prevents fencing Kacey.
+            unsafe {
+                std::env::remove_var("AGENT_PERSONA");
+            }
+            assert_eq!(
+                execute_register_with_hydration_env(
+                    &env,
+                    "Kacey".into(),
+                    "ferroloop".into(),
+                    "assistant".into(),
+                    None,
+                    true,
+                    Some(&g1),
+                    Some("claude:feira"),
+                )
+                .unwrap(),
+                0
+            );
+            unsafe {
+                std::env::set_var("AGENT_PERSONA", "feira");
+            }
+            let kacey_acks = store
+                .list_state(
+                    Some(&StateScope::Workspace),
+                    Some(fl_core::state::StateConcern::Runtime),
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|e| {
+                    e.slug
+                        .starts_with(fl_hub::lifecycle::HYDRATION_ACK_SLUG_PREFIX)
+                })
+                .filter(|e| {
+                    let fl_core::state::StatePayload::Runtime(rt) = &e.payload else {
+                        return false;
+                    };
+                    serde_json::from_value::<fl_hub::lifecycle::HydrationReceipt>(rt.value.clone())
+                        .is_ok_and(|r| r.persona.eq_ignore_ascii_case("kacey"))
+                })
+                .count();
+            assert_eq!(
+                kacey_acks, 0,
+                "no hydration receipt may be written for kacey"
+            );
+        }
+
+        // 70 consecutive restart cycles on the real store prune stale hydration-ack-* entries
+        // so at most 1 receipt exists at any time, and 0 remain after decommission.
+        {
+            use fl_core::StateStore;
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let mut rec = fl_hub::lifecycle::find_hosted_session(&store, &["codex:feira"])
+                .unwrap()
+                .unwrap();
+            for i in 0..70 {
+                let g = fl_hub::lifecycle::next_hydration_generation();
+                rec.restart_count = i + 1;
+                rec.hydration_status = fl_hub::lifecycle::HydrationStatus::Unconfirmed;
+                rec.hydration_generation = Some(g.clone());
+                fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+                assert!(
+                    fl_hub::lifecycle::record_hydration_ack(&store, "feira", true, Some(&g), None)
+                        .unwrap()
+                );
+            }
+            let ack_count = store
+                .list_state(
+                    Some(&StateScope::Workspace),
+                    Some(fl_core::state::StateConcern::Runtime),
+                )
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.slug
+                        .starts_with(fl_hub::lifecycle::HYDRATION_ACK_SLUG_PREFIX)
+                })
+                .count();
+            assert_eq!(ack_count, 1);
+
+            rec.status = fl_hub::lifecycle::STATUS_DECOMMISSIONED.into();
+            rec.hydration_generation = None;
+            fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+            let ack_count_after = store
+                .list_state(
+                    Some(&StateScope::Workspace),
+                    Some(fl_core::state::StateConcern::Runtime),
+                )
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.slug
+                        .starts_with(fl_hub::lifecycle::HYDRATION_ACK_SLUG_PREFIX)
+                })
+                .count();
+            assert_eq!(ack_count_after, 0);
+        }
     }
 }

@@ -1271,33 +1271,20 @@ fn explicit_hosted_owner<'a>(spec: &SpawnSpec, env: &'a [(String, String)]) -> O
 }
 
 #[cfg(unix)]
-fn write_if_pollout(fd: libc::c_int, bytes: &[u8]) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    // SAFETY: one pollfd with zero timeout so an unresponsive or full stderr pipe
-    // never blocks status draining or epoch retirement, without mutating fd flags.
-    if unsafe { libc::poll(&mut pfd, 1, 0) } > 0
-        && (pfd.revents & libc::POLLOUT) != 0
-        && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) == 0
-    {
-        let _ = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        true
-    } else {
-        false
+fn emit_hosted_cleanup_notice_unix(
+    session: &Session,
+    direct_children: usize,
+    sink: &mut dyn std::io::Write,
+) {
+    if direct_children == 0 {
+        return;
     }
-}
-
-#[cfg(unix)]
-fn emit_hosted_cleanup_notice_unix(session: &Session, descendants: usize) {
     use std::io::Write;
     let mut raw = [0u8; 256];
     let mut cursor = std::io::Cursor::new(raw.as_mut_slice());
     if writeln!(
         cursor,
-        "fl-host: hosted session {} (epoch {}) armed post-leader-exit cleanup after {}ms (descendants={descendants})",
+        "fl-host: hosted session {} (epoch {}) armed post-leader-exit cleanup after {}ms (direct_children={direct_children})",
         session.session.as_str(),
         session.epoch,
         HOSTED_LEADER_EXIT_GRACE.as_millis(),
@@ -1307,11 +1294,22 @@ fn emit_hosted_cleanup_notice_unix(session: &Session, descendants: usize) {
         return;
     }
     let len = cursor.position() as usize;
-    let _ = write_if_pollout(libc::STDERR_FILENO, &raw[..len]);
+    let _ = sink.write_all(&raw[..len]);
 }
 
 #[cfg(unix)]
-fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
+fn unix_status(status: File, session: Arc<Session>, host: Arc<HostInner>) {
+    let mut sink = NonBlockingStderrSink;
+    unix_status_log(status, session, host, &mut sink);
+}
+
+#[cfg(unix)]
+fn unix_status_log(
+    mut status: File,
+    session: Arc<Session>,
+    host: Arc<HostInner>,
+    sink: &mut dyn std::io::Write,
+) {
     while let Ok(Some(line)) = child::unix::read_line_blocking(&mut status) {
         let Ok(message) = protocol::from_line::<protocol::SupervisorMsg>(&line) else {
             continue;
@@ -1336,9 +1334,9 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
                     adopted,
                 });
             }
-            protocol::SupervisorMsg::HostedLeaderExitCleanup { descendants } => {
-                if session.has_hosted_owner() {
-                    emit_hosted_cleanup_notice_unix(&session, descendants);
+            protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children } => {
+                if session.has_hosted_owner() && direct_children > 0 {
+                    emit_hosted_cleanup_notice_unix(&session, direct_children, sink);
                 }
             }
             protocol::SupervisorMsg::Cleanup { complete } => {
@@ -1398,6 +1396,53 @@ fn observe_windows_job_after_poll(
     WatchTick::Poll { requested, quiet }
 }
 
+#[derive(Clone)]
+struct NonBlockingWriteSink(std::sync::mpsc::SyncSender<([u8; 256], usize)>);
+
+impl NonBlockingWriteSink {
+    fn spawn<W: std::io::Write + Send + 'static>(mut writer: W) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<([u8; 256], usize)>(16);
+        let _ = std::thread::Builder::new()
+            .name("fl-host-stderr".into())
+            .spawn(move || {
+                while let Ok((raw, len)) = rx.recv() {
+                    let _ = writer.write_all(&raw[..len]);
+                }
+            });
+        Self(tx)
+    }
+}
+
+impl std::io::Write for NonBlockingWriteSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let len = buf.len().min(256);
+        let mut raw = [0u8; 256];
+        raw[..len].copy_from_slice(&buf[..len]);
+        let _ = self.0.try_send((raw, len));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct NonBlockingStderrSink;
+
+impl std::io::Write for NonBlockingStderrSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        static STDERR_SINK: std::sync::OnceLock<NonBlockingWriteSink> = std::sync::OnceLock::new();
+        STDERR_SINK
+            .get_or_init(|| NonBlockingWriteSink::spawn(std::io::stderr()))
+            .clone()
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Poll until cleanup is resolved or the post-request deadline expires.
 ///
 /// Unresolved cleanup leaves this loop so `shutdown` can join the thread. The
@@ -1408,7 +1453,8 @@ fn windows_watch_until(
     host: Arc<HostInner>,
     mut observe: impl FnMut(&Session) -> WatchTick,
 ) {
-    windows_watch_until_log(session, host, &mut std::io::stderr(), &mut observe);
+    let mut sink = NonBlockingStderrSink;
+    windows_watch_until_log(session, host, &mut sink, &mut observe);
 }
 
 #[cfg(any(windows, test))]
@@ -1420,6 +1466,7 @@ fn windows_watch_until_log(
 ) {
     let mut cleanup_started: Option<Instant> = None;
     let mut leader_exited_at: Option<Instant> = None;
+    let mut emit_hosted_notice = false;
     loop {
         match observe(&session) {
             WatchTick::Stop => break,
@@ -1454,7 +1501,7 @@ fn windows_watch_until_log(
                     cleanup_started = Some(Instant::now());
                     let _ = session.request_cleanup();
                     requested = true;
-                    let _ = emit_hosted_cleanup_notice_windows(&session, sink);
+                    emit_hosted_notice = true;
                 }
                 if (requested || cleanup_started.is_some())
                     && cleanup_deadline_expired(cleanup_started, Instant::now())
@@ -1466,6 +1513,9 @@ fn windows_watch_until_log(
             }
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if emit_hosted_notice {
+        let _ = emit_hosted_cleanup_notice_windows(&session, sink);
     }
 }
 
@@ -1770,19 +1820,15 @@ mod deadline_tests {
             host.shutdown().unwrap();
         }
 
-        // A failing io::Write sink must run outside all host locks and still complete cleanup.
-        struct FailingSink<'a> {
-            host: &'a super::HostInner,
-            calls: usize,
-            locks_free: bool,
+        // A blocked/failing io::Write sink must run after retire + note_cleanup and outside all host locks.
+        struct BlockedSink {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
         }
-        impl std::io::Write for FailingSink<'_> {
+        impl std::io::Write for BlockedSink {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                self.calls += 1;
-                self.locks_free = self.host.registry.try_lock().is_ok()
-                    && self.host.sessions.try_lock().is_ok()
-                    && self.host.outputs.try_lock().is_ok()
-                    && self.host.spawn_gate.try_lock().is_ok();
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
                 Err(std::io::ErrorKind::BrokenPipe.into())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1805,18 +1851,18 @@ mod deadline_tests {
             })
             .with_hosted_owner(Some("hosted-409")),
         );
-        let started = Instant::now();
-        let mut leader_sent = false;
-        let mut sink = FailingSink {
-            host: &host.inner,
-            calls: 0,
-            locks_free: false,
-        };
-        windows_watch_until_log(
-            Arc::clone(&session),
-            Arc::clone(&host.inner),
-            &mut sink,
-            &mut |s| {
+        let (entered, observing) = std::sync::mpsc::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let watched = Arc::clone(&session);
+        let inner = Arc::clone(&host.inner);
+        let watcher = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut leader_sent = false;
+            let mut sink = BlockedSink {
+                entered,
+                release: waiting,
+            };
+            windows_watch_until_log(watched, inner, &mut sink, &mut |s| {
                 if !leader_sent {
                     leader_sent = true;
                     return WatchTick::Leader(Some(0));
@@ -1834,16 +1880,30 @@ mod deadline_tests {
                     requested: false,
                     quiet: false,
                 }
-            },
+            });
+        });
+        observing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let registry_retired = host
+            .inner
+            .registry
+            .try_lock()
+            .is_ok_and(|registry| registry.sessions.is_empty());
+        let cleanup_published = session.cleanup_report() == Some(CleanupReport { complete: true });
+        let locks_free = host.inner.sessions.try_lock().is_ok()
+            && host.inner.outputs.try_lock().is_ok()
+            && host.inner.spawn_gate.try_lock().is_ok();
+        release.send(()).unwrap();
+        watcher.join().unwrap();
+        assert!(
+            registry_retired,
+            "blocked log ran before session retired from registry or held registry lock"
         );
-        assert_eq!(sink.calls, 1);
-        assert!(sink.locks_free, "log write held a host lock");
+        assert!(
+            cleanup_published,
+            "blocked log ran before session.note_cleanup completed"
+        );
+        assert!(locks_free, "blocked log held a host lock");
         assert!(session.cleanup_requested());
-        assert_eq!(
-            session.cleanup_report(),
-            Some(CleanupReport { complete: true })
-        );
-        assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
         host.shutdown().unwrap();
     }
 
@@ -1998,8 +2058,8 @@ mod deadline_tests {
     #[cfg(unix)]
     #[test]
     fn unix_hosted_cleanup_log_and_protocol_defaults_stay_bounded() {
-        use std::io::Read;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
 
         let legacy = br#"{"op":"spawn","argv":["a"],"cwd":[47],"env":[],"session":"s","epoch":1}"#;
         let parsed: super::protocol::DaemonMsg = super::protocol::from_line(legacy).unwrap();
@@ -2014,42 +2074,117 @@ mod deadline_tests {
                 hosted_owner: false,
             }
         );
-        let msg = super::protocol::SupervisorMsg::HostedLeaderExitCleanup { descendants: 3 };
+        let msg = super::protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children: 3 };
         let line = super::protocol::to_line(&msg).unwrap();
         assert_eq!(
             super::protocol::from_line::<super::protocol::SupervisorMsg>(&line[..line.len() - 1])
                 .unwrap(),
             msg
         );
+        let legacy_cleanup = br#"{"op":"hosted_leader_exit_cleanup","descendants":3}"#;
+        assert_eq!(
+            super::protocol::from_line::<super::protocol::SupervisorMsg>(legacy_cleanup).unwrap(),
+            msg
+        );
+
+        struct CaptureWriter(std::sync::mpsc::Sender<String>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .send(String::from_utf8(buf.to_vec()).unwrap())
+                    .unwrap();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_dir, host, _, _) = watch_fixture();
+        let session = Arc::new(
+            Session::new(SessionParts {
+                session: SessionId::new("race").unwrap(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            })
+            .with_hosted_owner(Some("hosted-423")),
+        );
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        let mut capture_sink = super::NonBlockingWriteSink::spawn(CaptureWriter(line_tx));
+        super::emit_hosted_cleanup_notice_unix(&session, 2, &mut capture_sink);
+        assert_eq!(
+            line_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "fl-host: hosted session race (epoch 1) armed post-leader-exit cleanup after 500ms (direct_children=2)\n"
+        );
+
+        struct BlockedWriter {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl std::io::Write for BlockedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered, observing) = std::sync::mpsc::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let mut blocked_sink = super::NonBlockingWriteSink::spawn(BlockedWriter {
+            entered,
+            release: waiting,
+        });
+        super::emit_hosted_cleanup_notice_unix(&session, 1, &mut blocked_sink);
+        observing.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..24 {
+            super::emit_hosted_cleanup_notice_unix(&session, 1, &mut blocked_sink);
+        }
 
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        assert!(super::write_if_pollout(writer.as_raw_fd(), b"hello\n"));
-        let mut got = [0u8; 6];
-        reader.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"hello\n");
+        let status_reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut status_writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        for status_msg in [
+            super::protocol::SupervisorMsg::Leader {
+                code: Some(0),
+                signal: None,
+            },
+            super::protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children: 2 },
+            super::protocol::SupervisorMsg::Cleanup { complete: true },
+        ] {
+            status_writer
+                .write_all(&super::protocol::to_line(&status_msg).unwrap())
+                .unwrap();
+        }
+        drop(status_writer);
 
-        // Fill the pipe with O_NONBLOCK, then restore blocking flags like STDERR_FILENO.
-        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-        assert!(flags >= 0);
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
-        let chunk = [b'x'; 4096];
-        while unsafe { libc::write(writer.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) } > 0 {}
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
-            0
-        );
         let started = Instant::now();
-        assert!(!super::write_if_pollout(
-            writer.as_raw_fd(),
-            b"must-not-block\n"
-        ));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        super::unix_status_log(
+            status_reader,
+            Arc::clone(&session),
+            Arc::clone(&host.inner),
+            &mut blocked_sink,
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
+        assert_eq!(
+            session.cleanup_report(),
+            Some(CleanupReport { complete: true })
+        );
+        assert_eq!(session.leader_exit().unwrap().code, Some(0));
+        release.send(()).unwrap();
+        host.shutdown().unwrap();
     }
 
     #[test]

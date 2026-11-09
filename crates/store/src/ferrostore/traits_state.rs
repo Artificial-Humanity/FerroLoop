@@ -816,6 +816,32 @@ impl StateStore for FerroStore {
         })
     }
 
+    fn delete_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<bool, StoreError> {
+        let slug = validate_slug(slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
+        let key = doc::triple(&scope.as_wire(), concern.as_wire(), &slug);
+        self.with_write(|txn| {
+            doc::raise_format(txn, FORMAT_WITH_STATE)?;
+            let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, &key)? else {
+                return Ok(false);
+            };
+            txn.delete(STATE_KEYS, &key);
+            txn.delete(STATE_ENTRIES, &id_str);
+            txn.delete(STATE_CONFLICTS, &id_str);
+            if let Ok(id_iri) = Iri::parse(&id_str)
+                && let Ok((target, Kind::State)) = doc::locate(txn, &self.label, &id_iri)
+            {
+                txn.delete(STATE_ENTRIES, target.as_str());
+                txn.delete(STATE_CONFLICTS, target.as_str());
+            }
+            Ok(true)
+        })
+    }
+
     fn list_state(
         &self,
         scope: Option<&StateScope>,

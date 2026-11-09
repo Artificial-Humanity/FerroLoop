@@ -1545,32 +1545,36 @@ fn a_virtual_scope_defaults_to_the_workspace_root_and_a_directory_project_is_unc
     let ws = fx.ws();
     let root = &fx.ws_root;
 
-    let virt = request("council", None).with_default_cwd(&ws, root);
+    let virt = request("council", None).with_default_cwd_for_home(&ws, root, Some(&fx.home));
     assert_eq!(virt.cwd.as_deref(), Some(root.to_str().unwrap()));
     // A name no area has yet: spin-up makes it as a virtual area.
-    let fresh = request("brand-new", None).with_default_cwd(&ws, root);
+    let fresh = request("brand-new", None).with_default_cwd_for_home(&ws, root, Some(&fx.home));
     assert_eq!(fresh.cwd.as_deref(), Some(root.to_str().unwrap()));
     // A virtual scope named like a directory under the workspace root starts in that directory.
     std::fs::create_dir_all(root.join("Studio")).unwrap();
     fx.virtual_group("studio");
-    let named = request("studio", None).with_default_cwd(&ws, root);
+    let named = request("studio", None).with_default_cwd_for_home(&ws, root, Some(&fx.home));
     assert_eq!(
         named.cwd.as_deref(),
         Some(root.join("Studio").to_str().unwrap())
     );
     // A directory-backed project: no default, and its path is not used.
-    let dir = request("alpha", None).with_default_cwd(&ws, root);
+    let dir = request("alpha", None).with_default_cwd_for_home(&ws, root, Some(&fx.home));
     assert_eq!(dir.cwd, None);
     let _ = dir_root;
     // An explicit cwd always wins.
-    let explicit = request("council", Some("/somewhere")).with_default_cwd(&ws, root);
+    let explicit =
+        request("council", Some("/somewhere")).with_default_cwd_for_home(&ws, root, Some(&fx.home));
     assert_eq!(explicit.cwd.as_deref(), Some("/somewhere"));
-    let explicit_dir = request("alpha", Some("/elsewhere")).with_default_cwd(&ws, root);
+    let explicit_dir =
+        request("alpha", Some("/elsewhere")).with_default_cwd_for_home(&ws, root, Some(&fx.home));
     assert_eq!(explicit_dir.cwd.as_deref(), Some("/elsewhere"));
     // A root that is not a directory on this host is not used.
     let missing = fx.base.join("no-such-dir");
     assert_eq!(
-        request("council", None).with_default_cwd(&ws, &missing).cwd,
+        request("council", None)
+            .with_default_cwd_for_home(&ws, &missing, Some(&fx.home))
+            .cwd,
         None
     );
 }
@@ -1581,7 +1585,7 @@ fn an_agent_spun_up_in_a_virtual_group_runs_in_the_workspace_root() {
     fx.virtual_group("Council");
     let ws = fx.ws();
     let env = LifecycleEnv::new(Some(&fx.home));
-    let req = request("council", None).with_default_cwd(&ws, &fx.ws_root);
+    let req = request("council", None).with_default_cwd_for_home(&ws, &fx.ws_root, Some(&fx.home));
     lifecycle::spin_up(&ws, &env, &req, "tester", lifecycle::Caller::Owner).unwrap();
     let record = lifecycle::find_hosted_session(&ws, &["claude:ada"])
         .unwrap()

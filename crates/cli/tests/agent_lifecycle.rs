@@ -44,6 +44,8 @@ impl Env {
             .env("FL_TEST_SPINUP_NO_SPAWN", "1")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
+            .env_remove("AGENT_HYDRATION_GENERATION")
+            .env_remove("FL_HOSTED_ID")
             .arg("--db")
             .arg(self.store());
         c
@@ -717,4 +719,169 @@ fn hydration_remodel_warnings_are_printed_once_or_returned_as_json() {
         .collect();
     assert_eq!(stderr.lines().collect::<Vec<_>>(), expected);
     assert_eq!(String::from_utf8(output.stdout).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn hosted_session_register_replace_with_hydration_generation_confirms_without_duplicate_prompt_and_fences_stale_generation()
+ {
+    let e = Env::new();
+    let sock_path = e.path().join("ada-webhook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut table = RouteTable::default();
+    table.upsert(
+        "ada",
+        VendorRoute::Webhook {
+            socket_path: sock_path,
+        },
+        At::from_unix_millis(1),
+    );
+    table.save(Some(&e.routes())).unwrap();
+
+    // 1. Spin up `ada` with a live webhook route: prompt is delivered once, status is `unconfirmed`.
+    let spun = Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    assert_eq!(spun["hydration_dispatched"], true);
+    assert_eq!(spun["hydration_status"], "unconfirmed");
+    let g1 = spun["hydration_generation"]
+        .as_str()
+        .expect("hydration_generation in spin-up JSON")
+        .to_string();
+    let prompt = spun["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains(&format!(
+            "AGENT_PERSONA=ada AGENT_HYDRATION_GENERATION={g1} fl wire register Ada --project FerroLoop --role assistant --replace"
+        )),
+        "spin-up prompt must embed AGENT_HYDRATION_GENERATION={g1}: {prompt}"
+    );
+    assert!(
+        listener.accept().is_ok(),
+        "initial spin-up should deliver hydration prompt once"
+    );
+    assert!(
+        listener.accept().is_err(),
+        "no second prompt should be queued"
+    );
+
+    // 2. Run `fl wire register Ada --project FerroLoop --role assistant --replace` with AGENT_HYDRATION_GENERATION=g1.
+    let mut reg = e.fl();
+    reg.env("AGENT_PERSONA", "ada")
+        .env("AGENT_HYDRATION_GENERATION", &g1)
+        .args([
+            "wire",
+            "register",
+            "Ada",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .assert()
+        .success();
+    assert!(
+        listener.accept().is_err(),
+        "wire register --replace must not trigger a duplicate prompt send"
+    );
+
+    // Verify `hydration-ack-<g1>` receipt exists and `list_hosted_sessions` projects `confirmed`.
+    let store = fl_store::open_store(&e.store()).unwrap();
+    let session = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.hydration_status,
+        fl_hub::lifecycle::HydrationStatus::Confirmed
+    );
+    drop(store);
+
+    // 3. Remodel `ada` to mint a newer generation `g2` (`g1 < g2`) and verify stale `g1` is refused.
+    let remodeled =
+        Env::json_of(e.remodel("ada", &["--vendor", "claude", "--by", "owner", "--json"]));
+    let g2 = remodeled["hydration_generation"]
+        .as_str()
+        .expect("hydration_generation in remodel JSON")
+        .to_string();
+    assert!(g1 < g2, "expected {g1} < {g2}");
+
+    let mut stale_reg = e.fl();
+    stale_reg
+        .env("AGENT_PERSONA", "ada")
+        .env("AGENT_HYDRATION_GENERATION", &g1)
+        .args([
+            "wire",
+            "register",
+            "Ada",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(format!(
+            "registration refused for `ada`: session launch generation `{g1}` was superseded by a newer launch; this process should exit"
+        )));
+}
+
+#[test]
+fn sonora_named_binding_spin_up_keeps_umbrella_cwd_without_warnings() {
+    let e = Env::new();
+    let workspace = e.path().join("workspace");
+    let umbrella = workspace.join("Sonora");
+    let root = umbrella.join("github");
+    for dir in [
+        root.join(".git"),
+        workspace.join("audio-suite"),
+        workspace.join("Notes"),
+        workspace.join(".agents/roles"),
+        e.path().join("config/fl"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+        std::fs::write(root.join(file), "project guidance").unwrap();
+    }
+    std::fs::write(workspace.join(".agents/AGENTS.md"), "workspace").unwrap();
+    std::fs::write(workspace.join(".agents/roles/assistant.md"), "role").unwrap();
+    std::fs::write(
+        e.path().join("config/fl/config.toml"),
+        format!(
+            "[[project]]\nname = 'Audio-Suite'\nroot = {:?}\nstore = {:?}\n",
+            root.to_str().unwrap(),
+            e.store().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = e
+        .fl()
+        .current_dir(&umbrella)
+        .args([
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "audio-suite",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let response = one_json_document(&output.stdout);
+    assert_eq!(response["warnings"], serde_json::json!([]), "{response}");
+    assert_eq!(e.hosted_records()[0]["cwd"], umbrella.to_str().unwrap());
+    assert!(
+        response["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(root.join("AGENTS.md").to_str().unwrap())
+    );
+    assert!(output.stderr.is_empty());
 }
