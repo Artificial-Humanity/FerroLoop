@@ -718,3 +718,65 @@ fn hydration_remodel_warnings_are_printed_once_or_returned_as_json() {
     assert_eq!(stderr.lines().collect::<Vec<_>>(), expected);
     assert_eq!(String::from_utf8(output.stdout).unwrap().lines().count(), 1);
 }
+
+#[test]
+fn sonora_named_binding_spin_up_keeps_umbrella_cwd_without_warnings() {
+    let e = Env::new();
+    let workspace = e.path().join("workspace");
+    let umbrella = workspace.join("Sonora");
+    let root = umbrella.join("github");
+    for dir in [
+        root.join(".git"),
+        workspace.join("audio-suite"),
+        workspace.join("Notes"),
+        workspace.join(".agents/roles"),
+        e.path().join("config/fl"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+        std::fs::write(root.join(file), "project guidance").unwrap();
+    }
+    std::fs::write(workspace.join(".agents/AGENTS.md"), "workspace").unwrap();
+    std::fs::write(workspace.join(".agents/roles/assistant.md"), "role").unwrap();
+    std::fs::write(
+        e.path().join("config/fl/config.toml"),
+        format!(
+            "[[project]]\nname = 'Audio-Suite'\nroot = {:?}\nstore = {:?}\n",
+            root.to_str().unwrap(),
+            e.store().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = e
+        .fl()
+        .current_dir(&umbrella)
+        .args([
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "audio-suite",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let response = one_json_document(&output.stdout);
+    assert_eq!(response["warnings"], serde_json::json!([]), "{response}");
+    assert_eq!(e.hosted_records()[0]["cwd"], umbrella.to_str().unwrap());
+    assert!(
+        response["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(root.join("AGENTS.md").to_str().unwrap())
+    );
+    assert!(output.stderr.is_empty());
+}
