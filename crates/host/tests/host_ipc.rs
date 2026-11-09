@@ -5104,22 +5104,27 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
         baseline.projection_reserved_bytes
     );
     let evicted = &streams[2];
-    let error = rpc
-        .inner
-        .claim_controller(evicted.clone())
-        .unwrap_err()
-        .to_string();
+    let err = rpc.inner.claim_controller(evicted.clone()).unwrap_err();
+    assert!(
+        matches!(&err, HostError::PtyEpochEvicted { stream } if stream == evicted),
+        "{err:?}"
+    );
+    let error = err.to_string();
     assert!(error.contains("PTY epoch evicted"), "{error}");
     assert!(
         error.contains(&serde_json::to_string(evicted).unwrap()),
         "{error}"
     );
     let old_same_name = &streams[0];
-    let error = rpc
+    let err = rpc
         .inner
         .claim_controller(old_same_name.clone())
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostError::StaleEpoch { stream } if stream == old_same_name),
+        "{err:?}"
+    );
+    let error = err.to_string();
     assert!(error.contains("stale epoch (possibly evicted"), "{error}");
     assert!(
         !error.contains("PTY epoch evicted"),
@@ -5143,6 +5148,262 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
             code: Refuse::StaleEpoch
         }
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn attached_completed_pty_reader_receives_session_fenced_notice_on_compaction() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut child = spec("fenced-reader", &["exit", "0"]);
+    child.kind = SpawnKind::Pty;
+    let (stream, _) = rpc.inner.spawn_pty_session(child, None).unwrap();
+    let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+    let XResp::Subscription {
+        ticket: sub_ticket, ..
+    } = rpc
+        .inner
+        .extension_request(XReq::SubscribeReliable {
+            stream: stream.clone(),
+            lease,
+            after_seq: Some(0),
+        })
+        .unwrap()
+    else {
+        panic!("subscribe ticket");
+    };
+    let (rt, mut events) = event_socket(&daemon.paths.endpoint, sub_ticket);
+    assert_eq!(event_seq(&rt, &mut events, 0), 1);
+
+    // Hold the reader before the next record's first part so unread records are
+    // still pending when completed-PTY compaction fences the journal.
+    arm(&daemon.paths.subscriber, "reliable-before-part");
+    wait_at(&daemon.paths.subscriber, "reliable-before-part");
+    rpc.inner.kill_session(stream.clone(), lease).unwrap();
+
+    // Drive completed-PTY compaction and >8 completed-PTY retention pressure.
+    for n in 0..9 {
+        let mut extra = spec(&format!("compact-extra-{n}"), &["exit", "0"]);
+        extra.kind = SpawnKind::Pty;
+        let (extra_stream, _) = rpc.inner.spawn_pty_session(extra, None).unwrap();
+        let mut cleanup_sent = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = rpc.inner.pty_retention_status().unwrap().unwrap();
+            let records = rpc.inner.list_sessions().unwrap();
+            if !cleanup_sent
+                && records.iter().any(|r| {
+                    r.stream == extra_stream && matches!(r.state, ChildState::LeaderExited(_))
+                })
+            {
+                let extra_lease = rpc
+                    .inner
+                    .claim_controller(extra_stream.clone())
+                    .unwrap()
+                    .lease;
+                rpc.inner
+                    .kill_session(extra_stream.clone(), extra_lease)
+                    .unwrap();
+                cleanup_sent = true;
+            }
+            if records.iter().any(|r| {
+                r.stream == extra_stream && matches!(r.state, ChildState::CleanupComplete(_))
+            }) && status.completed_pty_sessions <= 8
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "extra PTY {n} did not complete");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let notice = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match events
+                    .next_frame()
+                    .await
+                    .expect("fenced reader frame before EOF")
+                {
+                    fl_host_proto::ExtensionFrame::Notice { code } => return code,
+                    fl_host_proto::ExtensionFrame::ReliablePart { .. } => continue,
+                    other => panic!("unexpected frame on fenced PTY stream: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("fenced notice deadline")
+    });
+    assert_eq!(notice, Refuse::SessionFenced);
+    release(&daemon.paths.subscriber, "reliable-before-part");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipes_survive_completed_pty_compaction_and_sixty_four_slot_pressure() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rel_rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut leg_rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut pty_rpc = Rpc::connect(&daemon.paths.endpoint);
+
+    // 1. Spawn a ReliablePipe and verify initial replay + partial Ack.
+    let rel_stream = reliable_spawn(&mut rel_rpc, "keep-reliable", &["echo"]);
+    let rel_lease = controller(&mut rel_rpc, &rel_stream);
+    let sub_ticket = ticket(&mut rel_rpc, &rel_stream, rel_lease, 0);
+    let (rt, mut rel_events) = event_socket(&daemon.paths.endpoint, sub_ticket);
+    assert_eq!(event_seq(&rt, &mut rel_events, 0), 1); // Spawned
+    assert_eq!(event_seq(&rt, &mut rel_events, 1), 2); // READY
+    assert_eq!(
+        ack(&mut rel_rpc, &rel_stream, rel_lease, 2),
+        XResp::Acked { through: 2 }
+    );
+    assert_eq!(
+        extended(
+            &mut rel_rpc,
+            XReq::SendLine {
+                stream: rel_stream.clone(),
+                lease: rel_lease,
+                line: "rel-before".into(),
+            },
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written,
+        }
+    );
+    assert_eq!(event_seq(&rt, &mut rel_events, 2), 3); // rel-before (left unacked across churn)
+    drop(rel_events);
+
+    // 2. Spawn a LegacyPipe and verify initial CaptureOutput.
+    let leg_child = leg_rpc.spawn("keep-legacy", &["echo"]);
+    let leg_epoch = record(&leg_child.state).session_epoch.0;
+    let leg_lease = leg_rpc
+        .claim("keep-legacy", leg_epoch)
+        .expect("legacy lease");
+    assert_eq!(
+        leg_rpc.send("keep-legacy", leg_epoch, leg_lease, "leg-before"),
+        SendOutcome::Written
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = pty_rpc
+            .inner
+            .capture_output(sid("keep-legacy"), 4096)
+            .unwrap();
+        if out.contains("READY\n") && out.contains("leg-before\n") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legacy output before churn: {out:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // 3. Churn 10 completed PTYs (>8 completed-PTY retention limit).
+    for n in 0..10 {
+        let mut pty = spec(&format!("pty-churn-{n:02}"), &["exit", "0"]);
+        pty.kind = SpawnKind::Pty;
+        let (pty_stream, _) = pty_rpc.inner.spawn_pty_session(pty, None).unwrap();
+        let mut killed = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = pty_rpc.inner.pty_retention_status().unwrap().unwrap();
+            let records = pty_rpc.inner.list_sessions().unwrap();
+            if !killed
+                && records.iter().any(|r| {
+                    r.stream == pty_stream && matches!(r.state, ChildState::LeaderExited(_))
+                })
+            {
+                let l = pty_rpc
+                    .inner
+                    .claim_controller(pty_stream.clone())
+                    .unwrap()
+                    .lease;
+                pty_rpc.inner.kill_session(pty_stream.clone(), l).unwrap();
+                killed = true;
+            }
+            if status.completed_pty_sessions == (n + 1).min(8)
+                && status.evicted_total == u64::from((n + 1).saturating_sub(8))
+                && records.iter().any(|r| {
+                    r.stream == pty_stream && matches!(r.state, ChildState::CleanupComplete(_))
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pty-churn-{n:02} did not complete"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // 4. Fill to 64 total outputs (2 pipes + 8 completed PTYs + 54 live PTYs = 64)
+    // and spawn 2 more PTYs to force 64-slot pressure eviction of completed PTYs.
+    let mut live_ptys = Vec::new();
+    for n in 0..54 {
+        let mut pty = spec(&format!("pty-live-{n:02}"), &["stall"]);
+        pty.kind = SpawnKind::Pty;
+        let (pty_stream, _) = pty_rpc.inner.spawn_pty_session(pty, None).unwrap();
+        live_ptys.push(pty_stream);
+    }
+    assert_eq!(pty_rpc.inner.list_sessions().unwrap().len(), 64);
+
+    for n in 0..2 {
+        let mut pty = spec(&format!("pty-pressure-{n}"), &["stall"]);
+        pty.kind = SpawnKind::Pty;
+        let (pty_stream, _) = pty_rpc.inner.spawn_pty_session(pty, None).unwrap();
+        live_ptys.push(pty_stream);
+    }
+    let status = pty_rpc.inner.pty_retention_status().unwrap().unwrap();
+    assert_eq!(status.completed_pty_sessions, 6);
+    assert_eq!(status.evicted_total, 4);
+    assert!(!status.recent_evictions.contains(&rel_stream));
+
+    // 5. Verify ReliablePipe replay and Ack still work after PTY compaction and slot pressure.
+    assert_eq!(
+        extended(
+            &mut rel_rpc,
+            XReq::SendLine {
+                stream: rel_stream.clone(),
+                lease: rel_lease,
+                line: "rel-after".into(),
+            },
+        ),
+        XResp::Input {
+            outcome: SendOutcome::Written,
+        }
+    );
+    let sub_ticket = ticket(&mut rel_rpc, &rel_stream, rel_lease, 2);
+    let (rt2, mut rel_events2) = event_socket(&daemon.paths.endpoint, sub_ticket);
+    assert_eq!(event_seq(&rt2, &mut rel_events2, 2), 3); // unacked rel-before replayed!
+    assert_eq!(event_seq(&rt2, &mut rel_events2, 3), 4); // rel-after
+    assert_eq!(
+        ack(&mut rel_rpc, &rel_stream, rel_lease, 4),
+        XResp::Acked { through: 4 }
+    );
+    drop(rel_events2);
+
+    // 6. Verify LegacyPipe send and CaptureOutput still work after PTY compaction and slot pressure.
+    assert_eq!(
+        leg_rpc.send("keep-legacy", leg_epoch, leg_lease, "leg-after"),
+        SendOutcome::Written
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = pty_rpc
+            .inner
+            .capture_output(sid("keep-legacy"), 4096)
+            .unwrap();
+        if out.contains("READY\n") && out.contains("leg-before\n") && out.contains("leg-after\n") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legacy output after churn: {out:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(unix)]

@@ -672,7 +672,7 @@ impl ReplayCursor {
     }
     pub(crate) fn gap(&self) -> Option<fl_host_proto::ReliableGap> {
         let state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.next <= state.acked || self.next >= state.next {
+        if state.compacted || self.next <= state.acked || self.next >= state.next {
             return None;
         }
         let next_seq = (0..state.len)
@@ -1359,6 +1359,23 @@ mod tests {
         assert!(matches!(
             &last.body,
             ReliableBody::Line(bytes) if !bytes.terminated && bytes.as_slice() == b"done"
+        ));
+    }
+
+    #[test]
+    fn compacted_pty_journal_fences_attached_cursor_without_reporting_gap() {
+        let j = ReliableJournal::new_with_mode(SliceBudget::new(), stream(), true).unwrap();
+        admit(&j, b"first\nsecond\n");
+        let (_, mut cursor) = begin_replay(&j, 0).unwrap();
+        let first = cursor.next().unwrap().unwrap();
+        assert_eq!(first.seq, 1);
+        drop(first);
+        j.eof();
+        j.compact_completed_pty();
+        assert_eq!(cursor.gap(), None);
+        assert!(matches!(
+            cursor.next(),
+            Err(ExtensionRefusal::SessionFenced)
         ));
     }
 }

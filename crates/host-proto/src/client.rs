@@ -1657,6 +1657,31 @@ mod extension_client_tests {
                     .unwrap();
                 let HostRequest::Extended {
                     id,
+                    request: crate::ExtensionRequest::Capabilities,
+                } = crate::decode_request_for_minor(1, &frame).unwrap()
+                else {
+                    panic!("expected capabilities query");
+                };
+                let caps = crate::encode_response_for_minor(
+                    1,
+                    &HostResponse::Extended {
+                        id,
+                        response: crate::ExtensionResponse::Capabilities {
+                            host: evicted_for_server.host.clone(),
+                            features: crate::PTY_RETENTION_FEATURE,
+                            limits: crate::ExtensionLimits::default(),
+                        },
+                    },
+                )
+                .unwrap();
+                auth::write_frame_async(&mut right, &caps, deadline)
+                    .await
+                    .unwrap();
+                let frame = auth::read_frame_async(&mut right, deadline, false)
+                    .await
+                    .unwrap();
+                let HostRequest::Extended {
+                    id,
                     request: crate::ExtensionRequest::PtyRetentionStatus,
                 } = crate::decode_request_for_minor(1, &frame).unwrap()
                 else {
