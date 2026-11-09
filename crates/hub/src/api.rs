@@ -5906,6 +5906,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
             && let Some((item, claim)) =
                 state.claim_queued_for_dispatch(&canonical_id, &session_id, &prompt_id, true)
         {
+            let accepted_at = stamp::now().to_string();
             let delivery_res = dispatch_operator_prompt_for_session_typed(
                 state,
                 item.persona.as_deref(),
@@ -5942,7 +5943,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
                     "queued": delivery_res.is_err(),
                     "is_busy": true,
-                    "accepted_at": stamp::now().to_string(),
+                    "accepted_at": accepted_at,
                     "prompt_id": item.id,
                     "prompt": item.prompt,
                     "effective_body": item.effective_body,
@@ -5996,6 +5997,7 @@ fn handle_post_queued_prompt_send_now(
     } else {
         canonical_id.as_str()
     };
+    let accepted_at = stamp::now().to_string();
     let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
         state,
         item.persona.as_deref().or(target_persona.as_deref()),
@@ -6051,7 +6053,7 @@ fn handle_post_queued_prompt_send_now(
             "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
             "queued": delivery_res.is_err(),
             "is_busy": true,
-            "accepted_at": stamp::now().to_string(),
+            "accepted_at": accepted_at,
             "prompt_id": prompt_id,
             "prompt": item.prompt,
             "effective_body": item.effective_body,
@@ -6392,6 +6394,7 @@ fn handle_post_session_prompt(
         }
     };
 
+    let accepted_at = stamp::now().to_string();
     let delivery_res = dispatch_operator_prompt_with_intent_for_session(
         state,
         target_persona.as_deref(),
@@ -6429,7 +6432,7 @@ fn handle_post_session_prompt(
             "status": if matches!(delivery_res, Err(OperatorPromptError::Steer(_))) { "delivery_failed" } else { "sent" },
             "queued": false,
             "is_busy": true,
-            "accepted_at": stamp::now().to_string(),
+            "accepted_at": accepted_at,
             "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_session_id),
             "prompt": prompt_text,
             "effective_body": effective_body,
