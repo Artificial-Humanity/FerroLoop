@@ -185,8 +185,8 @@ async fn serve_conn(host: Arc<HostInner>, mut conn: HostConn) {
                         }
                         Ok(permit)=>{
                             let host=Arc::clone(&host);let tx=extended_tx.clone();
-                            let task_budget=Arc::clone(&host.reliable_budget);
-                            let operation=async move {
+                            let dispatch_host=Arc::clone(&host);
+                            let result=spawn_extension_operation(&dispatch_host,request,|request|async move {
                                 let mut snapshot=None;
                                 let response=extended(&host,ConnId(conn_id),request,&mut snapshot).await.unwrap_or_else(|code|XResp::Refused{code});
                                 if let Some(dir)=crate::input::hold_dir(){
@@ -197,9 +197,9 @@ async fn serve_conn(host: Arc<HostInner>, mut conn: HostConn) {
                                     }
                                 }
                                 let _=tx.send(ExtendedReply{response:HostResponse::Extended{id,response},_permit:permit,_snapshot:snapshot});
-                            };
-                            match budgeted_operation(operation, &task_budget) {
-                                Ok(operation)=>{tokio::spawn(operation);}
+                            });
+                            match result {
+                                Ok(())=>{}
                                 Err(code)=>{
                                     if conn.respond(&HostResponse::Extended{id,response:XResp::Refused{code}}).await.is_err(){break;}
                                 }
@@ -1126,6 +1126,35 @@ async fn run_extension(
     drop(active);
 }
 
+// Admit the complete operation before allocating its runtime task.
+fn spawn_extension_operation<F>(
+    host: &HostInner,
+    request: XReq,
+    operation: impl FnOnce(XReq) -> F,
+) -> Result<(), Refusal>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let blocking = matches!(
+        request,
+        XReq::HostStatus | XReq::ListSessions | XReq::PtyRetentionStatus
+    );
+    let operation = budgeted_operation(operation(request), &host.reliable_budget)?;
+    if blocking {
+        // Retention takes spawn_gate across supervisor handshakes and may log
+        // to a blocked sink. Move the entire admitted operation, including its
+        // snapshot and reply permits, off the async workers. Keeping the
+        // budgeted future inside the blocking task also covers queued work and
+        // cancellation: no detached capture/result can outlive its charge.
+        let handle = host.handle.clone();
+        host.handle
+            .spawn_blocking(move || handle.block_on(operation));
+    } else {
+        host.handle.spawn(operation);
+    }
+    Ok(())
+}
+
 // A private cap bounds task/channel descriptors. Metadata charges also bound aggregate owned bodies.
 // The inline async operation grew with Ack's cancellation/timeout state. Charge
 // its actual monomorphized size before Box::pin and task allocation, separately
@@ -1301,6 +1330,97 @@ mod list_response_tests {
             );
         }
         (dir, host)
+    }
+
+    // Catches retention handlers blocking all four production runtime workers.
+    // Readiness is signalled from inside each scheduled operation immediately
+    // before entering the real handler, while the test thread owns spawn_gate.
+    #[test]
+    fn retention_queries_leave_runtime_workers_available() {
+        for request in [
+            XReq::HostStatus,
+            XReq::ListSessions,
+            XReq::PtyRetentionStatus,
+        ] {
+            let (_dir, host) = fixture();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let gate = host.inner.spawn_gate.lock().unwrap();
+            for id in 0..4 {
+                let request = request.clone();
+                let permit = admit_extension(&host.inner, &count, &request).unwrap();
+                let inner = Arc::clone(&host.inner);
+                let started = started_tx.clone();
+                let replies = reply_tx.clone();
+                spawn_extension_operation(&host.inner, request, |request| async move {
+                    started.send(()).unwrap();
+                    let mut snapshot = None;
+                    let response = extended(&inner, ConnId(1), request, &mut snapshot)
+                        .await
+                        .unwrap();
+                    let _ = replies.send(ExtendedReply {
+                        response: HostResponse::Extended {
+                            id: RequestId(id),
+                            response,
+                        },
+                        _permit: permit,
+                        _snapshot: snapshot,
+                    });
+                })
+                .unwrap();
+            }
+            let ready = (0..4).all(|_| started_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+            let owner_request = XReq::CheckSessionOwner {
+                stream: fl_host_proto::StreamId {
+                    host: host.inner.authority.instance().clone(),
+                    session: SessionId::new("missing").unwrap(),
+                    epoch: fl_host_proto::SessionEpoch(1),
+                },
+                hosted_id: "missing".into(),
+            };
+            let permit = admit_extension(&host.inner, &count, &owner_request).unwrap();
+            let inner = Arc::clone(&host.inner);
+            let (owner_tx, owner_rx) = std::sync::mpsc::channel();
+            spawn_extension_operation(&host.inner, owner_request, |request| async move {
+                let mut snapshot = None;
+                let response = extended(&inner, ConnId(1), request, &mut snapshot)
+                    .await
+                    .unwrap();
+                let _ = owner_tx.send(ExtendedReply {
+                    response: HostResponse::Extended {
+                        id: RequestId(4),
+                        response,
+                    },
+                    _permit: permit,
+                    _snapshot: snapshot,
+                });
+            })
+            .unwrap();
+            let owner = owner_rx.recv_timeout(Duration::from_secs(1));
+            // Always release the lock before asserting so a failing regression
+            // cannot strand the runtime or the host's shutdown path.
+            drop(gate);
+            for _ in 0..4 {
+                drop(reply_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+            assert!(
+                ready,
+                "all four retention operations must enter the handler"
+            );
+            assert!(
+                matches!(
+                    owner.as_ref().map(|reply| &reply.response),
+                    Ok(HostResponse::Extended {
+                        response: XResp::SessionOwner { matches: false },
+                        ..
+                    })
+                ),
+                "{request:?}: ownership check stalled behind retention maintenance"
+            );
+            drop(owner);
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
     }
 
     fn rendered_fixture() -> (tempfile::TempDir, Host, fl_host_proto::StreamId) {

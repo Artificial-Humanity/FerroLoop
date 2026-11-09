@@ -1123,15 +1123,14 @@ impl HostInner {
 
     // spawn_gate serializes this with inventory publication and status maintenance.
     fn evict_completed_ptys(&self, for_spawn: bool, notices: &mut retention::EvictionNotices) {
+        let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let mut outputs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
-        let unresolved = self
-            .registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let unresolved = registry
             .sessions
             .iter()
             .filter(|r| !outputs.contains_key(&(r.session.clone(), r.epoch)))
             .count();
+        drop(registry);
         while !notices.is_full() {
             let mut completed = 0;
             let oldest = outputs
