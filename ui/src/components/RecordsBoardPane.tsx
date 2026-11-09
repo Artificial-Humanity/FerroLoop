@@ -81,7 +81,9 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const [project, setProject] = useState<string>(() =>
     selectedProject && selectedProject.trim().length > 0
       ? selectedProject.trim().toLowerCase()
-      : "ferroloop",
+      : selectedProject === null
+        ? (projects[0]?.slug.trim().toLowerCase() ?? "")
+        : "ferroloop",
   );
   const listedProjects = useMemo(
     () => projects.map((p) => p.slug.trim().toLowerCase()),
@@ -176,9 +178,11 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
       prevSelectedProjectRef.current = selectedProject;
       if (selectedProject && selectedProject.trim().length > 0) {
         setProject(selectedProject.trim().toLowerCase());
+      } else if (selectedProject === null) {
+        setProject(projects[0]?.slug.trim().toLowerCase() ?? "");
       }
     }
-  }, [selectedProject]);
+  }, [selectedProject, projects]);
 
   const loadRecords = useCallback(
     async (targetProject: string) => {
@@ -458,6 +462,9 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
               value={project}
               onChange={(e) => setProject(e.target.value)}
             >
+              {projectOptions.length === 0 && (
+                <option value="">None</option>
+              )}
               {projectOptions.map((proj) => (
                 <option key={proj} value={proj}>
                   {proj}

@@ -657,6 +657,7 @@ export const App: React.FC<AppProps> = ({
 
   // Auth & Pairing State
   const [authority, setAuthority] = useState<HubAuthority | null>(null);
+  const [authRequired, setAuthRequired] = useState<boolean>(false);
   const [pairingOpen, setPairingOpen] = useState<boolean>(false);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
@@ -1446,7 +1447,7 @@ export const App: React.FC<AppProps> = ({
         return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
       });
       if (error instanceof HubApiError && error.status === 401) {
-        setAuthority(null); setPairingOpen(true);
+        setAuthority(null); setAuthRequired(true); setPairingOpen(true);
       }
     }
   }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, isTranscriptResetPending, setSessionMetadataOwner]);
@@ -1544,8 +1545,10 @@ export const App: React.FC<AppProps> = ({
     [splitView, secondaryTab, navigatePhone],
   );
 
+  const rosterRefreshInFlightRef = useRef<boolean>(false);
   const refreshRosterAndLiveness = useCallback(async () => {
-    if (loggedOutRef.current || !mountedRef.current) return;
+    if (loggedOutRef.current || !mountedRef.current || rosterRefreshInFlightRef.current) return;
+    rosterRefreshInFlightRef.current = true;
     try {
       const [agentsRes, livenessRes] = await Promise.all([
         apiClient.getAgents().catch(() => null),
@@ -1565,6 +1568,8 @@ export const App: React.FC<AppProps> = ({
       }
     } catch {
       // Ignore background refresh errors
+    } finally {
+      rosterRefreshInFlightRef.current = false;
     }
   }, [apiClient]);
 
@@ -1792,6 +1797,7 @@ export const App: React.FC<AppProps> = ({
 
       if (sawUnauthorized && !agentsRes && !livenessRes && !sessionsRes) {
         setAuthority(null);
+        setAuthRequired(true);
         setPairingOpen(true);
         setAgents([]);
         setRoutes([]);
@@ -1902,6 +1908,7 @@ export const App: React.FC<AppProps> = ({
             if (pairRes.authority) {
               authIdentityRef.current = { apiClient, token: apiClient.getToken() };
               setAuthority(pairRes.authority);
+              setAuthRequired(false);
             }
             wsClient.setToken(apiClient.getToken());
             wsClient.connect();
@@ -1909,6 +1916,7 @@ export const App: React.FC<AppProps> = ({
         } catch (err) {
           if (acceptsBootstrap()) {
             setPairingError(err instanceof Error ? err.message : "Pairing code rejected");
+            setAuthRequired(true);
             setPairingOpen(true);
           }
         } finally {
@@ -1924,13 +1932,16 @@ export const App: React.FC<AppProps> = ({
           if (authRes.authenticated && authRes.authority) {
             authIdentityRef.current = { apiClient, token: apiClient.getToken() };
             setAuthority(authRes.authority);
+            setAuthRequired(false);
           } else {
+            setAuthRequired(true);
             setPairingOpen(true);
           }
         }
       } catch (err) {
         if (acceptsBootstrap()) {
           if (err instanceof HubApiError && err.status === 401) {
+            setAuthRequired(true);
             setPairingOpen(true);
           }
         }
@@ -2247,7 +2258,7 @@ export const App: React.FC<AppProps> = ({
       return agents[0];
     }
 
-    if (!authority && pairingOpen) {
+    if (!authority && (pairingOpen || authRequired)) {
       return null;
     }
 
@@ -2260,11 +2271,11 @@ export const App: React.FC<AppProps> = ({
           : selectedAgentName.trim() === key
             ? key.charAt(0).toUpperCase() + key.slice(1)
             : selectedAgentName.trim(),
-      project: key === "jarvis" ? "Workspace" : "FerroLoop",
+      project: "",
       role: "assistant",
       status: "active",
     };
-  }, [agents, liveness, sessions, routes, selectedAgentName, authority, pairingOpen]);
+  }, [agents, liveness, sessions, routes, selectedAgentName, authority, pairingOpen, authRequired]);
 
   const [spunUpByAgent, setSpunUpByAgent] = useState<
     Record<
@@ -2455,18 +2466,36 @@ export const App: React.FC<AppProps> = ({
 
   // Re-fetch /api/v1/sessions, roster, liveness, and active transcript when returning focus or visibility
   // to FerroDeck (e.g. after changing model in a vendor CLI or the Claude app).
+  // Browsers fire both `visibilitychange` and `focus` back-to-back on tab activation; dedupe them.
+  const lastForegroundRefreshAtRef = useRef<number>(0);
+  const foregroundRefreshInFlightRef = useRef<boolean>(false);
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
+    const triggerForegroundRefresh = () => {
+      const now = Date.now();
+      if (
+        foregroundRefreshInFlightRef.current ||
+        now - lastForegroundRefreshAtRef.current < 40
+      ) {
+        return;
+      }
+      lastForegroundRefreshAtRef.current = now;
+      foregroundRefreshInFlightRef.current = true;
+      void Promise.all([
+        refreshSessionsAndTranscript(),
+        refreshRosterAndLiveness(),
+      ]).finally(() => {
+        foregroundRefreshInFlightRef.current = false;
+      });
+    };
     const handleWindowFocus = () => {
-      void refreshSessionsAndTranscript();
-      void refreshRosterAndLiveness();
+      triggerForegroundRefresh();
     };
     const handleVisibilityChange = () => {
       if (typeof document !== "undefined" && !document.hidden) {
-        void refreshSessionsAndTranscript();
-        void refreshRosterAndLiveness();
+        triggerForegroundRefresh();
       }
     };
     window.addEventListener("focus", handleWindowFocus);
@@ -2540,6 +2569,7 @@ export const App: React.FC<AppProps> = ({
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     if (res.authority) {
       setAuthority(res.authority);
+      setAuthRequired(false);
     }
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
@@ -2555,6 +2585,7 @@ export const App: React.FC<AppProps> = ({
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     if (res.authority) {
       setAuthority(res.authority);
+      setAuthRequired(false);
     }
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
@@ -2569,6 +2600,7 @@ export const App: React.FC<AppProps> = ({
     setTranscriptSnapshot(null);
     await apiClient.logout().catch(() => {});
     setAuthority(null);
+    setAuthRequired(true);
     wsClient.setToken(null);
     wsClient.disconnect();
     // Drop everything fetched under the old identity so the next principal
@@ -3121,7 +3153,7 @@ export const App: React.FC<AppProps> = ({
       case "git":
         return (
           <GitPrPane
-            selectedProject={selectedAgent?.project ?? null}
+            selectedProject={selectedAgent?.project || null}
             worktrees={worktrees}
             selectedWorktreeId={selectedWorktreeId}
             worktreeDiff={worktreeDiff}
@@ -3151,7 +3183,7 @@ export const App: React.FC<AppProps> = ({
         return (
           <RecordsBoardPane
             projects={projects}
-            selectedProject={selectedAgent?.project ?? null}
+            selectedProject={selectedAgent?.project || null}
             apiClient={apiClient}
           />
         );
@@ -3513,7 +3545,7 @@ export const App: React.FC<AppProps> = ({
       agentName={selectedAgent?.name_key ?? null}
       agentDisplayName={selectedAgent?.display_name ?? null}
       agentRole={selectedAgent?.role ?? null}
-      agentProject={selectedAgent?.project ?? null}
+      agentProject={selectedAgent?.project || null}
       adapter={activeAdapter}
       model={activeModel}
       thinkingLevel={activeSession?.thinking_level ?? null}
@@ -3581,7 +3613,7 @@ export const App: React.FC<AppProps> = ({
       projects={projects}
       showEmptyProjects={projectsFromHub}
       loading={loading}
-      signedOut={!authority && pairingOpen}
+      signedOut={!authority && (pairingOpen || authRequired)}
       agents={agents}
       routes={mergedRoutes}
       sessions={sessions}
@@ -3849,6 +3881,7 @@ export const App: React.FC<AppProps> = ({
         onAuthenticated={(auth) => {
           advanceTranscriptAuth();
           loggedOutRef.current = false;
+          setAuthRequired(false);
           if (auth) {
             setAuthority(auth);
           }
