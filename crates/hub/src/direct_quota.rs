@@ -19,7 +19,14 @@ use fl_core::telemetry::AdapterKind;
 use fl_exec::child_env::{child_env, helper_env};
 use serde_json::Value;
 
-use crate::discovery::{QuotaWindowUsage, SessionQuotaUsage, json_f64, parse_iso8601_unix_millis};
+use crate::discovery::{
+    QuotaWindowUsage, SessionQuotaUsage, json_f64, parse_iso8601_unix_millis,
+    parse_timestamp_value_ms,
+};
+
+fn now_ms() -> u64 {
+    fl_exec::stamp::now().unix_millis()
+}
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -127,6 +134,8 @@ pub(crate) fn merge_account_quota(
         (Some(account), None) => Some(account),
         (None, Some(disk)) => Some(disk),
         (Some(mut account), Some(disk)) => {
+            let account_had_windows =
+                account.primary_window.is_some() || account.secondary_window.is_some();
             if account.tier.is_none() {
                 account.tier = disk.tier;
             }
@@ -138,6 +147,9 @@ pub(crate) fn merge_account_quota(
             }
             if disk.exhausted_reason.is_some() {
                 account.exhausted_reason = disk.exhausted_reason;
+            }
+            if !account_had_windows {
+                account.observed_at_ms = account.observed_at_ms.or(disk.observed_at_ms);
             }
             Some(account)
         }
@@ -155,7 +167,11 @@ pub(crate) fn muse_account_quota(home_override: Option<&Path>) -> Option<Session
             PROBE_TIMEOUT,
         )?;
         let value = parse_json_document(&raw)?;
-        muse_allowance(&value)
+        let mut quota = muse_allowance(&value)?;
+        if quota.observed_at_ms.is_none() {
+            quota.observed_at_ms = Some(now_ms());
+        }
+        Some(quota)
     })
 }
 
@@ -176,7 +192,7 @@ pub(crate) fn claude_account_quota(home_override: Option<&Path>) -> Option<Sessi
             .unwrap_or_default(),
         override_json
             .as_ref()
-            .map(|value| value.to_string())
+            .map(|(value, _)| value.to_string())
             .unwrap_or_default()
     );
     cached(ProbeKind::Claude, &key, move || {
@@ -187,7 +203,7 @@ pub(crate) fn claude_account_quota(home_override: Option<&Path>) -> Option<Sessi
 fn claude_quota_uncached(
     home_override: Option<&Path>,
     bin: Option<&Path>,
-    override_json: Option<Value>,
+    override_json: Option<(Value, Option<u64>)>,
 ) -> Option<SessionQuotaUsage> {
     let auth = bin.and_then(|path| {
         let raw = command_stdout(
@@ -200,8 +216,11 @@ fn claude_quota_uncached(
     });
     let auth_tier = auth.as_ref().and_then(subscription_type);
     let creds = credentials_path(home_override).and_then(|path| read_claude_credentials(&path));
-    let mut quota = if let Some(doc) = override_json {
-        usage_windows(&doc)
+    let mut quota = if let Some((doc, observed_at_ms)) = override_json {
+        usage_windows(&doc).map(|mut q| {
+            q.observed_at_ms = observed_at_ms;
+            q
+        })
     } else if let Some(creds) = creds.as_ref() {
         if let Some(embedded) = creds.embedded.clone() {
             Some(embedded)
@@ -211,6 +230,10 @@ fn claude_quota_uncached(
                 .as_deref()
                 .and_then(fetch_claude_oauth_usage)
                 .and_then(|value| usage_windows(&value))
+                .map(|mut q| {
+                    q.observed_at_ms = Some(now_ms());
+                    q
+                })
         } else {
             None
         }
@@ -222,6 +245,7 @@ fn claude_quota_uncached(
         primary_window: None,
         secondary_window: None,
         exhausted_reason: None,
+        observed_at_ms: (auth.is_some() && creds.is_none()).then(now_ms),
     });
     // `subscriptionType` is written once at `claude auth login`, so the
     // credentials file and `claude auth status` stay on the old plan after an
@@ -375,8 +399,10 @@ pub(crate) fn agy_account_quota(
             let key = format!("agy:{}", home_key(home_override));
             let raw = raw.to_string();
             return cached(ProbeKind::Agy, &key, move || {
-                let value = load_json_override(&raw)?;
-                agy_allowance(&value)
+                let (value, observed_at_ms) = load_json_override(&raw)?;
+                let mut quota = agy_allowance(&value)?;
+                quota.observed_at_ms = observed_at_ms;
+                Some(quota)
             });
         }
     }
@@ -448,6 +474,7 @@ struct AgyLive {
     buckets: Vec<AgyBucket>,
     models: Vec<AgyModelQuota>,
     tier: Option<String>,
+    observed_at_ms: Option<u64>,
 }
 
 const AGY_LIVE_NEGATIVE_TTL: Duration = Duration::from_secs(10);
@@ -513,7 +540,12 @@ fn fetch_agy_live(port: u16, csrf: &str) -> Option<AgyLive> {
         live.tier = parse_agy_tier(&doc);
         live.models = parse_agy_model_quotas(&doc);
     }
-    (live.tier.is_some() || !live.buckets.is_empty() || !live.models.is_empty()).then_some(live)
+    if live.tier.is_some() || !live.buckets.is_empty() || !live.models.is_empty() {
+        live.observed_at_ms = Some(now_ms());
+        Some(live)
+    } else {
+        None
+    }
 }
 
 /// `used_percent` for a protobuf-JSON `remainingFraction`. The wire format omits a zero,
@@ -623,11 +655,13 @@ fn agy_model_quota<'a>(live: &'a AgyLive, model: &str) -> Option<&'a AgyModelQuo
 }
 
 fn agy_live_usage(live: &AgyLive, model: Option<&str>) -> Option<SessionQuotaUsage> {
+    let now = now_ms();
+    let is_live = |reset: Option<u64>| reset.is_none_or(|r| r > now);
     let prefix = agy_bucket_prefix(model);
     let window = |name: &str, minutes: u64| {
         live.buckets
             .iter()
-            .find(|b| b.id.starts_with(prefix) && b.window == name)
+            .find(|b| b.id.starts_with(prefix) && b.window == name && is_live(b.resets_at_ms))
             .map(|b| QuotaWindowUsage {
                 used_percent: b.used_percent,
                 window_minutes: Some(minutes),
@@ -638,6 +672,7 @@ fn agy_live_usage(live: &AgyLive, model: Option<&str>) -> Option<SessionQuotaUsa
     let secondary_window = window("weekly", 10_080);
     // The active model's own quota replaces the shared 5h bucket once it resets later.
     if let Some(entry) = model.and_then(|m| agy_model_quota(live, m))
+        && is_live(entry.resets_at_ms)
         && entry.resets_at_ms > primary_window.as_ref().and_then(|w| w.resets_at_ms)
     {
         primary_window = Some(QuotaWindowUsage {
@@ -654,10 +689,16 @@ fn agy_live_usage(live: &AgyLive, model: Option<&str>) -> Option<SessionQuotaUsa
         primary_window,
         secondary_window,
         exhausted_reason: None,
+        observed_at_ms: live.observed_at_ms,
     })
 }
 
+#[cfg(test)]
 pub(crate) fn claude_rate_limit_reason(raw: &str) -> Option<String> {
+    claude_rate_limit_entry(raw).map(|(reason, _)| reason)
+}
+
+pub(crate) fn claude_rate_limit_entry(raw: &str) -> Option<(String, Option<u64>)> {
     let mut latest = None;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -674,13 +715,19 @@ pub(crate) fn claude_rate_limit_reason(raw: &str) -> Option<String> {
             "assistant" => match value.get("error") {
                 None | Some(Value::Null) => latest = None,
                 Some(Value::String(text)) if is_rate_text(text) => {
-                    latest = Some(text.clone());
+                    latest = Some((
+                        text.clone(),
+                        value.get("timestamp").and_then(parse_timestamp_value_ms),
+                    ));
                 }
                 Some(_) => {}
             },
             "system" | "api-request" => {
                 if let Some(found) = first_rate_string(&value, 0) {
-                    latest = Some(found);
+                    latest = Some((
+                        found,
+                        value.get("timestamp").and_then(parse_timestamp_value_ms),
+                    ));
                 }
             }
             _ => {}
@@ -689,7 +736,12 @@ pub(crate) fn claude_rate_limit_reason(raw: &str) -> Option<String> {
     latest
 }
 
+#[cfg(test)]
 pub(crate) fn antigravity_exhausted_reason(raw: &str) -> Option<String> {
+    antigravity_exhausted_entry(raw).map(|(reason, _)| reason)
+}
+
+pub(crate) fn antigravity_exhausted_entry(raw: &str) -> Option<(String, Option<u64>)> {
     let mut latest = None;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -709,7 +761,10 @@ pub(crate) fn antigravity_exhausted_reason(raw: &str) -> Option<String> {
                     continue;
                 };
                 if is_rate_text(error) {
-                    latest = Some(error.to_string());
+                    latest = Some((
+                        error.to_string(),
+                        value.get("created_at").and_then(parse_timestamp_value_ms),
+                    ));
                 }
             }
             _ => {}
@@ -787,7 +842,20 @@ fn resolve_host_bin(command: &str) -> Option<PathBuf> {
     local.is_file().then_some(local)
 }
 
-fn usage_override_json(var: &str, home_override: Option<&Path>, bin_set: bool) -> Option<Value> {
+fn file_modified_ms(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| u64::try_from(dur.as_millis()).ok())
+        .filter(|&ms| ms > 0)
+}
+
+fn usage_override_json(
+    var: &str,
+    home_override: Option<&Path>,
+    bin_set: bool,
+) -> Option<(Value, Option<u64>)> {
     let raw = std::env::var(var).ok()?;
     let raw = raw.trim();
     if raw.is_empty() {
@@ -799,12 +867,15 @@ fn usage_override_json(var: &str, home_override: Option<&Path>, bin_set: bool) -
     load_json_override(raw)
 }
 
-fn load_json_override(raw: &str) -> Option<Value> {
+fn load_json_override(raw: &str) -> Option<(Value, Option<u64>)> {
     if raw.starts_with('{') {
-        return serde_json::from_str(raw).ok();
+        let value = serde_json::from_str(raw).ok()?;
+        return Some((value, Some(now_ms())));
     }
-    let text = fs::read_to_string(raw).ok()?;
-    serde_json::from_str(&text).ok()
+    let path = Path::new(raw);
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str(&text).ok()?;
+    Some((value, file_modified_ms(path)))
 }
 
 /// Runs `bin` and returns its stdout. The child gets a scrubbed environment (see
@@ -895,6 +966,7 @@ fn muse_allowance(value: &Value) -> Option<SessionQuotaUsage> {
         primary_window,
         secondary_window,
         exhausted_reason: None,
+        observed_at_ms: None,
     })
 }
 
@@ -925,6 +997,7 @@ fn agy_allowance(value: &Value) -> Option<SessionQuotaUsage> {
         primary_window,
         secondary_window,
         exhausted_reason: None,
+        observed_at_ms: None,
     })
 }
 
@@ -948,6 +1021,7 @@ fn usage_windows(value: &Value) -> Option<SessionQuotaUsage> {
         primary_window,
         secondary_window,
         exhausted_reason: None,
+        observed_at_ms: None,
     })
 }
 
@@ -956,6 +1030,10 @@ fn window_from_usage(value: &Value, default_minutes: Option<u64>) -> Option<Quot
         .or_else(|| json_f64(value.get("used_percent")))
         .or_else(|| json_f64(value.get("utilization")))
         .or_else(|| json_f64(value.get("used_percentage")))?;
+    let resets_at_ms = resets_ms(value);
+    if resets_at_ms.is_some_and(|reset| reset <= now_ms()) {
+        return None;
+    }
     let window_minutes = value
         .get("windowDurationMins")
         .and_then(Value::as_u64)
@@ -964,7 +1042,7 @@ fn window_from_usage(value: &Value, default_minutes: Option<u64>) -> Option<Quot
     Some(QuotaWindowUsage {
         used_percent,
         window_minutes,
-        resets_at_ms: resets_ms(value),
+        resets_at_ms,
     })
 }
 
@@ -1358,7 +1436,7 @@ mod tests {
                 .join("sessions")
                 .join(session);
             fs::create_dir_all(&dir).unwrap();
-            let reason = "API error 429: Subscription quota exhausted. Your usage window resets at 2026-11-02T00:00:00Z.";
+            let reason = "API error 429: Subscription quota exhausted. Your usage window resets at 2099-11-02T00:00:00Z.";
             let failure = serde_json::json!({
                 "payload_type": "runtime.session",
                 "payload": { "event": { "kind": "failed", "reason": reason } }
@@ -1370,7 +1448,7 @@ mod tests {
             write_script(
                 &script,
                 &format!(
-                    "#!/bin/sh\nf=\"{}\"\nn=0\nif [ -f \"$f\" ]; then n=$(cat \"$f\"); fi\nn=$((n+1))\nprintf '%s\\n' \"$n\" > \"$f\"\nprintf '%s\\n' '{{\"allowance\":{{\"tier\":\"muse-pro\",\"window\":{{\"usedPercent\":12.5,\"windowDurationMins\":300,\"resetsAtMs\":1700000000000}},\"weekly\":{{\"usedPercent\":40,\"resetsAtMs\":1700086400000}}}}}}'\n",
+                    "#!/bin/sh\nf=\"{}\"\nn=0\nif [ -f \"$f\" ]; then n=$(cat \"$f\"); fi\nn=$((n+1))\nprintf '%s\\n' \"$n\" > \"$f\"\nprintf '%s\\n' '{{\"allowance\":{{\"tier\":\"muse-pro\",\"window\":{{\"usedPercent\":12.5,\"windowDurationMins\":300,\"resetsAtMs\":4100000000000}},\"weekly\":{{\"usedPercent\":40,\"resetsAtMs\":4100086400000}}}}}}'\n",
                     counter_path.display()
                 ),
             );
@@ -1387,12 +1465,13 @@ mod tests {
             assert_eq!(counter(&counter_path), 1);
             assert_eq!(first.tier.as_deref(), Some("muse-pro"));
             assert_eq!(first.exhausted_reason.as_deref(), Some(reason));
+            assert!(first.observed_at_ms.is_some());
             assert_eq!(
                 first.primary_window,
                 Some(QuotaWindowUsage {
                     used_percent: 12.5,
                     window_minutes: Some(300),
-                    resets_at_ms: Some(1_700_000_000_000),
+                    resets_at_ms: Some(4_100_000_000_000),
                 })
             );
             assert_eq!(
@@ -1400,7 +1479,7 @@ mod tests {
                 Some(QuotaWindowUsage {
                     used_percent: 40.0,
                     window_minutes: Some(10_080),
-                    resets_at_ms: Some(1_700_086_400_000),
+                    resets_at_ms: Some(4_100_086_400_000),
                 })
             );
 
@@ -1456,7 +1535,7 @@ mod tests {
                     counter_path.display()
                 ),
             );
-            let usage = r#"{"five_hour":{"utilization":10,"resets_at":"2026-11-05T01:11:25.780Z"},"seven_day":{"utilization":20,"resets_at":"2026-11-05T01:11:25.780Z"}}"#;
+            let usage = r#"{"five_hour":{"utilization":10,"resets_at":"2099-11-05T01:11:25.780Z"},"seven_day":{"utilization":20,"resets_at":"2099-11-05T01:11:25.780Z"}}"#;
             // SAFETY: this test holds PROBE_LOCK until `_clear` drops and removes the vars.
             unsafe {
                 std::env::set_var("FL_HUB_CLAUDE_BIN", &script);
@@ -1465,7 +1544,7 @@ mod tests {
                 std::env::remove_var("FL_AGY_QUOTA_JSON");
             }
             expire_direct_quota_cache();
-            let expected_ms = At::parse("2026-11-05T01:11:25.780Z").unwrap().unix_millis();
+            let expected_ms = At::parse("2099-11-05T01:11:25.780Z").unwrap().unix_millis();
 
             let first =
                 read_session_quota_usage_locked("claude-poll", Some(home)).expect("claude quota");
@@ -1521,7 +1600,7 @@ mod tests {
             fs::create_dir_all(&claude_dir).unwrap();
             fs::write(
                 claude_dir.join(".credentials.json"),
-                r#"{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"default_claude_max","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2026-11-05T01:11:25.780Z"},"seven_day":{"utilization":9,"resets_at":"2026-11-05T01:11:25.780Z"}}}"#,
+                r#"{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"default_claude_max","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2099-11-05T01:11:25.780Z"},"seven_day":{"utilization":9,"resets_at":"2099-11-05T01:11:25.780Z"}}}"#,
             )
             .unwrap();
             let projects = claude_dir.join("projects").join("demo");
@@ -1563,7 +1642,7 @@ mod tests {
             fs::create_dir_all(&claude_dir).unwrap();
             fs::write(
                 claude_dir.join(".credentials.json"),
-                r#"{"claudeAiOauth":{"subscriptionType":"pro","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2026-11-05T01:11:25.780Z"}}}"#,
+                r#"{"claudeAiOauth":{"subscriptionType":"pro","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2099-11-05T01:11:25.780Z"}}}"#,
             )
             .unwrap();
             fs::write(
@@ -1662,7 +1741,7 @@ mod tests {
             unsafe {
                 std::env::set_var(
                     "FL_AGY_QUOTA_JSON",
-                    r#"{"tier":"Google AI Pro","window":{"usedPercent":15,"windowDurationMins":300,"resetsAtMs":1700000000000},"weekly":{"usedPercent":55,"resetsAtMs":1700086400000}}"#,
+                    r#"{"tier":"Google AI Pro","window":{"usedPercent":15,"windowDurationMins":300,"resetsAtMs":4100000000000},"weekly":{"usedPercent":55,"resetsAtMs":4100086400000}}"#,
                 );
             }
             expire_direct_quota_cache();
@@ -1683,7 +1762,7 @@ mod tests {
             unsafe {
                 std::env::set_var(
                     "FL_AGY_QUOTA_JSON",
-                    r#"{"tier":"changed","window":{"usedPercent":99,"windowDurationMins":300,"resetsAtMs":1}}"#,
+                    r#"{"tier":"changed","window":{"usedPercent":99,"windowDurationMins":300,"resetsAtMs":4100000000001}}"#,
                 );
             }
             let cached = read_session_quota_usage_locked(conv, Some(home)).expect("cached agy");
@@ -1723,7 +1802,7 @@ mod tests {
                     counter_path.display()
                 ),
             );
-            let usage = r#"{"five_hour":{"utilization":10,"resets_at":"2026-11-05T01:11:25.780Z"},"seven_day":{"utilization":20,"resets_at":"2026-11-05T01:11:25.780Z"}}"#;
+            let usage = r#"{"five_hour":{"utilization":10,"resets_at":"2099-11-05T01:11:25.780Z"},"seven_day":{"utilization":20,"resets_at":"2099-11-05T01:11:25.780Z"}}"#;
             // SAFETY: this test holds PROBE_LOCK until `_clear` drops and removes the vars.
             unsafe {
                 std::env::set_var("FL_HUB_CLAUDE_BIN", &script);
@@ -1748,7 +1827,7 @@ mod tests {
             fs::create_dir_all(dir_b.join("projects").join("demo")).unwrap();
             fs::write(
                 dir_b.join(".credentials.json"),
-                r#"{"claudeAiOauth":{"subscriptionType":"pro","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2026-11-05T01:11:25.780Z"},"seven_day":{"utilization":9,"resets_at":"2026-11-05T01:11:25.780Z"}}}"#,
+                r#"{"claudeAiOauth":{"subscriptionType":"pro","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2099-11-05T01:11:25.780Z"},"seven_day":{"utilization":9,"resets_at":"2099-11-05T01:11:25.780Z"}}}"#,
             )
             .unwrap();
             fs::write(
@@ -1786,7 +1865,7 @@ mod tests {
             fs::create_dir_all(dir.join("projects").join("demo")).unwrap();
             fs::write(
                 dir.join(".credentials.json"),
-                r#"{"claudeAiOauth":{"rateLimitTier":"default_claude_max","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2026-11-05T01:11:25.780Z"},"seven_day":{"utilization":9,"resets_at":"2026-11-05T01:11:25.780Z"}}}"#,
+                r#"{"claudeAiOauth":{"rateLimitTier":"default_claude_max","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2099-11-05T01:11:25.780Z"},"seven_day":{"utilization":9,"resets_at":"2099-11-05T01:11:25.780Z"}}}"#,
             )
             .unwrap();
             fs::write(
@@ -1869,16 +1948,16 @@ mod tests {
 
     const AGY_SUMMARY: &str = r#"{"response":{"groups":[
         {"displayName":"Gemini Models","buckets":[
-            {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.9739852,"resetTime":"2026-11-07T20:27:46Z"},
-            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.99091005,"resetTime":"2026-11-01T06:46:15Z"}]},
+            {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.9739852,"resetTime":"2099-11-07T20:27:46Z"},
+            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.99091005,"resetTime":"2099-11-01T06:46:15Z"}]},
         {"displayName":"Claude and GPT models","buckets":[
-            {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.9975795,"resetTime":"2026-11-02T19:29:36Z"},
-            {"bucketId":"3p-5h","window":"5h","remainingFraction":1,"resetTime":"2026-11-01T07:10:39Z"}]}]}}"#;
+            {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.9975795,"resetTime":"2099-11-02T19:29:36Z"},
+            {"bucketId":"3p-5h","window":"5h","remainingFraction":1,"resetTime":"2099-11-01T07:10:39Z"}]}]}}"#;
     const AGY_STATUS: &str = r#"{"userStatus":{"planStatus":{"planInfo":{"teamsTier":"TEAMS_TIER_PRO","planName":"Pro"}},
         "cascadeModelConfigData":{"defaultOverrideModelConfig":{"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"}},
         "clientModelConfigs":[
             {"modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"},
-             "quotaInfo":{"remainingFraction":0.9811882,"resetTime":"2026-11-02T17:46:15Z"}},
+             "quotaInfo":{"remainingFraction":0.9811882,"resetTime":"2099-11-02T17:46:15Z"}},
             {"modelId":"claude-opus-5-5","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M12"}}]}}}"#;
 
     fn ms(iso: &str) -> u64 {
@@ -1890,6 +1969,7 @@ mod tests {
             buckets: parse_agy_buckets(&serde_json::from_str(AGY_SUMMARY).unwrap()),
             models: parse_agy_model_quotas(&serde_json::from_str(AGY_STATUS).unwrap()),
             tier: parse_agy_tier(&serde_json::from_str(AGY_STATUS).unwrap()),
+            observed_at_ms: None,
         }
     }
 
@@ -1909,10 +1989,10 @@ mod tests {
             let (five, week) = (q.primary_window.unwrap(), q.secondary_window.unwrap());
             assert!(near(five.used_percent, 0.0), "{model}: {five:?}");
             assert_eq!(five.window_minutes, Some(300));
-            assert_eq!(five.resets_at_ms, Some(ms("2026-11-01T07:10:39Z")));
+            assert_eq!(five.resets_at_ms, Some(ms("2099-11-01T07:10:39Z")));
             assert!(near(week.used_percent, (1.0 - 0.9975795) * 100.0));
             assert_eq!(week.window_minutes, Some(10_080));
-            assert_eq!(week.resets_at_ms, Some(ms("2026-11-02T19:29:36Z")));
+            assert_eq!(week.resets_at_ms, Some(ms("2099-11-02T19:29:36Z")));
             assert_eq!(q.tier.as_deref(), Some("pro"));
         }
         // Any other model, and an unknown one, reads `gemini-*`.
@@ -1926,7 +2006,7 @@ mod tests {
     #[test]
     fn agy_live_model_quota_replaces_the_5h_bucket_only_when_it_resets_later() {
         let live = agy_fixture_live();
-        // The model resets 2026-11-02T17:46:15Z, after the 5h bucket's 2026-11-01T06:46:15Z.
+        // The model resets 2099-11-02T17:46:15Z, after the 5h bucket's 2099-11-01T06:46:15Z.
         let q = agy_live_usage(&live, Some("gemini-4-argon")).unwrap();
         let five = q.primary_window.unwrap();
         assert!(
@@ -1934,7 +2014,7 @@ mod tests {
             "{five:?}"
         );
         assert_eq!(five.window_minutes, Some(300));
-        assert_eq!(five.resets_at_ms, Some(ms("2026-11-02T17:46:15Z")));
+        assert_eq!(five.resets_at_ms, Some(ms("2099-11-02T17:46:15Z")));
         // The weekly window is untouched.
         assert!(near(
             q.secondary_window.unwrap().used_percent,
@@ -1943,18 +2023,18 @@ mod tests {
 
         // An older model reset keeps the bucket.
         let mut older = live.clone();
-        older.models[0].resets_at_ms = Some(ms("2026-11-01T06:00:00Z"));
+        older.models[0].resets_at_ms = Some(ms("2099-11-01T06:00:00Z"));
         let five = agy_live_usage(&older, Some("gemini-4-argon"))
             .unwrap()
             .primary_window
             .unwrap();
-        assert_eq!(five.resets_at_ms, Some(ms("2026-11-01T06:46:15Z")));
+        assert_eq!(five.resets_at_ms, Some(ms("2099-11-01T06:46:15Z")));
         // A model with no quotaInfo keeps the bucket.
         let five = agy_live_usage(&live, Some("claude-opus-5-5"))
             .unwrap()
             .primary_window
             .unwrap();
-        assert_eq!(five.resets_at_ms, Some(ms("2026-11-01T07:10:39Z")));
+        assert_eq!(five.resets_at_ms, Some(ms("2099-11-01T07:10:39Z")));
     }
 
     #[test]
@@ -2274,7 +2354,7 @@ mod tests {
             assert_eq!(q.tier.as_deref(), Some("pro"));
             assert_eq!(
                 q.primary_window.as_ref().unwrap().resets_at_ms,
-                Some(ms("2026-11-01T07:10:39Z"))
+                Some(ms("2099-11-01T07:10:39Z"))
             );
 
             // The watch entry knows only the session id: the route and the model come from
@@ -2399,7 +2479,7 @@ mod tests {
             assert_eq!(q.tier.as_deref(), Some("pro"));
             assert_eq!(
                 q.primary_window.as_ref().unwrap().resets_at_ms,
-                Some(ms("2026-11-01T06:46:15Z"))
+                Some(ms("2099-11-01T06:46:15Z"))
             );
             assert!(
                 stub.calls().iter().all(|(_, csrf)| csrf == "stub-csrf"),
@@ -2444,7 +2524,7 @@ mod tests {
             assert_eq!(q.tier.as_deref(), Some("pro"));
             assert_eq!(
                 q.primary_window.as_ref().unwrap().resets_at_ms,
-                Some(ms("2026-11-01T06:46:15Z"))
+                Some(ms("2099-11-01T06:46:15Z"))
             );
             assert_eq!(q.exhausted_reason, None);
             assert!(!stub.calls().is_empty());
@@ -2497,8 +2577,12 @@ mod tests {
                 expire_direct_quota_cache();
                 crate::discovery::quota_for_resolved_route("antigravity", None, Some(home), conv)
             };
-            let claude_5h = Some(ms("2026-11-01T07:10:39Z"));
+            let claude_5h = Some(ms("2099-11-01T07:10:39Z"));
+            let before_first = now_ms();
             let first = watch().expect("old endpoint");
+            let after_first = now_ms();
+            let first_obs = first.observed_at_ms.expect("first observed_at_ms");
+            assert!(first_obs >= before_first && first_obs <= after_first);
             assert_eq!(
                 first.primary_window.as_ref().unwrap().resets_at_ms,
                 claude_5h
@@ -2509,8 +2593,22 @@ mod tests {
             write_agy_route(home, conv, Some((&new_addr, "csrf-new")));
             cold_discovery_pass(home);
             let old_before = old.calls().len();
+            let before_second = now_ms();
             let second = watch().expect("new endpoint");
-            assert_eq!(second, first, "the remembered model is kept");
+            let after_second = now_ms();
+            let second_obs = second.observed_at_ms.expect("second observed_at_ms");
+            assert!(
+                second_obs >= first_obs
+                    && second_obs >= before_second
+                    && second_obs <= after_second
+            );
+            assert_eq!(second.tier, first.tier);
+            assert_eq!(
+                second.primary_window, first.primary_window,
+                "the remembered model is kept"
+            );
+            assert_eq!(second.secondary_window, first.secondary_window);
+            assert_eq!(second.exhausted_reason, first.exhausted_reason);
             assert_eq!(old.calls().len(), old_before, "the old stub is not asked");
             assert!(!new.calls().is_empty());
             assert!(new.calls().iter().all(|(_, csrf)| csrf == "csrf-new"));
@@ -2519,8 +2617,17 @@ mod tests {
             write_agy_route(home, conv, None);
             cold_discovery_pass(home);
             let new_before = new.calls().len();
+            let before_third = now_ms();
             let third = watch().expect("endpoint survives an empty route");
-            assert_eq!(third, first);
+            let after_third = now_ms();
+            let third_obs = third.observed_at_ms.expect("third observed_at_ms");
+            assert!(
+                third_obs >= second_obs && third_obs >= before_third && third_obs <= after_third
+            );
+            assert_eq!(third.tier, first.tier);
+            assert_eq!(third.primary_window, first.primary_window);
+            assert_eq!(third.secondary_window, first.secondary_window);
+            assert_eq!(third.exhausted_reason, first.exhausted_reason);
             assert!(new.calls().len() > new_before);
             assert_eq!(old.calls().len(), old_before);
             old.shutdown();
@@ -2575,5 +2682,134 @@ mod tests {
             assert!(!agy_live_cache_has(port, "other-csrf"));
             AGY_LIVE_CACHE.lock().unwrap().clear();
         });
+    }
+
+    #[test]
+    fn file_path_overrides_use_file_mtime_and_inline_overrides_use_capture_time() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let claude_file = home.join("claude-usage.json");
+            let agy_file = home.join("agy-quota.json");
+            fs::write(
+                &claude_file,
+                r#"{"five_hour":{"utilization":18,"resets_at":"2099-11-05T01:11:25.780Z"}}"#,
+            )
+            .unwrap();
+            fs::write(
+                &agy_file,
+                r#"{"tier":"Google AI Pro","window":{"usedPercent":25,"windowDurationMins":300,"resetsAtMs":4100000000000}}"#,
+            )
+            .unwrap();
+
+            // Set both files' mtimes into the past so mtime is strictly older than now_ms().
+            let old_mtime_sec: u64 = 1_700_000_000;
+            let old_mtime_ms: u64 = old_mtime_sec * 1000;
+            let old_time = std::time::UNIX_EPOCH + Duration::from_secs(old_mtime_sec);
+            fs::File::open(&claude_file)
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+            fs::File::open(&agy_file)
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+            assert_eq!(file_modified_ms(&claude_file), Some(old_mtime_ms));
+            assert_eq!(file_modified_ms(&agy_file), Some(old_mtime_ms));
+
+            // 1. File-path overrides carry the file's mtime, not now_ms(), both cold and after cache expiry.
+            unsafe {
+                std::env::set_var("FL_HUB_CLAUDE_BIN", "/nonexistent/claude");
+                std::env::set_var("FL_CLAUDE_USAGE_JSON", &claude_file);
+                std::env::set_var("FL_AGY_QUOTA_JSON", &agy_file);
+            }
+            expire_direct_quota_cache();
+            let claude_from_file = claude_account_quota(Some(home)).expect("claude file override");
+            assert_eq!(claude_from_file.observed_at_ms, Some(old_mtime_ms));
+            let agy_from_file = agy_account_quota(Some(home), &AgyQuotaTarget::default())
+                .expect("agy file override");
+            assert_eq!(agy_from_file.observed_at_ms, Some(old_mtime_ms));
+
+            // Cached hits and post-expiry refreshes still report the file's mtime, never now_ms().
+            let claude_cached = claude_account_quota(Some(home)).expect("claude cached");
+            assert_eq!(claude_cached.observed_at_ms, Some(old_mtime_ms));
+            let agy_cached =
+                agy_account_quota(Some(home), &AgyQuotaTarget::default()).expect("agy cached");
+            assert_eq!(agy_cached.observed_at_ms, Some(old_mtime_ms));
+            expire_direct_quota_cache();
+            let claude_reloaded = claude_account_quota(Some(home)).expect("claude reloaded");
+            assert_eq!(claude_reloaded.observed_at_ms, Some(old_mtime_ms));
+            let agy_reloaded =
+                agy_account_quota(Some(home), &AgyQuotaTarget::default()).expect("agy reloaded");
+            assert_eq!(agy_reloaded.observed_at_ms, Some(old_mtime_ms));
+
+            // 2. Inline JSON overrides carry capture time in [before_ms, after_ms].
+            unsafe {
+                std::env::set_var(
+                    "FL_CLAUDE_USAGE_JSON",
+                    r#"{"five_hour":{"utilization":32,"resets_at":"2099-11-05T01:11:25.780Z"}}"#,
+                );
+                std::env::set_var(
+                    "FL_AGY_QUOTA_JSON",
+                    r#"{"tier":"Ultra","window":{"usedPercent":40,"windowDurationMins":300,"resetsAtMs":4100000000000}}"#,
+                );
+            }
+            expire_direct_quota_cache();
+            let before_ms = now_ms();
+            let claude_inline = claude_account_quota(Some(home)).expect("claude inline override");
+            let agy_inline = agy_account_quota(Some(home), &AgyQuotaTarget::default())
+                .expect("agy inline override");
+            let after_ms = now_ms();
+            let claude_obs = claude_inline.observed_at_ms.expect("claude inline obs");
+            let agy_obs = agy_inline.observed_at_ms.expect("agy inline obs");
+            assert!(
+                claude_obs >= before_ms && claude_obs <= after_ms,
+                "claude inline obs {claude_obs} not in [{before_ms}, {after_ms}]"
+            );
+            assert!(
+                agy_obs >= before_ms && agy_obs <= after_ms,
+                "agy inline obs {agy_obs} not in [{before_ms}, {after_ms}]"
+            );
+        });
+    }
+
+    #[test]
+    fn merge_account_quota_preserves_embedded_windows_observation_time() {
+        let embedded = SessionQuotaUsage {
+            tier: Some("max".to_string()),
+            primary_window: Some(QuotaWindowUsage {
+                used_percent: 12.0,
+                window_minutes: Some(300),
+                resets_at_ms: Some(4_100_000_000_000),
+            }),
+            secondary_window: None,
+            exhausted_reason: None,
+            observed_at_ms: None,
+        };
+        let disk_reason = SessionQuotaUsage {
+            tier: None,
+            primary_window: None,
+            secondary_window: None,
+            exhausted_reason: Some("HTTP 429 rate limit reached".to_string()),
+            observed_at_ms: Some(1_762_000_000_000),
+        };
+        let merged = merge_account_quota(Some(embedded), Some(disk_reason.clone())).unwrap();
+        assert_eq!(merged.observed_at_ms, None);
+        assert_eq!(
+            merged.exhausted_reason.as_deref(),
+            Some("HTTP 429 rate limit reached")
+        );
+
+        // When account has only tier (no windows), disk observation time is used for disk's data.
+        let tier_only = SessionQuotaUsage {
+            tier: Some("max".to_string()),
+            primary_window: None,
+            secondary_window: None,
+            exhausted_reason: None,
+            observed_at_ms: None,
+        };
+        let merged_tier_only = merge_account_quota(Some(tier_only), Some(disk_reason)).unwrap();
+        assert_eq!(merged_tier_only.observed_at_ms, Some(1_762_000_000_000));
     }
 }

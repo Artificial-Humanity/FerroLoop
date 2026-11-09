@@ -287,6 +287,9 @@ pub(crate) fn discovered_quotas(state: &HubState) -> Vec<WatchQuotaWindow> {
         if s.source != "route" {
             continue;
         }
+        if s.adapter == "grok" && s.transcript_path.is_none() {
+            continue;
+        }
         if let Some(q) =
             quota_for_resolved_route(&s.adapter, s.transcript_path.as_deref(), home, &s.id)
         {
@@ -820,6 +823,7 @@ mod tests {
                 resets_at_ms: Some(20),
             }),
             exhausted_reason: None,
+            observed_at_ms: None,
         };
         let w = quota_windows("codex", "thread-1", &both);
         assert_eq!(w.len(), 2);
@@ -835,6 +839,7 @@ mod tests {
             primary_window: None,
             secondary_window: None,
             exhausted_reason: Some("rate limited".into()),
+            observed_at_ms: None,
         };
         let w = quota_windows("claude", "s", &exhausted);
         assert_eq!(w.len(), 1);
@@ -867,6 +872,7 @@ mod tests {
             primary_window: None,
             secondary_window: None,
             exhausted_reason: None,
+            observed_at_ms: None,
         };
         assert!(quota_windows("grok", "s", &empty).is_empty());
     }
