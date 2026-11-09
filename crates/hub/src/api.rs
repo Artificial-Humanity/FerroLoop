@@ -6794,6 +6794,22 @@ fn handle_post_session_model(
         (None, None, None) => "unknown".to_string(),
     };
 
+    if vendor == "antigravity" && thinking_level.is_none() {
+        let normalized_model = model.trim().to_ascii_lowercase();
+        let has_effort_suffix =
+            fl_wire::vendor_adapter::split_agy_thinking_suffix(&normalized_model)
+                .1
+                .is_some();
+        let has_fixed_effort = lifecycle::agy_cli_model_id(&model, Some("low"))
+            == lifecycle::agy_cli_model_id(&model, Some("high"));
+        if !has_effort_suffix && !has_fixed_effort {
+            return HttpResponse::json(
+                400,
+                json!({ "error": "choose a thinking level for this Antigravity model" }),
+            );
+        }
+    }
+
     // Key the override by the discovered session id. A session discovery does not list (a
     // route or hosted record only) has no id a summary could match, so it is keyed by its
     // lowercased persona, which `apply_model_overrides` also matches.

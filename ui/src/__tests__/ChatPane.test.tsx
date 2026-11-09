@@ -1963,7 +1963,7 @@ describe("Resizable chat composer (Record 57 & Record 112)", () => {
     );
 
     expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
-      "claude · claude-opus-5-5 (high)",
+      "claude · claude-opus-5-5 (unknown)",
     );
 
     rerender(
@@ -1978,7 +1978,7 @@ describe("Resizable chat composer (Record 57 & Record 112)", () => {
     );
 
     expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
-      "antigravity · gemini-4-argon (high)",
+      "antigravity · gemini-4-argon (unknown)",
     );
 
     const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
