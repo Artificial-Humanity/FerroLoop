@@ -389,15 +389,22 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
         setInternalWireStatus({
           daemon: res.daemon,
           dispatch_diagnostics: res.dispatch_diagnostics ?? null,
+          pending_recipients_available:
+            typeof res.pending_recipients_available === "boolean"
+              ? res.pending_recipients_available
+              : res.pending_recipients !== null,
           pending_recipients: Array.isArray(res.pending_recipients)
             ? res.pending_recipients
-            : [],
+            : res.pending_recipients === null
+              ? null
+              : [],
         });
       }
     } catch {
       setInternalWireStatus({
         daemon: "unreachable",
         dispatch_diagnostics: null,
+        pending_recipients_available: false,
         pending_recipients: [],
       });
     }
@@ -1298,6 +1305,9 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     effectiveWireStatus !== null
       ? (() => {
           const diag = effectiveWireStatus.dispatch_diagnostics;
+          const pendingAvailable =
+            effectiveWireStatus.pending_recipients_available !== false &&
+            effectiveWireStatus.pending_recipients !== null;
           const displayedPending = (effectiveWireStatus.pending_recipients ?? []).filter(
             (item) =>
               item.pending_count > 0 &&
@@ -1373,20 +1383,30 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                   </span>
                 ) : null}
 
-                {displayedPending.map((item) => (
+                {!pendingAvailable ? (
                   <span
-                    key={item.recipient}
-                    data-testid={`wire-pending-recipient-${item.recipient}`}
+                    data-testid="wire-pending-unavailable"
                     className="fd-badge fd-mono"
-                    style={{
-                      color: "var(--accent-hover)",
-                      borderColor: "var(--border-accent)",
-                      backgroundColor: "var(--accent-subtle)",
-                    }}
+                    style={{ color: "var(--text-muted)" }}
                   >
-                    {`${item.recipient}: ${item.pending_count} pending (oldest ${formatPendingAge(item.oldest_pending_age_ms)})`}
+                    pending: unavailable
                   </span>
-                ))}
+                ) : (
+                  displayedPending.map((item) => (
+                    <span
+                      key={item.recipient}
+                      data-testid={`wire-pending-recipient-${item.recipient}`}
+                      className="fd-badge fd-mono"
+                      style={{
+                        color: "var(--accent-hover)",
+                        borderColor: "var(--border-accent)",
+                        backgroundColor: "var(--accent-subtle)",
+                      }}
+                    >
+                      {`${item.recipient}: ${item.pending_count} pending (oldest ${formatPendingAge(item.oldest_pending_age_ms)})`}
+                    </span>
+                  ))
+                )}
               </div>
 
               {diag !== null && !isSupportedEmpty && (

@@ -380,6 +380,45 @@ describe("WireMailPane", () => {
     expect(screen.queryByRole("button", { name: /clear|unfence|retry|replay/i })).toBeNull();
   });
 
+  it("renders wire-pending-unavailable when pending_recipients_available is false and omits it when true with empty pending_recipients", () => {
+    const unavailableStatus: WireStatusResponse = {
+      daemon: "inactive",
+      dispatch_diagnostics: null,
+      pending_recipients_available: false,
+      pending_recipients: [],
+    };
+
+    const { rerender } = render(
+      <WireMailPane
+        messages={SAMPLE_MESSAGES}
+        selectedAgentName="ferris"
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        wireStatus={unavailableStatus}
+      />,
+    );
+
+    const pendingUnavailable = screen.getByTestId("wire-pending-unavailable");
+    expect(pendingUnavailable).toHaveTextContent(/^pending: unavailable$/);
+
+    const availableEmptyStatus: WireStatusResponse = {
+      daemon: "inactive",
+      dispatch_diagnostics: null,
+      pending_recipients_available: true,
+      pending_recipients: [],
+    };
+
+    rerender(
+      <WireMailPane
+        messages={SAMPLE_MESSAGES}
+        selectedAgentName="ferris"
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        wireStatus={availableEmptyStatus}
+      />,
+    );
+
+    expect(screen.queryByTestId("wire-pending-unavailable")).toBeNull();
+  });
+
   it("fetches wireStatus via apiClient.getWireStatus on mount and on Refresh click, surfacing HTTP errors as unreachable", async () => {
     const getWireStatus = vi
       .fn<() => Promise<WireStatusResponse>>()
@@ -396,6 +435,7 @@ describe("WireMailPane", () => {
           omitted_evidence_total: 0,
           omitted_evidence_total_saturated: false,
         },
+        pending_recipients_available: true,
         pending_recipients: [],
       })
       .mockRejectedValueOnce(new Error("HTTP 502"));
@@ -422,6 +462,7 @@ describe("WireMailPane", () => {
     expect(await screen.findByTestId("wire-diagnostics-available")).toHaveTextContent(
       "Auto-push diagnostics: 0 holds (daemon_lifetime)",
     );
+    expect(screen.queryByTestId("wire-pending-unavailable")).toBeNull();
 
     const refreshBtn = screen.getByTestId("wire-refresh-btn");
     fireEvent.click(refreshBtn);
@@ -432,6 +473,9 @@ describe("WireMailPane", () => {
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(await screen.findByTestId("wire-diagnostics-unavailable")).toHaveTextContent(
       "Auto-push diagnostics: unavailable (status query failed)",
+    );
+    expect(screen.getByTestId("wire-pending-unavailable")).toHaveTextContent(
+      /^pending: unavailable$/,
     );
   });
 });

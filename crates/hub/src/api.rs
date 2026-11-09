@@ -1695,6 +1695,7 @@ pub enum WireDaemonState {
 pub struct HubWireStatusResponse {
     pub daemon: WireDaemonState,
     pub dispatch_diagnostics: Option<HubDispatchDiagnostics>,
+    pub pending_recipients_available: bool,
     pub pending_recipients: Vec<HubRecipientPendingSummary>,
 }
 
@@ -1888,6 +1889,7 @@ impl HubWireStatusResponse {
         Self {
             daemon: WireDaemonState::Active,
             dispatch_diagnostics: dispatch_diagnostics.map(HubDispatchDiagnostics::from_wire),
+            pending_recipients_available: true,
             pending_recipients: pending_recipients
                 .into_iter()
                 .map(HubRecipientPendingSummary::from_wire)
@@ -1928,34 +1930,46 @@ fn probe_wire_daemon(socket_path: PathBuf, timeout: Duration) -> WireDaemonProbe
         .unwrap_or(WireDaemonProbe::Unreachable)
 }
 
-fn store_pending_recipients(state: &HubState) -> Vec<HubRecipientPendingSummary> {
+fn store_pending_recipients(state: &HubState) -> Option<Vec<HubRecipientPendingSummary>> {
     let now = stamp::now();
-    state
-        .open_store()
-        .ok()
-        .map(|store| {
-            fl_wire::daemon::collect_pending_recipient_summaries(&*store, &now)
-                .into_iter()
-                .map(HubRecipientPendingSummary::from_wire)
-                .collect()
-        })
-        .unwrap_or_default()
+    state.open_store().ok().map(|store| {
+        fl_wire::daemon::collect_pending_recipient_summaries(&*store, &now)
+            .into_iter()
+            .map(HubRecipientPendingSummary::from_wire)
+            .collect()
+    })
 }
 
 fn handle_get_wire_status(state: &HubState) -> HttpResponse {
     let socket_path = state.resolve_wire_socket_path();
     let response = match probe_wire_daemon(socket_path, WIRE_STATUS_RPC_TIMEOUT) {
         WireDaemonProbe::Active(status) => HubWireStatusResponse::from_daemon_status(*status),
-        WireDaemonProbe::Inactive => HubWireStatusResponse {
-            daemon: WireDaemonState::Inactive,
-            dispatch_diagnostics: None,
-            pending_recipients: store_pending_recipients(state),
-        },
-        WireDaemonProbe::Unreachable => HubWireStatusResponse {
-            daemon: WireDaemonState::Unreachable,
-            dispatch_diagnostics: None,
-            pending_recipients: store_pending_recipients(state),
-        },
+        WireDaemonProbe::Inactive => {
+            let (pending_recipients_available, pending_recipients) =
+                match store_pending_recipients(state) {
+                    Some(list) => (true, list),
+                    None => (false, Vec::new()),
+                };
+            HubWireStatusResponse {
+                daemon: WireDaemonState::Inactive,
+                dispatch_diagnostics: None,
+                pending_recipients_available,
+                pending_recipients,
+            }
+        }
+        WireDaemonProbe::Unreachable => {
+            let (pending_recipients_available, pending_recipients) =
+                match store_pending_recipients(state) {
+                    Some(list) => (true, list),
+                    None => (false, Vec::new()),
+                };
+            HubWireStatusResponse {
+                daemon: WireDaemonState::Unreachable,
+                dispatch_diagnostics: None,
+                pending_recipients_available,
+                pending_recipients,
+            }
+        }
     };
     HttpResponse::json(
         200,
@@ -10495,6 +10509,7 @@ mod council_guidance_tests {
             let body = resp.json_value().unwrap();
             assert_eq!(body["daemon"], "inactive");
             assert!(body["dispatch_diagnostics"].is_null());
+            assert_eq!(body["pending_recipients_available"], json!(true));
             let pending = body["pending_recipients"].as_array().unwrap();
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0]["recipient"], "felix");
@@ -10518,10 +10533,60 @@ mod council_guidance_tests {
         let body = resp.json_value().unwrap();
         assert_eq!(body["daemon"], "inactive");
         assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
         let pending = body["pending_recipients"].as_array().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["recipient"], "felix");
         assert_eq!(pending[0]["pending_count"], 1);
+    }
+
+    #[test]
+    fn wire_status_reports_pending_recipients_unavailable_when_store_fails_to_open() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TempDir::new().unwrap();
+        let parent_file = tmp.path().join("not-a-dir");
+        std::fs::write(&parent_file, b"regular file").unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: parent_file.join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            owner_token: Some("owner-secret".into()),
+            ..HubServerConfig::default()
+        });
+        assert!(state.open_store().is_err());
+
+        // 1. Inactive socket + broken store -> pending_recipients_available == false.
+        state.set_wire_socket(Some(tmp.path().join("missing-wire.sock")));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "inactive");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(false));
+        assert_eq!(body["pending_recipients"], json!([]));
+
+        // 2. Unreachable socket + broken store -> pending_recipients_available == false.
+        let bad_sock = tmp.path().join("bad-wire.sock");
+        let bad_listener = UnixListener::bind(&bad_sock).unwrap();
+        let bad_handle = std::thread::spawn(move || {
+            let (mut stream, _) = bad_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = stream.write_all(b"{invalid\n");
+            let _ = stream.flush();
+        });
+        state.set_wire_socket(Some(bad_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "unreachable");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(false));
+        assert_eq!(body["pending_recipients"], json!([]));
+        let _ = bad_handle.join();
     }
 
     #[test]
@@ -10568,6 +10633,7 @@ mod council_guidance_tests {
         assert_eq!(body["daemon"], "unreachable");
         assert_ne!(body["daemon"], "inactive");
         assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
         assert_eq!(body["pending_recipients"][0]["recipient"], "kacey");
         assert_eq!(body["pending_recipients"][0]["pending_count"], 1);
         let _ = stall_handle.join();
@@ -10585,6 +10651,7 @@ mod council_guidance_tests {
         let body = resp.json_value().unwrap();
         assert_eq!(body["daemon"], "unreachable");
         assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
         assert_eq!(body["pending_recipients"][0]["recipient"], "kacey");
         let _ = eof_handle.join();
 
@@ -10605,6 +10672,7 @@ mod council_guidance_tests {
         let body = resp.json_value().unwrap();
         assert_eq!(body["daemon"], "unreachable");
         assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
         assert_eq!(body["pending_recipients"][0]["recipient"], "kacey");
         let _ = bad_handle.join();
     }
@@ -10664,6 +10732,7 @@ mod council_guidance_tests {
         );
         assert_eq!(body["dispatch_diagnostics"]["scope"], "daemon_lifetime");
         assert_eq!(body["dispatch_diagnostics"]["records"], json!([]));
+        assert_eq!(body["pending_recipients_available"], json!(true));
         assert_eq!(body["pending_recipients"], json!([]));
         let _ = empty_handle.join();
 
@@ -10700,6 +10769,7 @@ mod council_guidance_tests {
         let body = resp.json_value().unwrap();
         assert_eq!(body["daemon"], "active");
         assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
         assert_eq!(body["pending_recipients"].as_array().unwrap().len(), 1);
         assert_eq!(body["pending_recipients"][0]["recipient"], "felix");
         assert_eq!(body["pending_recipients"][0]["pending_count"], 2);

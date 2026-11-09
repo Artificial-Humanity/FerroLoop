@@ -1278,7 +1278,8 @@ export interface WireRecipientPendingSummary {
 export interface WireStatusResponse {
   daemon: WireDaemonState;
   dispatch_diagnostics: WireDispatchDiagnostics | null;
-  pending_recipients: WireRecipientPendingSummary[];
+  pending_recipients_available?: boolean;
+  pending_recipients: WireRecipientPendingSummary[] | null;
 }
 
 export interface StepDef {
