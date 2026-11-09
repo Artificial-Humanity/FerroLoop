@@ -323,6 +323,14 @@ export interface DeleteProjectResponse {
   error?: string;
 }
 
+export type AutoApproval = "vendor-reviewer" | "ask-human" | "native";
+
+export interface AutoApprovalCapability {
+  supported: AutoApproval[];
+  default: AutoApproval;
+  configurable: boolean;
+}
+
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
   timezone: string;
@@ -359,9 +367,15 @@ export interface HubSettings {
   project_artifacts_dirs?: Record<string, string>;
   /** Default context window in tokens per vendor (`{ "grok": 500000 }`). Type only: no UI sets it yet. */
   context_window_defaults?: Record<string, number>;
+  /** Per-vendor effective auto approval choices (`vendor-reviewer` | `ask-human` | `native`). */
+  auto_approval?: Record<string, AutoApproval>;
+  /** Per-vendor auto approval capability matrix (read-only on GET /api/v1/settings). */
+  auto_approval_capabilities?: Record<string, AutoApprovalCapability>;
 }
 
-export type HubSettingsPatch = Partial<HubSettings>;
+export type HubSettingsPatch = Omit<Partial<HubSettings>, "auto_approval"> & {
+  auto_approval?: Record<string, AutoApproval | null>;
+};
 
 export const DEFAULT_HUB_SETTINGS: HubSettings = {
   theme_preference: "dark",

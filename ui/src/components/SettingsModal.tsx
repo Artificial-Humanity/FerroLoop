@@ -1,5 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { HubApiClient, HubApiError, generatePasskeyCredentialId } from "../api/client";
+import {
+  HubApiClient,
+  HubApiError,
+  generatePasskeyCredentialId,
+  normalizeHubSettings,
+} from "../api/client";
+import type { HubWsClient } from "../api/ws";
 import {
   FONT_SCALE_MAX_PCT,
   FONT_SCALE_MIN_PCT,
@@ -712,6 +718,7 @@ import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
   DEFAULT_WORKSPACE_AGENTS,
+  type AutoApproval,
   type RoleRecord,
   type RoleReviewPolicy,
   type AgentRecord,
@@ -722,6 +729,7 @@ import {
   type DecommissionMode,
   type HubAuthority,
   type HubSettings,
+  type HubSettingsPatch,
   type OperatorAccount,
   type OperatorRole,
   type ProjectArtifactsDirInfo,
@@ -838,6 +846,7 @@ export interface SettingsModalProps {
   onChangeShowSafeAreaMargins?: (enabled: boolean) => void;
   onSettingsUpdated?: (settings: HubSettings) => void;
   apiClient?: HubApiClient;
+  wsClient?: Pick<HubWsClient, "subscribe">;
   postureInputsByAgent?: Record<string, Partial<AgentMcpPostureInput>>;
   onReconcileAgentPosture?: (
     agentKey: string,
@@ -1426,6 +1435,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onChangeShowSafeAreaMargins,
   onSettingsUpdated,
   apiClient,
+  wsClient,
   postureInputsByAgent,
   onReconcileAgentPosture,
   versionProvenance: propVersionProvenance,
@@ -1501,6 +1511,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   );
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [autoApprovalDraft, setAutoApprovalDraft] = useState<
+    Record<string, AutoApproval | null>
+  >({});
+  const [autoApprovalError, setAutoApprovalError] = useState<string | null>(
+    null,
+  );
   const [pruningAttachments, setPruningAttachments] = useState(false);
   const [pruneStatusMessage, setPruneStatusMessage] = useState<string | null>(
     null,
@@ -1758,6 +1774,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     setArmedAction(null);
     setError(null);
+    setAutoApprovalError(null);
+    setAutoApprovalDraft({});
     setLastResult(null);
     setSettingsSaved(false);
     setCurrencyPref(getActiveCurrency());
@@ -1800,6 +1818,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       .then((loaded) => {
         if (!cancelled) {
           setSettings(loaded);
+          setAutoApprovalDraft({});
         }
       })
       .catch(() => {
@@ -1897,6 +1916,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       cancelled = true;
     };
   }, [isOpen, apiClient]);
+
+  useEffect(() => {
+    if (!wsClient || typeof wsClient.subscribe !== "function") {
+      return;
+    }
+    const unsub = wsClient.subscribe("settings", (frame) => {
+      if (
+        frame?.event === "settings.updated" &&
+        frame.data &&
+        typeof frame.data === "object"
+      ) {
+        setSettings((prev) => {
+          const next = normalizeHubSettings(frame.data, prev);
+          onSettingsUpdated?.(next);
+          return next;
+        });
+        setAutoApprovalDraft({});
+        setAutoApprovalError(null);
+      }
+    });
+    return () => {
+      unsub();
+    };
+  }, [wsClient, onSettingsUpdated]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -2237,19 +2280,88 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (savingSettings) return;
     setSavingSettings(true);
     setError(null);
+    setAutoApprovalError(null);
     setSettingsSaved(false);
     try {
       const client = apiClient ?? new HubApiClient();
-      const updated = await client.updateSettings(settings);
-      setSettings(updated);
-      setActiveTimeZone(updated.timezone);
+      const draftKeys = Object.keys(autoApprovalDraft);
+      let autoApprovalPatch: Record<string, AutoApproval | null> | undefined;
+      if (draftKeys.length > 0) {
+        autoApprovalPatch = { ...autoApprovalDraft };
+      } else if (
+        settings.auto_approval &&
+        settings.auto_approval_capabilities
+      ) {
+        const configurableOnly: Record<string, AutoApproval | null> = {};
+        for (const [vendor, choice] of Object.entries(settings.auto_approval)) {
+          if (settings.auto_approval_capabilities[vendor]?.configurable) {
+            configurableOnly[vendor] = choice;
+          }
+        }
+        if (Object.keys(configurableOnly).length > 0) {
+          autoApprovalPatch = configurableOnly;
+        }
+      }
+      const patch: HubSettingsPatch = {
+        ...settings,
+        ...(autoApprovalPatch !== undefined
+          ? { auto_approval: autoApprovalPatch }
+          : { auto_approval: undefined }),
+      };
+      if (patch.auto_approval === undefined) {
+        delete patch.auto_approval;
+      }
+      const updated = await client.updateSettings(patch);
+      const merged = normalizeHubSettings(updated, settings);
+      setSettings(merged);
+      setAutoApprovalDraft({});
+      setActiveTimeZone(merged.timezone);
       setActiveCurrency(currencyPref);
       setSettingsSaved(true);
-      onSettingsUpdated?.(updated);
+      onSettingsUpdated?.(merged);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to save hub settings",
-      );
+      const msg =
+        err instanceof Error ? err.message : "Failed to save hub settings";
+      setError(msg);
+      setAutoApprovalError(msg);
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const handleResetVendorAutoApproval = async (vendor: string) => {
+    if (savingSettings) return;
+    const cap = settings.auto_approval_capabilities?.[vendor];
+    const fallbackDefault = cap?.default ?? "vendor-reviewer";
+    setAutoApprovalError(null);
+    setError(null);
+    setSettingsSaved(false);
+    setAutoApprovalDraft((prev) => ({ ...prev, [vendor]: null }));
+    const nextFallbackSettings: HubSettings = {
+      ...settings,
+      auto_approval: {
+        ...(settings.auto_approval ?? {}),
+        [vendor]: fallbackDefault,
+      },
+    };
+    setSettings(nextFallbackSettings);
+    setSavingSettings(true);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const updated = await client.updateSettings({
+        auto_approval: { [vendor]: null },
+      });
+      const merged = normalizeHubSettings(updated, nextFallbackSettings);
+      setSettings(merged);
+      setSettingsSaved(true);
+      onSettingsUpdated?.(merged);
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : `Failed to reset ${vendor} auto approval`;
+      setError(msg);
+      setAutoApprovalError(msg);
     } finally {
       setSavingSettings(false);
     }
@@ -5410,6 +5522,209 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                 </label>
               </div>
+            </div>
+
+            <hr
+              style={{
+                border: "none",
+                borderTop: "1px solid var(--border-subtle)",
+                margin: 0,
+              }}
+            />
+
+            {/* Per-Vendor Auto Approval (`posture = auto`) */}
+            <div
+              data-testid="settings-auto-approval-section"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: "12.5px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Per-Vendor Auto Approval (<code>posture = auto</code>)
+                </h3>
+                <p
+                  data-testid="auto-approval-note"
+                  style={{
+                    margin: "4px 0 0 0",
+                    fontSize: "11.5px",
+                    color: "var(--text-muted)",
+                    lineHeight: 1.4,
+                  }}
+                >
+                  <code>vendor-reviewer</code> runs an unattended vendor reviewer
+                  and <strong>spends tokens</strong>; <code>ask-human</code>{" "}
+                  prompts interactively; <code>native</code> is natively
+                  unattended and fixed. Changes apply at the{" "}
+                  <strong>next launch or restart</strong>, not to running
+                  sessions.
+                </p>
+              </div>
+
+              {autoApprovalError && (
+                <div
+                  role="alert"
+                  data-testid="auto-approval-error"
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "rgba(239, 68, 68, 0.14)",
+                    border: "1px solid rgba(239, 68, 68, 0.45)",
+                    color: "#FCA5A5",
+                    fontSize: "12px",
+                  }}
+                >
+                  {autoApprovalError}
+                </div>
+              )}
+
+              {Object.keys(settings.auto_approval_capabilities ?? {}).length >
+                0 && (
+                <div
+                  data-testid="auto-approval-vendor-list"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                  }}
+                >
+                  {Object.entries(settings.auto_approval_capabilities ?? {}).map(
+                    ([vendor, cap]) => {
+                      const effectiveChoice: AutoApproval =
+                        settings.auto_approval?.[vendor] ?? cap.default;
+                      const isOwnerAllowed =
+                        !authority || authority.tier === "owner";
+                      return (
+                        <div
+                          key={vendor}
+                          data-testid={`auto-approval-row-${vendor}`}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "10px",
+                            flexWrap: "wrap",
+                            padding: "6px 10px",
+                            borderRadius: "6px",
+                            border: "1px solid var(--border-subtle)",
+                            backgroundColor: "rgba(255, 255, 255, 0.02)",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "8px",
+                            }}
+                          >
+                            <span
+                              data-testid={`auto-approval-vendor-${vendor}`}
+                              className="fd-mono"
+                              style={{
+                                fontSize: "12px",
+                                fontWeight: 600,
+                              }}
+                            >
+                              {vendor}
+                            </span>
+                            <span
+                              style={{
+                                fontSize: "11px",
+                                color: "var(--text-muted)",
+                              }}
+                            >
+                              (default: <code>{cap.default}</code>)
+                            </span>
+                          </div>
+
+                          {!cap.configurable ? (
+                            <span
+                              data-testid={`auto-approval-readonly-${vendor}`}
+                              aria-readonly="true"
+                              className="fd-badge fd-mono"
+                              style={{
+                                fontSize: "11.5px",
+                              }}
+                            >
+                              {effectiveChoice}
+                            </span>
+                          ) : (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "8px",
+                                flexWrap: "wrap",
+                              }}
+                            >
+                              <select
+                                aria-label={`Auto approval for ${vendor}`}
+                                data-testid={`auto-approval-select-${vendor}`}
+                                className="fd-select fd-mono"
+                                value={effectiveChoice}
+                                disabled={savingSettings || !isOwnerAllowed}
+                                onChange={(e) => {
+                                  const nextChoice = e.target
+                                    .value as AutoApproval;
+                                  setAutoApprovalError(null);
+                                  setSettingsSaved(false);
+                                  setAutoApprovalDraft((prev) => ({
+                                    ...prev,
+                                    [vendor]: nextChoice,
+                                  }));
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    auto_approval: {
+                                      ...(prev.auto_approval ?? {}),
+                                      [vendor]: nextChoice,
+                                    },
+                                  }));
+                                }}
+                                style={{
+                                  fontSize: "12px",
+                                  padding: "4px 8px",
+                                }}
+                              >
+                                {cap.supported.map((choice) => (
+                                  <option key={choice} value={choice}>
+                                    {choice}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                data-testid={`auto-approval-reset-${vendor}`}
+                                aria-label={`Reset ${vendor} auto approval to default`}
+                                className="fd-btn"
+                                disabled={savingSettings || !isOwnerAllowed}
+                                onClick={() =>
+                                  void handleResetVendorAutoApproval(vendor)
+                                }
+                                style={{
+                                  fontSize: "11.5px",
+                                  padding: "4px 8px",
+                                }}
+                              >
+                                Reset to default
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    },
+                  )}
+                </div>
+              )}
             </div>
 
             <div style={{ display: "flex", justifyContent: "flex-end" }}>

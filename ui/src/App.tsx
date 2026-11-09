@@ -1,7 +1,7 @@
 import { codexSendNowReceipt, isPromptDeliveryFailure } from "./types/api";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./styles/tokens.css";
-import { HubApiClient, HubApiError } from "./api/client";
+import { HubApiClient, HubApiError, normalizeHubSettings } from "./api/client";
 import { HubWsClient } from "./api/ws";
 import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
@@ -1798,6 +1798,27 @@ export const App: React.FC<AppProps> = ({
     const unsubWorkflow = wsClient.subscribe("workflow", () => {
       void refreshWorkflows();
     });
+    const unsubSettings = wsClient.subscribe("settings", (frame) => {
+      if (loggedOutRef.current || !mountedRef.current) return;
+      if (
+        frame?.event === "settings.updated" &&
+        frame.data &&
+        typeof frame.data === "object"
+      ) {
+        const updated = normalizeHubSettings(frame.data);
+        if (
+          updated.theme_preference === "dark" ||
+          updated.theme_preference === "light" ||
+          updated.theme_preference === "system"
+        ) {
+          persistThemeMode(updated.theme_preference);
+          setThemeMode(updated.theme_preference);
+        }
+        if (updated.timezone) {
+          setActiveTimeZone(updated.timezone);
+        }
+      }
+    });
 
     try {
       wsClient.connect();
@@ -1810,6 +1831,7 @@ export const App: React.FC<AppProps> = ({
       unsubWire();
       unsubSession();
       unsubWorkflow();
+      unsubSettings();
       wsClient.disconnect();
     };
   }, [wsClient, apiClient, refreshWireAndRoster, refreshSessionsAndTranscript, refreshWorkflows, adoptPromptMetadata]);
@@ -3351,6 +3373,7 @@ export const App: React.FC<AppProps> = ({
           }
         }}
         apiClient={apiClient}
+        wsClient={wsClient}
       />
 
       <NodesModal
