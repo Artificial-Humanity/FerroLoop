@@ -747,6 +747,14 @@ impl Host {
             .take();
         let path = host.path.clone();
         let fail_after_publish = host.fail_handshake_after_publish;
+        let hosted_owner = env
+            .iter()
+            .find(|(key, _)| key == "FL_HOSTED_ID")
+            .filter(|(_, value)| {
+                spec.env.contains_key("FL_HOSTED_ID")
+                    && value.len() <= fl_host_proto::MAX_HOSTED_OWNER_BYTES
+            })
+            .map(|(_, value)| value.clone());
         let supervised = child::unix::spawn_supervised(
             &host.supervisor_bin,
             spec.kind,
@@ -801,19 +809,22 @@ impl Host {
             control: Some(supervised.control),
             stdin: Some(supervised.stdin),
         };
-        let session = Arc::new(match (admission.as_ref(), projection) {
-            (Some(admission), Some(projection)) => Session::with_projection(
-                parts,
-                Arc::clone(&admission.journal),
-                projection,
-                supervised.resize_master,
-            ),
-            (Some(admission), None) => {
-                Session::with_reliable(parts, Some(Arc::clone(&admission.journal)))
-            }
-            (None, None) => Session::new(parts),
-            (None, Some(_)) => unreachable!("projection requires an epoch journal"),
-        });
+        let session = Arc::new(
+            (match (admission.as_ref(), projection) {
+                (Some(admission), Some(projection)) => Session::with_projection(
+                    parts,
+                    Arc::clone(&admission.journal),
+                    projection,
+                    supervised.resize_master,
+                ),
+                (Some(admission), None) => {
+                    Session::with_reliable(parts, Some(Arc::clone(&admission.journal)))
+                }
+                (None, None) => Session::new(parts),
+                (None, Some(_)) => unreachable!("projection requires an epoch journal"),
+            })
+            .with_hosted_owner(hosted_owner.as_deref()),
+        );
         session.set_supervisor(supervised.child);
         this.sessions
             .lock()
@@ -915,10 +926,23 @@ impl Host {
             control: None,
             stdin: Some(spawned.stdin),
         };
-        let session = Arc::new(match admission.as_ref() {
-            Some(admission) => Session::with_reliable(parts, Some(Arc::clone(&admission.journal))),
-            None => Session::new(parts),
-        });
+        let hosted_owner = env
+            .iter()
+            .find(|(key, _)| key == "FL_HOSTED_ID")
+            .filter(|(_, value)| {
+                spec.env.contains_key("FL_HOSTED_ID")
+                    && value.len() <= fl_host_proto::MAX_HOSTED_OWNER_BYTES
+            })
+            .map(|(_, value)| value.as_str());
+        let session = Arc::new(
+            (match admission.as_ref() {
+                Some(admission) => {
+                    Session::with_reliable(parts, Some(Arc::clone(&admission.journal)))
+                }
+                None => Session::new(parts),
+            })
+            .with_hosted_owner(hosted_owner),
+        );
         *session.job.lock().unwrap_or_else(|err| err.into_inner()) = Some(spawned.job);
         *session
             .process

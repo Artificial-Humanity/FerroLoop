@@ -526,14 +526,29 @@ pub(super) async fn extended(
             features: fl_host_proto::RELIABLE_FEATURE
                 | fl_host_proto::PTY_FEATURE
                 | fl_host_proto::RENDERED_PTY_FEATURE
-                | fl_host_proto::HOST_STATUS_FEATURE,
+                | fl_host_proto::HOST_STATUS_FEATURE
+                | fl_host_proto::SESSION_OWNER_FEATURE,
             #[cfg(not(unix))]
-            features: fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE,
+            features: fl_host_proto::RELIABLE_FEATURE
+                | fl_host_proto::HOST_STATUS_FEATURE
+                | fl_host_proto::SESSION_OWNER_FEATURE,
             limits: fl_host_proto::ExtensionLimits::default(),
         }),
         XReq::HostStatus => Ok(XResp::HostStatus {
             build: host.build_info.clone(),
         }),
+        XReq::CheckSessionOwner { stream, hosted_id } => {
+            let sessions = host.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let matches = stream.host == *host.authority.instance()
+                && sessions
+                    .get(stream.session.as_str())
+                    .is_some_and(|session| {
+                        session.epoch == stream.epoch.0
+                            && matches!(session.state(), fl_host_proto::ChildState::Running(_))
+                            && session.owned_by(&hosted_id)
+                    });
+            Ok(XResp::SessionOwner { matches })
+        }
         XReq::ListSessions => {
             let outputs = host.outputs.lock().unwrap_or_else(|e| e.into_inner());
             if outputs.len() > fl_host_proto::DEFAULT_MAX_SESSIONS {
@@ -1191,6 +1206,7 @@ fn admit_extension(
                     .sum::<usize>()
                 + 64
         }
+        XReq::CheckSessionOwner { hosted_id, .. } => hosted_id.capacity() + 64,
         XReq::SendLine { line, .. } => line.capacity() + 64,
         XReq::Write { bytes, .. } => bytes.as_slice().len() + 64,
         _ => 64,

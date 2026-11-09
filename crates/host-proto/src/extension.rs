@@ -16,6 +16,9 @@ pub const PTY_FEATURE: u64 = 2;
 /// Opt-in daemon build telemetry; does not change existing response shapes.
 pub const HOST_STATUS_FEATURE: u64 = 4;
 pub const RENDERED_PTY_FEATURE: u64 = 8;
+/// Opt-in, epoch-bound ownership check; existing response shapes are unchanged.
+pub const SESSION_OWNER_FEATURE: u64 = 16;
+pub const MAX_HOSTED_OWNER_BYTES: usize = 128;
 pub const MAX_RENDERED_TEXT: usize = 196_608;
 pub const MAX_BUILD_FIELD_BYTES: usize = 128;
 
@@ -48,6 +51,26 @@ fn bounded_build_field<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Err
         fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
             if value.len() > MAX_BUILD_FIELD_BYTES {
                 return Err(E::custom("build metadata field too long"));
+            }
+            Ok(value.to_owned())
+        }
+    }
+    d.deserialize_str(Visitor)
+}
+
+fn bounded_hosted_owner<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Visitor;
+    impl de::Visitor<'_> for Visitor {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "at most {MAX_HOSTED_OWNER_BYTES} bytes of hosted owner id"
+            )
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            if value.len() > MAX_HOSTED_OWNER_BYTES {
+                return Err(E::custom("hosted owner id too long"));
             }
             Ok(value.to_owned())
         }
@@ -382,6 +405,11 @@ pub enum ExtensionRequest {
     Capabilities,
     HostStatus,
     ListSessions,
+    CheckSessionOwner {
+        stream: StreamId,
+        #[serde(deserialize_with = "bounded_hosted_owner")]
+        hosted_id: String,
+    },
     SpawnSession {
         spec: SpawnSpec,
         mode: SessionMode,
@@ -446,6 +474,11 @@ pub enum ExtensionRequest {
 impl ExtensionRequest {
     pub fn validate(&self) -> Result<(), HostError> {
         match self {
+            Self::CheckSessionOwner { hosted_id, .. }
+                if hosted_id.len() > MAX_HOSTED_OWNER_BYTES =>
+            {
+                return Err(HostError::EventTooLarge);
+            }
             Self::SpawnSession { spec, mode, pty } => {
                 match (*mode, spec.kind, pty.is_some()) {
                     (
@@ -550,6 +583,9 @@ fn bounded_sessions<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SessionSummar
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionResponse {
+    SessionOwner {
+        matches: bool,
+    },
     HostStatus {
         build: HostBuildInfo,
     },
@@ -919,6 +955,17 @@ impl ReliableReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A request cannot retain an unbounded owner string during deserialization.
+    #[test]
+    fn owner_query_bounds_id_before_retaining_it() {
+        let stream = serde_json::json!({"host": "01010101010101010101010101010101", "session": "Ada.claude", "epoch": 1});
+        for len in [128, 129] {
+            let request = serde_json::json!({"op": "check_session_owner", "stream": stream, "hosted_id": "x".repeat(len)});
+            let result = serde_json::from_value::<ExtensionRequest>(request);
+            assert_eq!(result.is_ok(), len == 128, "{result:?}");
+        }
+    }
+
     // Catches absent opt-in codecs, permissive snapshot fields and invalid geometry/schema.
     #[test]
     fn rendered_snapshot_roundtrip_is_strict_and_bounded() {

@@ -378,6 +378,17 @@ pub enum RuntimePresence {
 /// `kill` and `exists` take the unit, so a Muse window is never confused with the session that
 /// holds other agents' windows.
 pub trait SessionRuntime: std::fmt::Debug {
+    /// Whether each vendor has a separate session rather than a shared persona container.
+    fn separate_vendor_units(&self) -> bool {
+        false
+    }
+
+    /// The addressable runtime unit for a recorded vendor target. Legacy tmux runtimes
+    /// share a persona session; the native host gives each vendor a separate session.
+    fn unit<'a>(&self, target: &'a str) -> &'a str {
+        runtime_unit(target)
+    }
+
     /// Start a detached runtime; `false` when it did not start (tmux failed, or the name exists).
     /// With `launch` the window runs that command (the vendor's CLI) instead of a blank shell.
     /// Built-in CLI vendors launch via [`launch_spec_for`]; custom vendors get a blank window.
@@ -625,6 +636,20 @@ fn connect_host_client() -> Option<fl_host_proto::BlockingHostClient> {
     fl_host_proto::BlockingHostClient::connect(&endpoint).ok()
 }
 
+fn exact_host_unit(unit: &str, hosted_id: &str) -> Option<fl_host_proto::SessionId> {
+    let target = if unit.contains(':') || unit.contains('.') {
+        unit.to_owned()
+    } else {
+        let (vendor, persona) = hosted_id.split_once(':')?;
+        let target = hosted_tmux_target(vendor, persona);
+        if target.split(':').next()? != unit {
+            return None;
+        }
+        target
+    };
+    fl_wire::vendor_adapter::unit_to_host_session_id(&target)
+}
+
 fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
     if !is_killable_unit(unit) {
         return false;
@@ -638,7 +663,16 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
     let Ok(sessions) = client.list_sessions() else {
         return false;
     };
-    let ids = fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, unit);
+    let Some(wanted) = exact_host_unit(unit, hosted_id) else {
+        return false;
+    };
+    let ids: Vec<_> = sessions
+        .iter()
+        .filter(|s| {
+            s.stream.session == wanted && matches!(s.state, fl_host_proto::ChildState::Running(_))
+        })
+        .map(|s| s.stream.session.clone())
+        .collect();
     if ids.is_empty() {
         return true;
     }
@@ -649,6 +683,13 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
         }) else {
             continue;
         };
+        if !client
+            .check_session_owner(summary.stream.clone(), hosted_id)
+            .unwrap_or(false)
+        {
+            all_ok = false;
+            continue;
+        }
         let killed = client
             .claim_controller(summary.stream.clone())
             .and_then(|grant| client.kill_session(summary.stream.clone(), grant.lease))
@@ -674,6 +715,18 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
 }
 
 impl SessionRuntime for HostRuntime {
+    fn separate_vendor_units(&self) -> bool {
+        !use_legacy_tmux_fallback()
+    }
+
+    fn unit<'a>(&self, target: &'a str) -> &'a str {
+        if use_legacy_tmux_fallback() {
+            runtime_unit(target)
+        } else {
+            target
+        }
+    }
+
     fn spawn(
         &self,
         session: &str,
@@ -695,18 +748,19 @@ impl SessionRuntime for HostRuntime {
         let Some(mut client) = connect_host_client() else {
             return false;
         };
-        let Ok(sessions) = client.list_sessions() else {
-            return false;
-        };
-        let unit_check = if session == MUSE_SESSION {
-            format!("{MUSE_SESSION}:{window}")
-        } else {
-            session.to_string()
-        };
-        if !fl_wire::vendor_adapter::matching_live_host_sessions(&sessions, &unit_check).is_empty()
+        // Ownership must be verifiable before a child is created: an older host cannot
+        // satisfy the survival check or safely clean up the newly launched runtime.
+        if hosted_id.is_empty()
+            || hosted_id.len() > fl_host_proto::MAX_HOSTED_OWNER_BYTES
+            || !matches!(client.extension_request(fl_host_proto::ExtensionRequest::Capabilities),
+                Ok(fl_host_proto::ExtensionResponse::Capabilities { features, .. })
+                    if features & fl_host_proto::SESSION_OWNER_FEATURE != 0)
         {
             return false;
         }
+        let Ok(sessions) = client.list_sessions() else {
+            return false;
+        };
         let raw_id = if window.is_empty() {
             session.to_string()
         } else {
@@ -715,6 +769,12 @@ impl SessionRuntime for HostRuntime {
         let Ok(session_id) = fl_host_proto::SessionId::new(&raw_id) else {
             return false;
         };
+        if sessions.iter().any(|s| {
+            s.stream.session == session_id
+                && !matches!(s.state, fl_host_proto::ChildState::CleanupComplete(_))
+        }) {
+            return false;
+        }
         let argv = match launch {
             Some(spec) if !spec.argv.is_empty() => spec.argv.clone(),
             _ => vec!["/bin/sh".to_string()],
@@ -910,10 +970,26 @@ impl SessionRuntime for HostRuntime {
         if use_legacy_tmux_fallback() {
             return TmuxRuntime.owns(unit, hosted_id);
         }
-        if unit.contains(':') && hosted_id.is_empty() {
+        let Some(wanted) = exact_host_unit(unit, hosted_id) else {
             return false;
-        }
-        self.exists(unit)
+        };
+        let Some(mut client) = connect_host_client() else {
+            return false;
+        };
+        let Ok(sessions) = client.list_sessions() else {
+            return false;
+        };
+        sessions
+            .into_iter()
+            .find(|s| {
+                s.stream.session == wanted
+                    && matches!(s.state, fl_host_proto::ChildState::Running(_))
+            })
+            .is_some_and(|s| {
+                client
+                    .check_session_owner(s.stream, hosted_id)
+                    .unwrap_or(false)
+            })
     }
 
     fn settle_delay(&self) -> std::time::Duration {
@@ -3210,7 +3286,10 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     register_spun_up_agent(store, &v, by)?;
 
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
-    let unit = tmux_target.as_deref().map_or("", runtime_unit).to_string();
+    let unit = tmux_target
+        .as_deref()
+        .map_or("", |t| env.runtime.unit(t))
+        .to_string();
 
     let now = now_ms();
     let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
@@ -3689,9 +3768,10 @@ fn infer_vendor_from_hosted_siblings<S: StateStore>(
 /// represent the same session rather than a second vendor.
 fn runtime_sharers<S: StateStore>(
     store: &S,
+    runtime: &dyn SessionRuntime,
     record: &HostedSessionRecord,
 ) -> Result<Vec<HostedSessionRecord>, LifecycleError> {
-    let Some(name) = record.tmux_target.as_deref().map(runtime_unit) else {
+    let Some(name) = record.tmux_target.as_deref().map(|t| runtime.unit(t)) else {
         return Ok(Vec::new());
     };
     Ok(list_hosted_sessions(store)?
@@ -3700,7 +3780,7 @@ fn runtime_sharers<S: StateStore>(
             r.session_id != record.session_id
                 && !is_decommissioned(r)
                 && !is_same_vendor_sibling(record, r)
-                && r.tmux_target.as_deref().map(runtime_unit) == Some(name)
+                && r.tmux_target.as_deref().map(|t| runtime.unit(t)) == Some(name)
         })
         .collect())
 }
@@ -4290,7 +4370,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         }
     }
     let agent = store.agent_by_name(&target.persona)?;
-    let sharing = runtime_sharers(store, &record)?;
+    let sharing = runtime_sharers(store, env.runtime, &record)?;
     let shared_runtime = record.runtime_spawned && !sharing.is_empty();
     if shared_runtime {
         // The runtime stays up for the other sessions, so ownership of it moves to them: the
@@ -4369,14 +4449,14 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     // session only when the window is the session's only one, even though `runtime_spawned`
     // is false, including an unmarked Muse window. That path prunes the same
     // `session:window` string `kill_owner` received, so a sibling window keeps the session
-    // in the resurrect save. A recorded target with the flag clear is a unit this lifecycle
-    // already decided is not ours, and stays up; it is pruned only when it is already gone.
+    // in the resurrect save. A recorded target with a stale cleared flag is stopped only
+    // when this runtime proves ownership; foreign or unverifiable units stay up.
     // An HTTP API vendor has no tmux unit, so its teardown never stops one.
     let mut restore_source = None;
     let runtime_stopped = if env.spawn_runtime && record.runtime_spawned {
         match &record.tmux_target {
             Some(tmux_target) => {
-                let unit = runtime_unit(tmux_target);
+                let unit = env.runtime.unit(tmux_target);
                 let gone = env.runtime.kill(unit, &runtime_owner_id);
                 restore_source = Some(prune_unit_after_stop(env, unit));
                 record.runtime_spawned &= !gone;
@@ -4403,8 +4483,16 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             .tmux_target
             .clone()
             .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
-        restore_source = Some(prune_unit_after_stop(env, runtime_unit(&target)));
-        false
+        // A stale flag is not proof that the native unit is foreign. Require ownership
+        // of the recorded target before using the owner cleanup path; this also keeps
+        // legacy tmux's unmarked owner-adoption behavior out of this branch.
+        let stopped = caller == Caller::Owner
+            && !shared_runtime
+            && !persona_still_running
+            && env.runtime.owns(&target, &runtime_owner_id)
+            && env.runtime.kill_owner(&target, &runtime_owner_id);
+        restore_source = Some(prune_unit_after_stop(env, env.runtime.unit(&target)));
+        stopped && !env.runtime.exists(&target)
     } else {
         false
     };
@@ -4524,7 +4612,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
     )?;
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
-    let unit = runtime_unit(&want_target).to_string();
+    let unit = env.runtime.unit(&want_target).to_string();
     if record.vendor == "claude"
         && record
             .vendor_session_id
@@ -4555,7 +4643,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
         if record
             .tmux_target
             .as_deref()
-            .map(runtime_unit)
+            .map(|t| env.runtime.unit(t))
             .is_some_and(|old| env.runtime.exists(old))
         {
             adopted_old_session = true;
@@ -4770,11 +4858,19 @@ fn check_old_runtime_stoppable<S: StateStore>(
         .hosted
         .as_ref()
         .and_then(|r| r.tmux_target.as_deref())
-        .map_or(name.as_str(), runtime_unit);
+        .map_or(name.as_str(), |t| env.runtime.unit(t));
     let mut units = vec![old_unit];
-    // The persona's session name matters unless both runtimes are Muse windows (it is not
-    // taken, or it is nothing of Muse's).
-    if old_unit != name && !(to.vendor == "muse" && is_muse_window_target(old_unit)) {
+    // Native vendors have separate units. A new non-Muse target must also be free;
+    // legacy tmux maps this back to the same persona session as before.
+    let new_target = hosted_tmux_target(&to.vendor, &target.persona);
+    let new_unit = env.runtime.unit(&new_target);
+    if env.runtime.separate_vendor_units() {
+        if to.vendor != "muse" && old_unit != new_unit {
+            units.push(new_unit);
+        }
+    } else if old_unit != name && !(to.vendor == "muse" && is_muse_window_target(old_unit)) {
+        // A legacy record may name a different container. Its persona container can
+        // still block the remodel, including a move from a non-Muse window to Muse.
         units.push(name.as_str());
     }
     for unit in units {
@@ -4784,7 +4880,7 @@ fn check_old_runtime_stoppable<S: StateStore>(
         let why = match target.hosted.as_ref() {
             None => "no hosted record started it".to_string(),
             Some(r) if !r.runtime_spawned => format!("`{}` did not start it", r.session_id),
-            Some(r) if r.tmux_target.as_deref().map(runtime_unit) != Some(unit) => {
+            Some(r) if r.tmux_target.as_deref().map(|t| env.runtime.unit(t)) != Some(unit) => {
                 format!("`{}` started another tmux session", r.session_id)
             }
             // The flag says it started a Muse window, but the window under the name carries no
@@ -4796,7 +4892,7 @@ fn check_old_runtime_stoppable<S: StateStore>(
                 )
             }
             Some(r) => {
-                let sharers = runtime_sharers(store, r)?;
+                let sharers = runtime_sharers(store, env.runtime, r)?;
                 if sharers.is_empty() {
                     continue;
                 }

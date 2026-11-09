@@ -152,6 +152,8 @@ impl ReliableJournal {
             SLOTS * std::mem::size_of::<Option<Arc<ReliableRecord>>>()
                 + std::mem::size_of::<Self>()
                 + std::mem::size_of::<Counts>()
+                // The session retains one fixed-size hosted owner for this epoch.
+                + fl_host_proto::MAX_HOSTED_OWNER_BYTES + std::mem::size_of::<usize>()
                 + 2 * ARC_OVERHEAD
                 + 64
                 + 2 * std::mem::size_of::<ChargedBytes>(),
