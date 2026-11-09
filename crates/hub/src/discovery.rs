@@ -2018,15 +2018,23 @@ fn plain_bounded_str(value: Option<&Value>, max_chars: usize) -> Option<String> 
 }
 
 /// Per-session `(model, thinking_level)` from the newest Codex rollout lines. Each field is
-/// the most recent valid value, found independently: a later line may carry only one of them.
-/// The effort comes from `payload.effort`, else `payload.reasoning_effort`, else
-/// `payload.collaboration_mode.settings.reasoning_effort`. A cut-off first line of a tail
-/// is not valid JSON and is skipped like any other malformed line.
+/// the most recent valid value, found independently across `turn_context` and
+/// `thread_settings_applied` lines: a later line may carry only one of them. A cut-off first
+/// line of a tail is not valid JSON and is skipped like any other malformed line.
 fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
-    const EFFORT_POINTERS: [&str; 3] = [
+    const MODEL_POINTERS: [&str; 4] = [
+        "/payload/model",
+        "/payload/thread_settings/model",
+        "/payload/collaboration_mode/settings/model",
+        "/payload/thread_settings/collaboration_mode/settings/model",
+    ];
+    const EFFORT_POINTERS: [&str; 6] = [
         "/payload/effort",
         "/payload/reasoning_effort",
         "/payload/collaboration_mode/settings/reasoning_effort",
+        "/payload/thread_settings/effort",
+        "/payload/thread_settings/reasoning_effort",
+        "/payload/thread_settings/collaboration_mode/settings/reasoning_effort",
     ];
     let (mut model, mut effort) = (None, None);
     for line in jsonl.lines().rev() {
@@ -2041,7 +2049,9 @@ fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
             continue;
         };
         if model.is_none() {
-            model = plain_bounded_str(val.pointer("/payload/model"), MODEL_ID_MAX_CHARS);
+            model = MODEL_POINTERS
+                .iter()
+                .find_map(|pointer| plain_bounded_str(val.pointer(pointer), MODEL_ID_MAX_CHARS));
         }
         if effort.is_none() {
             effort = EFFORT_POINTERS.iter().find_map(|pointer| {
@@ -2053,8 +2063,8 @@ fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Model and thinking level of a Codex session. The session's rollout transcript names what
-/// the session runs; `~/.codex/config.toml` is only the default for a field the rollout
-/// does not carry.
+/// the session runs; `~/.codex/config.toml` is only the default when the rollout does not
+/// carry a session model.
 fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
     let (session_model, session_effort) = transcript_path
         .and_then(|p| read_file_tail(Path::new(p), CLAUDE_TRANSCRIPT_TAIL_BYTES))
@@ -2074,14 +2084,22 @@ fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessi
     }
     let config_model = config.as_ref().and_then(|c| toml_non_empty_str(c, "model"));
     // The config default stands in when the rollout tail names no model; it is no live report.
-    let model_is_default = session_model.is_none() && config_model.is_some();
+    // Only fall back to config's `model_reasoning_effort` when no session model was observed in
+    // the rollout, so a live rollout model without an effort is never paired with config's effort.
+    let has_session_model = session_model.is_some();
+    let model_is_default = !has_session_model && config_model.is_some();
+    let thinking_level = session_effort.or_else(|| {
+        (!has_session_model)
+            .then(|| {
+                config
+                    .as_ref()
+                    .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
+            })
+            .flatten()
+    });
     SessionModelInfo {
         model: session_model.or(config_model),
-        thinking_level: session_effort.or_else(|| {
-            config
-                .as_ref()
-                .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
-        }),
+        thinking_level,
         available_models,
         model_is_default,
     }
@@ -9530,21 +9548,119 @@ mod tests {
     }
 
     #[test]
-    fn codex_effort_falls_back_to_config_when_the_rollout_has_a_model_only() {
+    fn codex_effort_does_not_fall_back_to_config_when_the_rollout_has_a_model_only() {
         let tmp = codex_home_with_config();
         let info = codex_session_info(
             tmp.path(),
             &[r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#],
         );
         assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
-        assert_eq!(info.thinking_level.as_deref(), Some("high"));
-        // An effort with no model keeps the config model.
+        assert_eq!(info.thinking_level, None);
+        assert!(!info.model_is_default);
+        // Verify apply_model_overrides does not falsely clear a pending effort override.
+        let make_session =
+            |model: Option<String>, thinking_level: Option<String>| DiscoveredSessionSummary {
+                id: "codex:t-fixture".to_string(),
+                source: "route".to_string(),
+                adapter: "codex".to_string(),
+                persona: None,
+                status: "active".to_string(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: None,
+                quota_usage: None,
+                model,
+                thinking_level,
+                available_models: info.available_models.clone(),
+                context_usage: None,
+                execution_mode: None,
+                model_is_default: info.model_is_default,
+            };
+        let mut overrides = std::collections::BTreeMap::from([(
+            "codex:t-fixture".to_string(),
+            crate::session_actions::ModelOverride::new(
+                "gpt-6.1-sol".to_string(),
+                Some("medium".to_string()),
+            ),
+        )]);
+        // First pass records the baseline before the rollout switched to gpt-6.1-sol.
+        let mut baseline_sessions = vec![make_session(
+            Some("gpt-6.1-terra".to_string()),
+            Some("high".to_string()),
+        )];
+        crate::session_actions::apply_model_overrides(&mut baseline_sessions, &mut overrides);
+        // Second pass uses the rollout info where only model = gpt-6.1-sol is present.
+        let mut sessions = vec![make_session(
+            info.model.clone(),
+            info.thinking_level.clone(),
+        )];
+        crate::session_actions::apply_model_overrides(&mut sessions, &mut overrides);
+        assert!(
+            overrides.contains_key("codex:t-fixture"),
+            "pending effort override must not be dropped when rollout has model only"
+        );
+        assert_eq!(sessions[0].model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(sessions[0].thinking_level.as_deref(), Some("medium"));
+
+        // An effort with no model keeps the config model as default.
         let info = codex_session_info(
             tmp.path(),
             &[r#"{"type":"turn_context","payload":{"effort":"minimal"}}"#],
         );
         assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
         assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+        assert!(info.model_is_default);
+    }
+
+    #[test]
+    fn codex_thread_settings_applied_updates_model_and_effort_in_file_order() {
+        let tmp = codex_home_with_config();
+        // Initial turn_context followed by TUI thread_settings_applied event_msg.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-terra","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium"}}}}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        assert!(!info.model_is_default);
+
+        // A later turn_context after an earlier thread_settings_applied wins.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"medium"}}}}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-terra","effort":"low"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        assert!(!info.model_is_default);
+
+        // thread_settings_applied carrying only collaboration_mode.settings.{model,reasoning_effort}.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"low"}}}}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        assert!(!info.model_is_default);
+
+        // payload.collaboration_mode.settings.model directly on payload is also honored.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6.1-sol","reasoning_effort":"minimal"}}}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+        assert!(!info.model_is_default);
     }
 
     #[test]
