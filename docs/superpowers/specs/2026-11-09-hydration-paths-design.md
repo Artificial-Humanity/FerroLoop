@@ -1,0 +1,117 @@
+# Hydration paths and missing guidance (Issue 383 D6+D5)
+
+Status: proposed implementation design after Ferris's path and warning policy
+decisions. Implement after D2b merges. No production changes yet.
+
+## Problem and outcome
+
+Generated startup prompts interpolate a logical project slug into relative paths.
+An agent already running in `Kaggle-Gemma4/` can consequently be told to read
+`kaggle-gemma4/AGENTS.md` beneath that cwd, and `.agents` is resolved against the
+wrong base. Built-in roles also assume a role file exists. The local
+`journalist.md` now exists as a symlink; that does not justify a product-specific
+`journalist -> scribe` alias.
+
+Render absolute paths from resolved filesystem context, preserving actual case.
+When guidance is absent, continue with an explicit missing-guidance prompt line
+and operator warnings. Keep FerroState primary and missing legacy STATE.md silent.
+
+## Approaches and selected policy
+
+Ferris selected resolved paths with warnings, rather than a new launch refusal.
+Changing the child cwd to make existing relative strings work would lose requested
+worktree context and would not fix project-name case. The selected approach keeps
+runtime cwd and permission behavior unchanged and supplies context to the prompt.
+
+For project instructions, Ferris selected worktree-first resolution with a
+repository identity guard, then the registered project root. Workspace `.agents`
+and `Notes` remain anchored to the umbrella workspace. No shell or Git command is
+run to resolve these paths.
+
+## Filesystem context
+
+Resolve context before building the startup prompt on spin-up, restart and remodel.
+Keep the logical project slug for identity, registration and FerroState scopes;
+never use that slug as though it were a filesystem path.
+
+- Resolve the registered project root from the existing project binding/catalog
+  facilities. A configured project name may differ from its root basename; reuse
+  the existing config-entry parser rather than introduce another TOML reader.
+  Retain the existing case-aware workspace-directory fallback only when no binding
+  exists. Canonicalize and deduplicate candidates; an ambiguous binding produces a
+  warning and no guessed instruction root.
+- Resolve the umbrella workspace from supplied workspace context or the existing
+  workspace-root finder applied to known roots. Do not treat an arbitrary parent
+  directory as a proven workspace. No recursive filesystem search.
+- Find the nearest `.git` marker above the effective cwd. Use that working-tree
+  root only when its canonical repository identity matches the registered root:
+  canonical `commondir` when present, otherwise canonical git dir. This covers
+  normal checkouts, linked worktrees and standalone gitfiles.
+- An unrelated or ambiguous cwd repository falls back to the registered root and
+  adds `cwd is outside project <name>`. Missing/malformed repository metadata cannot
+  authorize a worktree override. A non-Git registered project remains usable from
+  its registered root; it does not acquire an unrelated worktree override.
+- If no project or workspace root can be established, report unavailable guidance
+  explicitly. Do not construct actionable read instructions for invented paths.
+
+The #405 gitfile/commondir parser is shared, not copied. Extract its generic bounded
+layout resolution into `fl-mcp`'s public project-path utilities, consumed by both
+Codex trust checking and the hub. `fl-mcp` currently has no dependency on `fl-core`;
+this avoids adding one or placing a vendor-specific resolver in the hub. Keep the
+existing Codex trust precedence, no-Git behavior, diagnostics, 1 MiB config cap and
+8 KiB indirection caps unchanged. This extraction is a separate reviewed task.
+
+## Guidance selection and rendering
+
+- Resolve a built-in or legacy file role in this order:
+  `.agents/roles/<Project>/<role>.md`, then `.agents/roles/<role>.md`.
+  Match the project's existing directory with preserved filesystem case, follow
+  symlinks, and emit the absolute resolved file path. Preserve the existing shared
+  UI-developer role mapping; add no journalist alias.
+- If neither role candidate exists, emit an explicit missing-guidance line and a
+  warning such as `role file not found: looked in <absolute paths>`.
+- Retain current catalog role templates and structural-custom authority rules.
+  Catalog-guided roles do not acquire a fictitious required role file. Keep authored
+  guidance unchanged and state its workspace-relative base explicitly.
+- Resolve workspace AGENTS.md and project AGENTS.md, WORKFLOW.md and PERSONA.md
+  against their respective roots. Emit read instructions only for present regular
+  files. Missing required guidance emits prompt text and a warning; no new refusal.
+- Include the optional legacy `Notes/<Project>/STATE.md` reference only when found.
+  Its absence emits no warning. FerroState commands and precedence remain intact.
+- The introductory residence line names the resolved context instead of instructing
+  the agent to descend into another slug-named directory from its current cwd.
+
+Use one internal result carrying prompt text and warnings. Build role guidance and
+path context explicitly rather than replace arbitrary text inside authored catalog
+templates. Keep the canonical reset/reforge fallback consistent with this renderer;
+preserve the existing external hydrate override and recast safeguards.
+
+## Public response and CLI contract
+
+Add `#[serde(default)] warnings: Vec<String>` to `SpinUpResponse` and
+`RestartResponse`; apply the same default to the existing `RemodelResponse.warnings`
+and append guidance warnings without losing existing remodel warnings. Empty means
+no warning. JSON field names are `warnings` on each top-level response.
+
+Human-readable CLI output prints warnings using the existing remodel convention.
+JSON output carries the list without contaminating JSON stdout. No new restart
+command is introduced if a direct CLI restart command does not exist.
+
+Ferris assigned FerroDeck warning display to Felix, alongside hydration_status.
+This backend PR names the response fields for that follow-up and does not change UI.
+Warnings are response data; this does not add a durable warnings field to hosted
+records or alter hydration_status/dispatch evidence.
+
+## Verification and boundaries
+
+Tests cover actual-case project directories and a child cwd already in the project;
+project-specific/global role precedence; symlinked journalist guidance; missing role,
+workspace and project files; silent absent legacy state; custom catalog guidance;
+worktree/subdirectory instruction selection; foreign-repository fallback; ambiguous
+and malformed git metadata; config names differing from root basenames; and legacy
+response deserialization with empty warnings. Check all three lifecycle paths and
+CLI warning/JSON behavior with private fixtures.
+
+Run the full Rust verification trio and fresh independent task/branch reviews.
+No live agent launches, service changes, config writes, file creation to conceal
+missing guidance, new vendor behavior, or hard-coded role aliases.
