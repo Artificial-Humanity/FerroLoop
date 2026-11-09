@@ -105,6 +105,9 @@ pub enum AgentCmd {
         /// `low`, `medium` or `high` and needs `--model`.
         #[arg(long = "thinking-level", visible_alias = "effort")]
         thinking_level: Option<String>,
+        /// Permission posture (`ask`, `accept-edits`, `auto`, `plan`, or `bypass`; default `auto`).
+        #[arg(long, default_value_t = fl_core::permissions::Posture::Auto)]
+        posture: fl_core::permissions::Posture,
         /// Node the session runs on (default `ai-lab-0`).
         #[arg(long = "node-id")]
         node_id: Option<String>,
@@ -147,6 +150,9 @@ pub enum AgentCmd {
         /// Vendor-native thinking level on the new vendor (see `spin-up --thinking-level`).
         #[arg(long = "thinking-level", visible_alias = "effort")]
         thinking_level: Option<String>,
+        /// Permission posture (`ask`, `accept-edits`, `auto`, `plan`, or `bypass`; default `auto`).
+        #[arg(long, default_value_t = fl_core::permissions::Posture::Auto)]
+        posture: fl_core::permissions::Posture,
         /// `prepare` (handoff prompt, status `decommissioning`) or `execute`.
         #[arg(long)]
         mode: Option<String>,
@@ -745,6 +751,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             vendor,
             model,
             thinking_level,
+            posture,
             node_id,
             hosted,
             cwd,
@@ -760,6 +767,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 vendor,
                 model,
                 thinking_level,
+                posture,
                 node_id,
                 hosted: Some(hosted),
                 cwd,
@@ -844,6 +852,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             vendor,
             model,
             thinking_level,
+            posture,
             mode,
             cwd,
             node_id,
@@ -855,6 +864,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 vendor,
                 model,
                 thinking_level,
+                posture,
                 mode,
                 cwd,
                 node_id,
@@ -1603,14 +1613,15 @@ mod tests {
         assert_eq!(launches.len(), 1);
         let argv = &launches[0].argv;
         assert!(
-            argv.len() >= 7,
+            argv.len() >= 8,
             "expected claude launch argv with session-id and name, got {argv:?}"
         );
         assert_eq!(
-            &argv[1..7],
+            &argv[1..8],
             &[
                 "--remote-control".to_string(),
-                "--enable-auto-mode".to_string(),
+                "--permission-mode".to_string(),
+                "auto".to_string(),
                 "--session-id".to_string(),
                 sid.clone(),
                 "--name".to_string(),
@@ -1651,5 +1662,126 @@ mod tests {
             "ClaudeHostAdapter::archive must move transcript to archived path"
         );
         assert!(!transcript_path.exists());
+    }
+
+    #[test]
+    fn cli_spin_up_and_remodel_parse_posture_and_reject_unsupported_vendor_posture() {
+        use clap::Parser;
+        use fl_core::permissions::Posture;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: AgentCmd,
+        }
+
+        // Default posture is `auto` when `--posture` is omitted.
+        let parsed = TestCli::try_parse_from([
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+        ])
+        .unwrap();
+        match parsed.cmd {
+            AgentCmd::SpinUp { posture, .. } => assert_eq!(posture, Posture::Auto),
+            _ => panic!("expected SpinUp"),
+        }
+
+        // Explicit `--posture` values parse for both `spin-up` and `remodel`.
+        for (raw, want) in [
+            ("ask", Posture::Ask),
+            ("accept-edits", Posture::AcceptEdits),
+            ("auto", Posture::Auto),
+            ("plan", Posture::Plan),
+            ("bypass", Posture::Bypass),
+        ] {
+            let spin_cli = TestCli::try_parse_from([
+                "agent",
+                "spin-up",
+                "ada",
+                "--project",
+                "FerroLoop",
+                "--role",
+                "assistant",
+                "--vendor",
+                "claude",
+                "--posture",
+                raw,
+                "--by",
+                "owner",
+            ])
+            .unwrap();
+            match spin_cli.cmd {
+                AgentCmd::SpinUp { posture, .. } => assert_eq!(posture, want),
+                _ => panic!("expected SpinUp"),
+            }
+
+            let remodel_cli = TestCli::try_parse_from([
+                "agent",
+                "remodel",
+                "claude:ada",
+                "--vendor",
+                "codex",
+                "--posture",
+                raw,
+            ])
+            .unwrap();
+            match remodel_cli.cmd {
+                AgentCmd::Remodel { posture, .. } => assert_eq!(posture, want),
+                _ => panic!("expected Remodel"),
+            }
+        }
+
+        // Unknown `--posture` value is rejected by clap.
+        assert!(
+            TestCli::try_parse_from([
+                "agent",
+                "spin-up",
+                "ada",
+                "--project",
+                "FerroLoop",
+                "--role",
+                "assistant",
+                "--vendor",
+                "claude",
+                "--posture",
+                "invalid-posture",
+                "--by",
+                "owner",
+            ])
+            .is_err()
+        );
+
+        // Unsupported `(vendor, posture)` on `agent::run` returns exit code 1 with zero side effects.
+        let store = MemStore::default();
+        let err = run(
+            &store,
+            AgentCmd::SpinUp {
+                persona: "ada".into(),
+                project: "FerroLoop".into(),
+                role: "assistant".into(),
+                vendor: "codex".into(),
+                model: None,
+                thinking_level: None,
+                posture: Posture::Ask,
+                node_id: None,
+                hosted: false,
+                cwd: None,
+                by: "owner".into(),
+                json: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 1);
+        assert!(err.1.contains("posture"), "unexpected error: {}", err.1);
+        assert!(store.agent_by_name("ada").unwrap().is_none());
     }
 }

@@ -3747,3 +3747,151 @@ fn antigravity_does_not_claim_an_unemitted_posture_or_sandbox_off() {
         .unwrap();
     assert_eq!(s.class, ReceiptClass::Exact);
 }
+
+#[test]
+fn compile_posture_compiles_axes_only_and_refuses_unenforceable_launch_postures() {
+    assert_eq!(Posture::default(), Posture::Auto);
+    for (p, wire) in [
+        (Posture::Ask, "ask"),
+        (Posture::AcceptEdits, "accept-edits"),
+        (Posture::Auto, "auto"),
+        (Posture::Plan, "plan"),
+        (Posture::Bypass, "bypass"),
+    ] {
+        assert_eq!(p.as_str(), wire);
+        assert_eq!(p.to_string(), wire);
+        assert_eq!(wire.parse::<Posture>().unwrap(), p);
+        assert_eq!(
+            format!("  {}  ", wire.to_uppercase())
+                .parse::<Posture>()
+                .unwrap(),
+            p
+        );
+    }
+    assert!("yolo".parse::<Posture>().is_err());
+
+    let pty = VendorFacts::new(Transport::Pty);
+    for (vendor, posture, want_args) in [
+        (
+            Vendor::Claude,
+            Posture::Ask,
+            vec!["--permission-mode", "manual"],
+        ),
+        (
+            Vendor::Claude,
+            Posture::AcceptEdits,
+            vec!["--permission-mode", "acceptEdits"],
+        ),
+        (
+            Vendor::Claude,
+            Posture::Auto,
+            vec!["--permission-mode", "auto"],
+        ),
+        (
+            Vendor::Claude,
+            Posture::Plan,
+            vec!["--permission-mode", "plan"],
+        ),
+        (
+            Vendor::Claude,
+            Posture::Bypass,
+            vec![
+                "--permission-mode",
+                "bypassPermissions",
+                "--allow-dangerously-skip-permissions",
+            ],
+        ),
+        (
+            Vendor::Codex,
+            Posture::AcceptEdits,
+            vec!["-a", "on-request", "-s", "workspace-write"],
+        ),
+        (
+            Vendor::Codex,
+            Posture::Auto,
+            vec!["-a", "on-request", "-s", "workspace-write"],
+        ),
+        (
+            Vendor::Codex,
+            Posture::Plan,
+            vec!["-a", "on-request", "-s", "read-only"],
+        ),
+        (
+            Vendor::Codex,
+            Posture::Bypass,
+            vec!["-a", "never", "-s", "workspace-write"],
+        ),
+        (
+            Vendor::Muse,
+            Posture::Ask,
+            vec!["--approval-mode", "untrusted", "--approval-judge", "off"],
+        ),
+        (
+            Vendor::Muse,
+            Posture::AcceptEdits,
+            vec!["--approval-mode", "on-request", "--approval-judge", "off"],
+        ),
+        (
+            Vendor::Muse,
+            Posture::Auto,
+            vec!["--approval-mode", "on-request", "--approval-judge", "off"],
+        ),
+        (Vendor::Muse, Posture::Bypass, vec!["--disable-approval"]),
+        (
+            Vendor::Grok,
+            Posture::Ask,
+            vec!["--permission-mode", "default"],
+        ),
+        (
+            Vendor::Grok,
+            Posture::AcceptEdits,
+            vec!["--permission-mode", "acceptEdits"],
+        ),
+        (
+            Vendor::Grok,
+            Posture::Auto,
+            vec!["--permission-mode", "auto"],
+        ),
+        (
+            Vendor::Grok,
+            Posture::Plan,
+            vec!["--permission-mode", "plan"],
+        ),
+        (
+            Vendor::Grok,
+            Posture::Bypass,
+            vec!["--permission-mode", "bypassPermissions"],
+        ),
+        (
+            Vendor::Antigravity,
+            Posture::AcceptEdits,
+            vec!["--mode", "accept-edits"],
+        ),
+        (Vendor::Antigravity, Posture::Auto, vec!["--mode", "auto"]),
+        (Vendor::Antigravity, Posture::Plan, vec!["--mode", "plan"]),
+        (
+            Vendor::Antigravity,
+            Posture::Bypass,
+            vec!["--dangerously-skip-permissions"],
+        ),
+    ] {
+        let plan = compile_posture(vendor, &pty, posture).expect("supported launch posture");
+        assert_eq!(plan.launch_args, want_args, "{vendor:?} {posture:?}");
+        assert!(plan.config_files.is_empty(), "{vendor:?} {posture:?}");
+        assert!(!plan.receipts.is_empty(), "{vendor:?} {posture:?}");
+    }
+
+    for (vendor, posture) in [
+        (Vendor::Codex, Posture::Ask),
+        (Vendor::Antigravity, Posture::Ask),
+        (Vendor::Muse, Posture::Plan),
+    ] {
+        assert!(
+            matches!(
+                compile_posture(vendor, &pty, posture),
+                Err(CompileRefusal::PostureNotEnforceable { .. })
+            ),
+            "{vendor:?} {posture:?} must be refused"
+        );
+    }
+}

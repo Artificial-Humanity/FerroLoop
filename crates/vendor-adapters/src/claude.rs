@@ -456,14 +456,23 @@ impl VendorHostAdapter for ClaudeHostAdapter {
             self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
         let binary = self.resolve_binary(request.home_dir.as_deref());
 
-        // Place `--remote-control` before `--enable-auto-mode` so `--remote-control [name]`
+        // Place `--remote-control` before `--permission-mode <mode>` so `--remote-control [name]`
         // in Commander.js is always followed by a `--` flag and never consumes a trailing
         // positional `<prompt>` when `model` and `thinking_effort` are both `None`.
+        let perms = fl_core::permissions::compile_posture(
+            fl_core::permissions::Vendor::Claude,
+            &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
+            request.posture,
+        )
+        .map_err(|e| VendorAdapterError::InvalidConfig {
+            vendor: self.vendor_id().to_string(),
+            reason: format!("posture: {e}"),
+        })?;
         let mut argv = vec![binary.clone()];
         if request.remote_control {
             argv.push("--remote-control".to_string());
         }
-        argv.push("--enable-auto-mode".to_string());
+        argv.extend(perms.launch_args);
 
         if let Some(raw_sid) = request
             .binding
@@ -510,11 +519,20 @@ impl VendorHostAdapter for ClaudeHostAdapter {
             self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
         let binary = self.resolve_binary(request.home_dir.as_deref());
 
+        let perms = fl_core::permissions::compile_posture(
+            fl_core::permissions::Vendor::Claude,
+            &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
+            request.posture,
+        )
+        .map_err(|e| VendorAdapterError::InvalidConfig {
+            vendor: self.vendor_id().to_string(),
+            reason: format!("posture: {e}"),
+        })?;
         let mut argv = vec![binary.clone()];
         if request.remote_control {
             argv.push("--remote-control".to_string());
         }
-        argv.push("--enable-auto-mode".to_string());
+        argv.extend(perms.launch_args);
         argv.extend(["--resume".to_string(), session_id.to_string()]);
 
         if let Some(persona) = request.persona.as_deref()
@@ -1042,11 +1060,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_launch_places_remote_control_before_enable_auto_mode_and_binds_session_id() {
+    fn prepare_launch_places_remote_control_before_permission_mode_and_binds_session_id() {
         let tmp = TempDir::new().unwrap();
         let adapter = ClaudeHostAdapter::new();
 
-        // Case 1: model and thinking_effort are both None — `--enable-auto-mode` must still
+        // Case 1: model and thinking_effort are both None — `--permission-mode` must still
         // sit immediately after `--remote-control` so Commander.js `--remote-control [name]`
         // never consumes the positional prompt.
         let req_minimal = VendorLaunchRequest {
@@ -1058,13 +1076,15 @@ mod tests {
             cwd: Some(tmp.path().to_path_buf()),
             home_dir: Some(tmp.path().to_path_buf()),
             remote_control: true,
+            posture: fl_core::permissions::Posture::Auto,
         };
         let plan_minimal = adapter.prepare_launch(&req_minimal).unwrap();
         assert_eq!(
             &plan_minimal.argv[1..],
             &[
                 "--remote-control",
-                "--enable-auto-mode",
+                "--permission-mode",
+                "auto",
                 "Hydrate and check roster"
             ]
         );
@@ -1095,13 +1115,15 @@ mod tests {
             cwd: Some(tmp.path().to_path_buf()),
             home_dir: Some(tmp.path().to_path_buf()),
             remote_control: true,
+            posture: fl_core::permissions::Posture::Auto,
         };
         let plan_bound = adapter.prepare_launch(&req_bound).unwrap();
         assert_eq!(
             &plan_bound.argv[1..],
             &[
                 "--remote-control",
-                "--enable-auto-mode",
+                "--permission-mode",
+                "auto",
                 "--session-id",
                 session_uuid,
                 "--name",
@@ -1148,7 +1170,8 @@ mod tests {
             &plan.argv[1..],
             &[
                 "--remote-control",
-                "--enable-auto-mode",
+                "--permission-mode",
+                "auto",
                 "--resume",
                 uuid,
                 "--name",

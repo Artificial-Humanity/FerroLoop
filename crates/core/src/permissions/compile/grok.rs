@@ -61,6 +61,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             "no flag turns a sandbox off; nothing emitted",
         ),
     }
+    if cx.axes_only {
+        return Ok(());
+    }
     let mut e = Entries::default();
     compile_rules(cx, &mut e, true)?;
     e.sort_dedup();

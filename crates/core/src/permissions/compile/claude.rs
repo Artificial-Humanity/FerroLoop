@@ -331,6 +331,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             "the compiler cannot switch off a sandbox the vendor config may enable; nothing emitted",
         ),
     }
+    if cx.axes_only {
+        return Ok(());
+    }
     let mut e = Entries::default();
     compile_rules(cx, &mut e, false)?;
     e.sort_dedup();

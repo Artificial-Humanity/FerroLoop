@@ -180,6 +180,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         Surface::Sandbox,
         "separate axis from approvals; launch-fixed",
     );
+    if cx.axes_only {
+        return Ok(());
+    }
 
     // Rules.
     let mut net: Option<(&'static str, ReceiptClass)> = None;
