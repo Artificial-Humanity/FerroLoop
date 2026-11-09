@@ -247,6 +247,42 @@ impl AsyncHostClient {
         }
     }
 
+    /// False for missing/mismatched ownership or an older host without this capability.
+    /// The caller must use the same stream for the subsequent controller claim and mutation.
+    pub async fn check_session_owner(
+        &mut self,
+        stream: crate::StreamId,
+        hosted_id: &str,
+    ) -> Result<bool, HostError> {
+        if hosted_id.is_empty() || hosted_id.len() > crate::MAX_HOSTED_OWNER_BYTES || self.minor < 1
+        {
+            return Ok(false);
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::Capabilities)
+            .await?
+        {
+            crate::ExtensionResponse::Capabilities { features, .. } => {
+                if features & crate::SESSION_OWNER_FEATURE == 0 {
+                    return Ok(false);
+                }
+            }
+            _ => return Err(HostError::Protocol("capabilities response required".into())),
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::CheckSessionOwner {
+                stream,
+                hosted_id: hosted_id.to_owned(),
+            })
+            .await?
+        {
+            crate::ExtensionResponse::SessionOwner { matches } => Ok(matches),
+            _ => Err(HostError::Protocol(
+                "session owner response required".into(),
+            )),
+        }
+    }
+
     pub async fn claim_controller(
         &mut self,
         stream: crate::StreamId,
@@ -652,6 +688,15 @@ impl BlockingHostClient {
     /// None means the daemon does not support build identity telemetry.
     pub fn host_status(&mut self) -> Result<Option<crate::HostBuildInfo>, HostError> {
         self.runtime.block_on(self.inner.host_status())
+    }
+
+    pub fn check_session_owner(
+        &mut self,
+        stream: crate::StreamId,
+        hosted_id: &str,
+    ) -> Result<bool, HostError> {
+        self.runtime
+            .block_on(self.inner.check_session_owner(stream, hosted_id))
     }
 
     pub fn list_sessions(&mut self) -> Result<Vec<crate::SessionSummary>, HostError> {

@@ -150,3 +150,44 @@ readiness. PTY backend/schema eligibility, controller persistence, authenticated
 service readiness/installer packaging and exact-version vendor conformance remain
 separate reviewed prerequisites. PTY display projection/snapshot progress and
 vendor receipts must never be substituted for durable reliable-event application.
+
+## Hosted-session ownership (feature 16)
+
+`SESSION_OWNER_FEATURE` is capability bit **16** in the protocol 1.1 extension.
+After negotiating it, a client may send the following extension request (inside
+its usual `Extended` envelope):
+
+```json
+{"op":"check_session_owner","stream":{"host":"0123456789abcdef0123456789abcdef","session":"Ada.claude","epoch":1},"hosted_id":"claude:ada"}
+```
+
+The response is `{"op":"session_owner","matches":true}` or `false`. The query
+returns only a boolean; `ListSessions` and the legacy protocol shapes are unchanged.
+An ownership match requires a `hosted_id` of 1–128 UTF-8 bytes. An empty query
+returns `false`; values over 128 bytes are rejected during validation. The host
+retains a fixed-size owner marker from `FL_HOSTED_ID` in the explicit, allowed
+launch environment; inherited environment alone supplies no marker. Missing or
+oversized launch markers do not establish ownership.
+
+The host checks the full `(host instance, session ID, epoch)` against its retained
+session before comparing the marker. A stale stream cannot establish ownership of
+a same-name replacement. The query grants no controller lease: mutation still
+requires `ClaimController` and `KillSession` on that same stream. The lifecycle
+uses the exact `<Persona>.<vendor>` ID throughout, never a persona prefix.
+
+Updated lifecycle clients preflight spin-up, restart and execute-remodel before
+registry, hosted-record or route changes. A host without this feature produces an
+HTTP 409 / nonzero CLI result naming `SESSION_OWNER_FEATURE` and instructing the
+operator to upgrade and restart `ferroloop-host.service`. Invalid owner IDs produce
+HTTP 400. No ownership request is sent to an older host.
+
+For teardown there is one compatibility exception: a durable `runtime_spawned=true`
+record permits stopping its exact recorded vendor unit on an older host without
+feature 16. This preserves the existing recorded-session stop contract during
+rollout. It does not permit owner adoption of a stale `runtime_spawned=false` unit;
+that operation refuses before cleanup when ownership cannot be queried. On a host
+with feature 16, even a recorded runtime requires matching ownership. Missing or
+mismatched markers explicitly refuse recorded teardown and name the exact manual
+`fl host kill <Persona>.<vendor>` command for operator inspection. Foreign or
+unmarked units behind stale false records remain running. Failure to negotiate
+capabilities is not treated as evidence of an old host.

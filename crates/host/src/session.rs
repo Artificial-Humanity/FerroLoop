@@ -23,6 +23,9 @@ pub struct Session {
     pub pgid: u32,
     pub control_inode: u64,
     pub started_at_ms: u64,
+    // Fixed storage bounds retained ownership without exposing launch environment values.
+    hosted_owner: [u8; fl_host_proto::MAX_HOSTED_OWNER_BYTES],
+    hosted_owner_len: usize,
     control: Mutex<Option<File>>,
     stdin: Mutex<Option<File>>,
     leader: Mutex<Option<ChildExit>>,
@@ -73,6 +76,19 @@ pub(crate) struct SessionParts {
 }
 
 impl Session {
+    pub(crate) fn with_hosted_owner(mut self, owner: Option<&str>) -> Self {
+        if let Some(owner) = owner.filter(|s| !s.is_empty() && s.len() <= self.hosted_owner.len()) {
+            self.hosted_owner[..owner.len()].copy_from_slice(owner.as_bytes());
+            self.hosted_owner_len = owner.len();
+        }
+        self
+    }
+
+    pub(crate) fn owned_by(&self, hosted_id: &str) -> bool {
+        self.hosted_owner_len != 0
+            && self.hosted_owner[..self.hosted_owner_len] == *hosted_id.as_bytes()
+    }
+
     pub(crate) fn mode(&self) -> fl_host_proto::SessionMode {
         match &self.reliable {
             Some(journal) if journal.pty_mode() => fl_host_proto::SessionMode::Pty,
@@ -221,6 +237,8 @@ impl Session {
             pgid,
             control_inode,
             started_at_ms,
+            hosted_owner: [0; fl_host_proto::MAX_HOSTED_OWNER_BYTES],
+            hosted_owner_len: 0,
             control: Mutex::new(control),
             stdin: Mutex::new(stdin),
             leader: Mutex::new(None),
