@@ -1271,77 +1271,11 @@ fn explicit_hosted_owner<'a>(spec: &SpawnSpec, env: &'a [(String, String)]) -> O
 }
 
 #[cfg(unix)]
-fn write_if_pollout(fd: libc::c_int, bytes: &[u8]) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    // SAFETY: one pollfd with zero timeout so an unresponsive or full stderr pipe
-    // never blocks status draining or epoch retirement.
-    if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0
-        || (pfd.revents & libc::POLLOUT) == 0
-        || (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-    {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::io::Write;
-        let mut path = [0u8; 32];
-        let mut cursor = std::io::Cursor::new(path.as_mut_slice());
-        if write!(cursor, "/proc/self/fd/{fd}\0").is_ok() {
-            // SAFETY: NUL-terminated stack path; opens an independent kernel file
-            // description with O_NONBLOCK so `fd`'s own status flags are untouched.
-            let opened = unsafe {
-                libc::open(
-                    path.as_ptr().cast(),
-                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            };
-            if opened >= 0 {
-                let n = unsafe { libc::write(opened, bytes.as_ptr().cast(), bytes.len()) };
-                unsafe { libc::close(opened) };
-                return n > 0;
-            }
-        }
-    }
-    // SAFETY: if `fd` is a socket, MSG_DONTWAIT performs a non-blocking write without
-    // mutating file status flags; if `fd` is not a socket, send fails with ENOTSOCK.
-    let sent = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
-    if sent >= 0 {
-        return sent > 0;
-    }
-    if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOTSOCK) {
-        return false;
-    }
-    static NONBLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = NONBLOCK_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-    let dup_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if dup_fd < 0 {
-        return false;
-    }
-    let flags = unsafe { libc::fcntl(dup_fd, libc::F_GETFL) };
-    if flags < 0 {
-        unsafe { libc::close(dup_fd) };
-        return false;
-    }
-    if (flags & libc::O_NONBLOCK) == 0
-        && unsafe { libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0
-    {
-        unsafe { libc::close(dup_fd) };
-        return false;
-    }
-    let n = unsafe { libc::write(dup_fd, bytes.as_ptr().cast(), bytes.len()) };
-    if (flags & libc::O_NONBLOCK) == 0 {
-        let _ = unsafe { libc::fcntl(dup_fd, libc::F_SETFL, flags) };
-    }
-    unsafe { libc::close(dup_fd) };
-    n > 0
-}
-
-#[cfg(unix)]
-fn emit_hosted_cleanup_notice_unix(session: &Session, direct_children: usize) {
+fn emit_hosted_cleanup_notice_unix(
+    session: &Session,
+    direct_children: usize,
+    sink: &mut dyn std::io::Write,
+) {
     if direct_children == 0 {
         return;
     }
@@ -1360,11 +1294,22 @@ fn emit_hosted_cleanup_notice_unix(session: &Session, direct_children: usize) {
         return;
     }
     let len = cursor.position() as usize;
-    let _ = write_if_pollout(libc::STDERR_FILENO, &raw[..len]);
+    let _ = sink.write_all(&raw[..len]);
 }
 
 #[cfg(unix)]
-fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
+fn unix_status(status: File, session: Arc<Session>, host: Arc<HostInner>) {
+    let mut sink = NonBlockingStderrSink;
+    unix_status_log(status, session, host, &mut sink);
+}
+
+#[cfg(unix)]
+fn unix_status_log(
+    mut status: File,
+    session: Arc<Session>,
+    host: Arc<HostInner>,
+    sink: &mut dyn std::io::Write,
+) {
     while let Ok(Some(line)) = child::unix::read_line_blocking(&mut status) {
         let Ok(message) = protocol::from_line::<protocol::SupervisorMsg>(&line) else {
             continue;
@@ -1391,7 +1336,7 @@ fn unix_status(mut status: File, session: Arc<Session>, host: Arc<HostInner>) {
             }
             protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children } => {
                 if session.has_hosted_owner() && direct_children > 0 {
-                    emit_hosted_cleanup_notice_unix(&session, direct_children);
+                    emit_hosted_cleanup_notice_unix(&session, direct_children, sink);
                 }
             }
             protocol::SupervisorMsg::Cleanup { complete } => {
@@ -1451,30 +1396,46 @@ fn observe_windows_job_after_poll(
     WatchTick::Poll { requested, quiet }
 }
 
-#[cfg(any(windows, test))]
-struct NonBlockingStderrSink;
+#[derive(Clone)]
+struct NonBlockingWriteSink(std::sync::mpsc::SyncSender<([u8; 256], usize)>);
 
-#[cfg(any(windows, test))]
-impl std::io::Write for NonBlockingStderrSink {
+impl NonBlockingWriteSink {
+    fn spawn<W: std::io::Write + Send + 'static>(mut writer: W) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<([u8; 256], usize)>(16);
+        let _ = std::thread::Builder::new()
+            .name("fl-host-stderr".into())
+            .spawn(move || {
+                while let Ok((raw, len)) = rx.recv() {
+                    let _ = writer.write_all(&raw[..len]);
+                }
+            });
+        Self(tx)
+    }
+}
+
+impl std::io::Write for NonBlockingWriteSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        static STDERR_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<([u8; 256], usize)>> =
-            std::sync::OnceLock::new();
-        let tx = STDERR_TX.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<([u8; 256], usize)>(16);
-            let _ = std::thread::Builder::new()
-                .name("fl-host-stderr".into())
-                .spawn(move || {
-                    while let Ok((raw, len)) = rx.recv() {
-                        let _ = std::io::stderr().write_all(&raw[..len]);
-                    }
-                });
-            tx
-        });
         let len = buf.len().min(256);
         let mut raw = [0u8; 256];
         raw[..len].copy_from_slice(&buf[..len]);
-        let _ = tx.try_send((raw, len));
+        let _ = self.0.try_send((raw, len));
         Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct NonBlockingStderrSink;
+
+impl std::io::Write for NonBlockingStderrSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        static STDERR_SINK: std::sync::OnceLock<NonBlockingWriteSink> = std::sync::OnceLock::new();
+        STDERR_SINK
+            .get_or_init(|| NonBlockingWriteSink::spawn(std::io::stderr()))
+            .clone()
+            .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2097,8 +2058,8 @@ mod deadline_tests {
     #[cfg(unix)]
     #[test]
     fn unix_hosted_cleanup_log_and_protocol_defaults_stay_bounded() {
-        use std::io::Read;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
 
         let legacy = br#"{"op":"spawn","argv":["a"],"cwd":[47],"env":[],"session":"s","epoch":1}"#;
         let parsed: super::protocol::DaemonMsg = super::protocol::from_line(legacy).unwrap();
@@ -2126,59 +2087,104 @@ mod deadline_tests {
             msg
         );
 
+        struct CaptureWriter(std::sync::mpsc::Sender<String>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .send(String::from_utf8(buf.to_vec()).unwrap())
+                    .unwrap();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_dir, host, _, _) = watch_fixture();
+        let session = Arc::new(
+            Session::new(SessionParts {
+                session: SessionId::new("race").unwrap(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            })
+            .with_hosted_owner(Some("hosted-423")),
+        );
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        let mut capture_sink = super::NonBlockingWriteSink::spawn(CaptureWriter(line_tx));
+        super::emit_hosted_cleanup_notice_unix(&session, 2, &mut capture_sink);
+        assert_eq!(
+            line_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "fl-host: hosted session race (epoch 1) armed post-leader-exit cleanup after 500ms (direct_children=2)\n"
+        );
+
+        struct BlockedWriter {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl std::io::Write for BlockedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered, observing) = std::sync::mpsc::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let mut blocked_sink = super::NonBlockingWriteSink::spawn(BlockedWriter {
+            entered,
+            release: waiting,
+        });
+        super::emit_hosted_cleanup_notice_unix(&session, 1, &mut blocked_sink);
+        observing.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..24 {
+            super::emit_hosted_cleanup_notice_unix(&session, 1, &mut blocked_sink);
+        }
+
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        assert!(super::write_if_pollout(writer.as_raw_fd(), b"hello\n"));
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-            0
-        );
-        let mut got = [0u8; 6];
-        reader.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"hello\n");
+        let status_reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut status_writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        for status_msg in [
+            super::protocol::SupervisorMsg::Leader {
+                code: Some(0),
+                signal: None,
+            },
+            super::protocol::SupervisorMsg::HostedLeaderExitCleanup { direct_children: 2 },
+            super::protocol::SupervisorMsg::Cleanup { complete: true },
+        ] {
+            status_writer
+                .write_all(&super::protocol::to_line(&status_msg).unwrap())
+                .unwrap();
+        }
+        drop(status_writer);
 
-        // Fill the pipe with O_NONBLOCK, then restore blocking flags like STDERR_FILENO.
-        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-        assert!(flags >= 0);
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
-        let chunk = [b'x'; 4096];
-        while unsafe { libc::write(writer.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) } > 0 {}
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
-            0
-        );
         let started = Instant::now();
-        assert!(!super::write_if_pollout(
-            writer.as_raw_fd(),
-            b"must-not-block\n"
-        ));
-        assert!(started.elapsed() < Duration::from_millis(100));
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-            0
+        super::unix_status_log(
+            status_reader,
+            Arc::clone(&session),
+            Arc::clone(&host.inner),
+            &mut blocked_sink,
         );
-
-        // Also verify socket fallback path (`MSG_DONTWAIT` when `/proc/self/fd` returns ENXIO).
-        let mut socks = [0; 2];
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(host.inner.registry.lock().unwrap().sessions.is_empty());
         assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, socks.as_mut_ptr()) },
-            0
+            session.cleanup_report(),
+            Some(CleanupReport { complete: true })
         );
-        let mut sock_reader = unsafe { std::fs::File::from_raw_fd(socks[0]) };
-        let sock_writer = unsafe { OwnedFd::from_raw_fd(socks[1]) };
-        assert!(super::write_if_pollout(sock_writer.as_raw_fd(), b"sock!\n"));
-        assert_eq!(
-            unsafe { libc::fcntl(sock_writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-            0
-        );
-        let mut sock_got = [0u8; 6];
-        sock_reader.read_exact(&mut sock_got).unwrap();
-        assert_eq!(&sock_got, b"sock!\n");
+        assert_eq!(session.leader_exit().unwrap().code, Some(0));
+        release.send(()).unwrap();
+        host.shutdown().unwrap();
     }
 
     #[test]
