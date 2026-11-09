@@ -542,8 +542,21 @@ fn report(rest: &[String]) {
         out.push_str(&json_escape(&value));
         out.push('"');
     }
+    #[cfg(unix)]
+    let sigpipe_blocked = {
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut set) },
+            0
+        );
+        unsafe { libc::sigismember(&set, libc::SIGPIPE) == 1 }
+    };
+    #[cfg(not(unix))]
+    let sigpipe_blocked = false;
     let tty = stdout_is_tty();
-    out.push_str(&format!("}},\"isatty\":{tty}}}\n"));
+    out.push_str(&format!(
+        "}},\"sigpipe_blocked\":{sigpipe_blocked},\"isatty\":{tty}}}\n"
+    ));
     let mut stdout = io::stdout();
     let _ = stdout.write_all(out.as_bytes());
     let _ = stdout.flush();
