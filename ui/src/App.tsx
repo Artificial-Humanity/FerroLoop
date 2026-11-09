@@ -96,7 +96,6 @@ import {
   type PrReviewRequest,
   type PullRequestItem,
   type RemodelSessionResponse,
-  type RestartHostedSessionResponse,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type SpinUpSessionRequest,
@@ -2844,59 +2843,6 @@ export const App: React.FC<AppProps> = ({
                       node_id: res.node_id || existing?.node_id || "",
                       status: res.status || existing?.status || "running",
                       restart_count: existing?.restart_count ?? 0,
-                      updated_at_ms: Date.now(),
-                    },
-                  };
-                });
-              }
-              void refreshWireAndRoster();
-              void refreshSessionsAndTranscript();
-            }}
-            onAfterRestart={(res: RestartHostedSessionResponse) => {
-              const personaKey = (res.persona || "").trim().toLowerCase();
-              if (personaKey) {
-                const hydrationStatus = normalizeHydrationStatus(
-                  res.hydration_status,
-                );
-                const warnings = normalizeHydrationWarnings(res.warnings);
-                setSpunUpByAgent((prev) => ({
-                  ...prev,
-                  [personaKey]: {
-                    adapter: res.vendor || prev[personaKey]?.adapter || "unknown",
-                    model: res.model ?? prev[personaKey]?.model ?? null,
-                    sessionId:
-                      res.session_id || prev[personaKey]?.sessionId || null,
-                    hydrationDispatched: Boolean(res.hydration_dispatched),
-                    hydrationStatus,
-                    warnings,
-                  },
-                }));
-                setHostedSessionsByAgent((prev) => {
-                  const existing = prev[personaKey];
-                  if (!existing && res.hosted === false) {
-                    return prev;
-                  }
-                  return {
-                    ...prev,
-                    [personaKey]: {
-                      session_id:
-                        res.session_id ||
-                        existing?.session_id ||
-                        `${res.vendor || existing?.vendor || "unknown"}:${personaKey}`,
-                      persona: res.persona || existing?.persona || personaKey,
-                      project: res.project || existing?.project || "",
-                      role: res.role || existing?.role || "",
-                      vendor: res.vendor || existing?.vendor || "unknown",
-                      model: res.model ?? existing?.model ?? null,
-                      posture: res.posture ?? existing?.posture,
-                      hydration_dispatched: Boolean(res.hydration_dispatched),
-                      hydration_status: hydrationStatus,
-                      node_id: res.node_id || existing?.node_id || "",
-                      status: res.status || existing?.status || "running",
-                      restart_count:
-                        typeof res.restart_count === "number"
-                          ? res.restart_count
-                          : (existing?.restart_count ?? 0),
                       updated_at_ms: Date.now(),
                     },
                   };

@@ -756,26 +756,6 @@ export interface HostedSessionSummary {
   updated_at_ms?: number;
 }
 
-export interface RestartHostedSessionResponse extends HostedSessionSummary {
-  warnings?: string[];
-  hosted?: boolean;
-  restart_policy?: string;
-  restart_count: number;
-  tmux_target?: string | null;
-  host_session_id?: string | null;
-  cwd?: string | null;
-  context_window?: number;
-  thinking_level?: string | null;
-  runtime_spawned?: boolean;
-  vendor_session_id?: string | null;
-  created_at_ms?: number;
-  updated_at_ms?: number;
-  decommission_prepared_at_ms?: number | null;
-  prompt: string;
-}
-
-export type HostedSessionRestartResponse = RestartHostedSessionResponse;
-
 export interface SpinUpSessionRequest {
   persona: string;
   project: string;
