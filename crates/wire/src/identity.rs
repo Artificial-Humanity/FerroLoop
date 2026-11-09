@@ -109,6 +109,22 @@ thread_local! {
     pub(crate) static DISCOVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// In-memory result for the latest rejected claim remembered for one persona. A later scan
+/// can confirm the same source, and that confirmation clears only this exact rejection.
+#[derive(Debug, Clone)]
+struct PassiveAgyRevalidation {
+    entry: RouteEntry,
+    source_validated: bool,
+    /// Orders only in-process validation results, never competing route identities.
+    observed_at: Instant,
+}
+
+impl PassiveAgyRevalidation {
+    fn rejects(&self, entry: &RouteEntry) -> bool {
+        !self.source_validated && self.entry == *entry
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteTable {
     pub entries: BTreeMap<String, RouteEntry>,
@@ -116,6 +132,11 @@ pub struct RouteTable {
     /// memory only (never in the routes file), so a fresh process starts due for a scan.
     #[serde(skip)]
     last_discovery: Option<Instant>,
+    /// Latest exact passive Agy claim rejected per persona. Kept only in memory so a scan's
+    /// invalidation survives snapshot reconciliation, including a same-persona replacement.
+    /// This is not route freshness metadata or a history of rejected conversations.
+    #[serde(skip)]
+    passive_agy_revalidation: BTreeMap<String, PassiveAgyRevalidation>,
 }
 
 /// Sidecar next to the route table. Rebuilt from hosted records that are still
@@ -727,7 +748,32 @@ impl RouteTable {
     }
 
     pub fn merge_newer(&mut self, other: Self) {
+        // Apply source invalidation before freshness comparisons. Matching the whole rejected
+        // entry preserves a concurrent registration or a changed, valid route. Keep one exact
+        // rejection per persona so replaying that stale snapshot cannot resurrect the claim.
+        for (key, result) in other.passive_agy_revalidation {
+            let current = self.passive_agy_revalidation.get(&key);
+            if current.is_none_or(|old| result.observed_at > old.observed_at)
+                && (!result.source_validated
+                    || current.is_some_and(|old| old.entry == result.entry))
+            {
+                self.passive_agy_revalidation.insert(key, result);
+            }
+        }
+        self.entries.retain(|key, entry| {
+            !self
+                .passive_agy_revalidation
+                .get(key)
+                .is_some_and(|result| result.rejects(entry))
+        });
         for (k, mut v) in other.entries {
+            if self
+                .passive_agy_revalidation
+                .get(&k)
+                .is_some_and(|result| result.rejects(&v))
+            {
+                continue;
+            }
             if !v.explicit
                 && v.route.session_identity().is_some_and(|identity| {
                     self.entries.iter().any(|(name, entry)| {
@@ -857,6 +903,7 @@ impl RouteTable {
             return Some(RouteTable {
                 entries,
                 last_discovery: None,
+                passive_agy_revalidation: BTreeMap::new(),
             });
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
@@ -888,6 +935,7 @@ impl RouteTable {
                 return Some(RouteTable {
                     entries,
                     last_discovery: None,
+                    passive_agy_revalidation: BTreeMap::new(),
                 });
             }
         }
@@ -1303,14 +1351,33 @@ impl RouteTable {
             .iter()
             .map(|(_, conversation_id, persona)| (conversation_id.as_str(), persona.as_str()))
             .collect();
+        let validation_at = Instant::now();
+        // A later bounded scan can validate a previously rejected conversation again. Do not
+        // let old in-memory rejection evidence suppress that now-valid identity.
+        for (persona, result) in &mut self.passive_agy_revalidation {
+            result.source_validated = matches!(&result.entry.route, VendorRoute::Agy { conversation_id, .. }
+                if validated.get(conversation_id.as_str()).copied() == Some(persona.as_str()));
+            result.observed_at = validation_at;
+        }
         self.entries.retain(|persona, entry| {
-            entry.explicit
+            let keep = entry.explicit
                 || match &entry.route {
                     VendorRoute::Agy {
                         conversation_id, ..
                     } => validated.get(conversation_id.as_str()).copied() == Some(persona.as_str()),
                     _ => true,
-                }
+                };
+            if !keep {
+                self.passive_agy_revalidation.insert(
+                    persona.clone(),
+                    PassiveAgyRevalidation {
+                        entry: entry.clone(),
+                        source_validated: false,
+                        observed_at: validation_at,
+                    },
+                );
+            }
+            keep
         });
         if !brain_dir.is_dir() {
             // No transcript to scan. Still replace a missing or `.old` exe with
@@ -8382,7 +8449,7 @@ mod tests {
         let transcript =
             agy_registration_fixture(home.path(), "unreadable-conversation", "Kayla", 100);
         let permissions = fs::metadata(&transcript).unwrap().permissions();
-        fs::set_permissions(&transcript, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o0)).unwrap();
         assert!(fs::read_to_string(&transcript).is_err());
         assert_eq!(mtime_ms(&transcript), 100);
         let mut table = RouteTable::default();
@@ -8573,6 +8640,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn passive_agy_invalid_claim_replacement_survives_all_merge_paths() {
+        for merge in ["direct", "dispatch", "daemon"] {
+            for concurrent in ["none", "explicit", "valid-newer"] {
+                let home = TempDir::new().unwrap();
+                agy_transcript_fixture(
+                    home.path(),
+                    "quoted-conversation",
+                    "{\"type\":\"GENERIC\",\"content\":\"fl wire register Kayla\"}\n",
+                    100,
+                );
+                agy_registration_fixture(home.path(), "real-conversation", "Kayla", 200);
+                let mut base = RouteTable::default();
+                base.upsert(
+                    "kayla",
+                    agy_route("quoted-conversation"),
+                    At::from_unix_millis(9000),
+                );
+                let mut working = base.clone();
+                working.discover_routes(Some(home.path()), At::from_unix_millis(10000));
+                let replacement = working.get("kayla").unwrap().clone();
+                assert_eq!(replacement.updated_at.unix_millis(), 200);
+                let mut live = base.clone();
+                match concurrent {
+                    "explicit" => live.upsert_explicit(
+                        "kayla",
+                        agy_route("explicit-conversation"),
+                        At::from_unix_millis(9500),
+                    ),
+                    "valid-newer" => live.upsert(
+                        "kayla",
+                        agy_route("valid-newer-conversation"),
+                        At::from_unix_millis(9500),
+                    ),
+                    _ => {}
+                }
+                let concurrent_entry = live.get("kayla").unwrap().clone();
+                match merge {
+                    "direct" => live.merge_newer(working),
+                    "dispatch" => live.merge_dispatch_result(&base, working),
+                    "daemon" => live.merge_daemon_dispatch_result(&base, working),
+                    _ => unreachable!(),
+                }
+                let expected = if concurrent == "none" {
+                    &replacement
+                } else {
+                    &concurrent_entry
+                };
+                assert_eq!(live.get("kayla"), Some(expected), "{merge}, {concurrent}");
+                // A stale snapshot must not put the exact rejected claim back.
+                live.merge_newer(base.clone());
+                assert_eq!(
+                    live.get("kayla"),
+                    Some(expected),
+                    "replay: {merge}, {concurrent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn passive_agy_rejection_does_not_change_valid_route_freshness_policy() {
+        let mut newer = RouteTable::default();
+        newer.upsert(
+            "kayla",
+            agy_route("valid-newer"),
+            At::from_unix_millis(9000),
+        );
+        let expected = newer.get("kayla").unwrap().clone();
+        let mut older = RouteTable::default();
+        older.upsert("kayla", agy_route("valid-older"), At::from_unix_millis(200));
+        newer.merge_newer(older);
+        assert_eq!(newer.get("kayla"), Some(&expected));
+    }
+
+    #[test]
+    fn passive_agy_rejection_is_transient_and_successful_revalidation_clears_it() {
+        let home = TempDir::new().unwrap();
+        let mut table = RouteTable::default();
+        let mut route = agy_route("revalidated-conversation");
+        if let VendorRoute::Agy { agentapi_exe, .. } = &mut route {
+            *agentapi_exe = Some(PathBuf::from("agy"));
+        }
+        table.upsert("kayla", route, At::from_unix_millis(9000));
+        let old = table.clone();
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(10000));
+        assert!(table.get("kayla").is_none());
+        let encoded = serde_json::to_value(&table).unwrap();
+        assert_eq!(encoded, serde_json::json!({"entries": {}}));
+        table.merge_newer(old.clone());
+        assert!(table.get("kayla").is_none(), "rejected snapshot reappeared");
+
+        let rejected = table.clone();
+        agy_registration_fixture(home.path(), "revalidated-conversation", "Kayla", 9000);
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(10001));
+        assert_eq!(table.get("kayla"), old.get("kayla"));
+        for merge in ["direct", "dispatch", "daemon"] {
+            let mut live = rejected.clone();
+            match merge {
+                "direct" => live.merge_newer(table.clone()),
+                "dispatch" => live.merge_dispatch_result(&rejected, table.clone()),
+                "daemon" => live.merge_daemon_dispatch_result(&rejected, table.clone()),
+                _ => unreachable!(),
+            }
+            assert_eq!(live.get("kayla"), old.get("kayla"), "revalidation: {merge}");
+            live.merge_newer(rejected.clone());
+            assert_eq!(
+                live.get("kayla"),
+                old.get("kayla"),
+                "stale rejection: {merge}"
+            );
+        }
+
+        // A later scan must revoke that confirmation if the source vanishes, even when the
+        // current snapshot has no route (for example after an unregister).
+        let mut missing_again = table.clone();
+        missing_again.entries.clear();
+        fs::remove_file(home.path().join(".gemini/antigravity-cli/brain/revalidated-conversation/.system_generated/logs/transcript.jsonl")).unwrap();
+        missing_again.discover_agy_routes(home.path(), false, &At::from_unix_millis(10002));
+        missing_again.merge_newer(old.clone());
+        assert!(
+            missing_again.get("kayla").is_none(),
+            "missing source reused an old confirmation"
+        );
+        agy_registration_fixture(home.path(), "revalidated-conversation", "Kayla", 9000);
+
+        // An older successful validation may clear only its own rejected entry. A different
+        // claim rejected in the meantime still must not be replayed from a stale snapshot.
+        let mut changed = rejected;
+        changed.upsert(
+            "kayla",
+            agy_route("different-rejected"),
+            At::from_unix_millis(9500),
+        );
+        let stale = changed.clone();
+        changed.discover_agy_routes(home.path(), false, &At::from_unix_millis(10002));
+        changed.merge_newer(table);
+        changed.merge_newer(stale);
+        assert_eq!(changed.get("kayla"), old.get("kayla"));
     }
 
     #[test]
