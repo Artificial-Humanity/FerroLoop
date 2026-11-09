@@ -78,6 +78,7 @@ import {
   type WireInboxItem,
   type WireSendRequest,
   type WireSendResponse,
+  type WireStatusResponse,
   type DeleteGateSecretResponse,
   type DispatchNodeTaskInput,
   type EnrolledNode,
@@ -1340,6 +1341,10 @@ export class HubApiClient {
       method: "POST",
       body: JSON.stringify(payload),
     });
+  }
+
+  public async getWireStatus(): Promise<WireStatusResponse> {
+    return this.request<WireStatusResponse>("/api/v1/wire/status");
   }
 
   public async getWorkflows(): Promise<{ workflows: WorkflowDef[] }> {

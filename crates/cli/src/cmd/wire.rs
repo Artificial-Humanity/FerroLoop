@@ -281,26 +281,11 @@ fn hydrate_program() -> PathBuf {
 }
 
 pub fn resolve_socket_path(env: &StateEnv<'_>, explicit: Option<&Path>) -> PathBuf {
-    if let Some(p) = explicit {
-        return p.to_path_buf();
-    }
-    if let Some(s) = std::env::var_os("FL_WIRE_SOCKET") {
-        let p = PathBuf::from(s);
-        if p.is_absolute() {
-            return p;
-        }
-    }
-    if let Some(p) = env.cfg.wire.as_ref().and_then(|w| w.socket.clone()) {
-        return p;
-    }
-    if let Some(dir) = env
-        .explicit_db
-        .and_then(|p| p.parent())
-        .filter(|d| !d.as_os_str().is_empty())
-    {
-        return dir.join("fl-wire.sock");
-    }
-    default_socket_path()
+    fl_wire::daemon::resolve_socket_path(
+        explicit,
+        env.cfg.wire.as_ref().and_then(|w| w.socket.as_deref()),
+        env.explicit_db,
+    )
 }
 
 pub fn resolve_routes_path() -> Option<PathBuf> {
