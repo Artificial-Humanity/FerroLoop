@@ -389,6 +389,22 @@ pub trait SessionRuntime: std::fmt::Debug {
         runtime_unit(target)
     }
 
+    /// Check launch compatibility before lifecycle state or routes are changed.
+    fn preflight_spawn(&self, _hosted_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    /// Check stop authority before lifecycle cleanup. `recorded` means the durable record
+    /// proves this lifecycle started the exact unit; adoption requires live ownership proof.
+    fn preflight_stop(
+        &self,
+        _unit: &str,
+        _hosted_id: &str,
+        _recorded: bool,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
     /// Start a detached runtime; `false` when it did not start (tmux failed, or the name exists).
     /// With `launch` the window runs that command (the vendor's CLI) instead of a blank shell.
     /// Built-in CLI vendors launch via [`launch_spec_for`]; custom vendors get a blank window.
@@ -650,6 +666,21 @@ fn exact_host_unit(unit: &str, hosted_id: &str) -> Option<fl_host_proto::Session
     fl_wire::vendor_adapter::unit_to_host_session_id(&target)
 }
 
+fn host_supports_session_owner(client: &mut fl_host_proto::BlockingHostClient) -> Result<bool, ()> {
+    match client.extension_request(fl_host_proto::ExtensionRequest::Capabilities) {
+        Ok(fl_host_proto::ExtensionResponse::Capabilities { features, .. }) => {
+            Ok(features & fl_host_proto::SESSION_OWNER_FEATURE != 0)
+        }
+        _ => Err(()),
+    }
+}
+
+fn host_owner_upgrade_required() -> LifecycleError {
+    LifecycleError::Conflict(
+        "host lacks SESSION_OWNER_FEATURE; upgrade and restart ferroloop-host.service before launching or adopting a hosted session".to_string(),
+    )
+}
+
 fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
     if !is_killable_unit(unit) {
         return false;
@@ -676,6 +707,14 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
     if ids.is_empty() {
         return true;
     }
+    let Ok(owner_capable) = host_supports_session_owner(&mut client) else {
+        return false;
+    };
+    // A durable runtime_spawned record is the compatibility proof for an older daemon.
+    // Owner adoption has no such proof and must never use this fallback.
+    if owner_mode && !owner_capable {
+        return false;
+    }
     let mut all_ok = true;
     for id in &ids {
         let Some(summary) = sessions.iter().find(|s| {
@@ -683,9 +722,10 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
         }) else {
             continue;
         };
-        if !client
-            .check_session_owner(summary.stream.clone(), hosted_id)
-            .unwrap_or(false)
+        if owner_capable
+            && !client
+                .check_session_owner(summary.stream.clone(), hosted_id)
+                .unwrap_or(false)
         {
             all_ok = false;
             continue;
@@ -715,6 +755,66 @@ fn kill_host_unit(unit: &str, hosted_id: &str, owner_mode: bool) -> bool {
 }
 
 impl SessionRuntime for HostRuntime {
+    fn preflight_spawn(&self, hosted_id: &str) -> Result<(), LifecycleError> {
+        if use_legacy_tmux_fallback() {
+            return Ok(());
+        }
+        if hosted_id.is_empty() || hosted_id.len() > fl_host_proto::MAX_HOSTED_OWNER_BYTES {
+            return Err(LifecycleError::Invalid(format!(
+                "hosted session id must contain 1..={} bytes for SESSION_OWNER_FEATURE",
+                fl_host_proto::MAX_HOSTED_OWNER_BYTES
+            )));
+        }
+        let mut client = connect_host_client().ok_or_else(|| {
+            LifecycleError::Conflict("cannot connect to ferroloop-host.service".to_string())
+        })?;
+        if !host_supports_session_owner(&mut client).unwrap_or(false) {
+            return Err(host_owner_upgrade_required());
+        }
+        Ok(())
+    }
+
+    fn preflight_stop(
+        &self,
+        unit: &str,
+        hosted_id: &str,
+        recorded: bool,
+    ) -> Result<(), LifecycleError> {
+        if use_legacy_tmux_fallback() {
+            return Ok(());
+        }
+        let wanted = exact_host_unit(unit, hosted_id)
+            .ok_or_else(|| LifecycleError::Invalid(format!("invalid host session `{unit}`")))?;
+        let refusal = || {
+            let wanted = wanted.as_str();
+            LifecycleError::Conflict(format!(
+                "cannot verify ownership of host session `{wanted}`; inspect it and manually stop it with `fl host kill {wanted}` if appropriate"
+            ))
+        };
+        let mut client = connect_host_client().ok_or_else(refusal)?;
+        let sessions = client.list_sessions().map_err(|_| refusal())?;
+        let Some(session) = sessions.iter().find(|s| {
+            s.stream.session == wanted && matches!(s.state, fl_host_proto::ChildState::Running(_))
+        }) else {
+            return Ok(());
+        };
+        if !host_supports_session_owner(&mut client).map_err(|_| refusal())? {
+            return if recorded {
+                Ok(())
+            } else {
+                Err(host_owner_upgrade_required())
+            };
+        }
+        if recorded
+            && !client
+                .check_session_owner(session.stream.clone(), hosted_id)
+                .unwrap_or(false)
+        {
+            return Err(refusal());
+        }
+        Ok(())
+    }
+
     fn separate_vendor_units(&self) -> bool {
         !use_legacy_tmux_fallback()
     }
@@ -3283,6 +3383,9 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         previous.as_ref(),
         OwnerGate::SpinUp,
     )?;
+    if has_runtime && v.hosted && env.spawn_runtime {
+        env.runtime.preflight_spawn(&session_id)?;
+    }
     register_spun_up_agent(store, &v, by)?;
 
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
@@ -4372,6 +4475,33 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     let agent = store.agent_by_name(&target.persona)?;
     let sharing = runtime_sharers(store, env.runtime, &record)?;
     let shared_runtime = record.runtime_spawned && !sharing.is_empty();
+    // Another running session of this persona (a second vendor) still owns the registry
+    // record, the persona route, and the persona-keyed queue. One lookup covers the route
+    // and queue decision and the retire guard below.
+    let persona_still_running = all_hosted.iter().any(|other| {
+        other.session_id != record.session_id
+            && other.persona.eq_ignore_ascii_case(&target.persona)
+            && other.status.eq_ignore_ascii_case(STATUS_RUNNING)
+            && !is_same_vendor_sibling(&record, other)
+    });
+    if env.spawn_runtime && !shared_runtime {
+        if record.runtime_spawned {
+            if let Some(target) = &record.tmux_target {
+                env.runtime
+                    .preflight_stop(env.runtime.unit(target), &runtime_owner_id, true)?;
+            }
+        } else if caller == Caller::Owner
+            && !persona_still_running
+            && vendor_has_runtime(&record.vendor)
+        {
+            let target = record
+                .tmux_target
+                .clone()
+                .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+            env.runtime
+                .preflight_stop(env.runtime.unit(&target), &runtime_owner_id, false)?;
+        }
+    }
     if shared_runtime {
         // The runtime stays up for the other sessions, so ownership of it moves to them: the
         // last one torn down then stops it.
@@ -4383,15 +4513,6 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         record.runtime_spawned = false;
     }
 
-    // Another running session of this persona (a second vendor) still owns the registry
-    // record, the persona route, and the persona-keyed queue. One lookup covers the route
-    // and queue decision and the retire guard below.
-    let persona_still_running = all_hosted.iter().any(|other| {
-        other.session_id != record.session_id
-            && other.persona.eq_ignore_ascii_case(&target.persona)
-            && other.status.eq_ignore_ascii_case(STATUS_RUNNING)
-            && !is_same_vendor_sibling(&record, other)
-    });
     for key in target.keys() {
         if persona_still_running && key.eq_ignore_ascii_case(&target.persona) {
             continue;
@@ -4602,6 +4723,9 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry>(
     if let Some(agent) = current_recast_assignment(store, &record.persona)? {
         record.project = agent.project;
         record.role = role_label_of(&agent.role);
+    }
+    if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
+        env.runtime.preflight_spawn(&record.session_id)?;
     }
     let display = capitalize(&record.persona);
     let prompt = registered_role_prompt(
@@ -5032,6 +5156,10 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         )));
     }
     if mode == RemodelMode::Execute {
+        if to.hosted && vendor_has_runtime(&to.vendor) && env.spawn_runtime {
+            env.runtime
+                .preflight_spawn(&format!("{}:{}", to.vendor, to.persona))?;
+        }
         check_old_runtime_stoppable(store, env, target, &to)?;
     }
     Ok(RemodelPlan {

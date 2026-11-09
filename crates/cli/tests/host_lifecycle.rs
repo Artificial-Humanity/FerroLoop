@@ -319,37 +319,66 @@ async fn ownership_query_never_sends_unknown_request_to_older_host() {
 
 #[test]
 fn recorded_spawn_does_not_kill_a_foreign_replacement() {
-    let f = Fixture::new();
-    f.spin("claude", true);
-    let entries = f.json(&["state", "list", "--concern", "runtime", "--json"], true);
-    let entry = entries
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["slug"] == "hosted-session-claude-ada")
-        .unwrap();
-    let mut record = entry["payload"]["runtime"]["value"].clone();
-    record["runtime_spawned"] = true.into();
-    f.json(
-        &[
-            "state",
-            "runtime",
-            "set",
-            "--scope",
-            "workspace",
-            "--key",
-            "hosted-session-claude-ada",
-            "--value",
-            &record.to_string(),
-            "--by",
-            "owner",
-            "--json",
-        ],
-        true,
-    );
-    f.raw_spawn("Ada.claude", Some("foreign:ada"));
-    assert_eq!(f.teardown("claude")["runtime_stopped"], false);
-    assert!(f.running("Ada.claude"));
+    for owner in [Some("foreign:ada"), None] {
+        let f = Fixture::new();
+        f.spin("claude", true);
+        let entries = f.json(&["state", "list", "--concern", "runtime", "--json"], true);
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["slug"] == "hosted-session-claude-ada")
+            .unwrap();
+        let mut record = entry["payload"]["runtime"]["value"].clone();
+        record["runtime_spawned"] = true.into();
+        f.json(
+            &[
+                "state",
+                "runtime",
+                "set",
+                "--scope",
+                "workspace",
+                "--key",
+                "hosted-session-claude-ada",
+                "--value",
+                &record.to_string(),
+                "--by",
+                "owner",
+                "--json",
+            ],
+            true,
+        );
+        f.raw_spawn("Ada.claude", owner);
+        let out = f
+            .command()
+            .args([
+                "agent",
+                "decommission",
+                "claude:ada",
+                "--mode",
+                "teardown",
+                "--by",
+                "owner",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            error.contains("Ada.claude") && error.contains("fl host kill"),
+            "{error}"
+        );
+        assert!(f.running("Ada.claude"));
+        let entries = f.json(&["state", "list", "--concern", "runtime", "--json"], true);
+        let value = &entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["slug"] == "hosted-session-claude-ada")
+            .unwrap()["payload"]["runtime"]["value"];
+        assert_eq!(value["status"], "running");
+    }
 }
 
 #[tokio::test]
@@ -391,7 +420,7 @@ async fn spawn_refuses_older_host_before_creating_an_unverifiable_child() {
         );
     });
     let out = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_fl"))
+        let out = Command::new(env!("CARGO_BIN_EXE_fl"))
             .env_clear()
             .current_dir(root.path())
             .env("HOME", root.path())
@@ -418,16 +447,261 @@ async fn spawn_refuses_older_host_before_creating_an_unverifiable_child() {
                 "--json",
             ])
             .output()
+            .unwrap();
+        use fl_core::store::AgentRegistry;
+        let store = fl_store::open_store(&root.path().join("fl.fls")).unwrap();
+        assert!(store.agent_by_name("ada").unwrap().is_none());
+        assert!(
+            fl_hub::lifecycle::list_hosted_sessions(&store)
+                .unwrap()
+                .is_empty()
+        );
+        out
+    })
+    .await
+    .unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("SESSION_OWNER_FEATURE"), "{error}");
+    assert!(
+        error.contains("upgrade and restart ferroloop-host.service"),
+        "{error}"
+    );
+    server.await.unwrap();
+}
+
+/// An old daemon that knows reliable sessions but has no ownership extension. Any
+/// unknown request fails the test, and every kill must use the exact listed stream.
+async fn old_host(
+    endpoint: HostEndpoint,
+    sessions: Vec<fl_host_proto::SessionSummary>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<fl_host_proto::StreamId>>>,
+) {
+    use fl_host_proto::{
+        ControllerLease, ExtensionRequest as Req, ExtensionResponse as Resp, HostConfig,
+        HostInstance, HostListener, HostRequest, HostResponse,
+    };
+    let mut cfg = HostConfig::new(endpoint);
+    cfg.minor = 1;
+    let listener = HostListener::bind(cfg).await.unwrap();
+    let sessions = std::sync::Arc::new(std::sync::Mutex::new(sessions));
+    let killed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = killed.clone();
+    let task = tokio::spawn(async move {
+        let mut listener = listener;
+        while let Ok(mut conn) = listener.accept().await {
+            let sessions = sessions.clone();
+            let killed = killed.clone();
+            tokio::spawn(async move {
+                while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                    let response = match request {
+                        Req::Capabilities => Resp::Capabilities {
+                            host: HostInstance::new([1; 16]),
+                            features: fl_host_proto::RELIABLE_FEATURE,
+                            limits: Default::default(),
+                        },
+                        Req::ListSessions => Resp::Sessions {
+                            records: sessions.lock().unwrap().clone(),
+                        },
+                        Req::ClaimController { stream } => {
+                            assert!(sessions.lock().unwrap().iter().any(|s| s.stream == stream));
+                            Resp::Controller {
+                                lease: ControllerLease(1),
+                                acked: 0,
+                                latest: 0,
+                            }
+                        }
+                        Req::KillSession { stream, lease } => {
+                            assert_eq!(lease, ControllerLease(1));
+                            let mut sessions = sessions.lock().unwrap();
+                            assert!(sessions.iter().any(|s| s.stream == stream));
+                            sessions.retain(|s| s.stream != stream);
+                            killed.lock().unwrap().push(stream);
+                            Resp::Controlled
+                        }
+                        unexpected => panic!("old host received {unexpected:?}"),
+                    };
+                    conn.respond(&HostResponse::Extended { id, response })
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+    (task, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_host_stops_only_exact_recorded_unit_and_refuses_unproven_adoption() {
+    for recorded in [true, false] {
+        let (f, summaries) = tokio::task::spawn_blocking(move || {
+            let f = Fixture::new();
+            f.spin("claude", !recorded);
+            if !recorded {
+                f.raw_spawn("Ada.claude", None);
+            }
+            f.raw_spawn("Ada.antigravity", None);
+            let summaries = f.rpc().list_sessions().unwrap();
+            (f, summaries)
+        })
+        .await
+        .unwrap();
+        let endpoint = HostEndpoint::unix(f.root.path().join("old.sock")).unwrap();
+        let wanted = summaries
+            .iter()
+            .find(|s| s.stream.session.as_str() == "Ada.claude")
+            .unwrap()
+            .stream
+            .clone();
+        let (server, killed) = old_host(endpoint.clone(), summaries).await;
+        tokio::task::spawn_blocking(move || {
+            let before = f.json(&["state", "list", "--scope", "workspace", "--json"], true);
+            let out = f
+                .command()
+                .env("FL_HOST_SOCK", endpoint.socket_path())
+                .args([
+                    "agent",
+                    "decommission",
+                    "claude:ada",
+                    "--mode",
+                    "teardown",
+                    "--by",
+                    "owner",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            if recorded {
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(json["runtime_stopped"], true);
+                assert_eq!(*killed.lock().unwrap(), vec![wanted]);
+            } else {
+                assert!(!out.status.success());
+                assert!(String::from_utf8_lossy(&out.stderr).contains("SESSION_OWNER_FEATURE"));
+                assert!(killed.lock().unwrap().is_empty());
+                assert_eq!(
+                    before,
+                    f.json(&["state", "list", "--scope", "workspace", "--json"], true)
+                );
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hub_reports_old_host_refusal_without_creating_session_or_agent() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = HostEndpoint::unix(root.path().join("old.sock")).unwrap();
+    let (server, killed) = old_host(endpoint.clone(), Vec::new()).await;
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("FL_HOST_SOCK", endpoint.socket_path())
+            .env("F397_HUB_CHILD", root.path())
+            .args(["--exact", "hub_old_host_refusal_child", "--nocapture"])
+            .output()
             .unwrap()
     })
     .await
     .unwrap();
     assert!(
         out.status.success(),
-        "{}",
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let response: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(response["runtime_spawned"], false);
-    server.await.unwrap();
+    assert!(killed.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[test]
+fn hub_old_host_refusal_child() {
+    use fl_core::store::AgentRegistry;
+    let Some(root) = std::env::var_os("F397_HUB_CHILD").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let path = root.join("hub.fls");
+    let state = fl_hub::HubState::new(fl_hub::HubServerConfig {
+        store_path: path.clone(),
+        repo_root: root.clone(),
+        home_override: Some(root.clone()),
+        owner_token: Some("test-owner".into()),
+        ..Default::default()
+    });
+    let req = fl_hub::HttpRequest::new("POST", "/api/v1/sessions/spin-up")
+        .with_header("authorization", "Bearer test-owner")
+        .with_json_body(&serde_json::json!({"persona":"ada", "project":"FerroLoop", "role":"assistant", "vendor":"claude"}));
+    let response = fl_hub::handle_http_request(&state, &req);
+    assert_eq!(
+        response.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(
+        String::from_utf8_lossy(&response.body)
+            .contains("upgrade and restart ferroloop-host.service")
+    );
+    let store = fl_store::open_store(&path).unwrap();
+    assert!(store.agent_by_name("ada").unwrap().is_none());
+    assert!(
+        fl_hub::lifecycle::list_hosted_sessions(&store)
+            .unwrap()
+            .is_empty()
+    );
+    use fl_hub::lifecycle::{self, Caller, LifecycleEnv, SpinUpRequest};
+    let mut env = LifecycleEnv::new(Some(&root));
+    env.spawn_runtime = false;
+    let seed = SpinUpRequest {
+        persona: "ada".into(),
+        project: "FerroLoop".into(),
+        role: "assistant".into(),
+        vendor: "claude".into(),
+        ..Default::default()
+    };
+    lifecycle::spin_up(&store, &env, &seed, "owner", Caller::Owner).unwrap();
+    let before = lifecycle::list_hosted_sessions(&store).unwrap();
+    for (path, body) in [
+        (
+            "/api/v1/hosted-sessions/claude:ada/restart",
+            serde_json::json!({}),
+        ),
+        (
+            "/api/v1/sessions/claude:ada/remodel",
+            serde_json::json!({"vendor":"codex", "mode":"execute"}),
+        ),
+    ] {
+        let req = fl_hub::HttpRequest::new("POST", path)
+            .with_header("authorization", "Bearer test-owner")
+            .with_json_body(&body);
+        let response = fl_hub::handle_http_request(&state, &req);
+        assert_eq!(
+            response.status,
+            409,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        assert!(String::from_utf8_lossy(&response.body).contains("SESSION_OWNER_FEATURE"));
+        assert_eq!(before, lifecycle::list_hosted_sessions(&store).unwrap());
+    }
+    use lifecycle::SessionRuntime;
+    for id in [String::new(), "x".repeat(129)] {
+        let error = lifecycle::HostRuntime.preflight_spawn(&id).unwrap_err();
+        assert_eq!(error.status(), 400);
+        assert!(error.to_string().contains("1..=128 bytes"));
+    }
+    assert_eq!(before, lifecycle::list_hosted_sessions(&store).unwrap());
 }
