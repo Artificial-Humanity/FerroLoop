@@ -3842,7 +3842,9 @@ fn host_build_identity_is_opt_in() {
         0,
         "host must advertise opt-in build identity"
     );
-    let expected = fl_host_proto::RELIABLE_FEATURE | fl_host_proto::HOST_STATUS_FEATURE;
+    let expected = fl_host_proto::RELIABLE_FEATURE
+        | fl_host_proto::HOST_STATUS_FEATURE
+        | fl_host_proto::SESSION_OWNER_FEATURE;
     #[cfg(unix)]
     let expected = expected | fl_host_proto::PTY_FEATURE | fl_host_proto::RENDERED_PTY_FEATURE;
     assert_eq!(features, expected);
