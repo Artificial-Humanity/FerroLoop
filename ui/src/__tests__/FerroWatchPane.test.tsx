@@ -1501,4 +1501,43 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
 
     unmount();
   });
+
+  it("omits the local_host badge when summary.health.local_host is empty instead of falling back to ai-lab-0", async () => {
+    const summaryWithoutHost = makeSampleWatchSummary();
+    summaryWithoutHost.health.local_host = "";
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.includes("/api/v1/watch/summary")) {
+        return json(summaryWithoutHost);
+      }
+      if (url.endsWith("/api/v1/hosted-sessions")) {
+        return json({ sessions: [] });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+
+    await screen.findByTestId("ferrowatch-pane-title");
+    expect(
+      screen.queryByTestId("ferrowatch-local-host-badge"),
+    ).not.toBeInTheDocument();
+
+    unmount();
+  });
 });
