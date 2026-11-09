@@ -94,7 +94,7 @@ fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
             "--approval-mode".into(),
             "on-request".into(),
             "--approval-judge".into(),
-            "off".into(),
+            "on".into(),
             prompt.to_string(),
         ],
     }
@@ -237,7 +237,7 @@ fn the_launch_argv_puts_the_model_first_and_the_prompt_last() {
                 "--approval-mode".to_string(),
                 "on-request".to_string(),
                 "--approval-judge".to_string(),
-                "off".to_string(),
+                "on".to_string(),
                 out.prompt.unwrap(),
             ],
             "{requested:?}"
@@ -575,14 +575,7 @@ fn built_in_vendors_launch_with_their_prompt() {
             "codex",
             "codex",
             "FL_WIRE_CODEX_BIN",
-            vec![
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
-                "--remote",
-                "unix://",
-            ],
+            vec!["--approve-for-me", "--remote", "unix://"],
         ),
         (
             "grok",
@@ -661,14 +654,7 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             "codex",
             "codex",
             "FL_WIRE_CODEX_BIN",
-            vec![
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
-                "--remote",
-                "unix://",
-            ],
+            vec!["--approve-for-me", "--remote", "unix://"],
         ),
         (
             "grok",

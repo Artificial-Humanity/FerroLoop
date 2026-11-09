@@ -74,6 +74,57 @@ impl std::str::FromStr for Posture {
     }
 }
 
+/// How a vendor fulfills [`Posture::Auto`] when launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoApproval {
+    /// Route approval requests through the vendor's automatic reviewer
+    /// (Codex `--approve-for-me`, Muse `--approval-judge on`).
+    VendorReviewer,
+    /// Prompt a human on request (`on-request` with automatic review off).
+    AskHuman,
+    /// The vendor's `auto` posture is natively unattended (Claude `--permission-mode auto`,
+    /// Grok, Antigravity `--mode auto`).
+    Native,
+}
+
+impl AutoApproval {
+    /// All [`AutoApproval`] choices in wire order.
+    pub const ALL: [AutoApproval; 3] = [
+        AutoApproval::VendorReviewer,
+        AutoApproval::AskHuman,
+        AutoApproval::Native,
+    ];
+
+    /// Wire and CLI spelling (`vendor-reviewer`, `ask-human`, `native`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VendorReviewer => "vendor-reviewer",
+            Self::AskHuman => "ask-human",
+            Self::Native => "native",
+        }
+    }
+}
+
+impl std::fmt::Display for AutoApproval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AutoApproval {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "vendor-reviewer" => Ok(Self::VendorReviewer),
+            "ask-human" => Ok(Self::AskHuman),
+            "native" => Ok(Self::Native),
+            _ => Err("auto_approval must be vendor-reviewer, ask-human or native".to_string()),
+        }
+    }
+}
+
 /// The sandbox axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -310,6 +361,10 @@ pub struct PermissionPolicy {
     pub schema_version: u32,
     pub posture: Posture,
     pub sandbox: SandboxChoice,
+    /// Explicit [`AutoApproval`] choice used when `posture` is [`Posture::Auto`]. When `None`,
+    /// the compiler uses the vendor's default ([`super::Vendor::default_auto_approval`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approval: Option<AutoApproval>,
     /// Refuse the plan unless every filesystem restriction is enforced by an OS or runtime
     /// boundary (or the facts prove coverage), not by a tool-scoped rule.
     #[serde(default)]
@@ -574,10 +629,17 @@ impl PermissionPolicy {
             schema_version: SCHEMA_VERSION,
             posture,
             sandbox,
+            auto_approval: None,
             require_fs_enforcement: false,
             unenforced_defaults: UnenforcedDefaults::Refuse,
             rules: Vec::new(),
         }
+    }
+
+    /// Sets the explicit [`AutoApproval`] choice used when `posture` is [`Posture::Auto`].
+    pub fn with_auto_approval(mut self, choice: AutoApproval) -> Self {
+        self.auto_approval = Some(choice);
+        self
     }
 
     /// Adds a rule.
@@ -678,6 +740,7 @@ impl PermissionPolicy {
             schema_version: SCHEMA_VERSION,
             posture: self.posture,
             sandbox: self.sandbox,
+            auto_approval: self.auto_approval,
             require_fs_enforcement: self.require_fs_enforcement,
             unenforced_defaults: self.unenforced_defaults,
             rules,

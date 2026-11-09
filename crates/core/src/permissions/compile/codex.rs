@@ -9,7 +9,9 @@ use crate::permissions::facts::{ProvenFact, Surface};
 use crate::permissions::plan::{
     CompileRefusal, ConfigTarget, NativeFile, NativeFormat, Origin, ReceiptClass, ReceiptSubject,
 };
-use crate::permissions::policy::{Capability, Effect, Pattern, Posture, Rule, SandboxChoice};
+use crate::permissions::policy::{
+    AutoApproval, Capability, Effect, Pattern, Posture, Rule, SandboxChoice,
+};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,11 +78,18 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             ReceiptClass::Exact,
             "edits run in the workspace sandbox; the model asks to escalate",
         ),
-        Posture::Auto => (
-            "on-request",
-            ReceiptClass::StricterDowngrade,
-            "no reviewer is enabled: auto_review spends tokens and needs admission",
-        ),
+        Posture::Auto => match cx.auto_approval {
+            AutoApproval::VendorReviewer => (
+                "on-request",
+                ReceiptClass::Exact,
+                "automatic approval review in the workspace-write sandbox (auto_approval=vendor-reviewer)",
+            ),
+            AutoApproval::AskHuman | AutoApproval::Native => (
+                "on-request",
+                ReceiptClass::StricterDowngrade,
+                "no reviewer is enabled (auto_approval=ask-human): approval requests ask a human",
+            ),
+        },
         Posture::Plan => (
             "on-request",
             ReceiptClass::Exact,
@@ -555,47 +564,95 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     }
 
     // 4. Emit.
-    let approval_args = vec!["-a".to_owned(), approval.to_owned()];
-    cx.args.extend(approval_args.iter().cloned());
-    let mut note = approval_note.to_owned();
-    let mut aclass = approval_class;
-    if approval
-        != match posture {
-            Posture::Ask => "untrusted",
-            Posture::Bypass => "never",
-            _ => "on-request",
+    let posture_requested = if posture == Posture::Auto {
+        format!("posture Auto (auto_approval={})", cx.auto_approval.as_str())
+    } else {
+        format!("posture {posture:?}")
+    };
+    let use_approve_for_me = posture == Posture::Auto
+        && cx.auto_approval == AutoApproval::VendorReviewer
+        && approval == "on-request"
+        && mode == Mode::WorkspaceWrite;
+    if use_approve_for_me {
+        let combined = vec!["--approve-for-me".to_owned()];
+        cx.args.extend(combined.iter().cloned());
+        cx.push(
+            ReceiptSubject::Posture,
+            Origin::Axis,
+            None,
+            posture_requested,
+            combined.clone(),
+            ReceiptClass::Exact,
+            Surface::Posture,
+            approval_note,
+        );
+        cx.push(
+            ReceiptSubject::Sandbox,
+            Origin::Axis,
+            None,
+            format!("sandbox {}", if off { "off" } else { "vendor-default" }),
+            combined,
+            ReceiptClass::Exact,
+            Surface::Sandbox,
+            if mode_notes.is_empty() {
+                "workspace-write sandbox implied by --approve-for-me".to_owned()
+            } else {
+                mode_notes.join("; ")
+            },
+        );
+    } else {
+        let approval_args = vec!["-a".to_owned(), approval.to_owned()];
+        cx.args.extend(approval_args.iter().cloned());
+        let mut note = approval_note.to_owned();
+        let mut aclass = approval_class;
+        if posture == Posture::Auto
+            && cx.auto_approval == AutoApproval::VendorReviewer
+            && mode != Mode::WorkspaceWrite
+        {
+            aclass = ReceiptClass::StricterDowngrade;
+            note = format!(
+                "--approve-for-me requires the workspace-write sandbox; downgraded to -a {approval} to preserve -s {} (auto_approval=vendor-reviewer)",
+                mode.as_str()
+            );
         }
-    {
-        aclass = ReceiptClass::StricterDowngrade;
-        note = format!("{note}; tightened by a shell ask");
-    }
-    cx.push(
-        ReceiptSubject::Posture,
-        Origin::Axis,
-        None,
-        format!("posture {posture:?}"),
-        approval_args,
-        aclass,
-        Surface::Posture,
-        note,
-    );
+        if approval
+            != match posture {
+                Posture::Ask => "untrusted",
+                Posture::Bypass => "never",
+                _ => "on-request",
+            }
+        {
+            aclass = ReceiptClass::StricterDowngrade;
+            note = format!("{note}; tightened by a shell ask");
+        }
+        cx.push(
+            ReceiptSubject::Posture,
+            Origin::Axis,
+            None,
+            posture_requested,
+            approval_args,
+            aclass,
+            Surface::Posture,
+            note,
+        );
 
-    let sandbox_args = vec!["-s".to_owned(), mode.as_str().to_owned()];
-    cx.args.extend(sandbox_args.iter().cloned());
-    cx.push(
-        ReceiptSubject::Sandbox,
-        Origin::Axis,
-        None,
-        format!("sandbox {}", if off { "off" } else { "vendor-default" }),
-        sandbox_args,
-        ReceiptClass::Exact,
-        Surface::Sandbox,
-        if mode_notes.is_empty() {
-            "explicit sandbox_mode; no vendor default is relied on".to_owned()
-        } else {
-            mode_notes.join("; ")
-        },
-    );
+        let sandbox_args = vec!["-s".to_owned(), mode.as_str().to_owned()];
+        cx.args.extend(sandbox_args.iter().cloned());
+        cx.push(
+            ReceiptSubject::Sandbox,
+            Origin::Axis,
+            None,
+            format!("sandbox {}", if off { "off" } else { "vendor-default" }),
+            sandbox_args,
+            ReceiptClass::Exact,
+            Surface::Sandbox,
+            if mode_notes.is_empty() {
+                "explicit sandbox_mode; no vendor default is relied on".to_owned()
+            } else {
+                mode_notes.join("; ")
+            },
+        );
+    }
     if read_all {
         cx.args.extend([
             "-c".to_owned(),
