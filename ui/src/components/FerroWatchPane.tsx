@@ -5,6 +5,7 @@ import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_WATCH_THRESHOLDS,
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   type AgentRecord,
   type DiscoveredSessionSummary,
   type HostedSessionSummary,
@@ -13,6 +14,7 @@ import {
   type PermissionPosture,
   type RemodelMode,
   type RemodelSessionResponse,
+  type RestartHostedSessionResponse,
   type WatchAgentHealth,
   type WatchAlert,
   type WatchBalanceApplyResponse,
@@ -286,6 +288,7 @@ export interface FerroWatchPaneProps {
   sessions?: DiscoveredSessionSummary[];
   apiClient?: HubApiClient;
   onAfterRemodel?: (res: RemodelSessionResponse) => void;
+  onAfterRestart?: (res: RestartHostedSessionResponse) => void;
   otlpStatus?: OtlpExporterStatus;
   tokenizerLedger?: CountedTokenizerLedgerEntry[];
   acpConformanceMatrix?: AcpAdapterConformanceRow[];
@@ -629,6 +632,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
   sessions = [],
   apiClient,
   onAfterRemodel,
+  onAfterRestart,
   otlpStatus: propOtlpStatus,
   tokenizerLedger: propTokenizerLedger,
   acpConformanceMatrix: propAcpMatrix,
@@ -713,7 +717,25 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     useState<HydrationStatus | null>(null);
   const [remodelHydrationDispatched, setRemodelHydrationDispatched] =
     useState<boolean | null>(null);
+  const [remodelWarnings, setRemodelWarnings] = useState<string[]>([]);
   const [remodelError, setRemodelError] = useState<string | null>(null);
+  const [restartingByAgent, setRestartingByAgent] = useState<
+    Record<string, boolean>
+  >({});
+  const [restartResultByAgent, setRestartResultByAgent] = useState<
+    Record<
+      string,
+      {
+        statusText: string;
+        hydrationStatus: HydrationStatus;
+        hydrationDispatched: boolean;
+        warnings: string[];
+      }
+    >
+  >({});
+  const [restartErrorByAgent, setRestartErrorByAgent] = useState<
+    Record<string, string>
+  >({});
   const remodelControlsRef = useRef<HTMLDivElement | null>(null);
   const remodelAgentSelectRef = useRef<HTMLSelectElement | null>(null);
   const pendingRemodelFocusRef = useRef<boolean>(false);
@@ -1154,6 +1176,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     setRemodelStatus(null);
     setRemodelHydrationStatus(null);
     setRemodelHydrationDispatched(null);
+    setRemodelWarnings([]);
     setRemodelError(null);
     try {
       const res = await apiClient.remodelSession(remodelTarget.trim(), {
@@ -1163,12 +1186,15 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         mode: remodelMode,
       });
       const hydrationStatus = normalizeHydrationStatus(res.hydration_status);
+      const warnings = normalizeHydrationWarnings(res.warnings);
       const normalizedRes: RemodelSessionResponse = {
         ...res,
         hydration_status: hydrationStatus,
+        warnings,
       };
       setRemodelHydrationStatus(hydrationStatus);
       setRemodelHydrationDispatched(Boolean(res.hydration_dispatched));
+      setRemodelWarnings(warnings);
       setRemodelStatus(
         res.mode === "prepare"
           ? `Prepared handoff for ${res.persona} → ${res.vendor} (${res.session_id}).`
@@ -1182,6 +1208,55 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       );
     } finally {
       setRemodeling(false);
+    }
+  };
+
+  const handleRestartHostedSession = async (
+    agentKey: string,
+    targetId: string,
+  ) => {
+    if (!apiClient || !targetId.trim()) return;
+    setRestartingByAgent((prev) => ({ ...prev, [agentKey]: true }));
+    setRestartErrorByAgent((prev) => {
+      const next = { ...prev };
+      delete next[agentKey];
+      return next;
+    });
+    setRestartResultByAgent((prev) => {
+      const next = { ...prev };
+      delete next[agentKey];
+      return next;
+    });
+    try {
+      const res = await apiClient.restartHostedSession(targetId.trim());
+      const hydrationStatus = normalizeHydrationStatus(res.hydration_status);
+      const warnings = normalizeHydrationWarnings(res.warnings);
+      const normalizedRes: RestartHostedSessionResponse = {
+        ...res,
+        hydration_status: hydrationStatus,
+        warnings,
+      };
+      setRestartResultByAgent((prev) => ({
+        ...prev,
+        [agentKey]: {
+          statusText: `Restarted ${res.persona || agentKey} [${res.session_id || targetId}] (restarts=${res.restart_count ?? 1}, hydration_status=${hydrationStatus}).`,
+          hydrationStatus,
+          hydrationDispatched: Boolean(res.hydration_dispatched),
+          warnings,
+        },
+      }));
+      onAfterRestart?.(normalizedRes);
+      await loadSummary(appliedOverrides);
+    } catch (err) {
+      setRestartErrorByAgent((prev) => ({
+        ...prev,
+        [agentKey]:
+          err instanceof Error
+            ? err.message
+            : "Failed to restart hosted session.",
+      }));
+    } finally {
+      setRestartingByAgent((prev) => ({ ...prev, [agentKey]: false }));
     }
   };
 
@@ -2405,6 +2480,32 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 </div>
               )}
 
+              {remodelWarnings.length > 0 && (
+                <ul
+                  role="status"
+                  data-testid="watch-remodel-warnings"
+                  className="fd-mono"
+                  style={{
+                    margin: 0,
+                    padding: "6px 8px 6px 22px",
+                    borderRadius: "4px",
+                    fontSize: "11px",
+                    border: "1px solid rgba(245, 158, 11, 0.45)",
+                    backgroundColor: "rgba(245, 158, 11, 0.14)",
+                    color: "#FBBF24",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "2px",
+                  }}
+                >
+                  {remodelWarnings.map((warning, idx) => (
+                    <li key={idx} data-testid="watch-remodel-warning-item">
+                      {warning}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
               {remodelError && (
                 <div
                   role="alert"
@@ -2670,24 +2771,52 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                           )}
                         </div>
 
-                        <button
-                          type="button"
-                          className="fd-btn"
-                          data-testid={`watch-liveness-remodel-btn-${key}`}
-                          style={{ fontSize: "10px", padding: "2px 6px" }}
-                          onClick={() => {
-                            setRemodelTarget(key);
-                            if (vendor) {
-                              setRemodelVendor(pickLeastLoadedVendor(vendor));
-                            }
-                            if (sectionFilter === "liveness") {
-                              setSectionFilter("all");
-                            }
-                            focusRemodelAgentSelect();
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            flexWrap: "wrap",
                           }}
                         >
-                          Re-Model
-                        </button>
+                          {hosted && isOwner && (
+                            <button
+                              type="button"
+                              className="fd-btn"
+                              data-testid={`watch-liveness-restart-btn-${key}`}
+                              disabled={Boolean(restartingByAgent[key])}
+                              style={{ fontSize: "10px", padding: "2px 6px" }}
+                              onClick={() =>
+                                void handleRestartHostedSession(
+                                  key,
+                                  hosted.session_id || key,
+                                )
+                              }
+                            >
+                              {restartingByAgent[key]
+                                ? "Restarting..."
+                                : "Restart"}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="fd-btn"
+                            data-testid={`watch-liveness-remodel-btn-${key}`}
+                            style={{ fontSize: "10px", padding: "2px 6px" }}
+                            onClick={() => {
+                              setRemodelTarget(key);
+                              if (vendor) {
+                                setRemodelVendor(pickLeastLoadedVendor(vendor));
+                              }
+                              if (sectionFilter === "liveness") {
+                                setSectionFilter("all");
+                              }
+                              focusRemodelAgentSelect();
+                            }}
+                          >
+                            Re-Model
+                          </button>
+                        </div>
                       </div>
 
                       <div
@@ -2779,6 +2908,124 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                           >
                             {normalizeHydrationStatus(hosted.hydration_status)}
                           </span>
+                        </div>
+                      )}
+
+                      {restartResultByAgent[key] && (
+                        <div
+                          data-testid={`watch-restart-status-${key}`}
+                          style={{
+                            fontSize: "11px",
+                            color:
+                              restartResultByAgent[key].hydrationStatus ===
+                              "failed"
+                                ? "#FBBF24"
+                                : "#34D399",
+                            padding: "5px 8px",
+                            borderRadius: "4px",
+                            backgroundColor:
+                              restartResultByAgent[key].hydrationStatus ===
+                              "failed"
+                                ? "rgba(245, 158, 11, 0.14)"
+                                : "rgba(16, 185, 129, 0.12)",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "8px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span>{restartResultByAgent[key].statusText}</span>
+                          <span
+                            data-testid={`watch-restart-hydration-status-${key}`}
+                            data-hydration-status={
+                              restartResultByAgent[key].hydrationStatus
+                            }
+                            data-hydration-dispatched={String(
+                              restartResultByAgent[key].hydrationDispatched,
+                            )}
+                            className="fd-mono"
+                            style={{
+                              fontSize: "10px",
+                              padding: "2px 6px",
+                              borderRadius: "999px",
+                              border:
+                                restartResultByAgent[key].hydrationStatus ===
+                                "failed"
+                                  ? "1px solid rgba(245, 158, 11, 0.5)"
+                                  : restartResultByAgent[key]
+                                        .hydrationStatus === "confirmed"
+                                    ? "1px solid rgba(16, 185, 129, 0.5)"
+                                    : "1px solid var(--border-subtle)",
+                              color:
+                                restartResultByAgent[key].hydrationStatus ===
+                                "failed"
+                                  ? "#FBBF24"
+                                  : restartResultByAgent[key]
+                                        .hydrationStatus === "confirmed"
+                                    ? "#34D399"
+                                    : "var(--text-secondary)",
+                              backgroundColor:
+                                restartResultByAgent[key].hydrationStatus ===
+                                "failed"
+                                  ? "rgba(245, 158, 11, 0.16)"
+                                  : restartResultByAgent[key]
+                                        .hydrationStatus === "confirmed"
+                                    ? "rgba(16, 185, 129, 0.16)"
+                                    : "var(--bg-surface)",
+                            }}
+                          >
+                            Hydration:{" "}
+                            {restartResultByAgent[key].hydrationStatus}
+                          </span>
+                        </div>
+                      )}
+
+                      {restartResultByAgent[key] &&
+                        restartResultByAgent[key].warnings.length > 0 && (
+                          <ul
+                            role="status"
+                            data-testid={`watch-restart-warnings-${key}`}
+                            className="fd-mono"
+                            style={{
+                              margin: 0,
+                              padding: "6px 8px 6px 22px",
+                              borderRadius: "4px",
+                              fontSize: "11px",
+                              border: "1px solid rgba(245, 158, 11, 0.45)",
+                              backgroundColor: "rgba(245, 158, 11, 0.14)",
+                              color: "#FBBF24",
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: "2px",
+                            }}
+                          >
+                            {restartResultByAgent[key].warnings.map(
+                              (warning, idx) => (
+                                <li
+                                  key={idx}
+                                  data-testid={`watch-restart-warning-item-${key}`}
+                                >
+                                  {warning}
+                                </li>
+                              ),
+                            )}
+                          </ul>
+                        )}
+
+                      {restartErrorByAgent[key] && (
+                        <div
+                          role="alert"
+                          data-testid={`watch-restart-error-${key}`}
+                          style={{
+                            fontSize: "11px",
+                            color: "#F87171",
+                            padding: "5px 8px",
+                            borderRadius: "4px",
+                            backgroundColor: "rgba(239, 68, 68, 0.14)",
+                          }}
+                        >
+                          {restartErrorByAgent[key]}
                         </div>
                       )}
                     </div>

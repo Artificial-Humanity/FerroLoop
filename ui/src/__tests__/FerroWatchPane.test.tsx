@@ -1628,4 +1628,233 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
       Element.prototype.scrollIntoView = origScrollIntoView;
     }
   });
+
+  it("renders plain-text hydration warnings when present and omits them when empty or absent on remodel and restart actions (#419)", async () => {
+    const summaryData = makeSampleWatchSummary();
+    let nextRemodelWarnings: string[] | undefined = undefined;
+    let nextRestartWarnings: string[] | undefined = undefined;
+
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.includes("/api/v1/watch/summary")) {
+          return json(summaryData);
+        }
+        if (url.endsWith("/api/v1/hosted-sessions")) {
+          return json({ sessions: [] });
+        }
+        if (url.includes("/api/v1/sessions/") && url.endsWith("/remodel") && method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          return json({
+            mode: body.mode ?? "execute",
+            session_id: "codex:feira",
+            previous_session_id: "claude:feira",
+            persona: "feira",
+            project: "FerroLoop",
+            role: "assistant",
+            from_vendor: "claude",
+            vendor: body.vendor ?? "codex",
+            model: body.model ?? "gpt-5.4",
+            node_id: "local",
+            hosted: true,
+            cwd: "/workspace/FerroLoop",
+            status: "running",
+            handshake_dispatched: true,
+            hydration_dispatched: true,
+            hydration_status: "confirmed",
+            runtime_stopped: true,
+            tmux_target: "feira.codex:0.0",
+            prompt: "remodel prompt",
+            handoff: "remodel-feira",
+            ...(nextRemodelWarnings !== undefined
+              ? { warnings: nextRemodelWarnings }
+              : {}),
+          });
+        }
+        if (
+          url.includes("/api/v1/hosted-sessions/") &&
+          url.endsWith("/restart") &&
+          method === "POST"
+        ) {
+          return json({
+            ...(nextRestartWarnings !== undefined
+              ? { warnings: nextRestartWarnings }
+              : {}),
+            session_id: "claude:ferris",
+            persona: "ferris",
+            project: "FerroLoop",
+            role: "lead",
+            vendor: "claude",
+            model: "claude-opus-4-7",
+            node_id: "local",
+            hosted: true,
+            status: "running",
+            restart_policy: "on-failure",
+            restart_count: 2,
+            hydration_dispatched: true,
+            hydration_status: "confirmed",
+            created_at_ms: 1000,
+            updated_at_ms: 2000,
+            prompt: "restart prompt",
+          });
+        }
+        return json({});
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const onAfterRemodel = vi.fn();
+    const onAfterRestart = vi.fn();
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        onAfterRemodel={onAfterRemodel}
+        onAfterRestart={onAfterRestart}
+      />,
+    );
+
+    await screen.findByTestId("ferrowatch-pane-title");
+
+    // --- Remodel action: absent (undefined), empty ([]), and present warnings ---
+    const agentSelect = screen.getByTestId("watch-remodel-agent-select");
+    fireEvent.change(agentSelect, { target: { value: "feira" } });
+
+    // 1. Remodel with absent warnings (undefined)
+    nextRemodelWarnings = undefined;
+    fireEvent.click(screen.getByTestId("watch-remodel-submit-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("watch-remodel-status")).toHaveTextContent(
+        /Remodeled feira: claude → codex/i,
+      );
+    });
+    expect(onAfterRemodel).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        persona: "feira",
+        hydration_status: "confirmed",
+        warnings: [],
+      }),
+    );
+    expect(
+      screen.queryByTestId("watch-remodel-warnings"),
+    ).not.toBeInTheDocument();
+
+    // 2. Remodel with empty warnings ([])
+    nextRemodelWarnings = [];
+    fireEvent.click(screen.getByTestId("watch-remodel-submit-btn"));
+
+    await waitFor(() => {
+      expect(onAfterRemodel).toHaveBeenCalledTimes(2);
+    });
+    expect(
+      screen.queryByTestId("watch-remodel-warnings"),
+    ).not.toBeInTheDocument();
+
+    // 3. Remodel with present warnings (including HTML-like string)
+    nextRemodelWarnings = [
+      "role file not found: looked in /workspace/.agents/roles/assistant.md",
+      "<script>alert('xss')</script> cwd is outside project ferroloop",
+    ];
+    fireEvent.click(screen.getByTestId("watch-remodel-submit-btn"));
+
+    const remodelWarningsList = await screen.findByTestId(
+      "watch-remodel-warnings",
+    );
+    expect(remodelWarningsList).toHaveAttribute("role", "status");
+    const remodelWarningItems = screen.getAllByTestId(
+      "watch-remodel-warning-item",
+    );
+    expect(remodelWarningItems).toHaveLength(2);
+    expect(remodelWarningItems[0]).toHaveTextContent(
+      "role file not found: looked in /workspace/.agents/roles/assistant.md",
+    );
+    expect(remodelWarningItems[1].textContent).toBe(
+      "<script>alert('xss')</script> cwd is outside project ferroloop",
+    );
+    expect(remodelWarningItems[1].querySelector("script")).toBeNull();
+    // Remodel status still reads as succeeded
+    expect(screen.getByTestId("watch-remodel-status")).toHaveTextContent(
+      /Remodeled feira: claude → codex/i,
+    );
+    expect(
+      screen.getByTestId("watch-remodel-hydration-status"),
+    ).toHaveAttribute("data-hydration-status", "confirmed");
+
+    // --- Restart action: absent (undefined), empty ([]), and present warnings ---
+    const restartBtn = screen.getByTestId("watch-liveness-restart-btn-ferris");
+
+    // 1. Restart with absent warnings (undefined)
+    nextRestartWarnings = undefined;
+    fireEvent.click(restartBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("watch-restart-status-ferris"),
+      ).toHaveTextContent(/Restarted ferris \[claude:ferris\]/i);
+    });
+    expect(onAfterRestart).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        persona: "ferris",
+        hydration_status: "confirmed",
+        warnings: [],
+      }),
+    );
+    expect(
+      screen.queryByTestId("watch-restart-warnings-ferris"),
+    ).not.toBeInTheDocument();
+
+    // 2. Restart with empty warnings ([])
+    nextRestartWarnings = [];
+    fireEvent.click(restartBtn);
+
+    await waitFor(() => {
+      expect(onAfterRestart).toHaveBeenCalledTimes(2);
+    });
+    expect(
+      screen.queryByTestId("watch-restart-warnings-ferris"),
+    ).not.toBeInTheDocument();
+
+    // 3. Restart with present warnings (including HTML-like string)
+    nextRestartWarnings = [
+      "missing required guidance: /workspace/FerroLoop/PERSONA.md",
+      "<svg onload=alert(1)> ambiguous project binding",
+    ];
+    fireEvent.click(restartBtn);
+
+    const restartWarningsList = await screen.findByTestId(
+      "watch-restart-warnings-ferris",
+    );
+    expect(restartWarningsList).toHaveAttribute("role", "status");
+    const restartWarningItems = screen.getAllByTestId(
+      "watch-restart-warning-item-ferris",
+    );
+    expect(restartWarningItems).toHaveLength(2);
+    expect(restartWarningItems[0]).toHaveTextContent(
+      "missing required guidance: /workspace/FerroLoop/PERSONA.md",
+    );
+    expect(restartWarningItems[1].textContent).toBe(
+      "<svg onload=alert(1)> ambiguous project binding",
+    );
+    expect(restartWarningItems[1].querySelector("svg")).toBeNull();
+    // Restart status still reads as succeeded
+    expect(screen.getByTestId("watch-restart-status-ferris")).toHaveTextContent(
+      /Restarted ferris \[claude:ferris\] \(restarts=2, hydration_status=confirmed\)/i,
+    );
+    expect(
+      screen.getByTestId("watch-restart-hydration-status-ferris"),
+    ).toHaveAttribute("data-hydration-status", "confirmed");
+
+    unmount();
+  });
 });

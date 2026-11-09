@@ -27,6 +27,7 @@ import {
   type HubStatsResponse,
   type InterruptSessionResponse,
   normalizeHydrationStatus,
+  normalizeHydrationWarnings,
   type LivenessResponse,
   type OperatorAccount,
   type OperatorRole,
@@ -52,6 +53,7 @@ import {
   type ProjectsListResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
+  type RestartHostedSessionResponse,
   type RoleRecord,
   type RecastAgentRequest,
   type RecastAgentResponse,
@@ -1065,6 +1067,23 @@ export class HubApiClient {
     return { sessions };
   }
 
+  public async restartHostedSession(
+    sessionIdOrPersona: string,
+  ): Promise<RestartHostedSessionResponse> {
+    const res = await this.request<RestartHostedSessionResponse>(
+      `/api/v1/hosted-sessions/${encodeURIComponent(sessionIdOrPersona)}/restart`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    );
+    return {
+      ...res,
+      hydration_status: normalizeHydrationStatus(res.hydration_status),
+      warnings: normalizeHydrationWarnings(res.warnings),
+    };
+  }
+
   public async getSessionTranscript(sessionId: string): Promise<SessionTranscriptResponse> {
     return this.request<SessionTranscriptResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript`,
@@ -1103,6 +1122,7 @@ export class HubApiClient {
     return {
       ...res,
       hydration_status: normalizeHydrationStatus(res.hydration_status),
+      warnings: normalizeHydrationWarnings(res.warnings),
     };
   }
 
@@ -2350,6 +2370,7 @@ export class HubApiClient {
     return {
       ...res,
       hydration_status: normalizeHydrationStatus(res.hydration_status),
+      warnings: normalizeHydrationWarnings(res.warnings),
     };
   }
 
