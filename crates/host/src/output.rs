@@ -279,8 +279,12 @@ impl Hub {
         let mut fanout = self.fanout.lock().unwrap_or_else(|err| err.into_inner());
         let now = (self.clock)();
         for sub in &mut fanout.subs {
-            if !sub.dropped && !sub.slow && sub.wants_key(key) && sub.overflow_deadline.is_some() {
-                sub.mark_slow(now);
+            if !sub.dropped
+                && !sub.slow
+                && sub.wants_key(key)
+                && let Some(deadline) = sub.overflow_deadline
+            {
+                sub.mark_slow(now.min(deadline));
                 sub.wake.notify_all();
             }
         }
@@ -1148,6 +1152,7 @@ impl Subscriber {
             let removed = sub.queue.remove(pos).expect("queued event");
             let bytes = removed.raw_len.saturating_add(removed.envelope);
             sub.queued_bytes = sub.queued_bytes.saturating_sub(bytes);
+            sub.expire((hub.clock)());
             sub.reset_grace();
         }
     }
@@ -1562,6 +1567,89 @@ mod tests {
         // Nothing was written: disconnect cannot manufacture reusable capacity.
         assert_eq!(out.room(), 0);
         assert_eq!(out.inner.lock().unwrap().events.len(), MAX_EVENTS);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_expired_record_pressure_preserves_original_cutoff() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        // Publish up to the shared limit without asking admission to end the
+        // grace early. The next room check happens only after expiry.
+        for _ in 0..MAX_EVENTS {
+            out.emit_line(b"x".to_vec());
+        }
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            assert!(!fanout.subs[0].slow);
+            assert_eq!(fanout.subs[0].overflow_deadline, Some(expiry));
+        }
+        advance(&clock, OVERFLOW_GRACE + Duration::from_millis(100));
+        let now = *clock.lock().unwrap();
+        assert_eq!(out.room(), 0);
+        assert!(hub.fanout.lock().unwrap().subs[0].slow);
+        assert_eq!(sub.write_cutoff(&hub), Some(expiry + WRITE_TIMEOUT));
+        assert_eq!(*clock.lock().unwrap(), now, "admission must not wait");
+        assert_eq!(out.inner.lock().unwrap().events.len(), MAX_EVENTS);
+        sub.abandon(&hub);
+    }
+
+    #[test]
+    fn legacy_overflow_grace_expired_write_cannot_reset_episode() {
+        let (hub, clock) = clocked_hub();
+        let out = fixture(1, &hub);
+        let sub = hub.subscribe(None, None).ok().unwrap();
+        assert!(out.push(&b"x\n".repeat(SUB_QUEUE + 1)));
+        let expiry = *clock.lock().unwrap() + OVERFLOW_GRACE;
+        for _ in 0..=SUB_QUEUE / 2 {
+            drain_one(&sub, &hub);
+        }
+        {
+            let fanout = hub.fanout.lock().unwrap();
+            let state = &fanout.subs[0];
+            assert_eq!(state.queue.len(), SUB_QUEUE / 2);
+            assert!(state.queued_bytes < SUB_BYTES / 2);
+            assert!(
+                state
+                    .cursors
+                    .values()
+                    .all(|cursor| cursor.next >= cursor.published)
+            );
+            assert_eq!(state.overflow_deadline, Some(expiry));
+        }
+        *clock.lock().unwrap() = expiry - Duration::from_nanos(1);
+        let mut writes = 0;
+        sub.run(
+            Arc::clone(&hub),
+            2,
+            |frame, cutoff| {
+                writes += 1;
+                assert_eq!(cutoff, Some(expiry + WRITE_TIMEOUT));
+                if writes == 1 {
+                    assert_eq!(frame.kind, FrameKind::Line);
+                    // This completed frame takes the queue below half, but its
+                    // write crossed expiry and cannot erase the old deadline.
+                    *clock.lock().unwrap() = expiry + Duration::from_nanos(1);
+                } else {
+                    assert!(matches!(
+                        serde_json::from_slice::<ControlEvent>(&frame.payload).unwrap(),
+                        ControlEvent::SlowSubscriber { .. }
+                    ));
+                }
+                Ok(())
+            },
+            || false,
+        );
+        assert_eq!(
+            writes, 2,
+            "only the in-flight frame and slow notice are sent"
+        );
+        let fanout = hub.fanout.lock().unwrap();
+        let state = &fanout.subs[0];
+        assert!(state.slow);
+        assert!(state.dropped);
+        assert_eq!(state.write_cutoff, Some(expiry + WRITE_TIMEOUT));
     }
 
     #[test]
