@@ -32,9 +32,12 @@ use fl_wire::identity::{
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    canonical_reforge_prompt, reforge_role_label, route_matches_session_id,
+    reforge_role_label, route_matches_session_id,
     synthesize_decommission_prompt,
 };
+
+#[cfg(test)]
+use crate::api::canonical_reforge_prompt;
 
 /// Legacy executable role choices; spin-up also accepts roles in the current catalog.
 pub const SPIN_UP_ROLES: [&str; 11] = [
@@ -245,7 +248,37 @@ impl<'a> LifecycleEnv<'a> {
         fl_wire::vendor_adapter::VendorLaunchOptions {
             remote_control,
             posture,
+            auto_approval: None,
         }
+    }
+
+    /// Resolve the effective [`fl_core::permissions::AutoApproval`] choice for `vendor` from the
+    /// hub's saved settings (or the compiler default when no settings file exists).
+    pub fn auto_approval_for(&self, vendor: &str) -> Option<fl_core::permissions::AutoApproval> {
+        let home = self
+            .home_override
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        match home {
+            Some(home) => crate::settings::load(&home).effective_auto_approval_for(vendor),
+            None => vendor
+                .trim()
+                .parse::<fl_core::permissions::Vendor>()
+                .ok()
+                .map(|v| v.default_auto_approval()),
+        }
+    }
+
+    /// Adapter-layer launch options for a specific `vendor` and permission `posture`, including
+    /// the configured per-vendor [`fl_core::permissions::AutoApproval`] choice.
+    pub fn vendor_launch_options_for_vendor(
+        &self,
+        vendor: &str,
+        posture: fl_core::permissions::Posture,
+    ) -> fl_wire::vendor_adapter::VendorLaunchOptions {
+        let mut opts = self.vendor_launch_options_for(posture);
+        opts.auto_approval = self.auto_approval_for(vendor);
+        opts
     }
 }
 
@@ -720,7 +753,7 @@ fn launch_spec_for_with_session(
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let options = env.vendor_launch_options_for(posture);
+    let options = env.vendor_launch_options_for_vendor(vendor, posture);
     if let Some(host_adapter) = env.host_vendor_adapter(vendor) {
         let mut binding = fl_core::AdapterIdentityBinding::new(
             format!("{vendor}:{persona}"),
@@ -741,6 +774,7 @@ fn launch_spec_for_with_session(
             home_dir: home.clone(),
             remote_control: options.remote_control,
             posture,
+            auto_approval: options.auto_approval,
         };
         match host_adapter.prepare_launch(&req) {
             Ok(plan) => {
@@ -791,11 +825,6 @@ fn launch_spec_for_with_session(
         )
         .map_err(|why| invalid_field("posture", &why))?;
     Ok(Some(spec))
-}
-
-#[cfg(test)]
-pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, String)> {
-    launch_env_for_vendor("claude", persona, home)
 }
 
 #[cfg(test)]
@@ -2021,6 +2050,10 @@ pub struct SpinUpResponse {
     pub hosted: bool,
     pub status: String,
     pub tmux_target: Option<String>,
+    /// The `fl-host` session identifier for this runtime (`<Persona>.<vendor>`, or `muse.<persona>`),
+    /// when the session has a runtime target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     /// Whether the prompt was handed to the vendor; this is not acceptance evidence.
     pub hydration_dispatched: bool,
     #[serde(default)]
@@ -2063,6 +2096,10 @@ pub struct HostedSessionRecord {
     pub restart_policy: String,
     pub restart_count: u32,
     pub tmux_target: Option<String>,
+    /// The `fl-host` session identifier for this runtime (`<Persona>.<vendor>`, or `muse.<persona>`),
+    /// when the session has a runtime target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     pub cwd: Option<String>,
     /// The context window chosen for the session, in tokens. Validated and recorded; whether and
     /// how a launch applies it is separate. Absent when none was chosen.
@@ -2095,6 +2132,14 @@ pub struct HostedSessionRecord {
     pub decommission_prepared_at_ms: Option<u64>,
 }
 
+/// Compute the `fl-host` session identifier for an optional `tmux_target` (`<Persona>.<vendor>`,
+/// or `muse.<persona>`).
+fn host_session_id_for_target(tmux_target: Option<&str>) -> Option<String> {
+    tmux_target
+        .and_then(fl_wire::vendor_adapter::unit_to_host_session_id)
+        .map(|id| id.as_str().to_string())
+}
+
 /// Slug of the runtime entry for `session_id` (`:` is not a slug character).
 pub fn hosted_session_slug(session_id: &str) -> String {
     format!("{HOSTED_SLUG_PREFIX}{}", session_id.replace(':', "-"))
@@ -2105,7 +2150,10 @@ pub fn persist_hosted_session<S: StateStore>(
     record: &HostedSessionRecord,
     by: &str,
 ) -> Result<(), LifecycleError> {
-    let value = serde_json::to_value(record).map_err(|e| LifecycleError::Store(e.to_string()))?;
+    let mut normalized = record.clone();
+    normalized.host_session_id = host_session_id_for_target(normalized.tmux_target.as_deref());
+    let value =
+        serde_json::to_value(&normalized).map_err(|e| LifecycleError::Store(e.to_string()))?;
     // Never replace another session's record (see `check_slug_free`).
     check_slug_free(store, &record.session_id)?;
     store.upsert_state(UpsertStateArgs {
@@ -2131,7 +2179,13 @@ pub fn list_hosted_sessions<S: StateStore>(
         .into_iter()
         .filter(|e| e.slug.starts_with(HOSTED_SLUG_PREFIX))
         .filter_map(|e| match e.payload {
-            StatePayload::Runtime(rt) => serde_json::from_value(rt.value).ok(),
+            StatePayload::Runtime(rt) => {
+                let mut rec: HostedSessionRecord = serde_json::from_value(rt.value).ok()?;
+                if rec.host_session_id.is_none() {
+                    rec.host_session_id = host_session_id_for_target(rec.tmux_target.as_deref());
+                }
+                Some(rec)
+            }
             _ => None,
         })
         .collect();
@@ -3589,6 +3643,13 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let mut v = req.validate()?;
+    v.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+        &v.vendor,
+        v.posture,
+        env.auto_approval_for(&v.vendor),
+    )
+    .map_err(|msg| LifecycleError::Invalid(format!("posture: {msg}")))?
+    .receipts;
     if let Some(agent) = current_recast_assignment(store, &v.persona)? {
         v.project = agent.project;
         v.role = role_label_of(&agent.role);
@@ -3657,6 +3718,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     register_spun_up_agent(store, &v, by)?;
 
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
+    let host_session_id = host_session_id_for_target(tmux_target.as_deref());
     let unit = tmux_target
         .as_deref()
         .map_or("", |t| env.runtime.unit(t))
@@ -3677,6 +3739,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         restart_policy: "on-failure".to_string(),
         restart_count: previous.as_ref().map_or(0, |r| r.restart_count),
         tmux_target: tmux_target.clone(),
+        host_session_id: host_session_id.clone(),
         cwd: v.cwd.clone(),
         context_window: v.context_window,
         posture: v.posture,
@@ -3760,6 +3823,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
         tmux_target,
+        host_session_id,
         hydration_dispatched: hydration.dispatched,
         hydration_status: hydration.status,
         prompt: Some(prompt),
@@ -3945,6 +4009,7 @@ fn record_for_target<S: AgentRegistry>(
         restart_policy: "never".to_string(),
         restart_count: 0,
         tmux_target: None,
+        host_session_id: None,
         cwd: None,
         context_window: None,
         posture: fl_core::permissions::Posture::Auto,
@@ -4732,6 +4797,7 @@ fn preflight_teardown_runtime<S: AgentRegistry + StateStore>(
     {
         if record.tmux_target.is_none() {
             record.tmux_target = sib.tmux_target.clone();
+            record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
         }
         if !record.runtime_spawned && sib.runtime_spawned {
             record.runtime_spawned = true;
@@ -5041,8 +5107,12 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     )?;
     crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
     let prompt = guidance.text;
-    fl_wire::vendor_adapter::launch_permissions(&record.vendor, record.posture)
-        .map_err(|why| invalid_field("posture", &why))?;
+    fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+        &record.vendor,
+        record.posture,
+        env.auto_approval_for(&record.vendor),
+    )
+    .map_err(|why| invalid_field("posture", &why))?;
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = env.runtime.unit(&want_target).to_string();
@@ -5074,9 +5144,11 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
             // The window now under the shared name is not what that record created, so it does
             // not own it: a teardown must not kill it unless this restart opens it.
             record.tmux_target = Some(want_target.clone());
+            record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
             record.runtime_spawned = false;
         }
     }
+    record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
     if record.hosted
         && !adopted_old_session
         && record.runtime_spawned
@@ -5230,6 +5302,10 @@ pub struct RemodelResponse {
     /// `execute`: whether the old session's runtime is gone.
     pub runtime_stopped: bool,
     pub tmux_target: Option<String>,
+    /// The `fl-host` session identifier for this runtime (`<Persona>.<vendor>`, or `muse.<persona>`),
+    /// when the session has a runtime target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     /// `prepare`: the handoff prompt; `execute`: the new session's reforge prompt.
     pub prompt: Option<String>,
     /// `execute`: slug of the workspace handoff entry that records the remodel.
@@ -5453,6 +5529,13 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         posture: req.posture,
     }
     .validate()?;
+    to.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+        &to.vendor,
+        to.posture,
+        env.auto_approval_for(&to.vendor),
+    )
+    .map_err(|msg| LifecycleError::Invalid(format!("posture: {msg}")))?
+    .receipts;
     validate_catalog_role(store, &to.role)?;
     registered_role_prompt(
         store,
@@ -5471,7 +5554,12 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     // The restore puts back what was there: a session with no record was not hosted, and a
     // restore must not turn it into a managed one.
     let restore = if lookup_vendor(&from_vendor).is_some() {
-        fl_wire::vendor_adapter::launch_permissions(&from_vendor, from_posture).map_err(|why| {
+        fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+            &from_vendor,
+            from_posture,
+            env.auto_approval_for(&from_vendor),
+        )
+        .map_err(|why| {
             LifecycleError::Invalid(format!(
                 "cannot build restore plan for `{}` on `{from_vendor}` with recorded posture `{from_posture}`: {why}",
                 target.session_id
@@ -5740,6 +5828,11 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
     let to = &plan.to;
     if plan.mode == RemodelMode::Prepare {
         let out = prepare_decommission(store, env, target, by, caller)?;
+        let tmux_target = target.hosted.as_ref().and_then(|r| r.tmux_target.clone());
+        let host_session_id = tmux_target
+            .as_deref()
+            .and_then(fl_wire::vendor_adapter::unit_to_host_session_id)
+            .map(|id| id.as_str().to_string());
         return Ok(RemodelResponse {
             mode: RemodelMode::Prepare,
             session_id: out.session_id.clone(),
@@ -5759,7 +5852,8 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
             hydration_dispatched: false,
             hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
             runtime_stopped: false,
-            tmux_target: target.hosted.as_ref().and_then(|r| r.tmux_target.clone()),
+            tmux_target,
+            host_session_id,
             prompt: out.prompt,
             handoff: None,
             warnings: Vec::new(),
@@ -5834,6 +5928,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
                 hydration_status: out.hydration_status,
                 runtime_stopped: torn.runtime_stopped,
                 tmux_target: out.tmux_target,
+                host_session_id: out.host_session_id,
                 prompt: out.prompt,
                 handoff: Some(handoff),
                 warnings,
@@ -6434,10 +6529,7 @@ mod tests {
         assert_eq!(
             launch_args("codex", Some("gpt-6-sol")),
             strings(&[
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
+                "--approve-for-me",
                 "--remote",
                 "unix://",
                 "--model",
@@ -6457,7 +6549,8 @@ mod tests {
                 "--approval-mode",
                 "on-request",
                 "--approval-judge",
-                "off",
+                "on",
+                "--disable-sandbox",
                 "hello"
             ])
         );
@@ -9528,6 +9621,8 @@ mod tests {
         status: &str,
         spawned: bool,
     ) -> HostedSessionRecord {
+        let tmux_target = Some(format!("{}:{vendor}", capitalize(persona)));
+        let host_session_id = host_session_id_for_target(tmux_target.as_deref());
         HostedSessionRecord {
             session_id: format!("{vendor}:{persona}"),
             persona: persona.into(),
@@ -9542,7 +9637,8 @@ mod tests {
             status: status.into(),
             restart_policy: "on-failure".into(),
             restart_count: 0,
-            tmux_target: Some(format!("{}:{vendor}", capitalize(persona))),
+            tmux_target,
+            host_session_id,
             cwd: None,
             context_window: None,
             hydration_dispatched: false,
@@ -9776,6 +9872,12 @@ mod tests {
                 env.iter()
                     .any(|(k, v)| k == "AGENT_PERSONA" && v == "fiona"),
                 "{vendor} must include AGENT_PERSONA: {env:?}"
+            );
+            assert_eq!(
+                env.iter()
+                    .any(|(k, v)| k == "MUSE_NO_AUTO_UPDATE" && v == "1"),
+                vendor == "muse",
+                "{vendor} MUSE_NO_AUTO_UPDATE mismatch: {env:?}"
             );
         }
     }
@@ -11059,5 +11161,282 @@ mod tests {
         assert!(claude_fake.live.borrow().is_empty());
         assert!(claude_fake.calls.borrow().is_empty());
         assert!(claude_fake.launches.borrow().is_empty());
+    }
+
+    #[test]
+    fn spin_up_restart_and_remodel_read_configured_auto_approval_setting() {
+        use fl_core::permissions::ReceiptClass;
+
+        let home = tempfile::tempdir().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+
+        // 1. Default settings (`vendor-reviewer`): Codex `Posture::Auto` launches with
+        //    `--approve-for-me` (never `-a` or `-s`) and returns `Exact` receipts.
+        let codex_req = req("ada", "assistant", "codex");
+        let spun = spin_up(&store, &env, &codex_req, "owner", Caller::Owner).unwrap();
+        assert!(
+            spun.permission_receipts
+                .iter()
+                .all(|r| r.class == ReceiptClass::Exact),
+            "default vendor-reviewer receipts must be Exact: {:?}",
+            spun.permission_receipts
+        );
+        {
+            let launches = fake.launches.borrow();
+            assert_eq!(launches.len(), 1);
+            let spec = launches[0].1.as_ref().unwrap();
+            assert!(
+                spec.argv.iter().any(|a| a == "--approve-for-me"),
+                "expected --approve-for-me in {:?}",
+                spec.argv
+            );
+            assert!(
+                spec.argv.iter().all(|a| !matches!(
+                    a.as_str(),
+                    "-a" | "--ask-for-approval" | "-s" | "--sandbox"
+                )),
+                "Codex vendor-reviewer must never emit -a or -s: {:?}",
+                spec.argv
+            );
+        }
+
+        // 2. Update settings to `ask-human` for Codex and Muse; restart reads the updated setting.
+        let patch: crate::settings::SettingsPatch = serde_json::from_value(serde_json::json!({
+            "auto_approval": {
+                "codex": "ask-human",
+                "muse": "ask-human"
+            }
+        }))
+        .unwrap();
+        crate::settings::update(home.path(), patch).unwrap();
+
+        fake.live.borrow_mut().clear();
+        restart_hosted_session(&store, &env, "codex:ada", "owner").unwrap();
+        {
+            let launches = fake.launches.borrow();
+            assert_eq!(launches.len(), 2);
+            let spec = launches[1].1.as_ref().unwrap();
+            assert!(
+                spec.argv.windows(2).any(|w| w == ["-a", "on-request"]),
+                "restart with ask-human must emit -a on-request: {:?}",
+                spec.argv
+            );
+            assert!(
+                spec.argv.windows(2).any(|w| w == ["-s", "workspace-write"]),
+                "restart with ask-human must emit -s workspace-write: {:?}",
+                spec.argv
+            );
+            assert!(!spec.argv.iter().any(|a| a == "--approve-for-me"));
+        }
+
+        // 3. Remodel onto Muse with `ask-human` configured emits `--approval-judge off` and
+        //    records `StricterDowngrade` on the Posture receipt (both Prepare and Execute).
+        let remodel_target = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
+        let prepared = remodel_session(
+            &store,
+            &env,
+            &remodel_target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .permission_receipts
+                .iter()
+                .any(|r| r.class == ReceiptClass::StricterDowngrade
+                    && r.requested.contains("ask-human")),
+            "Muse Prepare ask-human receipt must record StricterDowngrade: {:?}",
+            prepared.permission_receipts
+        );
+        let remodeled = remodel_session(
+            &store,
+            &env,
+            &remodel_target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            remodeled
+                .permission_receipts
+                .iter()
+                .any(|r| r.class == ReceiptClass::StricterDowngrade
+                    && r.requested.contains("ask-human")),
+            "Muse ask-human receipt must record StricterDowngrade: {:?}",
+            remodeled.permission_receipts
+        );
+        {
+            let launches = fake.launches.borrow();
+            let spec = launches.last().unwrap().1.as_ref().unwrap();
+            assert!(
+                spec.argv
+                    .windows(2)
+                    .any(|w| w == ["--approval-judge", "off"]),
+                "Muse ask-human must emit --approval-judge off: {:?}",
+                spec.argv
+            );
+        }
+    }
+
+    #[test]
+    fn spin_up_and_remodel_expose_host_session_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let mut env = fake.env(home.path());
+        env.key_probe = &RestoreKeys;
+
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(spun.session_id, "codex:ada");
+        assert_eq!(spun.tmux_target.as_deref(), Some("Ada:codex"));
+        assert_eq!(spun.host_session_id.as_deref(), Some("Ada.codex"));
+        let stored_codex = find_hosted_session(&store, &["codex:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_codex.host_session_id.as_deref(), Some("Ada.codex"));
+
+        let target = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
+        let prepared = remodel_session(
+            &store,
+            &env,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(prepared.host_session_id.as_deref(), Some("Ada.codex"));
+
+        let remodeled = remodel_session(
+            &store,
+            &env,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(remodeled.session_id, "muse:ada");
+        assert_eq!(remodeled.tmux_target.as_deref(), Some("muse:ada"));
+        assert_eq!(remodeled.host_session_id.as_deref(), Some("muse.ada"));
+        let stored_muse = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+        assert_eq!(stored_muse.host_session_id.as_deref(), Some("muse.ada"));
+
+        // API-only vendor session (`tmux_target: None`) populates `host_session_id: None` across
+        // SpinUpResponse, HostedSessionRecord, and RemodelResponse (both Prepare and Execute).
+        let api_spun = spin_up(
+            &store,
+            &env,
+            &req("bea", "assistant", "kimi-api"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(api_spun.tmux_target, None);
+        assert_eq!(api_spun.host_session_id, None);
+        let api_rec = find_hosted_session(&store, &["kimi-api:bea"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(api_rec.tmux_target, None);
+        assert_eq!(api_rec.host_session_id, None);
+
+        let api_target = SessionTarget::resolve(&store, "kimi-api:bea", None).unwrap();
+        let api_prepared = remodel_session(
+            &store,
+            &env,
+            &api_target,
+            &RemodelRequest {
+                vendor: "openrouter-api".into(),
+                mode: Some("prepare".into()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(api_prepared.tmux_target, None);
+        assert_eq!(api_prepared.host_session_id, None);
+
+        let api_remodeled = remodel_session(
+            &store,
+            &env,
+            &api_target,
+            &RemodelRequest {
+                vendor: "openrouter-api".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(api_remodeled.tmux_target, None);
+        assert_eq!(api_remodeled.host_session_id, None);
+        let api_rec_after = find_hosted_session(&store, &["openrouter-api:bea"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(api_rec_after.tmux_target, None);
+        assert_eq!(api_rec_after.host_session_id, None);
+
+        // Legacy HostedSessionRecord JSON serialized without `host_session_id` deserializes cleanly
+        // and backfills `host_session_id` when read via `list_hosted_sessions`.
+        let mut legacy_json = serde_json::to_value(&stored_muse).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("host_session_id");
+        let deserialized: HostedSessionRecord =
+            serde_json::from_value(legacy_json.clone()).unwrap();
+        assert_eq!(deserialized.host_session_id, None);
+
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: hosted_session_slug("muse:ada"),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: legacy_json,
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        let listed = list_hosted_sessions(&store).unwrap();
+        let backfilled = listed.iter().find(|r| r.session_id == "muse:ada").unwrap();
+        assert_eq!(backfilled.host_session_id.as_deref(), Some("muse.ada"));
     }
 }

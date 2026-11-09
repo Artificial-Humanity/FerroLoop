@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { App } from "../App";
+import { App, selectPreferredHostedSessions } from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { ChatPane } from "../components/ChatPane";
@@ -1104,7 +1104,439 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
 
     const consoleBody = within(watchPane).getByTestId("watch-console-body");
     expect(consoleBody).toHaveClass("fd-scroll");
-    expect(consoleBody.style.overflowY).toBe("auto");
+    expect(consoleBody).toHaveStyle({ overflowY: "auto" });
+
+    unmount();
+  });
+
+  it("displays hydration_status in FerroWatch remodel results, hosted session liveness rows, and ChatPane session toolbar (#383 D2b)", async () => {
+    const summaryData = makeSampleWatchSummary();
+    summaryData.health!.agents[0].hosted_session = {
+      ...summaryData.health!.agents[0].hosted_session!,
+      hydration_dispatched: true,
+      hydration_status: "unconfirmed",
+    };
+    let remodelHydrationResponse: "unconfirmed" | "failed" | "confirmed" =
+      "unconfirmed";
+
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const json = (payload: unknown) =>
+          new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.includes("/api/v1/watch/summary")) {
+          return json(summaryData);
+        }
+        if (
+          url.includes("/api/v1/sessions/ferris/remodel") &&
+          method === "POST"
+        ) {
+          return json({
+            persona: "ferris",
+            from_vendor: "claude",
+            vendor: "codex",
+            model: "gpt-5.4",
+            session_id: "codex:ferris",
+            mode: "execute",
+            hosted: true,
+            hydration_dispatched: remodelHydrationResponse !== "failed",
+            hydration_status: remodelHydrationResponse,
+          });
+        }
+        return json({});
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const onAfterRemodel = vi.fn();
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        onAfterRemodel={onAfterRemodel}
+      />,
+    );
+
+    const livenessHosted = await screen.findByTestId(
+      "watch-liveness-hosted-ferris",
+    );
+    expect(livenessHosted).toHaveTextContent("hydration=unconfirmed");
+    expect(
+      within(livenessHosted).getByTestId("watch-liveness-hydration-ferris"),
+    ).toHaveAttribute("data-hydration-status", "unconfirmed");
+
+    const quotasSection = screen.getByTestId("watch-quota-matrix-section");
+    const balanceControls = within(quotasSection).getByTestId(
+      "watch-quota-balance-controls",
+    );
+    await waitFor(() => {
+      expect(
+        within(balanceControls).getByTestId("watch-remodel-agent-select"),
+      ).toHaveValue("ferris");
+    });
+    fireEvent.click(
+      within(balanceControls).getByTestId("watch-remodel-submit-btn"),
+    );
+
+    const remodelBadge = await screen.findByTestId(
+      "watch-remodel-hydration-status",
+    );
+    expect(remodelBadge).toHaveAttribute(
+      "data-hydration-status",
+      "unconfirmed",
+    );
+    expect(remodelBadge).toHaveAttribute("data-hydration-dispatched", "true");
+    expect(remodelBadge).toHaveTextContent("Hydration: unconfirmed");
+    expect(onAfterRemodel).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        persona: "ferris",
+        hydration_status: "unconfirmed",
+      }),
+    );
+
+    // Remodel with failed hydration_status
+    remodelHydrationResponse = "failed";
+    fireEvent.click(
+      within(balanceControls).getByTestId("watch-remodel-submit-btn"),
+    );
+
+    await waitFor(() => {
+      const updatedBadge = screen.getByTestId(
+        "watch-remodel-hydration-status",
+      );
+      expect(updatedBadge).toHaveAttribute("data-hydration-status", "failed");
+      expect(updatedBadge).toHaveAttribute(
+        "data-hydration-dispatched",
+        "false",
+      );
+      expect(updatedBadge).toHaveTextContent("Hydration: failed");
+    });
+
+    unmount();
+
+    // Also verify ChatPane directly renders confirmed, unconfirmed, and failed hydration_status badges
+    const { rerender, unmount: unmountChat } = render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        agentRole="lead"
+        agentProject="FerroLoop"
+        adapter="claude"
+        model="claude-opus-5-5"
+        sessionId="claude:ferris"
+        hydrationStatus="confirmed"
+        hydrationDispatched={true}
+        turns={[]}
+        isBusy={false}
+        queue={[]}
+        loading={false}
+        wsConnected={true}
+      />,
+    );
+
+    const chatBadge = screen.getByTestId("session-hydration-status-badge");
+    expect(chatBadge).toHaveAttribute("data-hydration-status", "confirmed");
+    expect(chatBadge).toHaveTextContent("Hydration: confirmed");
+    expect(chatBadge).not.toHaveAttribute("role", "status");
+
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        agentRole="lead"
+        agentProject="FerroLoop"
+        adapter="claude"
+        model="claude-opus-5-5"
+        sessionId="claude:ferris"
+        hydrationStatus="failed"
+        hydrationDispatched={false}
+        turns={[]}
+        isBusy={false}
+        queue={[]}
+        loading={false}
+        wsConnected={true}
+      />,
+    );
+
+    const failedChatBadge = screen.getByTestId(
+      "session-hydration-status-badge",
+    );
+    expect(failedChatBadge).toHaveAttribute("data-hydration-status", "failed");
+    expect(failedChatBadge).toHaveAttribute("role", "status");
+    expect(failedChatBadge).toHaveTextContent("Hydration: failed");
+
+    unmountChat();
+  });
+
+  it("selectPreferredHostedSessions filters decommissioned/tornDown records, normalizes hydration_status, and prefers running or newer updated_at_ms", () => {
+    const selected = selectPreferredHostedSessions(
+      [
+        {
+          session_id: "claude:ferris-old",
+          persona: "Ferris",
+          project: "FerroLoop",
+          role: "lead",
+          vendor: "claude",
+          node_id: "local",
+          status: "running",
+          restart_count: 0,
+          updated_at_ms: 1000,
+          hydration_dispatched: true,
+        },
+        {
+          session_id: "claude:ferris-new",
+          persona: "ferris",
+          project: "FerroLoop",
+          role: "lead",
+          vendor: "claude",
+          node_id: "local",
+          status: "running",
+          restart_count: 1,
+          updated_at_ms: 2000,
+          hydration_dispatched: true,
+          hydration_status: "confirmed",
+        },
+        {
+          session_id: "claude:ferris-crashed-later",
+          persona: "ferris",
+          project: "FerroLoop",
+          role: "lead",
+          vendor: "claude",
+          node_id: "local",
+          status: "crashed",
+          restart_count: 2,
+          updated_at_ms: 3000,
+          hydration_dispatched: false,
+          hydration_status: "failed",
+        },
+        {
+          session_id: "claude:ferris-decommissioned",
+          persona: "ferris",
+          project: "FerroLoop",
+          role: "lead",
+          vendor: "claude",
+          node_id: "local",
+          status: "decommissioned",
+          restart_count: 0,
+          updated_at_ms: 9999,
+          hydration_dispatched: false,
+          hydration_status: "failed",
+        },
+        {
+          session_id: "codex:fiona",
+          persona: "fiona",
+          project: "FerroLoop",
+          role: "developer",
+          vendor: "codex",
+          node_id: "local",
+          status: "stopped",
+          restart_count: 0,
+          updated_at_ms: 500,
+          hydration_dispatched: true,
+        },
+        {
+          session_id: "codex:torn-persona",
+          persona: "felix",
+          project: "FerroLoop",
+          role: "ui-developer",
+          vendor: "codex",
+          node_id: "local",
+          status: "running",
+          restart_count: 0,
+          updated_at_ms: 4000,
+          hydration_dispatched: true,
+        },
+        {
+          session_id: "codex:torn-session",
+          persona: "feira",
+          project: "FerroLoop",
+          role: "assistant",
+          vendor: "codex",
+          node_id: "local",
+          status: "running",
+          restart_count: 0,
+          updated_at_ms: 4000,
+          hydration_dispatched: true,
+        },
+      ],
+      new Set(["felix", "codex:torn-session"]),
+    );
+
+    expect(Object.keys(selected).sort()).toEqual(["ferris", "fiona"]);
+    expect(selected.ferris.session_id).toBe("claude:ferris-new");
+    expect(selected.ferris.hydration_status).toBe("confirmed");
+    expect(selected.fiona.session_id).toBe("codex:fiona");
+    expect(selected.fiona.hydration_status).toBe("unconfirmed");
+  });
+
+  it("enriches summary.health.agents hosted_session hydration_status from getHostedSessions while ignoring decommissioned records", async () => {
+    const summaryData = makeSampleWatchSummary();
+    // summary.health.agents[0] (ferris) has hosted_session without hydration_status
+    delete summaryData.health!.agents[0].hosted_session!.hydration_status;
+    delete summaryData.health!.agents[0].hosted_session!.hydration_dispatched;
+    // summary.health.agents[1] (feira) has hosted_session with unmatched session_id so it falls back to persona match
+    summaryData.health!.agents[1].hosted_session = {
+      session_id: "codex:feira-live",
+      persona: "feira",
+      project: "FerroLoop",
+      role: "assistant",
+      vendor: "codex",
+      model: "gpt-5.4",
+      node_id: "local",
+      status: "running",
+      restart_count: 0,
+      updated_at_ms: 1000,
+    };
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (payload: unknown) =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.includes("/api/v1/watch/summary")) {
+        return json(summaryData);
+      }
+      if (url.includes("/api/v1/hosted-sessions")) {
+        return json({
+          sessions: [
+            {
+              session_id: "claude:ferris",
+              persona: "ferris",
+              project: "FerroLoop",
+              role: "lead",
+              vendor: "claude",
+              node_id: "local",
+              status: "running",
+              restart_count: 0,
+              updated_at_ms: 1000,
+              hydration_dispatched: true,
+              hydration_status: "confirmed",
+            },
+            {
+              session_id: "claude:ferris",
+              persona: "ferris",
+              project: "FerroLoop",
+              role: "lead",
+              vendor: "claude",
+              node_id: "local",
+              status: "decommissioned",
+              restart_count: 0,
+              updated_at_ms: 9999,
+              hydration_dispatched: false,
+              hydration_status: "failed",
+            },
+            {
+              session_id: "codex:feira-older-crashed",
+              persona: "feira",
+              project: "FerroLoop",
+              role: "assistant",
+              vendor: "codex",
+              node_id: "local",
+              status: "crashed",
+              restart_count: 1,
+              updated_at_ms: 5000,
+              hydration_dispatched: true,
+              hydration_status: "confirmed",
+            },
+            {
+              session_id: "codex:feira-running",
+              persona: "feira",
+              project: "FerroLoop",
+              role: "assistant",
+              vendor: "codex",
+              node_id: "local",
+              status: "running",
+              restart_count: 0,
+              updated_at_ms: 2000,
+              hydration_dispatched: false,
+              hydration_status: "failed",
+            },
+          ],
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+
+    const ferrisHydration = await screen.findByTestId(
+      "watch-liveness-hydration-ferris",
+    );
+    expect(ferrisHydration).toHaveAttribute(
+      "data-hydration-status",
+      "confirmed",
+    );
+    expect(ferrisHydration).toHaveTextContent("confirmed");
+    expect(
+      screen.getByTestId("watch-liveness-hosted-ferris"),
+    ).toHaveTextContent("hydration=confirmed");
+
+    const feiraHydration = await screen.findByTestId(
+      "watch-liveness-hydration-feira",
+    );
+    expect(feiraHydration).toHaveAttribute("data-hydration-status", "failed");
+    expect(feiraHydration).toHaveTextContent("failed");
+    expect(
+      screen.getByTestId("watch-liveness-hosted-feira"),
+    ).toHaveTextContent("hydration=failed");
+
+    unmount();
+  });
+
+  it("omits the local_host badge when summary.health.local_host is empty instead of falling back to ai-lab-0", async () => {
+    const summaryWithoutHost = makeSampleWatchSummary();
+    summaryWithoutHost.health.local_host = "";
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.includes("/api/v1/watch/summary")) {
+        return json(summaryWithoutHost);
+      }
+      if (url.endsWith("/api/v1/hosted-sessions")) {
+        return json({ sessions: [] });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+
+    await screen.findByTestId("ferrowatch-pane-title");
+    expect(
+      screen.queryByTestId("ferrowatch-local-host-badge"),
+    ).not.toBeInTheDocument();
 
     unmount();
   });

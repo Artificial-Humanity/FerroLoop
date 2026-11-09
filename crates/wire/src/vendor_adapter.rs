@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use fl_core::permissions::{
-    Effect, EvidenceClass, Origin, Posture, ReceiptClass, ReceiptLine, ReceiptSubject, Transport,
-    Vendor, VendorFacts, compile_posture,
+    AutoApproval, Effect, EvidenceClass, Origin, Posture, ReceiptClass, ReceiptLine,
+    ReceiptSubject, Transport, Vendor, VendorFacts, compile_posture,
 };
 use fl_host_proto::{ChildState, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,9 @@ pub struct VendorLaunchOptions {
     pub remote_control: bool,
     /// Permission posture compiled into the vendor's launch flags (`Posture::Auto` by default).
     pub posture: Posture,
+    /// Explicit [`AutoApproval`] choice used when `posture == Posture::Auto`. When `None`, the
+    /// vendor's compiler default ([`Vendor::default_auto_approval`]) is used.
+    pub auto_approval: Option<AutoApproval>,
 }
 
 impl Default for VendorLaunchOptions {
@@ -42,6 +45,7 @@ impl Default for VendorLaunchOptions {
         Self {
             remote_control: true,
             posture: Posture::Auto,
+            auto_approval: None,
         }
     }
 }
@@ -98,24 +102,28 @@ pub struct LaunchPermissions {
     pub receipts: Vec<PermissionReceipt>,
 }
 
-/// Compile the launch permission arguments and receipts for `vendor` and `posture`.
+/// Compile the launch permission arguments and receipts for `vendor` and `posture` using the
+/// vendor's default [`AutoApproval`] choice.
 ///
 /// The five permission-compiler vendors (`claude`, `codex`, `muse`, `grok`, `antigravity`) run
 /// [`compile_posture`]. Vendors without a permission compiler (`lemonade`, `ollama`, and custom
 /// prompt-delivery or API vendors) accept only [`Posture::Auto`] with an `unsupported` receipt and
 /// refuse any other posture with an actionable error.
 pub fn launch_permissions(vendor: &str, posture: Posture) -> Result<LaunchPermissions, String> {
+    launch_permissions_with_auto_approval(vendor, posture, None)
+}
+
+/// Compile the launch permission arguments and receipts for `vendor`, `posture`, and an optional
+/// explicit [`AutoApproval`] choice (defaulting to [`Vendor::default_auto_approval`] when `None`).
+pub fn launch_permissions_with_auto_approval(
+    vendor: &str,
+    posture: Posture,
+    auto_approval: Option<AutoApproval>,
+) -> Result<LaunchPermissions, String> {
     let v = vendor.trim().to_ascii_lowercase();
-    let compiler_vendor = match v.as_str() {
-        "claude" => Some(Vendor::Claude),
-        "codex" => Some(Vendor::Codex),
-        "muse" => Some(Vendor::Muse),
-        "grok" => Some(Vendor::Grok),
-        "antigravity" => Some(Vendor::Antigravity),
-        _ => None,
-    };
-    if let Some(cv) = compiler_vendor {
-        let plan = compile_posture(cv, &VendorFacts::new(Transport::Pty), posture)
+    if let Ok(cv) = v.parse::<Vendor>() {
+        let choice = auto_approval.unwrap_or_else(|| cv.default_auto_approval());
+        let plan = compile_posture(cv, &VendorFacts::new(Transport::Pty), posture, choice)
             .map_err(|e| e.to_string())?;
         return Ok(LaunchPermissions {
             args: plan.launch_args,
@@ -240,6 +248,16 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
         launch_permissions(self.vendor_id(), posture)
     }
 
+    /// Whether a launch on this vendor can express `posture` with `auto_approval`, returning the
+    /// compiled CLI flags and receipts when supported.
+    fn check_posture_with_auto_approval(
+        &self,
+        posture: Posture,
+        auto_approval: Option<AutoApproval>,
+    ) -> Result<LaunchPermissions, String> {
+        launch_permissions_with_auto_approval(self.vendor_id(), posture, auto_approval)
+    }
+
     /// Interactive startup prompts to poll and answer right after spawning.
     fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
         &[]
@@ -267,6 +285,20 @@ pub const MUSE_DEFAULT_MODEL: &str = "muse-wonder-full-1.0";
 /// The Muse catalog model ids the CLI accepts for `--model`, default first.
 pub const MUSE_CATALOG_MODELS: [&str; 3] =
     [MUSE_DEFAULT_MODEL, "muse-wonder-1.0", "muse-spark-1.3"];
+
+/// The Muse reasoning effort tiers the CLI accepts for `--reasoning-effort`.
+pub const MUSE_REASONING_EFFORTS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// Canonical lowercase Muse `--reasoning-effort` tier for `level`, or `None` when unsupported.
+pub fn normalize_muse_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
+    let lower = level?.trim().to_ascii_lowercase();
+    MUSE_REASONING_EFFORTS
+        .iter()
+        .copied()
+        .find(|tier| *tier == lower)
+}
 
 /// Unversioned names the CLI rejects ("model ... does not exist"), with the catalog id each means.
 const MUSE_MODEL_ALIASES: [(&str, &str); 3] = [
@@ -419,8 +451,9 @@ pub fn muse_prompt_argument(prompt: &str) -> String {
 }
 
 /// `AGENT_PERSONA` (omitted for `codex`, which shares one `codex app-server` daemon across
-/// sessions) plus a `PATH` that starts with `<home>/.local/bin` when that directory is not
-/// already a `PATH` entry.
+/// sessions), `MUSE_NO_AUTO_UPDATE=1` for `muse` (so the `~/.local/bin/muse` launcher never forks
+/// a background auto-update subshell that pins the session supervisor), plus a `PATH` that starts
+/// with `<home>/.local/bin` when that directory is not already a `PATH` entry.
 pub fn launch_env_for_vendor(
     vendor: &str,
     persona: &str,
@@ -429,6 +462,9 @@ pub fn launch_env_for_vendor(
     let mut env = Vec::new();
     if vendor != "codex" {
         env.push(("AGENT_PERSONA".into(), persona.into()));
+    }
+    if vendor == "muse" {
+        env.push(("MUSE_NO_AUTO_UPDATE".into(), "1".into()));
     }
     if let Some(path) = path_with_local_bin(home) {
         env.push(("PATH".into(), path));
@@ -523,7 +559,8 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         // (which accepts an optional name in Commander.js) is always followed by a `--` flag
         // and never consumes the trailing positional `<prompt>` when `model` and
         // `thinking_level` are both `None`.
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         if options.remote_control {
             argv.extend(self.remote_control_args(persona));
@@ -594,7 +631,8 @@ impl VendorCliAdapter for CodexCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if options.remote_control {
@@ -685,7 +723,8 @@ impl VendorCliAdapter for AntigravityCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if options.remote_control {
@@ -740,7 +779,8 @@ impl VendorCliAdapter for GrokCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![self.resolve_binary(home)];
         argv.extend(perms.args);
         if let Some(m) = self.normalize_model(model) {
@@ -778,22 +818,43 @@ impl VendorCliAdapter for MuseCliAdapter {
         Some(normalize_muse_model(requested))
     }
 
+    /// Muse supports `--reasoning-effort <none|minimal|low|medium|high|xhigh|max|ultra>` with or
+    /// without `--model`.
+    fn check_thinking_level(&self, _model: Option<&str>, level: &str) -> Result<(), String> {
+        if normalize_muse_reasoning_effort(Some(level)).is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "muse supports thinking_level {}, not `{}`",
+                MUSE_REASONING_EFFORTS.join(", "),
+                level.trim().to_ascii_lowercase()
+            ))
+        }
+    }
+
     fn build_launch_spec_with_options(
         &self,
         persona: &str,
         model: Option<&str>,
-        _thinking_level: Option<&str>,
+        thinking_level: Option<&str>,
         prompt: &str,
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![
             self.resolve_binary(home),
             "--model".to_string(),
             normalize_muse_model(model),
         ];
+        if let Some(effort) = normalize_muse_reasoning_effort(thinking_level) {
+            argv.extend(["--reasoning-effort".to_string(), effort.to_string()]);
+        }
         argv.extend(perms.args);
+        if options.posture == Posture::Auto {
+            argv.push("--disable-sandbox".to_string());
+        }
         argv.push(muse_prompt_argument(prompt));
         Ok(LaunchSpec {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
@@ -837,7 +898,8 @@ impl VendorCliAdapter for LemonadeCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let host = std::env::var("FL_LEMONADE_HOST")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -920,7 +982,8 @@ impl VendorCliAdapter for OllamaCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
-        let perms = self.check_posture(options.posture)?;
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
         let mut argv = vec![
             self.resolve_binary(home),
             "run".to_string(),
@@ -1052,12 +1115,78 @@ pub fn host_session_id_to_unit(id: &SessionId) -> String {
     }
 }
 
+/// Split `target` into `(vendor, persona)` when it has the `<vendor>:<persona>` lifecycle
+/// session-id shape (`"codex:kage"`, `"muse:eve"`): a registered vendor id (matched
+/// case-insensitively) and a non-empty persona slug separated by a single `:`.
+pub fn split_lifecycle_session_id(target: &str) -> Option<(String, &str)> {
+    let (vendor, persona) = target.trim().split_once(':')?;
+    if vendor.is_empty() || persona.is_empty() || persona.contains(':') {
+        return None;
+    }
+    let spec = fl_core::lookup_vendor(&vendor.to_ascii_lowercase())?;
+    Some((spec.id, persona))
+}
+
+/// Map a `<vendor>:<persona>` lifecycle session id (`"codex:kage"`, `"muse:eve"`) onto its
+/// `fl_host_proto::SessionId` (`"Kage.codex"`, `"muse.eve"`) using the registry's display
+/// casing for `<persona>` (`agents`).
+///
+/// - For `"muse:<persona>"`, the host session id is `"muse.<persona>"` (with `<persona>`
+///   lowercased).
+/// - For any other registered vendor, `<persona>` is looked up in `agents` (active records
+///   take precedence over retired ones). When matching records disagree on `display_name`,
+///   an `Err` is returned describing the ambiguity.
+/// - Returns `Ok(None)` when `target` is not a `<vendor>:<persona>` lifecycle id or `<persona>`
+///   is not present in `agents`.
+pub fn lifecycle_id_to_host_session_id(
+    target: &str,
+    agents: &[fl_core::AgentRecord],
+) -> Result<Option<SessionId>, String> {
+    let Some((vendor, persona)) = split_lifecycle_session_id(target) else {
+        return Ok(None);
+    };
+    if vendor == "muse" {
+        return Ok(SessionId::new(&format!("muse.{}", persona.to_ascii_lowercase())).ok());
+    }
+    let matches_persona = |a: &&fl_core::AgentRecord| {
+        a.name_key.eq_ignore_ascii_case(persona) || a.display_name.eq_ignore_ascii_case(persona)
+    };
+    let active: Vec<&fl_core::AgentRecord> = agents
+        .iter()
+        .filter(|a| a.status == fl_core::AgentStatus::Active)
+        .filter(matches_persona)
+        .collect();
+    let candidates = if !active.is_empty() {
+        active
+    } else {
+        agents.iter().filter(matches_persona).collect()
+    };
+    let mut display_names: Vec<&str> = candidates
+        .into_iter()
+        .map(|a| a.display_name.as_str())
+        .collect();
+    display_names.sort_unstable();
+    display_names.dedup();
+    match display_names.as_slice() {
+        [] => Ok(None),
+        [display] => Ok(SessionId::new(&format!("{display}.{vendor}")).ok()),
+        many => Err(format!(
+            "ambiguous fl-host session target `{}`: registry has multiple display casings for persona `{persona}` ({})",
+            target.trim(),
+            many.join(", ")
+        )),
+    }
+}
+
 /// Live `SessionId`s in `sessions` that belong to `unit`.
 ///
 /// - `unit == ""` or `unit == "muse"` matches nothing (the shared Muse container is never a single
 ///   session unit).
 /// - `unit` containing `:` (`"muse:ada"`, `"Ada:claude"`) matches the exact `SessionId`
-///   (`"muse.ada"`, `"Ada.claude"`).
+///   (`"muse.ada"`, `"Ada.claude"`), and when `unit` has the `<vendor>:<persona>` lifecycle shape
+///   (`"codex:kage"`, `"muse:eve"`), also matches live sessions whose `s.stream.session` is
+///   `muse.<persona_lower>` (for `vendor == "muse"`) or `<SessionPersona>.<vendor>` where
+///   `SessionPersona.eq_ignore_ascii_case(persona)` (for non-Muse vendors).
 /// - Bare `unit` (`"Ada"`) matches `"Ada"` and any `"Ada.<window>"` (`"Ada.claude"`, etc.).
 pub fn matching_live_host_sessions(sessions: &[SessionSummary], unit: &str) -> Vec<SessionId> {
     let unit = unit.trim();
@@ -1068,11 +1197,27 @@ pub fn matching_live_host_sessions(sessions: &[SessionSummary], unit: &str) -> V
         .iter()
         .filter(|s| matches!(s.state, ChildState::Running(_)));
     if unit.contains(':') {
-        let Some(wanted) = unit_to_host_session_id(unit) else {
-            return Vec::new();
-        };
+        let wanted = unit_to_host_session_id(unit);
+        let lifecycle = split_lifecycle_session_id(unit);
         return live
-            .filter(|s| s.stream.session == wanted)
+            .filter(|s| {
+                if wanted.as_ref() == Some(&s.stream.session) {
+                    return true;
+                }
+                if let Some((ref vendor, persona)) = lifecycle {
+                    if vendor == "muse" {
+                        let expected = format!("muse.{}", persona.to_ascii_lowercase());
+                        return s.stream.session.as_str() == expected;
+                    }
+                    if let Some((sess_persona, sess_vendor)) =
+                        s.stream.session.as_str().split_once('.')
+                    {
+                        return sess_vendor == vendor.as_str()
+                            && sess_persona.eq_ignore_ascii_case(persona);
+                    }
+                }
+                false
+            })
             .map(|s| s.stream.session.clone())
             .collect();
     }
@@ -1193,10 +1338,7 @@ mod tests {
         assert_eq!(
             &spec.argv[1..],
             &[
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
+                "--approve-for-me",
                 "--remote",
                 "unix://",
                 "--model",
@@ -1223,8 +1365,42 @@ mod tests {
             spec.argv
         );
 
+        let muse = lookup_vendor_cli_adapter("muse").unwrap();
+        for effort in MUSE_REASONING_EFFORTS {
+            assert!(muse.check_thinking_level(None, effort).is_ok(), "{effort}");
+            assert!(
+                muse.check_thinking_level(None, &effort.to_ascii_uppercase())
+                    .is_ok(),
+                "{effort}"
+            );
+        }
+        assert!(muse.check_thinking_level(None, "extreme").is_err());
+        let spec = muse.build_launch_spec("ada", None, Some(" HIGH "), "Hi", None);
+        assert_eq!(
+            &spec.argv[1..],
+            &[
+                "--model",
+                MUSE_DEFAULT_MODEL,
+                "--reasoning-effort",
+                "high",
+                "--approval-mode",
+                "on-request",
+                "--approval-judge",
+                "on",
+                "--disable-sandbox",
+                "Hi"
+            ]
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "MUSE_NO_AUTO_UPDATE" && v == "1"),
+            "{:?}",
+            spec.env
+        );
+
         // Vendors with no launch option for it ignore the level.
-        for vendor in ["grok", "muse", "lemonade", "ollama"] {
+        for vendor in ["grok", "lemonade", "ollama"] {
             let a = lookup_vendor_cli_adapter(vendor).unwrap();
             let with = a.build_launch_spec("ada", None, Some("high"), "Hi", None);
             let without = a.build_launch_spec("ada", None, None, "Hi", None);
@@ -1237,6 +1413,7 @@ mod tests {
         let off = VendorLaunchOptions {
             remote_control: false,
             posture: Posture::Auto,
+            auto_approval: None,
         };
         let claude = lookup_vendor_cli_adapter("claude").unwrap();
         assert!(claude.supports_remote_control());
@@ -1255,15 +1432,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             &spec_off.argv[1..],
-            &[
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
-                "--model",
-                "gpt-5",
-                "Hi"
-            ]
+            &["--approve-for-me", "--model", "gpt-5", "Hi"]
         );
 
         let agy = lookup_vendor_cli_adapter("antigravity").unwrap();
@@ -1297,7 +1466,7 @@ mod tests {
             "high low",
             "$(id)",
         ] {
-            for vendor in ["claude", "codex", "antigravity"] {
+            for vendor in ["claude", "codex", "antigravity", "muse"] {
                 let a = lookup_vendor_cli_adapter(vendor).unwrap();
                 let with = a.build_launch_spec("ada", Some("opus"), Some(bad), "Hi", None);
                 let without = a.build_launch_spec("ada", Some("opus"), None, "Hi", None);
@@ -1331,6 +1500,31 @@ mod tests {
         let spec = codex.build_launch_spec("ada", Some("gpt-5"), None, "Hello", None);
         assert_eq!(
             &spec.argv[1..],
+            &[
+                "--approve-for-me",
+                "--remote",
+                "unix://",
+                "--model",
+                "gpt-5",
+                "Hello"
+            ]
+        );
+        let spec_ask = codex
+            .build_launch_spec_with_options(
+                "ada",
+                Some("gpt-5"),
+                None,
+                "Hello",
+                None,
+                VendorLaunchOptions {
+                    remote_control: true,
+                    posture: Posture::Auto,
+                    auto_approval: Some(AutoApproval::AskHuman),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            &spec_ask.argv[1..],
             &[
                 "-a",
                 "on-request",
@@ -1405,10 +1599,72 @@ mod tests {
                 "--approval-mode",
                 "on-request",
                 "--approval-judge",
-                "off",
+                "on",
+                "--disable-sandbox",
                 "Hello"
             ]
         );
+        let spec_muse_ask = muse
+            .build_launch_spec_with_options(
+                "ada",
+                None,
+                None,
+                "Hello",
+                None,
+                VendorLaunchOptions {
+                    remote_control: true,
+                    posture: Posture::Auto,
+                    auto_approval: Some(AutoApproval::AskHuman),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            &spec_muse_ask.argv[1..],
+            &[
+                "--model",
+                MUSE_DEFAULT_MODEL,
+                "--approval-mode",
+                "on-request",
+                "--approval-judge",
+                "off",
+                "--disable-sandbox",
+                "Hello"
+            ]
+        );
+        for non_auto in [Posture::Ask, Posture::AcceptEdits] {
+            let spec_non_auto = muse
+                .build_launch_spec_with_options(
+                    "ada",
+                    None,
+                    None,
+                    "Hello",
+                    None,
+                    VendorLaunchOptions {
+                        remote_control: true,
+                        posture: non_auto,
+                        auto_approval: None,
+                    },
+                )
+                .unwrap();
+            assert!(
+                !spec_non_auto.argv.iter().any(|a| a == "--disable-sandbox"),
+                "muse {non_auto} must keep the sandbox: {:?}",
+                spec_non_auto.argv
+            );
+        }
+        let spec_muse_plan = muse.build_launch_spec_with_options(
+            "ada",
+            None,
+            None,
+            "Hello",
+            None,
+            VendorLaunchOptions {
+                remote_control: true,
+                posture: Posture::Plan,
+                auto_approval: None,
+            },
+        );
+        assert!(spec_muse_plan.is_err());
         assert_eq!(muse.reset_command(), "/new");
 
         let lemonade = lookup_vendor_cli_adapter("lemonade").unwrap();
@@ -1457,11 +1713,100 @@ mod tests {
             vec![SessionId::new("Ada.claude").unwrap()]
         );
         assert_eq!(
+            matching_live_host_sessions(&sessions, "claude:ada"),
+            vec![SessionId::new("Ada.claude").unwrap()]
+        );
+        assert_eq!(
+            matching_live_host_sessions(&sessions, "CLAUDE:Ada"),
+            vec![SessionId::new("Ada.claude").unwrap()]
+        );
+        assert_eq!(
             matching_live_host_sessions(&sessions, "muse:ada"),
+            vec![SessionId::new("muse.ada").unwrap()]
+        );
+        assert_eq!(
+            matching_live_host_sessions(&sessions, "Muse:Ada"),
             vec![SessionId::new("muse.ada").unwrap()]
         );
         assert!(matching_live_host_sessions(&sessions, "muse:bob").is_empty());
         assert!(matching_live_host_sessions(&sessions, "muse").is_empty());
+    }
+
+    #[test]
+    fn lifecycle_id_to_host_session_id_uses_registry_display_casing_and_refuses_ambiguity() {
+        use fl_core::{AgentId, AgentRecord, AgentRole, AgentStatus, At, Iri};
+
+        let make_agent =
+            |id: u64, name_key: &str, display_name: &str, status: AgentStatus| AgentRecord {
+                id: AgentId(Iri::parse(&format!("urn:test:agent:{id}")).unwrap()),
+                name_key: name_key.to_string(),
+                display_name: display_name.to_string(),
+                email: format!("{name_key}@artificialhumanity.io"),
+                project: "ferroloop".to_string(),
+                role: AgentRole::Assistant,
+                extra_areas: Vec::new(),
+                status,
+                updated_at: At::from_unix_millis(1),
+                by: "owner".to_string(),
+            };
+
+        let agents = vec![
+            make_agent(1, "kage", "Kage", AgentStatus::Active),
+            make_agent(2, "jarvis", "JARVIS", AgentStatus::Active),
+            make_agent(3, "jarvis", "Jarvis", AgentStatus::Retired),
+        ];
+
+        assert_eq!(
+            split_lifecycle_session_id("codex:kage"),
+            Some(("codex".to_string(), "kage"))
+        );
+        assert_eq!(
+            split_lifecycle_session_id("codex:Kage"),
+            Some(("codex".to_string(), "Kage"))
+        );
+        assert_eq!(
+            split_lifecycle_session_id("CODEX:kage"),
+            Some(("codex".to_string(), "kage"))
+        );
+        assert_eq!(
+            split_lifecycle_session_id("Muse:Eve"),
+            Some(("muse".to_string(), "Eve"))
+        );
+        assert_eq!(split_lifecycle_session_id("Kage:codex"), None);
+        assert_eq!(
+            lifecycle_id_to_host_session_id("codex:kage", &agents).unwrap(),
+            Some(SessionId::new("Kage.codex").unwrap())
+        );
+        assert_eq!(
+            lifecycle_id_to_host_session_id("CODEX:Kage", &agents).unwrap(),
+            Some(SessionId::new("Kage.codex").unwrap())
+        );
+        // Active record wins over retired record with older casing.
+        assert_eq!(
+            lifecycle_id_to_host_session_id("claude:jarvis", &agents).unwrap(),
+            Some(SessionId::new("JARVIS.claude").unwrap())
+        );
+        // Muse keeps `muse.<persona>` lowercased.
+        assert_eq!(
+            lifecycle_id_to_host_session_id("muse:eve", &[]).unwrap(),
+            Some(SessionId::new("muse.eve").unwrap())
+        );
+        assert_eq!(
+            lifecycle_id_to_host_session_id("Muse:Eve", &[]).unwrap(),
+            Some(SessionId::new("muse.eve").unwrap())
+        );
+        // Unregistered non-Muse persona returns None.
+        assert_eq!(
+            lifecycle_id_to_host_session_id("codex:unknown", &agents).unwrap(),
+            None
+        );
+        // Conflicting active display casings refuse on ambiguity.
+        let conflicting = vec![
+            make_agent(10, "kage", "Kage", AgentStatus::Active),
+            make_agent(11, "kage", "KAGE", AgentStatus::Active),
+        ];
+        let err = lifecycle_id_to_host_session_id("codex:kage", &conflicting).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
     }
 
     #[test]
@@ -1515,6 +1860,7 @@ mod tests {
                     VendorLaunchOptions {
                         remote_control: true,
                         posture,
+                        auto_approval: None,
                     },
                 );
                 if unsupported {

@@ -86,7 +86,7 @@ fn install_home_muse(home: &Path) -> PathBuf {
 
 fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
     LaunchSpec {
-        env: launch_env(persona, Some(home)),
+        env: launch_env_for_vendor("muse", persona, Some(home)),
         argv: vec![
             home.join(".local/bin/muse").to_string_lossy().into_owned(),
             "--model".into(),
@@ -94,7 +94,8 @@ fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
             "--approval-mode".into(),
             "on-request".into(),
             "--approval-judge".into(),
-            "off".into(),
+            "on".into(),
+            "--disable-sandbox".into(),
             prompt.to_string(),
         ],
     }
@@ -237,7 +238,8 @@ fn the_launch_argv_puts_the_model_first_and_the_prompt_last() {
                 "--approval-mode".to_string(),
                 "on-request".to_string(),
                 "--approval-judge".to_string(),
-                "off".to_string(),
+                "on".to_string(),
+                "--disable-sandbox".to_string(),
                 out.prompt.unwrap(),
             ],
             "{requested:?}"
@@ -575,14 +577,7 @@ fn built_in_vendors_launch_with_their_prompt() {
             "codex",
             "codex",
             "FL_WIRE_CODEX_BIN",
-            vec![
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
-                "--remote",
-                "unix://",
-            ],
+            vec!["--approve-for-me", "--remote", "unix://"],
         ),
         (
             "grok",
@@ -649,6 +644,75 @@ fn restart_launches_muse_in_the_window_it_reopens() {
 }
 
 #[test]
+fn spin_up_and_restart_launch_muse_with_reasoning_effort_and_no_auto_update_env() {
+    let _bin = MuseBinEnv::cleared();
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    install_home_muse(home.path());
+    let first = FakeRuntime::default();
+    let mut request = req("ada", "muse");
+    request.model = Some("muse-wonder-full".into());
+    request.thinking_level = Some("  HIGH ".into());
+    let out = spin_up(
+        &store,
+        &first.env(home.path()),
+        &request,
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.thinking_level.as_deref(), Some("HIGH"));
+    let spec = first.launches.borrow()[0].1.clone().unwrap();
+    assert!(
+        spec.env
+            .iter()
+            .any(|(k, v)| k == "MUSE_NO_AUTO_UPDATE" && v == "1"),
+        "{:?}",
+        spec.env
+    );
+    assert_eq!(
+        &spec.argv[1..9],
+        &[
+            "--model",
+            "muse-wonder-full-1.0",
+            "--reasoning-effort",
+            "high",
+            "--approval-mode",
+            "on-request",
+            "--approval-judge",
+            "on",
+        ]
+    );
+    assert_eq!(spec.argv[9], "--disable-sandbox");
+
+    let second = FakeRuntime::default();
+    restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner").unwrap();
+    let restart_spec = second.launches.borrow()[0].1.clone().unwrap();
+    assert!(
+        restart_spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "MUSE_NO_AUTO_UPDATE" && v == "1"),
+        "{:?}",
+        restart_spec.env
+    );
+    assert_eq!(
+        &restart_spec.argv[1..9],
+        &[
+            "--model",
+            "muse-wonder-full-1.0",
+            "--reasoning-effort",
+            "high",
+            "--approval-mode",
+            "on-request",
+            "--approval-judge",
+            "on",
+        ]
+    );
+    assert_eq!(restart_spec.argv[9], "--disable-sandbox");
+}
+
+#[test]
 fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
     for (vendor, bin, variable, flags) in [
         (
@@ -661,14 +725,7 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             "codex",
             "codex",
             "FL_WIRE_CODEX_BIN",
-            vec![
-                "-a",
-                "on-request",
-                "-s",
-                "workspace-write",
-                "--remote",
-                "unix://",
-            ],
+            vec!["--approve-for-me", "--remote", "unix://"],
         ),
         (
             "grok",

@@ -1,6 +1,6 @@
 //! `fl host` — Native `fl-host` daemon and session inspection/control subcommands.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
@@ -8,7 +8,8 @@ use fl_host_proto::{
     BlockingHostClient, ChildState, HostConfig, HostEndpoint, SendOutcome, SessionSummary,
 };
 use fl_wire::vendor_adapter::{
-    host_session_id_to_unit, matching_live_host_sessions, unit_to_host_session_id,
+    host_session_id_to_unit, lifecycle_id_to_host_session_id, matching_live_host_sessions,
+    split_lifecycle_session_id, unit_to_host_session_id,
 };
 
 #[derive(Subcommand)]
@@ -111,11 +112,117 @@ pub fn dedup_session_summaries(sessions: Vec<SessionSummary>) -> Vec<SessionSumm
     by_session.into_values().collect()
 }
 
+#[cfg(test)]
 fn resolve_target_session<'a>(
     sessions: &'a [SessionSummary],
     target: &str,
 ) -> Result<&'a SessionSummary> {
-    let live_ids = matching_live_host_sessions(sessions, target);
+    resolve_target_session_with_agents(sessions, target, &[])
+}
+
+fn resolve_target_session_with_agents<'a>(
+    sessions: &'a [SessionSummary],
+    target: &str,
+    agents: &[fl_core::AgentRecord],
+) -> Result<&'a SessionSummary> {
+    let trimmed = target.trim();
+    if let Some((vendor, persona)) = split_lifecycle_session_id(trimmed) {
+        if vendor == "muse" {
+            let id = lifecycle_id_to_host_session_id(trimmed, &[])
+                .map_err(anyhow::Error::msg)?
+                .ok_or_else(|| anyhow::anyhow!("no fl-host session matching `{target}`"))?;
+            return sessions
+                .iter()
+                .find(|s| s.stream.session == id && matches!(s.state, ChildState::Running(_)))
+                .or_else(|| sessions.iter().find(|s| s.stream.session == id))
+                .ok_or_else(|| anyhow::anyhow!("no fl-host session matching `{target}`"));
+        }
+        let lifecycle_id =
+            lifecycle_id_to_host_session_id(trimmed, agents).map_err(anyhow::Error::msg)?;
+        let direct_id = unit_to_host_session_id(trimmed);
+
+        let mut case_matched_ids: Vec<&str> = sessions
+            .iter()
+            .filter_map(|s| {
+                let (sess_persona, sess_vendor) = s.stream.session.as_str().split_once('.')?;
+                (sess_vendor == vendor && sess_persona.eq_ignore_ascii_case(persona))
+                    .then_some(s.stream.session.as_str())
+            })
+            .collect();
+        case_matched_ids.sort_unstable();
+        case_matched_ids.dedup();
+        if case_matched_ids.len() > 1 {
+            bail!(
+                "ambiguous fl-host session target `{target}`: multiple sessions match persona `{persona}` on vendor `{vendor}` ({})",
+                case_matched_ids.join(", ")
+            );
+        }
+
+        let direct_exists = direct_id
+            .as_ref()
+            .is_some_and(|did| sessions.iter().any(|s| &s.stream.session == did));
+
+        if let Some(id) = lifecycle_id {
+            if direct_exists && direct_id.as_ref() != Some(&id) {
+                let did = direct_id.as_ref().unwrap().as_str();
+                let id_str = id.as_str();
+                bail!(
+                    "ambiguous fl-host session target `{target}`: matches both `{did}` and `{id_str}`"
+                );
+            }
+            if let [only] = case_matched_ids.as_slice()
+                && *only != id.as_str()
+            {
+                let id_str = id.as_str();
+                bail!(
+                    "ambiguous fl-host session target `{target}`: registry display casing `{id_str}` disagrees with session `{only}`"
+                );
+            }
+            if let Some(found) = sessions
+                .iter()
+                .find(|s| s.stream.session == id && matches!(s.state, ChildState::Running(_)))
+                .or_else(|| sessions.iter().find(|s| s.stream.session == id))
+            {
+                return Ok(found);
+            }
+            let id_str = id.as_str();
+            bail!("no fl-host session matching `{target}` (expected `{id_str}`)");
+        } else if let [only] = case_matched_ids.as_slice() {
+            if direct_exists {
+                let did = direct_id.as_ref().unwrap().as_str();
+                if *only != did {
+                    bail!(
+                        "ambiguous fl-host session target `{target}`: matches both `{did}` and `{only}`"
+                    );
+                }
+            }
+            if let Some(found) = sessions
+                .iter()
+                .find(|s| {
+                    s.stream.session.as_str() == *only && matches!(s.state, ChildState::Running(_))
+                })
+                .or_else(|| sessions.iter().find(|s| s.stream.session.as_str() == *only))
+            {
+                return Ok(found);
+            }
+        }
+    }
+
+    let live_ids = matching_live_host_sessions(sessions, trimmed);
+    if live_ids.len() > 1 {
+        let mut names: Vec<&str> = live_ids
+            .iter()
+            .map(fl_host_proto::SessionId::as_str)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() > 1 {
+            bail!(
+                "ambiguous fl-host session target `{target}`: matches multiple live sessions ({})",
+                names.join(", ")
+            );
+        }
+    }
     if let Some(id) = live_ids.first()
         && let Some(found) = sessions
             .iter()
@@ -123,18 +230,59 @@ fn resolve_target_session<'a>(
     {
         return Ok(found);
     }
-    if let Some(id) = unit_to_host_session_id(target)
+    if let Some(id) = unit_to_host_session_id(trimmed)
         && let Some(found) = sessions.iter().find(|s| s.stream.session == id)
     {
         return Ok(found);
     }
     sessions
         .iter()
-        .find(|s| s.stream.session.as_str() == target)
+        .find(|s| s.stream.session.as_str() == trimmed)
         .ok_or_else(|| anyhow::anyhow!("no fl-host session matching `{target}`"))
 }
 
-pub fn execute(cmd: HostCmd) -> Result<()> {
+fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> {
+    let store_path = match crate::explicit_db(db.map(Path::to_path_buf)) {
+        Some(p) => Some(p),
+        None => {
+            let default = crate::default_state_store_path().ok();
+            match crate::config::load(crate::config::path().as_deref()) {
+                Ok(cfg) => match default {
+                    Some(d) => Some(cfg.workspace_state_store(&d)),
+                    None => cfg.state.as_ref().and_then(|s| s.store.clone()),
+                },
+                Err(_) => default,
+            }
+        }
+    };
+    let Some(path) = store_path else {
+        return Ok(Vec::new());
+    };
+    if !fl_store::store_exists(&path) {
+        return Ok(Vec::new());
+    }
+    let store = fl_store::open_store(&path)
+        .with_context(|| format!("could not open the store at {}", path.display()))?;
+    use fl_core::AgentRegistry;
+    store
+        .list_agents(None, true)
+        .with_context(|| format!("could not list agents from {}", path.display()))
+}
+
+fn resolve_target_session_from_store<'a>(
+    sessions: &'a [SessionSummary],
+    target: &str,
+    db: Option<&Path>,
+) -> Result<&'a SessionSummary> {
+    let agents = if split_lifecycle_session_id(target).is_some_and(|(vendor, _)| vendor != "muse") {
+        load_registry_agents(db)?
+    } else {
+        Vec::new()
+    };
+    resolve_target_session_with_agents(sessions, target, &agents)
+}
+
+pub fn execute_with_db(cmd: HostCmd, db: Option<&Path>) -> Result<()> {
     match cmd {
         HostCmd::Serve { socket } => {
             let endpoint = match socket {
@@ -166,6 +314,9 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
             let build = client
                 .host_status()
                 .context("failed to query fl-host build identity")?;
+            let retention = client
+                .pty_retention_status()
+                .context("failed to query fl-host PTY retention")?;
             let (active, total) = if client.negotiated().1 == 0 {
                 // host_status sends no request at minor zero, so this remains the
                 // first request. These hosts cannot decode ListSessions either.
@@ -205,11 +356,31 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     "total_sessions": total,
                     "build_identity": if build.is_some() { "available" } else { "unavailable" },
                     "build": build,
+                    "pty_retention_diagnostics": if retention.is_some() { "available" } else { "unavailable" },
+                    "pty_retention": retention,
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 println!("fl-host: {}", endpoint.socket_path().display());
                 println!("sessions: {active} active / {total} total");
+                match &retention {
+                    Some(status) => {
+                        println!(
+                            "projection reservation: {} / {} bytes (accounting allowance, not RSS)",
+                            status.projection_reserved_bytes, status.projection_limit_bytes
+                        );
+                        println!(
+                            "completed PTYs: {} / {}; evicted: {}",
+                            status.completed_pty_sessions,
+                            status.completed_pty_limit,
+                            status.evicted_total
+                        );
+                        for stream in &status.recent_evictions {
+                            println!("evicted PTY: {}", serde_json::to_string(stream)?);
+                        }
+                    }
+                    None => println!("PTY retention diagnostics: unavailable (older daemon)"),
+                }
                 match build {
                     Some(build) => {
                         println!("build: {} ({})", build.version, build.commit);
@@ -298,7 +469,7 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     .list_sessions()
                     .context("failed to list fl-host sessions")?,
             );
-            let summary = resolve_target_session(&sessions, &session)?;
+            let summary = resolve_target_session_from_store(&sessions, &session, db)?;
             if rendered {
                 let screen = client
                     .capture_rendered(summary.stream.clone())
@@ -335,7 +506,7 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     .list_sessions()
                     .context("failed to list fl-host sessions")?,
             );
-            let summary = resolve_target_session(&sessions, &session)?;
+            let summary = resolve_target_session_from_store(&sessions, &session, db)?;
             let stream = summary.stream.clone();
             let grant = client
                 .claim_controller(stream.clone())
@@ -380,7 +551,7 @@ pub fn execute(cmd: HostCmd) -> Result<()> {
                     .list_sessions()
                     .context("failed to list fl-host sessions")?,
             );
-            let summary = resolve_target_session(&sessions, &session)?;
+            let summary = resolve_target_session_from_store(&sessions, &session, db)?;
             let stream = summary.stream.clone();
             let grant = client
                 .claim_controller(stream.clone())
@@ -509,5 +680,133 @@ mod tests {
         assert_eq!(deduped_rev.len(), 1);
         assert_eq!(deduped_rev[0].stream.epoch, SessionEpoch(2));
         assert!(matches!(deduped_rev[0].state, ChildState::Running(_)));
+    }
+
+    #[test]
+    fn resolves_lifecycle_vendor_persona_id_via_registry_display_casing_and_refuses_ambiguity() {
+        use fl_core::{AgentId, AgentRecord, AgentRole, AgentStatus, At, Iri};
+
+        let make_agent = |id: u64, name_key: &str, display_name: &str| AgentRecord {
+            id: AgentId(Iri::parse(&format!("urn:test:agent:{id}")).unwrap()),
+            name_key: name_key.to_string(),
+            display_name: display_name.to_string(),
+            email: format!("{name_key}@artificialhumanity.io"),
+            project: "kaggle-gemma4".to_string(),
+            role: AgentRole::Journalist,
+            extra_areas: Vec::new(),
+            status: AgentStatus::Active,
+            updated_at: At::from_unix_millis(1),
+            by: "owner".to_string(),
+        };
+
+        let agents = vec![
+            make_agent(1, "kage", "Kage"),
+            make_agent(2, "jarvis", "JARVIS"),
+        ];
+        let sessions = vec![
+            make_summary("Kage.codex", 201),
+            make_summary("JARVIS.claude", 202),
+            make_summary("muse.eve", 203),
+        ];
+
+        let kage = resolve_target_session_with_agents(&sessions, "codex:kage", &agents).unwrap();
+        assert_eq!(kage.stream.session.as_str(), "Kage.codex");
+        let kage_mixed =
+            resolve_target_session_with_agents(&sessions, "CODEX:Kage", &agents).unwrap();
+        assert_eq!(kage_mixed.stream.session.as_str(), "Kage.codex");
+
+        let jarvis =
+            resolve_target_session_with_agents(&sessions, "claude:jarvis", &agents).unwrap();
+        assert_eq!(jarvis.stream.session.as_str(), "JARVIS.claude");
+
+        let muse = resolve_target_session_with_agents(&sessions, "muse:eve", &agents).unwrap();
+        assert_eq!(muse.stream.session.as_str(), "muse.eve");
+        let muse_mixed = resolve_target_session_with_agents(&sessions, "Muse:Eve", &[]).unwrap();
+        assert_eq!(muse_mixed.stream.session.as_str(), "muse.eve");
+
+        // Unregistered persona with a single unambiguous matching session resolves via fallback.
+        let kage_unregistered =
+            resolve_target_session_with_agents(&sessions, "codex:kage", &[]).unwrap();
+        assert_eq!(kage_unregistered.stream.session.as_str(), "Kage.codex");
+        let kage_upper_unregistered =
+            resolve_target_session_with_agents(&sessions, "codex:Kage", &[]).unwrap();
+        assert_eq!(
+            kage_upper_unregistered.stream.session.as_str(),
+            "Kage.codex"
+        );
+
+        // Unregistered persona with no matching session errors.
+        let err = resolve_target_session_with_agents(&sessions, "codex:nobody", &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no fl-host session matching `codex:nobody`"),
+            "{err}"
+        );
+
+        // Multiple case-colliding host sessions refuse on ambiguity (with or without registry).
+        let colliding_sessions = vec![
+            make_summary("Kage.codex", 201),
+            make_summary("kage.codex", 202),
+        ];
+        let err = resolve_target_session_with_agents(&colliding_sessions, "codex:kage", &agents)
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        let err =
+            resolve_target_session_with_agents(&colliding_sessions, "codex:kage", &[]).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+
+        // Direct `<vendor>.<persona>` alongside `<Persona>.<vendor>` refuses on ambiguity.
+        let direct_and_lifecycle = vec![
+            make_summary("Kage.codex", 201),
+            make_summary("codex.kage", 202),
+        ];
+        let err = resolve_target_session_with_agents(&direct_and_lifecycle, "codex:kage", &agents)
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        let err = resolve_target_session_with_agents(&direct_and_lifecycle, "codex:kage", &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+
+        // Session casing disagreeing with registry display casing refuses on ambiguity.
+        let wrong_case = vec![make_summary("Jarvis.claude", 201)];
+        let err =
+            resolve_target_session_with_agents(&wrong_case, "claude:jarvis", &agents).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+
+        // Bare persona matching multiple live vendor sessions refuses on ambiguity.
+        let multi_live = vec![
+            make_summary("Kage.codex", 201),
+            make_summary("Kage.claude", 202),
+        ];
+        let err = resolve_target_session_with_agents(&multi_live, "Kage", &agents).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn resolve_target_session_from_store_reads_agent_registry() {
+        use fl_core::{AgentRegistry, AgentRole, At, RegisterAgentArgs};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("fl.fls");
+        let store = fl_store::open_store(&db_path).unwrap();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Kage".to_string(),
+                email: None,
+                project: "kaggle-gemma4".to_string(),
+                role: AgentRole::Journalist,
+                extra_areas: Vec::new(),
+                create_area: true,
+                replace: false,
+                at: At::from_unix_millis(100),
+                by: "owner".to_string(),
+            })
+            .unwrap();
+        drop(store);
+
+        let sessions = vec![make_summary("Kage.codex", 301)];
+        let resolved =
+            resolve_target_session_from_store(&sessions, "codex:kage", Some(&db_path)).unwrap();
+        assert_eq!(resolved.stream.session.as_str(), "Kage.codex");
     }
 }

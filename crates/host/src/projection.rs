@@ -52,6 +52,11 @@ fn storage_bound(rows: u16, cols: u16, scrollback: u16) -> usize {
         + 4096
 }
 
+pub(crate) fn default_storage_bound() -> usize {
+    let opts = PtyOptions::default();
+    storage_bound(opts.rows, opts.cols, opts.scrollback_rows)
+}
+
 impl Projection {
     #[cfg_attr(not(any(unix, test)), expect(dead_code, reason = "Unix PTY backend"))]
     pub(crate) fn new(
@@ -252,6 +257,28 @@ mod tests {
         Projection::new(SliceBudget::new(), PtyOptions::default()).unwrap()
     }
     #[test]
+    fn default_projection_capacity_admits_all_sessions_and_releases_charges() {
+        let root = SliceBudget::new();
+        let baseline = root.used(ChargeKind::Projection);
+        let mut projections = Vec::new();
+        for index in 0..fl_host_proto::DEFAULT_MAX_SESSIONS {
+            let epoch = SliceBudget::epoch(&root).unwrap();
+            let projection = Projection::new(epoch, PtyOptions::default())
+                .unwrap_or_else(|error| panic!("default projection {index}: {error:?}"));
+            projections.push(projection);
+        }
+        let epoch = SliceBudget::epoch(&root).unwrap();
+        assert!(matches!(
+            Projection::new(Arc::clone(&epoch), PtyOptions::default()),
+            Err(ExtensionRefusal::ResourceLimit)
+        ));
+        projections.pop();
+        projections.push(Projection::new(epoch, PtyOptions::default()).unwrap());
+        drop(projections);
+        assert_eq!(root.used(ChargeKind::Projection), baseline);
+    }
+
+    #[test]
     fn split_csi_utf8_and_alternate_screen_restore() {
         let mut p = projection();
         for chunk in [
@@ -420,7 +447,7 @@ mod tests {
     }
     #[test]
     fn geometry_scrollback_budget_and_snapshot_admission_release() {
-        let budget = SliceBudget::new();
+        let budget = SliceBudget::epoch(&SliceBudget::new()).unwrap();
         for opts in [
             PtyOptions {
                 rows: 0,
@@ -463,7 +490,7 @@ mod tests {
     }
     #[test]
     fn failed_resize_is_atomic_and_shrink_retains_high_water_charge() {
-        let budget = SliceBudget::new();
+        let budget = SliceBudget::epoch(&SliceBudget::new()).unwrap();
         let mut p = Projection::new(Arc::clone(&budget), PtyOptions::default()).unwrap();
         p.process(b"abc");
         let charged = budget.used(ChargeKind::Projection);

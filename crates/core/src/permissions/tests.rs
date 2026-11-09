@@ -2011,11 +2011,17 @@ fn fixture_muse_profiles_and_network() {
         ),
     );
     assert!(pair(&m, "--permission-profile", "ro"));
-    // Auto does not enable the reviewer.
+    // Auto defaults to vendor-reviewer (approval judge on, Exact) and supports ask-human (off, StricterDowngrade).
     let m = ok(Vendor::Muse, &pol(Posture::Auto, &[]));
-    assert!(pair(&m, "--approval-judge", "off"));
+    assert!(pair(&m, "--approval-judge", "on"));
+    assert_eq!(line_for(&m, "posture").class, ReceiptClass::Exact);
+    let m_ask = ok(
+        Vendor::Muse,
+        &pol(Posture::Auto, &[]).with_auto_approval(AutoApproval::AskHuman),
+    );
+    assert!(pair(&m_ask, "--approval-judge", "off"));
     assert_eq!(
-        line_for(&m, "posture").class,
+        line_for(&m_ask, "posture").class,
         ReceiptClass::StricterDowngrade
     );
     // No profile in the facts: the plan says the vendor default governs.
@@ -3806,11 +3812,7 @@ fn compile_posture_compiles_axes_only_and_refuses_unenforceable_launch_postures(
             Posture::AcceptEdits,
             vec!["-a", "on-request", "-s", "workspace-write"],
         ),
-        (
-            Vendor::Codex,
-            Posture::Auto,
-            vec!["-a", "on-request", "-s", "workspace-write"],
-        ),
+        (Vendor::Codex, Posture::Auto, vec!["--approve-for-me"]),
         (
             Vendor::Codex,
             Posture::Plan,
@@ -3834,7 +3836,7 @@ fn compile_posture_compiles_axes_only_and_refuses_unenforceable_launch_postures(
         (
             Vendor::Muse,
             Posture::Auto,
-            vec!["--approval-mode", "on-request", "--approval-judge", "off"],
+            vec!["--approval-mode", "on-request", "--approval-judge", "on"],
         ),
         (Vendor::Muse, Posture::Bypass, vec!["--disable-approval"]),
         (
@@ -3875,7 +3877,8 @@ fn compile_posture_compiles_axes_only_and_refuses_unenforceable_launch_postures(
             vec!["--dangerously-skip-permissions"],
         ),
     ] {
-        let plan = compile_posture(vendor, &pty, posture).expect("supported launch posture");
+        let plan = compile_posture(vendor, &pty, posture, vendor.default_auto_approval())
+            .expect("supported launch posture");
         assert_eq!(plan.launch_args, want_args, "{vendor:?} {posture:?}");
         assert!(plan.config_files.is_empty(), "{vendor:?} {posture:?}");
         assert!(!plan.receipts.is_empty(), "{vendor:?} {posture:?}");
@@ -3888,10 +3891,138 @@ fn compile_posture_compiles_axes_only_and_refuses_unenforceable_launch_postures(
     ] {
         assert!(
             matches!(
-                compile_posture(vendor, &pty, posture),
+                compile_posture(vendor, &pty, posture, vendor.default_auto_approval()),
                 Err(CompileRefusal::PostureNotEnforceable { .. })
             ),
             "{vendor:?} {posture:?} must be refused"
         );
     }
+
+    // Per-vendor auto_approval capability truth, receipts, and Codex clap conflicts_with guard.
+    assert_eq!(
+        Vendor::Codex.supported_auto_approvals(),
+        &[AutoApproval::VendorReviewer, AutoApproval::AskHuman]
+    );
+    assert_eq!(
+        Vendor::Muse.supported_auto_approvals(),
+        &[AutoApproval::VendorReviewer, AutoApproval::AskHuman]
+    );
+    assert_eq!(
+        Vendor::Codex.default_auto_approval(),
+        AutoApproval::VendorReviewer
+    );
+    assert_eq!(
+        Vendor::Muse.default_auto_approval(),
+        AutoApproval::VendorReviewer
+    );
+    assert!(Vendor::Codex.is_auto_approval_configurable());
+    assert!(Vendor::Muse.is_auto_approval_configurable());
+
+    for native_vendor in [Vendor::Claude, Vendor::Grok, Vendor::Antigravity] {
+        assert_eq!(
+            native_vendor.supported_auto_approvals(),
+            &[AutoApproval::Native]
+        );
+        assert_eq!(native_vendor.default_auto_approval(), AutoApproval::Native);
+        assert!(!native_vendor.is_auto_approval_configurable());
+        for bad in [AutoApproval::VendorReviewer, AutoApproval::AskHuman] {
+            assert!(matches!(
+                compile_posture(native_vendor, &pty, Posture::Auto, bad),
+                Err(CompileRefusal::AutoApprovalNotSupported { .. })
+            ));
+        }
+    }
+
+    for reviewer_vendor in [Vendor::Codex, Vendor::Muse] {
+        assert!(matches!(
+            compile_posture(reviewer_vendor, &pty, Posture::Auto, AutoApproval::Native),
+            Err(CompileRefusal::AutoApprovalNotSupported { .. })
+        ));
+    }
+
+    // Codex vendor-reviewer: emits `--approve-for-me` alone, never `-a` or `-s` (clap conflicts_with),
+    // and records Exact receipts with no StricterDowngrade.
+    let codex_reviewer = compile_posture(
+        Vendor::Codex,
+        &pty,
+        Posture::Auto,
+        AutoApproval::VendorReviewer,
+    )
+    .unwrap();
+    assert_eq!(codex_reviewer.launch_args, vec!["--approve-for-me"]);
+    for forbidden in ["-a", "--ask-for-approval", "-s", "--sandbox"] {
+        assert!(
+            !codex_reviewer.launch_args.iter().any(|a| a == forbidden),
+            "Codex vendor-reviewer argv must never include {forbidden}: {:?}",
+            codex_reviewer.launch_args
+        );
+    }
+    assert!(
+        codex_reviewer
+            .receipts
+            .iter()
+            .all(|r| r.class == ReceiptClass::Exact),
+        "Codex vendor-reviewer receipts must be Exact: {:?}",
+        codex_reviewer.receipts
+    );
+    assert!(
+        line_for(&codex_reviewer, "posture")
+            .requested
+            .contains("vendor-reviewer")
+    );
+
+    // Codex ask-human: emits `-a on-request -s workspace-write` and records StricterDowngrade.
+    let codex_human =
+        compile_posture(Vendor::Codex, &pty, Posture::Auto, AutoApproval::AskHuman).unwrap();
+    assert_eq!(
+        codex_human.launch_args,
+        vec!["-a", "on-request", "-s", "workspace-write"]
+    );
+    assert_eq!(
+        line_for(&codex_human, "posture").class,
+        ReceiptClass::StricterDowngrade
+    );
+    assert!(
+        line_for(&codex_human, "posture")
+            .requested
+            .contains("ask-human")
+    );
+
+    // Muse vendor-reviewer vs ask-human.
+    let muse_reviewer = compile_posture(
+        Vendor::Muse,
+        &pty,
+        Posture::Auto,
+        AutoApproval::VendorReviewer,
+    )
+    .unwrap();
+    assert_eq!(
+        muse_reviewer.launch_args,
+        vec!["--approval-mode", "on-request", "--approval-judge", "on"]
+    );
+    assert_eq!(
+        line_for(&muse_reviewer, "posture").class,
+        ReceiptClass::Exact
+    );
+    assert!(
+        line_for(&muse_reviewer, "posture")
+            .requested
+            .contains("vendor-reviewer")
+    );
+
+    let muse_human =
+        compile_posture(Vendor::Muse, &pty, Posture::Auto, AutoApproval::AskHuman).unwrap();
+    assert_eq!(
+        muse_human.launch_args,
+        vec!["--approval-mode", "on-request", "--approval-judge", "off"]
+    );
+    assert_eq!(
+        line_for(&muse_human, "posture").class,
+        ReceiptClass::StricterDowngrade
+    );
+    assert!(
+        line_for(&muse_human, "posture")
+            .requested
+            .contains("ask-human")
+    );
 }

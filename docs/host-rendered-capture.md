@@ -22,6 +22,24 @@ promises. A snapshot is coherent at capture time; later output can change it.
 would be incoherent. Unsupported daemons and platforms refuse rendered capture;
 pipe sessions refuse it as the wrong mode. There is no implicit raw fallback.
 
+Successful cleanup releases the PTY parser and its reservation independently of
+consumer Ack. Rendered capture and resize then refuse with `SessionFenced`.
+Incomplete cleanup keeps the projection. The existing 64 KiB raw tail remains
+available through raw capture; output still draining after cleanup can update it.
+Neither release nor capture advances Ack. After cleanup, EOF and thread retirement,
+spawn/status maintenance retains at most eight completed raw tails and evicts the
+oldest first (also under spawn-slot pressure). Live sessions and incomplete cleanup
+are ineligible. See [retention diagnostics](host-replay-pty.md#completed-pty-retention-and-diagnostics)
+for eviction identity, client errors and `fl host status` output.
+
+The shared projection allowance derives from 64 default sessions times the
+conservative per-session storage bound: approximately 593 MB decimal. Reservations
+update accounting counters; vt100 allocates visible rows and grows scrollback as
+output arrives. The allowance covers high-water geometry, alternate screens,
+geometric allocation growth and resize coexistence. It is neither an eager
+allocation nor a promised process RSS bound. Non-default geometry and scrollback
+can exhaust this finite allowance before all session slots are occupied.
+
 PTY geometry defaults to 40 rows by 120 columns. The host clients' capability-gated
 `resize_session` methods require the current stream identity and controller lease.
 On Unix the host applies the kernel PTY resize and parser resize in the same

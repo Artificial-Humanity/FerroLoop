@@ -4,10 +4,12 @@ import {
   DEFAULT_SLASH_COMMANDS,
   codexSendNowReceipt,
   isPromptDeliveryFailure,
+  normalizeHydrationStatus,
   promptDeliveryStatus,
   type ClearSessionMode,
   type DecommissionMode,
   type HubAuthority,
+  type HydrationStatus,
   type DecommissionSessionResponse,
   type InterruptSessionResponse,
   type PromptAttachment,
@@ -1081,6 +1083,10 @@ export interface ChatPaneProps {
   availableModels?: string[] | null;
   /** Effective execution mode reported for the session (`auto`, `yolo`, `plan`, `default`, `accept-edits`, or a vendor value). */
   executionMode?: string | null;
+  /** Hydration acceptance status for hosted/spun-up/remodeled sessions (`confirmed` | `unconfirmed` | `failed`). */
+  hydrationStatus?: HydrationStatus | null;
+  /** Whether the startup/remodel hydration prompt was handed to the vendor adapter. */
+  hydrationDispatched?: boolean;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
@@ -1168,6 +1174,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   thinkingLevel = null,
   availableModels = null,
   executionMode,
+  hydrationStatus,
+  hydrationDispatched,
   sessionId,
   turns,
   contextUsage = null,
@@ -2808,6 +2816,63 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               {effectiveQuotaUsage.exhausted_reason?.trim() || "Quota exhausted"}
             </button>
           )}
+          {(hydrationStatus !== undefined && hydrationStatus !== null) ||
+          hydrationDispatched !== undefined ? (
+            (() => {
+              const effectiveHydrationStatus =
+                normalizeHydrationStatus(hydrationStatus);
+              const isFailed = effectiveHydrationStatus === "failed";
+              const isConfirmed = effectiveHydrationStatus === "confirmed";
+              const titleText = isFailed
+                ? "Hydration failed (no route or launch died before hydration)"
+                : isConfirmed
+                  ? "Hydration confirmed by session"
+                  : hydrationDispatched
+                    ? "Hydration prompt dispatched (unconfirmed acceptance — normal for fresh launches)"
+                    : "Hydration unconfirmed";
+              return (
+                <span
+                  role={isFailed ? "status" : undefined}
+                  data-testid="session-hydration-status-badge"
+                  data-hydration-status={effectiveHydrationStatus}
+                  data-hydration-dispatched={
+                    hydrationDispatched !== undefined
+                      ? String(Boolean(hydrationDispatched))
+                      : undefined
+                  }
+                  className="fd-badge fd-mono"
+                  title={titleText}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    padding: "2px 8px",
+                    whiteSpace: "nowrap",
+                    flexShrink: 0,
+                    fontSize: "10px",
+                    borderColor: isFailed
+                      ? "rgba(245, 158, 11, 0.5)"
+                      : isConfirmed
+                        ? "rgba(16, 185, 129, 0.5)"
+                        : "var(--border-subtle)",
+                    backgroundColor: isFailed
+                      ? "rgba(245, 158, 11, 0.14)"
+                      : isConfirmed
+                        ? "rgba(16, 185, 129, 0.14)"
+                        : "var(--bg-surface)",
+                    color: isFailed
+                      ? "#FBBF24"
+                      : isConfirmed
+                        ? "#34D399"
+                        : "var(--text-secondary)",
+                    fontWeight: isFailed ? 600 : 500,
+                  }}
+                >
+                  Hydration: {effectiveHydrationStatus}
+                </span>
+              );
+            })()
+          ) : null}
           {compactFeedback && (
             <span
               role="status"

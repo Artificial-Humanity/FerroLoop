@@ -5,9 +5,12 @@ import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_WATCH_BALANCE_POLICY,
   DEFAULT_WATCH_THRESHOLDS,
+  normalizeHydrationStatus,
   type AgentRecord,
   type DiscoveredSessionSummary,
+  type HostedSessionSummary,
   type HubAuthority,
+  type HydrationStatus,
   type PermissionPosture,
   type RemodelMode,
   type RemodelSessionResponse,
@@ -708,6 +711,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
   const [remodelMode, setRemodelMode] = useState<RemodelMode>("execute");
   const [remodeling, setRemodeling] = useState<boolean>(false);
   const [remodelStatus, setRemodelStatus] = useState<string | null>(null);
+  const [remodelHydrationStatus, setRemodelHydrationStatus] =
+    useState<HydrationStatus | null>(null);
+  const [remodelHydrationDispatched, setRemodelHydrationDispatched] =
+    useState<boolean | null>(null);
   const [remodelError, setRemodelError] = useState<string | null>(null);
 
   // Subscription Auto-Balance Controls
@@ -727,11 +734,97 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       setLoading(true);
       setError(null);
       try {
-        const [summaryRes, balanceRes] = await Promise.all([
+        const [summaryRes, balanceRes, hostedRes] = await Promise.all([
           apiClient.getWatchSummary(overrides),
           apiClient.getWatchBalance().catch(() => null),
+          apiClient.getHostedSessions?.().catch(() => null) ??
+            Promise.resolve(null),
         ]);
-        setSummary(summaryRes);
+        let nextSummary = summaryRes;
+        if (
+          hostedRes?.sessions &&
+          hostedRes.sessions.length > 0 &&
+          summaryRes?.health?.agents
+        ) {
+          const bySessionId = new Map<string, HostedSessionSummary>();
+          const byPersona = new Map<string, HostedSessionSummary>();
+          const prefersCandidate = (
+            existing: HostedSessionSummary | undefined,
+            candidate: HostedSessionSummary,
+          ): boolean => {
+            if (!existing) return true;
+            const existingRunning =
+              (existing.status ?? "").trim().toLowerCase() === "running";
+            const candidateRunning =
+              (candidate.status ?? "").trim().toLowerCase() === "running";
+            if (candidateRunning !== existingRunning) {
+              return candidateRunning;
+            }
+            return (
+              (candidate.updated_at_ms ?? 0) >= (existing.updated_at_ms ?? 0)
+            );
+          };
+          for (const hs of hostedRes.sessions) {
+            const status = (hs.status ?? "").trim().toLowerCase();
+            if (status === "decommissioned") {
+              continue;
+            }
+            const normalized: HostedSessionSummary = {
+              ...hs,
+              hydration_status: normalizeHydrationStatus(hs.hydration_status),
+            };
+            const sidKey = (hs.session_id ?? "").trim().toLowerCase();
+            if (
+              sidKey &&
+              prefersCandidate(bySessionId.get(sidKey), normalized)
+            ) {
+              bySessionId.set(sidKey, normalized);
+            }
+            const pKey = (hs.persona ?? "").trim().toLowerCase();
+            if (pKey && prefersCandidate(byPersona.get(pKey), normalized)) {
+              byPersona.set(pKey, normalized);
+            }
+          }
+          nextSummary = {
+            ...summaryRes,
+            health: {
+              ...summaryRes.health,
+              agents: summaryRes.health.agents.map((ag) => {
+                if (
+                  !ag.hosted_session ||
+                  ag.hosted_session.hydration_status !== undefined
+                ) {
+                  return ag;
+                }
+                const sidKey = (ag.hosted_session.session_id ?? "")
+                  .trim()
+                  .toLowerCase();
+                const pKey = (ag.hosted_session.persona || ag.agent || "")
+                  .trim()
+                  .toLowerCase();
+                const matched =
+                  (sidKey ? bySessionId.get(sidKey) : undefined) ??
+                  (pKey ? byPersona.get(pKey) : undefined);
+                if (!matched) {
+                  return ag;
+                }
+                return {
+                  ...ag,
+                  hosted_session: {
+                    ...ag.hosted_session,
+                    hydration_status: normalizeHydrationStatus(
+                      matched.hydration_status,
+                    ),
+                    hydration_dispatched:
+                      ag.hosted_session.hydration_dispatched ??
+                      matched.hydration_dispatched,
+                  },
+                };
+              }),
+            },
+          };
+        }
+        setSummary(nextSummary);
         if (balanceRes?.policy) {
           setBalancePolicy(balanceRes.policy);
         }
@@ -1038,6 +1131,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     if (!apiClient || !remodelTarget.trim()) return;
     setRemodeling(true);
     setRemodelStatus(null);
+    setRemodelHydrationStatus(null);
+    setRemodelHydrationDispatched(null);
     setRemodelError(null);
     try {
       const res = await apiClient.remodelSession(remodelTarget.trim(), {
@@ -1046,12 +1141,19 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         posture: remodelPosture,
         mode: remodelMode,
       });
+      const hydrationStatus = normalizeHydrationStatus(res.hydration_status);
+      const normalizedRes: RemodelSessionResponse = {
+        ...res,
+        hydration_status: hydrationStatus,
+      };
+      setRemodelHydrationStatus(hydrationStatus);
+      setRemodelHydrationDispatched(Boolean(res.hydration_dispatched));
       setRemodelStatus(
         res.mode === "prepare"
           ? `Prepared handoff for ${res.persona} → ${res.vendor} (${res.session_id}).`
-          : `Remodeled ${res.persona}: ${res.from_vendor} → ${res.vendor}${res.model ? ` (${res.model})` : ""} [${res.session_id}].`,
+          : `Remodeled ${res.persona}: ${res.from_vendor} → ${res.vendor}${res.model ? ` (${res.model})` : ""} [${res.session_id}] (hydration_status=${hydrationStatus}).`,
       );
-      onAfterRemodel?.(res);
+      onAfterRemodel?.(normalizedRes);
       await loadSummary(appliedOverrides);
     } catch (err) {
       setRemodelError(
@@ -1288,12 +1390,15 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 flexShrink: 0,
               }}
             >
-              <span
-                className="fd-badge"
-                style={{ fontSize: "10px", fontWeight: 600 }}
-              >
-                {summary?.health?.local_host || "ai-lab-0"}
-              </span>
+              {summary?.health?.local_host ? (
+                <span
+                  className="fd-badge"
+                  data-testid="ferrowatch-local-host-badge"
+                  style={{ fontSize: "10px", fontWeight: 600 }}
+                >
+                  {summary.health.local_host}
+                </span>
+              ) : null}
 
               <button
                 type="button"
@@ -2244,13 +2349,61 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   data-testid="watch-remodel-status"
                   style={{
                     fontSize: "11px",
-                    color: "#34D399",
+                    color:
+                      remodelHydrationStatus === "failed"
+                        ? "#FBBF24"
+                        : "#34D399",
                     padding: "6px 8px",
                     borderRadius: "4px",
-                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                    backgroundColor:
+                      remodelHydrationStatus === "failed"
+                        ? "rgba(245, 158, 11, 0.14)"
+                        : "rgba(16, 185, 129, 0.12)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
                   }}
                 >
-                  {remodelStatus}
+                  <span>{remodelStatus}</span>
+                  {remodelHydrationStatus && (
+                    <span
+                      data-testid="watch-remodel-hydration-status"
+                      data-hydration-status={remodelHydrationStatus}
+                      data-hydration-dispatched={
+                        remodelHydrationDispatched !== null
+                          ? String(remodelHydrationDispatched)
+                          : undefined
+                      }
+                      className="fd-mono"
+                      style={{
+                        fontSize: "10px",
+                        padding: "2px 6px",
+                        borderRadius: "999px",
+                        border:
+                          remodelHydrationStatus === "failed"
+                            ? "1px solid rgba(245, 158, 11, 0.5)"
+                            : remodelHydrationStatus === "confirmed"
+                              ? "1px solid rgba(16, 185, 129, 0.5)"
+                              : "1px solid var(--border-subtle)",
+                        color:
+                          remodelHydrationStatus === "failed"
+                            ? "#FBBF24"
+                            : remodelHydrationStatus === "confirmed"
+                              ? "#34D399"
+                              : "var(--text-secondary)",
+                        backgroundColor:
+                          remodelHydrationStatus === "failed"
+                            ? "rgba(245, 158, 11, 0.16)"
+                            : remodelHydrationStatus === "confirmed"
+                              ? "rgba(16, 185, 129, 0.16)"
+                              : "var(--bg-surface)",
+                      }}
+                    >
+                      Hydration: {remodelHydrationStatus}
+                    </span>
+                  )}
                 </div>
               )}
 
@@ -2643,7 +2796,27 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                           Hosted session: {hosted.session_id} · status=
                           {hosted.status}
                           {hosted.model ? ` · model=${hosted.model}` : ""} ·
-                          restarts={hosted.restart_count}
+                          restarts={hosted.restart_count} · hydration=
+                          <span
+                            data-testid={`watch-liveness-hydration-${key}`}
+                            data-hydration-status={normalizeHydrationStatus(
+                              hosted.hydration_status,
+                            )}
+                            style={{
+                              color:
+                                normalizeHydrationStatus(
+                                  hosted.hydration_status,
+                                ) === "failed"
+                                  ? "#FBBF24"
+                                  : normalizeHydrationStatus(
+                                        hosted.hydration_status,
+                                      ) === "confirmed"
+                                    ? "#34D399"
+                                    : "var(--text-secondary)",
+                            }}
+                          >
+                            {normalizeHydrationStatus(hosted.hydration_status)}
+                          </span>
                         </div>
                       )}
                     </div>
