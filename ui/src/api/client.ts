@@ -7,6 +7,8 @@ import {
   type ArtifactListResponse,
   type ArtifactPreviewResponse,
   type ArtifactVersionsResponse,
+  type AutoApproval,
+  type AutoApprovalCapability,
   type OfficePreviewResponse,
   type AuthSessionResponse,
   type BulkSessionAction,
@@ -18,10 +20,13 @@ import {
   type DecommissionSessionResponse,
   type DiscoveredSessionSummary,
   type HealthResponse,
+  type HostedSessionSummary,
   type HubAuthority,
   type HubSettings,
+  type HubSettingsPatch,
   type HubStatsResponse,
   type InterruptSessionResponse,
+  normalizeHydrationStatus,
   type LivenessResponse,
   type OperatorAccount,
   type OperatorRole,
@@ -110,6 +115,12 @@ import {
 import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
 import { getActiveTimeZone, normalizeTimeZone } from "../lib/datetime";
 
+function isAutoApproval(val: unknown): val is AutoApproval {
+  return (
+    val === "vendor-reviewer" || val === "ask-human" || val === "native"
+  );
+}
+
 export function normalizeHubSettings(
   raw: unknown,
   fallback: HubSettings = DEFAULT_HUB_SETTINGS,
@@ -195,6 +206,79 @@ export function normalizeHubSettings(
     project_artifacts_dirs = map;
   }
 
+  const autoCapsRaw =
+    obj.auto_approval_capabilities &&
+    typeof obj.auto_approval_capabilities === "object" &&
+    !Array.isArray(obj.auto_approval_capabilities)
+      ? (obj.auto_approval_capabilities as Record<string, unknown>)
+      : null;
+  let auto_approval_capabilities: Record<string, AutoApprovalCapability> | undefined =
+    fallback.auto_approval_capabilities;
+  if (autoCapsRaw) {
+    const capsMap: Record<string, AutoApprovalCapability> = {};
+    for (const [vendorKey, rawCap] of Object.entries(autoCapsRaw)) {
+      const k = vendorKey.trim().toLowerCase();
+      if (!k || !rawCap || typeof rawCap !== "object" || Array.isArray(rawCap)) {
+        continue;
+      }
+      const capObj = rawCap as Record<string, unknown>;
+      const supported = Array.isArray(capObj.supported)
+        ? capObj.supported.filter(isAutoApproval)
+        : [];
+      const defaultChoice: AutoApproval = isAutoApproval(capObj.default)
+        ? capObj.default
+        : supported[0] ?? "vendor-reviewer";
+      const configurable =
+        typeof capObj.configurable === "boolean"
+          ? capObj.configurable
+          : supported.length > 1;
+      capsMap[k] = {
+        supported,
+        default: defaultChoice,
+        configurable,
+      };
+    }
+    auto_approval_capabilities = capsMap;
+  }
+
+  const autoRaw =
+    obj.auto_approval &&
+    typeof obj.auto_approval === "object" &&
+    !Array.isArray(obj.auto_approval)
+      ? (obj.auto_approval as Record<string, unknown>)
+      : null;
+  let auto_approval: Record<string, AutoApproval> | undefined =
+    fallback.auto_approval;
+  if (autoRaw || auto_approval_capabilities) {
+    const map: Record<string, AutoApproval> = {
+      ...(fallback.auto_approval ?? {}),
+    };
+    if (auto_approval_capabilities) {
+      for (const [k, cap] of Object.entries(auto_approval_capabilities)) {
+        if (!(k in map)) {
+          map[k] = cap.default;
+        }
+      }
+    }
+    if (autoRaw) {
+      for (const [vendorKey, rawChoice] of Object.entries(autoRaw)) {
+        const k = vendorKey.trim().toLowerCase();
+        if (!k) continue;
+        if (isAutoApproval(rawChoice)) {
+          map[k] = rawChoice;
+        } else if (rawChoice === null) {
+          const defaultFromCap = auto_approval_capabilities?.[k]?.default;
+          if (defaultFromCap) {
+            map[k] = defaultFromCap;
+          } else {
+            delete map[k];
+          }
+        }
+      }
+    }
+    auto_approval = map;
+  }
+
   return {
     theme_preference,
     timezone,
@@ -207,6 +291,10 @@ export function normalizeHubSettings(
       : {}),
     ...(project_artifacts_dirs !== undefined
       ? { project_artifacts_dirs }
+      : {}),
+    ...(auto_approval !== undefined ? { auto_approval } : {}),
+    ...(auto_approval_capabilities !== undefined
+      ? { auto_approval_capabilities }
       : {}),
     subsystems: {
       ferrogate_enabled:
@@ -962,6 +1050,23 @@ export class HubApiClient {
     return this.request<{ sessions: DiscoveredSessionSummary[] }>("/api/v1/sessions");
   }
 
+  public async getHostedSessions(): Promise<{ sessions: HostedSessionSummary[] }> {
+    const res = await this.request<{
+      sessions?: HostedSessionSummary[];
+      hosted_sessions?: HostedSessionSummary[];
+    }>("/api/v1/hosted-sessions");
+    const rawList = Array.isArray(res?.sessions)
+      ? res.sessions
+      : Array.isArray(res?.hosted_sessions)
+        ? res.hosted_sessions
+        : [];
+    const sessions = rawList.map((s) => ({
+      ...s,
+      hydration_status: normalizeHydrationStatus(s.hydration_status),
+    }));
+    return { sessions };
+  }
+
   public async getSessionTranscript(sessionId: string): Promise<SessionTranscriptResponse> {
     return this.request<SessionTranscriptResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript`,
@@ -990,10 +1095,17 @@ export class HubApiClient {
   public async spinUpSession(
     req: SpinUpSessionRequest,
   ): Promise<SpinUpSessionResponse> {
-    return this.request<SpinUpSessionResponse>("/api/v1/sessions/spin-up", {
-      method: "POST",
-      body: JSON.stringify(req),
-    });
+    const res = await this.request<SpinUpSessionResponse>(
+      "/api/v1/sessions/spin-up",
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      },
+    );
+    return {
+      ...res,
+      hydration_status: normalizeHydrationStatus(res.hydration_status),
+    };
   }
 
   public async decommissionSession(
@@ -1534,7 +1646,7 @@ export class HubApiClient {
   }
 
   public async updateSettings(
-    patch: Partial<HubSettings>,
+    patch: HubSettingsPatch,
   ): Promise<HubSettings> {
     const mergedFallback = normalizeHubSettings(patch, DEFAULT_HUB_SETTINGS);
     const {
@@ -1543,6 +1655,7 @@ export class HubApiClient {
       default_artifacts_dir: _defaultArtifactsDir,
       effective_artifacts_dir: _effectiveArtifactsDir,
       project_artifacts_dirs: _projectArtifactsDirs,
+      auto_approval_capabilities: _autoApprovalCapabilities,
       ...putPayload
     } = patch;
     void _homeDir;
@@ -1550,6 +1663,7 @@ export class HubApiClient {
     void _defaultArtifactsDir;
     void _effectiveArtifactsDir;
     void _projectArtifactsDirs;
+    void _autoApprovalCapabilities;
     const raw = await this.request<unknown>("/api/v1/settings", {
       method: "PUT",
       body: JSON.stringify(putPayload),
@@ -2228,13 +2342,17 @@ export class HubApiClient {
     if (payload.hosted !== undefined) {
       body.hosted = payload.hosted;
     }
-    return this.request<RemodelSessionResponse>(
+    const res = await this.request<RemodelSessionResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionIdOrPersona)}/remodel`,
       {
         method: "POST",
         body: JSON.stringify(body),
       },
     );
+    return {
+      ...res,
+      hydration_status: normalizeHydrationStatus(res.hydration_status),
+    };
   }
 
   public async remodelAgent(
