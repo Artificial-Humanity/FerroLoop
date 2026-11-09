@@ -109,6 +109,53 @@ struct ResizeControl {
     _metadata: crate::slice_budget::Reservation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlError {
+    StaleEpoch,
+    StaleLease,
+    WrongConnection,
+    Disconnected,
+    WriterStopped,
+    Busy,
+    Timeout,
+    LeaseExhausted,
+    Refusal(fl_host_proto::ExtensionRefusal),
+    Io(String),
+}
+
+impl ControlError {
+    pub(crate) fn into_refusal(self) -> fl_host_proto::ExtensionRefusal {
+        use fl_host_proto::ExtensionRefusal as Refusal;
+        match self {
+            Self::WrongConnection | Self::Disconnected => Refusal::WrongConnection,
+            Self::StaleLease => Refusal::StaleLease,
+            Self::StaleEpoch => Refusal::StaleEpoch,
+            Self::Busy | Self::Timeout => Refusal::Busy,
+            Self::WriterStopped => Refusal::SessionFenced,
+            Self::LeaseExhausted => Refusal::ResourceLimit,
+            Self::Refusal(code) => code,
+            Self::Io(_) => Refusal::Io,
+        }
+    }
+}
+
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleEpoch => f.write_str("stale epoch"),
+            Self::StaleLease => f.write_str("stale lease"),
+            Self::WrongConnection => f.write_str("wrong connection"),
+            Self::Disconnected => f.write_str("disconnected"),
+            Self::WriterStopped => f.write_str("writer stopped"),
+            Self::Busy => f.write_str("busy"),
+            Self::Timeout => f.write_str("timeout"),
+            Self::LeaseExhausted => f.write_str("lease exhausted"),
+            Self::Refusal(code) => code.fmt(f),
+            Self::Io(reason) => f.write_str(reason),
+        }
+    }
+}
+
 enum CtrlKind {
     Resize(ResizeControl),
     Claim,
@@ -122,7 +169,7 @@ struct CtrlJob {
     epoch: u64,
     lease: u64,
     admitted: Instant,
-    reply: oneshot::Sender<Result<u64, String>>,
+    reply: oneshot::Sender<Result<u64, ControlError>>,
 }
 
 struct State {
@@ -196,7 +243,7 @@ impl WriterHandle {
         state.stop = true;
         self.invalidate_queued(&mut state, SendBlock::SessionFenced);
         for job in state.control.drain(..) {
-            let _ = job.reply.send(Err("writer stopped".into()));
+            let _ = job.reply.send(Err(ControlError::WriterStopped));
         }
         state.claim_conns.clear();
         self.cv.notify_all();
@@ -313,7 +360,7 @@ impl WriterHandle {
         &self,
         conn: u64,
         epoch: u64,
-    ) -> Result<oneshot::Receiver<Result<u64, String>>, String> {
+    ) -> Result<oneshot::Receiver<Result<u64, ControlError>>, ControlError> {
         self.enqueue_ctrl(conn, epoch, 0, CtrlKind::Claim, true)
     }
 
@@ -325,7 +372,7 @@ impl WriterHandle {
         geometry: (u16, u16),
         authority: &Arc<crate::authority::AuthorityRegistry>,
         budget: &Arc<crate::slice_budget::SliceBudget>,
-    ) -> Result<oneshot::Receiver<Result<u64, String>>, fl_host_proto::ExtensionRefusal> {
+    ) -> Result<oneshot::Receiver<Result<u64, ControlError>>, fl_host_proto::ExtensionRefusal> {
         use fl_host_proto::ExtensionRefusal as Refusal;
         let (cols, rows) = geometry;
         let (authority_lease, writer_lease) = leases;
@@ -359,7 +406,7 @@ impl WriterHandle {
                 }),
                 false,
             )
-            .map_err(|reason| control_refusal(&reason))?;
+            .map_err(ControlError::into_refusal)?;
         if let Some(dir) = self.barrier.as_ref() {
             let _ = std::fs::write(dir.join(format!("queued-resize-{cols}-{rows}")), b"1");
         }
@@ -372,13 +419,13 @@ impl WriterHandle {
         epoch: u64,
         lease: ControllerLease,
         signal: SignalKind,
-    ) -> Result<oneshot::Receiver<Result<u64, String>>, String> {
+    ) -> Result<oneshot::Receiver<Result<u64, ControlError>>, ControlError> {
         let mut state = self.lock();
         if let Some(reason) = self.classify_signal(&state, conn, epoch, lease.0) {
             return Err(reason);
         }
         if state.control.len() >= CONTROL_LIMIT {
-            return Err("busy".into());
+            return Err(ControlError::Busy);
         }
         let (tx, rx) = oneshot::channel();
         state.control.push_back(CtrlJob {
@@ -398,27 +445,27 @@ impl WriterHandle {
         conn: u64,
         epoch: u64,
         lease: Option<ControllerLease>,
-    ) -> Result<oneshot::Receiver<Result<u64, String>>, String> {
+    ) -> Result<oneshot::Receiver<Result<u64, ControlError>>, ControlError> {
         let mut state = self.lock();
         if epoch != self.session.epoch {
-            return Err("stale epoch".into());
+            return Err(ControlError::StaleEpoch);
         }
         if state.stop || self.completed() {
-            return Err("writer stopped".into());
+            return Err(ControlError::WriterStopped);
         }
         if let Some(lease) = lease {
             if state.fenced {
                 // An administrative lease is optional. A supplied one still has to match.
             }
             if lease.0 != state.lease || state.lease == 0 {
-                return Err("stale lease".into());
+                return Err(ControlError::StaleLease);
             }
             if state.owner != conn {
-                return Err("wrong connection".into());
+                return Err(ControlError::WrongConnection);
             }
         }
         if state.control.len() >= CONTROL_LIMIT {
-            return Err("busy".into());
+            return Err(ControlError::Busy);
         }
         let (tx, rx) = oneshot::channel();
         state.control.push_back(CtrlJob {
@@ -459,7 +506,7 @@ impl WriterHandle {
                 if matches!(job.kind, CtrlKind::Claim) {
                     state.claim_conns.remove(&conn);
                 }
-                let _ = job.reply.send(Err("disconnected".into()));
+                let _ = job.reply.send(Err(ControlError::Disconnected));
             } else {
                 control.push_back(job);
             }
@@ -479,19 +526,19 @@ impl WriterHandle {
         lease: u64,
         kind: CtrlKind,
         claim: bool,
-    ) -> Result<oneshot::Receiver<Result<u64, String>>, String> {
+    ) -> Result<oneshot::Receiver<Result<u64, ControlError>>, ControlError> {
         let mut state = self.lock();
         if epoch != self.session.epoch {
-            return Err("stale epoch".into());
+            return Err(ControlError::StaleEpoch);
         }
         if state.stop || self.completed() {
-            return Err("writer stopped".into());
+            return Err(ControlError::WriterStopped);
         }
         if state.control.len() >= CONTROL_LIMIT {
-            return Err("busy".into());
+            return Err(ControlError::Busy);
         }
         if claim && !state.claim_conns.insert(conn) {
-            return Err("busy".into());
+            return Err(ControlError::Busy);
         }
         let (tx, rx) = oneshot::channel();
         state.control.push_back(CtrlJob {
@@ -549,18 +596,24 @@ impl WriterHandle {
         None
     }
 
-    fn classify_signal(&self, state: &State, conn: u64, epoch: u64, lease: u64) -> Option<String> {
+    fn classify_signal(
+        &self,
+        state: &State,
+        conn: u64,
+        epoch: u64,
+        lease: u64,
+    ) -> Option<ControlError> {
         if epoch != self.session.epoch {
-            return Some("stale epoch".into());
+            return Some(ControlError::StaleEpoch);
         }
         if state.stop || self.completed() {
-            return Some("writer stopped".into());
+            return Some(ControlError::WriterStopped);
         }
         if lease == 0 || lease != state.lease {
-            return Some("stale lease".into());
+            return Some(ControlError::StaleLease);
         }
         if state.owner != conn {
-            return Some("wrong connection".into());
+            return Some(ControlError::WrongConnection);
         }
         None
     }
@@ -608,7 +661,7 @@ impl WriterHandle {
     fn run_ctrl(&self, job: CtrlJob) {
         if let CtrlKind::Resize(ref resize) = job.kind {
             let result = self.run_resize(&job, resize);
-            let _ = job.reply.send(result.map_err(|code| code.to_string()));
+            let _ = job.reply.send(result.map_err(ControlError::Refusal));
             return;
         }
         match job.kind {
@@ -666,12 +719,15 @@ impl WriterHandle {
                 self.session
                     .resize_pty(resize.cols, resize.rows)
                     .map_err(|error| match error {
-                        fl_host_proto::HostError::Unsupported { .. } => Refusal::Unsupported,
-                        fl_host_proto::HostError::Io(_) => Refusal::Io,
-                        fl_host_proto::HostError::Protocol(reason) if reason == "SessionFenced" => {
-                            Refusal::SessionFenced
+                        crate::session::ResizeError::SessionFenced => Refusal::SessionFenced,
+                        crate::session::ResizeError::WrongMode => Refusal::WrongMode,
+                        crate::session::ResizeError::Host(
+                            fl_host_proto::HostError::Unsupported { .. },
+                        ) => Refusal::Unsupported,
+                        crate::session::ResizeError::Host(fl_host_proto::HostError::Io(_)) => {
+                            Refusal::Io
                         }
-                        _ => Refusal::ResourceLimit,
+                        crate::session::ResizeError::Host(_) => Refusal::ResourceLimit,
                     })
             },
         )
@@ -682,12 +738,12 @@ impl WriterHandle {
         let mut state = self.lock();
         if state.stop || state.revoked.contains(&job.conn) {
             state.claim_conns.remove(&job.conn);
-            let _ = job.reply.send(Err("disconnected".into()));
+            let _ = job.reply.send(Err(ControlError::Disconnected));
             return;
         }
         if job.epoch != self.session.epoch {
             state.claim_conns.remove(&job.conn);
-            let _ = job.reply.send(Err("stale epoch".into()));
+            let _ = job.reply.send(Err(ControlError::StaleEpoch));
             return;
         }
         self.invalidate_queued(&mut state, SendBlock::StaleLease);
@@ -695,17 +751,17 @@ impl WriterHandle {
             self.fence_locked(&mut state);
             state.claim_conns.remove(&job.conn);
             state.uncertain = false;
-            let _ = job.reply.send(Err("timeout".into()));
+            let _ = job.reply.send(Err(ControlError::Timeout));
             return;
         }
         let Some(next) = state.lease.checked_add(1).filter(|next| *next != 0) else {
             state.claim_conns.remove(&job.conn);
-            let _ = job.reply.send(Err("lease exhausted".into()));
+            let _ = job.reply.send(Err(ControlError::LeaseExhausted));
             return;
         };
         if Instant::now() >= job.admitted + STDIN_WRITE_TIMEOUT {
             state.claim_conns.remove(&job.conn);
-            let _ = job.reply.send(Err("timeout".into()));
+            let _ = job.reply.send(Err(ControlError::Timeout));
             return;
         }
         state.lease = next;
@@ -718,7 +774,7 @@ impl WriterHandle {
         self.pause_phase("before-signal");
         let state = self.lock();
         if state.stop {
-            let _ = job.reply.send(Err("disconnected".into()));
+            let _ = job.reply.send(Err(ControlError::Disconnected));
             return;
         }
         if let Some(reason) = self.classify_signal(&state, job.conn, job.epoch, job.lease) {
@@ -727,32 +783,34 @@ impl WriterHandle {
         }
         drop(state);
         let result = signal_session(&self.session, signal);
-        let _ = job.reply.send(result.map(|()| 0));
+        let _ = job.reply.send(result.map(|()| 0).map_err(ControlError::Io));
     }
 
     fn run_kill(&self, job: CtrlJob, lease: Option<ControllerLease>) {
         self.pause_phase("before-kill");
         let state = self.lock();
         if job.epoch != self.session.epoch {
-            let _ = job.reply.send(Err("stale epoch".into()));
+            let _ = job.reply.send(Err(ControlError::StaleEpoch));
             return;
         }
         if let Some(lease) = lease
             && (lease.0 != state.lease || state.owner != job.conn || state.lease == 0)
         {
             let reason = if lease.0 != state.lease || state.lease == 0 {
-                "stale lease"
+                ControlError::StaleLease
             } else {
-                "wrong connection"
+                ControlError::WrongConnection
             };
-            let _ = job.reply.send(Err(reason.into()));
+            let _ = job.reply.send(Err(reason));
             return;
         }
         drop(state);
         let result = self.session.request_cleanup();
-        let _ = job
-            .reply
-            .send(result.map(|()| 0).map_err(|err| err.to_string()));
+        let _ = job.reply.send(
+            result
+                .map(|()| 0)
+                .map_err(|err| ControlError::Io(err.to_string())),
+        );
     }
 
     fn send_block(&self, job: &DataJob) -> Option<SendBlock> {
@@ -1043,22 +1101,6 @@ impl WriterHandle {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|err| err.into_inner())
-    }
-}
-
-pub(crate) fn control_refusal(reason: &str) -> fl_host_proto::ExtensionRefusal {
-    use fl_host_proto::ExtensionRefusal as Refusal;
-    match reason {
-        "WrongConnection" | "wrong connection" | "disconnected" => Refusal::WrongConnection,
-        "StaleLease" | "stale lease" => Refusal::StaleLease,
-        "StaleEpoch" | "stale epoch" => Refusal::StaleEpoch,
-        "WrongInstance" => Refusal::WrongInstance,
-        "ResourceLimit" => Refusal::ResourceLimit,
-        "WrongMode" => Refusal::WrongMode,
-        "Unsupported" => Refusal::Unsupported,
-        "Busy" | "busy" | "timeout" => Refusal::Busy,
-        "SessionFenced" | "writer stopped" => Refusal::SessionFenced,
-        _ => Refusal::Io,
     }
 }
 

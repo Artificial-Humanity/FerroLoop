@@ -27,6 +27,7 @@ import {
 import { ThinkingBlock } from "../components/ThinkingBlock";
 import { summarizeWireContent } from "../components/TurnCard";
 import type { TranscriptTurn } from "../types/api";
+import { TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function turn(partial: Partial<TranscriptTurn> & { index: number }): TranscriptTurn {
   return {
@@ -899,6 +900,159 @@ describe("optimistic prompt preservation", () => {
     );
     expect(resolvePromptSentAtMs(undefined, 456)).toBe(456);
     expect(resolvePromptSentAtMs("not-a-timestamp", 789)).toBe(789);
+  });
+
+  it("keeps a repeated short prompt ('yes') sent within 30s visible when sentAtAnchored is true, while retaining the 30s fallback when unanchored", () => {
+    const turnsWithFirstYes: TranscriptTurn[] = [
+      turn({
+        index: 1,
+        role: "user",
+        content: "yes",
+        created_at: new Date(10_000).toISOString(),
+      }),
+      turn({
+        index: 2,
+        role: "assistant",
+        content: "Shall I proceed to step 2?",
+        created_at: new Date(15_000).toISOString(),
+      }),
+    ];
+
+    const secondYesAnchored = {
+      content: "yes",
+      sentAt: 20_000,
+      sentAtAnchored: true,
+      agentKey: "ferris",
+    };
+
+    const preserved = preserveOptimisticTurn(
+      turnsWithFirstYes,
+      secondYesAnchored,
+      21_000,
+      "ferris",
+      undefined,
+      true,
+    );
+    expect(preserved.map((t) => `${t.role}:${t.content}`)).toEqual([
+      "user:yes",
+      "assistant:Shall I proceed to step 2?",
+      "user:yes",
+    ]);
+    expect(
+      pruneOptimisticPrompts(
+        [secondYesAnchored],
+        turnsWithFirstYes,
+        21_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(1);
+
+    // Once the second "yes" lands on disk at or after sentAt - 2_000, it is pruned:
+    const turnsWithSecondYes: TranscriptTurn[] = [
+      ...turnsWithFirstYes,
+      turn({
+        index: 3,
+        role: "user",
+        content: "yes",
+        created_at: new Date(20_100).toISOString(),
+      }),
+    ];
+    expect(
+      preserveOptimisticTurn(
+        turnsWithSecondYes,
+        secondYesAnchored,
+        21_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toBe(turnsWithSecondYes);
+    expect(
+      pruneOptimisticPrompts(
+        [secondYesAnchored],
+        turnsWithSecondYes,
+        21_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+
+    // Without sentAtAnchored (browser-clock fallback), the 30s skew window still matches the 10s-earlier turn:
+    const unanchoredPrompt = {
+      content: "yes",
+      sentAt: 20_000,
+      agentKey: "ferris",
+    };
+    expect(
+      preserveOptimisticTurn(
+        turnsWithFirstYes,
+        unanchoredPrompt,
+        21_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toBe(turnsWithFirstYes);
+    expect(
+      pruneOptimisticPrompts(
+        [unanchoredPrompt],
+        turnsWithFirstYes,
+        21_000,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("matches and prunes a slow-delivery turn under the 2s anchored window when sentAt is anchored to pre-dispatch accepted_at", () => {
+    const preDispatchAcceptedIso = new Date(10_000).toISOString();
+    const diskTurnCreatedIso = new Date(11_000).toISOString();
+    const responseReceivedAtMs = 16_000;
+
+    // Pre-dispatch accepted_at at t = 10_000, disk turn written during delivery at t = 11_000,
+    // and HTTP delivery response arriving at t = 16_000 (5s after the disk turn was written):
+    const anchoredPrompt = {
+      content: "Deploy the hotfix",
+      sentAt: resolvePromptSentAtMs(preDispatchAcceptedIso, responseReceivedAtMs),
+      sentAtAnchored: true,
+      agentKey: "ferris",
+    };
+    expect(anchoredPrompt.sentAt).toBe(10_000);
+
+    const turnsAfterSlowDelivery: TranscriptTurn[] = [
+      ...diskTurns,
+      turn({
+        index: 8,
+        role: "user",
+        content: "Deploy the hotfix",
+        created_at: diskTurnCreatedIso,
+      }),
+    ];
+
+    expect(
+      preserveOptimisticTurn(
+        turnsAfterSlowDelivery,
+        anchoredPrompt,
+        responseReceivedAtMs,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toBe(turnsAfterSlowDelivery);
+    expect(
+      pruneOptimisticPrompts(
+        [anchoredPrompt],
+        turnsAfterSlowDelivery,
+        responseReceivedAtMs,
+        "ferris",
+        undefined,
+        true,
+      ),
+    ).toHaveLength(0);
   });
 
   it("polls faster while the session is busy", () => {
@@ -1786,6 +1940,7 @@ describe("App transcript observation ownership", () => {
       const url = String(input);
       if (url.includes("/auth/session")) return response({ authenticated: true, authority: { tier: "owner", login: "owner" } });
       if (url.includes("/transcript")) return read(url);
+      if (url.endsWith("/agents")) return response({ agents: TEST_WORKSPACE_AGENTS, routes: [] });
       if (url.endsWith("/sessions")) return response({ sessions });
       return response({});
     });
@@ -2589,6 +2744,80 @@ describe("App transcript observation ownership", () => {
     expect(screen.getByTestId("context-ring-ferris")).toHaveAttribute("data-percent", "50");
     expect(screen.queryByText("Obsolete event predecessor")).toBeNull();
     expect(screen.getByText("Event owner history")).toBeInTheDocument();
+    h.unmount();
+  });
+
+  it("anchors optimistic prompts to the tight 2s skew window when accepted_at is returned by sendSessionPrompt or prompt_sent", async () => {
+    const baseMs = Date.now() - 15_000;
+    const firstYesIso = new Date(baseMs).toISOString();
+    const secondYesAcceptedIso = new Date(baseMs + 10_000).toISOString();
+    const h = harness(async () =>
+      response({
+        session_id: "session-a",
+        turns: [
+          turn({ index: 0, role: "user", content: "yes", created_at: firstYesIso }),
+          turn({ index: 1, role: "assistant", content: "Proceed with step 2?", created_at: new Date(baseMs + 5_000).toISOString() }),
+        ],
+        queue: [],
+        is_busy: true,
+      }),
+    );
+    await screen.findByText("Proceed with step 2?");
+
+    vi.spyOn(h.api, "sendSessionPrompt").mockResolvedValue({
+      session_id: "session-a",
+      delivered: true,
+      queued: false,
+      effective_body: "yes",
+      accepted_at: secondYesAcceptedIso,
+      is_busy: true,
+    } as never);
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "yes" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
+
+    await waitFor(() => {
+      expect(within(screen.getByTestId("turn-card-2")).getByText("yes")).toBeInTheDocument();
+    });
+
+    // Trigger another transcript refresh before the second "yes" flushes to disk:
+    // because accepted_at anchored the prompt to a 2s window, the 10s-earlier on-disk "yes" does not prune it.
+    h.refresh();
+    await waitFor(() => {
+      expect(within(screen.getByTestId("turn-card-2")).getByText("yes")).toBeInTheDocument();
+    });
+
+    // Once the second "yes" lands on disk during delivery (created_at at baseMs + 11_000, 1s after
+    // pre-dispatch accepted_at at baseMs + 10_000, even if delivery finished 5s later at baseMs + 16_000),
+    // it matches and prunes the second optimistic "yes" without duplication; a third "yes" arriving at
+    // baseMs + 20_000 via prompt_sent with accepted_at stays visible as turn-card-4:
+    const secondYesDiskCreatedIso = new Date(baseMs + 11_000).toISOString();
+    const thirdYesAcceptedIso = new Date(baseMs + 20_000).toISOString();
+    h.setRead(async () =>
+      response({
+        session_id: "session-a",
+        turns: [
+          turn({ index: 0, role: "user", content: "yes", created_at: firstYesIso }),
+          turn({ index: 1, role: "assistant", content: "Proceed with step 2?", created_at: new Date(baseMs + 5_000).toISOString() }),
+          turn({ index: 2, role: "user", content: "yes", created_at: secondYesDiskCreatedIso }),
+          turn({ index: 3, role: "assistant", content: "Proceed with step 3?", created_at: new Date(baseMs + 16_000).toISOString() }),
+        ],
+        queue: [],
+        is_busy: true,
+      }),
+    );
+    h.refresh({
+      session_id: "session-a",
+      persona: "ferris",
+      effective_body: "yes",
+      delivered: true,
+      accepted_at: thirdYesAcceptedIso,
+    });
+    await waitFor(() => {
+      expect(within(screen.getByTestId("turn-card-3")).getByText("Proceed with step 3?")).toBeInTheDocument();
+      expect(within(screen.getByTestId("turn-card-4")).getByText("yes")).toBeInTheDocument();
+      expect(screen.queryByTestId("turn-card-5")).toBeNull();
+    });
     h.unmount();
   });
 

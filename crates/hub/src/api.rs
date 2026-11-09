@@ -5963,6 +5963,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
             && let Some((item, claim)) =
                 state.claim_queued_for_dispatch(&canonical_id, &session_id, &prompt_id, true)
         {
+            let accepted_at = stamp::now().to_string();
             let delivery_res = dispatch_operator_prompt_for_session_typed(
                 state,
                 item.persona.as_deref(),
@@ -5999,7 +6000,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
                     "queued": delivery_res.is_err(),
                     "is_busy": true,
-                    "accepted_at": stamp::now().to_string(),
+                    "accepted_at": accepted_at,
                     "prompt_id": item.id,
                     "prompt": item.prompt,
                     "effective_body": item.effective_body,
@@ -6059,6 +6060,7 @@ fn handle_post_queued_prompt_send_now(
     } else {
         canonical_id.as_str()
     };
+    let accepted_at = stamp::now().to_string();
     let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
         state,
         item.persona.as_deref().or(target_persona.as_deref()),
@@ -6114,7 +6116,7 @@ fn handle_post_queued_prompt_send_now(
             "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
             "queued": delivery_res.is_err(),
             "is_busy": true,
-            "accepted_at": stamp::now().to_string(),
+            "accepted_at": accepted_at,
             "prompt_id": prompt_id,
             "prompt": item.prompt,
             "effective_body": item.effective_body,
@@ -6496,6 +6498,7 @@ fn handle_post_session_prompt(
         }
     };
 
+    let accepted_at = stamp::now().to_string();
     let delivery_res = dispatch_operator_prompt_with_intent_for_session(
         state,
         target_persona.as_deref(),
@@ -6537,7 +6540,7 @@ fn handle_post_session_prompt(
             "status": if matches!(delivery_res, Err(OperatorPromptError::Steer(_))) { "delivery_failed" } else { "sent" },
             "queued": false,
             "is_busy": true,
-            "accepted_at": stamp::now().to_string(),
+            "accepted_at": accepted_at,
             "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_session_id),
             "prompt": prompt_text,
             "effective_body": effective_body,
@@ -6898,6 +6901,22 @@ fn handle_post_session_model(
         (None, None, Some(record)) => record.vendor.clone(),
         (None, None, None) => "unknown".to_string(),
     };
+
+    if vendor == "antigravity" && thinking_level.is_none() {
+        let normalized_model = model.trim().to_ascii_lowercase();
+        let has_effort_suffix =
+            fl_wire::vendor_adapter::split_agy_thinking_suffix(&normalized_model)
+                .1
+                .is_some();
+        let has_fixed_effort = lifecycle::agy_cli_model_id(&model, Some("low"))
+            == lifecycle::agy_cli_model_id(&model, Some("high"));
+        if !has_effort_suffix && !has_fixed_effort {
+            return HttpResponse::json(
+                400,
+                json!({ "error": "choose a thinking level for this Antigravity model" }),
+            );
+        }
+    }
 
     // Key the override by the discovered session id. A session discovery does not list (a
     // route or hosted record only) has no id a summary could match, so it is keyed by its

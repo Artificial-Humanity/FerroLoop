@@ -832,12 +832,22 @@ fn replacement_session_cannot_overtake_fenced_queue_via_persona_alias() {
         crate::discovery::scan_and_save_route_table(Some(tmp.path()));
         let calls = tmp.path().join(".local/bin/agy.calls");
         assert_eq!(fs::read_to_string(&calls).unwrap(), "conv-ferris-1\n");
+        let mut refused_events = state.subscribe();
         let (third, _) = post_prompt(&state, send_now);
         assert_eq!(third.status, 409);
-        let error = third.json_value().unwrap()["error"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let refused = third.json_value().unwrap();
+        assert!(
+            refused.get("accepted_at").is_none(),
+            "a fenced alias must be refused before acceptance is recorded"
+        );
+        assert!(
+            matches!(
+                refused_events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a fenced alias must not broadcast acceptance or queue changes"
+        );
+        let error = refused["error"].as_str().unwrap().to_owned();
         assert!(error.contains("fenced queued prompts on conv-ferris-1"));
         assert!(error.contains("resolve or discard"));
         assert_eq!(fs::read_to_string(&calls).unwrap(), "conv-ferris-1\n");
@@ -1286,6 +1296,119 @@ fn removed_queued_dispatch_transcript_keeps_following_prompt_fenced() {
     write_ferris_transcript(tmp.path(), 4);
     crate::api::drain_ready_session_queues(&state);
     assert!(state.session_queue("conv-ferris-1").is_empty());
+}
+
+#[test]
+fn accepted_at_is_captured_before_dispatch_across_direct_send_now_and_auto_drain() {
+    use fl_core::at::At;
+    use fl_exec::stamp;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let mut rx = state.subscribe();
+
+    let next_prompt_sent = |rx: &mut tokio::sync::broadcast::Receiver<crate::HubWsFrame>| loop {
+        let frame = rx.try_recv().expect("expected prompt_sent frame");
+        if frame.channel == "session" && frame.event == "prompt_sent" {
+            return frame.data;
+        }
+    };
+
+    // 1. Direct prompt via POST /api/v1/sessions/ferris/prompt
+    let turn_created_direct = Arc::new(Mutex::new(None));
+    let turn_created_for_hook = turn_created_direct.clone();
+    crate::api::after_next_prompt_dispatch(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        *turn_created_for_hook.lock().unwrap() = Some(stamp::now());
+        std::thread::sleep(Duration::from_millis(5));
+    });
+    let (direct_resp, _) = post_prompt(&state, false);
+    let direct_received_at = stamp::now();
+    assert_eq!(direct_resp.status, 200);
+    let direct_body = direct_resp.json_value().unwrap();
+    let direct_broadcast = next_prompt_sent(&mut rx);
+    let direct_accepted = At::parse(direct_body["accepted_at"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        direct_body["accepted_at"], direct_broadcast["accepted_at"],
+        "HTTP response and prompt_sent broadcast must share pre-dispatch accepted_at"
+    );
+    let direct_turn_created = turn_created_direct.lock().unwrap().take().unwrap();
+    assert!(
+        direct_accepted < direct_turn_created && direct_turn_created < direct_received_at,
+        "expected accepted_at ({direct_accepted}) < turn.created_at ({direct_turn_created}) < response_received_at ({direct_received_at})"
+    );
+
+    // 2. Queued prompt dispatched via POST /api/v1/sessions/ferris/queue/:prompt_id/send-now
+    let (queued_item_1, _) = state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "send-now queued".into(),
+        "send-now queued".into(),
+        "owner".into(),
+        vec![],
+    );
+    let turn_created_send_now = Arc::new(Mutex::new(None));
+    let turn_created_for_hook = turn_created_send_now.clone();
+    crate::api::after_next_prompt_dispatch(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        *turn_created_for_hook.lock().unwrap() = Some(stamp::now());
+        std::thread::sleep(Duration::from_millis(5));
+    });
+    let send_now_resp = handle_http_request(
+        &state,
+        &HttpRequest::new(
+            "POST",
+            format!(
+                "/api/v1/sessions/ferris/queue/{}/send-now",
+                queued_item_1.id
+            ),
+        )
+        .with_header("Authorization", OWNER),
+    );
+    let send_now_received_at = stamp::now();
+    assert_eq!(send_now_resp.status, 200);
+    let send_now_body = send_now_resp.json_value().unwrap();
+    let send_now_broadcast = next_prompt_sent(&mut rx);
+    let send_now_accepted = At::parse(send_now_body["accepted_at"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        send_now_body["accepted_at"],
+        send_now_broadcast["accepted_at"]
+    );
+    let send_now_turn_created = turn_created_send_now.lock().unwrap().take().unwrap();
+    assert!(
+        send_now_accepted < send_now_turn_created && send_now_turn_created < send_now_received_at,
+        "expected accepted_at ({send_now_accepted}) < turn.created_at ({send_now_turn_created}) < response_received_at ({send_now_received_at})"
+    );
+
+    // 3. Auto-drained queued prompt via drain_ready_session_queues
+    write_ferris_transcript(tmp.path(), 4);
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "auto-drained queued".into(),
+        "auto-drained queued".into(),
+        "owner".into(),
+        vec![],
+    );
+    let turn_created_drain = Arc::new(Mutex::new(None));
+    let turn_created_for_hook = turn_created_drain.clone();
+    crate::api::after_next_prompt_dispatch(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        *turn_created_for_hook.lock().unwrap() = Some(stamp::now());
+        std::thread::sleep(Duration::from_millis(5));
+    });
+    crate::api::drain_ready_session_queues(&state);
+    let drain_received_at = stamp::now();
+    let drain_broadcast = next_prompt_sent(&mut rx);
+    let drain_accepted = At::parse(drain_broadcast["accepted_at"].as_str().unwrap()).unwrap();
+    let drain_turn_created = turn_created_drain.lock().unwrap().take().unwrap();
+    assert!(
+        drain_accepted < drain_turn_created && drain_turn_created < drain_received_at,
+        "expected accepted_at ({drain_accepted}) < turn.created_at ({drain_turn_created}) < response_received_at ({drain_received_at})"
+    );
 }
 
 #[test]

@@ -375,38 +375,20 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
   it.each<[string, ProjectsMode]>([
     ["fails", "error"],
     ["is missing on an older hub", "missing"],
-  ])("keeps the built-in list working when the endpoint %s", async (_label, mode) => {
+  ])("does not render a guessed built-in project list when the endpoint %s", async (_label, mode) => {
     const { client } = makeHub([COUNCIL], mode);
     await renderApp(client);
 
-    // The agents' own group is still there; the built-in groups are not added when empty.
+    // The agents' own group is still there; no static built-in groups are added.
     expect(screen.getByTestId("project-group-ferroloop")).toBeInTheDocument();
     expect(screen.queryByTestId("project-group-council")).toBeNull();
 
     await openSettings();
-    expect(filterOptions()).toEqual([
-      "all",
-      "AI-Lab-AMD",
-      "FerroLoop",
-      "Kaggle-Gemma4",
-      "Lucida",
-      "Prosodia",
-      "Sonora",
-      "Website",
-      "Workspace",
-    ]);
+    expect(filterOptions()).toEqual(["all", "Workspace", "ferroloop"]);
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toEqual([
-      "ai-lab-amd",
-      "ferroloop",
-      "kaggle-gemma4",
-      "lucida",
-      "prosodia",
-      "sonora",
-      "website",
-    ]);
+    expect(spinUpOptions()).toEqual([""]);
   });
 
   it("shows the virtual group in the roster, Settings and Spin-Up at phone width", async () => {
@@ -433,7 +415,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
   it.each<[string, ProjectsMode]>([
     ["a legacy reply", "legacy"],
     ["a 404", "missing"],
-  ])("shows the unsupported notice and keeps the built-in labels on %s", async (_label, mode) => {
+  ])("shows the unsupported notice without static project fallbacks on %s", async (_label, mode) => {
     const { client } = makeHub([FERRO, SONORA], mode);
     await renderApp(client);
 
@@ -443,8 +425,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.queryByTestId("project-group-lucida")).toBeNull();
 
     await openSettings();
-    expect(filterOptions()).toContain("FerroLoop");
-    expect(filterOptions()).not.toContain("ferroloop");
+    expect(filterOptions()).toEqual(["all", "Workspace", "ferroloop"]);
     await openProjectsTab();
     expect(screen.getByTestId("settings-projects-unsupported")).toHaveTextContent(
       "This hub does not support project management. Update the hub to create, edit or delete projects.",
@@ -455,8 +436,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toContain("ferroloop");
-    expect(spinUpOptions()).toContain("lucida");
+    expect(spinUpOptions()).toEqual([""]);
   });
 
   it("shows the cards and no notice for a new-style reply", async () => {

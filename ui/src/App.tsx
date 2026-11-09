@@ -76,7 +76,6 @@ import {
   type ThemeMode,
 } from "./lib/accessibility";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   normalizeHydrationStatus,
   normalizeHydrationWarnings,
   type AgentLivenessItem,
@@ -266,6 +265,7 @@ export function selectPreferredHostedSessions(
 export interface OptimisticPrompt {
   content: string;
   sentAt: number;
+  sentAtAnchored?: boolean;
   agentKey?: string;
   sessionId?: string;
   authEpoch?: number;
@@ -321,37 +321,46 @@ function optimisticSessionMatches(
 }
 
 const PROMPT_DISK_CLOCK_SKEW_MS = 30_000;
+const PROMPT_DISK_ANCHORED_SKEW_MS = 2_000;
 
-export function resolvePromptSentAtMs(
-  acceptedAt?: unknown,
-  fallbackMs: number = Date.now(),
-): number {
+function parseAcceptedAtMs(acceptedAt?: unknown): number | null {
   if (typeof acceptedAt === "string" && acceptedAt.trim()) {
     const parsed = Date.parse(acceptedAt);
     if (Number.isFinite(parsed)) {
       return parsed;
     }
   }
-  return fallbackMs;
+  return null;
+}
+
+export function resolvePromptSentAtMs(
+  acceptedAt?: unknown,
+  fallbackMs: number = Date.now(),
+): number {
+  return parseAcceptedAtMs(acceptedAt) ?? fallbackMs;
 }
 
 function isPromptOnDisk(
   turns: TranscriptTurn[],
   content: string,
   sentAt?: number,
+  sentAtAnchored?: boolean,
 ): boolean {
   const trimmed = content.trim();
   if (!trimmed) return true;
   const collapsedTrimmed = trimmed.replace(/\s+/g, " ");
   const normTarget = normalizeOperatorPromptForMatch(content);
   if (!normTarget) return true;
+  const skewMs = sentAtAnchored
+    ? PROMPT_DISK_ANCHORED_SKEW_MS
+    : PROMPT_DISK_CLOCK_SKEW_MS;
   let startIdx = 0;
   if (sentAt !== undefined) {
     for (let i = turns.length - 1; i >= 0; i--) {
       const rawTs = turns[i].created_at;
       if (!rawTs) continue;
       const ms = Date.parse(rawTs);
-      if (Number.isFinite(ms) && ms < sentAt - PROMPT_DISK_CLOCK_SKEW_MS) {
+      if (Number.isFinite(ms) && ms < sentAt - skewMs) {
         startIdx = i + 1;
         break;
       }
@@ -364,7 +373,7 @@ function isPromptOnDisk(
     }
     if (sentAt !== undefined && turn.created_at) {
       const turnMs = Date.parse(turn.created_at);
-      if (Number.isFinite(turnMs) && turnMs < sentAt - PROMPT_DISK_CLOCK_SKEW_MS) {
+      if (Number.isFinite(turnMs) && turnMs < sentAt - skewMs) {
         continue;
       }
     }
@@ -402,7 +411,7 @@ export function pruneOptimisticPrompts(
     const matchesActive = (!activeKey || !promptKey || promptKey === activeKey) &&
       optimisticSessionMatches(p.sessionId, currentSessionId, !!activeKey && promptKey === activeKey);
     if (optimisticPromptExpired(p.sentAt, nowMs, sessionBusy && matchesActive)) return false;
-    if (matchesActive && isPromptOnDisk(turns, p.content, p.sentAt)) {
+    if (matchesActive && isPromptOnDisk(turns, p.content, p.sentAt, p.sentAtAnchored)) {
       return false;
     }
     return true;
@@ -449,7 +458,7 @@ export function preserveOptimisticTurn(
     if (activeKey && itemKey && itemKey !== activeKey) {
       continue;
     }
-    if (isPromptOnDisk(turns, item.content, item.sentAt)) {
+    if (isPromptOnDisk(turns, item.content, item.sentAt, item.sentAtAnchored)) {
       continue;
     }
     pending.push(item);
@@ -460,7 +469,7 @@ export function preserveOptimisticTurn(
   pending.sort((a, b) => a.sentAt - b.sentAt);
   const out = [...turns];
   for (const item of pending) {
-    if (isPromptOnDisk(out, item.content, item.sentAt)) {
+    if (isPromptOnDisk(out, item.content, item.sentAt, item.sentAtAnchored)) {
       continue;
     }
     const maxIndex = out.reduce((max, t) => Math.max(max, t.index), -1);
@@ -481,6 +490,9 @@ export function preserveOptimisticTurn(
 export function transcriptPollIntervalMs(isSessionBusy: boolean): number {
   return isSessionBusy ? 2_000 : 3_500;
 }
+
+/** Background roster and liveness poll cadence while authenticated. */
+export const ROSTER_POLL_INTERVAL_MS = 12_000;
 
 export const LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY =
   "ferrodeck.last_seen_assistant_turn";
@@ -630,6 +642,7 @@ export const App: React.FC<AppProps> = ({
     error: projectsError,
     projectManagement,
     refresh: refreshProjects,
+    clear: clearProjects,
   } = useProjects(apiClient);
   const wsClientRef = useRef<HubWsClient | null>(null);
   if (!wsClientRef.current) {
@@ -644,6 +657,7 @@ export const App: React.FC<AppProps> = ({
 
   // Auth & Pairing State
   const [authority, setAuthority] = useState<HubAuthority | null>(null);
+  const [authRequired, setAuthRequired] = useState<boolean>(false);
   const [pairingOpen, setPairingOpen] = useState<boolean>(false);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
@@ -1125,7 +1139,7 @@ export const App: React.FC<AppProps> = ({
   }, []);
 
   // Data State
-  const [agents, setAgents] = useState<AgentRecord[]>(DEFAULT_WORKSPACE_AGENTS);
+  const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [routes, setRoutes] = useState<DiscoveredSessionSummary[]>([]);
   const [liveness, setLiveness] = useState<AgentLivenessItem[]>([]);
   const [sessions, setSessions] = useState<DiscoveredSessionSummary[]>([]);
@@ -1278,7 +1292,13 @@ export const App: React.FC<AppProps> = ({
   );
 
   const recordOptimisticPrompt = useCallback(
-    (content: string, agentKey?: string | null, sentAt: number = Date.now(), sessionId?: string | null) => {
+    (
+      content: string,
+      agentKey?: string | null,
+      sentAt: number = Date.now(),
+      sessionId?: string | null,
+      sentAtAnchored?: boolean,
+    ) => {
       const trimmed = (content || "").trim();
       if (!trimmed) return;
       const normalizedKey = (agentKey ?? "").trim().toLowerCase();
@@ -1286,7 +1306,7 @@ export const App: React.FC<AppProps> = ({
         (p) => sentAt - p.sentAt <= OPTIMISTIC_PROMPT_BUSY_MAX_MS,
       );
       const normTarget = normalizeOperatorPromptForMatch(content);
-      const duplicate = current.some(
+      const duplicateIdx = current.findIndex(
         (p) =>
           (p.content.trim() === trimmed ||
             (normTarget.length > 0 &&
@@ -1295,14 +1315,21 @@ export const App: React.FC<AppProps> = ({
           (p.sessionId ?? "") === (sessionId ?? "") &&
           Math.abs(sentAt - p.sentAt) < 3_000,
       );
-      if (!duplicate) {
+      if (duplicateIdx === -1) {
         current.push({
           content,
           sentAt,
+          ...(sentAtAnchored ? { sentAtAnchored: true } : {}),
           agentKey: normalizedKey || undefined,
           sessionId: sessionId || undefined,
           authEpoch: ownerRef.current.authEpoch,
         });
+      } else if (sentAtAnchored && !current[duplicateIdx].sentAtAnchored) {
+        current[duplicateIdx] = {
+          ...current[duplicateIdx],
+          sentAt,
+          sentAtAnchored: true,
+        };
       }
       optimisticPromptRef.current = current;
     },
@@ -1420,7 +1447,7 @@ export const App: React.FC<AppProps> = ({
         return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
       });
       if (error instanceof HubApiError && error.status === 401) {
-        setAuthority(null); setPairingOpen(true);
+        setAuthority(null); setAuthRequired(true); setPairingOpen(true);
       }
     }
   }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, isTranscriptResetPending, setSessionMetadataOwner]);
@@ -1518,18 +1545,48 @@ export const App: React.FC<AppProps> = ({
     [splitView, secondaryTab, navigatePhone],
   );
 
+  const rosterRefreshInFlightRef = useRef<boolean>(false);
+  const refreshRosterAndLiveness = useCallback(async () => {
+    if (loggedOutRef.current || !mountedRef.current || rosterRefreshInFlightRef.current) return;
+    rosterRefreshInFlightRef.current = true;
+    try {
+      const [agentsRes, livenessRes] = await Promise.all([
+        apiClient.getAgents().catch(() => null),
+        apiClient.getAgentsLiveness().catch(() => null),
+      ]);
+      if (!mountedRef.current || loggedOutRef.current) return;
+      if (agentsRes) {
+        if (Array.isArray(agentsRes.agents)) {
+          setAgents(agentsRes.agents);
+        }
+        if (Array.isArray(agentsRes.routes)) {
+          setRoutes(agentsRes.routes);
+        }
+      }
+      if (livenessRes?.liveness) {
+        setLiveness(livenessRes.liveness);
+      }
+    } catch {
+      // Ignore background refresh errors
+    } finally {
+      rosterRefreshInFlightRef.current = false;
+    }
+  }, [apiClient]);
+
   const refreshWireAndRoster = useCallback(async () => {
+    if (loggedOutRef.current || !mountedRef.current) return;
     try {
       const [agentsRes, livenessRes, wireRes] = await Promise.all([
         apiClient.getAgents().catch(() => null),
         apiClient.getAgentsLiveness().catch(() => null),
         apiClient.getWireMessages().catch(() => null),
       ]);
+      if (!mountedRef.current || loggedOutRef.current) return;
       if (agentsRes) {
-        if (agentsRes.agents && agentsRes.agents.length > 0) {
+        if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
-        if (agentsRes.routes) {
+        if (Array.isArray(agentsRes.routes)) {
           setRoutes(agentsRes.routes);
         }
       }
@@ -1698,6 +1755,15 @@ export const App: React.FC<AppProps> = ({
     setLoading(true);
     void refreshHostedSessions();
     try {
+      let sawUnauthorized = false;
+      const catchRosterErr = <T,>(p: Promise<T>): Promise<T | null> =>
+        p.catch((err) => {
+          if (err instanceof HubApiError && err.status === 401) {
+            sawUnauthorized = true;
+          }
+          return null;
+        });
+
       const [
         agentsRes,
         livenessRes,
@@ -1712,9 +1778,9 @@ export const App: React.FC<AppProps> = ({
         nodesRes,
         settingsRes,
       ] = await Promise.all([
-        apiClient.getAgents().catch(() => null),
-        apiClient.getAgentsLiveness().catch(() => null),
-        apiClient.getSessions().catch(() => null),
+        catchRosterErr(apiClient.getAgents()),
+        catchRosterErr(apiClient.getAgentsLiveness()),
+        catchRosterErr(apiClient.getSessions()),
         apiClient.getWorktrees().catch(() => null),
         apiClient.getPrs().catch(() => null),
         apiClient.getWireMessages().catch(() => null),
@@ -1724,9 +1790,21 @@ export const App: React.FC<AppProps> = ({
         apiClient.getStats().catch(() => null),
         apiClient.fetchNodes().catch(() => null),
         apiClient.getSettings().catch(() => null),
+        refreshProjects().catch(() => null),
       ]);
 
       if (!mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(initialOwner, ownerRef.current)) return;
+
+      if (sawUnauthorized && !agentsRes && !livenessRes && !sessionsRes) {
+        setAuthority(null);
+        setAuthRequired(true);
+        setPairingOpen(true);
+        setAgents([]);
+        setRoutes([]);
+        setLiveness([]);
+        setSessions([]);
+      }
+
       if (settingsRes?.timezone) {
         setActiveTimeZone(settingsRes.timezone);
       }
@@ -1736,10 +1814,10 @@ export const App: React.FC<AppProps> = ({
       }
 
       if (agentsRes) {
-        if (agentsRes.agents && agentsRes.agents.length > 0) {
+        if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
-        if (agentsRes.routes) {
+        if (Array.isArray(agentsRes.routes)) {
           setRoutes(agentsRes.routes);
         }
       }
@@ -1788,7 +1866,7 @@ export const App: React.FC<AppProps> = ({
     } finally {
       if (mountedRef.current && initialOwner.authEpoch === ownerRef.current.authEpoch) setLoading(false);
     }
-  }, [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection, refreshHostedSessions]);
+  }, [apiClient, refreshProjects, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection, refreshHostedSessions]);
 
   // Startup URL pairing check + Auth session check + initial load
   useEffect(() => {
@@ -1830,6 +1908,7 @@ export const App: React.FC<AppProps> = ({
             if (pairRes.authority) {
               authIdentityRef.current = { apiClient, token: apiClient.getToken() };
               setAuthority(pairRes.authority);
+              setAuthRequired(false);
             }
             wsClient.setToken(apiClient.getToken());
             wsClient.connect();
@@ -1837,6 +1916,7 @@ export const App: React.FC<AppProps> = ({
         } catch (err) {
           if (acceptsBootstrap()) {
             setPairingError(err instanceof Error ? err.message : "Pairing code rejected");
+            setAuthRequired(true);
             setPairingOpen(true);
           }
         } finally {
@@ -1852,13 +1932,16 @@ export const App: React.FC<AppProps> = ({
           if (authRes.authenticated && authRes.authority) {
             authIdentityRef.current = { apiClient, token: apiClient.getToken() };
             setAuthority(authRes.authority);
+            setAuthRequired(false);
           } else {
+            setAuthRequired(true);
             setPairingOpen(true);
           }
         }
       } catch (err) {
         if (acceptsBootstrap()) {
           if (err instanceof HubApiError && err.status === 401) {
+            setAuthRequired(true);
             setPairingOpen(true);
           }
         }
@@ -1914,11 +1997,13 @@ export const App: React.FC<AppProps> = ({
           ? rawSessionId === activeSessionId && (!rawPersona || rawPersona === activeKey)
           : !activeSessionId && Boolean(rawPersona) && rawPersona === activeKey;
         if (matchesActive && rawContent && data.delivered !== false) {
+          const acceptedAtMs = parseAcceptedAtMs(data.accepted_at);
           recordOptimisticPrompt(
             rawContent,
             activeKey,
-            resolvePromptSentAtMs(data.accepted_at),
+            acceptedAtMs ?? Date.now(),
             rawSessionId || null,
+            acceptedAtMs !== null,
           );
           refreshOptimisticView((previous) => previous + 1);
         }
@@ -2114,18 +2199,83 @@ export const App: React.FC<AppProps> = ({
   }, [apiClient, selectedWorktreeId]);
 
   // Compute active agent and session
-  const selectedAgent = useMemo(() => {
+  const selectedAgent = useMemo<AgentRecord | null>(() => {
     const key = selectedAgentName.trim().toLowerCase();
     if (!key) {
       return null;
     }
-    return (
-      agents.find((a) => a.name_key.toLowerCase() === key) ??
-      DEFAULT_WORKSPACE_AGENTS.find((a) => a.name_key.toLowerCase() === key) ??
-      agents[0] ??
-      null
+    const fromAgents = agents.find((a) => a.name_key.toLowerCase() === key);
+    if (fromAgents) return fromAgents;
+
+    const fromLiveness = liveness.find(
+      (item) => item.agent.trim().toLowerCase() === key,
     );
-  }, [agents, selectedAgentName]);
+    if (fromLiveness) {
+      return {
+        id: `urn:fl:agent:${key}`,
+        name_key: key,
+        display_name:
+          fromLiveness.agent.toLowerCase() === "jarvis"
+            ? "JARVIS"
+            : fromLiveness.agent === fromLiveness.agent.toLowerCase()
+              ? fromLiveness.agent.charAt(0).toUpperCase() +
+                fromLiveness.agent.slice(1)
+              : fromLiveness.agent,
+        project: fromLiveness.project || "Workspace",
+        role: fromLiveness.role || "assistant",
+        status: "active",
+      };
+    }
+
+    const fromSession =
+      sessions.find((s) => (s.persona ?? "").trim().toLowerCase() === key) ??
+      routes.find((r) => (r.persona ?? "").trim().toLowerCase() === key);
+    if (fromSession) {
+      const rawPersona = (fromSession.persona ?? key).trim();
+      const explicitProject = (
+        (fromSession as { project?: string | null }).project ?? ""
+      ).trim();
+      const cwd = (fromSession.cwd ?? "").trim().replace(/\/+$/, "");
+      const cwdProject = cwd ? (cwd.split("/").filter(Boolean).pop() ?? "") : "";
+      return {
+        id: `urn:fl:agent:${key}`,
+        name_key: key,
+        display_name:
+          rawPersona.toLowerCase() === "jarvis"
+            ? "JARVIS"
+            : rawPersona === rawPersona.toLowerCase()
+              ? rawPersona.charAt(0).toUpperCase() + rawPersona.slice(1)
+              : rawPersona,
+        project: explicitProject || cwdProject || "Workspace",
+        role:
+          ((fromSession as { role?: string | null }).role ?? "").trim() ||
+          "assistant",
+        status: "active",
+      };
+    }
+
+    if (agents.length > 0) {
+      return agents[0];
+    }
+
+    if (!authority && (pairingOpen || authRequired)) {
+      return null;
+    }
+
+    return {
+      id: `urn:fl:agent:${key}`,
+      name_key: key,
+      display_name:
+        key === "jarvis"
+          ? "JARVIS"
+          : selectedAgentName.trim() === key
+            ? key.charAt(0).toUpperCase() + key.slice(1)
+            : selectedAgentName.trim(),
+      project: "",
+      role: "assistant",
+      status: "active",
+    };
+  }, [agents, liveness, sessions, routes, selectedAgentName, authority, pairingOpen, authRequired]);
 
   const [spunUpByAgent, setSpunUpByAgent] = useState<
     Record<
@@ -2299,18 +2449,53 @@ export const App: React.FC<AppProps> = ({
     return () => clearInterval(intervalId);
   }, [authority, activeTab, splitView, isSessionBusy, refreshSessionsAndTranscript]);
 
-  // Re-fetch /api/v1/sessions and active transcript when returning focus or visibility
+  // Periodically poll /api/v1/agents and /api/v1/agents/liveness while authenticated
+  // so roster membership and liveness stay fresh even without WebSocket wire events.
+  useEffect(() => {
+    if (!authority || pairingOpen) {
+      return;
+    }
+    const intervalId = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
+      void refreshRosterAndLiveness();
+    }, ROSTER_POLL_INTERVAL_MS);
+    return () => clearInterval(intervalId);
+  }, [authority, pairingOpen, refreshRosterAndLiveness]);
+
+  // Re-fetch /api/v1/sessions, roster, liveness, and active transcript when returning focus or visibility
   // to FerroDeck (e.g. after changing model in a vendor CLI or the Claude app).
+  // Browsers fire both `visibilitychange` and `focus` back-to-back on tab activation; dedupe them.
+  const lastForegroundRefreshAtRef = useRef<number>(0);
+  const foregroundRefreshInFlightRef = useRef<boolean>(false);
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
+    const triggerForegroundRefresh = () => {
+      const now = Date.now();
+      if (
+        foregroundRefreshInFlightRef.current ||
+        now - lastForegroundRefreshAtRef.current < 40
+      ) {
+        return;
+      }
+      lastForegroundRefreshAtRef.current = now;
+      foregroundRefreshInFlightRef.current = true;
+      void Promise.all([
+        refreshSessionsAndTranscript(),
+        refreshRosterAndLiveness(),
+      ]).finally(() => {
+        foregroundRefreshInFlightRef.current = false;
+      });
+    };
     const handleWindowFocus = () => {
-      void refreshSessionsAndTranscript();
+      triggerForegroundRefresh();
     };
     const handleVisibilityChange = () => {
       if (typeof document !== "undefined" && !document.hidden) {
-        void refreshSessionsAndTranscript();
+        triggerForegroundRefresh();
       }
     };
     window.addEventListener("focus", handleWindowFocus);
@@ -2323,7 +2508,7 @@ export const App: React.FC<AppProps> = ({
         document.removeEventListener("visibilitychange", handleVisibilityChange);
       }
     };
-  }, [refreshSessionsAndTranscript]);
+  }, [refreshSessionsAndTranscript, refreshRosterAndLiveness]);
 
   // Transcripts keyed by owning agent (background scans + recorded active
   // loads). Keying by owner avoids crediting one agent with another's turns
@@ -2384,6 +2569,7 @@ export const App: React.FC<AppProps> = ({
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     if (res.authority) {
       setAuthority(res.authority);
+      setAuthRequired(false);
     }
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
@@ -2399,6 +2585,7 @@ export const App: React.FC<AppProps> = ({
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     if (res.authority) {
       setAuthority(res.authority);
+      setAuthRequired(false);
     }
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
@@ -2413,6 +2600,7 @@ export const App: React.FC<AppProps> = ({
     setTranscriptSnapshot(null);
     await apiClient.logout().catch(() => {});
     setAuthority(null);
+    setAuthRequired(true);
     wsClient.setToken(null);
     wsClient.disconnect();
     // Drop everything fetched under the old identity so the next principal
@@ -2429,9 +2617,11 @@ export const App: React.FC<AppProps> = ({
     setUnconfirmedBySession({});
     setSessionContextUsage(null);
     setSessionQuotaUsage(null);
+    setAgents([]);
     setSessions([]);
     setRoutes([]);
     setLiveness([]);
+    clearProjects();
     setWireMessages([]);
     setWorktrees([]);
     setWorktreeDiff(null);
@@ -2472,11 +2662,13 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
+      const acceptedAtMs = parseAcceptedAtMs(res.accepted_at);
       recordOptimisticPrompt(
         content,
         agentKey,
-        resolvePromptSentAtMs(res.accepted_at),
+        acceptedAtMs ?? Date.now(),
         activeSessionIdRef.current,
+        acceptedAtMs !== null,
       );
       refreshOptimisticView((previous) => previous + 1);
     }
@@ -2505,11 +2697,13 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
+      const acceptedAtMs = parseAcceptedAtMs(res.accepted_at);
       recordOptimisticPrompt(
         content,
         agentKey,
-        resolvePromptSentAtMs(res.accepted_at),
+        acceptedAtMs ?? Date.now(),
         activeSessionIdRef.current,
+        acceptedAtMs !== null,
       );
       refreshOptimisticView((previous) => previous + 1);
     }
@@ -2959,7 +3153,7 @@ export const App: React.FC<AppProps> = ({
       case "git":
         return (
           <GitPrPane
-            selectedProject={selectedAgent?.project ?? null}
+            selectedProject={selectedAgent?.project || null}
             worktrees={worktrees}
             selectedWorktreeId={selectedWorktreeId}
             worktreeDiff={worktreeDiff}
@@ -2989,7 +3183,7 @@ export const App: React.FC<AppProps> = ({
         return (
           <RecordsBoardPane
             projects={projects}
-            selectedProject={selectedAgent?.project ?? null}
+            selectedProject={selectedAgent?.project || null}
             apiClient={apiClient}
           />
         );
@@ -3351,7 +3545,7 @@ export const App: React.FC<AppProps> = ({
       agentName={selectedAgent?.name_key ?? null}
       agentDisplayName={selectedAgent?.display_name ?? null}
       agentRole={selectedAgent?.role ?? null}
-      agentProject={selectedAgent?.project ?? null}
+      agentProject={selectedAgent?.project || null}
       adapter={activeAdapter}
       model={activeModel}
       thinkingLevel={activeSession?.thinking_level ?? null}
@@ -3418,6 +3612,8 @@ export const App: React.FC<AppProps> = ({
     <RosterSidebar
       projects={projects}
       showEmptyProjects={projectsFromHub}
+      loading={loading}
+      signedOut={!authority && (pairingOpen || authRequired)}
       agents={agents}
       routes={mergedRoutes}
       sessions={sessions}
@@ -3685,6 +3881,7 @@ export const App: React.FC<AppProps> = ({
         onAuthenticated={(auth) => {
           advanceTranscriptAuth();
           loggedOutRef.current = false;
+          setAuthRequired(false);
           if (auth) {
             setAuthority(auth);
           }

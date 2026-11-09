@@ -2,8 +2,8 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { describe, expect, it, vi } from "vitest";
 import type { HubApiClient } from "../api/client";
 import { WireMailPane } from "../components/WireMailPane";
+import { TEST_WORKSPACE_AGENTS as DEFAULT_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   type WireInboxItem,
   type WireStatusResponse,
 } from "../types/api";

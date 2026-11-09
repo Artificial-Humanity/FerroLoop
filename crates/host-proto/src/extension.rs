@@ -149,6 +149,11 @@ pub struct StreamId {
     pub session: SessionId,
     pub epoch: SessionEpoch,
 }
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&serde_json::to_string(self).expect("stream identity"))
+    }
+}
 /// Accounting counters, not measured RSS. Recent identities are oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

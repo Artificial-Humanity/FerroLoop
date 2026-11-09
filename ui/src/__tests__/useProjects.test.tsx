@@ -2,7 +2,6 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { HubApiError } from "../api/client";
 import {
-  FALLBACK_PROJECTS,
   findProject,
   projectLabel,
   projectLabels,
@@ -35,13 +34,11 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-const FALLBACK_SLUGS = FALLBACK_PROJECTS.map((p) => p.slug);
-
 describe("useProjects", () => {
-  it("starts on the fallback list and loads the hub list once on mount", async () => {
+  it("starts with an empty list (never a static fallback) and loads the hub list once on mount", async () => {
     const listProjects = vi.fn(async () => [project("alpha", "Alpha"), project("council", "Council", "virtual")]);
     const { result, rerender } = renderHook(() => useProjects({ listProjects }));
-    expect(result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+    expect(result.current.projects).toEqual([]);
     expect(result.current.loaded).toBe(false);
     expect(result.current.fromHub).toBe(false);
 
@@ -54,74 +51,88 @@ describe("useProjects", () => {
     expect(listProjects).toHaveBeenCalledTimes(1);
   });
 
-  it("falls back to the built-in list and reports the error when the request fails", async () => {
+  it("returns an empty list and reports the error when the initial request fails", async () => {
     const listProjects = vi.fn(async () => {
       throw new Error("hub unreachable");
     });
     const { result } = renderHook(() => useProjects({ listProjects }));
     await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+    expect(result.current.projects).toEqual([]);
     expect(result.current.error).toBe("hub unreachable");
     expect(result.current.fromHub).toBe(false);
   });
 
-  it("falls back quietly on a 404 from an older hub", async () => {
+  it("returns an empty list quietly on a 404 from an older hub", async () => {
     const listProjects = vi.fn(async () => {
       throw new HubApiError(404, "Not Found");
     });
     const { result } = renderHook(() => useProjects({ listProjects }));
     await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+    expect(result.current.projects).toEqual([]);
     expect(result.current.error).toBeNull();
   });
 
-  it("falls back when the hub answers with an empty list", async () => {
+  it("returns an empty list when the hub answers with an empty list", async () => {
     const { result } = renderHook(() => useProjects({ listProjects: async () => [] }));
     await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+    expect(result.current.projects).toEqual([]);
     expect(result.current.fromHub).toBe(false);
   });
 
-  it("falls back when the client has no listProjects method or there is no client", async () => {
+  it("returns an empty list when the client has no listProjects method or there is no client", async () => {
     const missing = renderHook(() => useProjects({}));
     await waitFor(() => expect(missing.result.current.loaded).toBe(true));
-    expect(missing.result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+    expect(missing.result.current.projects).toEqual([]);
     expect(missing.result.current.error).toBeNull();
 
     const none = renderHook(() => useProjects(undefined));
     await waitFor(() => expect(none.result.current.loaded).toBe(true));
-    expect(none.result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
+    expect(none.result.current.projects).toEqual([]);
   });
 
-  it("refresh() swaps in the new list", async () => {
-    let current = [project("alpha")];
-    const listProjects = vi.fn(async () => current);
+  it("refresh() swaps in the new list, including after an initial 401", async () => {
+    let authed = false;
+    const listProjects = vi.fn(async () => {
+      if (!authed) throw new HubApiError(401, "Unauthorized");
+      return [project("ferroloop", "FerroLoop"), project("the-council", "The Council", "virtual")];
+    });
     const { result } = renderHook(() => useProjects({ listProjects }));
-    await waitFor(() => expect(result.current.projects.map((p) => p.slug)).toEqual(["alpha"]));
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+    expect(result.current.projects).toEqual([]);
+    expect(result.current.fromHub).toBe(false);
 
-    current = [project("alpha"), project("council", "Council", "virtual")];
+    authed = true;
     await act(async () => {
       await result.current.refresh();
     });
-    expect(result.current.projects.map((p) => p.slug)).toEqual(["alpha", "council"]);
+    expect(result.current.projects.map((p) => p.slug)).toEqual(["ferroloop", "the-council"]);
+    expect(result.current.fromHub).toBe(true);
     expect(listProjects).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps the last hub list when a refresh fails", async () => {
-    let fail = false;
+  it("keeps the last hub list when a transient non-auth refresh fails, and clears on 401", async () => {
+    let mode: "ok" | "500" | "401" = "ok";
     const listProjects = vi.fn(async () => {
-      if (fail) throw new Error("boom");
+      if (mode === "500") throw new Error("boom");
+      if (mode === "401") throw new HubApiError(401, "Unauthorized");
       return [project("alpha")];
     });
     const { result } = renderHook(() => useProjects({ listProjects }));
     await waitFor(() => expect(result.current.fromHub).toBe(true));
-    fail = true;
+    mode = "500";
     await act(async () => {
       await result.current.refresh();
     });
     expect(result.current.projects.map((p) => p.slug)).toEqual(["alpha"]);
     expect(result.current.error).toBe("boom");
     expect(result.current.fromHub).toBe(true);
+
+    mode = "401";
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.projects).toEqual([]);
+    expect(result.current.fromHub).toBe(false);
   });
 
   it("lets the latest of overlapping refreshes win, whatever order they finish in", async () => {
@@ -207,8 +218,7 @@ describe("project helpers", () => {
       expect(result.current.projectManagement).toBe("unsupported");
       expect(result.current.fromHub).toBe(false);
       expect(result.current.error).toBeNull();
-      expect(result.current.projects.map((p) => p.slug)).toEqual(FALLBACK_SLUGS);
-      expect(projectLabels(result.current.projects)).toContain("FerroLoop");
+      expect(result.current.projects).toEqual([]);
     });
 
     it("keeps a mixed reply as a normal list", async () => {

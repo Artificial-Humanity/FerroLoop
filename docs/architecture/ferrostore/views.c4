@@ -1,0 +1,81 @@
+views {
+
+  view index {
+    title 'FerroStore today: who opens which store file'
+    description 'Processes and callers on one host and the .fls files they open, as of main@386cb6a7. Solid = embedded open, dashed = socket client.'
+    include
+      operator,
+      ferroloop.wsDaemon,
+      ferroloop.projDaemon,
+      ferroloop.wireDaemon,
+      ferroloop.hub,
+      ferroloop.cli,
+      ferroloop.stateMcp,
+      ferroloop.storeCli,
+      ferroloop.flFls,
+      ferroloop.projectFls,
+      ferroloop.councilFls,
+      ferroloop.websiteAltFls,
+      ferroloop.codeFls
+    exclude * -> * where tag is #target
+    style ferroloop.councilFls, ferroloop.websiteAltFls {
+      color red
+    }
+    autoLayout LeftRight
+  }
+
+  view gaps {
+    title 'FerroStore today: ownership gaps'
+    description 'Only the opens that break the single-owner rule: unserved files opened embedded by several processes, per-call MCP connections, and the ferrostore data CLI bypassing its own daemon.'
+    include
+      ferroloop.hub,
+      ferroloop.cli,
+      ferroloop.stateMcp,
+      ferroloop.storeCli,
+      ferroloop.wsDaemon,
+      ferroloop.projDaemon,
+      ferroloop.flFls,
+      ferroloop.projectFls,
+      ferroloop.councilFls,
+      ferroloop.websiteAltFls
+    exclude * -> *
+    include * -> * where tag is #gap
+    autoLayout LeftRight
+  }
+
+  view library of ferroloop.flStore {
+    title 'The fl-store library'
+    description 'How a handle is chosen (engine, embedded or remote) and the modules behind it. Grey-red modules have no production caller.'
+    include *, ferroloop.codeFls, ferroloop.legacyRedb
+    exclude * -> * where tag is #target
+    style ferroloop.flStore.ferroMq, ferroloop.flStore.wireDelivery {
+      color red
+    }
+    autoLayout TopBottom
+  }
+
+  view target {
+    title 'Proposed: one owner per store file (Milestone 6)'
+    description 'Not built. Each .fls has exactly one opener, its ferrostore daemon, holding an exclusive lock; every other process is a socket client with a reused connection.'
+    include
+      ferroloop.wsDaemon,
+      ferroloop.projDaemon,
+      ferroloop.councilDaemon,
+      ferroloop.websiteAltDaemon,
+      ferroloop.wireDaemon,
+      ferroloop.hub,
+      ferroloop.cli,
+      ferroloop.stateMcp,
+      ferroloop.storeCli,
+      ferroloop.flFls,
+      ferroloop.projectFls,
+      ferroloop.councilFls,
+      ferroloop.websiteAltFls
+    exclude * -> *
+    include * -> * where tag is #target
+    style ferroloop.councilDaemon, ferroloop.websiteAltDaemon {
+      color green
+    }
+    autoLayout LeftRight
+  }
+}

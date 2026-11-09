@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
@@ -17,9 +17,9 @@ import {
   togglePinnedAgent,
   togglePinnedProject,
 } from "../components/RosterSidebar";
-import { computeUnreadSeverityByAgent } from "../App";
+import { computeUnreadSeverityByAgent, ROSTER_POLL_INTERVAL_MS } from "../App";
+import { TEST_WORKSPACE_AGENTS as DEFAULT_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
   type AgentRecord,
   type DiscoveredSessionSummary,
@@ -144,8 +144,30 @@ describe("RosterSidebar", () => {
     expect(screen.getByTestId("roster-triage-toggle-btn")).toBeInTheDocument();
   });
 
-  it("falls back to DEFAULT_WORKSPACE_AGENTS when agents prop is empty and groups by project", () => {
+  it("never falls back to a static roster when agents, liveness, sessions, and routes are empty, and synthesizes agents from routes/liveness/sessions when present", () => {
     const onSelectAgent = vi.fn();
+    const { unmount } = render(
+      <RosterSidebar
+        agents={[]}
+        routes={[]}
+        sessions={[]}
+        liveness={[]}
+        unreadByAgent={{}}
+        selectedAgentName={null}
+        onSelectAgent={onSelectAgent}
+        signedOut={true}
+      />,
+    );
+
+    expect(screen.getByTestId("roster-empty-state")).toHaveTextContent(
+      /sign in to view the workspace agent roster/i,
+    );
+    expect(screen.queryByText("JARVIS")).toBeNull();
+    expect(screen.queryByText("Ferris")).toBeNull();
+    expect(screen.queryByText("Felicia")).toBeNull();
+    expect(screen.queryByText("Wesley")).toBeNull();
+    unmount();
+
     render(
       <RosterSidebar
         agents={[]}
@@ -157,18 +179,18 @@ describe("RosterSidebar", () => {
       />,
     );
 
-    // Default projects should be rendered
+    // Projects from liveness and routes should be rendered, without unseeded static projects
     expect(screen.getByText("AI-Lab-AMD")).toBeInTheDocument();
     expect(screen.getByText("FerroLoop")).toBeInTheDocument();
     expect(screen.getByText("Kaggle-Gemma4")).toBeInTheDocument();
     expect(screen.getByText("Sonora")).toBeInTheDocument();
-    expect(screen.getByText("Website")).toBeInTheDocument();
+    expect(screen.queryByText("Website")).toBeNull();
 
-    // Agents should be rendered
+    // Agents from liveness and routes should be rendered
     expect(screen.getByText("JARVIS")).toBeInTheDocument();
     expect(screen.getByText("Ferris")).toBeInTheDocument();
     expect(screen.getByText("Kayla")).toBeInTheDocument();
-    expect(screen.getByText("Wesley")).toBeInTheDocument();
+    expect(screen.queryByText("Wesley")).toBeNull();
 
     // Unread mail count badge for jarvis
     expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("3");
@@ -184,6 +206,39 @@ describe("RosterSidebar", () => {
     // Clicking an agent triggers onSelectAgent
     fireEvent.click(screen.getByTestId("agent-row-ferris"));
     expect(onSelectAgent).toHaveBeenCalledWith("ferris");
+  });
+
+  it("counts a live session in sessionMap as online (hasRoute) and includes session-only personas (e.g. Kacey) in enrichedAgents", () => {
+    const onSelectAgent = vi.fn();
+    render(
+      <RosterSidebar
+        agents={[]}
+        routes={[]}
+        sessions={[
+          {
+            id: "sess-kacey-live",
+            source: "route",
+            adapter: "antigravity",
+            persona: "kacey",
+            status: "active",
+            cwd: "/home/lmcfarlin/Projects/Artificial-Humanity/Kaggle-Gemma4",
+          },
+        ]}
+        liveness={[]}
+        unreadByAgent={{}}
+        selectedAgentName={null}
+        onSelectAgent={onSelectAgent}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-row-kacey")).toBeInTheDocument();
+    expect(screen.getByText("Kacey")).toBeInTheDocument();
+    expect(screen.getByTestId("liveness-dot-kacey")).toHaveClass("fd-dot-alive");
+    expect(screen.getByTestId("activity-tag-kacey")).toHaveAttribute(
+      "data-activity",
+      "idle",
+    );
+    expect(screen.getByTestId("adapter-pill-kacey")).toHaveTextContent(/antigravity/i);
   });
 
   it("filters agents instantaneously by name, project, role, or adapter", () => {
@@ -823,6 +878,12 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      if (url.includes("/api/v1/agents") && !url.includes("/liveness")) {
+        return new Response(
+          JSON.stringify({ agents: DEFAULT_WORKSPACE_AGENTS, routes: [] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) {
         return new Response(
           JSON.stringify({
@@ -924,6 +985,631 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
       configurable: true,
       value: prevInnerWidth,
     });
+
+    unmount();
+  });
+
+  it("shows no static roster while unauthenticated (401 bootstrap) and loads the full roster including the-council and session-only Kacey after login", async () => {
+    let authenticated = false;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.includes("/api/v1/auth/pair") && method === "POST") {
+        authenticated = true;
+        return new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+            session_token: "tok-after-login",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/api/v1/auth/session")) {
+        if (!authenticated) {
+          return new Response(
+            JSON.stringify({ authenticated: false, authority: null }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (!authenticated) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/api/v1/projects")) {
+        return new Response(
+          JSON.stringify({
+            projects: [
+              {
+                id: "ferroloop",
+                slug: "ferroloop",
+                name: "FerroLoop",
+                kind: "project",
+                path: "/work/ferroloop",
+                has_git: true,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 2,
+              },
+              {
+                id: "the-council",
+                slug: "the-council",
+                name: "The Council",
+                kind: "virtual",
+                path: null,
+                has_git: false,
+                purpose: "Deliberative council",
+                tracker: null,
+                store_path: null,
+                active_agent_count: 5,
+              },
+              {
+                id: "kaggle-gemma4",
+                slug: "kaggle-gemma4",
+                name: "Kaggle-Gemma4",
+                kind: "project",
+                path: "/work/kaggle-gemma4",
+                has_git: true,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 2,
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/agents")) {
+        return new Response(
+          JSON.stringify({
+            agents: [
+              {
+                id: "urn:fl:agent:ferris",
+                name_key: "ferris",
+                display_name: "Ferris",
+                project: "FerroLoop",
+                role: "lead",
+                status: "active",
+              },
+              {
+                id: "urn:fl:agent:felix",
+                name_key: "felix",
+                display_name: "Felix",
+                project: "FerroLoop",
+                role: "developer",
+                status: "active",
+              },
+              {
+                id: "urn:fl:agent:athena",
+                name_key: "athena",
+                display_name: "Athena",
+                project: "the-council",
+                role: "strategist",
+                status: "active",
+              },
+              {
+                id: "urn:fl:agent:solon",
+                name_key: "solon",
+                display_name: "Solon",
+                project: "the-council",
+                role: "architect",
+                status: "active",
+              },
+            ],
+            routes: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/agents/liveness")) {
+        return new Response(
+          JSON.stringify({
+            liveness: [
+              {
+                agent: "ferris",
+                project: "FerroLoop",
+                role: "lead",
+                has_route: true,
+                adapter: "claude",
+                verdict: { state: "alive" },
+              },
+              {
+                agent: "felix",
+                project: "FerroLoop",
+                role: "developer",
+                has_route: true,
+                adapter: "antigravity",
+                verdict: { state: "alive" },
+              },
+              {
+                agent: "athena",
+                project: "the-council",
+                role: "strategist",
+                has_route: true,
+                adapter: "claude",
+                verdict: { state: "alive" },
+              },
+              {
+                agent: "solon",
+                project: "the-council",
+                role: "architect",
+                has_route: true,
+                adapter: "codex",
+                verdict: { state: "alive" },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/sessions")) {
+        return new Response(
+          JSON.stringify({
+            sessions: [
+              {
+                id: "sess-kacey-1",
+                source: "route",
+                adapter: "antigravity",
+                persona: "kacey",
+                status: "active",
+                cwd: "/home/lmcfarlin/Projects/Artificial-Humanity/Kaggle-Gemma4",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    // 1. On initial 401 bootstrap, pairing modal opens and NO static roster rows are rendered
+    expect(await screen.findByTestId("roster-empty-state")).toHaveTextContent(
+      /Sign in to view the workspace agent roster/i,
+    );
+    expect(screen.queryAllByTestId(/^agent-row-/)).toHaveLength(0);
+    expect(screen.queryByTestId("agent-row-felicia")).toBeNull();
+    expect(screen.queryByTestId("agent-row-ferris")).toBeNull();
+
+    // 2. Authenticate via PairingModal token form
+    const tokenInput = await screen.findByPlaceholderText("Paste bearer token");
+    fireEvent.change(tokenInput, { target: { value: "valid-owner-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Token" }));
+
+    // 3. After login, projects, agents, liveness, and sessions refresh together
+    expect(await screen.findByTestId("project-group-the council")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-row-athena")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-row-solon")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-row-felix")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-row-ferris")).toBeInTheDocument();
+
+    // Session-only persona Kacey appears in the roster and renders online
+    expect(screen.getByTestId("agent-row-kacey")).toBeInTheDocument();
+    expect(screen.getByTestId("liveness-dot-kacey")).toHaveClass("fd-dot-alive");
+    expect(screen.getByTestId("activity-tag-kacey")).toHaveAttribute(
+      "data-activity",
+      "idle",
+    );
+
+    unmount();
+  });
+
+  it("periodically polls /api/v1/agents and /api/v1/agents/liveness while authenticated", async () => {
+    vi.useFakeTimers();
+    try {
+      let pollWave = 0;
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/v1/auth/session")) {
+          return new Response(
+            JSON.stringify({
+              authenticated: true,
+              authority: { tier: "owner", login: "lmcfarlin" },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/api/v1/agents")) {
+          pollWave += 1;
+          return new Response(
+            JSON.stringify({
+              agents:
+                pollWave === 1
+                  ? [
+                      {
+                        id: "urn:fl:agent:ferris",
+                        name_key: "ferris",
+                        display_name: "Ferris",
+                        project: "FerroLoop",
+                        role: "lead",
+                        status: "active",
+                      },
+                    ]
+                  : [
+                      {
+                        id: "urn:fl:agent:ferris",
+                        name_key: "ferris",
+                        display_name: "Ferris",
+                        project: "FerroLoop",
+                        role: "lead",
+                        status: "active",
+                      },
+                      {
+                        id: "urn:fl:agent:athena",
+                        name_key: "athena",
+                        display_name: "Athena",
+                        project: "the-council",
+                        role: "strategist",
+                        status: "active",
+                      },
+                    ],
+              routes: [],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/api/v1/agents/liveness")) {
+          return new Response(
+            JSON.stringify({
+              liveness:
+                pollWave <= 1
+                  ? [
+                      {
+                        agent: "ferris",
+                        project: "FerroLoop",
+                        role: "lead",
+                        has_route: true,
+                        adapter: "claude",
+                        verdict: { state: "alive" },
+                      },
+                    ]
+                  : [
+                      {
+                        agent: "ferris",
+                        project: "FerroLoop",
+                        role: "lead",
+                        has_route: true,
+                        adapter: "claude",
+                        verdict: { state: "alive" },
+                      },
+                      {
+                        agent: "athena",
+                        project: "the-council",
+                        role: "strategist",
+                        has_route: true,
+                        adapter: "claude",
+                        verdict: { state: "alive" },
+                      },
+                    ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      });
+
+      const apiClient = new HubApiClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+      const wsStub = {
+        setToken: vi.fn(),
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+        onStatusChange: () => () => {},
+        subscribe: () => () => {},
+      } as unknown as HubWsClient;
+
+      const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByTestId("agent-row-ferris")).toBeInTheDocument();
+      expect(screen.queryByTestId("agent-row-athena")).toBeNull();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ROSTER_POLL_INTERVAL_MS + 100);
+      });
+
+      expect(screen.getByTestId("agent-row-athena")).toBeInTheDocument();
+      expect(screen.getByTestId("liveness-dot-athena")).toHaveClass("fd-dot-alive");
+
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps signed-out empty-state sign-in prompt after closing the pairing modal", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (
+        url.includes("/api/v1/auth/session") ||
+        url.endsWith("/api/v1/agents") ||
+        url.endsWith("/api/v1/agents/liveness") ||
+        url.endsWith("/api/v1/sessions") ||
+        url.endsWith("/api/v1/projects")
+      ) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    const closeBtn = await screen.findByRole("button", {
+      name: "Close Pairing Modal",
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("roster-empty-state")).toHaveTextContent(
+        "Sign in to view the workspace agent roster.",
+      );
+    });
+
+    // Close the pairing modal while still unauthenticated
+    fireEvent.click(closeBtn);
+    expect(
+      screen.queryByRole("button", { name: "Close Pairing Modal" }),
+    ).toBeNull();
+
+    expect(screen.getByTestId("roster-empty-state")).toHaveTextContent(
+      "Sign in to view the workspace agent roster.",
+    );
+    expect(screen.queryAllByTestId(/^agent-row-/)).toHaveLength(0);
+
+    unmount();
+  });
+
+  it("leaves selectedAgent last-resort project unset instead of inventing FerroLoop", async () => {
+    const recordsCalls: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) {
+        return new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/agents")) {
+        return new Response(JSON.stringify({ agents: [], routes: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/api/v1/agents/liveness")) {
+        return new Response(JSON.stringify({ liveness: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/api/v1/sessions")) {
+        return new Response(JSON.stringify({ sessions: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/api/v1/projects")) {
+        return new Response(
+          JSON.stringify({
+            projects: [
+              {
+                id: "ferroloop",
+                slug: "ferroloop",
+                name: "FerroLoop",
+                kind: "project",
+                path: "/work/ferroloop",
+                has_git: true,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 0,
+              },
+              {
+                id: "sonora",
+                slug: "sonora",
+                name: "Sonora",
+                kind: "project",
+                path: "/work/sonora",
+                has_git: true,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 0,
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      if (url.includes("/api/v1/records")) {
+        recordsCalls.push(url);
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(
+      <App
+        apiClient={apiClient}
+        wsClient={wsStub}
+        initialSelectedAgentName="ferris"
+      />,
+    );
+
+    const projectBadge = await screen.findByTestId("active-project-badge");
+    expect(projectBadge.textContent).toBe("");
+
+    fireEvent.click(screen.getByTestId("split-view-toggle"));
+    const rightHeader = screen.getByTestId("right-panel-header");
+    fireEvent.click(within(rightHeader).getByTestId("right-panel-tab-board"));
+
+    const boardSelect = (await screen.findByTestId(
+      "board-project-select",
+    )) as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(boardSelect.options).map((o) => o.value)).toEqual([
+        "",
+        "ferroloop",
+        "sonora",
+      ]);
+    });
+    expect(boardSelect.value).toBe("");
+    expect(boardSelect.selectedOptions[0]?.textContent).toBe("None");
+    expect(recordsCalls).toEqual([]);
+    expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
+      "Scope: Project",
+    );
+    expect(
+      screen.getByTestId("active-context-tier-badge"),
+    ).not.toHaveTextContent(/ferroloop/i);
+
+    unmount();
+  });
+
+  it("dedupes back-to-back visibilitychange and focus events into a single roster/liveness refetch", async () => {
+    let agentsFetchCount = 0;
+    let livenessFetchCount = 0;
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) {
+        return new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/agents")) {
+        agentsFetchCount += 1;
+        return new Response(
+          JSON.stringify({
+            agents: [
+              {
+                id: "urn:fl:agent:ferris",
+                name_key: "ferris",
+                display_name: "Ferris",
+                project: "FerroLoop",
+                role: "lead",
+                status: "active",
+              },
+            ],
+            routes: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/agents/liveness")) {
+        livenessFetchCount += 1;
+        return new Response(JSON.stringify({ liveness: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    await screen.findByTestId("agent-row-ferris");
+    const baselineAgents = agentsFetchCount;
+    const baselineLiveness = livenessFetchCount;
+
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => false,
+    });
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(agentsFetchCount - baselineAgents).toBe(1);
+    expect(livenessFetchCount - baselineLiveness).toBe(1);
 
     unmount();
   });
