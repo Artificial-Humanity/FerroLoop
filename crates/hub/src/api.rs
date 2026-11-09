@@ -6872,9 +6872,12 @@ fn handle_post_session_spin_up(
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    // A virtual scope has no directory of its own: its agents start in the workspace root.
-    let mut payload =
-        payload.with_default_cwd(&*store, &resolve_workspace_root(&state.config.repo_root));
+    // Resolve project bindings before falling back to the workspace for a virtual scope.
+    let mut payload = payload.with_default_cwd_for_home(
+        &*store,
+        &resolve_workspace_root(&state.config.repo_root),
+        state.config.home_override.as_deref(),
+    );
     if payload.context_window.is_none() {
         payload.context_window = default_context_window_for(state, &payload);
     }
@@ -8490,6 +8493,57 @@ mod tests {
         let resp = handle_http_request(state, &req);
         let value = serde_json::from_slice(&resp.body).unwrap_or(json!(null));
         (resp.status, value)
+    }
+
+    #[test]
+    fn named_binding_cwd_api_uses_home_override_before_workspace_defaulting() {
+        let (tmp, mut state) = roles_test_state();
+        let workspace = tmp.path().join("workspace");
+        let umbrella = workspace.join("Sonora");
+        let root = umbrella.join("github");
+        let home = state.config.home_override.clone().unwrap();
+        for dir in [
+            root.join(".git"),
+            workspace.join("audio-suite"),
+            workspace.join("Notes"),
+            workspace.join(".agents/roles"),
+            workspace.join("FerroLoop"),
+            home.join(".config/fl"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        state.config.repo_root = workspace.join("FerroLoop");
+        for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+            fs::write(root.join(file), "registered project").unwrap();
+        }
+        fs::write(workspace.join(".agents/AGENTS.md"), "workspace").unwrap();
+        fs::write(workspace.join(".agents/roles/assistant.md"), "role").unwrap();
+        fs::write(
+            home.join(".config/fl/config.toml"),
+            format!(
+                "[[project]]\nname = 'Audio-Suite'\nroot = {:?}\n",
+                root.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&json!({
+            "persona": "ada", "project": "audio-suite", "role": "assistant", "vendor": "claude"
+        }))
+        .unwrap();
+        let (status, response) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/sessions/spin-up",
+            "owner-test-tok",
+            Some(body),
+        );
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response["warnings"], json!([]), "{response}");
+        let store = state.open_store().unwrap();
+        let record = lifecycle::find_hosted_session(&*store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.cwd.as_deref(), umbrella.to_str());
     }
 
     fn role_body(slug: &str, label: &str, builtin: bool) -> Vec<u8> {

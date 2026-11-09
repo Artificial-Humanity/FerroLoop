@@ -6,7 +6,7 @@ A project bound to `workspace/Sonora/github` starts in `workspace/Sonora` so its
 
 Hydration accepts a canonical, non-Git cwd containing the registered root only when cwd is a direct child of the established workspace. Workspace ancestors, unrelated siblings, foreign repositories, malformed Git metadata and symlink escapes must not gain trust. A sibling subproject in the same worktree may map silently to the corresponding bound subproject under the existing repository-identity rule.
 
-Keep explicit cwd overrides and roots outside the workspace. Keep catalog/workspace fallback for unbound projects. Invalid or ambiguous named bindings must not select unrelated guidance or a cwd by ordering.
+Keep explicit cwd overrides and roots outside the workspace. Ferris clarified that absent, unreadable or unmatched configuration must preserve existing cwd fallback without adding a spin-up error. Match the configuration slug exactly, case-insensitively, and read configuration without modifying it. Keep catalog/workspace fallback for unbound projects. Invalid or ambiguous named bindings must not select unrelated guidance or a cwd by ordering.
 
 Reforge should avoid optional hosted/project metadata reads when an external hydration prompt succeeds. If that helper fails or returns blank, read fresh registration, role, project and hosted metadata under one store lock, with authority checks on that same snapshot. External helper calls and filesystem rendering remain outside the lock. Recast and catalog-role guidance continue to bypass opaque external prompts; authority errors remain hard errors, optional hosted lookup failures stay sanitized warnings.
 

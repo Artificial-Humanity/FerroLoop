@@ -25,7 +25,7 @@ Preserve Sonora umbrella cwd; use registered-root guidance; no store schema chan
 **Interfaces:** Preserve public default-cwd compatibility where possible. Private `resolve_project_cwd` may accept home/config context. `Context::resolve_with_catalog` retains its existing inputs/output.
 
 - [ ] Add failing tests using non-Git `workspace/Sonora`, Git child `github`, and non-Git/separate-Git sibling fixtures. Prove named bindings with a different alias choose Sonora explicitly, and external roots keep their root.
-- [ ] Cover explicit cwd, no binding fallback, same-worktree sibling subproject mapping, malformed/ambiguous bindings, canonical containment and warning negatives.
+- [ ] Cover explicit cwd, absent/unreadable/unmatched config preserving existing fallback, exact case-insensitive slug matching and read-only configuration, same-worktree sibling subproject mapping, malformed/ambiguous bindings, canonical containment and warning negatives.
 - [ ] Run focused tests and preserve RED logs.
 - [ ] Implement name-based binding selection and workspace-child runtime path. Keep defaults consistent through API and CLI callers.
 - [ ] Add only the narrow non-Git direct-workspace-child allowance to hydration; retain registered-root guidance.

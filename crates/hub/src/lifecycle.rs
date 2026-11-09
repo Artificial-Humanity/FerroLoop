@@ -1735,12 +1735,23 @@ impl SpinUpRequest {
     /// one, an agent of a virtual scope (an area with no path, or a project no area names yet,
     /// which spin-up makes as one) starts in `workspace_root`, the one directory such a scope
     /// has; an agent of a directory-backed project keeps what the request said (no `cwd`).
-    /// A virtual scope whose name matches a project directory ([`resolve_project_cwd`]) starts
-    /// there instead. A `workspace_root` that is not a directory on this host is not used.
+    /// A virtual scope with a configured project binding or matching directory uses
+    /// [`resolve_project_cwd`] instead. A `workspace_root` that is not a directory on this
+    /// host is not used. Configuration follows the CLI's XDG/HOME lookup.
     pub fn with_default_cwd<S: AgentRegistry + Catalog>(
+        self,
+        store: &S,
+        workspace_root: &Path,
+    ) -> Self {
+        self.with_default_cwd_for_home(store, workspace_root, None)
+    }
+
+    /// Apply the same defaults using the hub's isolated configuration home.
+    pub fn with_default_cwd_for_home<S: AgentRegistry + Catalog>(
         mut self,
         store: &S,
         workspace_root: &Path,
+        home_override: Option<&Path>,
     ) -> Self {
         if trimmed_opt(&self.cwd).is_some() {
             return self;
@@ -1754,7 +1765,9 @@ impl SpinUpRequest {
             Err(_) => false,
         };
         if virtual_scope {
-            if let Some(dir) = resolve_project_cwd(store, &project, Some(workspace_root)) {
+            if let Some(dir) =
+                resolve_project_cwd(store, &project, Some(workspace_root), home_override)
+            {
                 self.cwd = Some(dir);
             } else if workspace_root.is_dir() {
                 self.cwd = Some(workspace_root.to_string_lossy().into_owned());
@@ -3656,14 +3669,55 @@ fn remove_routes_locked(
 ///
 /// Directory a spin-up should start in when the request names none.
 ///
-/// A catalog project whose directory name matches `project` wins. Otherwise a child of
-/// `workspace_root` with that name wins. Anything else stays unset, so the caller does
-/// not invent a path.
+/// A named config binding wins. Within the workspace, its top-level project umbrella is
+/// the runtime directory; outside it, the registered root is retained. Invalid or ambiguous
+/// bindings leave cwd unset. Without a readable binding, preserve catalog/directory fallback.
 fn resolve_project_cwd<S: Catalog>(
     store: &S,
     project: &str,
     workspace_root: Option<&Path>,
+    home_override: Option<&Path>,
 ) -> Option<String> {
+    use crate::project_init::{config_entries, read_config, user_config_path};
+
+    if let Some(config) = user_config_path(home_override)
+        && let Ok(entries) = read_config(&config).and_then(|doc| config_entries(&doc, &config))
+    {
+        let bindings: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .slug()
+                    .is_some_and(|slug| slug.eq_ignore_ascii_case(project))
+            })
+            .collect();
+        if !bindings.is_empty() {
+            // Every matching binding must resolve before any may supply a runtime path.
+            let mut roots: Vec<_> = bindings
+                .into_iter()
+                .map(|entry| {
+                    let root = Path::new(&entry.root);
+                    root.is_absolute()
+                        .then(|| root.canonicalize().ok().filter(|path| path.is_dir()))
+                        .flatten()
+                })
+                .collect::<Option<_>>()?;
+            roots.sort();
+            roots.dedup();
+            if roots.len() != 1 {
+                return None;
+            }
+            let root = roots.pop()?;
+            let cwd = workspace_root
+                .and_then(|workspace| workspace.canonicalize().ok())
+                .and_then(|workspace| {
+                    let child = root.strip_prefix(&workspace).ok()?.components().next()?;
+                    Some(workspace.join(child))
+                })
+                .unwrap_or(root);
+            return Some(cwd.display().to_string());
+        }
+    }
     if let Ok(projects) = store.list_projects() {
         for item in projects {
             let root = Path::new(item.root.trim());
@@ -3728,7 +3782,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         .map_err(LifecycleError::Invalid)?;
     }
     if v.cwd.is_none() {
-        v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root);
+        v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root, env.home_override);
     }
     // Before any side effect: an API vendor whose key is missing would register an agent that
     // can never run.
@@ -5584,7 +5638,8 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             _ => false,
         };
         if old_cwd.is_none() || old_is_ws_root {
-            resolve_project_cwd(store, &project, env.workspace_root).or_else(|| old_cwd.clone())
+            resolve_project_cwd(store, &project, env.workspace_root, env.home_override)
+                .or_else(|| old_cwd.clone())
         } else {
             old_cwd.clone()
         }
@@ -7921,6 +7976,153 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rec.cwd.as_deref(), Some(project_dir.to_str().unwrap()));
+    }
+
+    fn write_project_bindings(home: &Path, roots: &[PathBuf]) {
+        let config = home.join(".config/fl");
+        std::fs::create_dir_all(&config).unwrap();
+        let text: String = roots
+            .iter()
+            .map(|root| {
+                format!(
+                    "[[project]]\nname = 'Audio-Suite'\nroot = {:?}\n",
+                    root.to_str().unwrap()
+                )
+            })
+            .collect();
+        std::fs::write(config.join("config.toml"), text).unwrap();
+    }
+
+    #[test]
+    fn named_binding_cwd_uses_umbrella_before_catalog_or_workspace_names() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let umbrella = workspace.join("Sonora");
+        let root = umbrella.join("github");
+        let decoy = workspace.join("audio-suite");
+        for dir in [&root, &decoy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        write_project_bindings(home.path(), std::slice::from_ref(&root));
+        let store = MemStore::default();
+        store.add_project(decoy.to_str().unwrap()).unwrap();
+        let mut test_env = env(&home);
+        test_env.workspace_root = Some(&workspace);
+        let mut request = req("ada", "assistant", "claude");
+        request.project = "audio-suite".into();
+        spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+        let record = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.cwd.as_deref(), umbrella.to_str());
+        request.persona = "bea".into();
+        request.cwd = Some(root.display().to_string());
+        spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+        let record = find_hosted_session(&store, &["claude:bea"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.cwd.as_deref(), root.to_str());
+    }
+
+    #[test]
+    fn named_binding_cwd_keeps_external_roots_and_deduplicates_bindings() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let root = home.path().join("external/github");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        write_project_bindings(home.path(), &[root.clone(), root.clone()]);
+        let store = MemStore::default();
+        let mut test_env = env(&home);
+        test_env.workspace_root = Some(&workspace);
+        let mut request = req("ada", "assistant", "claude");
+        request.project = "audio-suite".into();
+        spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+        let record = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.cwd.as_deref(), root.to_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_binding_cwd_symlink_escape_keeps_canonical_external_root() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let root = home.path().join("external/github");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let link = workspace.join("Sonora");
+        std::os::unix::fs::symlink(root.parent().unwrap(), &link).unwrap();
+        write_project_bindings(home.path(), &[link.join("github")]);
+        let store = MemStore::default();
+        let mut test_env = env(&home);
+        test_env.workspace_root = Some(&workspace);
+        let mut request = req("ada", "assistant", "claude");
+        request.project = "audio-suite".into();
+        spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+        let record = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.cwd.as_deref(), root.to_str());
+    }
+
+    #[test]
+    fn named_binding_cwd_invalid_or_ambiguous_never_selects_a_decoy() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let root = workspace.join("Sonora/github");
+        let other = workspace.join("Other/github");
+        let decoy = workspace.join("audio-suite");
+        for dir in [&root, &other, &decoy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for roots in [
+            vec![root.clone(), other],
+            vec![PathBuf::from(".")],
+            vec![root.clone(), workspace.join("missing")],
+        ] {
+            write_project_bindings(home.path(), &roots);
+            let store = MemStore::default();
+            store.add_project(decoy.to_str().unwrap()).unwrap();
+            let mut test_env = env(&home);
+            test_env.workspace_root = Some(&workspace);
+            let mut request = req("ada", "assistant", "claude");
+            request.project = "audio-suite".into();
+            spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
+            let record = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.cwd, None, "bindings: {roots:?}");
+        }
+    }
+
+    #[test]
+    fn named_binding_cwd_unavailable_or_unbound_config_preserves_catalog_fallback() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("audio-suite");
+        std::fs::create_dir(&root).unwrap();
+        let config = home.path().join(".config/fl/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        for contents in [None, Some(""), Some("not valid [toml"), Some("directory")] {
+            if let Some(text) = contents {
+                if text == "directory" {
+                    std::fs::remove_file(&config).unwrap();
+                    std::fs::create_dir(&config).unwrap();
+                } else {
+                    std::fs::write(&config, text).unwrap();
+                }
+            }
+            let store = MemStore::default();
+            store.add_project(root.to_str().unwrap()).unwrap();
+            let mut request = req("ada", "assistant", "claude");
+            request.project = "audio-suite".into();
+            spin_up(&store, &env(&home), &request, "owner", Caller::Owner).unwrap();
+            let record = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.cwd.as_deref(), root.to_str(), "config: {contents:?}");
+        }
     }
 
     #[test]
