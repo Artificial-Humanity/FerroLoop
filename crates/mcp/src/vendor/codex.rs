@@ -9,6 +9,7 @@
 use super::{Field, Fields, FileRefusal, Rendered, Vendor, VendorFile, VendorRefusal};
 use super::{Kind, args, command, env, headers, refuse, url};
 use crate::catalog::{EnvValue, HeaderValue, Server, Transport, VendorName};
+use crate::project_paths::{read_bounded_file, resolve_git_project};
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
@@ -52,68 +53,23 @@ pub fn check_codex_project_trust(
             return Err("cwd is not a directory".into());
         }
         error.cwd = cwd.clone();
-        let mut project: &Path = &cwd;
-        let mut marker_exists = false;
-        for ancestor in cwd.ancestors() {
-            match ancestor.join(".git").symlink_metadata() {
-                Ok(_) => {
-                    project = ancestor;
-                    marker_exists = true;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err("cannot inspect Git directory marker".into()),
+        let layout = resolve_git_project(&cwd).map_err(|why| {
+            if let Some(project) = &why.worktree_root {
+                error.key = toml::Value::String(project.display().to_string());
             }
-        }
+            why.to_string()
+        })?;
+        let project = layout.as_ref().map_or(&cwd, |layout| &layout.worktree_root);
         error.key = toml::Value::String(project.display().to_string());
-        let mut keys = vec![project.to_path_buf()];
-        let marker = project.join(".git");
-        if marker_exists && !marker.is_dir() {
-            let text = read_trust_file(&marker, 8192)
-                .map_err(|why| format!("Git directory marker: {why}"))?;
-            let gitdir = text
-                .strip_prefix("gitdir:")
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or("invalid Git directory marker")?;
-            let gitdir = project
-                .join(gitdir)
-                .canonicalize()
-                .map_err(|_| "cannot resolve Git directory")?;
-            if !gitdir.is_dir() {
-                return Err("Git directory is not a directory".into());
-            }
-            let common_marker = gitdir.join("commondir");
-            match common_marker.symlink_metadata() {
-                // Submodules and --separate-git-dir repositories do not need
-                // commondir. Its absence leaves only the explicit project key.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err("cannot inspect Git common directory marker".into()),
-                Ok(_) => {
-                    // Inspect without following symlinks above, so a dangling
-                    // marker is refused rather than treated as absent.
-                    let common = read_trust_file(&common_marker, 8192)
-                        .map_err(|why| format!("Git common directory marker: {why}"))?;
-                    if common.trim().is_empty() {
-                        return Err("invalid Git common directory".into());
-                    }
-                    let common = gitdir
-                        .join(common.trim())
-                        .canonicalize()
-                        .map_err(|_| "cannot resolve Git common directory")?;
-                    if !common.is_dir() {
-                        return Err("Git common directory is not a directory".into());
-                    }
-                    let main = common
-                        .parent()
-                        .ok_or("Git common directory has no parent")?;
-                    if main != project {
-                        keys.push(main.into());
-                    }
-                }
-            }
+        let mut keys = vec![project.clone()];
+        if let Some(main) = layout
+            .as_ref()
+            .and_then(|layout| layout.main_checkout_root.as_ref())
+            && main != project
+        {
+            keys.push(main.clone());
         }
-        let text = read_trust_file(config_path, 1024 * 1024)?;
+        let text = read_bounded_file(config_path, 1024 * 1024)?;
         let config = text.parse::<toml::Table>().map_err(|e| {
             let at = e.span().map_or(0, |s| s.start).min(text.len());
             let line = text.as_bytes()[..at]
@@ -141,38 +97,6 @@ pub fn check_codex_project_trust(
         error.reason = reason;
         error
     })
-}
-
-/// Metadata prevents opening devices/FIFOs; the limited reader also detects growth or
-/// understated metadata, without ever allocating an unbounded configuration string.
-fn read_trust_file(path: &Path, limit: u64) -> Result<String, String> {
-    use std::io::Read;
-    let unreadable = |e: std::io::Error| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "input does not exist".to_string()
-        } else {
-            "fl could not read input".to_string()
-        }
-    };
-    let metadata = path.metadata().map_err(unreadable)?;
-    if !metadata.is_file() {
-        return Err("fl could not read input: not a regular file".into());
-    }
-    if metadata.len() > limit {
-        return Err(format!("input exceeds {limit} byte limit"));
-    }
-    let file = std::fs::File::open(path).map_err(unreadable)?;
-    if !file.metadata().map_err(unreadable)?.is_file() {
-        return Err("input is not a regular file".into());
-    }
-    let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    if bytes.len() as u64 > limit {
-        return Err(format!("input exceeds {limit} byte limit"));
-    }
-    String::from_utf8(bytes).map_err(|_| "input is not UTF-8".into())
 }
 
 pub struct Codex;
@@ -605,29 +529,19 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn bounded_trust_read_detects_bytes_when_metadata_reports_zero() {
-        // procfs reports zero bytes even though this process has a nonempty command line.
-        let file = Path::new("/proc/self/cmdline");
-        assert_eq!(std::fs::metadata(file).unwrap().len(), 0);
-        assert!(
-            super::read_trust_file(file, 1)
-                .unwrap_err()
-                .contains("1 byte limit")
-        );
-    }
-
     #[test]
     fn trust_rejects_bad_git_indirection_even_with_a_trusted_entry() {
         let (dir, cwd, config) = trust_fixture();
         std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+        let sub = cwd.join("src");
+        std::fs::create_dir(&sub).unwrap();
         for text in ["PRIVATE_TOKEN".to_string(), "x".repeat(8193)] {
             std::fs::write(cwd.join(".git"), text).unwrap();
-            let err = check_codex_project_trust(&cwd, &config)
+            let err = check_codex_project_trust(&sub, &config)
                 .unwrap_err()
                 .to_string();
             assert!(!err.contains("PRIVATE_TOKEN"));
+            assert!(err.contains(trust_entry(&cwd, "trusted").trim()), "{err}");
         }
         let gitdir = dir.path().join("gitdir");
         std::fs::write(cwd.join(".git"), format!("gitdir: {}", gitdir.display())).unwrap();

@@ -61,6 +61,14 @@ this avoids adding one or placing a vendor-specific resolver in the hub. Keep th
 existing Codex trust precedence, no-Git behavior, diagnostics, 1 MiB config cap and
 8 KiB indirection caps unchanged. This extraction is a separate reviewed task.
 
+Task 1 preserves the original marker-shape boundary: a directory `.git` marker
+uses its own canonical path as identity and does not read `commondir`. A gitfile
+resolves its canonical target and optional `commondir`; no HEAD/objects/refs health
+checks are added. The `main_checkout_root` field is the parent of that resolved
+`commondir`, preserving Codex's fallback convention, not independent proof of a
+checkout. Task 2 must use this API conservatively for repository identity and warn
+and fall back for unsupported or ambiguous layouts.
+
 ## Guidance selection and rendering
 
 - Resolve a built-in or legacy file role in this order:

@@ -39,18 +39,36 @@ error. `common_dir` is canonical commondir when present, otherwise canonical git
 `main_checkout_root` preserves the old Codex fallback when commondir is present.
 Keep bounded file reading shared internally so extraction does not duplicate it.
 
-- [ ] Add failing layout tests for normal repository/subdirectory, linked worktree,
+- [x] Add failing layout tests for normal repository/subdirectory, linked worktree,
       no Git, standalone gitfile/submodule, relative gitdir and commondir, symlinks,
       missing target, dangling/unreadable/non-regular/oversized markers and safe errors.
-- [ ] Observe RED, extract the existing parser and implement the public layout
+- [x] Observe RED, extract the existing parser and implement the public layout
       result. Do not add HEAD/objects/refs health validation or repository mutation.
-- [ ] Make Codex trust consume the helper. Preserve canonical cwd, root-key-first
+- [x] Make Codex trust consume the helper. Preserve canonical cwd, root-key-first
       denial precedence, no-Git direct cwd trust, optional commondir behavior,
       diagnostic redaction and config/Git byte limits (1 MiB / 8 KiB).
-- [ ] Run `cargo test -p fl-mcp`, relevant hub Codex trust tests and CLI MCP black-box
+- [x] Run `cargo test -p fl-mcp`, relevant hub Codex trust tests and CLI MCP black-box
       tests; run Clippy for affected targets, formatting and diff checks. Record logs.
-- [ ] Commit with Fiona trailer; fresh independent task review and fix loop before
-      Task 2 consumes this API.
+- [x] Commit with Fiona trailer.
+- [ ] Fresh independent task review and fix loop before Task 2 consumes this API.
+
+**Implemented API:** `fl_mcp::project_paths::resolve_git_project(cwd: &Path) ->
+Result<Option<GitProjectLayout>, GitProjectError>`, with the four public path fields
+specified above. Errors expose safe Display/Debug diagnostics and keep discovered
+root context crate-private for Codex's suggested trust key. One crate-private
+`read_bounded_file` serves Git metadata and Codex config. Directory `.git` markers
+do not inspect `commondir`; only gitfiles do. `main_checkout_root` is the optional
+parent of the resolved common directory, not independent checkout verification.
+The existing procfs bounded-reader test moved alongside the shared implementation;
+Codex's malformed-metadata test additionally checks the root key from a child cwd.
+
+**Task 1 verification:** RED recorded nine intended failures (exit 101). GREEN:
+`fl-mcp` 187 unit tests and four catalog tests passed (two existing tests ignored);
+three hub `codex_trust` tests and 30 CLI MCP black-box tests passed. Clippy for
+`fl-mcp`, `fl-hub` and `fl-cli`, all targets with `-D warnings`, formatting and diff
+checks passed. External artifacts: `paths-task1-{red,mcp,hub-codex-trust,cli-mcp,
+clippy,fmt,diff}.log`, each retaining its exit code. Full workspace verification
+remains at Task 2's final gate; independent Task 1 review remains pending.
 
 ### Task 2: Render resolved guidance and propagate warnings
 
