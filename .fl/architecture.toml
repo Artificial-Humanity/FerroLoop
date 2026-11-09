@@ -12,9 +12,9 @@ paths = ["crates/core/**"]
 
 [[components]]
 id = "fl_store"
-title = "Redb Store"
+title = "FerroStore"
 kind = "store"
-description = "Durable local redb persistence for catalog, ledger, state, wire, and workflows"
+description = "Embedded .fls store (ferro engine, redb selectable), its socket server, FerroState search, and the code index"
 package = "fl-store"
 paths = ["crates/store/**"]
 
