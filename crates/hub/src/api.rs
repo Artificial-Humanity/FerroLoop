@@ -5702,6 +5702,7 @@ fn operator_prompt_intent(authority: &HubAuthority, send_now: bool) -> OperatorP
     }
 }
 
+#[cfg_attr(test, allow(clippy::too_many_arguments))] // Keep test transport scoped to queued calls.
 fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -5710,6 +5711,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     body: &str,
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
+    #[cfg(test)] queued: bool,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
     BEFORE_PROMPT_DISPATCH.with(|hook| {
@@ -5748,7 +5750,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 return Err(PushError::NotConnected("synthetic connect refusal".into()));
             }
             #[cfg(test)]
-            if QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+            if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
                 return Ok(OperatorPromptOutcome::TransportAccepted);
             }
             let delivery = if intent == OperatorPromptIntent::OwnerSendNow
@@ -5831,6 +5833,8 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         body,
         intent,
         intended_codex_thread_id,
+        #[cfg(test)]
+        true,
     )
 }
 
@@ -5932,7 +5936,20 @@ pub fn drain_ready_session_queues(state: &HubState) {
         let canonical_id = match state.prompt_queue_target(&session_id) {
             Ok(Some(target)) => target.session_id,
             Ok(None) => resolve_session_target_in(&sessions, &session_id).0,
-            Err(()) => continue,
+            Err(()) => {
+                let queue = state.note_pending_queue_error(&session_id, "ambiguous queued session alias; use the original session ID to resolve or discard its queue");
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": session_id,
+                        "persona": queue.first().and_then(|item| item.persona.as_deref()),
+                        "is_busy": true,
+                        "queue": queue,
+                    }),
+                );
+                continue;
+            }
         };
         let mut files = TranscriptReads::default();
         let turns =
@@ -6434,6 +6451,16 @@ fn handle_post_session_prompt(
         },
     ) {
         crate::DirectPromptDecision::Dispatch(claim) => claim,
+        crate::DirectPromptDecision::FencedAlias(original) => {
+            return HttpResponse::json(
+                409,
+                json!({
+                    "error": format!("{} has fenced queued prompts on {original}; resolve or discard that queue", session_id.trim()),
+                    "delivered": false,
+                    "delivery_stage": "refused",
+                }),
+            );
+        }
         crate::DirectPromptDecision::DispatchBusy => {
             return HttpResponse::json(
                 409,
@@ -6475,6 +6502,8 @@ fn handle_post_session_prompt(
         &effective_body,
         operator_prompt_intent(authority, payload.send_now),
         intended_codex_thread_id.as_deref(),
+        #[cfg(test)]
+        false,
     );
     match &delivery_res {
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}

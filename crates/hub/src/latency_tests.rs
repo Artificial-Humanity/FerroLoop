@@ -34,6 +34,15 @@ pub(crate) fn hub_with_ferris(tmp: &TempDir, turns: usize) -> HubState {
         session_ttl_secs: 3600,
         home_override: Some(tmp.path().to_path_buf()),
     });
+    // Each fixture owns its transport; direct dispatch must never reach a live CLI.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tmp.path().join(".local/bin/agy");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, "#!/bin/sh\ncase \"$1 $2\" in\n  'agentapi send-message') printf '%s\\n' \"$4\" >> \"$0.calls\" ;;\nesac\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     write_ferris_transcript(tmp.path(), turns);
     {
         let store = state.open_store().unwrap();
@@ -801,6 +810,176 @@ fn removed_route_alias_falls_back_to_original_queue_and_refuses_send_now() {
     assert_eq!(forced.json_value().unwrap()["delivered"], false);
     assert!(state.session_in_flight_unconfirmed("conv-ferris-1"));
     assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+}
+
+#[test]
+fn replacement_session_cannot_overtake_fenced_queue_via_persona_alias() {
+    for send_now in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let original = tmp.path().join(
+            ".gemini/antigravity-cli/brain/conv-ferris-1/.system_generated/logs/transcript.jsonl",
+        );
+        let transcript = fs::read(&original).unwrap();
+        crate::api::after_next_prompt_dispatch(move || fs::remove_file(original).unwrap());
+        let (first, _) = post_prompt(&state, false);
+        assert_eq!(first.json_value().unwrap()["delivered"], true);
+        assert_eq!(first.json_value().unwrap()["in_flight_unconfirmed"], true);
+        let (second, _) = post_prompt(&state, false);
+        assert_eq!(second.json_value().unwrap()["status"], "queued");
+        let replacement = write_agy_identity(tmp.path(), "conv-ferris-2", "Ferris");
+        fs::write(replacement, transcript).unwrap();
+        crate::discovery::scan_and_save_route_table(Some(tmp.path()));
+        let calls = tmp.path().join(".local/bin/agy.calls");
+        assert_eq!(fs::read_to_string(&calls).unwrap(), "conv-ferris-1\n");
+        let (third, _) = post_prompt(&state, send_now);
+        assert_eq!(third.status, 409);
+        let error = third.json_value().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(error.contains("fenced queued prompts on conv-ferris-1"));
+        assert!(error.contains("resolve or discard"));
+        assert_eq!(fs::read_to_string(&calls).unwrap(), "conv-ferris-1\n");
+        let exact = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/conv-ferris-2/prompt")
+                .with_header("Authorization", OWNER)
+                .with_json_body(&json!({"prompt":"exact", "send_now":send_now})),
+        );
+        assert_eq!(exact.json_value().unwrap()["delivered"], true);
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "conv-ferris-1\nconv-ferris-2\n"
+        );
+        assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+        assert!(state.session_in_flight_unconfirmed("conv-ferris-1"));
+    }
+}
+
+#[test]
+fn replacement_admission_checks_queue_created_after_its_discovery() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let original = crate::discovery::lookup_one_route_session(
+        &crate::discovery::DiscoveryStoreSnapshot::default(),
+        Some(tmp.path()),
+        "ferris",
+    )
+    .unwrap();
+    let mut replacement = original.clone();
+    replacement.id = "conv-ferris-2".into();
+    let input = |session: &crate::DiscoveredSessionSummary| crate::DirectPromptInput {
+        queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
+        intended_codex_thread_id: None,
+        persona: Some("ferris".into()),
+        prompt: "prompt".into(),
+        effective_body: "prompt".into(),
+        by: "owner".into(),
+        attachments: vec![],
+    };
+    for force in [false, true] {
+        // The replacement was discovered before another request enqueues on the original.
+        let stale_input = input(&replacement);
+        let mut queues = state.prompt_queues.lock().unwrap();
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let blocked = scope.spawn(|| {
+                ready.wait();
+                match state.admit_direct_prompt(
+                    &replacement.id,
+                    "ferris",
+                    force,
+                    false,
+                    stale_input,
+                ) {
+                    crate::DirectPromptDecision::FencedAlias(session) => {
+                        assert_eq!(session, "conv-ferris-1")
+                    }
+                    _ => panic!("stale discovery must not bypass concurrent enqueue"),
+                }
+            });
+            ready.wait();
+            queues.enqueue(&original.id, input(&original));
+            drop(queues);
+            blocked.join().unwrap();
+        });
+    }
+    assert_eq!(state.session_queue(&original.id).len(), 2);
+    assert!(state.session_queue(&replacement.id).is_empty());
+}
+
+#[test]
+fn queued_delivery_stub_does_not_short_circuit_direct_transport() {
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let (response, _) = post_prompt(&state, false);
+    assert_eq!(response.json_value().unwrap()["delivered"], true);
+    let calls = tmp.path().join(".local/bin/agy.calls");
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap_or_default(),
+        "conv-ferris-1\n",
+        "direct delivery must exercise the transport"
+    );
+    let (queued, _) = post_prompt(&state, false);
+    assert_eq!(queued.json_value().unwrap()["status"], "queued");
+    write_ferris_transcript(tmp.path(), 4);
+    crate::api::drain_ready_session_queues(&state);
+    assert!(state.session_queue("conv-ferris-1").is_empty());
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "conv-ferris-1\n",
+        "queued delivery remains stubbed after validation"
+    );
+}
+
+#[test]
+fn ambiguous_queued_alias_records_delivery_error_without_push() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let original = crate::discovery::lookup_one_route_session(
+        &crate::discovery::DiscoveryStoreSnapshot::default(),
+        Some(tmp.path()),
+        "ferris",
+    )
+    .unwrap();
+    let mut replacement = original.clone();
+    replacement.id = "conv-replacement".into();
+    for session in [&original, &replacement] {
+        let mut guard = state.prompt_queues.lock().unwrap();
+        guard.remember_target(crate::PromptQueueTarget::observed(session, "ferris"));
+        drop(guard);
+        state.mark_session_in_flight_from_observation(&session.id, None);
+    }
+    let (item, _) = state.enqueue_session_prompt(
+        "ferris",
+        Some("ferris".into()),
+        "queued".into(),
+        "queued".into(),
+        "owner".into(),
+        vec![],
+    );
+    let mut events = state.subscribe();
+    crate::api::drain_ready_session_queues(&state);
+    let queue = state.session_queue("ferris");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].id, item.id);
+    assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Pending);
+    assert!(
+        queue[0]
+            .delivery_error
+            .as_deref()
+            .is_some_and(|error| error.contains("ambiguous queued session alias")),
+        "{queue:?}"
+    );
+    let event = events.try_recv().unwrap();
+    assert!(
+        serde_json::to_string(&event)
+            .unwrap()
+            .contains("ambiguous queued session alias")
+    );
+    assert!(!tmp.path().join(".local/bin/agy.calls").exists());
 }
 
 #[test]

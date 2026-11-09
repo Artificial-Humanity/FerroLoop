@@ -1329,24 +1329,32 @@ impl RouteTable {
         // A cached conversation ID is not evidence by itself: its bounded transcript head
         // must still identify that persona, with a known nonzero source timestamp.
         let mut candidates: Vec<(u64, String, String)> = Vec::new();
-        if let Ok(read_dir) = fs::read_dir(&brain_dir) {
-            for entry in read_dir.flatten() {
-                let conv_dir = entry.path();
-                let Some(conv_id) = conv_dir.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let transcript = conv_dir
-                    .join(".system_generated")
-                    .join("logs")
-                    .join("transcript.jsonl");
-                let file_ms = mtime_ms(&transcript);
-                if transcript.is_file()
-                    && file_ms > 0
-                    && let Some(persona) = scan_transcript_for_persona(&transcript, 50)
-                {
-                    candidates.push((file_ms, conv_id.to_string(), persona));
+        let mut rejected_sources = BTreeMap::new();
+        let mut absent_reason = "source missing";
+        match fs::read_dir(&brain_dir) {
+            Ok(read_dir) => {
+                for entry in read_dir {
+                    let Ok(entry) = entry else {
+                        absent_reason = "conversation directory unreadable";
+                        continue;
+                    };
+                    let conv_dir = entry.path();
+                    let Some(conv_id) = conv_dir.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let transcript = conv_dir.join(".system_generated/logs/transcript.jsonl");
+                    match passive_agy_source(&transcript) {
+                        Ok((file_ms, persona)) => {
+                            candidates.push((file_ms, conv_id.to_owned(), persona))
+                        }
+                        Err(reason) => {
+                            rejected_sources.insert(conv_id.to_owned(), reason);
+                        }
+                    }
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => absent_reason = "source directory unreadable",
         }
         let validated: BTreeMap<&str, &str> = candidates
             .iter()
@@ -1369,6 +1377,21 @@ impl RouteTable {
                     _ => true,
                 };
             if !keep {
+                if let VendorRoute::Agy { conversation_id, .. } = &entry.route {
+                    let reason = if validated.contains_key(conversation_id.as_str()) {
+                        "persona mismatch"
+                    } else {
+                        rejected_sources.get(conversation_id).copied().unwrap_or(absent_reason)
+                    };
+                    // JSON escaping keeps untrusted IDs on one line. Never format the route:
+                    // it contains endpoint and credential material unrelated to rejection.
+                    let diagnostic = format!("fl-wire: rejected passive Antigravity claim {}", serde_json::json!({
+                        "persona": persona, "conversation_id": conversation_id, "reason": reason,
+                    }));
+                    eprintln!("{diagnostic}");
+                    #[cfg(test)]
+                    tests::AGY_REJECTION_DIAGNOSTICS.with(|lines| lines.borrow_mut().push(diagnostic));
+                }
                 self.passive_agy_revalidation.insert(
                     persona.clone(),
                     PassiveAgyRevalidation {
@@ -3234,6 +3257,33 @@ fn is_tool_output_type(kind: Option<&str>) -> bool {
                 | "generic"
         )
     )
+}
+
+/// Retain the bounded scan's rejection reason without reading the source a second time.
+fn passive_agy_source(path: &Path) -> Result<(u64, String), &'static str> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "source missing"
+        } else {
+            "source unreadable"
+        }
+    })?;
+    if !metadata.is_file() {
+        return Err("source unreadable (not a regular file)");
+    }
+    let file_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    if file_ms == 0 {
+        return Err("source mtime is zero or unknown");
+    }
+    let text = read_head_lines(path, 50).ok_or("source unreadable")?;
+    let persona =
+        scan_text_for_persona(&text, 50).ok_or("no supported identity in bounded source head")?;
+    Ok((file_ms, persona))
 }
 
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
@@ -8386,6 +8436,91 @@ mod tests {
         fs::write(&transcript, text).unwrap();
         set_mtime(&transcript, ms);
         transcript
+    }
+
+    thread_local! {
+        pub(super) static AGY_REJECTION_DIAGNOSTICS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn passive_agy_rejections_explain_source_failure_without_secrets() {
+        for (source, reason) in [
+            ("missing", "missing"),
+            ("unreadable", "unreadable"),
+            ("zero", "zero"),
+            ("mismatch", "mismatch"),
+            ("generic", "no supported identity"),
+            ("valid", ""),
+            ("explicit", ""),
+        ] {
+            let home = TempDir::new().unwrap();
+            let conversation = "cached-conversation\nforged-line";
+            let path = agy_registration_fixture(
+                home.path(),
+                conversation,
+                if source == "mismatch" {
+                    "Kacey"
+                } else {
+                    "Kayla"
+                },
+                100,
+            );
+            match source {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "unreadable" => {
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                }
+                "zero" => set_mtime(&path, 0),
+                "generic" | "explicit" => {
+                    fs::write(&path, "{\"type\":\"GENERIC\",\"content\":\"secret-transcript fl wire register Kayla\"}").unwrap();
+                    set_mtime(&path, 100);
+                }
+                _ => {}
+            }
+            let route = VendorRoute::Agy {
+                conversation_id: conversation.into(),
+                ls_pid: None,
+                ls_address: Some("secret-endpoint".into()),
+                csrf_token: Some("secret-csrf".into()),
+                agentapi_exe: None,
+            };
+            let mut table = RouteTable::default();
+            if source == "explicit" {
+                table.upsert_explicit("kayla", route, At::from_unix_millis(9000));
+            } else {
+                table.upsert("kayla", route, At::from_unix_millis(9000));
+            }
+            AGY_REJECTION_DIAGNOSTICS.with(|lines| lines.borrow_mut().clear());
+            table.discover_agy_routes(home.path(), false, &At::from_unix_millis(10000));
+            let lines =
+                AGY_REJECTION_DIAGNOSTICS.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+            if reason.is_empty() {
+                assert!(lines.is_empty(), "{source}: {lines:?}");
+                continue;
+            }
+            assert_eq!(lines.len(), 1, "{source}");
+            let line = &lines[0];
+            let fields: serde_json::Value = serde_json::from_str(
+                line.strip_prefix("fl-wire: rejected passive Antigravity claim ")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fields.as_object().unwrap().len(), 3);
+            assert_eq!(fields["persona"], "kayla");
+            assert_eq!(fields["conversation_id"], conversation);
+            assert!(fields["reason"].as_str().unwrap().contains(reason));
+            assert!(
+                line.contains("kayla")
+                    && line.contains("cached-conversation")
+                    && line.contains(reason),
+                "{source}: {line}"
+            );
+            assert_eq!(line.lines().count(), 1);
+            for secret in ["secret-csrf", "secret-endpoint", "secret-transcript"] {
+                assert!(!line.contains(secret));
+            }
+        }
     }
 
     #[test]

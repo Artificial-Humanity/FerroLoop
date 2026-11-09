@@ -269,6 +269,7 @@ pub(crate) enum DirectPromptDecision<'a> {
     Dispatch(SessionDispatchGuard<'a>),
     Queued(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>),
     DispatchBusy,
+    FencedAlias(String),
 }
 
 impl PromptQueueState {
@@ -852,6 +853,21 @@ impl HubState {
         input: DirectPromptInput,
     ) -> DirectPromptDecision<'a> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        // Discovery can change while a prompt is being admitted. Check retained ownership
+        // under the same lock as enqueue/claim so a persona cannot overtake its old queue.
+        // An exact native session ID is an intentional, independent destination.
+        if raw.trim() != canonical
+            && let Some(target) = guard.targets.values().find(|target| {
+                target.session_id != canonical
+                    && target.aliases.contains(raw.trim())
+                    && guard
+                        .queues
+                        .get(&target.session_id)
+                        .is_some_and(|q| !q.is_empty())
+            })
+        {
+            return DirectPromptDecision::FencedAlias(target.session_id.clone());
+        }
         let active =
             guard.active_queue_sends.contains(canonical) || guard.active_queue_sends.contains(raw);
         if force && active {
@@ -885,6 +901,25 @@ impl HubState {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.active_queue_sends.remove(canonical);
         guard.active_queue_sends.remove(raw);
+    }
+
+    /// Explain an automatic drain refusal without claiming or changing pending deliveries.
+    pub(crate) fn note_pending_queue_error(
+        &self,
+        session_key: &str,
+        error: &str,
+    ) -> Vec<QueuedOperatorPrompt> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return Vec::new();
+        };
+        for item in queue
+            .iter_mut()
+            .filter(|item| item.delivery_state == QueuedDeliveryState::Pending)
+        {
+            item.delivery_error = Some(error.to_owned());
+        }
+        queue.clone()
     }
 
     /// Complete the exact claim. Failed unknown deliveries are retained as evidence and fenced.
