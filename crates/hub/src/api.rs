@@ -5649,8 +5649,15 @@ thread_local! {
         std::cell::RefCell::new(None);
     static AFTER_PROMPT_DISPATCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static REFUSE_PROMPT_PUSH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
     static AFTER_QUEUE_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn refuse_next_prompt_push(f: impl FnOnce() + 'static) {
+    REFUSE_PROMPT_PUSH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
 }
 
 #[cfg(test)]
@@ -5695,6 +5702,7 @@ fn operator_prompt_intent(authority: &HubAuthority, send_now: bool) -> OperatorP
     }
 }
 
+#[cfg_attr(test, allow(clippy::too_many_arguments))] // Keep test transport scoped to queued calls.
 fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -5703,6 +5711,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     body: &str,
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
+    #[cfg(test)] queued: bool,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
     BEFORE_PROMPT_DISPATCH.with(|hook| {
@@ -5717,6 +5726,33 @@ fn dispatch_operator_prompt_with_intent_for_session(
         state.config.home_override.as_deref(),
         session_route_query(persona, session_id),
         |route| {
+            match state.prompt_queue_target(session_id) {
+                Ok(Some(target)) => {
+                    if !target.accepts(route) {
+                        return Err(PushError::NotConnected("resolved route does not serve the queued Antigravity session".into()));
+                    }
+                    // A retained queue can outlive passive identity evidence. Revalidate
+                    // at the push boundary, including each rediscovery retry.
+                    if !state.session_queue(session_id).is_empty()
+                        && crate::lifecycle::rescan_route(state.config.home_override.as_deref(),
+                            session_route_query(persona, session_id)).as_ref() != Some(route)
+                    {
+                        return Err(PushError::NotConnected("queued session route is no longer current".into()));
+                    }
+                }
+                Err(()) => return Err(PushError::NotConnected("ambiguous queued session alias".into())),
+                _ => {}
+            }
+            #[cfg(test)]
+            if REFUSE_PROMPT_PUSH.with(|hook| {
+                if let Some(f) = hook.borrow_mut().take() { f(); true } else { false }
+            }) {
+                return Err(PushError::NotConnected("synthetic connect refusal".into()));
+            }
+            #[cfg(test)]
+            if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+                return Ok(OperatorPromptOutcome::TransportAccepted);
+            }
             let delivery = if intent == OperatorPromptIntent::OwnerSendNow
                 && match intended_codex_thread_id {
                     Some(intended) => !matches!(route,
@@ -5779,7 +5815,9 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     intended_codex_thread_id: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
-    if QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+    if QUEUED_TEST_DELIVERY.with(|flag| flag.get())
+        && matches!(state.prompt_queue_target(session_id), Ok(None))
+    {
         AFTER_PROMPT_DISPATCH.with(|hook| {
             if let Some(f) = hook.borrow_mut().take() {
                 f();
@@ -5795,6 +5833,8 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         body,
         intent,
         intended_codex_thread_id,
+        #[cfg(test)]
+        true,
     )
 }
 
@@ -5893,7 +5933,24 @@ pub fn drain_ready_session_queues(state: &HubState) {
         // Keep the discovered path across the dispatch: if the file disappears before
         // the post-send observation, it is unknown rather than a new empty transcript.
         let sessions = lookup_sessions(&snap, home);
-        let (canonical_id, _) = resolve_session_target_in(&sessions, &session_id);
+        let canonical_id = match state.prompt_queue_target(&session_id) {
+            Ok(Some(target)) => target.session_id,
+            Ok(None) => resolve_session_target_in(&sessions, &session_id).0,
+            Err(()) => {
+                let queue = state.note_pending_queue_error(&session_id, "ambiguous queued session alias; use the original session ID to resolve or discard its queue");
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": session_id,
+                        "persona": queue.first().and_then(|item| item.persona.as_deref()),
+                        "is_busy": true,
+                        "queue": queue,
+                    }),
+                );
+                continue;
+            }
+        };
         let mut files = TranscriptReads::default();
         let turns =
             transcript_observation_from_sessions(&canonical_id, &sessions, &snap, home, &mut files);
@@ -5974,7 +6031,13 @@ fn handle_post_queued_prompt_send_now(
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
-    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
+    let (canonical_id, target_persona) = match state.prompt_queue_target(raw_session_id) {
+        Ok(Some(target)) => (target.session_id, target.persona),
+        Ok(None) => resolve_session_target(state, raw_session_id),
+        Err(()) => {
+            return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+        }
+    };
     let claimed = state.claim_queued_for_dispatch(&canonical_id, raw_session_id, prompt_id, false);
     let Some((item, claim)) = claimed else {
         let exists = state
@@ -6323,7 +6386,32 @@ fn handle_post_session_prompt(
         let sessions = lookup_sessions(&snap, home);
         (snap, sessions)
     };
-    let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
+    let observed_target = sessions
+        .iter()
+        .find(|s| s.id == session_id.trim() || s.persona.as_deref() == Some(session_id.trim()));
+    let retained_target = if observed_target.is_none() {
+        match state.prompt_queue_target(session_id.trim()) {
+            Ok(target) => target,
+            Err(()) => {
+                return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+            }
+        }
+    } else {
+        None
+    };
+    if payload.send_now && retained_target.is_some() {
+        return HttpResponse::json(
+            409,
+            json!({
+                "error": "no active vendor route for the queued session", "delivered": false,
+                "delivery_stage": "transport_failed",
+            }),
+        );
+    }
+    let (canonical_session_id, target_persona) = retained_target
+        .as_ref()
+        .map(|target| (target.session_id.clone(), target.persona.clone()))
+        .unwrap_or_else(|| resolve_session_target_in(&sessions, session_id));
     let intended_codex_thread_id = match sessions
         .iter()
         .find(|session| session.id == canonical_session_id)
@@ -6336,13 +6424,17 @@ fn handle_post_session_prompt(
     // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
     // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
     let busy = !payload.send_now && {
-        let turns = transcript_observation_from_sessions(
-            &canonical_session_id,
-            &sessions,
-            &snap,
-            home,
-            &mut files,
-        );
+        let turns = if retained_target.is_some() {
+            None
+        } else {
+            transcript_observation_from_sessions(
+                &canonical_session_id,
+                &sessions,
+                &snap,
+                home,
+                &mut files,
+            )
+        };
         state.is_session_busy_from_observation(&canonical_session_id, turns.as_deref())
     };
 
@@ -6352,6 +6444,8 @@ fn handle_post_session_prompt(
         payload.send_now,
         busy,
         crate::DirectPromptInput {
+            queue_target: observed_target
+                .and_then(|session| crate::PromptQueueTarget::observed(session, session_id)),
             intended_codex_thread_id: intended_codex_thread_id.clone(),
             persona: target_persona.clone(),
             prompt: prompt_text.clone(),
@@ -6361,6 +6455,16 @@ fn handle_post_session_prompt(
         },
     ) {
         crate::DirectPromptDecision::Dispatch(claim) => claim,
+        crate::DirectPromptDecision::FencedAlias(original) => {
+            return HttpResponse::json(
+                409,
+                json!({
+                    "error": format!("{} has fenced queued prompts on {original}; resolve or discard that queue", session_id.trim()),
+                    "delivered": false,
+                    "delivery_stage": "refused",
+                }),
+            );
+        }
         crate::DirectPromptDecision::DispatchBusy => {
             return HttpResponse::json(
                 409,
@@ -6403,9 +6507,13 @@ fn handle_post_session_prompt(
         &effective_body,
         operator_prompt_intent(authority, payload.send_now),
         intended_codex_thread_id.as_deref(),
+        #[cfg(test)]
+        false,
     );
     match &delivery_res {
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}
+        Err(OperatorPromptError::Push(PushError::NotConnected(_))) if retained_target.is_some() => {
+        }
         Ok(OperatorPromptOutcome::AppServerAccepted { .. })
         | Err(OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. })) => {
             // Steering uses app-server truth; never infer its active turn from a rollout.
@@ -10613,6 +10721,7 @@ mod council_guidance_tests {
                 state.prompt_queues.lock().unwrap().enqueue(
                     key,
                     crate::DirectPromptInput {
+                        queue_target: None,
                         intended_codex_thread_id: None,
                         persona: Some("ada".into()),
                         prompt: format!("prompt-{key}"),

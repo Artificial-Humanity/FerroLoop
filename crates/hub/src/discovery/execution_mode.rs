@@ -719,6 +719,7 @@ mod tests {
             ".gemini/antigravity-cli/settings.json",
             r#"{"toolPermission":"always-proceed"}"#,
         );
+        let identity = crate::latency_tests::write_agy_identity(home, "agy-mode-1", "ferris");
         write_route(
             home,
             "ferris",
@@ -729,6 +730,7 @@ mod tests {
             Some("always-proceed")
         );
 
+        std::fs::remove_file(identity).unwrap();
         write(
             home,
             ".config/muse/settings.json",
@@ -748,10 +750,11 @@ mod tests {
         write(
             home,
             ".gemini/antigravity-cli/brain/agy-ctx-1/.system_generated/logs/transcript.jsonl",
-            &lines(
-                &[serde_json::json!({"step_index":1,"type":"PLANNER_RESPONSE",
-                    "input_tokens":1000,"cache_read_tokens":200,"output_tokens":30})],
-            ),
+            &lines(&[
+                serde_json::json!({"type":"USER_INPUT", "content":"You will take the name of Ferris."}),
+                serde_json::json!({"step_index":1,"type":"PLANNER_RESPONSE",
+                    "input_tokens":1000,"cache_read_tokens":200,"output_tokens":30}),
+            ]),
         );
         write_route(
             home,
@@ -769,6 +772,10 @@ mod tests {
         );
         assert_eq!(discover(home, false).context_usage, None);
 
+        std::fs::remove_file(home.join(
+            ".gemini/antigravity-cli/brain/agy-ctx-1/.system_generated/logs/transcript.jsonl",
+        ))
+        .unwrap();
         write(
             home,
             ".local/share/muse/sessions/muse-ctx-1/session.jsonl",

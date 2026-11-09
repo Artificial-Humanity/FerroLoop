@@ -2330,6 +2330,7 @@ mod tests {
             let addr = format!("127.0.0.1:{}", stub.port);
             let tmp = tempfile::tempdir().unwrap();
             let home = tmp.path();
+            crate::latency_tests::write_agy_identity(home, "agy-q-1", "ferris");
             let routes = home.join(".cache").join("agent-bus").join("routes.json");
             fs::create_dir_all(routes.parent().unwrap()).unwrap();
             fs::write(
@@ -2431,6 +2432,7 @@ mod tests {
     }
 
     fn write_agy_route(home: &Path, conv: &str, endpoint: Option<(&str, &str)>) {
+        crate::latency_tests::write_agy_identity(home, conv, "ferris");
         let routes = home.join(".cache").join("agent-bus").join("routes.json");
         fs::create_dir_all(routes.parent().unwrap()).unwrap();
         let ls = endpoint
