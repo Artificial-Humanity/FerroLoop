@@ -59,7 +59,12 @@ describe("SpinUpAgentModal", () => {
     const nodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
     const hostedCheckbox = screen.getByTestId("spin-up-hosted-checkbox") as HTMLInputElement;
 
-    expect(projectSelect.value).toBe("ai-lab-amd");
+    expect(projectSelect.value).toBe("");
+    expect(projectSelect.selectedOptions[0]?.textContent).toBe("Select a project…");
+    expect(Array.from(projectSelect.options).map((o) => o.value)).toEqual([
+      "",
+      ...TEST_PROJECTS.map((p) => p.slug),
+    ]);
     expect(roleSelect.value).toBe("assistant");
     expect(
       Array.from(roleSelect.options).map((o) => o.value),
@@ -74,6 +79,12 @@ describe("SpinUpAgentModal", () => {
     expect(onSpinUp).not.toHaveBeenCalled();
 
     fireEvent.change(personaInput, { target: { value: "Kacey" } });
+
+    // Submitting without selecting a project shows validation error
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/select a project/i);
+    expect(onSpinUp).not.toHaveBeenCalled();
+
     fireEvent.change(projectSelect, { target: { value: "kaggle-gemma4" } });
     fireEvent.change(roleSelect, { target: { value: "assistant" } });
     fireEvent.change(vendorSelect, { target: { value: "antigravity" } });
@@ -114,7 +125,13 @@ describe("SpinUpAgentModal", () => {
     );
 
     const { rerender, unmount } = render(
-      <SpinUpAgentModal isOpen onClose={vi.fn()} projects={TEST_PROJECTS} onSpinUp={onSpinUp} />,
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        initialProject="ai-lab-amd"
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
     );
 
     const nodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
@@ -174,6 +191,7 @@ describe("SpinUpAgentModal", () => {
       <SpinUpAgentModal
         isOpen={false}
         onClose={vi.fn()}
+        initialProject="ai-lab-amd"
         projects={TEST_PROJECTS}
         nodes={nodes}
         onSpinUp={onSpinUp}
@@ -183,6 +201,7 @@ describe("SpinUpAgentModal", () => {
       <SpinUpAgentModal
         isOpen
         onClose={vi.fn()}
+        initialProject="ai-lab-amd"
         projects={TEST_PROJECTS}
         nodes={nodes}
         onSpinUp={onSpinUp}
@@ -698,7 +717,13 @@ describe("SpinUpAgentModal", () => {
     const onClose = vi.fn();
 
     const { rerender, unmount } = render(
-      <SpinUpAgentModal isOpen onClose={onClose} projects={TEST_PROJECTS} onSpinUp={onSpinUp} />,
+      <SpinUpAgentModal
+        isOpen
+        onClose={onClose}
+        initialProject="ferroloop"
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
     );
 
     const postureSelect = screen.getByTestId(
@@ -717,8 +742,24 @@ describe("SpinUpAgentModal", () => {
     fireEvent.change(postureSelect, { target: { value: "bypass" } });
     expect(postureSelect.value).toBe("bypass");
 
-    rerender(<SpinUpAgentModal isOpen={false} onClose={onClose} projects={TEST_PROJECTS} onSpinUp={onSpinUp} />);
-    rerender(<SpinUpAgentModal isOpen onClose={onClose} projects={TEST_PROJECTS} onSpinUp={onSpinUp} />);
+    rerender(
+      <SpinUpAgentModal
+        isOpen={false}
+        onClose={onClose}
+        initialProject="ferroloop"
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    rerender(
+      <SpinUpAgentModal
+        isOpen
+        onClose={onClose}
+        initialProject="ferroloop"
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
+    );
 
     const reopenedPostureSelect = screen.getByTestId(
       "spin-up-posture-select",
@@ -788,6 +829,7 @@ describe("SpinUpAgentModal", () => {
       <SpinUpAgentModal
         isOpen
         onClose={vi.fn()}
+        initialProject="ferroloop"
         projects={TEST_PROJECTS}
         onSpinUp={onSpinUp}
         onSpunUp={onSpunUp}
@@ -938,6 +980,9 @@ describe("SpinUpAgentModal", () => {
     ).toBeInTheDocument();
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "felix" },
+    });
+    fireEvent.change(screen.getByTestId("spin-up-project-select"), {
+      target: { value: "ferroloop" },
     });
     fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
 
@@ -1244,6 +1289,7 @@ describe("SpinUpAgentModal", () => {
       <SpinUpAgentModal
         isOpen
         onClose={vi.fn()}
+        initialProject="ferroloop"
         projects={TEST_PROJECTS}
         apiClient={apiClient}
         onSpunUp={onSpunUp}
@@ -1407,6 +1453,9 @@ describe("SpinUpAgentModal", () => {
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "felix" },
     });
+    fireEvent.change(screen.getByTestId("spin-up-project-select"), {
+      target: { value: "ferroloop" },
+    });
     fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
 
     const sessionWarnings = await screen.findByTestId(
@@ -1432,6 +1481,9 @@ describe("SpinUpAgentModal", () => {
     fireEvent.change(await screen.findByTestId("spin-up-persona-input"), {
       target: { value: "felix" },
     });
+    fireEvent.change(screen.getByTestId("spin-up-project-select"), {
+      target: { value: "ferroloop" },
+    });
     fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
 
     await waitFor(() => {
@@ -1443,12 +1495,18 @@ describe("SpinUpAgentModal", () => {
     unmountApp();
   });
 
-  it("leaves project unselected when projects is empty, maps initialProject to a real slug or unselected, and updates when projects arrives", async () => {
+  it("leaves project unselected unless initialProject matches a listed slug, keeps project unselected when projects arrives asynchronously without initialProject, and allows selecting options[0]", async () => {
     expect(resolveSpinUpProject(null, [])).toBe("");
+    expect(resolveSpinUpProject(undefined, [])).toBe("");
     expect(resolveSpinUpProject("ferroloop", [])).toBe("");
-    expect(resolveSpinUpProject(null, TEST_PROJECTS)).toBe("ai-lab-amd");
+    expect(resolveSpinUpProject(undefined, TEST_PROJECTS)).toBe("");
+    expect(resolveSpinUpProject(null, TEST_PROJECTS)).toBe("");
+    expect(resolveSpinUpProject("", TEST_PROJECTS)).toBe("");
+    expect(resolveSpinUpProject("all", TEST_PROJECTS)).toBe("");
     expect(resolveSpinUpProject("Sonora", TEST_PROJECTS)).toBe("sonora");
+    expect(resolveSpinUpProject("FerroLoop", TEST_PROJECTS)).toBe("ferroloop");
     expect(resolveSpinUpProject("nonexistent-project", TEST_PROJECTS)).toBe("");
+    expect(resolveSpinUpProject("ai", TEST_PROJECTS)).toBe("");
 
     const onSpinUp = vi.fn(
       async (req: SpinUpSessionRequest): Promise<SpinUpSessionResponse> => ({
@@ -1465,11 +1523,12 @@ describe("SpinUpAgentModal", () => {
       }),
     );
 
+    // 1. Omitted initialProject + async arrival of projects: stays "" (does not jump to options[0]),
+    //    renders "Select a project…" placeholder, blocks submit until chosen, and selecting options[0] works.
     const { rerender, unmount } = render(
       <SpinUpAgentModal
         isOpen
         onClose={vi.fn()}
-        initialProject="Sonora"
         projects={[]}
         onSpinUp={onSpinUp}
       />,
@@ -1479,9 +1538,25 @@ describe("SpinUpAgentModal", () => {
       "spin-up-project-select",
     ) as HTMLSelectElement;
     expect(projectSelect.value).toBe("");
-    expect(
-      Array.from(projectSelect.options).map((o) => o.value),
-    ).toEqual([""]);
+    expect(Array.from(projectSelect.options).map((o) => o.value)).toEqual([""]);
+
+    rerender(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
+    );
+
+    expect(projectSelect.value).toBe("");
+    expect(projectSelect.selectedOptions[0]?.textContent).toBe(
+      "Select a project…",
+    );
+    expect(Array.from(projectSelect.options).map((o) => o.value)).toEqual([
+      "",
+      ...TEST_PROJECTS.map((p) => p.slug),
+    ]);
 
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "felix" },
@@ -1493,7 +1568,79 @@ describe("SpinUpAgentModal", () => {
     );
     expect(onSpinUp).not.toHaveBeenCalled();
 
-    // When projects arrive, the untampered project selection updates to match initialProject
+    // Selecting options[0] ("ai-lab-amd") explicitly works and submits
+    fireEvent.change(projectSelect, {
+      target: { value: TEST_PROJECTS[0].slug },
+    });
+    expect(projectSelect.value).toBe("ai-lab-amd");
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpinUp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          persona: "felix",
+          project: "ai-lab-amd",
+        }),
+      );
+    });
+
+    // 2. Matching initialProject resolves immediately when projects is populated on open
+    rerender(
+      <SpinUpAgentModal
+        isOpen={false}
+        onClose={vi.fn()}
+        initialProject="FerroLoop"
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    rerender(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        initialProject="FerroLoop"
+        projects={TEST_PROJECTS}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    expect(
+      (screen.getByTestId("spin-up-project-select") as HTMLSelectElement).value,
+    ).toBe("ferroloop");
+
+    // 3. Matching initialProject with initially empty projects resolves when projects arrives asynchronously
+    rerender(
+      <SpinUpAgentModal
+        isOpen={false}
+        onClose={vi.fn()}
+        initialProject="Sonora"
+        projects={[]}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    rerender(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        initialProject="Sonora"
+        projects={[]}
+        onSpinUp={onSpinUp}
+      />,
+    );
+
+    const asyncProjectSelect = screen.getByTestId(
+      "spin-up-project-select",
+    ) as HTMLSelectElement;
+    expect(asyncProjectSelect.value).toBe("");
+
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "sonya" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /select a project/i,
+    );
+    expect(onSpinUp).toHaveBeenCalledTimes(1);
+
     rerender(
       <SpinUpAgentModal
         isOpen
@@ -1505,20 +1652,20 @@ describe("SpinUpAgentModal", () => {
     );
 
     await waitFor(() => {
-      expect(projectSelect.value).toBe("sonora");
+      expect(asyncProjectSelect.value).toBe("sonora");
     });
 
     fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
     await waitFor(() => {
-      expect(onSpinUp).toHaveBeenCalledWith(
+      expect(onSpinUp).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          persona: "felix",
+          persona: "sonya",
           project: "sonora",
         }),
       );
     });
 
-    // Unknown initialProject stays unselected even when projects is populated
+    // 4. Unknown initialProject stays unselected even when projects is populated
     rerender(
       <SpinUpAgentModal
         isOpen={false}

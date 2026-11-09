@@ -209,7 +209,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toEqual(["ferroloop", "sonora", "council"]);
+    expect(spinUpOptions()).toEqual(["", "ferroloop", "sonora", "council"]);
   });
 
   it("orders the roster groups like the list", async () => {
@@ -266,7 +266,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toEqual(["ferroloop", "sonora", "council"]);
+    expect(spinUpOptions()).toEqual(["", "ferroloop", "sonora", "council"]);
   });
 
   it("drops a deleted entry from all three and resets the filter that pointed at it", async () => {
@@ -291,7 +291,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await closeSettings();
 
     await openSpinUp();
-    expect(spinUpOptions()).toEqual(["ferroloop", "sonora"]);
+    expect(spinUpOptions()).toEqual(["", "ferroloop", "sonora"]);
   });
 
   it("follows a project renamed on the hub in the Agents filter", async () => {
