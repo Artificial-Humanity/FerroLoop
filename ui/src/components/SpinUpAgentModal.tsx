@@ -59,9 +59,22 @@ export interface SpinUpAgentModalProps {
   /** The shared project list for the Project dropdown. Defaults to the built-in list. */
   projects?: readonly ProjectSummary[];
   nodes?: EnrolledNode[];
+  defaultNodeId?: string | null;
   onSpinUp?: (req: SpinUpSessionRequest) => Promise<SpinUpSessionResponse>;
   onSpunUp?: (res: SpinUpSessionResponse) => void;
   apiClient?: HubApiClient;
+}
+
+export function resolveSpinUpNodeId(
+  defaultNodeId?: string | null,
+  nodes: readonly EnrolledNode[] = [],
+): string {
+  const explicit = (defaultNodeId ?? "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const hubNode = nodes.find((n) => n.role === "hub") ?? nodes[0];
+  return (hubNode?.node_id || hubNode?.display_name || "").trim();
 }
 
 export function resolveSpinUpProject(
@@ -819,6 +832,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   initialProject = null,
   projects = FALLBACK_PROJECTS,
   nodes = [],
+  defaultNodeId = null,
   onSpinUp,
   onSpunUp,
   apiClient,
@@ -832,10 +846,15 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   // Latest list for the reset effect, which must not rerun when the list refreshes.
   const projectsRef = useRef(projects);
   projectsRef.current = projects;
+  const defaultNodeRef = useRef({ defaultNodeId, nodes });
+  defaultNodeRef.current = { defaultNodeId, nodes };
   const [role, setRole] = useState<string>("assistant");
   const [vendor, setVendor] = useState<string>("claude");
   const [model, setModel] = useState("");
-  const [nodeId, setNodeId] = useState("ai-lab-0");
+  const [nodeId, setNodeId] = useState<string>(() =>
+    resolveSpinUpNodeId(defaultNodeId, nodes),
+  );
+  const [nodeIdTouched, setNodeIdTouched] = useState(false);
   const [hosted, setHosted] = useState(true);
   const [worktreePolicy, setWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
@@ -865,12 +884,26 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       setProject(resolveSpinUpProject(initialProject, projectsRef.current));
+      setNodeId(
+        resolveSpinUpNodeId(
+          defaultNodeRef.current.defaultNodeId,
+          defaultNodeRef.current.nodes,
+        ),
+      );
+      setNodeIdTouched(false);
       setPosture("auto");
       setWorktreePolicyTouched(false);
       setPermissionsTouched(false);
       setLastSpinUpResult(null);
     }
   }, [initialProject, isOpen]);
+
+  const resolvedDefaultNodeId = resolveSpinUpNodeId(defaultNodeId, nodes);
+  useEffect(() => {
+    if (isOpen && !nodeIdTouched && !nodeId.trim() && resolvedDefaultNodeId) {
+      setNodeId(resolvedDefaultNodeId);
+    }
+  }, [isOpen, nodeIdTouched, nodeId, resolvedDefaultNodeId]);
 
   useEffect(() => {
     setError(null);
@@ -895,7 +928,12 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   }
 
   const nodeOptions = Array.from(
-    new Set(["ai-lab-0", ...nodes.map((n) => n.node_id || n.display_name).filter(Boolean)]),
+    new Set(
+      [
+        defaultNodeId?.trim(),
+        ...nodes.map((n) => (n.node_id || n.display_name).trim()),
+      ].filter((v): v is string => Boolean(v)),
+    ),
   );
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -915,6 +953,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       worktreePolicy,
     );
 
+    const trimmedNodeId = nodeId.trim();
     const payload: SpinUpSessionRequest = {
       persona: trimmedPersona,
       project,
@@ -922,7 +961,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       vendor,
       ...(model.trim() ? { model: model.trim() } : {}),
       posture,
-      node_id: nodeId.trim() || "ai-lab-0",
+      ...(trimmedNodeId ? { node_id: trimmedNodeId } : {}),
       hosted,
       ...(worktreePolicyTouched
         ? {
@@ -1262,7 +1301,10 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               data-testid="spin-up-node-select"
               className="fd-input fd-mono"
               value={nodeId}
-              onChange={(e) => setNodeId(e.target.value)}
+              onChange={(e) => {
+                setNodeId(e.target.value);
+                setNodeIdTouched(true);
+              }}
               disabled={submitting}
               style={{ width: "100%" }}
             />

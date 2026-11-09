@@ -10,7 +10,11 @@ import {
   normalizeRecastRole,
   RECAST_ROLE_OPTIONS,
 } from "../components/SettingsModal";
-import type { SpinUpSessionRequest, SpinUpSessionResponse } from "../types/api";
+import type {
+  EnrolledNode,
+  SpinUpSessionRequest,
+  SpinUpSessionResponse,
+} from "../types/api";
 
 describe("SpinUpAgentModal", () => {
   it("renders all required inputs with defaults and submits spinUpSession payload", async () => {
@@ -49,7 +53,7 @@ describe("SpinUpAgentModal", () => {
       Array.from(roleSelect.options).map((o) => o.value),
     ).toContain("strategist");
     expect(vendorSelect.value).toBe("claude");
-    expect(nodeSelect.value).toBe("ai-lab-0");
+    expect(nodeSelect.value).toBe("");
     expect(hostedCheckbox.checked).toBe(true);
 
     // Submitting without persona shows validation error
@@ -79,6 +83,149 @@ describe("SpinUpAgentModal", () => {
       });
     });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("omits node_id when Target Node is blank and seeds Target Node from defaultNodeId or the hub node in nodes", async () => {
+    const onSpinUp = vi.fn(
+      async (req: SpinUpSessionRequest): Promise<SpinUpSessionResponse> => ({
+        session_id: "sess-node-test",
+        persona: req.persona,
+        project: req.project,
+        role: req.role,
+        vendor: req.vendor,
+        model: req.model ?? null,
+        node_id: req.node_id ?? "hub-default-node",
+        hosted: Boolean(req.hosted),
+        status: "running",
+        hydration_dispatched: true,
+      }),
+    );
+
+    const { rerender, unmount } = render(
+      <SpinUpAgentModal isOpen onClose={vi.fn()} onSpinUp={onSpinUp} />,
+    );
+
+    const nodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
+    expect(nodeSelect.value).toBe("");
+    const emptyDatalist = document.getElementById("fd-spin-up-node-options");
+    expect(emptyDatalist?.querySelectorAll("option").length ?? 0).toBe(0);
+
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "kacey" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpinUp).toHaveBeenCalledTimes(1);
+    });
+    expect(onSpinUp.mock.calls[0][0]).toEqual({
+      persona: "kacey",
+      project: "ferroloop",
+      role: "assistant",
+      vendor: "claude",
+      posture: "auto",
+      hosted: true,
+    });
+    expect("node_id" in onSpinUp.mock.calls[0][0]).toBe(false);
+
+    // Reopen with enrolled nodes (including a hub node) and verify hub node is seeded and submitted
+    const nodes: EnrolledNode[] = [
+      {
+        node_id: "worker-mac-1",
+        display_name: "Mac Worker",
+        role: "worker",
+        hostname: "mac-1",
+        os: "macos",
+        arch: "aarch64",
+        capabilities: [],
+        labels: [],
+        status: "online",
+        enrolled_at_ms: 1000,
+        last_seen_at_ms: 2000,
+      },
+      {
+        node_id: "hub-local-0",
+        display_name: "Local Hub",
+        role: "hub",
+        hostname: "hub-local-0",
+        os: "linux",
+        arch: "x86_64",
+        capabilities: [],
+        labels: [],
+        status: "online",
+        enrolled_at_ms: 1000,
+        last_seen_at_ms: 2000,
+      },
+    ];
+
+    rerender(
+      <SpinUpAgentModal
+        isOpen={false}
+        onClose={vi.fn()}
+        nodes={nodes}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    rerender(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        nodes={nodes}
+        onSpinUp={onSpinUp}
+      />,
+    );
+
+    const seededNodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
+    expect(seededNodeSelect.value).toBe("hub-local-0");
+    const populatedDatalist = document.getElementById("fd-spin-up-node-options");
+    expect(
+      Array.from(populatedDatalist?.querySelectorAll("option") ?? []).map((o) =>
+        o.getAttribute("value"),
+      ),
+    ).toEqual(["worker-mac-1", "hub-local-0"]);
+
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "felix" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpinUp).toHaveBeenCalledTimes(2);
+    });
+    expect(onSpinUp.mock.calls[1][0]).toEqual({
+      persona: "felix",
+      project: "ferroloop",
+      role: "assistant",
+      vendor: "claude",
+      posture: "auto",
+      node_id: "hub-local-0",
+      hosted: true,
+    });
+
+    // Explicit defaultNodeId overrides nodes fallback on reopen
+    rerender(
+      <SpinUpAgentModal
+        isOpen={false}
+        onClose={vi.fn()}
+        defaultNodeId="custom-hub-host"
+        nodes={nodes}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    rerender(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        defaultNodeId="custom-hub-host"
+        nodes={nodes}
+        onSpinUp={onSpinUp}
+      />,
+    );
+    expect(
+      (screen.getByTestId("spin-up-node-select") as HTMLInputElement).value,
+    ).toBe("custom-hub-host");
+
+    unmount();
   });
 
   it("clears validation/API errors when closed and reopened", async () => {
@@ -373,7 +520,6 @@ describe("SpinUpAgentModal", () => {
           role: "assistant",
           vendor: "claude",
           posture: "auto",
-          node_id: "ai-lab-0",
           hosted: true,
         },
       ]);
