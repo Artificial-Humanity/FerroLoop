@@ -314,6 +314,9 @@ pub fn execute_with_db(cmd: HostCmd, db: Option<&Path>) -> Result<()> {
             let build = client
                 .host_status()
                 .context("failed to query fl-host build identity")?;
+            let retention = client
+                .pty_retention_status()
+                .context("failed to query fl-host PTY retention")?;
             let (active, total) = if client.negotiated().1 == 0 {
                 // host_status sends no request at minor zero, so this remains the
                 // first request. These hosts cannot decode ListSessions either.
@@ -353,11 +356,31 @@ pub fn execute_with_db(cmd: HostCmd, db: Option<&Path>) -> Result<()> {
                     "total_sessions": total,
                     "build_identity": if build.is_some() { "available" } else { "unavailable" },
                     "build": build,
+                    "pty_retention_diagnostics": if retention.is_some() { "available" } else { "unavailable" },
+                    "pty_retention": retention,
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 println!("fl-host: {}", endpoint.socket_path().display());
                 println!("sessions: {active} active / {total} total");
+                match &retention {
+                    Some(status) => {
+                        println!(
+                            "projection reservation: {} / {} bytes (accounting allowance, not RSS)",
+                            status.projection_reserved_bytes, status.projection_limit_bytes
+                        );
+                        println!(
+                            "completed PTYs: {} / {}; evicted: {}",
+                            status.completed_pty_sessions,
+                            status.completed_pty_limit,
+                            status.evicted_total
+                        );
+                        for stream in &status.recent_evictions {
+                            println!("evicted PTY: {}", serde_json::to_string(stream)?);
+                        }
+                    }
+                    None => println!("PTY retention diagnostics: unavailable (older daemon)"),
+                }
                 match build {
                     Some(build) => {
                         println!("build: {} ({})", build.version, build.commit);

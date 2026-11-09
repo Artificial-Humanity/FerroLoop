@@ -68,6 +68,15 @@ fn host_serve_reports_its_cli_build_through_rpc_and_status() {
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["build_identity"], "available");
     assert_eq!(status["build"], expected);
+    assert_eq!(status["pty_retention_diagnostics"], "available");
+    assert_eq!(status["pty_retention"]["completed_pty_limit"], 8);
+    assert_eq!(status["pty_retention"]["projection_reserved_bytes"], 0);
+    assert!(
+        status["pty_retention"]["projection_limit_bytes"]
+            .as_u64()
+            .unwrap()
+            > 590_000_000
+    );
     let output = Command::new(bin)
         .args(["host", "status"])
         .env("FL_HOST_SOCK", &socket)
@@ -77,6 +86,8 @@ fn host_serve_reports_its_cli_build_through_rpc_and_status() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains(version["commit"].as_str().unwrap()));
     assert!(text.contains("build time (unix):"));
+    assert!(text.contains("projection reservation:"));
+    assert!(text.contains("completed PTYs: 0 / 8"));
 }
 
 #[tokio::test]
@@ -95,7 +106,7 @@ async fn old_host_status_explicitly_reports_unavailable() {
             let mut listener = HostListener::bind(cfg).await.unwrap();
             let server = tokio::spawn(async move {
                 let mut conn = listener.accept().await.unwrap();
-                if minor > 0 {
+                for _ in 0..if minor > 0 { 2 } else { 0 } {
                     let HostRequest::Extended {
                         id,
                         request: Req::Capabilities,
@@ -149,6 +160,8 @@ async fn old_host_status_explicitly_reports_unavailable() {
                 let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(value["build_identity"], "unavailable");
                 assert!(value["build"].is_null());
+                assert_eq!(value["pty_retention_diagnostics"], "unavailable");
+                assert!(value["pty_retention"].is_null());
             } else {
                 assert!(
                     String::from_utf8(output.stdout)

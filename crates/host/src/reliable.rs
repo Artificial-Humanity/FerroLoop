@@ -89,6 +89,7 @@ struct State {
     partial: Option<ChargedBytes>,
     pending: Option<Pending>,
     eof: bool,
+    compacted: bool,
 }
 pub(crate) struct ReliableJournal {
     self_ref: Weak<ReliableJournal>,
@@ -186,6 +187,7 @@ impl ReliableJournal {
                 partial: None,
                 pending: None,
                 eof: false,
+                compacted: false,
             }),
         }))
     }
@@ -288,6 +290,9 @@ impl ReliableJournal {
         state: &mut State,
         body: &mut Option<ReliableBody>,
     ) -> Result<u64, ExtensionRefusal> {
+        if state.compacted {
+            return Err(ExtensionRefusal::SessionFenced);
+        }
         let next = match state.next.checked_add(1) {
             Some(v) => v,
             None => return Err(ExtensionRefusal::ResourceLimit),
@@ -522,6 +527,30 @@ impl ReliableJournal {
     pub(crate) fn is_eof(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).eof
     }
+    /// Called only behind the completed-PTY authority fence after EOF and thread retirement.
+    /// Dropping journal ownership never credits Ack or releases externally held buffers.
+    pub(crate) fn compact_completed_pty(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(self.pty_mode && state.eof);
+        state.compacted = true;
+        for record in state.records.iter_mut() {
+            *record = None;
+        }
+        state.head = 0;
+        state.len = 0;
+        state.partial = None;
+        state.pending = None;
+        state.lifecycle_bytes = std::array::from_fn(|_| None);
+        state.lifecycle_metadata = std::array::from_fn(|_| None);
+    }
+
+    pub(crate) fn compacted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .compacted
+    }
+
     pub(crate) fn can_retire(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.budget.used(ChargeKind::ReliableData) == 0
@@ -594,6 +623,9 @@ pub(crate) fn begin_replay(
     after: u64,
 ) -> Result<(u64, ReplayCursor), ExtensionRefusal> {
     let mut state = j.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.compacted {
+        return Err(ExtensionRefusal::SessionFenced);
+    }
     let _ = j.drain(&mut state);
     let watermark = state.next - 1;
     if after > watermark {
@@ -669,6 +701,9 @@ impl ReplayCursor {
     }
     pub(crate) fn next(&mut self) -> Result<Option<RecordReference>, ExtensionRefusal> {
         let mut state = self.journal.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.compacted {
+            return Err(ExtensionRefusal::SessionFenced);
+        }
         let _ = self.journal.drain(&mut state);
         if self.next <= state.acked {
             return Err(ExtensionRefusal::CursorExpired);
@@ -716,6 +751,9 @@ impl ReplayCursor {
 }
 pub(crate) fn acknowledge(j: &ReliableJournal, through: u64) -> Result<(), ExtensionRefusal> {
     let mut state = j.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.compacted {
+        return Err(ExtensionRefusal::SessionFenced);
+    }
     if through >= state.next {
         return Err(ExtensionRefusal::FutureCursor);
     }
