@@ -8,6 +8,7 @@ import {
   normalizeHydrationStatus,
   type AgentRecord,
   type DiscoveredSessionSummary,
+  type HostedSessionSummary,
   type HubAuthority,
   type HydrationStatus,
   type PermissionPosture,
@@ -733,11 +734,97 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       setLoading(true);
       setError(null);
       try {
-        const [summaryRes, balanceRes] = await Promise.all([
+        const [summaryRes, balanceRes, hostedRes] = await Promise.all([
           apiClient.getWatchSummary(overrides),
           apiClient.getWatchBalance().catch(() => null),
+          apiClient.getHostedSessions?.().catch(() => null) ??
+            Promise.resolve(null),
         ]);
-        setSummary(summaryRes);
+        let nextSummary = summaryRes;
+        if (
+          hostedRes?.sessions &&
+          hostedRes.sessions.length > 0 &&
+          summaryRes?.health?.agents
+        ) {
+          const bySessionId = new Map<string, HostedSessionSummary>();
+          const byPersona = new Map<string, HostedSessionSummary>();
+          const prefersCandidate = (
+            existing: HostedSessionSummary | undefined,
+            candidate: HostedSessionSummary,
+          ): boolean => {
+            if (!existing) return true;
+            const existingRunning =
+              (existing.status ?? "").trim().toLowerCase() === "running";
+            const candidateRunning =
+              (candidate.status ?? "").trim().toLowerCase() === "running";
+            if (candidateRunning !== existingRunning) {
+              return candidateRunning;
+            }
+            return (
+              (candidate.updated_at_ms ?? 0) >= (existing.updated_at_ms ?? 0)
+            );
+          };
+          for (const hs of hostedRes.sessions) {
+            const status = (hs.status ?? "").trim().toLowerCase();
+            if (status === "decommissioned") {
+              continue;
+            }
+            const normalized: HostedSessionSummary = {
+              ...hs,
+              hydration_status: normalizeHydrationStatus(hs.hydration_status),
+            };
+            const sidKey = (hs.session_id ?? "").trim().toLowerCase();
+            if (
+              sidKey &&
+              prefersCandidate(bySessionId.get(sidKey), normalized)
+            ) {
+              bySessionId.set(sidKey, normalized);
+            }
+            const pKey = (hs.persona ?? "").trim().toLowerCase();
+            if (pKey && prefersCandidate(byPersona.get(pKey), normalized)) {
+              byPersona.set(pKey, normalized);
+            }
+          }
+          nextSummary = {
+            ...summaryRes,
+            health: {
+              ...summaryRes.health,
+              agents: summaryRes.health.agents.map((ag) => {
+                if (
+                  !ag.hosted_session ||
+                  ag.hosted_session.hydration_status !== undefined
+                ) {
+                  return ag;
+                }
+                const sidKey = (ag.hosted_session.session_id ?? "")
+                  .trim()
+                  .toLowerCase();
+                const pKey = (ag.hosted_session.persona || ag.agent || "")
+                  .trim()
+                  .toLowerCase();
+                const matched =
+                  (sidKey ? bySessionId.get(sidKey) : undefined) ??
+                  (pKey ? byPersona.get(pKey) : undefined);
+                if (!matched) {
+                  return ag;
+                }
+                return {
+                  ...ag,
+                  hosted_session: {
+                    ...ag.hosted_session,
+                    hydration_status: normalizeHydrationStatus(
+                      matched.hydration_status,
+                    ),
+                    hydration_dispatched:
+                      ag.hosted_session.hydration_dispatched ??
+                      matched.hydration_dispatched,
+                  },
+                };
+              }),
+            },
+          };
+        }
+        setSummary(nextSummary);
         if (balanceRes?.policy) {
           setBalancePolicy(balanceRes.policy);
         }

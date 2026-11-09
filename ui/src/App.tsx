@@ -218,6 +218,47 @@ export {
   type ThemeMode,
 };
 
+export function selectPreferredHostedSessions(
+  records: HostedSessionSummary[],
+  tornDown?: Set<string>,
+): Record<string, HostedSessionSummary> {
+  const nextHosted: Record<string, HostedSessionSummary> = {};
+  for (const hs of records) {
+    const pKey = (hs.persona ?? "").trim().toLowerCase();
+    const sessionKey = (hs.session_id ?? "").trim().toLowerCase();
+    const status = (hs.status ?? "").trim().toLowerCase();
+    if (!pKey || status === "decommissioned") {
+      continue;
+    }
+    if (
+      tornDown &&
+      (tornDown.has(pKey) || (sessionKey && tornDown.has(sessionKey)))
+    ) {
+      continue;
+    }
+    const candidate: HostedSessionSummary = {
+      ...hs,
+      hydration_status: normalizeHydrationStatus(hs.hydration_status),
+    };
+    const existing = nextHosted[pKey];
+    if (!existing) {
+      nextHosted[pKey] = candidate;
+      continue;
+    }
+    const existingIsRunning =
+      (existing.status ?? "").trim().toLowerCase() === "running";
+    const candidateIsRunning = status === "running";
+    if (
+      (candidateIsRunning && !existingIsRunning) ||
+      (candidateIsRunning === existingIsRunning &&
+        (candidate.updated_at_ms ?? 0) >= (existing.updated_at_ms ?? 0))
+    ) {
+      nextHosted[pKey] = candidate;
+    }
+  }
+  return nextHosted;
+}
+
 export interface OptimisticPrompt {
   content: string;
   sentAt: number;
@@ -1500,17 +1541,12 @@ export const App: React.FC<AppProps> = ({
       if (!mountedRef.current || loggedOutRef.current || !hostedRes?.sessions) {
         return;
       }
-      const nextHosted: Record<string, HostedSessionSummary> = {};
-      for (const hs of hostedRes.sessions) {
-        const pKey = (hs.persona ?? "").trim().toLowerCase();
-        if (pKey && !tornDownTargetsRef.current.has(pKey)) {
-          nextHosted[pKey] = {
-            ...hs,
-            hydration_status: normalizeHydrationStatus(hs.hydration_status),
-          };
-        }
-      }
-      setHostedSessionsByAgent(nextHosted);
+      setHostedSessionsByAgent(
+        selectPreferredHostedSessions(
+          hostedRes.sessions,
+          tornDownTargetsRef.current,
+        ),
+      );
     } catch {
       // Ignore hosted-sessions fetch errors
     }
@@ -1828,19 +1864,19 @@ export const App: React.FC<AppProps> = ({
     });
     const unsubSessionsLifecycle = wsClient.subscribe("sessions", (frame) => {
       if (loggedOutRef.current || !mountedRef.current) return;
-      if (
-        (frame?.event === "session.spun_up" ||
-          frame?.event === "session.remodeled" ||
-          frame?.event === "session.restarted") &&
-        frame.data &&
-        typeof frame.data === "object"
-      ) {
+      if (frame?.data && typeof frame.data === "object") {
         const data = frame.data as Record<string, unknown>;
         const personaKey =
           typeof data.persona === "string"
             ? data.persona.trim().toLowerCase()
             : "";
-        if (personaKey) {
+        if (
+          personaKey &&
+          (frame.event === "session.spun_up" ||
+            frame.event === "session.remodeled" ||
+            frame.event === "session.restarted") &&
+          data.mode !== "prepare"
+        ) {
           const hydrationStatus = normalizeHydrationStatus(
             data.hydration_status,
           );
@@ -1873,6 +1909,75 @@ export const App: React.FC<AppProps> = ({
                 hydrationStatus,
               },
             };
+          });
+          setHostedSessionsByAgent((prev) => {
+            const existing = prev[personaKey];
+            if (!existing && data.hosted === false) {
+              return prev;
+            }
+            const vendor =
+              typeof data.vendor === "string" && data.vendor.trim()
+                ? data.vendor.trim()
+                : existing?.vendor ?? "unknown";
+            const sessionId =
+              typeof data.session_id === "string" && data.session_id.trim()
+                ? data.session_id.trim()
+                : existing?.session_id ?? `${vendor}:${personaKey}`;
+            const model =
+              typeof data.model === "string"
+                ? data.model
+                : existing?.model ?? null;
+            return {
+              ...prev,
+              [personaKey]: {
+                session_id: sessionId,
+                persona:
+                  typeof data.persona === "string" && data.persona.trim()
+                    ? data.persona.trim()
+                    : existing?.persona ?? personaKey,
+                project:
+                  typeof data.project === "string" && data.project.trim()
+                    ? data.project.trim()
+                    : existing?.project ?? "",
+                role:
+                  typeof data.role === "string" && data.role.trim()
+                    ? data.role.trim()
+                    : existing?.role ?? "assistant",
+                vendor,
+                model,
+                posture: existing?.posture,
+                hydration_dispatched:
+                  hydrationDispatched ?? existing?.hydration_dispatched ?? false,
+                hydration_status: hydrationStatus,
+                node_id:
+                  typeof data.node_id === "string" && data.node_id.trim()
+                    ? data.node_id.trim()
+                    : existing?.node_id ?? "ai-lab-0",
+                status:
+                  typeof data.status === "string" && data.status.trim()
+                    ? data.status.trim()
+                    : existing?.status ?? "running",
+                restart_count: existing?.restart_count ?? 0,
+                updated_at_ms: Date.now(),
+              },
+            };
+          });
+        } else if (
+          personaKey &&
+          frame.event === "session.decommission" &&
+          (data.status === "decommissioned" || data.mode === "teardown")
+        ) {
+          setSpunUpByAgent((prev) => {
+            if (!(personaKey in prev)) return prev;
+            const next = { ...prev };
+            delete next[personaKey];
+            return next;
+          });
+          setHostedSessionsByAgent((prev) => {
+            if (!(personaKey in prev)) return prev;
+            const next = { ...prev };
+            delete next[personaKey];
+            return next;
           });
         }
       }
@@ -2041,29 +2146,29 @@ export const App: React.FC<AppProps> = ({
     const raw =
       activeSession?.hydration_status ??
       activeRoute?.hydration_status ??
-      activeHostedSession?.hydration_status ??
-      activeSpunUp?.hydrationStatus;
+      activeSpunUp?.hydrationStatus ??
+      activeHostedSession?.hydration_status;
     if (raw !== undefined && raw !== null) {
       return normalizeHydrationStatus(raw);
     }
     if (
       activeSession?.hydration_dispatched !== undefined ||
       activeRoute?.hydration_dispatched !== undefined ||
-      activeHostedSession?.hydration_dispatched !== undefined ||
-      activeSpunUp?.hydrationDispatched !== undefined
+      activeSpunUp?.hydrationDispatched !== undefined ||
+      activeHostedSession?.hydration_dispatched !== undefined
     ) {
       return "unconfirmed";
     }
     return null;
-  }, [activeSession, activeRoute, activeHostedSession, activeSpunUp]);
+  }, [activeSession, activeRoute, activeSpunUp, activeHostedSession]);
   const activeHydrationDispatched = useMemo<boolean | undefined>(() => {
     return (
       activeSession?.hydration_dispatched ??
       activeRoute?.hydration_dispatched ??
-      activeHostedSession?.hydration_dispatched ??
-      activeSpunUp?.hydrationDispatched
+      activeSpunUp?.hydrationDispatched ??
+      activeHostedSession?.hydration_dispatched
     );
-  }, [activeSession, activeRoute, activeHostedSession, activeSpunUp]);
+  }, [activeSession, activeRoute, activeSpunUp, activeHostedSession]);
   const activeAdapter = useMemo(() => {
     const candidates = [
       activeSession?.adapter,
@@ -2390,6 +2495,34 @@ export const App: React.FC<AppProps> = ({
           hydrationStatus,
         },
       }));
+      setHostedSessionsByAgent((prev) => {
+        const existing = prev[personaKey];
+        if (!existing && res.hosted === false) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [personaKey]: {
+            session_id:
+              res.session_id ||
+              existing?.session_id ||
+              `${res.vendor || req.vendor}:${personaKey}`,
+            persona: res.persona || req.persona || existing?.persona || personaKey,
+            project: res.project || req.project || existing?.project || "",
+            role: res.role || req.role || existing?.role || "assistant",
+            vendor: res.vendor || req.vendor || existing?.vendor || "unknown",
+            model: res.model ?? req.model ?? existing?.model ?? null,
+            posture: res.posture ?? req.posture ?? existing?.posture,
+            hydration_dispatched: Boolean(res.hydration_dispatched),
+            hydration_status: hydrationStatus,
+            node_id:
+              res.node_id || req.node_id || existing?.node_id || "ai-lab-0",
+            status: res.status || existing?.status || "running",
+            restart_count: existing?.restart_count ?? 0,
+            updated_at_ms: Date.now(),
+          },
+        };
+      });
     }
     if (req.persona) {
       tornDownTargetsRef.current.delete(req.persona.trim().toLowerCase());
@@ -2660,7 +2793,7 @@ export const App: React.FC<AppProps> = ({
             apiClient={apiClient}
             onAfterRemodel={(res: RemodelSessionResponse) => {
               const personaKey = (res.persona || "").trim().toLowerCase();
-              if (personaKey) {
+              if (personaKey && res.mode !== "prepare") {
                 const hydrationStatus = normalizeHydrationStatus(
                   res.hydration_status,
                 );
@@ -2675,6 +2808,33 @@ export const App: React.FC<AppProps> = ({
                     hydrationStatus,
                   },
                 }));
+                setHostedSessionsByAgent((prev) => {
+                  const existing = prev[personaKey];
+                  if (!existing && res.hosted === false) {
+                    return prev;
+                  }
+                  return {
+                    ...prev,
+                    [personaKey]: {
+                      session_id:
+                        res.session_id ||
+                        existing?.session_id ||
+                        `${res.vendor || existing?.vendor || "unknown"}:${personaKey}`,
+                      persona: res.persona || existing?.persona || personaKey,
+                      project: res.project || existing?.project || "",
+                      role: res.role || existing?.role || "assistant",
+                      vendor: res.vendor || existing?.vendor || "unknown",
+                      model: res.model ?? existing?.model ?? null,
+                      posture: res.posture ?? existing?.posture,
+                      hydration_dispatched: Boolean(res.hydration_dispatched),
+                      hydration_status: hydrationStatus,
+                      node_id: res.node_id || existing?.node_id || "ai-lab-0",
+                      status: res.status || existing?.status || "running",
+                      restart_count: existing?.restart_count ?? 0,
+                      updated_at_ms: Date.now(),
+                    },
+                  };
+                });
               }
               void refreshWireAndRoster();
               void refreshSessionsAndTranscript();
