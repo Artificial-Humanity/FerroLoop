@@ -29,6 +29,7 @@ import type {
   TranscriptTurn,
   WireInboxItem,
 } from "../types/api";
+import { TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -266,6 +267,9 @@ function appFetch(extra?: (url: string) => Response | undefined) {
     if (url.includes("/api/v1/auth/session")) {
       return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
     }
+    if (url.endsWith("/api/v1/agents")) {
+      return json({ agents: TEST_WORKSPACE_AGENTS, routes: [] });
+    }
     return json({});
   });
 }
@@ -417,7 +421,7 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.queryByText("confidential transcript from ferris")).toBeNull(),
     );
-    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.queryByTestId("agent-settings-btn-ferris")).toBeNull();
     expect(screen.queryByTestId("session-id-pill")).toBeNull();
     expect(screen.getByTestId("nodes-modal-btn")).toHaveTextContent(/^Nodes$/);
     expect(ws.setToken).toHaveBeenLastCalledWith(null);

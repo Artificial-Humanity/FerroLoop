@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   resolveLivenessState,
   type AgentLivenessItem,
   type AgentRecord,
@@ -11,7 +10,7 @@ import {
   type ProjectSummary,
   type WireMessage,
 } from "../types/api";
-import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
+import { projectLabel } from "../hooks/useProjects";
 import {
   estimateSessionContextUsage,
   formatContextMax,
@@ -365,15 +364,17 @@ export interface RosterSidebarProps {
   embedded?: boolean;
   /**
    * The shared project list. Every entry is a roster group, in list order; agents whose
-   * `project` matches a slug or name (case-insensitive) go to that group. Defaults to the
-   * built-in fallback list.
+   * `project` matches a slug or name (case-insensitive) go to that group. Defaults to `[]`.
    */
   projects?: readonly ProjectSummary[];
   /**
-   * Show a list entry's group even when it has no agents (and no search is active). The
-   * built-in fallback list leaves this off so it does not add empty groups.
+   * Show a list entry's group even when it has no agents (and no search is active).
    */
   showEmptyProjects?: boolean;
+  /** True while initial roster data is loading. */
+  loading?: boolean;
+  /** True when the session is unauthenticated / signed out (e.g. after a 401). */
+  signedOut?: boolean;
 }
 
 export type LeftPanelTab =
@@ -564,6 +565,70 @@ export function getAdapterBadgeClass(adapter: string | null | undefined): string
   return "fd-badge";
 }
 
+const INACTIVE_SESSION_STATUSES = new Set([
+  "completed",
+  "exited",
+  "dead",
+  "stopped",
+  "decommissioned",
+  "failed",
+  "terminated",
+]);
+
+export function isLiveSessionStatus(status?: string | null): boolean {
+  const normalized = (status ?? "").trim().toLowerCase();
+  if (!normalized) return true;
+  return !INACTIVE_SESSION_STATUSES.has(normalized);
+}
+
+function formatPersonaDisplayName(persona: string): string {
+  const trimmed = persona.trim();
+  if (!trimmed) return "Unknown";
+  if (trimmed.toLowerCase() === "jarvis") return "JARVIS";
+  if (trimmed === trimmed.toLowerCase()) {
+    return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  }
+  return trimmed;
+}
+
+function inferSessionProject(
+  session: DiscoveredSessionSummary,
+  projects: readonly ProjectSummary[],
+): string {
+  const explicitProject = (
+    (session as { project?: string | null }).project ?? ""
+  ).trim();
+  if (explicitProject) {
+    return explicitProject;
+  }
+  const cwd = (session.cwd ?? "").trim().replace(/\/+$/, "");
+  if (cwd) {
+    for (const proj of projects) {
+      const projPath = (proj.path ?? "").trim().replace(/\/+$/, "");
+      if (projPath && (cwd === projPath || cwd.startsWith(`${projPath}/`))) {
+        return projectLabel(proj);
+      }
+    }
+    const segments = cwd.split("/").filter(Boolean);
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const segLower = segments[i].toLowerCase();
+      const matched = projects.find(
+        (p) =>
+          p.slug.trim().toLowerCase() === segLower ||
+          projectLabel(p).toLowerCase() === segLower,
+      );
+      if (matched) {
+        return projectLabel(matched);
+      }
+    }
+    const lastSeg = segments[segments.length - 1];
+    if (lastSeg) {
+      return lastSeg;
+    }
+  }
+  return "Workspace";
+}
+
 export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   agents,
   routes,
@@ -592,8 +657,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onResizeStart,
   onTouchResizeStart,
   embedded = false,
-  projects = FALLBACK_PROJECTS,
+  projects = [],
   showEmptyProjects = false,
+  loading = false,
+  signedOut = false,
 }) => {
   const [internalLeftTab, setInternalLeftTab] = useState<LeftPanelTab>("roster");
   const effectiveLeftTab: LeftPanelTab = embedded
@@ -648,19 +715,23 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   };
 
   const enrichedAgents = useMemo<EnrichedAgent[]>(() => {
-    const baseAgents = agents.length > 0 ? agents : DEFAULT_WORKSPACE_AGENTS;
+    const baseAgents = agents;
 
     const routeMap = new Map<string, DiscoveredSessionSummary>();
     for (const r of routes) {
       const personaKey = (r.persona ?? "").trim().toLowerCase();
-      if (personaKey && !routeMap.has(personaKey)) {
+      if (!personaKey || personaKey === "unknown") continue;
+      const existing = routeMap.get(personaKey);
+      if (!existing || (!isLiveSessionStatus(existing.status) && isLiveSessionStatus(r.status))) {
         routeMap.set(personaKey, r);
       }
     }
     const sessionMap = new Map<string, DiscoveredSessionSummary>();
     for (const s of sessions ?? []) {
       const personaKey = (s.persona ?? "").trim().toLowerCase();
-      if (personaKey && !sessionMap.has(personaKey)) {
+      if (!personaKey || personaKey === "unknown") continue;
+      const existing = sessionMap.get(personaKey);
+      if (!existing || (!isLiveSessionStatus(existing.status) && isLiveSessionStatus(s.status))) {
         sessionMap.set(personaKey, s);
       }
     }
@@ -683,16 +754,46 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
       }
     }
 
-    // Also include any agents reported in liveness or routes that weren't in baseAgents
+    // Also include any agents reported in liveness, sessions, or routes that weren't in baseAgents
     for (const [key, item] of livenessMap.entries()) {
       if (!seenKeys.has(key)) {
         seenKeys.add(key);
         merged.push({
           id: `urn:fl:agent:${key}`,
           name_key: key,
-          display_name: item.agent,
+          display_name: formatPersonaDisplayName(item.agent),
           project: item.project || "Workspace",
           role: item.role || "assistant",
+          status: "active",
+        });
+      }
+    }
+
+    for (const [key, sess] of sessionMap.entries()) {
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        const rawRole = ((sess as { role?: string | null }).role ?? "").trim();
+        merged.push({
+          id: `urn:fl:agent:${key}`,
+          name_key: key,
+          display_name: formatPersonaDisplayName(sess.persona ?? key),
+          project: inferSessionProject(sess, projects),
+          role: rawRole || "assistant",
+          status: "active",
+        });
+      }
+    }
+
+    for (const [key, route] of routeMap.entries()) {
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        const rawRole = ((route as { role?: string | null }).role ?? "").trim();
+        merged.push({
+          id: `urn:fl:agent:${key}`,
+          name_key: key,
+          display_name: formatPersonaDisplayName(route.persona ?? key),
+          project: inferSessionProject(route, projects),
+          role: rawRole || "assistant",
           status: "active",
         });
       }
@@ -701,10 +802,27 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     return merged.map((record) => {
       const key = record.name_key.trim().toLowerCase();
       const route = routeMap.get(key) ?? null;
+      const matchedSession = sessionMap.get(key) ?? route;
       const livenessItem = livenessMap.get(key) ?? null;
-      const hasRoute = Boolean(route || livenessItem?.has_route);
-      const livenessState = resolveLivenessState(livenessItem?.verdict, hasRoute);
-      const adapter = route?.adapter ?? livenessItem?.adapter ?? null;
+      const hasLiveRoute = Boolean(route && isLiveSessionStatus(route.status));
+      const hasLiveSession = Boolean(
+        matchedSession && isLiveSessionStatus(matchedSession.status),
+      );
+      const hasRoute = Boolean(
+        hasLiveRoute || hasLiveSession || livenessItem?.has_route,
+      );
+      const baseLivenessState = resolveLivenessState(
+        livenessItem?.verdict,
+        hasRoute,
+      );
+      const livenessState =
+        baseLivenessState === "dead" &&
+        (hasLiveSession || hasLiveRoute) &&
+        !livenessItem?.has_route
+          ? "alive"
+          : baseLivenessState;
+      const adapter =
+        route?.adapter ?? matchedSession?.adapter ?? livenessItem?.adapter ?? null;
       const rawUnread = unreadByAgent[key] ?? unreadByAgent[record.name_key];
       const unreadCount =
         typeof rawUnread === "object" && rawUnread !== null
@@ -735,7 +853,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           ? "idle"
           : "offline";
 
-      const matchedSession = sessionMap.get(key) ?? route;
       const explicitContextUsage =
         contextUsageByAgent?.[key] ??
         contextUsageByAgent?.[record.name_key] ??
@@ -749,7 +866,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
 
       return {
         record,
-        route,
+        route: route ?? matchedSession,
         livenessItem,
         livenessState,
         activityState,
@@ -764,6 +881,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     routes,
     sessions,
     liveness,
+    projects,
     unreadByAgent,
     unreadSeverityByAgent,
     busyByAgent,
@@ -1048,6 +1166,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             <div className="fd-scroll" style={{ padding: "10px 8px" }}>
         {groupedByProject.length === 0 ? (
           <div
+            data-testid="roster-empty-state"
             style={{
               padding: "20px 12px",
               color: "var(--text-muted)",
@@ -1055,7 +1174,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
               fontSize: "12px",
             }}
           >
-            No matching agents found.
+            {searchQuery.trim()
+              ? "No matching agents found."
+              : signedOut
+                ? "Sign in to view the workspace agent roster."
+                : loading
+                  ? "Loading agent roster…"
+                  : "No matching agents found."}
           </div>
         ) : (
           groupedByProject.map(([project, items]) => {

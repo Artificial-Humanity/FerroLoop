@@ -14,8 +14,8 @@ import {
 import { FerroWatchPane } from "../components/FerroWatchPane";
 import { RosterSidebar } from "../components/RosterSidebar";
 import { HubApiClient } from "../api/client";
+import { TEST_WORKSPACE_AGENTS as DEFAULT_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 import {
-  DEFAULT_WORKSPACE_AGENTS,
   type DiscoveredSessionSummary,
   type SessionContextUsage,
   type WatchSummaryResponse,
