@@ -223,6 +223,8 @@ pub struct SessionQuotaUsage {
     pub secondary_window: Option<QuotaWindowUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhausted_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
 }
 
 /// B-tree rows discovery needs, captured while a [`AnyStore`] guard is held.
@@ -1095,6 +1097,10 @@ fn discover_sessions_from_routes(
             session.available_models = info.available_models;
             session.model_is_default = info.model_is_default;
         }
+    }
+
+    if with_model_info {
+        propagate_codex_sibling_quota(&mut out, home_override);
     }
 
     out
@@ -2745,6 +2751,42 @@ fn parse_reset_instant_from_reason(reason: &str) -> Option<u64> {
     parse_iso8601_unix_millis(token)
 }
 
+pub(crate) fn parse_timestamp_value_ms(raw: &Value) -> Option<u64> {
+    if let Some(text) = raw.as_str() {
+        let trimmed = text.trim();
+        if let Some(ms) = parse_iso8601_unix_millis(trimmed) {
+            return Some(ms);
+        }
+        if let Ok(n) = trimmed.parse::<u64>() {
+            return normalize_epoch_number_ms(n);
+        }
+        return None;
+    }
+    let n = raw
+        .as_u64()
+        .or_else(|| raw.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+        .or_else(|| {
+            raw.as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as u64)
+        })?;
+    normalize_epoch_number_ms(n)
+}
+
+fn normalize_epoch_number_ms(n: u64) -> Option<u64> {
+    if n == 0 {
+        None
+    } else if n < 1_000_000_000_000 {
+        Some(n.saturating_mul(1000))
+    } else if n < 1_000_000_000_000_000 {
+        Some(n)
+    } else if n < 1_000_000_000_000_000_000 {
+        Some(n / 1000)
+    } else {
+        Some(n / 1_000_000)
+    }
+}
+
 fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindowUsage> {
     let value = value?;
     let used_percent = json_f64(value.get("used_percent"))?;
@@ -3020,10 +3062,187 @@ pub(crate) fn codex_account_quota(home_override: Option<&Path>) -> Option<Sessio
         primary_window: None,
         secondary_window: None,
         exhausted_reason: None,
+        observed_at_ms: None,
     })
 }
 
+pub(crate) fn codex_tier_matches(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => normalize_codex_plan(a) == normalize_codex_plan(b),
+        _ => true,
+    }
+}
+
+/// Whether `session` and `reading` belong to the Codex account in `home_override` (checking
+/// both `codex_session_matches_account` and `account_tier` from `auth.json` when available).
+pub(crate) fn codex_reading_matches_account(
+    session: &DiscoveredSessionSummary,
+    reading: &SessionQuotaUsage,
+    account_tier: Option<&str>,
+    home_override: Option<&Path>,
+) -> bool {
+    let Some(account_tier) = account_tier else {
+        return true;
+    };
+    if !codex_session_matches_account(session, home_override) {
+        return false;
+    }
+    reading.tier.as_deref().is_some_and(|reading_tier| {
+        normalize_codex_plan(account_tier) == normalize_codex_plan(reading_tier)
+    })
+}
+
+/// How many facts a quota reading holds; the reading with the most is the most useful. A window
+/// that reset at or before `now_ms` describes an allowance that no longer applies, so it counts for
+/// nothing.
+pub(crate) fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
+    let text = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let live = |w: &Option<QuotaWindowUsage>| {
+        w.as_ref()
+            .is_some_and(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms))
+    };
+    usize::from(text(&q.tier))
+        + usize::from(live(&q.primary_window))
+        + usize::from(live(&q.secondary_window))
+        + usize::from(text(&q.exhausted_reason))
+}
+
+pub(crate) fn quota_live_window_count(q: &SessionQuotaUsage, now_ms: u64) -> usize {
+    let live = |w: &Option<QuotaWindowUsage>| {
+        w.as_ref()
+            .is_some_and(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms))
+    };
+    usize::from(live(&q.primary_window)) + usize::from(live(&q.secondary_window))
+}
+
+/// Selection key for choosing the best account-level quota reading across sibling sessions:
+/// `(live_window_count, observed_at_ms, richness)`.
+pub(crate) fn quota_selection_score(q: &SessionQuotaUsage, now_ms: u64) -> (usize, u64, usize) {
+    (
+        quota_live_window_count(q, now_ms),
+        q.observed_at_ms.unwrap_or(0),
+        quota_richness(q, now_ms),
+    )
+}
+
+/// Propagate the freshest account-matching `primary_window`, `secondary_window`, `tier`, and
+/// `observed_at_ms` across sibling Codex route sessions belonging to the same account, while
+/// keeping `exhausted_reason` per session and refusing to propagate across mismatched accounts.
+pub(crate) fn propagate_codex_sibling_quota(
+    sessions: &mut [DiscoveredSessionSummary],
+    home_override: Option<&Path>,
+) {
+    let now_ms = fl_exec::stamp::now().unix_millis();
+    let account_tier = codex_auth_plan(home_override);
+    let matches_home = |s: &DiscoveredSessionSummary| {
+        s.adapter == "codex" && codex_session_matches_account(s, home_override)
+    };
+    let matches_tier = |tier: Option<&str>| match account_tier.as_deref() {
+        Some(auth_tier) => {
+            tier.is_none_or(|t| normalize_codex_plan(t) == normalize_codex_plan(auth_tier))
+        }
+        None => true,
+    };
+
+    // Determine the common tier among account-matching sessions when auth.json is absent.
+    let inferred_tier: Option<String> = account_tier.clone().or_else(|| {
+        let mut seen: Option<String> = None;
+        for s in sessions.iter().filter(|s| matches_home(s)) {
+            if let Some(t) = s
+                .quota_usage
+                .as_ref()
+                .and_then(|q| q.tier.as_deref())
+                .map(normalize_codex_plan)
+            {
+                match &seen {
+                    None => seen = Some(t),
+                    Some(prev) if prev == &t => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        seen
+    });
+
+    struct BestCodexQuota {
+        score: (usize, u64, usize),
+        updated_at: Option<String>,
+        quota: SessionQuotaUsage,
+    }
+
+    let mut best: Option<BestCodexQuota> = None;
+    for session in sessions.iter() {
+        if !matches_home(session) {
+            continue;
+        }
+        let Some(q) = session.quota_usage.as_ref() else {
+            continue;
+        };
+        if !matches_tier(q.tier.as_deref()) {
+            continue;
+        }
+        if let Some(expected) = inferred_tier.as_deref()
+            && !codex_tier_matches(Some(expected), q.tier.as_deref())
+        {
+            continue;
+        }
+        let live_windows = quota_live_window_count(q, now_ms);
+        if live_windows == 0 {
+            continue;
+        }
+        let score = quota_selection_score(q, now_ms);
+        let dominated = best.as_ref().is_some_and(|b| {
+            score < b.score
+                || (score == b.score && session.updated_at.as_ref() <= b.updated_at.as_ref())
+        });
+        if !dominated {
+            best = Some(BestCodexQuota {
+                score,
+                updated_at: session.updated_at.clone(),
+                quota: q.clone(),
+            });
+        }
+    }
+
+    let Some(BestCodexQuota { quota: donor, .. }) = best else {
+        return;
+    };
+
+    for session in sessions.iter_mut() {
+        if !matches_home(session) {
+            continue;
+        }
+        if let Some(existing) = session.quota_usage.as_ref() {
+            if !matches_tier(existing.tier.as_deref()) {
+                continue;
+            }
+            if let Some(expected) = inferred_tier.as_deref()
+                && !codex_tier_matches(Some(expected), existing.tier.as_deref())
+            {
+                continue;
+            }
+        }
+        let existing_exhausted = session
+            .quota_usage
+            .as_ref()
+            .and_then(|q| q.exhausted_reason.clone());
+        let existing_tier = session.quota_usage.as_ref().and_then(|q| q.tier.clone());
+        session.quota_usage = Some(SessionQuotaUsage {
+            tier: donor
+                .tier
+                .clone()
+                .or(existing_tier)
+                .or_else(|| account_tier.clone()),
+            primary_window: donor.primary_window.clone(),
+            secondary_window: donor.secondary_window.clone(),
+            exhausted_reason: existing_exhausted,
+            observed_at_ms: donor.observed_at_ms,
+        });
+    }
+}
+
 fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
+    let now_ms = fl_exec::stamp::now().unix_millis();
     let mut latest = None;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -3047,18 +3266,33 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
         else {
             continue;
         };
+        let observed_at_ms = val
+            .get("timestamp")
+            .or_else(|| val.pointer("/payload/timestamp"))
+            .or_else(|| val.get("ts"))
+            .or_else(|| val.pointer("/payload/ts"))
+            .and_then(parse_timestamp_value_ms);
         let tier = limits
             .get("plan_type")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(normalize_codex_plan);
-        let exhausted_reason = limits
+        let mut exhausted_reason = limits
             .get("rate_limit_reached_type")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let mut primary_window = codex_window(limits.get("primary"), 300);
-        let mut secondary_window = codex_window(limits.get("secondary"), 10_080);
+        let raw_primary = codex_window(limits.get("primary"), 300);
+        let raw_secondary = codex_window(limits.get("secondary"), 10_080);
+        let had_any_window_with_reset = raw_primary.as_ref().and_then(|w| w.resets_at_ms).is_some()
+            || raw_secondary
+                .as_ref()
+                .and_then(|w| w.resets_at_ms)
+                .is_some();
+        let mut primary_window =
+            raw_primary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
+        let mut secondary_window =
+            raw_secondary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
         if secondary_window.is_none()
             && primary_window
                 .as_ref()
@@ -3066,6 +3300,9 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
                 .is_some_and(|minutes| minutes >= 1440)
         {
             secondary_window = primary_window.take();
+        }
+        if had_any_window_with_reset && primary_window.is_none() && secondary_window.is_none() {
+            exhausted_reason = None;
         }
         if tier.is_none()
             && exhausted_reason.is_none()
@@ -3079,12 +3316,14 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
             primary_window,
             secondary_window,
             exhausted_reason,
+            observed_at_ms,
         });
     }
     latest
 }
 
 fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
+    let now_ms = fl_exec::stamp::now().unix_millis();
     let raw = read_transcript_lossy(
         &home.join(".grok").join("logs").join("unified.jsonl"),
         QUOTA_LOG_TAIL_BYTES,
@@ -3105,6 +3344,9 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
         let Some(ctx) = val.get("ctx") else {
             continue;
         };
+        let line_observed_ms = ["time", "timestamp", "ts", "at"]
+            .into_iter()
+            .find_map(|key| val.get(key).and_then(parse_timestamp_value_ms));
         let tier = ctx
             .get("subscriptionTier")
             .and_then(Value::as_str)
@@ -3119,12 +3361,15 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
                     .and_then(Value::as_str)
             })
             .and_then(parse_iso8601_unix_millis);
-        let secondary_window = used_percent.map(|used_percent| QuotaWindowUsage {
-            used_percent,
-            window_minutes: Some(10_080),
-            resets_at_ms,
-        });
-        if tier.is_none() && secondary_window.is_none() {
+        let had_usage_entry = used_percent.is_some();
+        let secondary_window = used_percent
+            .map(|used_percent| QuotaWindowUsage {
+                used_percent,
+                window_minutes: Some(10_080),
+                resets_at_ms,
+            })
+            .filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
+        if tier.is_none() && !had_usage_entry {
             continue;
         }
         let quota = latest.get_or_insert(SessionQuotaUsage {
@@ -3132,20 +3377,31 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
             primary_window: None,
             secondary_window: None,
             exhausted_reason: None,
+            observed_at_ms: None,
         });
         if tier.is_some() {
             quota.tier = tier;
         }
-        if secondary_window.is_some() {
+        if had_usage_entry {
             quota.secondary_window = secondary_window;
+            quota.observed_at_ms = line_observed_ms;
+        } else if quota.observed_at_ms.is_none() && line_observed_ms.is_some() {
+            quota.observed_at_ms = line_observed_ms;
         }
     }
-    latest
+    latest.filter(|q| {
+        q.tier.is_some()
+            || q.primary_window.is_some()
+            || q.secondary_window.is_some()
+            || q.exhausted_reason.is_some()
+    })
 }
 
 fn muse_quota_from_session(raw: &str) -> Option<SessionQuotaUsage> {
+    let now_ms = fl_exec::stamp::now().unix_millis();
     let mut exhausted_reason = None;
     let mut resets_at_ms = None;
+    let mut observed_at_ms = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || !trimmed.contains("runtime.session") {
@@ -3161,6 +3417,7 @@ fn muse_quota_from_session(raw: &str) -> Option<SessionQuotaUsage> {
         if kind == Some("model_completed") {
             exhausted_reason = None;
             resets_at_ms = None;
+            observed_at_ms = None;
             continue;
         }
         if !matches!(kind, Some("model_failure_terminal_intent" | "failed")) {
@@ -3174,8 +3431,19 @@ fn muse_quota_from_session(raw: &str) -> Option<SessionQuotaUsage> {
         }
         resets_at_ms = parse_reset_instant_from_reason(reason);
         exhausted_reason = Some(reason.to_string());
+        observed_at_ms = ["timestamp", "ts", "at", "created_at"]
+            .into_iter()
+            .find_map(|k| {
+                val.get(k)
+                    .or_else(|| val.pointer(&format!("/payload/{k}")))
+                    .or_else(|| val.pointer(&format!("/payload/event/{k}")))
+                    .and_then(parse_timestamp_value_ms)
+            });
     }
     let exhausted_reason = exhausted_reason?;
+    if resets_at_ms.is_some_and(|reset| reset <= now_ms) {
+        return None;
+    }
     Some(SessionQuotaUsage {
         tier: None,
         primary_window: Some(QuotaWindowUsage {
@@ -3185,6 +3453,7 @@ fn muse_quota_from_session(raw: &str) -> Option<SessionQuotaUsage> {
         }),
         secondary_window: None,
         exhausted_reason: Some(exhausted_reason),
+        observed_at_ms,
     })
 }
 
@@ -3684,7 +3953,6 @@ fn quota_for_resolved_route_locked(
             .and_then(|path| files.raw(path))
             .and_then(codex_quota_from_rollout),
         "grok" => {
-            transcript_path?;
             let home = home?;
             grok_quota_from_home(&home)
         }
@@ -3695,12 +3963,14 @@ fn quota_for_resolved_route_locked(
         }
         "claude" => {
             let disk = transcript_path.and_then(|path| {
-                let reason = crate::direct_quota::claude_rate_limit_reason(files.raw(path)?)?;
+                let (reason, observed_at_ms) =
+                    crate::direct_quota::claude_rate_limit_entry(files.raw(path)?)?;
                 Some(SessionQuotaUsage {
                     tier: None,
                     primary_window: None,
                     secondary_window: None,
                     exhausted_reason: Some(reason),
+                    observed_at_ms,
                 })
             });
             let account = crate::direct_quota::claude_account_quota(home_override);
@@ -3708,12 +3978,14 @@ fn quota_for_resolved_route_locked(
         }
         "antigravity" => {
             let disk = transcript_path.and_then(|path| {
-                let reason = crate::direct_quota::antigravity_exhausted_reason(files.raw(path)?)?;
+                let (reason, observed_at_ms) =
+                    crate::direct_quota::antigravity_exhausted_entry(files.raw(path)?)?;
                 Some(SessionQuotaUsage {
                     tier: None,
                     primary_window: None,
                     secondary_window: None,
                     exhausted_reason: Some(reason),
+                    observed_at_ms,
                 })
             });
             let account = crate::direct_quota::agy_account_quota(home_override, agy);
@@ -12011,12 +12283,12 @@ mod tests {
                         "primary": {
                             "used_percent": primary,
                             "window_minutes": 300,
-                            "resets_at": 1_700_000_000_i64
+                            "resets_at": 4_100_000_000_i64
                         },
                         "secondary": {
                             "used_percent": secondary,
                             "window_minutes": 10080,
-                            "resets_at": 1_700_086_400_i64
+                            "resets_at": 4_100_086_400_i64
                         }
                     }
                 }
@@ -12041,7 +12313,7 @@ mod tests {
             Some(QuotaWindowUsage {
                 used_percent: 12.5,
                 window_minutes: Some(300),
-                resets_at_ms: Some(1_700_000_000_000),
+                resets_at_ms: Some(4_100_000_000_000),
             })
         );
         assert_eq!(
@@ -12049,7 +12321,7 @@ mod tests {
             Some(QuotaWindowUsage {
                 used_percent: 40.0,
                 window_minutes: Some(10_080),
-                resets_at_ms: Some(1_700_086_400_000),
+                resets_at_ms: Some(4_100_086_400_000),
             })
         );
 
@@ -12069,15 +12341,14 @@ mod tests {
                 "plan_type":"prolite", "primary":primary, "secondary":secondary
             }}}).to_string()
         };
-        let weekly =
-            serde_json::json!({"used_percent":26.0,"window_minutes":10080,"resets_at":1700000000});
+        let weekly = serde_json::json!({"used_percent":26.0,"window_minutes":10080,"resets_at":4100000000_i64});
         let quota = codex_quota_from_rollout(&rollout(weekly.clone(), Value::Null)).unwrap();
         assert_eq!(quota.tier.as_deref(), Some("pro"));
         assert!(quota.primary_window.is_none());
         let window = quota.secondary_window.unwrap();
         assert_eq!(window.used_percent, 26.0);
         assert_eq!(window.window_minutes, Some(10080));
-        assert_eq!(window.resets_at_ms, Some(1700000000000));
+        assert_eq!(window.resets_at_ms, Some(4100000000000));
 
         let quota = codex_quota_from_rollout(&rollout(
             serde_json::json!({"used_percent":3.0,"window_minutes":1440}),
@@ -12126,7 +12397,7 @@ mod tests {
                     "primary": {
                         "used_percent": 5.0,
                         "window_minutes": 300,
-                        "resets_at": 1_700_000_000_i64
+                        "resets_at": 4_100_000_000_i64
                     }
                 }
             }
@@ -12283,7 +12554,7 @@ mod tests {
             serde_json::json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}});
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
         fs::write(codex.join("auth.json"), serde_json::json!({"tokens": {"id_token": format!("e30.{payload}.signature"), "access_token": "secret-token"}}).to_string()).unwrap();
-        let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":100}}}}).to_string()));
+        let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":4_100_000_000_i64}}}}).to_string()));
         let quota =
             quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s").unwrap();
         assert_eq!(quota.tier.as_deref(), Some("plus"));
@@ -12449,7 +12720,7 @@ mod tests {
         let path = logs.join("unified.jsonl");
         let first = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
             "subscriptionTier":"SUPERGROK", "config":{"creditUsagePercent":100.0,
-            "billingPeriodEnd":"2026-12-01T00:00:00Z"}}});
+            "billingPeriodEnd":"2099-12-01T00:00:00Z"}}});
         let unrelated = serde_json::json!({"msg":"other billing: fetched credits config", "ctx":{
             "config":{"creditUsagePercent":0.0}}});
         let partial = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
@@ -12485,8 +12756,8 @@ mod tests {
         fs::write(session_dir.join("chat_history.jsonl"), "{}\n").unwrap();
         let logs = home.join(".grok").join("logs");
         fs::create_dir_all(&logs).unwrap();
-        let end = "2026-11-05T01:11:25.780+00:00";
-        let expected_ms = fl_core::At::parse("2026-11-05T01:11:25.780Z")
+        let end = "2099-11-05T01:11:25.780+00:00";
+        let expected_ms = fl_core::At::parse("2099-11-05T01:11:25.780Z")
             .unwrap()
             .unix_millis();
         let line = serde_json::json!({
@@ -12499,7 +12770,7 @@ mod tests {
                         "type": "USAGE_PERIOD_TYPE_WEEKLY",
                         "end": end
                     },
-                    "billingPeriodEnd": "2026-12-01T00:00:00Z"
+                    "billingPeriodEnd": "2099-12-01T00:00:00Z"
                 }
             }
         });
@@ -12537,7 +12808,7 @@ mod tests {
             .join(session);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
-        let reason = "API error 429: Subscription quota exhausted. Your usage window resets at 2026-11-02T00:00:00Z.";
+        let reason = "API error 429: Subscription quota exhausted. Your usage window resets at 2099-11-02T00:00:00Z.";
         let failure = serde_json::json!({
             "payload_type": "runtime.session",
             "payload": {
@@ -12557,7 +12828,7 @@ mod tests {
             }
         });
         fs::write(&path, format!("{failure}\n{failed}\n")).unwrap();
-        let expected_ms = fl_core::At::parse("2026-11-02T00:00:00.000Z")
+        let expected_ms = fl_core::At::parse("2099-11-02T00:00:00.000Z")
             .unwrap()
             .unix_millis();
         let quota = read_session_quota_usage_with_home(session, Some(home)).expect("muse quota");
@@ -12595,7 +12866,10 @@ mod tests {
             }
         });
         fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
-        assert!(quota_for_resolved_route("grok", None, Some(home), "s").is_none());
+        let grok_none = quota_for_resolved_route("grok", None, Some(home), "s")
+            .expect("grok route without transcript path reads unified.jsonl");
+        assert_eq!(grok_none.tier.as_deref(), Some("SuperGrok"));
+        assert_eq!(grok_none.secondary_window.unwrap().used_percent, 1.0);
 
         let quota = quota_for_resolved_route("grok", Some("already-resolved"), Some(home), "s")
             .expect("resolved grok path");
@@ -12608,8 +12882,8 @@ mod tests {
                 "type": "token_count",
                 "rate_limits": {
                     "plan_type": "plus",
-                    "primary": { "used_percent": 3.0, "resets_at": 10 },
-                    "secondary": { "used_percent": 4.0, "resets_at": 20 }
+                    "primary": { "used_percent": 3.0, "resets_at": 4_100_000_000_i64 },
+                    "secondary": { "used_percent": 4.0, "resets_at": 4_100_086_400_i64 }
                 }
             }
         });
@@ -12620,6 +12894,496 @@ mod tests {
         assert_eq!(codex.tier.as_deref(), Some("plus"));
         assert_eq!(codex.primary_window.unwrap().window_minutes, Some(300));
         assert!(quota_for_resolved_route("codex", None, Some(home), "s").is_none());
+    }
+
+    #[test]
+    fn observed_at_ms_extracted_from_codex_and_grok_log_timestamps_not_read_time() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+
+        // Codex rollout with an explicit timestamp vs no timestamp.
+        let with_ts = serde_json::json!({
+            "timestamp": "2026-11-08T12:34:56.789Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "plus",
+                    "primary": { "used_percent": 15.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 }
+                }
+            }
+        });
+        let expected_codex_ms = fl_core::At::parse("2026-11-08T12:34:56.789Z")
+            .unwrap()
+            .unix_millis();
+        let codex_with_ts = codex_quota_from_rollout(&format!("{with_ts}\n")).unwrap();
+        assert_eq!(codex_with_ts.observed_at_ms, Some(expected_codex_ms));
+
+        let without_ts = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "plus",
+                    "primary": { "used_percent": 15.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 }
+                }
+            }
+        });
+        let codex_without_ts = codex_quota_from_rollout(&format!("{without_ts}\n")).unwrap();
+        assert_eq!(codex_without_ts.observed_at_ms, None);
+
+        // Grok unified.jsonl with an explicit timestamp vs no timestamp.
+        let logs = home.join(".grok").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let grok_ts = "2026-11-08T15:00:00.250Z";
+        let expected_grok_ms = fl_core::At::parse(grok_ts).unwrap().unix_millis();
+        let grok_line_with_ts = serde_json::json!({
+            "time": grok_ts,
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok",
+                "config": {
+                    "creditUsagePercent": 22.0,
+                    "billingPeriodEnd": "2099-12-01T00:00:00Z"
+                }
+            }
+        });
+        fs::write(logs.join("unified.jsonl"), format!("{grok_line_with_ts}\n")).unwrap();
+        let grok_quota = grok_quota_from_home(home).unwrap();
+        assert_eq!(grok_quota.observed_at_ms, Some(expected_grok_ms));
+
+        let grok_line_no_ts = serde_json::json!({
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok",
+                "config": {
+                    "creditUsagePercent": 22.0,
+                    "billingPeriodEnd": "2099-12-01T00:00:00Z"
+                }
+            }
+        });
+        fs::write(logs.join("unified.jsonl"), format!("{grok_line_no_ts}\n")).unwrap();
+        let grok_quota_no_ts = grok_quota_from_home(home).unwrap();
+        assert_eq!(grok_quota_no_ts.observed_at_ms, None);
+    }
+
+    #[test]
+    fn live_probes_populate_observed_at_ms_with_capture_time_and_embedded_credentials_do_not() {
+        crate::direct_quota::with_probe_lock(|| {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path();
+            let before_ms = fl_exec::stamp::now().unix_millis();
+
+            // 1. Claude embedded .credentials.json without a timestamp must have observed_at_ms == None.
+            let claude_dir = home.join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            fs::write(
+                claude_dir.join(".credentials.json"),
+                serde_json::json!({
+                    "claudeAiOauth": {
+                        "subscriptionType": "max",
+                        "five_hour": { "utilization": 25.0, "resets_at": "2099-12-01T00:00:00Z" }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            crate::direct_quota::expire_direct_quota_cache();
+            let embedded =
+                crate::direct_quota::claude_account_quota(Some(home)).expect("embedded claude");
+            assert_eq!(embedded.observed_at_ms, None);
+
+            // 2. Claude live probe via FL_CLAUDE_USAGE_JSON sets observed_at_ms to capture time.
+            unsafe {
+                std::env::set_var("FL_HUB_CLAUDE_BIN", "/nonexistent/claude");
+                std::env::set_var(
+                    "FL_CLAUDE_USAGE_JSON",
+                    r#"{"five_hour":{"utilization":30.0,"resets_at":"2099-12-01T00:00:00Z"}}"#,
+                );
+            }
+            crate::direct_quota::expire_direct_quota_cache();
+            let live_claude =
+                crate::direct_quota::claude_account_quota(Some(home)).expect("live claude");
+            unsafe {
+                std::env::remove_var("FL_HUB_CLAUDE_BIN");
+                std::env::remove_var("FL_CLAUDE_USAGE_JSON");
+            }
+            let after_claude_ms = fl_exec::stamp::now().unix_millis();
+            let claude_obs = live_claude.observed_at_ms.expect("claude capture time");
+            assert!(
+                claude_obs >= before_ms && claude_obs <= after_claude_ms,
+                "claude observed_at_ms {claude_obs} not in [{before_ms}, {after_claude_ms}]"
+            );
+
+            // 3. Muse live CLI probe sets observed_at_ms to capture time and preserves it on cache hit.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let bin_dir = home.join(".local/bin");
+                fs::create_dir_all(&bin_dir).unwrap();
+                let muse_bin = bin_dir.join("muse");
+                fs::write(
+                    &muse_bin,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"allowance\":{\"plan_type\":\"pro\",\"window\":{\"used_percent\":14.0,\"resets_at\":\"2099-12-01T00:00:00Z\"}}}'\n",
+                )
+                .unwrap();
+                let mut perms = fs::metadata(&muse_bin).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&muse_bin, perms).unwrap();
+                unsafe {
+                    std::env::set_var("FL_HUB_MUSE_BIN", &muse_bin);
+                }
+                crate::direct_quota::expire_direct_quota_cache();
+                let muse_before = fl_exec::stamp::now().unix_millis();
+                let live_muse =
+                    crate::direct_quota::muse_account_quota(Some(home)).expect("live muse");
+                unsafe {
+                    std::env::remove_var("FL_HUB_MUSE_BIN");
+                }
+                let muse_after = fl_exec::stamp::now().unix_millis();
+                let muse_obs = live_muse.observed_at_ms.expect("muse capture time");
+                assert!(
+                    muse_obs >= muse_before && muse_obs <= muse_after,
+                    "muse observed_at_ms {muse_obs} not in [{muse_before}, {muse_after}]"
+                );
+            }
+
+            // 4. Antigravity live probe via FL_AGY_QUOTA_JSON sets observed_at_ms to capture time.
+            unsafe {
+                std::env::set_var(
+                    "FL_AGY_QUOTA_JSON",
+                    r#"{"tier":"Ultra","primary_window":{"used_percent":20.0,"resets_at":"2099-12-01T00:00:00Z"}}"#,
+                );
+            }
+            crate::direct_quota::expire_direct_quota_cache();
+            let agy_before = fl_exec::stamp::now().unix_millis();
+            let live_agy = crate::direct_quota::agy_account_quota(
+                Some(home),
+                &crate::direct_quota::AgyQuotaTarget::default(),
+            )
+            .expect("live agy");
+            unsafe {
+                std::env::remove_var("FL_AGY_QUOTA_JSON");
+            }
+            let agy_after = fl_exec::stamp::now().unix_millis();
+            let agy_obs = live_agy.observed_at_ms.expect("agy capture time");
+            assert!(
+                agy_obs >= agy_before && agy_obs <= agy_after,
+                "agy observed_at_ms {agy_obs} not in [{agy_before}, {agy_after}]"
+            );
+        });
+    }
+
+    #[test]
+    fn expired_windows_and_exhaustion_reasons_tied_to_reset_windows_are_dropped() {
+        let now_sec = (fl_exec::stamp::now().unix_millis() / 1000) as i64;
+        let past_sec = now_sec - 60;
+        let future_sec = now_sec + 3600;
+
+        // 1. Codex: primary window expired, secondary active -> primary dropped, secondary kept.
+        let partial_expired = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "plus",
+                    "rate_limit_reached_type": "primary",
+                    "primary": { "used_percent": 100.0, "window_minutes": 300, "resets_at": past_sec },
+                    "secondary": { "used_percent": 42.0, "window_minutes": 10080, "resets_at": future_sec }
+                }
+            }
+        });
+        let q = codex_quota_from_rollout(&format!("{partial_expired}\n")).unwrap();
+        assert!(
+            q.primary_window.is_none(),
+            "expired primary window must be dropped"
+        );
+        assert_eq!(q.secondary_window.unwrap().used_percent, 42.0);
+        assert_eq!(q.exhausted_reason.as_deref(), Some("primary"));
+
+        // 2. Codex: all windows expired -> windows dropped AND exhausted_reason cleared, tier retained.
+        let all_expired = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "plus",
+                    "rate_limit_reached_type": "primary",
+                    "primary": { "used_percent": 100.0, "window_minutes": 300, "resets_at": past_sec },
+                    "secondary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": past_sec }
+                }
+            }
+        });
+        let q_expired = codex_quota_from_rollout(&format!("{all_expired}\n")).unwrap();
+        assert_eq!(q_expired.tier.as_deref(), Some("plus"));
+        assert!(q_expired.primary_window.is_none());
+        assert!(q_expired.secondary_window.is_none());
+        assert!(
+            q_expired.exhausted_reason.is_none(),
+            "exhausted_reason tied to expired windows must be cleared"
+        );
+
+        // 3. Codex: no tier and all windows expired -> returns None.
+        let all_expired_no_tier = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "rate_limit_reached_type": "primary",
+                    "primary": { "used_percent": 100.0, "window_minutes": 300, "resets_at": past_sec }
+                }
+            }
+        });
+        assert!(codex_quota_from_rollout(&format!("{all_expired_no_tier}\n")).is_none());
+
+        // 4. Muse: session exhaustion with a past reset timestamp is cleared (returns None).
+        let muse_expired = serde_json::json!({
+            "payload_type": "runtime.session",
+            "payload": {
+                "event": {
+                    "kind": "failed",
+                    "reason": "API error 429: Subscription quota exhausted. Your usage window resets at 2020-01-01T00:00:00Z."
+                }
+            }
+        });
+        assert!(muse_quota_from_session(&format!("{muse_expired}\n")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_sibling_sessions_propagate_freshest_account_quota_and_isolate_mismatched_accounts() {
+        use base64::Engine as _;
+        let home = TempDir::new().unwrap();
+        let foreign_home = TempDir::new().unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let claims =
+            serde_json::json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        fs::write(
+            codex_dir.join("auth.json"),
+            serde_json::json!({"tokens": {"id_token": format!("e30.{payload}.sig")}}).to_string(),
+        )
+        .unwrap();
+
+        // Session A: fresh rollout in home with 2 live windows and observed_at_ms = 2000.
+        let rollout_a = write_codex_rollout(
+            home.path(),
+            "codex-fresh",
+            &serde_json::json!({
+                "timestamp": "2026-11-08T10:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "primary": { "used_percent": 33.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
+                        "secondary": { "used_percent": 55.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        // Session B: older rollout in same home with stale/older values and its own exhausted_reason.
+        let rollout_b = write_codex_rollout(
+            home.path(),
+            "codex-stale",
+            &serde_json::json!({
+                "timestamp": "2026-11-07T10:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "rate_limit_reached_type": "primary",
+                        "primary": { "used_percent": 9.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
+                        "secondary": { "used_percent": 11.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        // Session C: idle route in same home whose rollout has no rate_limits yet (quota_usage = None).
+        let rollout_c = write_codex_rollout(home.path(), "codex-idle", "{}");
+        // Session D: rollout in same home but from a different plan ("pro" != auth "plus").
+        let rollout_d = write_codex_rollout(
+            home.path(),
+            "codex-wrong-tier",
+            &serde_json::json!({
+                "timestamp": "2026-11-09T10:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "pro",
+                        "primary": { "used_percent": 88.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        // Session E: rollout outside home_override (foreign account).
+        let rollout_e = write_codex_rollout(
+            foreign_home.path(),
+            "codex-foreign-home",
+            &serde_json::json!({
+                "timestamp": "2026-11-09T11:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "primary": { "used_percent": 77.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let routes = serde_json::json!({
+            "entries": {
+                "agent-a": {
+                    "persona": "agent-a",
+                    "updated_at": "2026-11-08T10:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-fresh", "transcript_path": rollout_a }
+                },
+                "agent-b": {
+                    "persona": "agent-b",
+                    "updated_at": "2026-11-07T10:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-stale", "transcript_path": rollout_b }
+                },
+                "agent-c": {
+                    "persona": "agent-c",
+                    "updated_at": "2026-11-06T10:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-idle", "transcript_path": rollout_c }
+                },
+                "agent-d": {
+                    "persona": "agent-d",
+                    "updated_at": "2026-11-09T10:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-wrong-tier", "transcript_path": rollout_d }
+                },
+                "agent-e": {
+                    "persona": "agent-e",
+                    "updated_at": "2026-11-09T11:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-foreign-home", "transcript_path": rollout_e }
+                }
+            }
+        });
+        let routes: RouteTable = serde_json::from_value(routes).unwrap();
+        let sessions = discover_sessions_from_routes(
+            &DiscoveryStoreSnapshot::default(),
+            Some(home.path()),
+            true,
+            routes,
+            None,
+        );
+        let find = |id: &str| sessions.iter().find(|s| s.id == id).unwrap();
+        let expected_obs = fl_core::At::parse("2026-11-08T10:00:00.000Z")
+            .unwrap()
+            .unix_millis();
+
+        // Sibling B gets A's fresh windows and observed_at_ms, while keeping its own exhausted_reason.
+        let b = find("codex-stale").quota_usage.as_ref().unwrap();
+        assert_eq!(b.tier.as_deref(), Some("plus"));
+        assert_eq!(b.primary_window.as_ref().unwrap().used_percent, 33.0);
+        assert_eq!(b.secondary_window.as_ref().unwrap().used_percent, 55.0);
+        assert_eq!(b.observed_at_ms, Some(expected_obs));
+        assert_eq!(b.exhausted_reason.as_deref(), Some("primary"));
+
+        // Sibling C (previously None) inherits A's fresh windows, tier, and observed_at_ms, with no exhausted_reason.
+        let c = find("codex-idle").quota_usage.as_ref().unwrap();
+        assert_eq!(c.tier.as_deref(), Some("plus"));
+        assert_eq!(c.primary_window.as_ref().unwrap().used_percent, 33.0);
+        assert_eq!(c.secondary_window.as_ref().unwrap().used_percent, 55.0);
+        assert_eq!(c.observed_at_ms, Some(expected_obs));
+        assert!(c.exhausted_reason.is_none());
+
+        // Mismatched tier D is neither used as donor nor overwritten by A.
+        let d = find("codex-wrong-tier").quota_usage.as_ref().unwrap();
+        assert_eq!(d.tier.as_deref(), Some("pro"));
+        assert_eq!(d.primary_window.as_ref().unwrap().used_percent, 88.0);
+
+        // Unbound route E (no rollout under home) does not inherit A's quota.
+        assert!(
+            find("codex-foreign-home").quota_usage.is_none(),
+            "unbound route outside home must not inherit sibling quota"
+        );
+
+        // And a session whose resolved transcript_path lives in foreign_home is neither used as donor nor overwritten.
+        let mut with_foreign = sessions;
+        if let Some(foreign) = with_foreign
+            .iter_mut()
+            .find(|s| s.id == "codex-foreign-home")
+        {
+            foreign.transcript_path = Some(rollout_e.clone());
+            foreign.quota_usage = quota_for_resolved_route(
+                "codex",
+                Some(&rollout_e),
+                Some(home.path()),
+                "codex-foreign-home",
+            );
+        }
+        propagate_codex_sibling_quota(&mut with_foreign, Some(home.path()));
+        let e = with_foreign
+            .iter()
+            .find(|s| s.id == "codex-foreign-home")
+            .unwrap()
+            .quota_usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(e.primary_window.as_ref().unwrap().used_percent, 77.0);
+    }
+
+    #[test]
+    fn grok_route_without_transcript_path_receives_quota_from_unified_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let logs = home.join(".grok").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let ts = "2026-11-08T18:00:00.000Z";
+        let expected_obs = fl_core::At::parse(ts).unwrap().unix_millis();
+        let line = serde_json::json!({
+            "time": ts,
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok",
+                "config": {
+                    "creditUsagePercent": 19.5,
+                    "billingPeriodEnd": "2099-12-01T00:00:00Z"
+                }
+            }
+        });
+        fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
+
+        let routes = serde_json::json!({
+            "entries": {
+                "grok-agent": {
+                    "persona": "grok-agent",
+                    "updated_at": "2026-11-08T18:00:00.000Z",
+                    "route": {
+                        "kind": "grok",
+                        "session_id": "grok-no-transcript"
+                    }
+                }
+            }
+        });
+        let routes: RouteTable = serde_json::from_value(routes).unwrap();
+        let sessions = discover_sessions_from_routes(
+            &DiscoveryStoreSnapshot::default(),
+            Some(home),
+            true,
+            routes,
+            None,
+        );
+        let grok = sessions
+            .iter()
+            .find(|s| s.id == "grok-no-transcript")
+            .expect("grok route session");
+        assert!(grok.transcript_path.is_none());
+        let quota = grok.quota_usage.as_ref().expect("grok quota populated");
+        assert_eq!(quota.tier.as_deref(), Some("SuperGrok"));
+        assert_eq!(quota.secondary_window.as_ref().unwrap().used_percent, 19.5);
+        assert_eq!(quota.observed_at_ms, Some(expected_obs));
     }
 
     #[test]
