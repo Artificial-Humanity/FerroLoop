@@ -233,10 +233,14 @@ impl VendorHostAdapter for CodexHostAdapter {
         &self,
         request: &VendorLaunchRequest,
     ) -> Result<VendorLaunchPlan, VendorAdapterError> {
+        let auto_approval = request
+            .auto_approval
+            .unwrap_or_else(|| fl_core::permissions::Vendor::Codex.default_auto_approval());
         let perms = fl_core::permissions::compile_posture(
             fl_core::permissions::Vendor::Codex,
             &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
             request.posture,
+            auto_approval,
         )
         .map_err(|e| VendorAdapterError::PermissionRefused {
             vendor: self.vendor_id().to_string(),
@@ -1987,11 +1991,37 @@ mod tests {
             home_dir: Some(PathBuf::from("/tmp/home")),
             remote_control: true,
             posture: fl_core::permissions::Posture::Auto,
+            auto_approval: None,
         };
         let plan = adapter.prepare_launch(&req).unwrap();
         assert_eq!(plan.vendor_id, "codex");
         assert_eq!(
             &plan.argv[1..],
+            &[
+                "--approve-for-me",
+                "--remote",
+                "unix://",
+                "--model",
+                "gpt-5.4",
+                "-c",
+                "model_reasoning_effort=\"xhigh\"",
+                "Bootstrap prompt"
+            ]
+        );
+        assert!(
+            plan.argv
+                .iter()
+                .all(|a| !matches!(a.as_str(), "-a" | "--ask-for-approval" | "-s" | "--sandbox")),
+            "Codex vendor-reviewer argv must never include -a or -s alongside --approve-for-me"
+        );
+
+        let ask_human_req = VendorLaunchRequest {
+            auto_approval: Some(fl_core::permissions::AutoApproval::AskHuman),
+            ..req.clone()
+        };
+        let ask_human_plan = adapter.prepare_launch(&ask_human_req).unwrap();
+        assert_eq!(
+            &ask_human_plan.argv[1..],
             &[
                 "-a",
                 "on-request",

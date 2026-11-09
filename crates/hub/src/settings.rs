@@ -84,6 +84,12 @@ pub(crate) struct Settings {
     /// Omitted from the JSON when empty.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub context_window_defaults: BTreeMap<String, u64>,
+    /// Per-vendor [`fl_core::permissions::AutoApproval`] overrides used when a session launches
+    /// with `posture == Posture::Auto`, keyed by compiler vendor id (`claude`, `codex`, `muse`,
+    /// `grok`, `antigravity`). Vendors not present in the stored map use their compiler default
+    /// ([`fl_core::permissions::Vendor::default_auto_approval`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub auto_approval: BTreeMap<String, fl_core::permissions::AutoApproval>,
 }
 
 impl Default for Settings {
@@ -110,8 +116,67 @@ impl Default for Settings {
             artifacts_dir: None,
             project_artifacts_dirs: BTreeMap::new(),
             context_window_defaults: BTreeMap::new(),
+            auto_approval: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct VendorAutoApprovalCapability {
+    pub supported: Vec<fl_core::permissions::AutoApproval>,
+    pub default: fl_core::permissions::AutoApproval,
+    pub configurable: bool,
+}
+
+/// Per-vendor [`fl_core::permissions::AutoApproval`] capability metadata built directly from
+/// [`fl_core::permissions::Vendor::ALL`].
+pub(crate) fn auto_approval_capabilities() -> BTreeMap<String, VendorAutoApprovalCapability> {
+    let mut map = BTreeMap::new();
+    for vendor in fl_core::permissions::Vendor::ALL {
+        map.insert(
+            vendor.as_str().to_string(),
+            VendorAutoApprovalCapability {
+                supported: vendor.supported_auto_approvals().to_vec(),
+                default: vendor.default_auto_approval(),
+                configurable: vendor.is_auto_approval_configurable(),
+            },
+        );
+    }
+    map
+}
+
+pub(crate) fn validate_auto_approval(
+    vendor_raw: &str,
+    choice_raw: &str,
+) -> Result<
+    (
+        fl_core::permissions::Vendor,
+        fl_core::permissions::AutoApproval,
+    ),
+    String,
+> {
+    let vendor = vendor_raw
+        .trim()
+        .parse::<fl_core::permissions::Vendor>()
+        .map_err(|why| format!("auto_approval.{vendor_raw}: {why}"))?;
+    let choice = choice_raw
+        .trim()
+        .parse::<fl_core::permissions::AutoApproval>()
+        .map_err(|why| format!("auto_approval.{}: {why}", vendor.as_str()))?;
+    if !vendor.supports_auto_approval(choice) {
+        let supported = vendor
+            .supported_auto_approvals()
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "auto_approval.{}: vendor `{}` does not support auto_approval `{choice}` (supported: {supported})",
+            vendor.as_str(),
+            vendor.as_str()
+        ));
+    }
+    Ok((vendor, choice))
 }
 
 /// Whether `raw` may be stored as an artifacts directory: an absolute path with no NUL byte and
@@ -139,6 +204,10 @@ pub(crate) struct SettingsPatch {
     /// See [`Settings::context_window_defaults`]. Merged per vendor: a number sets that vendor's
     /// default and `null` removes it; vendors the patch does not name keep theirs.
     pub context_window_defaults: Option<BTreeMap<String, Option<u64>>>,
+    /// See [`Settings::auto_approval`]. Merged per vendor: a valid [`fl_core::permissions::AutoApproval`]
+    /// string sets that vendor's choice and `null` resets it to the compiler default; unsupported
+    /// vendors or choices are refused with 400.
+    pub auto_approval: Option<BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -262,7 +331,62 @@ impl Settings {
                 }
             }
         }
+        if let Some(approvals) = patch.auto_approval {
+            for (vendor_raw, choice_opt) in approvals {
+                let vendor = vendor_raw
+                    .trim()
+                    .parse::<fl_core::permissions::Vendor>()
+                    .map_err(|why| format!("auto_approval.{vendor_raw}: {why}"))?;
+                match choice_opt {
+                    Some(raw_choice) => {
+                        let (_, choice) = validate_auto_approval(&vendor_raw, &raw_choice)?;
+                        if choice == vendor.default_auto_approval() {
+                            next.auto_approval.remove(vendor.as_str());
+                        } else {
+                            next.auto_approval
+                                .insert(vendor.as_str().to_string(), choice);
+                        }
+                    }
+                    None => {
+                        next.auto_approval.remove(vendor.as_str());
+                    }
+                }
+            }
+        }
         Ok(next)
+    }
+
+    /// Resolve the effective [`fl_core::permissions::AutoApproval`] for `vendor` (`None` for
+    /// vendors outside the five-vendor permission compiler).
+    pub(crate) fn effective_auto_approval_for(
+        &self,
+        vendor: &str,
+    ) -> Option<fl_core::permissions::AutoApproval> {
+        let cv = vendor.trim().parse::<fl_core::permissions::Vendor>().ok()?;
+        let stored = self
+            .auto_approval
+            .get(cv.as_str())
+            .copied()
+            .filter(|&choice| cv.supports_auto_approval(choice));
+        Some(stored.unwrap_or_else(|| cv.default_auto_approval()))
+    }
+
+    /// Effective [`fl_core::permissions::AutoApproval`] map for all five permission-compiler
+    /// vendors, derived from `self.auto_approval` overlaid on [`fl_core::permissions::Vendor::ALL`].
+    pub(crate) fn effective_auto_approval_map(
+        &self,
+    ) -> BTreeMap<String, fl_core::permissions::AutoApproval> {
+        let mut out = BTreeMap::new();
+        for vendor in fl_core::permissions::Vendor::ALL {
+            let choice = self
+                .auto_approval
+                .get(vendor.as_str())
+                .copied()
+                .filter(|&c| vendor.supports_auto_approval(c))
+                .unwrap_or_else(|| vendor.default_auto_approval());
+            out.insert(vendor.as_str().to_string(), choice);
+        }
+        out
     }
 
     /// Read what a stored document still says: each readable, valid field overrides the default.
@@ -381,6 +505,16 @@ impl Settings {
                     .filter(|&t| crate::context_window::validate_default(vendor, t).is_ok())
                 {
                     s.context_window_defaults.insert(vendor.clone(), tokens);
+                }
+            }
+        }
+        if let Some(map) = root.get("auto_approval").and_then(Value::as_object) {
+            for (vendor_raw, choice_val) in map {
+                if let Some(choice_str) = choice_val.as_str()
+                    && let Ok((vendor, choice)) = validate_auto_approval(vendor_raw, choice_str)
+                    && choice != vendor.default_auto_approval()
+                {
+                    s.auto_approval.insert(vendor.as_str().to_string(), choice);
                 }
             }
         }
@@ -1079,5 +1213,108 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let out = update(tmp.path(), tz()).unwrap();
         assert_eq!(out.attachment_retention_days, 7);
+    }
+
+    #[test]
+    fn auto_approval_merges_per_vendor_validates_capabilities_and_drops_stored_invalid_entries() {
+        use fl_core::permissions::AutoApproval;
+
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+
+        let defaults = Settings::default();
+        assert_eq!(
+            defaults.effective_auto_approval_map(),
+            BTreeMap::from([
+                ("antigravity".to_string(), AutoApproval::Native),
+                ("claude".to_string(), AutoApproval::Native),
+                ("codex".to_string(), AutoApproval::VendorReviewer),
+                ("grok".to_string(), AutoApproval::Native),
+                ("muse".to_string(), AutoApproval::VendorReviewer),
+            ])
+        );
+        let caps = auto_approval_capabilities();
+        assert!(caps["codex"].configurable);
+        assert!(caps["muse"].configurable);
+        assert!(!caps["claude"].configurable);
+        assert!(!caps["grok"].configurable);
+        assert!(!caps["antigravity"].configurable);
+
+        let set = update(
+            tmp.path(),
+            patch(json!({
+                "auto_approval": {
+                    "codex": "ask-human",
+                    "claude": "native"
+                }
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            set.effective_auto_approval_for("codex"),
+            Some(AutoApproval::AskHuman)
+        );
+        assert_eq!(
+            set.effective_auto_approval_for("muse"),
+            Some(AutoApproval::VendorReviewer)
+        );
+        assert_eq!(
+            set.effective_auto_approval_for("claude"),
+            Some(AutoApproval::Native)
+        );
+        assert_eq!(load(tmp.path()), set);
+
+        // Unsupported choices or unknown vendors are refused without modifying stored settings.
+        for bad in [
+            json!({ "claude": "ask-human" }),
+            json!({ "claude": "vendor-reviewer" }),
+            json!({ "grok": "ask-human" }),
+            json!({ "antigravity": "vendor-reviewer" }),
+            json!({ "codex": "native" }),
+            json!({ "muse": "native" }),
+            json!({ "codex": "yolo" }),
+            json!({ "unknown": "vendor-reviewer" }),
+            json!({ "unknown": null }),
+        ] {
+            let res = update(tmp.path(), patch(json!({ "auto_approval": bad })));
+            assert!(matches!(res, Err(UpdateError::Invalid(_))), "{bad}");
+        }
+        assert_eq!(load(tmp.path()), set);
+
+        // Stored entries that are invalid or match the compiler default are dropped on load.
+        let doc = json!({
+            "timezone": "Asia/Tokyo",
+            "auto_approval": {
+                "muse": "ask-human",
+                "codex": "vendor-reviewer",
+                "claude": "ask-human",
+                "bogus": "vendor-reviewer"
+            }
+        });
+        std::fs::write(settings_path(tmp.path()), doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(
+            loaded.auto_approval,
+            BTreeMap::from([("muse".to_string(), AutoApproval::AskHuman)])
+        );
+        assert_eq!(
+            loaded.effective_auto_approval_for("muse"),
+            Some(AutoApproval::AskHuman)
+        );
+        assert_eq!(
+            loaded.effective_auto_approval_for("codex"),
+            Some(AutoApproval::VendorReviewer)
+        );
+
+        // Resetting with `null` clears the override and omits the key on disk when empty.
+        let cleared = update(
+            tmp.path(),
+            patch(json!({ "auto_approval": { "muse": null } })),
+        )
+        .unwrap();
+        assert!(cleared.auto_approval.is_empty());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(settings_path(tmp.path())).unwrap()).unwrap();
+        assert!(doc.get("auto_approval").is_none());
     }
 }

@@ -455,10 +455,14 @@ impl VendorHostAdapter for ClaudeHostAdapter {
         // Place `--remote-control` before `--permission-mode <mode>` so `--remote-control [name]`
         // in Commander.js is always followed by a `--` flag and never consumes a trailing
         // positional `<prompt>` when `model` and `thinking_effort` are both `None`.
+        let auto_approval = request
+            .auto_approval
+            .unwrap_or_else(|| fl_core::permissions::Vendor::Claude.default_auto_approval());
         let perms = fl_core::permissions::compile_posture(
             fl_core::permissions::Vendor::Claude,
             &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
             request.posture,
+            auto_approval,
         )
         .map_err(|e| VendorAdapterError::PermissionRefused {
             vendor: self.vendor_id().to_string(),
@@ -512,10 +516,14 @@ impl VendorHostAdapter for ClaudeHostAdapter {
         &self,
         request: &AttachOrResumeRequest,
     ) -> Result<VendorLaunchPlan, VendorAdapterError> {
+        let auto_approval = request
+            .auto_approval
+            .unwrap_or_else(|| fl_core::permissions::Vendor::Claude.default_auto_approval());
         let perms = fl_core::permissions::compile_posture(
             fl_core::permissions::Vendor::Claude,
             &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
             request.posture,
+            auto_approval,
         )
         .map_err(|e| VendorAdapterError::PermissionRefused {
             vendor: self.vendor_id().to_string(),
@@ -1075,6 +1083,7 @@ mod tests {
             home_dir: Some(tmp.path().to_path_buf()),
             remote_control: true,
             posture: fl_core::permissions::Posture::Auto,
+            auto_approval: None,
         };
         let plan_minimal = adapter.prepare_launch(&req_minimal).unwrap();
         assert_eq!(
@@ -1114,6 +1123,7 @@ mod tests {
             home_dir: Some(tmp.path().to_path_buf()),
             remote_control: true,
             posture: fl_core::permissions::Posture::Auto,
+            auto_approval: None,
         };
         let plan_bound = adapter.prepare_launch(&req_bound).unwrap();
         assert_eq!(

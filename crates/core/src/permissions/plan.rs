@@ -1,7 +1,7 @@
 //! The compiler's output: the plan, its receipts and its typed refusals.
 
 use super::facts::{ChangeField, Surface, Transport, Vendor, VendorFacts};
-use super::policy::{Capability, Effect, PolicyError, Posture};
+use super::policy::{AutoApproval, Capability, Effect, PolicyError, Posture};
 use serde::{Deserialize, Serialize};
 
 /// Where a native file belongs. Symbolic: no `~` is ever resolved by the compiler.
@@ -214,6 +214,15 @@ pub enum CompileRefusal {
         vendor: Vendor,
         posture: Posture,
         reason: String,
+    },
+    #[error(
+        "{vendor:?} does not support auto_approval `{auto_approval}` (supported: {})",
+        supported.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ")
+    )]
+    AutoApprovalNotSupported {
+        vendor: Vendor,
+        auto_approval: AutoApproval,
+        supported: Vec<AutoApproval>,
     },
     #[error("{vendor:?} cannot combine the requested posture and sandbox: {reason}")]
     SandboxConflict { vendor: Vendor, reason: String },

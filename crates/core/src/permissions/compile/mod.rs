@@ -27,8 +27,8 @@ use super::plan::{
 use std::collections::BTreeSet;
 
 use super::policy::{
-    Capability, Effect, PathClass, Pattern, PermissionPolicy, Posture, Rule, SandboxChoice,
-    UnenforcedDefaults, canonical_default,
+    AutoApproval, Capability, Effect, PathClass, Pattern, PermissionPolicy, Posture, Rule,
+    SandboxChoice, UnenforcedDefaults, canonical_default,
 };
 
 /// Compiles `policy` for `vendor`. Pure and deterministic: the same inputs give the same
@@ -41,7 +41,8 @@ pub fn compile(
     compile_inner(vendor, facts, policy, false)
 }
 
-/// Compiles only the posture and vendor-default sandbox axes for `vendor` at session launch.
+/// Compiles only the posture and vendor-default sandbox axes for `vendor` at session launch,
+/// using the explicit [`AutoApproval`] choice when `posture == Posture::Auto`.
 ///
 /// Used by spin-up and remodel before per-capability rule sets exist: it runs the same vendor
 /// axis compilers and the same bypass / sandbox-off audit as [`compile`], without emitting
@@ -50,8 +51,10 @@ pub fn compile_posture(
     vendor: Vendor,
     facts: &VendorFacts,
     posture: Posture,
+    auto_approval: AutoApproval,
 ) -> Result<CompiledPlan, CompileRefusal> {
-    let policy = PermissionPolicy::new(posture, SandboxChoice::VendorDefault);
+    let policy = PermissionPolicy::new(posture, SandboxChoice::VendorDefault)
+        .with_auto_approval(auto_approval);
     compile_inner(vendor, facts, &policy, true)
 }
 
@@ -68,11 +71,22 @@ fn compile_inner(
             transport: facts.transport,
         });
     }
+    let auto_approval = policy
+        .auto_approval
+        .unwrap_or_else(|| vendor.default_auto_approval());
+    if !vendor.supports_auto_approval(auto_approval) {
+        return Err(CompileRefusal::AutoApprovalNotSupported {
+            vendor,
+            auto_approval,
+            supported: vendor.supported_auto_approvals().to_vec(),
+        });
+    }
     let policy = policy.normalized().map_err(CompileRefusal::InvalidPolicy)?;
     let mut cx = Cx {
         vendor,
         facts,
         policy: &policy,
+        auto_approval,
         axes_only,
         args: Vec::new(),
         files: Vec::new(),
@@ -94,6 +108,7 @@ pub(crate) struct Cx<'a> {
     pub vendor: Vendor,
     pub facts: &'a VendorFacts,
     pub policy: &'a PermissionPolicy,
+    pub auto_approval: AutoApproval,
     /// When `true`, only the posture and sandbox axes are compiled (see [`compile_posture`]).
     pub axes_only: bool,
     pub args: Vec<String>,
@@ -450,7 +465,7 @@ impl Cx<'_> {
             requires_respawn,
             unenforced,
         };
-        audit(&plan, self.policy)?;
+        audit(&plan, self.policy, self.auto_approval)?;
         Ok(plan)
     }
 
@@ -511,7 +526,11 @@ const SANDBOX_OFF_TOKENS: [&str; 4] = [
 
 /// Defence in depth: a plan that carries a bypass or sandbox-off construct without the axis
 /// that asked for it is never returned.
-fn audit(plan: &CompiledPlan, policy: &PermissionPolicy) -> Result<(), CompileRefusal> {
+fn audit(
+    plan: &CompiledPlan,
+    policy: &PermissionPolicy,
+    auto_approval: AutoApproval,
+) -> Result<(), CompileRefusal> {
     let bad = |what: String| CompileRefusal::InternalInvariant(what);
     let arg = |tok: &str| plan.launch_args.iter().any(|a| a == tok);
     // Structural keys only: a user pattern that merely spells a flag is not a flag.
@@ -522,6 +541,32 @@ fn audit(plan: &CompiledPlan, policy: &PermissionPolicy) -> Result<(), CompileRe
                 .any(|l| l.trim_start().starts_with(needle))
         })
     };
+    if arg("--approve-for-me") {
+        if policy.posture != Posture::Auto || auto_approval != AutoApproval::VendorReviewer {
+            return Err(bad(
+                "`--approve-for-me` without `Posture::Auto` and `AutoApproval::VendorReviewer`"
+                    .to_owned(),
+            ));
+        }
+        for conflict in ["-a", "--ask-for-approval", "-s", "--sandbox"] {
+            if arg(conflict) {
+                return Err(bad(format!(
+                    "`--approve-for-me` conflicts with `{conflict}` in codex-cli"
+                )));
+            }
+        }
+    }
+    if plan
+        .launch_args
+        .windows(2)
+        .any(|w| w[0] == "--approval-judge" && w[1] == "on")
+        && (policy.posture != Posture::Auto || auto_approval != AutoApproval::VendorReviewer)
+    {
+        return Err(bad(
+            "`--approval-judge on` without `Posture::Auto` and `AutoApproval::VendorReviewer`"
+                .to_owned(),
+        ));
+    }
     if policy.posture != Posture::Bypass {
         for t in BYPASS_TOKENS {
             if arg(t) {
