@@ -3844,7 +3844,8 @@ fn host_build_identity_is_opt_in() {
     );
     let expected = fl_host_proto::RELIABLE_FEATURE
         | fl_host_proto::HOST_STATUS_FEATURE
-        | fl_host_proto::SESSION_OWNER_FEATURE;
+        | fl_host_proto::SESSION_OWNER_FEATURE
+        | fl_host_proto::PTY_RETENTION_FEATURE;
     #[cfg(unix)]
     let expected = expected | fl_host_proto::PTY_FEATURE | fl_host_proto::RENDERED_PTY_FEATURE;
     assert_eq!(features, expected);
@@ -4195,6 +4196,73 @@ fn rendered_spawn(rpc: &mut Rpc, name: &str) -> StreamId {
     }
 }
 
+// More than the former projection limit must coexist, without consumers or Ack.
+#[cfg(unix)]
+#[test]
+fn default_pty_capacity_supports_sixteen_live_gated_children() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let gate = daemon.paths.barrier.join("capacity-go");
+    let mut streams = Vec::new();
+    for index in 0..16 {
+        let mut child = spec(
+            &format!("capacity-{index}"),
+            &["gated-line-burst", gate.to_str().unwrap()],
+        );
+        child.kind = SpawnKind::Pty;
+        let stream = rpc.inner.spawn_pty_session(child, None).unwrap().0;
+        streams.push(stream);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for stream in &streams {
+        loop {
+            let screen = rpc.inner.capture_rendered(stream.clone()).unwrap();
+            if screen.contents.contains("READY") {
+                assert_eq!((screen.rows, screen.cols), (40, 120));
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not reach its gate");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let records = rpc.inner.list_sessions().unwrap();
+    assert_eq!(records.len(), 16);
+    assert!(
+        records
+            .iter()
+            .all(|r| matches!(r.state, ChildState::Running(_)))
+    );
+    std::fs::write(gate, b"go").unwrap();
+    for stream in &streams {
+        let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+        rpc.inner.kill_session(stream.clone(), lease).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let records = rpc.inner.list_sessions().unwrap();
+        if records
+            .iter()
+            .all(|r| matches!(r.state, ChildState::CleanupComplete(_)))
+        {
+            assert!(records.len() <= 16);
+            assert!(records.iter().all(|r| r.acked == 0));
+            break;
+        }
+        assert!(Instant::now() < deadline, "PTY cleanup incomplete");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for stream in streams {
+        assert!(matches!(
+            rpc.inner
+                .extension_request(XReq::CaptureRendered { stream })
+                .unwrap(),
+            XResp::Refused {
+                code: Refuse::SessionFenced | Refuse::StaleEpoch
+            }
+        ));
+    }
+}
+
 // Catches missing opt-in host support, name-based identity fallback and ioctl/parser divergence.
 #[cfg(unix)]
 #[test]
@@ -4453,6 +4521,7 @@ fn rendered_old_epoch_never_selects_respawned_session() {
     let old = rendered_spawn(&mut rpc, "rendered-respawn");
     let lease = controller(&mut rpc, &old);
     let before = rendered_ready(&mut rpc, &old);
+    assert_eq!((before.rows, before.cols), (40, 120));
     assert_eq!(
         extended(
             &mut rpc,
@@ -4477,14 +4546,23 @@ fn rendered_old_epoch_never_selects_respawned_session() {
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
+    assert!(matches!(
+        extended(&mut rpc, XReq::CaptureOutput { session: old.session.clone(), max_bytes: 64 * 1024 }),
+        XResp::CapturedOutput { text } if text.ends_with("ready")
+    ));
     let new = rendered_spawn(&mut rpc, "rendered-respawn");
     assert_ne!(old.epoch, new.epoch);
     assert_eq!(rendered_ready(&mut rpc, &new).stream, new);
-    let historical = rendered_screen(&mut rpc, &old);
-    assert_eq!(historical.stream, old);
     assert_eq!(
-        (historical.rows, historical.cols),
-        (before.rows, before.cols)
+        extended(
+            &mut rpc,
+            XReq::CaptureRendered {
+                stream: old.clone()
+            }
+        ),
+        XResp::Refused {
+            code: Refuse::SessionFenced
+        }
     );
     assert!(matches!(
         extended(
@@ -4935,4 +5013,129 @@ fn rendered_child_winsize_matches_ordered_resize_generation_and_output() {
         assert!(after.output_seq >= resized.output_seq);
     }
     rpc.inner.kill_session(stream, lease).unwrap();
+}
+
+// No consumer connection or Ack is created in this fixture.
+#[cfg(unix)]
+#[test]
+fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let baseline = rpc.inner.pty_retention_status().unwrap().unwrap();
+    assert_eq!(baseline.projection_reserved_bytes, 0);
+    let mut streams = Vec::new();
+    for n in 0..74 {
+        // Reusing the first name at the end tests full-epoch diagnostic identity.
+        let name = if n == 73 {
+            "tail-000".to_owned()
+        } else {
+            format!("tail-{n:03}")
+        };
+        let marker = daemon.paths.barrier.join("drained");
+        let mut child = if n == 0 {
+            spec(
+                &name,
+                &["stdout-fragments", "lines", marker.to_str().unwrap(), "eof"],
+            )
+        } else {
+            spec(&name, &["exit", "0"])
+        };
+        child.kind = SpawnKind::Pty;
+        let stream = rpc.inner.spawn_pty_session(child, None).unwrap().0;
+        streams.push(stream.clone());
+        let mut cleanup_requested = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = rpc.inner.pty_retention_status().unwrap().unwrap();
+            let records = rpc.inner.list_sessions().unwrap();
+            // A bare synthetic child is not a hosted owner: leader exit alone
+            // deliberately does not request containment cleanup. Request that
+            // boundary after natural exit, without subscribing or acknowledging.
+            if !cleanup_requested
+                && records
+                    .iter()
+                    .any(|r| r.stream == stream && matches!(r.state, ChildState::LeaderExited(_)))
+            {
+                let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+                rpc.inner.kill_session(stream.clone(), lease).unwrap();
+                cleanup_requested = true;
+            }
+            if status.projection_reserved_bytes == 0
+                && status.completed_pty_sessions == (n + 1).min(8)
+                && status.evicted_total == u64::from((n + 1).saturating_sub(8))
+                && records.iter().any(|r| {
+                    r.stream == stream && matches!(r.state, ChildState::CleanupComplete(_))
+                })
+            {
+                assert!(records.len() <= 8);
+                assert!(records.iter().all(|r| r.acked == 0));
+                let tail = rpc
+                    .inner
+                    .capture_output(stream.session.clone(), 65536)
+                    .unwrap();
+                if n == 0 {
+                    assert_eq!(tail.len(), 65536);
+                    assert!(tail.ends_with("99999\r\n"));
+                } else {
+                    assert_eq!(tail, "READY\r\n");
+                }
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "epoch {n} did not finish: diagnostic={status:?} records={records:?} child_finished_output={} tail={:?}",
+                marker.exists(),
+                rpc.inner.capture_output(stream.session.clone(), 128)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let status = rpc.inner.pty_retention_status().unwrap().unwrap();
+    assert_eq!(status.completed_pty_sessions, 8);
+    assert_eq!(status.evicted_total, 66);
+    assert_eq!(status.recent_evictions, streams[2..66]);
+    assert_eq!(
+        status.projection_reserved_bytes,
+        baseline.projection_reserved_bytes
+    );
+    let evicted = &streams[2];
+    let error = rpc
+        .inner
+        .claim_controller(evicted.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("PTY epoch evicted"), "{error}");
+    assert!(
+        error.contains(&serde_json::to_string(evicted).unwrap()),
+        "{error}"
+    );
+    let old_same_name = &streams[0];
+    let error = rpc
+        .inner
+        .claim_controller(old_same_name.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("stale epoch (possibly evicted"), "{error}");
+    assert!(
+        !error.contains("PTY epoch evicted"),
+        "history must not invent proof"
+    );
+    assert!(
+        rpc.inner
+            .capture_output(streams[73].session.clone(), 65536)
+            .unwrap()
+            .ends_with("READY\r\n")
+    );
+    // Old/raw clients continue receiving the existing refusal, never a new shape.
+    assert_eq!(
+        rpc.inner
+            .extension_request(XReq::Observe {
+                stream: evicted.clone(),
+                after_seq: None
+            })
+            .unwrap(),
+        XResp::Refused {
+            code: Refuse::StaleEpoch
+        }
+    );
 }

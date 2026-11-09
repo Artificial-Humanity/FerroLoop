@@ -668,6 +668,9 @@ impl WriterHandle {
                     .map_err(|error| match error {
                         fl_host_proto::HostError::Unsupported { .. } => Refusal::Unsupported,
                         fl_host_proto::HostError::Io(_) => Refusal::Io,
+                        fl_host_proto::HostError::Protocol(reason) if reason == "SessionFenced" => {
+                            Refusal::SessionFenced
+                        }
                         _ => Refusal::ResourceLimit,
                     })
             },
