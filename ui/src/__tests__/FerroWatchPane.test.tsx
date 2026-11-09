@@ -505,7 +505,14 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
     expect(within(quotasSection).getByTestId("watch-vendor-card-antigravity")).toBeInTheDocument();
     expect(within(quotasSection).getByTestId("watch-vendor-card-muse")).toBeInTheDocument();
 
-    // 3. Dry-Run Balance Plan & Apply Balance
+    // 3. Dry-Run Balance Plan & Apply Balance (without inert Auto-Balance checkbox / Save Policy)
+    expect(
+      within(quotasSection).queryByTestId("watch-balance-enabled-checkbox"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(quotasSection).queryByTestId("watch-balance-save-policy-btn"),
+    ).not.toBeInTheDocument();
+
     fireEvent.click(within(quotasSection).getByTestId("watch-balance-plan-btn"));
     const planResults = await screen.findByTestId("watch-balance-plan-results");
     expect(planResults).toHaveTextContent("ferris: claude → codex");
@@ -515,11 +522,28 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
     expect(applyResults).toHaveTextContent("ferris: claude → codex [OK]");
 
     // 4. Quick Re-Model from Claude card
-    fireEvent.click(within(claudeCard).getByTestId("watch-vendor-remodel-btn-claude"));
-    const balanceControls = within(quotasSection).getByTestId("watch-quota-balance-controls");
-    expect(within(balanceControls).getByTestId("watch-remodel-agent-select")).toHaveValue(
-      "ferris",
+    const claudeRemodelBtn = within(claudeCard).getByTestId(
+      "watch-vendor-remodel-btn-claude",
     );
+    expect(claudeRemodelBtn).toHaveTextContent(/^Re-Model$/);
+    expect(claudeRemodelBtn).not.toBeDisabled();
+
+    const grokCard = within(quotasSection).getByTestId("watch-vendor-card-grok");
+    const grokRemodelBtn = within(grokCard).getByTestId(
+      "watch-vendor-remodel-btn-grok",
+    );
+    expect(grokRemodelBtn).toHaveTextContent(/^Re-Model$/);
+    expect(grokRemodelBtn).toBeDisabled();
+    expect(grokRemodelBtn).toHaveAttribute(
+      "title",
+      "No active sessions on grok to re-model",
+    );
+
+    const balanceControls = within(quotasSection).getByTestId("watch-quota-balance-controls");
+    const agentSelect = within(balanceControls).getByTestId("watch-remodel-agent-select");
+    fireEvent.click(claudeRemodelBtn);
+    expect(agentSelect).toHaveValue("ferris");
+    expect(document.activeElement).toBe(agentSelect);
     const remodelPostureSelect = within(balanceControls).getByTestId(
       "watch-remodel-posture-select",
     ) as HTMLSelectElement;
@@ -1539,5 +1563,69 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
     ).not.toBeInTheDocument();
 
     unmount();
+  });
+
+  it("scrolls and focuses watch-remodel-agent-select from vendor and liveness Re-Model buttons, including from liveness-only filter (#350 D)", async () => {
+    const summaryData = makeSampleWatchSummary();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.includes("/api/v1/watch/summary")) {
+        return json(summaryData);
+      }
+      if (url.endsWith("/api/v1/hosted-sessions")) {
+        return json({ sessions: [] });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const scrollSpy = vi.fn();
+    const origScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollSpy;
+
+    try {
+      const { unmount } = render(
+        <FerroWatchPane
+          authority={{ tier: "owner", login: "lmcfarlin" }}
+          apiClient={apiClient}
+        />,
+      );
+
+      await screen.findByTestId("ferrowatch-pane-title");
+
+      // 1. Vendor card Re-Model button scrolls and focuses the agent select
+      const claudeRemodelBtn = screen.getByTestId("watch-vendor-remodel-btn-claude");
+      claudeRemodelBtn.focus();
+      expect(document.activeElement).toBe(claudeRemodelBtn);
+
+      fireEvent.click(claudeRemodelBtn);
+      const agentSelect = screen.getByTestId("watch-remodel-agent-select");
+      expect(document.activeElement).toBe(agentSelect);
+      expect(scrollSpy).toHaveBeenCalledTimes(1);
+
+      // 2. Switch to Liveness-only filter (quotas section unmounted), then click liveness Re-Model
+      fireEvent.click(screen.getByTestId("watch-section-filter-liveness"));
+      expect(screen.queryByTestId("watch-remodel-agent-select")).not.toBeInTheDocument();
+
+      const livenessRemodelBtn = screen.getByTestId("watch-liveness-remodel-btn-feira");
+      fireEvent.click(livenessRemodelBtn);
+
+      const remountedSelect = await screen.findByTestId("watch-remodel-agent-select");
+      expect(remountedSelect).toHaveValue("feira");
+      expect(document.activeElement).toBe(remountedSelect);
+      expect(scrollSpy).toHaveBeenCalledTimes(2);
+
+      unmount();
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView;
+    }
   });
 });
