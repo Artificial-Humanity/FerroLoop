@@ -14,6 +14,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         runtime: &TmuxRuntime,
         key_probe: &ProvisionedKeys,
         workspace_root: None,
+        log_hydration_warnings: true,
     }
 }
 

@@ -777,6 +777,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
             let _ = composed_vendor_host_adapters();
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
+            env.log_hydration_warnings = false;
             let out = lifecycle::spin_up(store, &env, &req, &by, lifecycle::Caller::Owner)
                 .map_err(lifecycle_failure)?;
             if json {
@@ -882,6 +883,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
+            env.log_hydration_warnings = false;
             let out = lifecycle::remodel_session(
                 store,
                 &env,

@@ -635,12 +635,31 @@ fn hydration_status_legacy_record_decodes_as_unconfirmed_when_saved_again() {
     assert_eq!(record["hydration_status"], "unconfirmed");
 }
 
+fn one_json_document(output: &[u8]) -> Value {
+    let mut documents = serde_json::Deserializer::from_slice(output).into_iter::<Value>();
+    let value = documents.next().expect("one JSON document").unwrap();
+    assert!(
+        documents.next().is_none(),
+        "stdout contains another document or trailing text"
+    );
+    value
+}
+
 #[test]
 fn hydration_guidance_warnings_keep_json_stdout_and_human_diagnostics() {
     let e = Env::new();
-    let json = Env::json_of(e.spin_up("ada", "assistant", "claude"));
-    assert!(json["warnings"].as_array().is_some_and(|w| !w.is_empty()));
-    e.fl()
+    let output = e
+        .spin_up("ada", "assistant", "claude")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let json = one_json_document(&output.stdout);
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(!warnings.is_empty());
+    let json_stderr = output.stderr;
+    let output = e
+        .fl()
         .args([
             "agent",
             "spin-up",
@@ -656,5 +675,46 @@ fn hydration_guidance_warnings_keep_json_stdout_and_human_diagnostics() {
         ])
         .assert()
         .success()
-        .stderr(contains("warning: "));
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected: Vec<_> = warnings
+        .iter()
+        .map(|w| format!("warning: {}", w.as_str().unwrap()))
+        .collect();
+    assert_eq!(stderr.lines().collect::<Vec<_>>(), expected);
+    assert!(
+        json_stderr.is_empty(),
+        "JSON warnings belong in the response"
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn hydration_remodel_warnings_are_printed_once_or_returned_as_json() {
+    let e = Env::new();
+    Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    let output = e
+        .remodel("ada", &["--vendor", "claude", "--by", "owner", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let json = one_json_document(&output.stdout);
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(!warnings.is_empty());
+    assert!(output.stderr.is_empty());
+    let output = e
+        .remodel("ada", &["--vendor", "claude", "--by", "owner"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected: Vec<_> = warnings
+        .iter()
+        .map(|w| format!("warning: {}", w.as_str().unwrap()))
+        .collect();
+    assert_eq!(stderr.lines().collect::<Vec<_>>(), expected);
+    assert_eq!(String::from_utf8(output.stdout).unwrap().lines().count(), 1);
 }

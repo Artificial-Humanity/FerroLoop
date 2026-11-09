@@ -171,6 +171,9 @@ pub struct LifecycleEnv<'a> {
     /// Parent of the hub repository. A spin-up with no `cwd` may use a child directory
     /// whose name matches the project. `None` leaves an unresolved `cwd` unset.
     pub workspace_root: Option<&'a Path>,
+    /// Log guidance warnings independently of response consumption (the hub default).
+    /// CLI callers disable this and render the returned warnings once in their output format.
+    pub log_hydration_warnings: bool,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -201,6 +204,7 @@ impl<'a> LifecycleEnv<'a> {
             runtime: &HostRuntime,
             key_probe: &HostKeyProbe,
             workspace_root: None,
+            log_hydration_warnings: true,
         }
     }
 
@@ -1393,6 +1397,7 @@ impl FakeRuntime {
             runtime: self,
             key_probe: &ProvisionedKeys,
             workspace_root: None,
+            log_hydration_warnings: true,
         }
     }
 
@@ -2355,6 +2360,69 @@ pub(crate) fn has_catalog_guidance<S: StateStore>(
             .is_some())
 }
 
+/// Owned role guidance captured from the store before filesystem rendering.
+pub(crate) struct RegisteredRoleGuidance {
+    label: String,
+    template: Option<String>,
+    structural_custom: bool,
+}
+
+impl RegisteredRoleGuidance {
+    pub(crate) fn render(
+        &self,
+        context: crate::hydration::Context,
+        display: &str,
+        project: &str,
+    ) -> crate::hydration::HydrationPrompt {
+        use crate::hydration::{RoleGuidance, render};
+        let guidance = if self.structural_custom {
+            RoleGuidance::StructuralCustom
+        } else if let Some(template) = &self.template {
+            RoleGuidance::Catalog(template)
+        } else {
+            RoleGuidance::File
+        };
+        render(context, display, project, &self.label, guidance)
+    }
+}
+
+/// Catalog authority remains fallible even when optional filesystem context is absent.
+pub(crate) fn prepare_registered_role_guidance<S: StateStore>(
+    store: &S,
+    role: &AgentRole,
+) -> Result<RegisteredRoleGuidance, LifecycleError> {
+    let mut guidance = RegisteredRoleGuidance {
+        label: reforge_role_label(role),
+        template: None,
+        structural_custom: false,
+    };
+    match role {
+        AgentRole::Custom(slug)
+            if matches!(
+                slug.as_str(),
+                "lead" | "assistant" | "lab_manager" | "lab-manager"
+            ) =>
+        {
+            guidance.structural_custom = true
+        }
+        AgentRole::Custom(slug) => {
+            if let Some(record) =
+                get_role(store, slug).map_err(|e| LifecycleError::Store(e.to_string()))?
+            {
+                guidance.label = role.as_wire();
+                guidance.template = Some(record.prompt_template);
+            } else if has_catalog_guidance(store, slug)? {
+                return Err(LifecycleError::Invalid(format!(
+                    "catalog guidance for `{}` is missing or deleted; restore the role before hydration",
+                    guidance.label
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(guidance)
+}
+
 /// Catalog guidance for custom roles. Structural custom shadows may share a catalog slug,
 /// but must never inherit the builtin structural template or file.
 pub(crate) fn registered_role_prompt<S: StateStore + Catalog>(
@@ -2365,43 +2433,18 @@ pub(crate) fn registered_role_prompt<S: StateStore + Catalog>(
     project: &str,
     role: &AgentRole,
 ) -> Result<crate::hydration::HydrationPrompt, LifecycleError> {
-    use crate::hydration::{Context, RoleGuidance, render};
+    let guidance = prepare_registered_role_guidance(store, role)?;
     // workspace_root also supplies legacy runtime cwd defaults. Preserve that hint
     // for launching, but require workspace markers before using it for guidance.
     let workspace = env.workspace_root.and_then(fl_core::find_workspace_root);
-    let context = Context::resolve(store, env.home_override, workspace.as_deref(), cwd, project);
-    let label = reforge_role_label(role);
-    let guidance = match role {
-        AgentRole::Custom(slug)
-            if matches!(
-                slug.as_str(),
-                "lead" | "assistant" | "lab_manager" | "lab-manager"
-            ) =>
-        {
-            RoleGuidance::StructuralCustom
-        }
-        AgentRole::Custom(slug) => {
-            if let Some(record) =
-                get_role(store, slug).map_err(|e| LifecycleError::Store(e.to_string()))?
-            {
-                return Ok(render(
-                    context,
-                    display,
-                    project,
-                    &role.as_wire(),
-                    RoleGuidance::Catalog(&record.prompt_template),
-                ));
-            }
-            if has_catalog_guidance(store, slug)? {
-                return Err(LifecycleError::Invalid(format!(
-                    "catalog guidance for `{label}` is missing or deleted; restore the role before hydration"
-                )));
-            }
-            RoleGuidance::File
-        }
-        _ => RoleGuidance::File,
-    };
-    Ok(render(context, display, project, &label, guidance))
+    let context = crate::hydration::Context::resolve(
+        store,
+        env.home_override,
+        workspace.as_deref(),
+        cwd,
+        project,
+    );
+    Ok(guidance.render(context, display, project))
 }
 
 /// Each staged binding has its own key, preserving earlier required guidance if a later
@@ -3718,7 +3761,9 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         &v.project,
         &agent_role_from_label(&v.role),
     )?;
-    crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
+    if env.log_hydration_warnings {
+        crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
+    }
     let prompt = guidance.text;
 
     let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
@@ -5129,7 +5174,9 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
         &record.project,
         &agent_role_from_label(&record.role),
     )?;
-    crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
+    if env.log_hydration_warnings {
+        crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
+    }
     let prompt = guidance.text;
     fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
         &record.vendor,
@@ -6608,6 +6655,7 @@ mod tests {
             runtime: &TmuxRuntime,
             key_probe: &ProvisionedKeys,
             workspace_root: None,
+            log_hydration_warnings: true,
         }
     }
 
