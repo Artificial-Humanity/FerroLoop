@@ -825,11 +825,6 @@ fn launch_spec_for_with_session(
 }
 
 #[cfg(test)]
-pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, String)> {
-    launch_env_for_vendor("claude", persona, home)
-}
-
-#[cfg(test)]
 fn resolve_muse_bin(configured: Option<std::ffi::OsString>, home: Option<&Path>) -> String {
     resolve_vendor_bin(configured, home, "muse")
 }
@@ -6520,6 +6515,7 @@ mod tests {
                 "on-request",
                 "--approval-judge",
                 "on",
+                "--disable-sandbox",
                 "hello"
             ])
         );
@@ -9786,6 +9782,12 @@ mod tests {
                 env.iter()
                     .any(|(k, v)| k == "AGENT_PERSONA" && v == "fiona"),
                 "{vendor} must include AGENT_PERSONA: {env:?}"
+            );
+            assert_eq!(
+                env.iter()
+                    .any(|(k, v)| k == "MUSE_NO_AUTO_UPDATE" && v == "1"),
+                vendor == "muse",
+                "{vendor} MUSE_NO_AUTO_UPDATE mismatch: {env:?}"
             );
         }
     }
