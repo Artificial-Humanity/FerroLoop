@@ -247,6 +247,103 @@ impl AsyncHostClient {
         }
     }
 
+    /// None means this host cannot report retention; it never means zero usage.
+    pub async fn pty_retention_status(
+        &mut self,
+    ) -> Result<Option<crate::PtyRetentionStatus>, HostError> {
+        if self.minor < 1 {
+            return Ok(None);
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::Capabilities)
+            .await?
+        {
+            crate::ExtensionResponse::Capabilities { features, .. } => {
+                if features & crate::PTY_RETENTION_FEATURE == 0 {
+                    return Ok(None);
+                }
+            }
+            _ => return Err(HostError::Protocol("capabilities response required".into())),
+        }
+        match self
+            .extension_request(crate::ExtensionRequest::PtyRetentionStatus)
+            .await?
+        {
+            crate::ExtensionResponse::PtyRetentionStatus { status } => Ok(Some(status)),
+            _ => Err(HostError::Protocol(
+                "PTY retention status response required".into(),
+            )),
+        }
+    }
+
+    // Raw protocol requests retain their existing refusal shape. Typed helpers
+    // enrich failures once, without resending the mutation or recursively diagnosing.
+    async fn diagnosed_extension_request(
+        &mut self,
+        request: crate::ExtensionRequest,
+    ) -> Result<crate::ExtensionResponse, HostError> {
+        use crate::{ExtensionRefusal as F, ExtensionRequest as R, ExtensionResponse as S};
+        let stream = match &request {
+            R::ClaimController { stream }
+            | R::SubscribeReliable { stream, .. }
+            | R::Observe { stream, .. }
+            | R::SendLine { stream, .. }
+            | R::SignalSession { stream, .. }
+            | R::KillSession { stream, .. }
+            | R::Write { stream, .. }
+            | R::CaptureRendered { stream }
+            | R::Resize { stream, .. } => Some(stream.clone()),
+            R::Ack { cursor, .. } => Some(cursor.stream.clone()),
+            _ => None,
+        };
+        let pty_capacity = matches!(
+            &request,
+            R::SpawnSession {
+                mode: crate::SessionMode::Pty,
+                ..
+            } | R::Resize { .. }
+        );
+        let response = self.extension_request(request).await?;
+        if matches!(
+            &response,
+            S::Refused {
+                code: F::StaleEpoch
+            }
+        ) && let Some(stream) = stream
+        {
+            let diagnostic = self.pty_retention_status().await.ok().flatten();
+            let evicted = diagnostic
+                .as_ref()
+                .is_some_and(|s| s.recent_evictions.contains(&stream));
+            let identity = serde_json::to_string(&stream).expect("stream identity");
+            return Err(HostError::Protocol(if evicted {
+                format!("PTY epoch evicted: {identity}")
+            } else {
+                format!("stale epoch (possibly evicted; no recent eviction proof): {identity}")
+            }));
+        }
+        if pty_capacity
+            && matches!(
+                &response,
+                S::Refused {
+                    code: F::ResourceLimit
+                }
+            )
+        {
+            let usage = match self.pty_retention_status().await.ok().flatten() {
+                Some(s) => format!(
+                    "{} / {} bytes reserved",
+                    s.projection_reserved_bytes, s.projection_limit_bytes
+                ),
+                None => "usage/limit unavailable on this host".into(),
+            };
+            return Err(HostError::Protocol(format!(
+                "PTY operation refused (ResourceLimit); projection capacity is one possible cause ({usage}). Inspect fl host status; reduce geometry or scrollback, or stop unused live sessions. The host does not identify the specific spawn failure."
+            )));
+        }
+        Ok(response)
+    }
+
     /// False for missing/mismatched ownership or an older host without this capability.
     /// The caller must use the same stream for the subsequent controller claim and mutation.
     pub async fn check_session_owner(
@@ -288,7 +385,7 @@ impl AsyncHostClient {
         stream: crate::StreamId,
     ) -> Result<ReliableControllerGrant, HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::ClaimController { stream })
+            .diagnosed_extension_request(crate::ExtensionRequest::ClaimController { stream })
             .await?
         {
             crate::ExtensionResponse::Controller {
@@ -312,7 +409,7 @@ impl AsyncHostClient {
         after: Option<u64>,
     ) -> Result<ReliableEventStream, HostError> {
         let response = self
-            .extension_request(crate::ExtensionRequest::SubscribeReliable {
+            .diagnosed_extension_request(crate::ExtensionRequest::SubscribeReliable {
                 stream: stream.clone(),
                 lease,
                 after_seq: after,
@@ -354,7 +451,7 @@ impl AsyncHostClient {
         lease: crate::ControllerLease,
     ) -> Result<u64, HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::Ack { cursor, lease })
+            .diagnosed_extension_request(crate::ExtensionRequest::Ack { cursor, lease })
             .await?
         {
             crate::ExtensionResponse::Acked { through } => Ok(through),
@@ -364,7 +461,7 @@ impl AsyncHostClient {
 
     pub async fn list_sessions(&mut self) -> Result<Vec<crate::SessionSummary>, HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::ListSessions)
+            .diagnosed_extension_request(crate::ExtensionRequest::ListSessions)
             .await?
         {
             crate::ExtensionResponse::Sessions { records } => Ok(records),
@@ -379,7 +476,7 @@ impl AsyncHostClient {
         spec: crate::SpawnSpec,
     ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::SpawnSession {
+            .diagnosed_extension_request(crate::ExtensionRequest::SpawnSession {
                 spec,
                 mode: crate::SessionMode::ReliablePipe,
                 pty: None,
@@ -399,7 +496,7 @@ impl AsyncHostClient {
         pty: Option<crate::PtyOptions>,
     ) -> Result<(crate::StreamId, crate::ChildState), HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::SpawnSession {
+            .diagnosed_extension_request(crate::ExtensionRequest::SpawnSession {
                 spec,
                 mode: crate::SessionMode::Pty,
                 pty,
@@ -420,7 +517,7 @@ impl AsyncHostClient {
         line: String,
     ) -> Result<crate::SendOutcome, HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::SendLine {
+            .diagnosed_extension_request(crate::ExtensionRequest::SendLine {
                 stream,
                 lease,
                 line,
@@ -440,7 +537,7 @@ impl AsyncHostClient {
     ) -> Result<crate::SendOutcome, HostError> {
         let bytes = crate::RawInput::new(bytes)?;
         match self
-            .extension_request(crate::ExtensionRequest::Write {
+            .diagnosed_extension_request(crate::ExtensionRequest::Write {
                 stream,
                 lease,
                 bytes,
@@ -459,7 +556,7 @@ impl AsyncHostClient {
         signal: crate::SignalKind,
     ) -> Result<(), HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::SignalSession {
+            .diagnosed_extension_request(crate::ExtensionRequest::SignalSession {
                 stream,
                 lease,
                 signal,
@@ -479,7 +576,7 @@ impl AsyncHostClient {
         lease: crate::ControllerLease,
     ) -> Result<(), HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::KillSession { stream, lease })
+            .diagnosed_extension_request(crate::ExtensionRequest::KillSession { stream, lease })
             .await?
         {
             crate::ExtensionResponse::Controlled => Ok(()),
@@ -496,7 +593,7 @@ impl AsyncHostClient {
             });
         }
         match self
-            .extension_request(crate::ExtensionRequest::Capabilities)
+            .diagnosed_extension_request(crate::ExtensionRequest::Capabilities)
             .await?
         {
             crate::ExtensionResponse::Capabilities { features, .. }
@@ -517,7 +614,7 @@ impl AsyncHostClient {
     ) -> Result<crate::RenderedScreen, HostError> {
         self.require_rendered_pty().await?;
         match self
-            .extension_request(crate::ExtensionRequest::CaptureRendered { stream })
+            .diagnosed_extension_request(crate::ExtensionRequest::CaptureRendered { stream })
             .await?
         {
             crate::ExtensionResponse::RenderedCapture { screen } => Ok(screen),
@@ -536,7 +633,7 @@ impl AsyncHostClient {
     ) -> Result<u64, HostError> {
         self.require_rendered_pty().await?;
         match self
-            .extension_request(crate::ExtensionRequest::Resize {
+            .diagnosed_extension_request(crate::ExtensionRequest::Resize {
                 stream,
                 lease,
                 cols,
@@ -560,7 +657,10 @@ impl AsyncHostClient {
         max_bytes: u32,
     ) -> Result<String, HostError> {
         match self
-            .extension_request(crate::ExtensionRequest::CaptureOutput { session, max_bytes })
+            .diagnosed_extension_request(crate::ExtensionRequest::CaptureOutput {
+                session,
+                max_bytes,
+            })
             .await?
         {
             crate::ExtensionResponse::CapturedOutput { text } => Ok(text),
@@ -688,6 +788,10 @@ impl BlockingHostClient {
     /// None means the daemon does not support build identity telemetry.
     pub fn host_status(&mut self) -> Result<Option<crate::HostBuildInfo>, HostError> {
         self.runtime.block_on(self.inner.host_status())
+    }
+
+    pub fn pty_retention_status(&mut self) -> Result<Option<crate::PtyRetentionStatus>, HostError> {
+        self.runtime.block_on(self.inner.pty_retention_status())
     }
 
     pub fn check_session_owner(
@@ -1105,6 +1209,161 @@ mod tests {
             };
             tokio::join!(caller, daemon);
         }
+    }
+
+    #[tokio::test]
+    async fn pty_retention_query_is_capability_gated_and_capacity_errors_preserve_uncertainty() {
+        for minor in [0, 1] {
+            for supported in [false, true] {
+                let (mut client, mut server) = memory_rpc();
+                client.minor = minor;
+                let caller = async {
+                    let status = client.pty_retention_status().await.unwrap();
+                    assert_eq!(status.is_some(), minor > 0 && supported);
+                    let id = client.correlator.last + 1;
+                    client.request(list(id)).await.unwrap();
+                };
+                let daemon = async {
+                    loop {
+                        let frame = auth::read_frame_async(
+                            &mut server,
+                            Instant::now() + Duration::from_secs(2),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                        let request = crate::decode_request_for_minor(minor, &frame).unwrap();
+                        let done = matches!(request, HostRequest::List { .. });
+                        let response = match request {
+                            HostRequest::Extended {
+                                id,
+                                request: crate::ExtensionRequest::Capabilities,
+                            } if minor > 0 => HostResponse::Extended {
+                                id,
+                                response: crate::ExtensionResponse::Capabilities {
+                                    host: crate::HostInstance::new([0; 16]),
+                                    features: if supported {
+                                        crate::PTY_RETENTION_FEATURE
+                                    } else {
+                                        0
+                                    },
+                                    limits: Default::default(),
+                                },
+                            },
+                            HostRequest::Extended {
+                                id,
+                                request: crate::ExtensionRequest::PtyRetentionStatus,
+                            } if minor > 0 && supported => HostResponse::Extended {
+                                id,
+                                response: crate::ExtensionResponse::PtyRetentionStatus {
+                                    status: crate::PtyRetentionStatus {
+                                        projection_reserved_bytes: 12,
+                                        projection_limit_bytes: 64,
+                                        completed_pty_sessions: 0,
+                                        completed_pty_limit: 8,
+                                        evicted_total: 0,
+                                        recent_evictions: vec![],
+                                    },
+                                },
+                            },
+                            HostRequest::List { id } => HostResponse::Listed {
+                                id,
+                                children: vec![],
+                            },
+                            other => panic!("unsupported diagnostic sent: {other:?}"),
+                        };
+                        auth::write_frame_async(
+                            &mut server,
+                            &crate::encode_response_for_minor(minor, &response).unwrap(),
+                            Instant::now() + Duration::from_secs(2),
+                        )
+                        .await
+                        .unwrap();
+                        if done {
+                            break;
+                        }
+                    }
+                };
+                tokio::join!(caller, daemon);
+            }
+        }
+        let (mut client, mut server) = memory_rpc();
+        let caller = async {
+            let stream = crate::StreamId {
+                host: crate::HostInstance::new([0; 16]),
+                session: crate::SessionId::new("capacity").unwrap(),
+                epoch: crate::SessionEpoch(1),
+            };
+            let error = client
+                .diagnosed_extension_request(crate::ExtensionRequest::Resize {
+                    stream,
+                    lease: crate::ControllerLease(1),
+                    cols: 80,
+                    rows: 24,
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("one possible cause"), "{error}");
+            assert!(error.contains("12 / 64 bytes"), "{error}");
+            assert!(
+                error.contains("fl host status")
+                    && error.contains("scrollback")
+                    && error.contains("stop unused live")
+            );
+        };
+        let daemon = async {
+            for step in 0..3 {
+                let frame = auth::read_frame_async(
+                    &mut server,
+                    Instant::now() + Duration::from_secs(2),
+                    false,
+                )
+                .await
+                .unwrap();
+                let HostRequest::Extended { id, request } =
+                    crate::decode_request_for_minor(1, &frame).unwrap()
+                else {
+                    panic!("extended required")
+                };
+                let response = match (step, request) {
+                    (0, crate::ExtensionRequest::Resize { .. }) => {
+                        crate::ExtensionResponse::Refused {
+                            code: crate::ExtensionRefusal::ResourceLimit,
+                        }
+                    }
+                    (1, crate::ExtensionRequest::Capabilities) => {
+                        crate::ExtensionResponse::Capabilities {
+                            host: crate::HostInstance::new([0; 16]),
+                            features: crate::PTY_RETENTION_FEATURE,
+                            limits: Default::default(),
+                        }
+                    }
+                    (2, crate::ExtensionRequest::PtyRetentionStatus) => {
+                        crate::ExtensionResponse::PtyRetentionStatus {
+                            status: crate::PtyRetentionStatus {
+                                projection_reserved_bytes: 12,
+                                projection_limit_bytes: 64,
+                                completed_pty_sessions: 0,
+                                completed_pty_limit: 8,
+                                evicted_total: 0,
+                                recent_evictions: vec![],
+                            },
+                        }
+                    }
+                    other => panic!("mutation was retried or diagnostics recursed: {other:?}"),
+                };
+                auth::write_frame_async(
+                    &mut server,
+                    &crate::encode_response_for_minor(1, &HostResponse::Extended { id, response })
+                        .unwrap(),
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        tokio::join!(caller, daemon);
     }
 
     fn list(id: u64) -> HostRequest {

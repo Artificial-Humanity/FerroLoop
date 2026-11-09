@@ -32,6 +32,7 @@ struct Epoch {
     writer: Weak<WriterHandle>,
     generation: u64,
     claiming: Option<u64>,
+    completed: bool,
     owner: Option<Owner>,
     active: Option<Arc<StreamState>>,
     final_write: Option<Arc<FinalWriteState>>,
@@ -56,6 +57,7 @@ struct Pending {
 }
 pub(crate) struct StreamState {
     cancelled: AtomicBool,
+    journal: Weak<ReliableJournal>,
 }
 struct State {
     rpc_connections: Vec<ConnId>,
@@ -109,6 +111,10 @@ impl StreamGuard {
 impl StreamState {
     pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+            || self
+                .journal
+                .upgrade()
+                .is_some_and(|journal| journal.compacted())
     }
 }
 // One final write per active stream. These inline slots bound retained task
@@ -337,6 +343,7 @@ impl AuthorityRegistry {
             writer: Arc::downgrade(writer),
             generation: 0,
             claiming: None,
+            completed: false,
             owner: None,
             active: None,
             final_write: None,
@@ -352,6 +359,13 @@ impl AuthorityRegistry {
             .iter_mut()
             .find(|e| e.journal.stream() == stream)
             .ok_or(Refusal::StaleEpoch)
+            .and_then(|epoch| {
+                if epoch.completed {
+                    Err(Refusal::SessionFenced)
+                } else {
+                    Ok(epoch)
+                }
+            })
     }
     fn live(state: &State, conn: ConnId) -> Result<(), Refusal> {
         if state.rpc_connections.contains(&conn) {
@@ -415,6 +429,72 @@ impl AuthorityRegistry {
         });
         true
     }
+    /// Fence new admission, cancel existing readers/claims, and detach reentrant
+    /// values before dropping them. The caller holds output selection and spawn_gate.
+    pub(crate) fn compact_completed_pty(
+        &self,
+        key: &(String, u64),
+        eligible: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !eligible() {
+            return false;
+        }
+        let Some(index) = state.epochs.iter().position(|e| {
+            e.journal.stream().session.as_str() == key.0 && e.journal.stream().epoch.0 == key.1
+        }) else {
+            return false;
+        };
+        let epoch = &mut state.epochs[index];
+        if epoch.completed {
+            return true;
+        }
+        epoch.completed = true;
+        epoch.claiming = None;
+        epoch.owner = None;
+        let active = epoch.active.take();
+        if let Some(active) = &active {
+            active.cancelled.store(true, Ordering::SeqCst);
+        }
+        let final_write = epoch.final_write.take();
+        epoch.journal.compact_completed_pty();
+        // The registry admits at most sixteen pending tickets, so detachment
+        // needs no allocation or uncharged temporary collection.
+        let mut pending: [Option<Pending>; 16] = std::array::from_fn(|_| None);
+        let mut count = 0;
+        let mut index = 0;
+        while index < state.pending.len() {
+            if state.pending[index].stream.session.as_str() == key.0
+                && state.pending[index].stream.epoch.0 == key.1
+            {
+                pending[count] = Some(state.pending.swap_remove(index));
+                count += 1;
+            } else {
+                index += 1;
+            }
+        }
+        drop(state);
+        if let Some(final_write) = final_write {
+            final_write.settle();
+        }
+        drop(pending);
+        drop(active);
+        true
+    }
+
+    pub(crate) fn evict_completed_pty(&self, key: &(String, u64)) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = state.epochs.iter().position(|e| {
+            e.completed
+                && e.journal.stream().session.as_str() == key.0
+                && e.journal.stream().epoch.0 == key.1
+        }) {
+            let epoch = state.epochs.swap_remove(index);
+            drop(state);
+            drop(epoch);
+        }
+    }
+
     pub(crate) fn mutation(
         &self,
         conn: ConnId,
@@ -832,6 +912,7 @@ pub(crate) fn consume_ticket(
         }
     }
     let active = Arc::new(StreamState {
+        journal: Arc::downgrade(&epoch.journal),
         cancelled: AtomicBool::new(false),
     });
     // Observers do not occupy/mutate the authoritative active slot.
@@ -932,6 +1013,7 @@ mod rendezvous_tests {
             )
             .unwrap();
             let active = Arc::new(StreamState {
+                journal: Arc::downgrade(&journal),
                 cancelled: AtomicBool::new(false),
             });
             let lease = ControllerLease(7);
@@ -941,6 +1023,7 @@ mod rendezvous_tests {
                 writer: Weak::new(),
                 generation: 1,
                 claiming: None,
+                completed: false,
                 owner: Some(Owner {
                     conn: ConnId(1),
                     lease,

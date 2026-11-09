@@ -18,6 +18,9 @@ pub const HOST_STATUS_FEATURE: u64 = 4;
 pub const RENDERED_PTY_FEATURE: u64 = 8;
 /// Opt-in, epoch-bound ownership check; existing response shapes are unchanged.
 pub const SESSION_OWNER_FEATURE: u64 = 16;
+/// Opt-in completed PTY retention and projection accounting diagnostics.
+pub const PTY_RETENTION_FEATURE: u64 = 32;
+pub const MAX_RECENT_PTY_EVICTIONS: usize = 64;
 pub const MAX_HOSTED_OWNER_BYTES: usize = 128;
 pub const MAX_RENDERED_TEXT: usize = 196_608;
 pub const MAX_BUILD_FIELD_BYTES: usize = 128;
@@ -146,6 +149,42 @@ pub struct StreamId {
     pub session: SessionId,
     pub epoch: SessionEpoch,
 }
+/// Accounting counters, not measured RSS. Recent identities are oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PtyRetentionStatus {
+    pub projection_reserved_bytes: u64,
+    pub projection_limit_bytes: u64,
+    pub completed_pty_sessions: u32,
+    pub completed_pty_limit: u32,
+    pub evicted_total: u64,
+    #[serde(deserialize_with = "bounded_evictions")]
+    pub recent_evictions: Vec<StreamId>,
+}
+fn bounded_evictions<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<StreamId>, D::Error> {
+    struct Visitor;
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = Vec<StreamId>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("at most 64 evicted stream identities")
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut records = Vec::with_capacity(MAX_RECENT_PTY_EVICTIONS);
+            while records.len() < MAX_RECENT_PTY_EVICTIONS {
+                let Some(record) = seq.next_element()? else {
+                    return Ok(records);
+                };
+                records.push(record);
+            }
+            if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom("eviction history count"));
+            }
+            Ok(records)
+        }
+    }
+    d.deserialize_seq(Visitor)
+}
+
 /// One coherent screen and progress watermark. Cursor coordinates are zero based.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -404,6 +443,7 @@ bounded_bytes!(RawInput, MAX_RAW_INPUT);
 pub enum ExtensionRequest {
     Capabilities,
     HostStatus,
+    PtyRetentionStatus,
     ListSessions,
     CheckSessionOwner {
         stream: StreamId,
@@ -583,6 +623,9 @@ fn bounded_sessions<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SessionSummar
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionResponse {
+    PtyRetentionStatus {
+        status: PtyRetentionStatus,
+    },
     SessionOwner {
         matches: bool,
     },
@@ -646,6 +689,11 @@ impl ExtensionResponse {
     pub(crate) fn validate(&self) -> Result<(), HostError> {
         match self {
             Self::HostStatus { build } => build.validate(),
+            Self::PtyRetentionStatus { status }
+                if status.recent_evictions.len() > MAX_RECENT_PTY_EVICTIONS =>
+            {
+                Err(HostError::EventTooLarge)
+            }
             Self::Sessions { records } if records.len() > 64 => Err(HostError::EventTooLarge),
             Self::CapturedOutput { text } if text.len() > MAX_RAW_INPUT => {
                 Err(HostError::EventTooLarge)
@@ -1288,5 +1336,26 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    #[test]
+    fn retention_diagnostic_roundtrip_and_history_bound() {
+        let stream = serde_json::json!({"host":"01010101010101010101010101010101", "session":"retained", "epoch":1});
+        let mut response = serde_json::json!({"op":"pty_retention_status", "status": {
+            "projection_reserved_bytes":0, "projection_limit_bytes":593000000,
+            "completed_pty_sessions":8, "completed_pty_limit":8, "evicted_total":100,
+            "recent_evictions":vec![stream.clone();64]
+        }});
+        let decoded: ExtensionResponse =
+            serde_json::from_value(response.clone()).expect("new diagnostic decodes");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), response);
+        response["status"]["recent_evictions"] = serde_json::json!(vec![stream; 65]);
+        assert!(serde_json::from_value::<ExtensionResponse>(response).is_err());
+        // Existing deny_unknown_fields responses must remain strict.
+        assert!(serde_json::from_str::<ExtensionResponse>(r#"{"op":"host_status","build":{"version":"1","commit":"x","dirty":null,"build_time_unix":null},"pty_retention":{}}"#).is_err());
     }
 }

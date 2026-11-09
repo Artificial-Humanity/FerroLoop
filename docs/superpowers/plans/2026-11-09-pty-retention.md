@@ -115,3 +115,43 @@ the spec's lock and reference ordering. Do not invent a new on-wire refusal enum
 - [ ] Fresh task review/fix loop, final whole-branch review, current-main integration,
       ready PR via `fl github pr create`, Ferris current-head approval and CI, then
       author merge. Ferris/Jarvis own deployment; no live host changes here.
+
+
+### Task 2 restart checkpoint (2026-11-09, unfinished)
+
+Implementation was paused at the coordinator's request for an imminent host restart.
+Current WIP adds the separate PTY completion fence, bounded eight-tail retention,
+64-identity eviction history, capability-32 diagnostic query, typed client failure
+diagnostics, and CLI human/JSON reporting. Completion order is recorded at successful
+cleanup using a monotonic sequence; inventory maintenance sorts by that order.
+The authority fence detaches pending tickets and final-write state before dropping
+or settling them. Observers also consult the journal completion fence because they
+do not occupy the controller's active slot. Journal compaction preserves Ack and
+actual externally held reservation ownership.
+
+Observed RED: no-Ack maintenance retained 116 ReliableData bytes rather than zero;
+new diagnostic JSON was initially rejected as an unknown variant; CLI initially
+omitted diagnostics. Initial compaction test and host/proto unit suites passed
+(99 host + 21 proto) before later race/compatibility additions. CLI host_status's
+real-daemon and old-host tests now both pass. The subsequent retention-focused unit
+run passed 10 tests but failed the held-reference assertion: its 97-byte charge
+includes the wire envelope, not only the 10-byte payload. The fixture now compares
+against its actual held reservation baseline, but has not been rerun.
+
+The new 74-epoch private-daemon fixture is still failing at epoch zero. Its first
+version incorrectly used the existing `lines` child mode, which deliberately parks;
+that was replaced with `stdout-fragments lines <private marker> eof` for a complete
+64-KiB tail and `exit 0` for later epochs. The latest run still times out at epoch
+zero and needs evidence from state/cleanup/EOF/thread progress before another fix.
+It no longer polls Observe, so the sequential workload creates no subscribers or
+Ack. Client capability/uncertain-capacity tests were added after the last proto test
+run and remain unverified.
+
+Resume: diagnose the epoch-zero fixture, rerun deterministic held-reference and
+final-write tests, check existing PTY integration expectations after bounded status
+maintenance (including the sixteen-live fixture), complete public documentation and
+remaining coverage, then run focused checks and the full workspace test/Clippy/fmt
+trio. Full workspace verification and independent Task 2 review have NOT run.
+Logs: the approved artifact directory contains `408-task2-{red,green,proto-red,unit,
+retention,ipc,cli-red,cli-green}.log`. No live-host launch or configuration change
+was performed. This checkpoint is not an approval or completion claim.

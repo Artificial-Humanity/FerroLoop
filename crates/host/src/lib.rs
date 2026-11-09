@@ -19,6 +19,7 @@ mod projection;
 mod protocol;
 mod refusal;
 mod reliable;
+mod retention;
 mod session;
 mod slice_budget;
 #[cfg(unix)]
@@ -100,6 +101,7 @@ pub(crate) struct HostInner {
     pub(crate) sessions: Mutex<HashMap<String, Arc<Session>>>,
     joins: Mutex<Vec<ThreadJoin>>,
     spawn_gate: Mutex<()>,
+    retention: Mutex<retention::Retention>,
     pub(crate) listener: Mutex<Option<HostListener>>,
     pub(crate) handle: tokio::runtime::Handle,
     pub(crate) stop: AtomicBool,
@@ -360,6 +362,8 @@ impl Host {
         let authority =
             authority::AuthorityRegistry::new(Arc::clone(&reliable_budget), Arc::clone(&hub))
                 .map_err(|_| HostError::Protocol("authority admission".into()))?;
+        let retention = retention::Retention::new(&reliable_budget)
+            .map_err(|_| HostError::Protocol("retention admission".into()))?;
         let host = Self {
             runtime: Some(runtime),
             inner: Arc::new(HostInner {
@@ -372,6 +376,7 @@ impl Host {
                 sessions: Mutex::new(HashMap::new()),
                 joins: Mutex::new(Vec::new()),
                 spawn_gate: Mutex::new(()),
+                retention: Mutex::new(retention),
                 listener: Mutex::new(Some(listener)),
                 handle,
                 stop: AtomicBool::new(false),
@@ -626,8 +631,9 @@ impl Host {
             check_pidfd_support()?;
         }
         this.reclaim_completed();
+        this.evict_completed_ptys(true);
         // Every retained epoch consumes capacity, including unread completed
-        // output and unresolved containment. Never evict either to admit a spawn.
+        // pipe output and unresolved containment. Completed PTYs were bounded above.
         let retained = this
             .outputs
             .lock()
@@ -1060,7 +1066,8 @@ impl HostInner {
         let retired: Vec<_> = outputs
             .iter()
             .filter(|(key, output)| {
-                output.can_retire()
+                output.session().mode() != fl_host_proto::SessionMode::Pty
+                    && output.can_retire()
                     && self.authority.can_retire(key)
                     && !joins
                         .iter()
@@ -1069,6 +1076,20 @@ impl HostInner {
             .map(|(key, _)| key.clone())
             .collect();
         selected();
+        for (key, output) in outputs.iter() {
+            if output.completed_pty()
+                && !joins
+                    .iter()
+                    .any(|(running, _)| running.as_ref() == Some(key))
+            {
+                self.authority.compact_completed_pty(key, || {
+                    output.completed_pty()
+                        && !joins
+                            .iter()
+                            .any(|(running, _)| running.as_ref() == Some(key))
+                });
+            }
+        }
         for key in retired {
             if !self
                 .authority
@@ -1090,6 +1111,96 @@ impl HostInner {
             }
             self.hub.forget_epoch(&key);
         }
+        drop(outputs);
+        drop(joins);
+        self.evict_completed_ptys(false);
+    }
+
+    // spawn_gate serializes this with inventory publication and status maintenance.
+    fn evict_completed_ptys(&self, for_spawn: bool) {
+        let mut outputs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
+        let unresolved = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .iter()
+            .filter(|r| !outputs.contains_key(&(r.session.clone(), r.epoch)))
+            .count();
+        loop {
+            let mut completed = 0;
+            let oldest = outputs
+                .iter()
+                .filter(|(_, output)| {
+                    let eligible = output.session().reliable().is_some_and(|j| j.compacted());
+                    if eligible {
+                        completed += 1;
+                    }
+                    eligible
+                })
+                .min_by_key(|(_, output)| output.session().completion_order())
+                .map(|(key, _)| key.clone());
+            let pressure = for_spawn
+                && outputs.len().saturating_add(unresolved) >= fl_host_proto::DEFAULT_MAX_SESSIONS;
+            if completed <= retention::COMPLETED_PTY_LIMIT && !pressure {
+                break;
+            }
+            let Some(key) = oldest else {
+                break;
+            };
+            self.authority.evict_completed_pty(&key);
+            let output = outputs.remove(&key).expect("selected completed PTY");
+            let stream = output
+                .session()
+                .reliable()
+                .expect("PTY journal")
+                .stream()
+                .clone();
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if sessions.get(&key.0).is_some_and(|s| s.epoch == key.1) {
+                sessions.remove(&key.0);
+                self.writers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key.0);
+            }
+            drop(sessions);
+            self.retention
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .evict(stream);
+            self.hub.forget_epoch(&key);
+        }
+    }
+
+    // The extension permit admits the bounded snapshot before this method runs.
+    pub(crate) fn pty_retention_status(&self) -> fl_host_proto::PtyRetentionStatus {
+        let _gate = self.spawn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.reclaim_completed();
+        let completed = self
+            .outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|output| output.session().reliable().is_some_and(|j| j.compacted()))
+            .count();
+        let retention = self.retention.lock().unwrap_or_else(|e| e.into_inner());
+        fl_host_proto::PtyRetentionStatus {
+            projection_reserved_bytes: self
+                .reliable_budget
+                .used(slice_budget::ChargeKind::Projection)
+                as u64,
+            projection_limit_bytes: slice_budget::projection_limit() as u64,
+            completed_pty_sessions: completed as u32,
+            completed_pty_limit: retention::COMPLETED_PTY_LIMIT as u32,
+            evicted_total: retention.evicted_total,
+            recent_evictions: retention.recent(),
+        }
+    }
+
+    pub(crate) fn maintain_completed(&self) {
+        let _gate = self.spawn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.reclaim_completed();
     }
 }
 
@@ -2016,6 +2127,406 @@ mod deadline_tests {
         drop(replay);
         host.inner.reclaim_completed();
         assert!(!host.inner.outputs.lock().unwrap().contains_key(&key));
+        host.shutdown().unwrap();
+    }
+
+    fn retained_pty_fixture(
+        host: &Host,
+        name: &str,
+        epoch: u64,
+    ) -> (
+        Arc<Session>,
+        Arc<super::reliable::ReliableJournal>,
+        Arc<super::input::WriterHandle>,
+    ) {
+        let stream = fl_host_proto::StreamId {
+            host: host.inner.authority.instance().clone(),
+            session: SessionId::new(name).unwrap(),
+            epoch: fl_host_proto::SessionEpoch(epoch),
+        };
+        let journal = host
+            .inner
+            .reserve_reliable_journal_with_mode(stream.clone(), true)
+            .unwrap();
+        let session = Arc::new(Session::with_reliable(
+            SessionParts {
+                session: stream.session.clone(),
+                epoch,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            },
+            Some(Arc::clone(&journal)),
+        ));
+        let output =
+            super::output::OutputSession::open(Arc::clone(&session), Arc::clone(&host.inner.hub));
+        let writer = super::input::WriterHandle::start(Arc::clone(&session), None);
+        host.inner.authority.register(
+            host.inner
+                .authority
+                .prepare_epoch(Arc::clone(&journal))
+                .unwrap(),
+            &session,
+            &writer,
+        );
+        host.inner
+            .outputs
+            .lock()
+            .unwrap()
+            .insert((name.to_owned(), epoch), output);
+        host.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), Arc::clone(&session));
+        (session, journal, writer)
+    }
+
+    #[test]
+    fn completed_pty_order_history_and_slot_pressure_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        // Reverse names prove retirement does not follow lexical/map order.
+        let mut streams = Vec::new();
+        for n in 0..74 {
+            let (session, journal, writer) =
+                retained_pty_fixture(&host, &format!("z-{:03}", 74 - n), n + 1);
+            streams.push(journal.stream().clone());
+            journal.eof();
+            session.note_cleanup(CleanupReport { complete: true });
+            host.inner.maintain_completed();
+            assert!(host.inner.outputs.lock().unwrap().len() <= 8);
+            assert_eq!(journal.position().0, 0);
+            writer.shutdown();
+        }
+        let status = host.inner.pty_retention_status();
+        assert_eq!(status.completed_pty_sessions, 8);
+        assert_eq!(status.evicted_total, 66);
+        assert_eq!(status.recent_evictions, streams[2..66]);
+        for n in 0..56 {
+            // These PTYs never clean up and must survive capacity pressure.
+            retained_pty_fixture(&host, &format!("live-{n}"), n + 100);
+        }
+        assert_eq!(host.inner.outputs.lock().unwrap().len(), 64);
+        host.inner.evict_completed_ptys(true);
+        assert_eq!(host.inner.outputs.lock().unwrap().len(), 63);
+        let status = host.inner.pty_retention_status();
+        assert_eq!(status.completed_pty_sessions, 7);
+        assert_eq!(status.evicted_total, 67);
+        assert_eq!(status.recent_evictions.last(), Some(&streams[66]));
+        assert!(
+            host.inner
+                .outputs
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(name, _)| name.starts_with("live-"))
+                .count()
+                == 56
+        );
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pty_compaction_requires_cleanup_eof_and_retired_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let (session, journal, writer) = retained_pty_fixture(&host, "held-thread", 1);
+        session.note_cleanup(CleanupReport { complete: true });
+        host.inner.maintain_completed();
+        assert!(!journal.compacted(), "cleanup alone is insufficient");
+        let (release, hold) = std::sync::mpsc::channel();
+        host.inner.spawn_epoch_thread(&session, move || {
+            hold.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        journal.eof();
+        host.inner.maintain_completed();
+        assert!(
+            !journal.compacted(),
+            "live epoch thread prevents compaction"
+        );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !journal.compacted() {
+            host.inner.maintain_completed();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let (incomplete, j2, w2) = retained_pty_fixture(&host, "incomplete", 2);
+        j2.eof();
+        incomplete.note_cleanup(CleanupReport { complete: false });
+        host.inner.maintain_completed();
+        assert!(!j2.compacted());
+        writer.shutdown();
+        w2.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pty_compaction_cancels_racing_tickets_and_observers_without_releasing_held_bytes() {
+        use fl_host_proto::{ConnId, Cursor, ExtensionRefusal as F};
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let (session, journal, writer) = retained_pty_fixture(&host, "observer", 1);
+        let bytes = journal.allocate(10).unwrap();
+        super::reliable::append(&journal, super::reliable::ReliableBody::Line(bytes)).unwrap();
+        journal.eof();
+        session.note_cleanup(CleanupReport { complete: true });
+        let reg = &host.inner.authority;
+        reg.connect(ConnId(1)).unwrap();
+        reg.connect(ConnId(2)).unwrap();
+        let cursor = Cursor {
+            stream: journal.stream().clone(),
+            seq: 0,
+        };
+        let ticket = super::authority::issue_ticket(
+            reg,
+            ConnId(1),
+            cursor.clone(),
+            None,
+            true,
+            Instant::now(),
+        )
+        .unwrap()
+        .ticket;
+        let mut replay =
+            super::authority::consume_ticket(reg, ConnId(2), ticket, Instant::now()).unwrap();
+        let record = replay.next().unwrap().unwrap();
+        let held_charge = journal
+            .budget()
+            .used(super::slice_budget::ChargeKind::ReliableData);
+        assert!(held_charge >= 10); // includes the retained wire envelope
+        let mut racing_ticket = None;
+        host.inner.reclaim_completed_selected(|| {
+            racing_ticket = Some(
+                super::authority::issue_ticket(
+                    reg,
+                    ConnId(1),
+                    cursor.clone(),
+                    None,
+                    true,
+                    Instant::now(),
+                )
+                .unwrap()
+                .ticket,
+            );
+        });
+        assert_eq!(journal.position().0, 0);
+        assert_eq!(
+            journal
+                .budget()
+                .used(super::slice_budget::ChargeKind::ReliableData),
+            held_charge
+        );
+        assert!(replay.authority.as_ref().unwrap().state.cancelled());
+        assert!(matches!(replay.next(), Err(F::SessionFenced)));
+        assert!(matches!(
+            super::authority::consume_ticket(
+                reg,
+                ConnId(2),
+                racing_ticket.unwrap(),
+                Instant::now()
+            ),
+            Err(F::TicketInvalid)
+        ));
+        assert!(matches!(
+            super::authority::issue_ticket(reg, ConnId(1), cursor, None, true, Instant::now()),
+            Err(F::SessionFenced)
+        ));
+        assert!(matches!(
+            super::reliable::begin_replay(&journal, 0),
+            Err(F::SessionFenced)
+        ));
+        drop(replay);
+        assert_eq!(
+            journal
+                .budget()
+                .used(super::slice_budget::ChargeKind::ReliableData),
+            held_charge
+        );
+        drop(record);
+        assert_eq!(
+            journal
+                .budget()
+                .used(super::slice_budget::ChargeKind::ReliableData),
+            0
+        );
+        writer.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pty_compaction_settles_final_write_and_unresolved_claim() {
+        use fl_host_proto::{ConnId, Cursor, ExtensionRefusal as F};
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let (session, journal, writer) = retained_pty_fixture(&host, "pending-claim", 1);
+        let reg = &host.inner.authority;
+        reg.connect(ConnId(1)).unwrap();
+        reg.connect(ConnId(2)).unwrap();
+        let mut claim = Box::pin(super::authority::claim(reg, ConnId(1), journal.stream()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(claim.as_mut().poll(&mut cx), Poll::Pending));
+        journal.eof();
+        session.note_cleanup(CleanupReport { complete: true });
+        host.inner.maintain_completed();
+        assert!(
+            journal.compacted(),
+            "unresolved claim must not retain completed PTY"
+        );
+        drop(claim); // ClaimAdmission reenters registry state; must not deadlock.
+        let (s2, j2, w2) = retained_pty_fixture(&host, "pending-write", 2);
+        super::reliable::append(
+            &j2,
+            super::reliable::ReliableBody::Line(j2.allocate(20).unwrap()),
+        )
+        .unwrap();
+        j2.eof();
+        s2.note_cleanup(CleanupReport { complete: true });
+        let grant = host
+            .inner
+            .handle
+            .block_on(super::authority::claim(reg, ConnId(1), j2.stream()))
+            .unwrap();
+        let ticket = super::authority::issue_ticket(
+            reg,
+            ConnId(1),
+            Cursor {
+                stream: j2.stream().clone(),
+                seq: 0,
+            },
+            Some(grant.lease),
+            false,
+            Instant::now(),
+        )
+        .unwrap()
+        .ticket;
+        let replay =
+            super::authority::consume_ticket(reg, ConnId(2), ticket, Instant::now()).unwrap();
+        let final_write = reg
+            .begin_final_write(&replay, 1, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let mut ack = Box::pin(reg.acknowledge(
+            ConnId(1),
+            Cursor {
+                stream: j2.stream().clone(),
+                seq: 1,
+            },
+            grant.lease,
+        ));
+        let _enter = host.inner.handle.enter();
+        assert!(matches!(ack.as_mut().poll(&mut cx), Poll::Pending));
+        host.inner.maintain_completed();
+        assert!(matches!(
+            ack.as_mut().poll(&mut cx),
+            Poll::Ready(Err(F::SessionFenced))
+        ));
+        assert_eq!(j2.position().0, 0);
+        drop(ack);
+        drop(final_write);
+        drop(replay);
+        drop(_enter);
+        writer.shutdown();
+        w2.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn completed_pty_compacts_unacked_journal_but_retains_tail_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let stream = fl_host_proto::StreamId {
+            host: host.inner.authority.instance().clone(),
+            session: SessionId::new("completed-pty").unwrap(),
+            epoch: fl_host_proto::SessionEpoch(1),
+        };
+        let journal = host
+            .inner
+            .reserve_reliable_journal_with_mode(stream.clone(), true)
+            .unwrap();
+        let session = Arc::new(Session::with_reliable(
+            SessionParts {
+                session: stream.session.clone(),
+                epoch: 1,
+                vendor_pid: 0,
+                vendor_start: 0,
+                supervisor_pid: 0,
+                supervisor_start: 0,
+                pgid: 0,
+                control_inode: 0,
+                control: None,
+                stdin: None,
+            },
+            Some(Arc::clone(&journal)),
+        ));
+        let output =
+            super::output::OutputSession::open(Arc::clone(&session), Arc::clone(&host.inner.hub));
+        let writer = super::input::WriterHandle::start(Arc::clone(&session), None);
+        host.inner.authority.register(
+            host.inner
+                .authority
+                .prepare_epoch(Arc::clone(&journal))
+                .unwrap(),
+            &session,
+            &writer,
+        );
+        let mut bytes = journal.allocate(10).unwrap();
+        bytes.as_mut_slice().copy_from_slice(b"final-tail");
+        journal.accept_read(bytes).unwrap();
+        journal.eof();
+        session.note_cleanup(CleanupReport { complete: true });
+        let key = (stream.session.as_str().to_owned(), 1);
+        host.inner
+            .outputs
+            .lock()
+            .unwrap()
+            .insert(key.clone(), output);
+        host.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(key.0.clone(), Arc::clone(&session));
+        assert!(
+            journal
+                .budget()
+                .used(super::slice_budget::ChargeKind::ReliableData)
+                > 0
+        );
+        host.inner.reclaim_completed();
+        assert_eq!(
+            journal
+                .budget()
+                .used(super::slice_budget::ChargeKind::ReliableData),
+            0
+        );
+        assert_eq!(journal.position().0, 0, "compaction must never invent Ack");
+        assert!(host.inner.outputs.lock().unwrap().contains_key(&key));
+        writer.shutdown();
         host.shutdown().unwrap();
     }
 

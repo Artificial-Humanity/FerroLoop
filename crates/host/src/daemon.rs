@@ -527,15 +527,23 @@ pub(super) async fn extended(
                 | fl_host_proto::PTY_FEATURE
                 | fl_host_proto::RENDERED_PTY_FEATURE
                 | fl_host_proto::HOST_STATUS_FEATURE
-                | fl_host_proto::SESSION_OWNER_FEATURE,
+                | fl_host_proto::SESSION_OWNER_FEATURE
+                | fl_host_proto::PTY_RETENTION_FEATURE,
             #[cfg(not(unix))]
             features: fl_host_proto::RELIABLE_FEATURE
                 | fl_host_proto::HOST_STATUS_FEATURE
-                | fl_host_proto::SESSION_OWNER_FEATURE,
+                | fl_host_proto::SESSION_OWNER_FEATURE
+                | fl_host_proto::PTY_RETENTION_FEATURE,
             limits: fl_host_proto::ExtensionLimits::default(),
         }),
-        XReq::HostStatus => Ok(XResp::HostStatus {
-            build: host.build_info.clone(),
+        XReq::HostStatus => {
+            host.maintain_completed();
+            Ok(XResp::HostStatus {
+                build: host.build_info.clone(),
+            })
+        }
+        XReq::PtyRetentionStatus => Ok(XResp::PtyRetentionStatus {
+            status: host.pty_retention_status(),
         }),
         XReq::CheckSessionOwner { stream, hosted_id } => {
             let sessions = host.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -550,6 +558,7 @@ pub(super) async fn extended(
             Ok(XResp::SessionOwner { matches })
         }
         XReq::ListSessions => {
+            host.maintain_completed();
             let outputs = host.outputs.lock().unwrap_or_else(|e| e.into_inner());
             if outputs.len() > fl_host_proto::DEFAULT_MAX_SESSIONS {
                 return Err(Refusal::ResourceLimit);
@@ -1215,6 +1224,11 @@ fn admit_extension(
         // Two bounded strings plus JSON (including worst-case escaping and Vec
         // growth) and the wire buffer. The permit lives through the socket write.
         XReq::HostStatus => 8192 + 2 * fl_host_proto::MAX_BUILD_FIELD_BYTES,
+        // Bounded identity vector + names, JSON growth and simultaneous wire copy.
+        XReq::PtyRetentionStatus => {
+            8192 + fl_host_proto::MAX_RECENT_PTY_EVICTIONS
+                * (std::mem::size_of::<fl_host_proto::StreamId>() + 64 + 4 * 256)
+        }
         XReq::CaptureRendered { .. } => 2 * fl_host_proto::MAX_FRAME_PAYLOAD + 5 + 4096,
         XReq::ListSessions => list_response_storage_bound().ok_or(Refusal::ResourceLimit)?,
         XReq::CaptureOutput { max_bytes, .. } => {

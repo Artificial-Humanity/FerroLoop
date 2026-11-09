@@ -684,6 +684,12 @@ impl OutputSession {
         }
     }
 
+    pub(crate) fn completed_pty(&self) -> bool {
+        self.session.mode() == fl_host_proto::SessionMode::Pty
+            && self.reliable.as_ref().is_some_and(|j| j.is_eof())
+            && self.session.cleanup_report().is_some_and(|r| r.complete)
+    }
+
     pub(crate) fn can_retire(&self) -> bool {
         if let Some(journal) = &self.reliable {
             return journal.is_eof()

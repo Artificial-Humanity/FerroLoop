@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,9 @@ use fl_host_proto::{
 };
 
 use crate::child::{CleanupReport, DescendantExit};
+
+// A total completion order, independent of map iteration and session names.
+static COMPLETION_ORDER: AtomicU64 = AtomicU64::new(1);
 
 pub struct Session {
     pub session: SessionId,
@@ -32,6 +35,7 @@ pub struct Session {
     leader_cv: Condvar,
     cleanup: Mutex<Option<CleanupReport>>,
     cleanup_cv: Condvar,
+    completion_order: AtomicU64,
     descendants: Mutex<Vec<DescendantExit>>,
     stdout: Mutex<OutBuf>,
     stdout_cv: Condvar,
@@ -266,6 +270,7 @@ impl Session {
             leader_cv: Condvar::new(),
             cleanup: Mutex::new(None),
             cleanup_cv: Condvar::new(),
+            completion_order: AtomicU64::new(0),
             descendants: Mutex::new(Vec::new()),
             stdout: Mutex::new(OutBuf {
                 bytes: Vec::new(),
@@ -433,6 +438,12 @@ impl Session {
         let fresh = {
             let mut slot = self.cleanup.lock().unwrap_or_else(|err| err.into_inner());
             if slot.is_none() {
+                if report.complete {
+                    self.completion_order.store(
+                        COMPLETION_ORDER.fetch_add(1, Ordering::SeqCst),
+                        Ordering::SeqCst,
+                    );
+                }
                 *slot = Some(report);
                 true
             } else {
@@ -459,6 +470,10 @@ impl Session {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    pub(crate) fn completion_order(&self) -> u64 {
+        self.completion_order.load(Ordering::SeqCst)
     }
 
     pub fn cleanup_report(&self) -> Option<CleanupReport> {
