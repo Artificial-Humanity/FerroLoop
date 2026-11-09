@@ -44,6 +44,7 @@ pub fn spawn_supervised(
     env: Vec<(String, String)>,
     session: &str,
     epoch: u64,
+    hosted_owner: bool,
     publish: impl FnOnce(u32, u64, u32, u64, u32) -> Result<(), HostError>,
     fail_after_publish: bool,
 ) -> Result<Supervised, HostError> {
@@ -193,6 +194,7 @@ pub fn spawn_supervised(
             env,
             session,
             epoch,
+            hosted_owner,
         },
         publish,
         fail_after_publish,
@@ -232,6 +234,7 @@ struct VendorLaunch<'a> {
     env: Vec<(String, String)>,
     session: &'a str,
     epoch: u64,
+    hosted_owner: bool,
 }
 
 fn handshake(
@@ -249,6 +252,7 @@ fn handshake(
         env,
         session,
         epoch,
+        hosted_owner,
     } = launch;
     let message = DaemonMsg::Spawn {
         argv,
@@ -256,6 +260,7 @@ fn handshake(
         env,
         session: session.to_owned(),
         epoch,
+        hosted_owner,
     };
     let bytes = to_line(&message).map_err(HostError::Protocol)?;
     control.write_all(&bytes)?;

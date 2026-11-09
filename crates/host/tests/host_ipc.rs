@@ -102,10 +102,12 @@ impl Daemon {
         let stderr_thread = child.stderr.take().map(|pipe| {
             let slot = Arc::clone(&stderr);
             thread::spawn(move || {
-                let mut text = String::new();
-                let _ =
-                    std::io::Read::read_to_string(&mut std::io::BufReader::new(pipe), &mut text);
-                *slot.lock().expect("stderr") = text;
+                let mut reader = std::io::BufReader::new(pipe);
+                let mut line = String::new();
+                while std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) > 0 {
+                    slot.lock().expect("stderr").push_str(&line);
+                    line.clear();
+                }
             })
         });
         Self {
@@ -5138,4 +5140,163 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
             code: Refuse::StaleEpoch
         }
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_owner_pty_and_reliable_pipe_auto_cleanup_after_leader_exit() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let baseline = rpc.inner.pty_retention_status().unwrap().unwrap();
+    assert_eq!(baseline.projection_reserved_bytes, 0);
+
+    // 1. Hosted-owner PTY session with a lingering descendant.
+    let mut pty_spec = spec("hosted-pty", &["orphan-linger"]);
+    pty_spec.kind = SpawnKind::Pty;
+    pty_spec
+        .env
+        .insert("FL_HOSTED_ID".into(), "hosted-pty-owner".into());
+    pty_spec.env_allow.insert("FL_HOSTED_ID".into());
+    let (pty_stream, _) = rpc.inner.spawn_pty_session(pty_spec, None).unwrap();
+
+    // 2. Hosted-owner ReliablePipe session with a lingering descendant.
+    let mut pipe_spec = spec("hosted-relpipe", &["orphan-linger"]);
+    pipe_spec
+        .env
+        .insert("FL_HOSTED_ID".into(), "hosted-pipe-owner".into());
+    pipe_spec.env_allow.insert("FL_HOSTED_ID".into());
+    let XResp::Session {
+        stream: pipe_stream,
+        ..
+    } = rpc
+        .inner
+        .extension_request(XReq::SpawnSession {
+            spec: pipe_spec,
+            mode: fl_host_proto::SessionMode::ReliablePipe,
+            pty: None,
+        })
+        .unwrap()
+    else {
+        panic!("spawn reliable pipe")
+    };
+
+    let extract_child = |rpc: &mut Rpc, session_name: &str| -> (u32, u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = rpc.inner.capture_output(sid(session_name), 4096).unwrap();
+            if let Some(pos) = text.find("CHILD ")
+                && text[pos..].contains(" END")
+            {
+                let digits: String = text[pos + "CHILD ".len()..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect();
+                let pid: u32 = digits.parse().expect("child pid");
+                let start = fl_host::process_identity(pid).expect("child ident").start;
+                return (pid, start);
+            }
+            assert!(Instant::now() < deadline, "missing CHILD line: {text:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    let (pty_child_pid, pty_child_start) = extract_child(&mut rpc, "hosted-pty");
+    let (pipe_child_pid, pipe_child_start) = extract_child(&mut rpc, "hosted-relpipe");
+
+    let deadline = Instant::now()
+        + fl_host::HOSTED_LEADER_EXIT_GRACE
+        + fl_host::CLEANUP_DEADLINE
+        + Duration::from_secs(2);
+    loop {
+        let status = rpc.inner.pty_retention_status().unwrap().unwrap();
+        let records = rpc.inner.list_sessions().unwrap();
+        let pty_done = records
+            .iter()
+            .any(|r| r.stream == pty_stream && matches!(r.state, ChildState::CleanupComplete(_)));
+        // Unattended ReliablePipe session retires once its epoch threads finish after auto-cleanup.
+        let pipe_done = records.iter().all(|r| r.stream != pipe_stream)
+            || records.iter().any(|r| {
+                r.stream == pipe_stream && matches!(r.state, ChildState::CleanupComplete(_))
+            });
+        let stderr = daemon.stderr.lock().expect("stderr").clone();
+        let pty_logged = stderr.lines().any(|line| {
+            line.starts_with(&format!(
+                "fl-host: hosted session hosted-pty (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=",
+                pty_stream.epoch.0
+            ))
+        });
+        let pipe_logged = stderr.lines().any(|line| {
+            line.starts_with(&format!(
+                "fl-host: hosted session hosted-relpipe (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=",
+                pipe_stream.epoch.0
+            ))
+        });
+        if pty_done
+            && pipe_done
+            && status.projection_reserved_bytes == 0
+            && status.completed_pty_sessions == 1
+            && pty_logged
+            && pipe_logged
+        {
+            #[cfg(target_os = "linux")]
+            {
+                assert!(stderr.lines().any(|line| {
+                    line == format!(
+                        "fl-host: hosted session hosted-pty (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=1)",
+                        pty_stream.epoch.0
+                    )
+                }), "stderr: {stderr}");
+                assert!(stderr.lines().any(|line| {
+                    line == format!(
+                        "fl-host: hosted session hosted-relpipe (epoch {}) armed post-leader-exit cleanup after 500ms (descendants=1)",
+                        pipe_stream.epoch.0
+                    )
+                }), "stderr: {stderr}");
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hosted sessions did not auto-clean: status={status:?} records={records:?} stderr={stderr:?}"
+        );
+        thread::sleep(Duration::from_millis(15));
+    }
+
+    assert!(
+        fl_host::read_registry(&daemon.paths.endpoint)
+            .expect("registry")
+            .sessions
+            .is_empty()
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        for (pid, start) in [
+            (pty_child_pid, pty_child_start),
+            (pipe_child_pid, pipe_child_start),
+        ] {
+            while matches!(fl_host::process_identity(pid), Ok(ident) if ident.pid == pid && ident.start == start)
+            {
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "lingering child {pid} survived"
+                );
+                thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for (pid, start) in [
+            (pty_child_pid, pty_child_start),
+            (pipe_child_pid, pipe_child_start),
+        ] {
+            if matches!(fl_host::process_identity(pid), Ok(ident) if ident.pid == pid && ident.start == start)
+            {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
 }

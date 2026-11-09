@@ -16,6 +16,8 @@ pub enum DaemonMsg {
         env: Vec<(String, String)>,
         session: String,
         epoch: u64,
+        #[serde(default)]
+        hosted_owner: bool,
     },
     Go,
     Signal {
@@ -55,6 +57,9 @@ pub enum SupervisorMsg {
         code: Option<i32>,
         signal: Option<i32>,
         adopted: bool,
+    },
+    HostedLeaderExitCleanup {
+        descendants: usize,
     },
     Cleanup {
         complete: bool,

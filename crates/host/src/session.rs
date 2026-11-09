@@ -93,6 +93,10 @@ impl Session {
             && self.hosted_owner[..self.hosted_owner_len] == *hosted_id.as_bytes()
     }
 
+    pub(crate) fn has_hosted_owner(&self) -> bool {
+        self.hosted_owner_len != 0
+    }
+
     pub(crate) fn mode(&self) -> fl_host_proto::SessionMode {
         match &self.reliable {
             Some(journal) if journal.pty_mode() => fl_host_proto::SessionMode::Pty,
