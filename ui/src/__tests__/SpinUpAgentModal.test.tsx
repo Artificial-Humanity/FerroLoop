@@ -780,7 +780,7 @@ describe("SpinUpAgentModal", () => {
     unmount();
   });
 
-  it("syncs hydration state on WebSocket sessions lifecycle events (spun_up, remodeled, restarted, decommission) and ignores mode === 'prepare'", async () => {
+  it("syncs hydration state and preserves or clears node_id/role without hardcoded fallbacks on WebSocket sessions lifecycle events", async () => {
     let hostedSessionsResponse: Array<Record<string, unknown>> = [
       {
         session_id: "claude:felix",
@@ -788,6 +788,7 @@ describe("SpinUpAgentModal", () => {
         project: "ferroloop",
         role: "ui-developer",
         vendor: "claude",
+        node_id: "worker-gpu-1",
         status: "running",
         restart_count: 0,
         updated_at_ms: 1000,
@@ -800,6 +801,7 @@ describe("SpinUpAgentModal", () => {
         project: "ferroloop",
         role: "ui-developer",
         vendor: "claude",
+        node_id: "worker-gpu-1",
         status: "decommissioned",
         restart_count: 0,
         updated_at_ms: 9999,
@@ -926,6 +928,15 @@ describe("SpinUpAgentModal", () => {
       const badge = screen.getByTestId("session-hydration-status-badge");
       expect(badge).toHaveAttribute("data-hydration-status", "failed");
       expect(badge).toHaveAttribute("data-hydration-dispatched", "false");
+      const workspace = screen.getByTestId("cockpit-workspace");
+      expect(workspace).toHaveAttribute(
+        "data-active-hosted-node-id",
+        "worker-gpu-1",
+      );
+      expect(workspace).toHaveAttribute(
+        "data-active-hosted-role",
+        "ui-developer",
+      );
     });
 
     // 3. session.restarted updates hydration status to confirmed
@@ -936,6 +947,7 @@ describe("SpinUpAgentModal", () => {
         project: "ferroloop",
         role: "ui-developer",
         vendor: "codex",
+        node_id: "worker-gpu-1",
         status: "running",
         restart_count: 1,
         updated_at_ms: 2000,
@@ -966,6 +978,7 @@ describe("SpinUpAgentModal", () => {
         project: "ferroloop",
         role: "ui-developer",
         vendor: "codex",
+        node_id: "worker-gpu-1",
         status: "decommissioned",
         restart_count: 1,
         updated_at_ms: 3000,
@@ -984,6 +997,23 @@ describe("SpinUpAgentModal", () => {
       expect(
         screen.queryByTestId("session-hydration-status-badge"),
       ).not.toBeInTheDocument();
+    });
+
+    // 5. Fresh session.spun_up without node_id or role falls back to empty string (not "ai-lab-0" or "assistant")
+    hostedSessionsResponse = [];
+    emitSessionsEvent("session.spun_up", {
+      persona: "felix",
+      vendor: "claude",
+      session_id: "claude:felix-fresh",
+      hosted: true,
+      hydration_dispatched: true,
+      hydration_status: "unconfirmed",
+    });
+
+    await waitFor(() => {
+      const workspace = screen.getByTestId("cockpit-workspace");
+      expect(workspace).toHaveAttribute("data-active-hosted-node-id", "");
+      expect(workspace).toHaveAttribute("data-active-hosted-role", "");
     });
 
     unmount();
