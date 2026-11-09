@@ -1942,7 +1942,7 @@ export const App: React.FC<AppProps> = ({
                 role:
                   typeof data.role === "string" && data.role.trim()
                     ? data.role.trim()
-                    : existing?.role ?? "assistant",
+                    : existing?.role ?? "",
                 vendor,
                 model,
                 posture: existing?.posture,
@@ -1952,7 +1952,7 @@ export const App: React.FC<AppProps> = ({
                 node_id:
                   typeof data.node_id === "string" && data.node_id.trim()
                     ? data.node_id.trim()
-                    : existing?.node_id ?? "ai-lab-0",
+                    : existing?.node_id ?? "",
                 status:
                   typeof data.status === "string" && data.status.trim()
                     ? data.status.trim()
@@ -2509,14 +2509,14 @@ export const App: React.FC<AppProps> = ({
               `${res.vendor || req.vendor}:${personaKey}`,
             persona: res.persona || req.persona || existing?.persona || personaKey,
             project: res.project || req.project || existing?.project || "",
-            role: res.role || req.role || existing?.role || "assistant",
+            role: res.role || req.role || existing?.role || "",
             vendor: res.vendor || req.vendor || existing?.vendor || "unknown",
             model: res.model ?? req.model ?? existing?.model ?? null,
             posture: res.posture ?? req.posture ?? existing?.posture,
             hydration_dispatched: Boolean(res.hydration_dispatched),
             hydration_status: hydrationStatus,
             node_id:
-              res.node_id || req.node_id || existing?.node_id || "ai-lab-0",
+              res.node_id || req.node_id || existing?.node_id || "",
             status: res.status || existing?.status || "running",
             restart_count: existing?.restart_count ?? 0,
             updated_at_ms: Date.now(),
@@ -2822,13 +2822,13 @@ export const App: React.FC<AppProps> = ({
                         `${res.vendor || existing?.vendor || "unknown"}:${personaKey}`,
                       persona: res.persona || existing?.persona || personaKey,
                       project: res.project || existing?.project || "",
-                      role: res.role || existing?.role || "assistant",
+                      role: res.role || existing?.role || "",
                       vendor: res.vendor || existing?.vendor || "unknown",
                       model: res.model ?? existing?.model ?? null,
                       posture: res.posture ?? existing?.posture,
                       hydration_dispatched: Boolean(res.hydration_dispatched),
                       hydration_status: hydrationStatus,
-                      node_id: res.node_id || existing?.node_id || "ai-lab-0",
+                      node_id: res.node_id || existing?.node_id || "",
                       status: res.status || existing?.status || "running",
                       restart_count: existing?.restart_count ?? 0,
                       updated_at_ms: Date.now(),
@@ -3518,6 +3518,8 @@ export const App: React.FC<AppProps> = ({
               <main
                 className={`fd-workspace${splitView ? " is-split" : ""}`}
                 data-testid="cockpit-workspace"
+                data-active-hosted-node-id={activeHostedSession?.node_id}
+                data-active-hosted-role={activeHostedSession?.role}
               >
               {chatPaneElement}
               {splitView && (
