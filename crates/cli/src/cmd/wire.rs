@@ -1228,35 +1228,45 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     println!("{}", serde_json::to_string_pretty(&st).unwrap());
                 } else {
                     println!(
-                        "daemon=active\tnode={}\thost={}\tsocket={}\tpeers={}\troutes={}\t{}",
+                        "daemon=active\tnode={}\thost={}\tsocket={}\tpeers={}\troutes={}\t{}{}",
                         st.node_id,
                         st.host,
                         st.socket_path.display(),
                         st.connected_peers.len(),
                         st.routes.len(),
-                        dispatch_diagnostics_summary(st.dispatch_diagnostics.as_ref())
+                        dispatch_diagnostics_summary(st.dispatch_diagnostics.as_ref()),
+                        pending_recipients_summary(&st.pending_recipients),
                     );
                 }
                 return Ok(0);
             }
             let rpath = resolve_routes_path_for(env);
             let routes = RouteTable::load(rpath.as_deref());
+            let route_entries: Vec<_> = routes.entries.values().cloned().collect();
+            let now = now_at();
+            let pending_recipients = env
+                .open_for_scope(Some(&StateScope::Workspace))
+                .ok()
+                .map(|store| fl_wire::daemon::collect_pending_recipient_summaries(&store, &now))
+                .unwrap_or_default();
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "daemon": "inactive",
-                        "dispatch_diagnostics": null,
-                        "socket_path": sock,
-                        "routes": routes.entries.values().collect::<Vec<_>>(),
-                    }))
-                    .unwrap()
-                );
+                let mut payload = json!({
+                    "daemon": "inactive",
+                    "dispatch_diagnostics": null,
+                    "socket_path": sock,
+                    "routes": route_entries,
+                });
+                if !pending_recipients.is_empty() {
+                    payload["pending_recipients"] =
+                        serde_json::to_value(&pending_recipients).unwrap();
+                }
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
             } else {
                 println!(
-                    "daemon=inactive\tsocket={}\troutes={}\tdispatch_diagnostics=unavailable",
+                    "daemon=inactive\tsocket={}\troutes={}\tdispatch_diagnostics=unavailable{}",
                     sock.display(),
-                    routes.entries.len()
+                    route_entries.len(),
+                    pending_recipients_summary(&pending_recipients),
                 );
             }
             Ok(0)
@@ -1899,6 +1909,24 @@ fn dispatch_diagnostics_summary(
         diagnostics.omitted_evidence_total_saturated,
         reasons,
     )
+}
+
+fn pending_recipients_summary(pending: &[fl_wire::daemon::RecipientPendingSummary]) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let formatted = pending
+        .iter()
+        .map(|row| {
+            let age = row
+                .oldest_pending_age_ms
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| "unknown".into());
+            format!("{}:{}(oldest_age={age})", row.recipient, row.pending_count)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("\tpending_recipients={formatted}")
 }
 
 #[cfg(test)]
