@@ -561,6 +561,10 @@ export interface DiscoveredSessionSummary {
    * or a lower-cased vendor value. Absent when the runtime states none.
    */
   execution_mode?: string | null;
+  /** Whether the startup hydration prompt was handed to the vendor. */
+  hydration_dispatched?: boolean;
+  /** Acceptance evidence for the startup hydration submission (`confirmed` | `unconfirmed` | `failed`; defaults to `unconfirmed`). */
+  hydration_status?: HydrationStatus;
 }
 
 export type DiscoveredSession = DiscoveredSessionSummary;
@@ -720,6 +724,31 @@ export type PermissionPosture =
   | "plan"
   | "bypass";
 
+export type HydrationStatus = "confirmed" | "unconfirmed" | "failed";
+
+export function normalizeHydrationStatus(raw: unknown): HydrationStatus {
+  if (raw === "confirmed" || raw === "unconfirmed" || raw === "failed") {
+    return raw;
+  }
+  return "unconfirmed";
+}
+
+export interface HostedSessionSummary {
+  session_id: string;
+  persona: string;
+  project: string;
+  role: string;
+  vendor: string;
+  model?: string | null;
+  posture?: PermissionPosture;
+  hydration_dispatched: boolean;
+  hydration_status?: HydrationStatus;
+  node_id: string;
+  status: string;
+  restart_count?: number;
+  updated_at_ms?: number;
+}
+
 export interface SpinUpSessionRequest {
   persona: string;
   project: string;
@@ -755,7 +784,10 @@ export interface SpinUpSessionResponse {
   hosted: boolean;
   status: string;
   tmux_target?: string | null;
+  /** Whether the prompt was handed to the vendor; this is not acceptance evidence. */
   hydration_dispatched: boolean;
+  /** Acceptance evidence for the current hydration submission (`confirmed` | `unconfirmed` | `failed`; defaults to `unconfirmed`). */
+  hydration_status?: HydrationStatus;
   prompt?: string | null;
   context_window?: number;
 }
@@ -1838,6 +1870,8 @@ export interface WatchHostedSession {
   model?: string | null;
   /** Context window in tokens stored on the hosted record; absent when none is stored. */
   context_window?: number;
+  hydration_dispatched?: boolean;
+  hydration_status?: HydrationStatus;
   node_id: string;
   status: string;
   restart_count: number;
@@ -2007,7 +2041,10 @@ export interface RemodelSessionResponse {
   cwd: string | null;
   status: string;
   handshake_dispatched: boolean;
+  /** Whether the prompt was handed to the vendor; this is not acceptance evidence. */
   hydration_dispatched: boolean;
+  /** Acceptance evidence for the current hydration submission (`confirmed` | `unconfirmed` | `failed`; defaults to `unconfirmed`). */
+  hydration_status?: HydrationStatus;
   runtime_stopped: boolean;
   tmux_target: string | null;
   prompt: string | null;

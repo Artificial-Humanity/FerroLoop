@@ -1104,8 +1104,175 @@ describe("RosterSidebar Activity Tag & ChatPane Busy Badge Relocation", () => {
 
     const consoleBody = within(watchPane).getByTestId("watch-console-body");
     expect(consoleBody).toHaveClass("fd-scroll");
-    expect(consoleBody.style.overflowY).toBe("auto");
+    expect(consoleBody).toHaveStyle({ overflowY: "auto" });
 
     unmount();
+  });
+
+  it("displays hydration_status in FerroWatch remodel results, hosted session liveness rows, and ChatPane session toolbar (#383 D2b)", async () => {
+    const summaryData = makeSampleWatchSummary();
+    summaryData.health!.agents[0].hosted_session = {
+      ...summaryData.health!.agents[0].hosted_session!,
+      hydration_dispatched: true,
+      hydration_status: "unconfirmed",
+    };
+    let remodelHydrationResponse: "unconfirmed" | "failed" | "confirmed" =
+      "unconfirmed";
+
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const json = (payload: unknown) =>
+          new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.includes("/api/v1/watch/summary")) {
+          return json(summaryData);
+        }
+        if (
+          url.includes("/api/v1/sessions/ferris/remodel") &&
+          method === "POST"
+        ) {
+          return json({
+            persona: "ferris",
+            from_vendor: "claude",
+            vendor: "codex",
+            model: "gpt-5.4",
+            session_id: "codex:ferris",
+            mode: "execute",
+            hosted: true,
+            hydration_dispatched: remodelHydrationResponse !== "failed",
+            hydration_status: remodelHydrationResponse,
+          });
+        }
+        return json({});
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const onAfterRemodel = vi.fn();
+
+    const { unmount } = render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        onAfterRemodel={onAfterRemodel}
+      />,
+    );
+
+    const livenessHosted = await screen.findByTestId(
+      "watch-liveness-hosted-ferris",
+    );
+    expect(livenessHosted).toHaveTextContent("hydration=unconfirmed");
+    expect(
+      within(livenessHosted).getByTestId("watch-liveness-hydration-ferris"),
+    ).toHaveAttribute("data-hydration-status", "unconfirmed");
+
+    const quotasSection = screen.getByTestId("watch-quota-matrix-section");
+    const balanceControls = within(quotasSection).getByTestId(
+      "watch-quota-balance-controls",
+    );
+    await waitFor(() => {
+      expect(
+        within(balanceControls).getByTestId("watch-remodel-agent-select"),
+      ).toHaveValue("ferris");
+    });
+    fireEvent.click(
+      within(balanceControls).getByTestId("watch-remodel-submit-btn"),
+    );
+
+    const remodelBadge = await screen.findByTestId(
+      "watch-remodel-hydration-status",
+    );
+    expect(remodelBadge).toHaveAttribute(
+      "data-hydration-status",
+      "unconfirmed",
+    );
+    expect(remodelBadge).toHaveAttribute("data-hydration-dispatched", "true");
+    expect(remodelBadge).toHaveTextContent("Hydration: unconfirmed");
+    expect(onAfterRemodel).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        persona: "ferris",
+        hydration_status: "unconfirmed",
+      }),
+    );
+
+    // Remodel with failed hydration_status
+    remodelHydrationResponse = "failed";
+    fireEvent.click(
+      within(balanceControls).getByTestId("watch-remodel-submit-btn"),
+    );
+
+    await waitFor(() => {
+      const updatedBadge = screen.getByTestId(
+        "watch-remodel-hydration-status",
+      );
+      expect(updatedBadge).toHaveAttribute("data-hydration-status", "failed");
+      expect(updatedBadge).toHaveAttribute(
+        "data-hydration-dispatched",
+        "false",
+      );
+      expect(updatedBadge).toHaveTextContent("Hydration: failed");
+    });
+
+    unmount();
+
+    // Also verify ChatPane directly renders confirmed, unconfirmed, and failed hydration_status badges
+    const { rerender, unmount: unmountChat } = render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        agentRole="lead"
+        agentProject="FerroLoop"
+        adapter="claude"
+        model="claude-opus-5-5"
+        sessionId="claude:ferris"
+        hydrationStatus="confirmed"
+        hydrationDispatched={true}
+        turns={[]}
+        isBusy={false}
+        queue={[]}
+        loading={false}
+        wsConnected={true}
+      />,
+    );
+
+    const chatBadge = screen.getByTestId("session-hydration-status-badge");
+    expect(chatBadge).toHaveAttribute("data-hydration-status", "confirmed");
+    expect(chatBadge).toHaveTextContent("Hydration: confirmed");
+    expect(chatBadge).not.toHaveAttribute("role", "status");
+
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        agentRole="lead"
+        agentProject="FerroLoop"
+        adapter="claude"
+        model="claude-opus-5-5"
+        sessionId="claude:ferris"
+        hydrationStatus="failed"
+        hydrationDispatched={false}
+        turns={[]}
+        isBusy={false}
+        queue={[]}
+        loading={false}
+        wsConnected={true}
+      />,
+    );
+
+    const failedChatBadge = screen.getByTestId(
+      "session-hydration-status-badge",
+    );
+    expect(failedChatBadge).toHaveAttribute("data-hydration-status", "failed");
+    expect(failedChatBadge).toHaveAttribute("role", "status");
+    expect(failedChatBadge).toHaveTextContent("Hydration: failed");
+
+    unmountChat();
   });
 });

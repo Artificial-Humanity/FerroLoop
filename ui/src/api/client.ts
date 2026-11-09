@@ -20,11 +20,13 @@ import {
   type DecommissionSessionResponse,
   type DiscoveredSessionSummary,
   type HealthResponse,
+  type HostedSessionSummary,
   type HubAuthority,
   type HubSettings,
   type HubSettingsPatch,
   type HubStatsResponse,
   type InterruptSessionResponse,
+  normalizeHydrationStatus,
   type LivenessResponse,
   type OperatorAccount,
   type OperatorRole,
@@ -1048,6 +1050,23 @@ export class HubApiClient {
     return this.request<{ sessions: DiscoveredSessionSummary[] }>("/api/v1/sessions");
   }
 
+  public async getHostedSessions(): Promise<{ sessions: HostedSessionSummary[] }> {
+    const res = await this.request<{
+      sessions?: HostedSessionSummary[];
+      hosted_sessions?: HostedSessionSummary[];
+    }>("/api/v1/hosted-sessions");
+    const rawList = Array.isArray(res?.sessions)
+      ? res.sessions
+      : Array.isArray(res?.hosted_sessions)
+        ? res.hosted_sessions
+        : [];
+    const sessions = rawList.map((s) => ({
+      ...s,
+      hydration_status: normalizeHydrationStatus(s.hydration_status),
+    }));
+    return { sessions };
+  }
+
   public async getSessionTranscript(sessionId: string): Promise<SessionTranscriptResponse> {
     return this.request<SessionTranscriptResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript`,
@@ -1076,10 +1095,17 @@ export class HubApiClient {
   public async spinUpSession(
     req: SpinUpSessionRequest,
   ): Promise<SpinUpSessionResponse> {
-    return this.request<SpinUpSessionResponse>("/api/v1/sessions/spin-up", {
-      method: "POST",
-      body: JSON.stringify(req),
-    });
+    const res = await this.request<SpinUpSessionResponse>(
+      "/api/v1/sessions/spin-up",
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      },
+    );
+    return {
+      ...res,
+      hydration_status: normalizeHydrationStatus(res.hydration_status),
+    };
   }
 
   public async decommissionSession(
@@ -2316,13 +2342,17 @@ export class HubApiClient {
     if (payload.hosted !== undefined) {
       body.hosted = payload.hosted;
     }
-    return this.request<RemodelSessionResponse>(
+    const res = await this.request<RemodelSessionResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionIdOrPersona)}/remodel`,
       {
         method: "POST",
         body: JSON.stringify(body),
       },
     );
+    return {
+      ...res,
+      hydration_status: normalizeHydrationStatus(res.hydration_status),
+    };
   }
 
   public async remodelAgent(

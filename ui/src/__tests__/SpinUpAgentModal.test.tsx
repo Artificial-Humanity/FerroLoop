@@ -590,4 +590,193 @@ describe("SpinUpAgentModal", () => {
 
     unmount();
   });
+
+  it("normalizes hydration_status in SpinUpAgentModal and renders session-hydration-status-badge in App for unconfirmed, failed, and confirmed states (#383 D2b)", async () => {
+    const onSpunUp = vi.fn();
+    let nextStatus: "unconfirmed" | "failed" | "confirmed" | undefined =
+      undefined;
+
+    const onSpinUp = vi.fn(
+      async (req: SpinUpSessionRequest): Promise<SpinUpSessionResponse> => ({
+        session_id: `sess-${req.persona}`,
+        persona: req.persona,
+        project: req.project,
+        role: req.role,
+        vendor: req.vendor,
+        model: req.model ?? null,
+        posture: req.posture,
+        node_id: req.node_id ?? "ai-lab-0",
+        hosted: Boolean(req.hosted),
+        status: "running",
+        hydration_dispatched: nextStatus !== "failed",
+        hydration_status: nextStatus,
+      }),
+    );
+
+    const { unmount: unmountModal } = render(
+      <SpinUpAgentModal
+        isOpen
+        onClose={vi.fn()}
+        onSpinUp={onSpinUp}
+        onSpunUp={onSpunUp}
+      />,
+    );
+
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "fiona" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      expect(onSpunUp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          persona: "fiona",
+          hydration_dispatched: true,
+          hydration_status: "unconfirmed",
+        }),
+      );
+    });
+    const modalHydrationBadge = await screen.findByTestId(
+      "spin-up-hydration-status",
+    );
+    expect(modalHydrationBadge).toHaveAttribute(
+      "data-hydration-status",
+      "unconfirmed",
+    );
+    expect(modalHydrationBadge).toHaveAttribute(
+      "data-hydration-dispatched",
+      "true",
+    );
+    expect(modalHydrationBadge).toHaveTextContent(
+      /Hydration: unconfirmed \(dispatched: true\)/i,
+    );
+    unmountModal();
+
+    // Verify App session toolbar badge reflects unconfirmed (neutral) and failed (warning) hydration_status
+    let spinUpHydrationStatus: "unconfirmed" | "failed" | "confirmed" =
+      "unconfirmed";
+    let hostedHydrationStatus: "unconfirmed" | "failed" | "confirmed" =
+      "unconfirmed";
+
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        if (url.includes("/api/v1/auth/session")) {
+          return json({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          });
+        }
+        if (url.endsWith("/api/v1/agents")) {
+          return json({
+            agents: [
+              {
+                name_key: "felix",
+                display_name: "Felix",
+                project: "FerroLoop",
+                role: "ui-developer",
+              },
+            ],
+            routes: [],
+          });
+        }
+        if (url.endsWith("/api/v1/hosted-sessions")) {
+          return json({
+            sessions: [
+              {
+                session_id: "claude:felix",
+                persona: "felix",
+                project: "ferroloop",
+                role: "ui-developer",
+                vendor: "claude",
+                status: "running",
+                restart_count: 0,
+                hydration_dispatched: hostedHydrationStatus !== "failed",
+                hydration_status: hostedHydrationStatus,
+              },
+            ],
+          });
+        }
+        if (url.endsWith("/api/v1/sessions/spin-up") && method === "POST") {
+          const body = JSON.parse(String(init?.body));
+          hostedHydrationStatus = spinUpHydrationStatus;
+          return json({
+            session_id: "claude:felix",
+            persona: body.persona,
+            project: body.project,
+            role: body.role,
+            vendor: body.vendor,
+            model: body.model ?? null,
+            node_id: body.node_id ?? "ai-lab-0",
+            hosted: Boolean(body.hosted),
+            status: "running",
+            hydration_dispatched: spinUpHydrationStatus !== "failed",
+            hydration_status: spinUpHydrationStatus,
+          });
+        }
+        return json({});
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(
+      <App
+        apiClient={apiClient}
+        wsClient={wsStub}
+        initialSelectedAgentName="felix"
+      />,
+    );
+
+    const sessionBadge = await screen.findByTestId(
+      "session-hydration-status-badge",
+    );
+    expect(sessionBadge).toHaveAttribute(
+      "data-hydration-status",
+      "unconfirmed",
+    );
+    expect(sessionBadge).toHaveAttribute("data-hydration-dispatched", "true");
+    expect(sessionBadge).toHaveTextContent("Hydration: unconfirmed");
+    expect(sessionBadge).not.toHaveAttribute("role", "status");
+
+    // Spin up with hydration_status: "failed" and verify warning badge in session view
+    spinUpHydrationStatus = "failed";
+    fireEvent.click(screen.getByTestId("spin-up-agent-btn"));
+    expect(
+      await screen.findByTestId("spin-up-agent-modal"),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
+      target: { value: "felix" },
+    });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+
+    await waitFor(() => {
+      const updatedBadge = screen.getByTestId("session-hydration-status-badge");
+      expect(updatedBadge).toHaveAttribute("data-hydration-status", "failed");
+      expect(updatedBadge).toHaveAttribute(
+        "data-hydration-dispatched",
+        "false",
+      );
+      expect(updatedBadge).toHaveAttribute("role", "status");
+      expect(updatedBadge).toHaveTextContent("Hydration: failed");
+    });
+
+    unmount();
+  });
 });

@@ -74,6 +74,7 @@ import {
 } from "./lib/accessibility";
 import {
   DEFAULT_WORKSPACE_AGENTS,
+  normalizeHydrationStatus,
   type AgentLivenessItem,
   type AgentRecord,
   type AuthSessionResponse,
@@ -85,12 +86,15 @@ import {
   type DecommissionMode,
   type DiscoveredSessionSummary,
   type EnrolledNode,
+  type HostedSessionSummary,
   type HubAuthority,
   type HubStatsResponse,
+  type HydrationStatus,
   type PrMergeRequest,
   type PromptRequest,
   type PrReviewRequest,
   type PullRequestItem,
+  type RemodelSessionResponse,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type SpinUpSessionRequest,
@@ -1490,6 +1494,28 @@ export const App: React.FC<AppProps> = ({
     (sessionOverride?: string | null) => Promise<void>
   >(async () => {});
 
+  const refreshHostedSessions = useCallback(async () => {
+    try {
+      const hostedRes = await apiClient.getHostedSessions?.();
+      if (!mountedRef.current || loggedOutRef.current || !hostedRes?.sessions) {
+        return;
+      }
+      const nextHosted: Record<string, HostedSessionSummary> = {};
+      for (const hs of hostedRes.sessions) {
+        const pKey = (hs.persona ?? "").trim().toLowerCase();
+        if (pKey && !tornDownTargetsRef.current.has(pKey)) {
+          nextHosted[pKey] = {
+            ...hs,
+            hydration_status: normalizeHydrationStatus(hs.hydration_status),
+          };
+        }
+      }
+      setHostedSessionsByAgent(nextHosted);
+    } catch {
+      // Ignore hosted-sessions fetch errors
+    }
+  }, [apiClient]);
+
   const refreshSessionsAndTranscript = useCallback(
     async (sessionOverride?: string | null) => {
       if (loggedOutRef.current) {
@@ -1502,6 +1528,7 @@ export const App: React.FC<AppProps> = ({
       refreshInFlightRef.current = true;
       const viewOwner = { ...ownerRef.current };
       const ticket = transcriptGuard.begin(viewOwner);
+      void refreshHostedSessions();
       try {
         const sessRes = await apiClient.getSessions().catch(() => null);
         if (!mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(viewOwner, ownerRef.current)) return;
@@ -1533,7 +1560,7 @@ export const App: React.FC<AppProps> = ({
         }
       }
     },
-    [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection],
+    [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection, refreshHostedSessions],
   );
   refreshSessionsAndTranscriptRef.current = refreshSessionsAndTranscript;
 
@@ -1571,6 +1598,7 @@ export const App: React.FC<AppProps> = ({
     const initialOwner = { ...ownerRef.current };
     if (loggedOutRef.current || !mountedRef.current) return;
     setLoading(true);
+    void refreshHostedSessions();
     try {
       const [
         agentsRes,
@@ -1662,7 +1690,7 @@ export const App: React.FC<AppProps> = ({
     } finally {
       if (mountedRef.current && initialOwner.authEpoch === ownerRef.current.authEpoch) setLoading(false);
     }
-  }, [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection]);
+  }, [apiClient, scanBackgroundTranscripts, readSelectedTranscript, advanceTranscriptSelection, refreshHostedSessions]);
 
   // Startup URL pairing check + Auth session check + initial load
   useEffect(() => {
@@ -1798,6 +1826,58 @@ export const App: React.FC<AppProps> = ({
     const unsubWorkflow = wsClient.subscribe("workflow", () => {
       void refreshWorkflows();
     });
+    const unsubSessionsLifecycle = wsClient.subscribe("sessions", (frame) => {
+      if (loggedOutRef.current || !mountedRef.current) return;
+      if (
+        (frame?.event === "session.spun_up" ||
+          frame?.event === "session.remodeled" ||
+          frame?.event === "session.restarted") &&
+        frame.data &&
+        typeof frame.data === "object"
+      ) {
+        const data = frame.data as Record<string, unknown>;
+        const personaKey =
+          typeof data.persona === "string"
+            ? data.persona.trim().toLowerCase()
+            : "";
+        if (personaKey) {
+          const hydrationStatus = normalizeHydrationStatus(
+            data.hydration_status,
+          );
+          const hydrationDispatched =
+            typeof data.hydration_dispatched === "boolean"
+              ? data.hydration_dispatched
+              : undefined;
+          setSpunUpByAgent((prev) => {
+            const existing = prev[personaKey];
+            const vendor =
+              typeof data.vendor === "string" && data.vendor.trim()
+                ? data.vendor.trim()
+                : existing?.adapter ?? "unknown";
+            const model =
+              typeof data.model === "string"
+                ? data.model
+                : existing?.model ?? null;
+            const sessionId =
+              typeof data.session_id === "string" && data.session_id.trim()
+                ? data.session_id.trim()
+                : existing?.sessionId ?? null;
+            return {
+              ...prev,
+              [personaKey]: {
+                adapter: vendor,
+                model,
+                sessionId,
+                hydrationDispatched:
+                  hydrationDispatched ?? existing?.hydrationDispatched,
+                hydrationStatus,
+              },
+            };
+          });
+        }
+      }
+      void refreshSessionsAndTranscript();
+    });
     const unsubSettings = wsClient.subscribe("settings", (frame) => {
       if (loggedOutRef.current || !mountedRef.current) return;
       if (
@@ -1831,6 +1911,7 @@ export const App: React.FC<AppProps> = ({
       unsubWire();
       unsubSession();
       unsubWorkflow();
+      unsubSessionsLifecycle();
       unsubSettings();
       wsClient.disconnect();
     };
@@ -1875,8 +1956,17 @@ export const App: React.FC<AppProps> = ({
   const [spunUpByAgent, setSpunUpByAgent] = useState<
     Record<
       string,
-      { adapter: string; model: string | null; sessionId: string | null }
+      {
+        adapter: string;
+        model: string | null;
+        sessionId: string | null;
+        hydrationDispatched?: boolean;
+        hydrationStatus?: HydrationStatus;
+      }
     >
+  >({});
+  const [hostedSessionsByAgent, setHostedSessionsByAgent] = useState<
+    Record<string, HostedSessionSummary>
   >({});
 
   const activeSession = useMemo(() => {
@@ -1944,6 +2034,36 @@ export const App: React.FC<AppProps> = ({
     [liveness, activeAgentKey],
   );
   const activeSpunUp = activeAgentKey ? spunUpByAgent[activeAgentKey] : undefined;
+  const activeHostedSession = activeAgentKey
+    ? hostedSessionsByAgent[activeAgentKey]
+    : undefined;
+  const activeHydrationStatus = useMemo<HydrationStatus | null>(() => {
+    const raw =
+      activeSession?.hydration_status ??
+      activeRoute?.hydration_status ??
+      activeHostedSession?.hydration_status ??
+      activeSpunUp?.hydrationStatus;
+    if (raw !== undefined && raw !== null) {
+      return normalizeHydrationStatus(raw);
+    }
+    if (
+      activeSession?.hydration_dispatched !== undefined ||
+      activeRoute?.hydration_dispatched !== undefined ||
+      activeHostedSession?.hydration_dispatched !== undefined ||
+      activeSpunUp?.hydrationDispatched !== undefined
+    ) {
+      return "unconfirmed";
+    }
+    return null;
+  }, [activeSession, activeRoute, activeHostedSession, activeSpunUp]);
+  const activeHydrationDispatched = useMemo<boolean | undefined>(() => {
+    return (
+      activeSession?.hydration_dispatched ??
+      activeRoute?.hydration_dispatched ??
+      activeHostedSession?.hydration_dispatched ??
+      activeSpunUp?.hydrationDispatched
+    );
+  }, [activeSession, activeRoute, activeHostedSession, activeSpunUp]);
   const activeAdapter = useMemo(() => {
     const candidates = [
       activeSession?.adapter,
@@ -2252,7 +2372,12 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
-    const res = await apiClient.spinUpSession(req);
+    const rawRes = await apiClient.spinUpSession(req);
+    const hydrationStatus = normalizeHydrationStatus(rawRes.hydration_status);
+    const res = {
+      ...rawRes,
+      hydration_status: hydrationStatus,
+    };
     const personaKey = (res.persona || req.persona || "").trim().toLowerCase();
     if (personaKey) {
       setSpunUpByAgent((prev) => ({
@@ -2261,6 +2386,8 @@ export const App: React.FC<AppProps> = ({
           adapter: res.vendor || req.vendor,
           model: res.model ?? req.model ?? null,
           sessionId: res.session_id || null,
+          hydrationDispatched: Boolean(res.hydration_dispatched),
+          hydrationStatus,
         },
       }));
     }
@@ -2368,6 +2495,21 @@ export const App: React.FC<AppProps> = ({
       if (!valid) return res;
       tornDownTargetsRef.current.add(targetId.trim().toLowerCase());
       tornDownTargetsRef.current.add(reset.resetOwner.agentKey);
+      if (reset.resetOwner.agentKey) {
+        const keyToDelete = reset.resetOwner.agentKey;
+        setSpunUpByAgent((prev) => {
+          if (!(keyToDelete in prev)) return prev;
+          const next = { ...prev };
+          delete next[keyToDelete];
+          return next;
+        });
+        setHostedSessionsByAgent((prev) => {
+          if (!(keyToDelete in prev)) return prev;
+          const next = { ...prev };
+          delete next[keyToDelete];
+          return next;
+        });
+      }
       discardTranscriptTarget(reset.resetOwner, true);
       // Only the captured target loses its view or schedules selected-view follow-up work.
       if (!sameTranscriptTarget(reset.resetOwner, ownerRef.current)) return res;
@@ -2516,7 +2658,24 @@ export const App: React.FC<AppProps> = ({
             agents={agents}
             sessions={mergedRoutes}
             apiClient={apiClient}
-            onAfterRemodel={() => {
+            onAfterRemodel={(res: RemodelSessionResponse) => {
+              const personaKey = (res.persona || "").trim().toLowerCase();
+              if (personaKey) {
+                const hydrationStatus = normalizeHydrationStatus(
+                  res.hydration_status,
+                );
+                setSpunUpByAgent((prev) => ({
+                  ...prev,
+                  [personaKey]: {
+                    adapter: res.vendor || prev[personaKey]?.adapter || "unknown",
+                    model: res.model ?? prev[personaKey]?.model ?? null,
+                    sessionId:
+                      res.session_id || prev[personaKey]?.sessionId || null,
+                    hydrationDispatched: Boolean(res.hydration_dispatched),
+                    hydrationStatus,
+                  },
+                }));
+              }
               void refreshWireAndRoster();
               void refreshSessionsAndTranscript();
             }}
@@ -2956,6 +3115,8 @@ export const App: React.FC<AppProps> = ({
       executionMode={
         activeSession?.execution_mode ?? activeRoute?.execution_mode
       }
+      hydrationStatus={activeHydrationStatus}
+      hydrationDispatched={activeHydrationDispatched}
       sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
       turns={transcriptTurns}
       transcriptRefreshState={transcriptRefreshState}
