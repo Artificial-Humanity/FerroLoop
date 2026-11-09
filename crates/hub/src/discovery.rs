@@ -5004,6 +5004,87 @@ fn normalize_hook_prompt_wire_turn(role: &str, text: &str) -> Option<(String, St
     Some((role, mails.join("\n\n---\n\n")))
 }
 
+/// Unwrap a single outer `<pasted_content id="X">...</pasted_content id="X">` wrapper when the
+/// entire string (ignoring outer whitespace) is enclosed by matching open and close tags with the
+/// same non-empty `id` and no sibling block with the same `id` appears inside.
+pub(crate) fn strip_outer_pasted_content_wrapper(content: &str) -> Option<String> {
+    const OPEN_PREFIX: &str = "<pasted_content id=\"";
+    let trimmed = content.trim();
+    let after_prefix = trimmed.strip_prefix(OPEN_PREFIX)?;
+    let id_end = after_prefix.find('"')?;
+    let id = &after_prefix[..id_end];
+    if id.is_empty()
+        || id.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+    {
+        return None;
+    }
+    let after_open = after_prefix[id_end..].strip_prefix("\">")?;
+    let close_tag = format!("</pasted_content id=\"{id}\">");
+    let raw_inner = after_open.strip_suffix(&close_tag)?;
+    let open_tag = format!("<pasted_content id=\"{id}\">");
+    // Reject sibling blocks with the same id (`<pasted_content id="X">...</pasted_content id="X"> ... <pasted_content id="X">...</pasted_content id="X">`).
+    // Genuine nested paste tags inside a wrapper are backslash-escaped by Claude Code.
+    if raw_inner.contains(&close_tag) || raw_inner.contains(&open_tag) {
+        return None;
+    }
+    let inner = raw_inner.trim_matches(['\r', '\n']);
+    let unescaped = if inner.contains("pasted_content") {
+        inner
+            .replace("<\\pasted_content ", "<pasted_content ")
+            .replace("<\\pasted_content>", "<pasted_content>")
+            .replace("<\\/pasted_content ", "</pasted_content ")
+            .replace("<\\/pasted_content>", "</pasted_content>")
+            .replace("</\\pasted_content ", "</pasted_content ")
+            .replace("</\\pasted_content>", "</pasted_content>")
+    } else {
+        inner.to_string()
+    };
+    Some(unescaped)
+}
+
+/// Strip a leading `[Operator Prompt via FerroDeck ...]` line when there is no sender or the
+/// sender is the owner (`owner` / `lmcfarlin`), while preserving the header line for non-owner
+/// senders so the transcript still shows who sent the operator prompt.
+pub(crate) fn strip_operator_prompt_header(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("[Operator Prompt via FerroDeck") {
+        return text.to_string();
+    }
+    let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+    let header_line = trimmed[..first_line_end].trim();
+    let Some(inside) = header_line
+        .strip_prefix("[Operator Prompt via FerroDeck")
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return trimmed.to_string();
+    };
+    let should_strip = match inside.trim() {
+        "" => true,
+        rest => rest
+            .strip_prefix('—')
+            .or_else(|| rest.strip_prefix('–'))
+            .or_else(|| rest.strip_prefix("--"))
+            .or_else(|| rest.strip_prefix('-'))
+            .and_then(|after_dash| after_dash.trim_start().strip_prefix("from "))
+            .is_some_and(|sender| fl_wire::dispatcher::is_owner_sender(sender.trim())),
+    };
+    if should_strip {
+        match trimmed.find('\n') {
+            Some(nl) => {
+                let body = trimmed[nl + 1..].trim();
+                if body.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    body.to_string()
+                }
+            }
+            None => trimmed.to_string(),
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && role != "user" {
         return (role.to_string(), content.to_string());
@@ -5024,6 +5105,13 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
             return ("system".to_string(), unwrapped);
         }
     }
+    let mut pasted_unwrapped = false;
+    let unwrapped = if let Some(inner_paste) = strip_outer_pasted_content_wrapper(&unwrapped) {
+        pasted_unwrapped = true;
+        inner_paste
+    } else {
+        unwrapped
+    };
     let content = unwrapped.as_str();
     let trimmed_content = content.trim();
     let is_notice = trimmed_content.starts_with("[Notice] ");
@@ -5069,6 +5157,17 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         }
     }
 
+    let inner_owned_pre = if !pasted_unwrapped && (has_claude_peer_wrapper || has_system_msg_block)
+    {
+        strip_outer_pasted_content_wrapper(inner)
+    } else {
+        None
+    };
+    if let Some(ref s) = inner_owned_pre {
+        pasted_unwrapped = true;
+        inner = s.as_str();
+    }
+
     let mut msg_sender = String::new();
     if inner.starts_with("[Message]") {
         let first_line_end = inner.find('\n').unwrap_or(inner.len());
@@ -5094,12 +5193,17 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         }
     }
 
+    let inner_owned_post = if !pasted_unwrapped && has_system_msg_block {
+        strip_outer_pasted_content_wrapper(inner)
+    } else {
+        None
+    };
+    if let Some(ref s) = inner_owned_post {
+        inner = s.as_str();
+    }
+
     if inner.starts_with("[Operator Prompt via FerroDeck") {
-        let cleaned = match inner.find('\n') {
-            Some(nl) => inner[nl + 1..].trim(),
-            None => inner,
-        };
-        return ("user".to_string(), cleaned.to_string());
+        return ("user".to_string(), strip_operator_prompt_header(inner));
     }
 
     if inner.starts_with("[Incoming NATS Message") {
@@ -13683,5 +13787,129 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "assistant");
         assert_eq!(turns[0].content, "compact only <truncated 100 bytes>");
+    }
+
+    #[test]
+    fn pasted_content_wrapper_and_operator_prompt_header_normalization() {
+        // 1. Wrapper with matching id and owner operator header -> unwrapped and header hidden.
+        let (role, content) = normalize_system_turn(
+            "user",
+            "<pasted_content id=\"1234\">\n[Operator Prompt via FerroDeck — from lmcfarlin]\n\nHello world\n</pasted_content id=\"1234\">",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "Hello world");
+
+        // 2. Wrapper with matching id and plain user text (no operator header) -> outer wrapper removed.
+        let (role, content) = normalize_system_turn(
+            "user",
+            "<pasted_content id=\"abcd-42\">\nFirst line\n\nSecond paragraph\n</pasted_content id=\"abcd-42\">",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "First line\n\nSecond paragraph");
+
+        // 3. Mismatched ids -> left completely untouched.
+        let mismatched = "<pasted_content id=\"1234\">\nHello\n</pasted_content id=\"5678\">";
+        let (role, content) = normalize_system_turn("user", mismatched);
+        assert_eq!(role, "user");
+        assert_eq!(content, mismatched);
+
+        // 4. Unterminated wrapper, missing closing tag, or invalid id -> left completely untouched.
+        for unterminated in [
+            "<pasted_content id=\"1234\">\nHello world",
+            "<pasted_content id=\"1234\">\nHello world\n</pasted_content>",
+            "<pasted_content id=\"\">\nHello\n</pasted_content id=\"\">",
+            "<pasted_content id=\"a b\">\nHello\n</pasted_content id=\"a b\">",
+            "Hello world\n</pasted_content id=\"1234\">",
+        ] {
+            let (role, content) = normalize_system_turn("user", unterminated);
+            assert_eq!(role, "user", "{unterminated:?}");
+            assert_eq!(content, unterminated, "{unterminated:?}");
+        }
+
+        // 5. Two sibling blocks with the same id -> left completely untouched.
+        let siblings = "<pasted_content id=\"1\">a</pasted_content id=\"1\">\n<pasted_content id=\"1\">b</pasted_content id=\"1\">";
+        let (role, content) = normalize_system_turn("user", siblings);
+        assert_eq!(role, "user");
+        assert_eq!(content, siblings);
+
+        // 6. Nested or literal tag in the body:
+        // (a) Literal tag in a non-wrapped message -> untouched.
+        let literal_in_body =
+            "Here is <pasted_content id=\"1\">example</pasted_content id=\"1\"> in body";
+        let (role, content) = normalize_system_turn("user", literal_in_body);
+        assert_eq!(role, "user");
+        assert_eq!(content, literal_in_body);
+
+        // (b) Escaped literal tag inside an outer wrapper -> outer wrapper and owner header removed,
+        // inner unescaped and preserved.
+        let nested_escaped = "<pasted_content id=\"9999\">\n[Operator Prompt via FerroDeck — from owner]\n\nCheck this <\\pasted_content id=\"1234\">literal</\\pasted_content id=\"1234\"> and <\\pasted_content id=\"5\">more<\\/pasted_content id=\"5\"> tag\n</pasted_content id=\"9999\">";
+        let (role, content) = normalize_system_turn("user", nested_escaped);
+        assert_eq!(role, "user");
+        assert_eq!(
+            content,
+            "Check this <pasted_content id=\"1234\">literal</pasted_content id=\"1234\"> and <pasted_content id=\"5\">more</pasted_content id=\"5\"> tag"
+        );
+
+        // (c) Entire inner body after owner header is an escaped literal paste block -> not double-unwrapped.
+        let sole_nested = "<pasted_content id=\"9999\">\n[Operator Prompt via FerroDeck — from owner]\n\n<\\pasted_content id=\"1234\">literal<\\/pasted_content id=\"1234\">\n</pasted_content id=\"9999\">";
+        let (role, content) = normalize_system_turn("user", sole_nested);
+        assert_eq!(role, "user");
+        assert_eq!(
+            content,
+            "<pasted_content id=\"1234\">literal</pasted_content id=\"1234\">"
+        );
+
+        // (d) Attribute-less `<pasted_content>` tags escaped inside an outer wrapper are also unescaped,
+        // and header-only owner prompts fall back to preserving the header line instead of returning empty.
+        let attrless_nested = "<pasted_content id=\"9999\">\n<\\pasted_content>inner<\\/pasted_content> and </\\pasted_content>\n</pasted_content id=\"9999\">";
+        assert_eq!(
+            strip_outer_pasted_content_wrapper(attrless_nested).as_deref(),
+            Some("<pasted_content>inner</pasted_content> and </pasted_content>")
+        );
+        assert_eq!(
+            strip_operator_prompt_header("[Operator Prompt via FerroDeck — from owner]\n   "),
+            "[Operator Prompt via FerroDeck — from owner]"
+        );
+
+        // 7. Codex or other vendor transcript with no wrapper -> completely unchanged.
+        let plain_codex = "Please review crates/hub/src/discovery.rs\nand run cargo test.";
+        let (role, content) = normalize_system_turn("user", plain_codex);
+        assert_eq!(role, "user");
+        assert_eq!(content, plain_codex);
+
+        // 8. `[Operator Prompt via FerroDeck — from <name>]` hidden for owner/lmcfarlin (and bare header)
+        // and preserved for non-owner senders (`ferris`, `jarvis`) both with and without `<pasted_content>`.
+        for owner_header in [
+            "[Operator Prompt via FerroDeck]",
+            "[Operator Prompt via FerroDeck — from owner]",
+            "[Operator Prompt via FerroDeck — from OWNER]",
+            "[Operator Prompt via FerroDeck — from lmcfarlin]",
+            "[Operator Prompt via FerroDeck - from lmcfarlin]",
+        ] {
+            let plain = format!("{owner_header}\n\nInspect the transcript.");
+            let (role, content) = normalize_system_turn("user", &plain);
+            assert_eq!(role, "user", "{owner_header}");
+            assert_eq!(content, "Inspect the transcript.", "{owner_header}");
+
+            let wrapped =
+                format!("<pasted_content id=\"77\">\n{plain}\n</pasted_content id=\"77\">");
+            let (role, content) = normalize_system_turn("user", &wrapped);
+            assert_eq!(role, "user", "{owner_header} wrapped");
+            assert_eq!(content, "Inspect the transcript.", "{owner_header} wrapped");
+        }
+
+        for peer_sender in ["ferris", "jarvis"] {
+            let peer_msg =
+                format!("[Operator Prompt via FerroDeck — from {peer_sender}]\n\nPlease check CI.");
+            let (role, content) = normalize_system_turn("user", &peer_msg);
+            assert_eq!(role, "user", "{peer_sender}");
+            assert_eq!(content, peer_msg, "{peer_sender}");
+
+            let wrapped =
+                format!("<pasted_content id=\"88\">\n{peer_msg}\n</pasted_content id=\"88\">");
+            let (role, content) = normalize_system_turn("user", &wrapped);
+            assert_eq!(role, "user", "{peer_sender} wrapped");
+            assert_eq!(content, peer_msg, "{peer_sender} wrapped");
+        }
     }
 }
