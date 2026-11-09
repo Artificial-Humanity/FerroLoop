@@ -88,7 +88,7 @@ export function resolveSpinUpProject(
   }
   const trimmed = (rawProject ?? "").trim().toLowerCase();
   if (!trimmed || trimmed === "all") {
-    return options[0]?.value ?? "";
+    return "";
   }
   const matched =
     options.find((p) => p.value === trimmed) ??
@@ -102,8 +102,7 @@ export function resolveSpinUpProject(
         (p) =>
           p.value === trimmed ||
           p.name === trimmed ||
-          p.label === trimmed ||
-          p.label.includes(trimmed),
+          p.label === trimmed,
       );
   return matched ? matched.value : "";
 }

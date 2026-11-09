@@ -159,6 +159,7 @@ describe("authenticated editable role catalog", () => {
         isOpen
         onClose={vi.fn()}
         apiClient={client}
+        initialProject="ferroloop"
         projects={[{ id: "ferroloop", slug: "ferroloop", name: "FerroLoop", kind: "project", path: "/work/ferroloop", has_git: true, purpose: null, tracker: null, store_path: null, active_agent_count: 0 }]}
         onSpinUp={onSpinUp}
       />,

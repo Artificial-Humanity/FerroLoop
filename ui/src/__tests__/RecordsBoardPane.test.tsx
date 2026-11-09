@@ -10,6 +10,7 @@ import type {
   RecordState,
   RecordsListResponse,
 } from "../types/api";
+import { TEST_PROJECTS } from "./fixtures/testAgents";
 
 function makeInitialRecords(): ProjectRecordItem[] {
   return [
@@ -215,7 +216,7 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
         makeBoardResponse(makeInitialRecords(), proj ?? "ferroloop"),
       );
 
-    render(<RecordsBoardPane apiClient={client} />);
+    render(<RecordsBoardPane selectedProject="ferroloop" apiClient={client} />);
 
     await waitFor(() => {
       expect(screen.getByTestId("record-card-1")).toBeInTheDocument();
@@ -261,7 +262,7 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
       .spyOn(client, "createRecord")
       .mockResolvedValue({ record: createdRecord });
 
-    render(<RecordsBoardPane apiClient={client} />);
+    render(<RecordsBoardPane selectedProject="ferroloop" apiClient={client} />);
 
     await waitFor(() => {
       expect(screen.getByTestId("record-card-1")).toBeInTheDocument();
@@ -333,7 +334,7 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
         },
       );
 
-    render(<RecordsBoardPane apiClient={client} />);
+    render(<RecordsBoardPane selectedProject="ferroloop" apiClient={client} />);
 
     await waitFor(() => {
       expect(
@@ -474,5 +475,56 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
       "data-topic",
       "board",
     );
+  });
+
+  it("renders None selected and makes zero /api/v1/records requests when selectedProject is omitted even with non-empty projects", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify(makeBoardResponse()), { status: 200 }),
+    );
+    const client = new HubApiClient({
+      baseUrl: "http://localhost:9000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const listSpy = vi.spyOn(client, "listRecords");
+
+    const { rerender } = render(
+      <RecordsBoardPane projects={TEST_PROJECTS} apiClient={client} />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const boardSelect = screen.getByTestId(
+      "board-project-select",
+    ) as HTMLSelectElement;
+    expect(boardSelect.value).toBe("");
+    expect(boardSelect.selectedOptions[0]?.textContent).toBe("None");
+    expect(Array.from(boardSelect.options).map((o) => o.value)).toEqual([
+      "",
+      ...TEST_PROJECTS.map((p) => p.slug),
+    ]);
+    expect(listSpy).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    // Selecting a project via prop loads that project, and omitting it again resets to None without new requests
+    rerender(
+      <RecordsBoardPane
+        selectedProject="ferroloop"
+        projects={TEST_PROJECTS}
+        apiClient={client}
+      />,
+    );
+    await waitFor(() => {
+      expect(listSpy).toHaveBeenCalledTimes(1);
+      expect(listSpy).toHaveBeenCalledWith("ferroloop");
+    });
+
+    rerender(
+      <RecordsBoardPane projects={TEST_PROJECTS} apiClient={client} />,
+    );
+    expect(boardSelect.value).toBe("");
+    expect(boardSelect.selectedOptions[0]?.textContent).toBe("None");
+    expect(listSpy).toHaveBeenCalledTimes(1);
   });
 });
