@@ -1054,25 +1054,12 @@ async fn run_extension(
             .max(1)
             .div_ceil(fl_host_proto::MAX_EXTENSION_PART);
         let mut complete = true;
+        let mut wrote_part = false;
         for index in 0..parts {
             if !reliable_hold(host, conn, &stream_state, "reliable-before-part", true).await
                 || stream_state.cancelled()
                 || !host.authority.connection_live(rpc)
             {
-                if index == 0
-                    && journal.compacted()
-                    && !host.stop.load(Ordering::SeqCst)
-                    && !conn.peer_closed()
-                    && host.authority.connection_live(rpc)
-                    && let Ok(frame) = fl_host_proto::encode_extension_frame(
-                        conn.negotiated_minor(),
-                        &fl_host_proto::ExtensionFrame::Notice {
-                            code: fl_host_proto::ExtensionRefusal::SessionFenced,
-                        },
-                    )
-                {
-                    let _ = conn.write_frame(&frame).await;
-                }
                 complete = false;
                 break;
             }
@@ -1126,6 +1113,7 @@ async fn run_extension(
                     complete = false;
                     break;
                 }
+                wrote_part = true;
                 if conn.write_frame_until(&frame, deadline).await.is_err() {
                     complete = false;
                     break;
@@ -1146,9 +1134,12 @@ async fn run_extension(
                 if let Some(final_write) = final_write {
                     final_write.complete();
                 }
-            } else if conn.write_frame(&frame).await.is_err() {
-                complete = false;
-                break;
+            } else {
+                wrote_part = true;
+                if conn.write_frame(&frame).await.is_err() {
+                    complete = false;
+                    break;
+                }
             }
             if index + 1 < parts
                 && !reliable_hold(host, conn, &stream_state, "reliable-after-part", true).await
@@ -1158,6 +1149,20 @@ async fn run_extension(
             }
         }
         if !complete {
+            if !wrote_part
+                && journal.compacted()
+                && !host.stop.load(Ordering::SeqCst)
+                && !conn.peer_closed()
+                && host.authority.connection_live(rpc)
+                && let Ok(frame) = fl_host_proto::encode_extension_frame(
+                    conn.negotiated_minor(),
+                    &fl_host_proto::ExtensionFrame::Notice {
+                        code: fl_host_proto::ExtensionRefusal::SessionFenced,
+                    },
+                )
+            {
+                let _ = conn.write_frame(&frame).await;
+            }
             parked = Some(record);
             break;
         }
