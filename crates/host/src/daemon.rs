@@ -507,9 +507,13 @@ async fn begin_events(
                 sub.run(
                     hub,
                     minor,
-                    move |frame| {
+                    move |frame, cutoff| {
                         let mut conn = writing.lock().unwrap_or_else(|err| err.into_inner());
-                        handle.block_on(conn.write_frame(&frame)).map_err(|_| ())
+                        let deadline = conn.frame_write_deadline(&frame).map_err(|_| ())?;
+                        let deadline = cutoff.map_or(deadline, |cutoff| deadline.min(cutoff));
+                        handle
+                            .block_on(conn.write_frame_until(&frame, deadline))
+                            .map_err(|_| ())
                     },
                     move || {
                         probing
