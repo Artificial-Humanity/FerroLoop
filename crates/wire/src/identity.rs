@@ -1276,6 +1276,42 @@ impl RouteTable {
     fn discover_agy_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         let brain_dir = agy_dir.join("brain");
+        // Revalidate passive identity claims before endpoint repair or any early return.
+        // A cached conversation ID is not evidence by itself: its bounded transcript head
+        // must still identify that persona, with a known nonzero source timestamp.
+        let mut candidates: Vec<(u64, String, String)> = Vec::new();
+        if let Ok(read_dir) = fs::read_dir(&brain_dir) {
+            for entry in read_dir.flatten() {
+                let conv_dir = entry.path();
+                let Some(conv_id) = conv_dir.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let transcript = conv_dir
+                    .join(".system_generated")
+                    .join("logs")
+                    .join("transcript.jsonl");
+                let file_ms = mtime_ms(&transcript);
+                if transcript.is_file()
+                    && file_ms > 0
+                    && let Some(persona) = scan_transcript_for_persona(&transcript, 50)
+                {
+                    candidates.push((file_ms, conv_id.to_string(), persona));
+                }
+            }
+        }
+        let validated: BTreeMap<&str, &str> = candidates
+            .iter()
+            .map(|(_, conversation_id, persona)| (conversation_id.as_str(), persona.as_str()))
+            .collect();
+        self.entries.retain(|persona, entry| {
+            entry.explicit
+                || match &entry.route {
+                    VendorRoute::Agy {
+                        conversation_id, ..
+                    } => validated.get(conversation_id.as_str()).copied() == Some(persona.as_str()),
+                    _ => true,
+                }
+        });
         if !brain_dir.is_dir() {
             // No transcript to scan. Still replace a missing or `.old` exe with
             // `$HOME/.local/bin/agy` when that file exists, otherwise `agy`.
@@ -1489,39 +1525,19 @@ impl RouteTable {
             }
         }
 
-        // Scan brain/*/transcript.jsonl for persona registrations, newest mtime first so the
-        // latest conversation for a persona wins and carries its transcript mtime.
-        let Ok(read_dir) = fs::read_dir(&brain_dir) else {
-            return;
-        };
-        let mut candidates: Vec<(u64, String, PathBuf)> = Vec::new();
-        for entry in read_dir.flatten() {
-            let conv_dir = entry.path();
-            let Some(conv_id) = conv_dir.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let transcript = conv_dir
-                .join(".system_generated")
-                .join("logs")
-                .join("transcript.jsonl");
-            if !transcript.is_file() {
-                continue;
-            }
-            candidates.push((mtime_ms(&transcript), conv_id.to_string(), transcript));
-        }
+        // Reuse the validated transcript claims, newest mtime first. Unknown timestamps
+        // were excluded above so neither new claims nor placeholder upgrades use scan time.
         candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        for (file_ms, conv_id, transcript) in candidates {
-            if let Some(persona) = scan_transcript_for_persona(&transcript, 50)
-                && !self.entries.values().any(|existing| {
-                    matches!(
-                        &existing.route,
-                        VendorRoute::Agy {
-                            conversation_id: existing_id,
-                            ..
-                        } if existing_id == &conv_id
-                    )
-                })
-            {
+        for (file_ms, conv_id, persona) in candidates {
+            if !self.entries.values().any(|existing| {
+                matches!(
+                    &existing.route,
+                    VendorRoute::Agy {
+                        conversation_id: existing_id,
+                        ..
+                    } if existing_id == &conv_id
+                )
+            }) {
                 let placeholder = match self.entries.get(&persona) {
                     None => Some((None, None, None, None, None, false)),
                     Some(entry) => match &entry.route {
@@ -4374,6 +4390,8 @@ mod tests {
     fn discover_agy_routes_overwrites_stale_pre_reboot_ls_address_and_csrf_token() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-kayla", "Kayla", 100);
+        agy_registration_fixture(home, "conv-ferris", "Ferris", 100);
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         fs::create_dir_all(agy_dir.join("brain")).unwrap();
         fs::write(
@@ -5329,6 +5347,7 @@ mod tests {
     fn stale_historical_sessions_do_not_overwrite_a_newer_route() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-wesley", "Wesley", 100);
         let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
         let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
 
@@ -5420,6 +5439,7 @@ mod tests {
     fn inactive_grok_summary_updated_at_does_not_replace_newer_route() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-wesley", "Wesley", 100);
         let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
         let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
         let summary_ms = At::parse("2026-10-29T05:00:00.000Z").unwrap().unix_millis();
@@ -5485,6 +5505,7 @@ mod tests {
     fn codex_index_updated_at_does_not_outstamp_older_rollout() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-wesley", "Wesley", 100);
         let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
         let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
         let thread_id = "01a0a9ce-1111-7222-8333-ea40058ed587";
@@ -6057,6 +6078,9 @@ mod tests {
     fn discover_agy_routes_replaces_old_or_missing_agentapi_exe() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-old", "Oldie", 100);
+        agy_registration_fixture(home, "conv-gone", "Gone", 100);
+        agy_registration_fixture(home, "conv-kept", "Kept", 100);
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         fs::create_dir_all(agy_dir.join("brain")).unwrap();
         let bin_dir = home.join(".local").join("bin");
@@ -6136,7 +6160,7 @@ mod tests {
         fs::write(&old, b"#!/bin/sh\n").unwrap();
 
         let mut table = RouteTable::default();
-        table.upsert(
+        table.upsert_explicit(
             "felicia",
             VendorRoute::Agy {
                 conversation_id: "conv-felicia".into(),
@@ -6163,6 +6187,7 @@ mod tests {
         let live_port = listener.local_addr().unwrap().port();
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-felicia", "Felicia", 100);
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         fs::create_dir_all(agy_dir.join("brain")).unwrap();
         // Reverse scan sees port 1 first. The HTTPS line stays skipped. The
@@ -6225,6 +6250,7 @@ mod tests {
     fn agy_discovery_restamps_a_corrected_route_so_the_legacy_file_cannot_clobber_it() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
+        agy_registration_fixture(&home, "conv-kayla", "Kayla", 100);
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         fs::create_dir_all(agy_dir.join("brain")).unwrap();
         fs::write(
@@ -6294,6 +6320,8 @@ mod tests {
     fn agy_discovery_restamps_a_replaced_exe_but_not_a_filled_one() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "c1", "Stale", 1);
+        agy_registration_fixture(home, "c2", "Unset", 1);
         fs::create_dir_all(home.join(".gemini").join("antigravity-cli").join("brain")).unwrap();
         let route = |conv: &str, exe: Option<&str>| VendorRoute::Agy {
             conversation_id: conv.into(),
@@ -6318,6 +6346,7 @@ mod tests {
     fn agy_discovery_skips_a_one_shot_cli_log_that_shut_its_language_server_down() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        agy_registration_fixture(home, "conv-kayla", "Kayla", 1);
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         let log_dir = agy_dir.join("log");
         fs::create_dir_all(agy_dir.join("brain")).unwrap();
@@ -7781,6 +7810,7 @@ mod tests {
     fn a_reregistered_route_survives_discover_routes_and_the_old_native_id_does_not() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        let transcript = agy_registration_fixture(home, "conv-new", "Ada", 5);
         fs::create_dir_all(home).unwrap();
         let banned = std::collections::BTreeSet::from([
             "conv-old".to_string(),
@@ -7799,6 +7829,8 @@ mod tests {
             }) => assert_eq!(conversation_id, "conv-new"),
             other => panic!("new native id must stay deliverable: {other:?}"),
         }
+        // The later Grok-only cases must not rediscover this Antigravity session.
+        fs::remove_file(transcript).unwrap();
 
         table.upsert(
             "ada",
@@ -8265,6 +8297,282 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan_transcript_for_persona(&transcript, 50), None);
+    }
+
+    fn agy_registration_fixture(
+        home: &Path,
+        conversation_id: &str,
+        persona: &str,
+        ms: u64,
+    ) -> PathBuf {
+        let text = serde_json::json!({"type": "USER_INPUT", "content": format!("fl wire register {persona}")});
+        agy_transcript_fixture(home, conversation_id, &text.to_string(), ms)
+    }
+
+    fn agy_transcript_fixture(home: &Path, conversation_id: &str, text: &str, ms: u64) -> PathBuf {
+        let transcript = home
+            .join(".gemini/antigravity-cli/brain")
+            .join(conversation_id)
+            .join(".system_generated/logs/transcript.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, text).unwrap();
+        set_mtime(&transcript, ms);
+        transcript
+    }
+
+    #[test]
+    fn passive_agy_cached_claims_require_current_bounded_source_evidence() {
+        for source in [
+            "generic",
+            "mismatch",
+            "missing",
+            "unreadable",
+            "zero-mtime",
+            "subagent",
+            "beyond-head",
+        ] {
+            let home = TempDir::new().unwrap();
+            let valid = "{\"type\":\"USER_INPUT\",\"content\":\"fl wire register Kayla\"}\n";
+            let text = match source {
+                "generic" => "{\"type\":\"GENERIC\",\"content\":\"diff --git a/example b/example\\n+fl wire register Kayla\"}\n".to_string(),
+                "mismatch" => "{\"type\":\"USER_INPUT\",\"content\":\"fl wire register Kacey\"}\n".to_string(),
+                "subagent" => format!("{{\"type\":\"SYSTEM_MESSAGE\",\"content\":\"<SYSTEM_MESSAGE> subagent </SYSTEM_MESSAGE>\"}}\n{valid}"),
+                "beyond-head" => format!("{}{valid}", "{\"type\":\"GENERIC\",\"content\":\"output\"}\n".repeat(50)),
+                _ => valid.to_string(),
+            };
+            let transcript = agy_transcript_fixture(home.path(), "cached-conversation", &text, 100);
+            match source {
+                "missing" => fs::remove_file(&transcript).unwrap(),
+                "unreadable" => {
+                    fs::remove_file(&transcript).unwrap();
+                    fs::create_dir(&transcript).unwrap();
+                }
+                "zero-mtime" => set_mtime(&transcript, 0),
+                _ => {}
+            }
+            let mut table = RouteTable::default();
+            table.upsert(
+                "kayla",
+                agy_route("cached-conversation"),
+                At::from_unix_millis(9000),
+            );
+            table.discover_agy_routes(home.path(), false, &At::from_unix_millis(10000));
+            assert!(
+                table.get("kayla").is_none(),
+                "invalid cached source {source}"
+            );
+            if source == "mismatch" {
+                assert!(
+                    matches!(table.get("kacey").map(|e| &e.route), Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "cached-conversation")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_agy_unreadable_regular_transcript_does_not_validate_cached_claim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can read mode-000 files, so permission denial cannot be exercised as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let home = TempDir::new().unwrap();
+        let transcript =
+            agy_registration_fixture(home.path(), "unreadable-conversation", "Kayla", 100);
+        let permissions = fs::metadata(&transcript).unwrap().permissions();
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0)).unwrap();
+        assert!(fs::read_to_string(&transcript).is_err());
+        assert_eq!(mtime_ms(&transcript), 100);
+        let mut table = RouteTable::default();
+        table.upsert(
+            "kayla",
+            agy_route("unreadable-conversation"),
+            At::from_unix_millis(9000),
+        );
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(10000));
+        fs::set_permissions(&transcript, permissions).unwrap();
+        assert!(table.get("kayla").is_none());
+    }
+
+    #[test]
+    fn passive_agy_missing_brain_removes_concrete_and_placeholder_but_keeps_explicit() {
+        let home = TempDir::new().unwrap();
+        let mut table = RouteTable::default();
+        table.upsert(
+            "kayla",
+            agy_route("cached-conversation"),
+            At::from_unix_millis(9000),
+        );
+        table.upsert(
+            "kacey",
+            agy_route("antigravity:kacey"),
+            At::from_unix_millis(9000),
+        );
+        table.upsert_explicit(
+            "ferris",
+            agy_route("explicit-conversation"),
+            At::from_unix_millis(100),
+        );
+        table.upsert_explicit(
+            "feira",
+            agy_route("antigravity:feira"),
+            At::from_unix_millis(100),
+        );
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(10000));
+        assert!(table.get("kayla").is_none());
+        assert!(table.get("kacey").is_none());
+        for persona in ["ferris", "feira"] {
+            assert!(table.get(persona).unwrap().explicit);
+        }
+    }
+
+    #[test]
+    fn passive_agy_zero_mtime_is_never_scan_time_evidence() {
+        let home = TempDir::new().unwrap();
+        agy_transcript_fixture(
+            home.path(),
+            "zero-conversation",
+            "{\"type\":\"USER_INPUT\",\"content\":\"fl wire register Kayla\"}\n",
+            0,
+        );
+        let mut table = RouteTable::default();
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(9000));
+        assert!(table.get("kayla").is_none());
+        table.upsert_explicit(
+            "kayla",
+            agy_route("antigravity:kayla"),
+            At::from_unix_millis(0),
+        );
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(9000));
+        let entry = table.get("kayla").unwrap();
+        assert!(entry.explicit);
+        assert!(
+            matches!(&entry.route, VendorRoute::Agy { conversation_id, .. } if conversation_id == "antigravity:kayla")
+        );
+    }
+
+    #[test]
+    fn passive_agy_valid_cached_claim_is_retained_and_explicit_claims_ignore_bad_sources() {
+        let home = TempDir::new().unwrap();
+        agy_transcript_fixture(
+            home.path(),
+            "valid-conversation",
+            "{\"type\":\"PLANNER_RESPONSE\",\"tool_calls\":[{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"fl wire register Kayla\"}}]}\n",
+            100,
+        );
+        agy_transcript_fixture(
+            home.path(),
+            "explicit-conversation",
+            "{\"type\":\"GENERIC\",\"content\":\"fl wire register Kacey\"}\n",
+            100,
+        );
+        let mut table = RouteTable::default();
+        table.upsert(
+            "kayla",
+            agy_route("valid-conversation"),
+            At::from_unix_millis(500),
+        );
+        table.upsert_explicit(
+            "ferris",
+            agy_route("explicit-conversation"),
+            At::from_unix_millis(500),
+        );
+        table.discover_agy_routes(home.path(), false, &At::from_unix_millis(9000));
+        assert_eq!(table.get("kayla").unwrap().updated_at.unix_millis(), 500);
+        assert!(!table.get("kayla").unwrap().explicit);
+        assert!(table.get("ferris").unwrap().explicit);
+        assert!(table.get("kacey").is_none());
+    }
+
+    #[test]
+    fn passive_agy_loaded_claims_are_revalidated_before_snapshot_merge() {
+        for legacy in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            agy_transcript_fixture(
+                &home,
+                "quoted-conversation",
+                "{\"type\":\"GENERIC\",\"content\":\"fl wire register Kayla\"}\n",
+                100,
+            );
+            let primary = tmp.path().join("primary.json");
+            let fallback = tmp.path().join("legacy.json");
+            if legacy {
+                fs::write(&fallback, serde_json::json!({"kayla":{"vendor":"agy","conversation_id":"quoted-conversation","updated_at":"2026-11-09T10:00:00Z"}}).to_string()).unwrap();
+            } else {
+                let mut saved = RouteTable::default();
+                saved.upsert(
+                    "kayla",
+                    agy_route("quoted-conversation"),
+                    At::from_unix_millis(9000),
+                );
+                saved.save(Some(&primary)).unwrap();
+            }
+            let mut loaded = RouteTable::load_with_legacy(&primary, Some(&fallback));
+            assert!(loaded.get("kayla").is_some());
+            loaded.discover_routes(Some(&home), At::from_unix_millis(10000));
+            assert!(loaded.get("kayla").is_none(), "legacy={legacy}");
+            loaded.save(Some(&primary)).unwrap();
+            assert!(
+                RouteTable::load_with_legacy(&primary, Some(&fallback))
+                    .get("kayla")
+                    .is_none()
+            );
+            let mut real = RouteTable::default();
+            real.upsert(
+                "kayla",
+                codex_route("real-thread"),
+                At::from_unix_millis(200),
+            );
+            real.merge_newer(loaded);
+            assert_eq!(real.get("kayla").unwrap().route, codex_route("real-thread"));
+        }
+    }
+
+    #[test]
+    fn passive_agy_pruning_survives_dispatch_reconciliation_without_removing_explicit_registration()
+    {
+        for daemon in [false, true] {
+            for concurrent_explicit in [false, true] {
+                let home = TempDir::new().unwrap();
+                agy_transcript_fixture(
+                    home.path(),
+                    "quoted-conversation",
+                    "{\"type\":\"GENERIC\",\"content\":\"fl wire register Kayla\"}\n",
+                    100,
+                );
+                let mut base = RouteTable::default();
+                base.upsert(
+                    "kayla",
+                    agy_route("quoted-conversation"),
+                    At::from_unix_millis(9000),
+                );
+                let mut working = base.clone();
+                working.discover_routes(Some(home.path()), At::from_unix_millis(10000));
+                let mut live = base.clone();
+                if concurrent_explicit {
+                    live.upsert_explicit(
+                        "kayla",
+                        codex_route("real-thread"),
+                        At::from_unix_millis(9500),
+                    );
+                }
+                if daemon {
+                    live.merge_daemon_dispatch_result(&base, working);
+                } else {
+                    live.merge_dispatch_result(&base, working);
+                }
+                if concurrent_explicit {
+                    let entry = live.get("kayla").unwrap();
+                    assert!(entry.explicit);
+                    assert_eq!(entry.route, codex_route("real-thread"));
+                } else {
+                    assert!(live.get("kayla").is_none(), "daemon={daemon}");
+                }
+            }
+        }
     }
 
     #[test]
