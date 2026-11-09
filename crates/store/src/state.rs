@@ -1292,6 +1292,48 @@ impl StateStore for RedbStore {
         additive(&tx, STATE_ENTRIES, &target)
     }
 
+    fn delete_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<bool, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let scope_wire = scope.as_wire();
+        let concern_wire = concern.as_wire();
+        let tx = self.db.begin_write().map_err(backend)?;
+        raise_format(&tx, FORMAT_WITH_STATE)?;
+        let id_str = {
+            let mut by_key = tx.open_table(STATE_KEYS).map_err(backend)?;
+            by_key
+                .remove((scope_wire.as_str(), concern_wire, slug.as_str()))
+                .map_err(backend)?
+                .map(|g| g.value().to_owned())
+        };
+        let Some(id_str) = id_str else {
+            return Ok(false);
+        };
+        let resolved = Iri::parse(&id_str)
+            .ok()
+            .and_then(|iri| self.resolve_in_wtx(&tx, &iri).ok());
+        {
+            let mut entries = tx.open_table(STATE_ENTRIES).map_err(backend)?;
+            entries.remove(id_str.as_str()).map_err(backend)?;
+            if let Some(ref r) = resolved {
+                entries.remove(r.as_str()).map_err(backend)?;
+            }
+        }
+        {
+            let mut conflicts = tx.open_table(STATE_CONFLICTS).map_err(backend)?;
+            conflicts.remove(id_str.as_str()).map_err(backend)?;
+            if let Some(ref r) = resolved {
+                conflicts.remove(r.as_str()).map_err(backend)?;
+            }
+        }
+        tx.commit().map_err(backend)?;
+        Ok(true)
+    }
+
     fn list_state(
         &self,
         scope: Option<&StateScope>,

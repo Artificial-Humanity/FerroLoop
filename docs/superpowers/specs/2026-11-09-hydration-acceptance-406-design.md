@@ -137,10 +137,13 @@ Step 6's `fl wire register ... --replace` is bound to `G` without adding a new C
       registration refused for `<persona>`: session launch generation `<G_caller>` was superseded by a newer launch; this process should exit
       ```
 
-## UI Freshness and Orthogonal Follow-Up Notes (Amendment A6)
+## UI Freshness, Amendments A7–A8, and Orthogonal Follow-Up Notes (Amendments A6–A8)
 
 - **FerroDeck UI freshness (Amendment A6):** Because `hydration-ack-<G>` is written by the `fl` CLI process (`fl wire register --replace`) rather than inside `fl-hub`, the hub does not emit an immediate push event when the receipt lands. FerroDeck displays `hydration_status: confirmed` on its next hosted-sessions fetch. This is an accepted limitation; no new poller or timer is added.
-- **Durable operator warning history:** Per the comment on #406 regarding #383 D6+D5, automatic boot/host-restart guidance warnings are returned on `spin-up` / `remodel` / `restart` responses and logged by the hub, not stored on `HostedSessionRecord`. `HydrationReceipt` remains single-purpose and bounded to at most one active receipt per persona.
+- **Amendment A7 (ruled by `ferris` 2026-11-09 — Multi-vendor persona scoping):** When a persona runs on multiple vendors simultaneously, `fence_hydration_register` refuses only when `!has_matching_live && (superseded_by_newer || all_matching_decommissioned)`, and `prune_stale_hydration_receipts` retains receipts for every generation held by any non-decommissioned record of that persona. Also, `execute_register` ignores `AGENT_HYDRATION_GENERATION` when `AGENT_PERSONA` or `FL_HOSTED_ID` names a different persona than the target being registered.
+- **Amendment A8 (ruled by `ferris` 2026-11-09 — Reuse generation when no new process is spawned):** When `spin_up` or `restart_hosted_session` does not spawn a new runtime process (e.g., `adopted_old_session`, existing runtime unit, or prompt-only delivery), it retains the record's existing valid `hydration_generation` (minting only if the record has none) so the live process's environment token is not superseded.
+- **Known Limitation (M7):** Under the existing no-CAS `MergeMode::LastWriter` model on `HostedSessionRecord`, a concurrent setter (`set_hosted_session_model`, `set_hosted_session_posture`) that writes back a pre-restart snapshot can transiently write a stale `hydration_status` until the next lifecycle write.
+- **Durable operator warning history:** Per the comment on #406 regarding #383 D6+D5, automatic boot/host-restart guidance warnings are returned on `spin-up` / `remodel` / `restart` responses and logged by the hub, not stored on `HostedSessionRecord`. `HydrationReceipt` remains single-purpose and bounded to at most one active receipt per live hosted session.
 
 ## Verification Plan (Once #409 Part 2(b) Lands)
 

@@ -58,7 +58,9 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 pub use api::{
-    HttpRequest, HttpResponse, drain_ready_session_queues, handle_http_request, parse_http_request,
+    HttpRequest, HttpResponse, HubDispatchDiagnostics, HubFenceDiagnostic,
+    HubRecipientPendingSummary, HubRouteDispatchObservation, HubWireStatusResponse,
+    WireDaemonState, drain_ready_session_queues, handle_http_request, parse_http_request,
     percent_decode,
 };
 pub use auth::{
@@ -352,6 +354,8 @@ pub struct HubState {
     pub(crate) mcp: Arc<mcp_api::McpHub>,
     /// What `fl hub serve` told the hub about its credential sources (see [`vault_consumers_api`]).
     pub(crate) vault_consumers: Arc<Mutex<Option<Arc<VaultConsumerConfig>>>>,
+    /// Configured wire daemon socket path (from `fl hub serve`), if any.
+    pub(crate) wire_socket: Arc<Mutex<Option<PathBuf>>>,
     /// The ONE persistent gate-governor store shared by every hub governed
     /// gate path, built lazily on first use (see [`GateGovernorStoreCache`]).
     pub(crate) gate_governor_store: GateGovernorStoreCache,
@@ -505,8 +509,24 @@ impl HubState {
             watch_caches: Arc::new(watch_api::WatchCaches::default()),
             mcp: Arc::default(),
             vault_consumers: Arc::default(),
+            wire_socket: Arc::new(Mutex::new(None)),
             gate_governor_store: GateGovernorStoreCache::default(),
         }
+    }
+
+    pub fn set_wire_socket(&self, socket: Option<PathBuf>) {
+        *self.wire_socket.lock().unwrap_or_else(|e| e.into_inner()) = socket;
+    }
+
+    pub fn resolve_wire_socket_path(&self) -> PathBuf {
+        let configured = self
+            .wire_socket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let explicit_db = (cfg!(test) || self.config.home_override.is_some())
+            .then_some(self.config.store_path.as_path());
+        fl_wire::daemon::resolve_socket_path(None, configured.as_deref(), explicit_db)
     }
 
     /// Sets how the MCP endpoints find this machine's `[[mcp]]` switches for a project

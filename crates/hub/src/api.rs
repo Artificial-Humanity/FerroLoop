@@ -469,6 +469,7 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
             };
             handle_get_prs(&store)
         }
+        ("GET", "/api/v1/wire/status") => handle_get_wire_status(state),
         ("GET", "/api/v1/wire/messages") => {
             let Ok(store) = open_store_response(state) else {
                 return store_open_failure();
@@ -1673,6 +1674,307 @@ fn all_wire_receipts_by_message(store: &AnyStore) -> BTreeMap<MessageId, Vec<Del
             .push(item.receipt);
     }
     grouped
+}
+
+#[cfg(test)]
+const WIRE_STATUS_RPC_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const WIRE_STATUS_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Observed local `fl-wire` daemon status for `GET /api/v1/wire/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireDaemonState {
+    Active,
+    Inactive,
+    Unreachable,
+}
+
+/// Allowlist response DTO for `GET /api/v1/wire/status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubWireStatusResponse {
+    pub daemon: WireDaemonState,
+    pub dispatch_diagnostics: Option<HubDispatchDiagnostics>,
+    pub pending_recipients_available: bool,
+    pub pending_recipients: Vec<HubRecipientPendingSummary>,
+}
+
+/// Allowlist projection of [`fl_wire::dispatch_diagnostics::DispatchDiagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubDispatchDiagnostics {
+    pub schema_version: u8,
+    pub instance_nonce: Option<String>,
+    pub instance_started_at: fl_core::at::At,
+    pub scope: fl_wire::dispatch_diagnostics::DiagnosticsScope,
+    pub records: Vec<HubFenceDiagnostic>,
+    pub global_capacity_exhausted: bool,
+    pub diagnostics_partial: bool,
+    pub omitted_evidence_total: u64,
+    pub omitted_evidence_total_saturated: bool,
+}
+
+/// Allowlist projection of [`fl_wire::dispatch_diagnostics::FenceDiagnostic`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubFenceDiagnostic {
+    pub recipient: Option<String>,
+    pub recipient_digest: Option<String>,
+    pub recipient_invalid: bool,
+    pub trigger_message_id: Option<String>,
+    pub trigger_message_id_digest: Option<String>,
+    pub trigger_message_id_omitted: bool,
+    pub hold_observed_at: fl_core::at::At,
+    pub phase: fl_wire::dispatch_diagnostics::SuppressionPhase,
+    pub first_reason: fl_wire::dispatch_diagnostics::FenceReason,
+    pub decisive_reason: fl_wire::dispatch_diagnostics::FenceReason,
+    pub failure_stages: Vec<fl_wire::dispatch_diagnostics::FailureStage>,
+    pub omitted_failure_stages: u64,
+    pub omitted_failure_stages_saturated: bool,
+    pub route_observations: Vec<HubRouteDispatchObservation>,
+    pub omitted_route_observations: u64,
+    pub omitted_route_observations_saturated: bool,
+    pub route_dispatch_calls: u64,
+    pub route_dispatch_calls_saturated: bool,
+    pub registration_generation: Option<u64>,
+}
+
+/// Allowlist projection of [`fl_wire::dispatch_diagnostics::RouteDispatchObservation`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubRouteDispatchObservation {
+    pub adapter: fl_wire::dispatch_diagnostics::RouteAdapter,
+    pub identity_digest: Option<String>,
+    pub route_updated_at: Option<fl_core::at::At>,
+    pub explicit: bool,
+    pub outcome: fl_wire::dispatch_diagnostics::DispatchCallOutcome,
+}
+
+/// Allowlist projection of [`fl_wire::daemon::RecipientPendingSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubRecipientPendingSummary {
+    pub recipient: String,
+    pub pending_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_at: Option<fl_core::at::At>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_ms: Option<u64>,
+}
+
+impl HubRecipientPendingSummary {
+    fn from_wire(summary: fl_wire::daemon::RecipientPendingSummary) -> Self {
+        let fl_wire::daemon::RecipientPendingSummary {
+            recipient,
+            pending_count,
+            oldest_pending_at,
+            oldest_pending_age_ms,
+        } = summary;
+        Self {
+            recipient,
+            pending_count,
+            oldest_pending_at,
+            oldest_pending_age_ms,
+        }
+    }
+}
+
+impl HubRouteDispatchObservation {
+    fn from_wire(obs: fl_wire::dispatch_diagnostics::RouteDispatchObservation) -> Self {
+        let fl_wire::dispatch_diagnostics::RouteDispatchObservation {
+            adapter,
+            identity_digest,
+            route_updated_at,
+            explicit,
+            outcome,
+        } = obs;
+        Self {
+            adapter,
+            identity_digest,
+            route_updated_at,
+            explicit,
+            outcome,
+        }
+    }
+}
+
+impl HubFenceDiagnostic {
+    fn from_wire(record: fl_wire::dispatch_diagnostics::FenceDiagnostic) -> Self {
+        let fl_wire::dispatch_diagnostics::FenceDiagnostic {
+            recipient,
+            recipient_digest,
+            recipient_invalid,
+            trigger_message_id,
+            trigger_message_id_digest,
+            trigger_message_id_omitted,
+            hold_observed_at,
+            phase,
+            first_reason,
+            decisive_reason,
+            failure_stages,
+            omitted_failure_stages,
+            omitted_failure_stages_saturated,
+            route_observations,
+            omitted_route_observations,
+            omitted_route_observations_saturated,
+            route_dispatch_calls,
+            route_dispatch_calls_saturated,
+            registration_generation,
+        } = record;
+        Self {
+            recipient,
+            recipient_digest,
+            recipient_invalid,
+            trigger_message_id,
+            trigger_message_id_digest,
+            trigger_message_id_omitted,
+            hold_observed_at,
+            phase,
+            first_reason,
+            decisive_reason,
+            failure_stages,
+            omitted_failure_stages,
+            omitted_failure_stages_saturated,
+            route_observations: route_observations
+                .into_iter()
+                .map(HubRouteDispatchObservation::from_wire)
+                .collect(),
+            omitted_route_observations,
+            omitted_route_observations_saturated,
+            route_dispatch_calls,
+            route_dispatch_calls_saturated,
+            registration_generation,
+        }
+    }
+}
+
+impl HubDispatchDiagnostics {
+    fn from_wire(diag: fl_wire::dispatch_diagnostics::DispatchDiagnostics) -> Self {
+        let fl_wire::dispatch_diagnostics::DispatchDiagnostics {
+            schema_version,
+            instance_nonce,
+            instance_started_at,
+            scope,
+            records,
+            global_capacity_exhausted,
+            diagnostics_partial,
+            omitted_evidence_total,
+            omitted_evidence_total_saturated,
+        } = diag;
+        Self {
+            schema_version,
+            instance_nonce,
+            instance_started_at,
+            scope,
+            records: records
+                .into_iter()
+                .map(HubFenceDiagnostic::from_wire)
+                .collect(),
+            global_capacity_exhausted,
+            diagnostics_partial,
+            omitted_evidence_total,
+            omitted_evidence_total_saturated,
+        }
+    }
+}
+
+impl HubWireStatusResponse {
+    fn from_daemon_status(status: fl_wire::daemon::DaemonStatus) -> Self {
+        let fl_wire::daemon::DaemonStatus {
+            node_id: _,
+            host: _,
+            socket_path: _,
+            listen_addr: _,
+            connected_peers: _,
+            routes: _,
+            dispatch_diagnostics,
+            pending_recipients,
+        } = status;
+        Self {
+            daemon: WireDaemonState::Active,
+            dispatch_diagnostics: dispatch_diagnostics.map(HubDispatchDiagnostics::from_wire),
+            pending_recipients_available: true,
+            pending_recipients: pending_recipients
+                .into_iter()
+                .map(HubRecipientPendingSummary::from_wire)
+                .collect(),
+        }
+    }
+}
+
+enum WireDaemonProbe {
+    Active(Box<fl_wire::daemon::DaemonStatus>),
+    Inactive,
+    Unreachable,
+}
+
+fn probe_wire_daemon(socket_path: PathBuf, timeout: Duration) -> WireDaemonProbe {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let outcome = match fl_wire::daemon::LocalClient::connect(&socket_path, timeout) {
+            Ok(mut client) => match client.request(&fl_wire::daemon::LocalRequest::Status) {
+                Ok(fl_wire::daemon::LocalResponse::Status(status)) => {
+                    WireDaemonProbe::Active(Box::new(status))
+                }
+                Ok(_) | Err(_) => WireDaemonProbe::Unreachable,
+            },
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                WireDaemonProbe::Inactive
+            }
+            Err(_) => WireDaemonProbe::Unreachable,
+        };
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(timeout + Duration::from_millis(50))
+        .unwrap_or(WireDaemonProbe::Unreachable)
+}
+
+fn store_pending_recipients(state: &HubState) -> Option<Vec<HubRecipientPendingSummary>> {
+    let now = stamp::now();
+    state.open_store().ok().map(|store| {
+        fl_wire::daemon::collect_pending_recipient_summaries(&*store, &now)
+            .into_iter()
+            .map(HubRecipientPendingSummary::from_wire)
+            .collect()
+    })
+}
+
+fn handle_get_wire_status(state: &HubState) -> HttpResponse {
+    let socket_path = state.resolve_wire_socket_path();
+    let response = match probe_wire_daemon(socket_path, WIRE_STATUS_RPC_TIMEOUT) {
+        WireDaemonProbe::Active(status) => HubWireStatusResponse::from_daemon_status(*status),
+        WireDaemonProbe::Inactive => {
+            let (pending_recipients_available, pending_recipients) =
+                match store_pending_recipients(state) {
+                    Some(list) => (true, list),
+                    None => (false, Vec::new()),
+                };
+            HubWireStatusResponse {
+                daemon: WireDaemonState::Inactive,
+                dispatch_diagnostics: None,
+                pending_recipients_available,
+                pending_recipients,
+            }
+        }
+        WireDaemonProbe::Unreachable => {
+            let (pending_recipients_available, pending_recipients) =
+                match store_pending_recipients(state) {
+                    Some(list) => (true, list),
+                    None => (false, Vec::new()),
+                };
+            HubWireStatusResponse {
+                daemon: WireDaemonState::Unreachable,
+                dispatch_diagnostics: None,
+                pending_recipients_available,
+                pending_recipients,
+            }
+        }
+    };
+    HttpResponse::json(
+        200,
+        serde_json::to_value(response).unwrap_or_else(|_| json!({})),
+    )
 }
 
 /// Scan the host into `routes` unless this request already did; `started` records when.
@@ -10394,5 +10696,491 @@ mod council_guidance_tests {
                 }
             }
         });
+    }
+
+    fn wire_status_fixture() -> (TempDir, HubState) {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            owner_token: Some("owner-secret".into()),
+            ..HubServerConfig::default()
+        });
+        (tmp, state)
+    }
+
+    fn get_wire_status(state: &HubState) -> HttpResponse {
+        crate::handle_http_request(
+            state,
+            &HttpRequest::new("GET", "/api/v1/wire/status")
+                .with_header("Authorization", "Bearer owner-secret"),
+        )
+    }
+
+    #[test]
+    fn wire_status_requires_authentication() {
+        let (_tmp, state) = wire_status_fixture();
+        let unauth =
+            crate::handle_http_request(&state, &HttpRequest::new("GET", "/api/v1/wire/status"));
+        assert_eq!(unauth.status, 401);
+    }
+
+    #[test]
+    fn wire_status_inactive_when_socket_missing_or_refused_with_store_pending_fallback() {
+        let (tmp, state) = wire_status_fixture();
+        let store = state.open_store().unwrap();
+        let created_at = fl_core::at::At::from_unix_millis(1_700_000_000_000);
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "ferris".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("Felix".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "Pending check".into(),
+                body: "Body".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: created_at.clone(),
+            })
+            .unwrap();
+        drop(store);
+
+        // 1. Missing socket file (and missing parent directory).
+        for sock_path in [
+            tmp.path().join("missing-wire.sock"),
+            tmp.path().join("missing-dir").join("fl-wire.sock"),
+        ] {
+            state.set_wire_socket(Some(sock_path));
+            let resp = get_wire_status(&state);
+            assert_eq!(resp.status, 200);
+            let body = resp.json_value().unwrap();
+            assert_eq!(body["daemon"], "inactive");
+            assert!(body["dispatch_diagnostics"].is_null());
+            assert_eq!(body["pending_recipients_available"], json!(true));
+            let pending = body["pending_recipients"].as_array().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0]["recipient"], "felix");
+            assert_eq!(pending[0]["pending_count"], 1);
+            assert_eq!(
+                pending[0]["oldest_pending_at"],
+                serde_json::to_value(&created_at).unwrap()
+            );
+            assert!(pending[0]["oldest_pending_age_ms"].as_u64().is_some());
+        }
+
+        // 2. Connection refused (bound and closed UnixListener leaving stale socket file).
+        let refused_sock = tmp.path().join("refused-wire.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&refused_sock).unwrap();
+        drop(listener);
+        assert!(refused_sock.exists());
+
+        state.set_wire_socket(Some(refused_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "inactive");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
+        let pending = body["pending_recipients"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["recipient"], "felix");
+        assert_eq!(pending[0]["pending_count"], 1);
+    }
+
+    #[test]
+    fn wire_status_reports_pending_recipients_unavailable_when_store_fails_to_open() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TempDir::new().unwrap();
+        let parent_file = tmp.path().join("not-a-dir");
+        std::fs::write(&parent_file, b"regular file").unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: parent_file.join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            owner_token: Some("owner-secret".into()),
+            ..HubServerConfig::default()
+        });
+        assert!(state.open_store().is_err());
+
+        // 1. Inactive socket + broken store -> pending_recipients_available == false.
+        state.set_wire_socket(Some(tmp.path().join("missing-wire.sock")));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "inactive");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(false));
+        assert_eq!(body["pending_recipients"], json!([]));
+
+        // 2. Unreachable socket + broken store -> pending_recipients_available == false.
+        let bad_sock = tmp.path().join("bad-wire.sock");
+        let bad_listener = UnixListener::bind(&bad_sock).unwrap();
+        let bad_handle = std::thread::spawn(move || {
+            let (mut stream, _) = bad_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = stream.write_all(b"{invalid\n");
+            let _ = stream.flush();
+        });
+        state.set_wire_socket(Some(bad_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "unreachable");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(false));
+        assert_eq!(body["pending_recipients"], json!([]));
+        let _ = bad_handle.join();
+    }
+
+    #[test]
+    fn wire_status_unreachable_on_timeout_invalid_json_and_eof() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let (tmp, state) = wire_status_fixture();
+        let store = state.open_store().unwrap();
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "ferris".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kacey".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "Pending on unreachable".into(),
+                body: "Body".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: fl_core::at::At::from_unix_millis(1_700_000_000_500),
+            })
+            .unwrap();
+        drop(store);
+
+        // 1. Stall past timeout -> must report "unreachable", never "inactive".
+        let stall_sock = tmp.path().join("stall-wire.sock");
+        let stall_listener = UnixListener::bind(&stall_sock).unwrap();
+        let stall_handle = std::thread::spawn(move || {
+            let (stream, _) = stall_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            std::thread::sleep(WIRE_STATUS_RPC_TIMEOUT + Duration::from_millis(200));
+        });
+        state.set_wire_socket(Some(stall_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "unreachable");
+        assert_ne!(body["daemon"], "inactive");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
+        assert_eq!(body["pending_recipients"][0]["recipient"], "kacey");
+        assert_eq!(body["pending_recipients"][0]["pending_count"], 1);
+        let _ = stall_handle.join();
+
+        // 2. Immediate EOF after accepting.
+        let eof_sock = tmp.path().join("eof-wire.sock");
+        let eof_listener = UnixListener::bind(&eof_sock).unwrap();
+        let eof_handle = std::thread::spawn(move || {
+            let (stream, _) = eof_listener.accept().unwrap();
+            drop(stream);
+        });
+        state.set_wire_socket(Some(eof_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "unreachable");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
+        assert_eq!(body["pending_recipients"][0]["recipient"], "kacey");
+        let _ = eof_handle.join();
+
+        // 3. Invalid JSON response.
+        let bad_sock = tmp.path().join("bad-json-wire.sock");
+        let bad_listener = UnixListener::bind(&bad_sock).unwrap();
+        let bad_handle = std::thread::spawn(move || {
+            let (mut stream, _) = bad_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = stream.write_all(b"{not-valid-json\n");
+            let _ = stream.flush();
+        });
+        state.set_wire_socket(Some(bad_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "unreachable");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
+        assert_eq!(body["pending_recipients"][0]["recipient"], "kacey");
+        let _ = bad_handle.join();
+    }
+
+    #[test]
+    fn wire_status_active_supported_empty_and_unsupported_older_daemon() {
+        use fl_wire::daemon::{DaemonStatus, LocalResponse, RecipientPendingSummary};
+        use fl_wire::dispatch_diagnostics::{DiagnosticsScope, DispatchDiagnostics};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let (tmp, state) = wire_status_fixture();
+        let started_at = fl_core::at::At::from_unix_millis(1_700_000_001_000);
+
+        // 1. Supported-empty state (`records: []`).
+        let empty_sock = tmp.path().join("active-empty.sock");
+        let empty_listener = UnixListener::bind(&empty_sock).unwrap();
+        let empty_sock_for_status = empty_sock.clone();
+        let started_for_status = started_at.clone();
+        let empty_handle = std::thread::spawn(move || {
+            let (mut stream, _) = empty_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line);
+            let resp = LocalResponse::Status(DaemonStatus {
+                node_id: "node-1".into(),
+                host: "host-1".into(),
+                socket_path: empty_sock_for_status,
+                listen_addr: None,
+                connected_peers: vec![],
+                routes: vec![],
+                dispatch_diagnostics: Some(DispatchDiagnostics {
+                    schema_version: 1,
+                    instance_nonce: Some("0123456789abcdef0123456789abcdef".into()),
+                    instance_started_at: started_for_status,
+                    scope: DiagnosticsScope::DaemonLifetime,
+                    records: vec![],
+                    global_capacity_exhausted: false,
+                    diagnostics_partial: false,
+                    omitted_evidence_total: 0,
+                    omitted_evidence_total_saturated: false,
+                }),
+                pending_recipients: vec![],
+            });
+            writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+            stream.flush().unwrap();
+        });
+        state.set_wire_socket(Some(empty_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "active");
+        assert_eq!(body["dispatch_diagnostics"]["schema_version"], 1);
+        assert_eq!(
+            body["dispatch_diagnostics"]["instance_nonce"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(body["dispatch_diagnostics"]["scope"], "daemon_lifetime");
+        assert_eq!(body["dispatch_diagnostics"]["records"], json!([]));
+        assert_eq!(body["pending_recipients_available"], json!(true));
+        assert_eq!(body["pending_recipients"], json!([]));
+        let _ = empty_handle.join();
+
+        // 2. Unsupported state (`dispatch_diagnostics: None` from an older daemon).
+        let legacy_sock = tmp.path().join("active-legacy.sock");
+        let legacy_listener = UnixListener::bind(&legacy_sock).unwrap();
+        let legacy_sock_for_status = legacy_sock.clone();
+        let legacy_handle = std::thread::spawn(move || {
+            let (mut stream, _) = legacy_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line);
+            let resp = LocalResponse::Status(DaemonStatus {
+                node_id: "node-legacy".into(),
+                host: "host-legacy".into(),
+                socket_path: legacy_sock_for_status,
+                listen_addr: None,
+                connected_peers: vec![],
+                routes: vec![],
+                dispatch_diagnostics: None,
+                pending_recipients: vec![RecipientPendingSummary {
+                    recipient: "felix".into(),
+                    pending_count: 2,
+                    oldest_pending_at: Some(started_at),
+                    oldest_pending_age_ms: Some(1500),
+                }],
+            });
+            writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+            stream.flush().unwrap();
+        });
+        state.set_wire_socket(Some(legacy_sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "active");
+        assert!(body["dispatch_diagnostics"].is_null());
+        assert_eq!(body["pending_recipients_available"], json!(true));
+        assert_eq!(body["pending_recipients"].as_array().unwrap().len(), 1);
+        assert_eq!(body["pending_recipients"][0]["recipient"], "felix");
+        assert_eq!(body["pending_recipients"][0]["pending_count"], 2);
+        assert_eq!(body["pending_recipients"][0]["oldest_pending_age_ms"], 1500);
+        let _ = legacy_handle.join();
+    }
+
+    #[test]
+    fn wire_status_active_allowlist_strips_secret_bearing_routes_and_socket_paths() {
+        use fl_wire::daemon::{DaemonStatus, LocalResponse, RecipientPendingSummary};
+        use fl_wire::dispatch_diagnostics::{
+            DiagnosticsScope, DispatchCallOutcome, DispatchDiagnostics, FailureStage,
+            FenceDiagnostic, FenceReason, RouteAdapter, RouteDispatchObservation, SuppressionPhase,
+        };
+        use fl_wire::identity::{RouteEntry, VendorRoute};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let (tmp, state) = wire_status_fixture();
+        let sock = tmp.path().join("active-secret-routes.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let sock_for_status = sock.clone();
+        let ts = fl_core::at::At::from_unix_millis(1_700_000_002_000);
+        let ts_for_status = ts.clone();
+
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line);
+            let resp = LocalResponse::Status(DaemonStatus {
+                node_id: "secret-node".into(),
+                host: "secret-host".into(),
+                socket_path: sock_for_status,
+                listen_addr: Some("127.0.0.1:9999".into()),
+                connected_peers: vec!["ws://peer.example/wire".into()],
+                routes: vec![
+                    RouteEntry {
+                        persona: "felix".into(),
+                        route: VendorRoute::Agy {
+                            conversation_id: "cascade-secret".into(),
+                            ls_pid: Some(4242),
+                            ls_address: Some("127.0.0.1:41111".into()),
+                            csrf_token: Some("SECRET_CSRF_TOKEN".into()),
+                            agentapi_exe: Some(PathBuf::from("/secret/agentapi")),
+                        },
+                        updated_at: ts_for_status.clone(),
+                        explicit: true,
+                    },
+                    RouteEntry {
+                        persona: "ada".into(),
+                        route: VendorRoute::Claude {
+                            pid: 5252,
+                            session_id: "claude-session-1".into(),
+                            socket_path: PathBuf::from("/secret/claude.sock"),
+                            key_path: Some(PathBuf::from("/secret/key_path")),
+                        },
+                        updated_at: ts_for_status.clone(),
+                        explicit: false,
+                    },
+                ],
+                dispatch_diagnostics: Some(DispatchDiagnostics {
+                    schema_version: 1,
+                    instance_nonce: Some("fedcba9876543210fedcba9876543210".into()),
+                    instance_started_at: ts_for_status.clone(),
+                    scope: DiagnosticsScope::DaemonLifetime,
+                    records: vec![FenceDiagnostic {
+                        recipient: Some("felix".into()),
+                        recipient_digest: None,
+                        recipient_invalid: false,
+                        trigger_message_id: Some(
+                            "urn:uuid:01900000-0000-7000-8000-000000000099".into(),
+                        ),
+                        trigger_message_id_digest: None,
+                        trigger_message_id_omitted: false,
+                        hold_observed_at: ts_for_status.clone(),
+                        phase: SuppressionPhase::RetainedFence,
+                        first_reason: FenceReason::ReceiptWriteError,
+                        decisive_reason: FenceReason::ReceiptWriteError,
+                        failure_stages: vec![FailureStage::ReceiptWriteError],
+                        omitted_failure_stages: 0,
+                        omitted_failure_stages_saturated: false,
+                        route_observations: vec![
+                            RouteDispatchObservation {
+                                adapter: RouteAdapter::Agy,
+                                identity_digest: Some("sha256:1122334455667788".into()),
+                                route_updated_at: Some(ts_for_status.clone()),
+                                explicit: true,
+                                outcome: DispatchCallOutcome::ReturnedOk,
+                            },
+                            RouteDispatchObservation {
+                                adapter: RouteAdapter::Claude,
+                                identity_digest: Some("sha256:99aabbccddeeff00".into()),
+                                route_updated_at: Some(ts_for_status.clone()),
+                                explicit: false,
+                                outcome: DispatchCallOutcome::ReturnedError,
+                            },
+                        ],
+                        omitted_route_observations: 0,
+                        omitted_route_observations_saturated: false,
+                        route_dispatch_calls: 2,
+                        route_dispatch_calls_saturated: false,
+                        registration_generation: None,
+                    }],
+                    global_capacity_exhausted: false,
+                    diagnostics_partial: false,
+                    omitted_evidence_total: 0,
+                    omitted_evidence_total_saturated: false,
+                }),
+                pending_recipients: vec![RecipientPendingSummary {
+                    recipient: "felix".into(),
+                    pending_count: 1,
+                    oldest_pending_at: Some(ts_for_status),
+                    oldest_pending_age_ms: Some(250),
+                }],
+            });
+            writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        state.set_wire_socket(Some(sock));
+        let resp = get_wire_status(&state);
+        assert_eq!(resp.status, 200);
+        let raw_json = String::from_utf8(resp.body.clone()).unwrap();
+
+        for forbidden in [
+            "routes",
+            "socket_path",
+            "csrf",
+            "token",
+            "key_path",
+            "SECRET_CSRF_TOKEN",
+            "/secret/key_path",
+            "/secret/claude.sock",
+        ] {
+            assert!(
+                !raw_json.contains(forbidden),
+                "serialized GET /api/v1/wire/status leaked `{forbidden}` in: {raw_json}"
+            );
+        }
+
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "active");
+        let rec = &body["dispatch_diagnostics"]["records"][0];
+        assert_eq!(rec["recipient"], "felix");
+        assert_eq!(rec["phase"], "retained_fence");
+        assert_eq!(rec["decisive_reason"], "receipt_write_error");
+        assert_eq!(rec["route_dispatch_calls"], 2);
+        let obs = rec["route_observations"].as_array().unwrap();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0]["adapter"], "agy");
+        assert_eq!(obs[0]["identity_digest"], "sha256:1122334455667788");
+        assert_eq!(obs[0]["explicit"], true);
+        assert_eq!(obs[0]["outcome"], "returned_ok");
+        assert_eq!(obs[1]["adapter"], "claude");
+        assert_eq!(obs[1]["identity_digest"], "sha256:99aabbccddeeff00");
+        assert_eq!(obs[1]["explicit"], false);
+        assert_eq!(obs[1]["outcome"], "returned_error");
+        let _ = server_handle.join();
     }
 }

@@ -84,9 +84,11 @@ fn install_home_muse(home: &Path) -> PathBuf {
     bin
 }
 
-fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
+fn muse_launch(prompt: &str, home: &Path, persona: &str, generation: &str) -> LaunchSpec {
+    let mut env = launch_env_for_vendor("muse", persona, Some(home));
+    env.push(("AGENT_HYDRATION_GENERATION".into(), generation.into()));
     LaunchSpec {
-        env: launch_env_for_vendor("muse", persona, Some(home)),
+        env,
         argv: vec![
             home.join(".local/bin/muse").to_string_lossy().into_owned(),
             "--model".into(),
@@ -539,7 +541,12 @@ fn spin_up_launches_muse_with_the_prompt_as_its_first_argument() {
     assert_eq!(launches[0].0, "muse:ada");
     assert_eq!(
         launches[0].1,
-        Some(muse_launch(&out.prompt.unwrap(), home.path(), "ada"))
+        Some(muse_launch(
+            &out.prompt.unwrap(),
+            home.path(),
+            "ada",
+            out.hydration_generation.as_deref().unwrap(),
+        ))
     );
 }
 
@@ -614,6 +621,11 @@ fn built_in_vendors_launch_with_their_prompt() {
                 "CODEX_HOME".into(),
                 home.path().join(".codex").display().to_string(),
             ));
+        } else {
+            expected_env.push((
+                "AGENT_HYDRATION_GENERATION".into(),
+                out.hydration_generation.unwrap(),
+            ));
         }
         assert_eq!(spec.env, expected_env);
         assert_eq!(spec.argv, expected, "{vendor}");
@@ -638,7 +650,12 @@ fn restart_launches_muse_in_the_window_it_reopens() {
     assert_eq!(launches[1].0, "muse:ada");
     assert_eq!(
         launches[1].1,
-        Some(muse_launch(&out.prompt, home.path(), "ada"))
+        Some(muse_launch(
+            &out.prompt,
+            home.path(),
+            "ada",
+            out.record.hydration_generation.as_deref().unwrap(),
+        ))
     );
     assert!(out.record.runtime_spawned);
 }
@@ -776,6 +793,11 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             expected_env.push((
                 "CODEX_HOME".into(),
                 home.path().join(".codex").display().to_string(),
+            ));
+        } else {
+            expected_env.push((
+                "AGENT_HYDRATION_GENERATION".into(),
+                out.record.hydration_generation.unwrap(),
             ));
         }
         assert_eq!(spec.env, expected_env);

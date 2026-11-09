@@ -98,6 +98,7 @@ pub const BASELINE_EXACT: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    "AGENT_HYDRATION_GENERATION",
 ];
 
 /// Name prefixes every dialect's child receives.
