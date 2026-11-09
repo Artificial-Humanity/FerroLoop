@@ -572,21 +572,21 @@ impl Host {
         mode: fl_host_proto::SessionMode,
         pty: Option<fl_host_proto::PtyOptions>,
     ) -> Result<SessionHandle, HostError> {
-        Self::admit_spawn(this, || Self::spawn_admitted(this, spec, mode, pty))
+        Self::admit_spawn(this, |notices| {
+            Self::spawn_admitted(this, spec, mode, pty, notices)
+        })
     }
 
     fn admit_spawn<T>(
         this: &HostInner,
-        spawn: impl FnOnce() -> Result<T, HostError>,
+        spawn: impl FnOnce(&mut retention::EvictionNotices) -> Result<T, HostError>,
     ) -> Result<T, HostError> {
-        let _gate = this
-            .spawn_gate
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if this.shutdown_started.load(Ordering::SeqCst) || this.stop.load(Ordering::SeqCst) {
-            return Err(HostError::Protocol("host shutting down".into()));
-        }
-        spawn()
+        this.with_spawn_gate(|notices| {
+            if this.shutdown_started.load(Ordering::SeqCst) || this.stop.load(Ordering::SeqCst) {
+                return Err(HostError::Protocol("host shutting down".into()));
+            }
+            spawn(notices)
+        })
     }
 
     fn spawn_admitted(
@@ -594,6 +594,7 @@ impl Host {
         spec: &SpawnSpec,
         mode: fl_host_proto::SessionMode,
         pty: Option<fl_host_proto::PtyOptions>,
+        notices: &mut retention::EvictionNotices,
     ) -> Result<SessionHandle, HostError> {
         spec.validate_fields()?;
         match (mode, spec.kind, pty) {
@@ -630,8 +631,8 @@ impl Host {
         {
             check_pidfd_support()?;
         }
-        this.reclaim_completed();
-        this.evict_completed_ptys(true);
+        this.reclaim_completed(notices);
+        this.evict_completed_ptys(true, notices);
         // Every retained epoch consumes capacity, including unread completed
         // pipe output and unresolved containment. Completed PTYs were bounded above.
         let retained = this
@@ -1054,12 +1055,16 @@ impl HostInner {
 
     // Called under spawn_gate. Output is reclaimable only after EOF, successful
     // cleanup, all pending/assigned output and all epoch threads have retired.
-    fn reclaim_completed(&self) {
-        self.reclaim_completed_selected(|| {});
+    fn reclaim_completed(&self, notices: &mut retention::EvictionNotices) {
+        self.reclaim_completed_selected(notices, || {});
     }
 
     // Private fixture boundary after candidate selection, before registry retirement.
-    fn reclaim_completed_selected(&self, selected: impl FnOnce()) {
+    fn reclaim_completed_selected(
+        &self,
+        notices: &mut retention::EvictionNotices,
+        selected: impl FnOnce(),
+    ) {
         self.reap_threads();
         let joins = self.joins.lock().unwrap_or_else(|err| err.into_inner());
         let mut outputs = self.outputs.lock().unwrap_or_else(|err| err.into_inner());
@@ -1113,11 +1118,11 @@ impl HostInner {
         }
         drop(outputs);
         drop(joins);
-        self.evict_completed_ptys(false);
+        self.evict_completed_ptys(false, notices);
     }
 
     // spawn_gate serializes this with inventory publication and status maintenance.
-    fn evict_completed_ptys(&self, for_spawn: bool) {
+    fn evict_completed_ptys(&self, for_spawn: bool, notices: &mut retention::EvictionNotices) {
         let mut outputs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
         let unresolved = self
             .registry
@@ -1127,7 +1132,7 @@ impl HostInner {
             .iter()
             .filter(|r| !outputs.contains_key(&(r.session.clone(), r.epoch)))
             .count();
-        loop {
+        while !notices.is_full() {
             let mut completed = 0;
             let oldest = outputs
                 .iter()
@@ -1168,39 +1173,62 @@ impl HostInner {
             self.retention
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .evict(stream);
+                .evict(stream, notices);
             self.hub.forget_epoch(&key);
         }
     }
 
+    // All maintenance/admission callers share this gate and log boundary.
+    fn with_spawn_gate<T>(
+        &self,
+        operation: impl FnOnce(&mut retention::EvictionNotices) -> T,
+    ) -> T {
+        self.with_spawn_gate_log(&mut std::io::stderr(), operation)
+    }
+
+    fn with_spawn_gate_log<T>(
+        &self,
+        sink: &mut dyn std::io::Write,
+        operation: impl FnOnce(&mut retention::EvictionNotices) -> T,
+    ) -> T {
+        let mut notices = retention::EvictionNotices::new();
+        let gate = self.spawn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let result = operation(&mut notices);
+        drop(gate);
+        // Inventory and diagnostic history are committed, and every host lock
+        // is released. A blocked/failed stderr cannot fence admission or shutdown.
+        let _ = notices.emit(sink);
+        result
+    }
+
     // The extension permit admits the bounded snapshot before this method runs.
     pub(crate) fn pty_retention_status(&self) -> fl_host_proto::PtyRetentionStatus {
-        let _gate = self.spawn_gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.reclaim_completed();
-        let completed = self
-            .outputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|output| output.session().reliable().is_some_and(|j| j.compacted()))
-            .count();
-        let retention = self.retention.lock().unwrap_or_else(|e| e.into_inner());
-        fl_host_proto::PtyRetentionStatus {
-            projection_reserved_bytes: self
-                .reliable_budget
-                .used(slice_budget::ChargeKind::Projection)
-                as u64,
-            projection_limit_bytes: slice_budget::projection_limit() as u64,
-            completed_pty_sessions: completed as u32,
-            completed_pty_limit: retention::COMPLETED_PTY_LIMIT as u32,
-            evicted_total: retention.evicted_total,
-            recent_evictions: retention.recent(),
-        }
+        self.with_spawn_gate(|notices| {
+            self.reclaim_completed(notices);
+            let completed = self
+                .outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .filter(|output| output.session().reliable().is_some_and(|j| j.compacted()))
+                .count();
+            let retention = self.retention.lock().unwrap_or_else(|e| e.into_inner());
+            fl_host_proto::PtyRetentionStatus {
+                projection_reserved_bytes: self
+                    .reliable_budget
+                    .used(slice_budget::ChargeKind::Projection)
+                    as u64,
+                projection_limit_bytes: slice_budget::projection_limit() as u64,
+                completed_pty_sessions: completed as u32,
+                completed_pty_limit: retention::COMPLETED_PTY_LIMIT as u32,
+                evicted_total: retention.evicted_total,
+                recent_evictions: retention.recent(),
+            }
+        })
     }
 
     pub(crate) fn maintain_completed(&self) {
-        let _gate = self.spawn_gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.reclaim_completed();
+        self.with_spawn_gate(|notices| self.reclaim_completed(notices));
     }
 }
 
@@ -1967,10 +1995,10 @@ mod deadline_tests {
         // Claim generation is assigned, owner is None, writer fence is unresolved.
         journal.eof();
         session.note_cleanup(CleanupReport { complete: true });
-        host.inner.reclaim_completed();
+        host.inner.maintain_completed();
         assert!(host.inner.outputs.lock().unwrap().contains_key(&key));
         drop(claim);
-        host.inner.reclaim_completed();
+        host.inner.maintain_completed();
         assert!(!host.inner.outputs.lock().unwrap().contains_key(&key));
         writer.shutdown();
         host.shutdown().unwrap();
@@ -2057,36 +2085,38 @@ mod deadline_tests {
         let mut lease = None;
         // The callback is the deterministic scheduling barrier: admission completes
         // after the old eligibility checks and before either removal.
-        host.inner.reclaim_completed_selected(|| {
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        if observer {
-                            ticket = Some(
-                                super::authority::issue_ticket(
-                                    reg,
-                                    ConnId(71),
-                                    cursor.clone(),
-                                    None,
-                                    true,
-                                    Instant::now(),
-                                )
-                                .unwrap()
-                                .ticket,
-                            );
-                        } else {
-                            lease = Some(
-                                host.inner
-                                    .handle
-                                    .block_on(super::authority::claim(reg, ConnId(71), &stream))
+        host.inner.with_spawn_gate(|notices| {
+            host.inner.reclaim_completed_selected(notices, || {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            if observer {
+                                ticket = Some(
+                                    super::authority::issue_ticket(
+                                        reg,
+                                        ConnId(71),
+                                        cursor.clone(),
+                                        None,
+                                        true,
+                                        Instant::now(),
+                                    )
                                     .unwrap()
-                                    .lease,
-                            );
-                        }
-                    })
-                    .join()
-                    .unwrap()
-            });
+                                    .ticket,
+                                );
+                            } else {
+                                lease = Some(
+                                    host.inner
+                                        .handle
+                                        .block_on(super::authority::claim(reg, ConnId(71), &stream))
+                                        .unwrap()
+                                        .lease,
+                                );
+                            }
+                        })
+                        .join()
+                        .unwrap()
+                });
+            })
         });
         assert!(
             host.inner.outputs.lock().unwrap().contains_key(&key),
@@ -2118,14 +2148,14 @@ mod deadline_tests {
             super::authority::consume_ticket(reg, ConnId(72), ticket, Instant::now()).unwrap()
         });
         super::authority::revoke_connection(reg, ConnId(71));
-        host.inner.reclaim_completed();
+        host.inner.maintain_completed();
         assert_eq!(
             host.inner.outputs.lock().unwrap().contains_key(&key),
             replay.is_some(),
             "active observer cursor must remain counted"
         );
         drop(replay);
-        host.inner.reclaim_completed();
+        host.inner.maintain_completed();
         assert!(!host.inner.outputs.lock().unwrap().contains_key(&key));
         host.shutdown().unwrap();
     }
@@ -2188,6 +2218,88 @@ mod deadline_tests {
     }
 
     #[test]
+    fn blocked_eviction_log_cannot_hold_inventory_history_or_spawn_gate() {
+        struct BlockedSink {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl std::io::Write for BlockedSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap();
+        let mut oldest = None;
+        for n in 0..9 {
+            let (session, journal, writer) =
+                retained_pty_fixture(&host, &format!("notice-{n}"), n + 1);
+            oldest.get_or_insert_with(|| journal.stream().clone());
+            journal.eof();
+            session.note_cleanup(CleanupReport { complete: true });
+            writer.shutdown();
+        }
+        let oldest = oldest.unwrap();
+        let (entered, observing) = std::sync::mpsc::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let inner = Arc::clone(&host.inner);
+        let logging = std::thread::spawn(move || {
+            let mut sink = BlockedSink {
+                entered,
+                release: waiting,
+            };
+            inner.with_spawn_gate_log(&mut sink, |notices| {
+                inner.reclaim_completed(notices);
+                // Admission may fail after reclaiming: notices still must be emitted
+                // outside the gate without replacing the operation's error.
+                Err::<(), _>(fl_host_proto::HostError::Protocol(
+                    "admission refused after maintenance".into(),
+                ))
+            })
+        });
+        observing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let inventory_committed = host.inner.outputs.try_lock().is_ok_and(|outputs| {
+            outputs.len() == 8
+                && !outputs.contains_key(&(oldest.session.as_str().to_owned(), oldest.epoch.0))
+        });
+        let history_committed =
+            host.inner.retention.try_lock().is_ok_and(|retention| {
+                retention.evicted_total == 1 && retention.recent() == [oldest]
+            });
+        let gate_available = host.inner.spawn_gate.try_lock().is_ok();
+        let sessions_available = host.inner.sessions.try_lock().is_ok();
+        let writers_available = host.inner.writers.try_lock().is_ok();
+        release.send(()).unwrap();
+        let result = logging.join();
+        host.shutdown().unwrap();
+        assert!(
+            inventory_committed,
+            "blocked log retained inventory lock or eviction"
+        );
+        assert!(
+            history_committed,
+            "blocked log retained history lock or eviction record"
+        );
+        assert!(
+            gate_available,
+            "blocked log retained admission/shutdown gate"
+        );
+        assert!(sessions_available && writers_available);
+        assert!(
+            matches!(result, Ok(Err(fl_host_proto::HostError::Protocol(message))) if message == "admission refused after maintenance"),
+            "failed log panicked or replaced admission result"
+        );
+    }
+
+    #[test]
     fn completed_pty_order_history_and_slot_pressure_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let host = Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
@@ -2216,7 +2328,8 @@ mod deadline_tests {
             retained_pty_fixture(&host, &format!("live-{n}"), n + 100);
         }
         assert_eq!(host.inner.outputs.lock().unwrap().len(), 64);
-        host.inner.evict_completed_ptys(true);
+        host.inner
+            .with_spawn_gate(|notices| host.inner.evict_completed_ptys(true, notices));
         assert_eq!(host.inner.outputs.lock().unwrap().len(), 63);
         let status = host.inner.pty_retention_status();
         assert_eq!(status.completed_pty_sessions, 7);
@@ -2311,19 +2424,21 @@ mod deadline_tests {
             .used(super::slice_budget::ChargeKind::ReliableData);
         assert!(held_charge >= 10); // includes the retained wire envelope
         let mut racing_ticket = None;
-        host.inner.reclaim_completed_selected(|| {
-            racing_ticket = Some(
-                super::authority::issue_ticket(
-                    reg,
-                    ConnId(1),
-                    cursor.clone(),
-                    None,
-                    true,
-                    Instant::now(),
-                )
-                .unwrap()
-                .ticket,
-            );
+        host.inner.with_spawn_gate(|notices| {
+            host.inner.reclaim_completed_selected(notices, || {
+                racing_ticket = Some(
+                    super::authority::issue_ticket(
+                        reg,
+                        ConnId(1),
+                        cursor.clone(),
+                        None,
+                        true,
+                        Instant::now(),
+                    )
+                    .unwrap()
+                    .ticket,
+                );
+            })
         });
         assert_eq!(journal.position().0, 0);
         assert_eq!(
@@ -2517,7 +2632,7 @@ mod deadline_tests {
                 .used(super::slice_budget::ChargeKind::ReliableData)
                 > 0
         );
-        host.inner.reclaim_completed();
+        host.inner.maintain_completed();
         assert_eq!(
             journal
                 .budget()
@@ -2568,14 +2683,14 @@ mod deadline_tests {
         host.inner.spawn_epoch_thread(&session, move || {
             hold.recv_timeout(Duration::from_secs(2)).unwrap();
         });
-        host.inner.reclaim_completed();
+        host.inner.maintain_completed();
         assert!(host.inner.outputs.lock().unwrap().contains_key(&key));
         assert!(host.inner.sessions.lock().unwrap().contains_key(&key.0));
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !host.inner.outputs.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline, "retired epoch was not reclaimed");
-            host.inner.reclaim_completed();
+            host.inner.maintain_completed();
             std::thread::yield_now();
         }
         assert!(host.inner.sessions.lock().unwrap().is_empty());
@@ -2594,7 +2709,7 @@ mod deadline_tests {
         let at = Arc::clone(&admitted);
         let go = Arc::clone(&publish);
         let spawn = std::thread::spawn(move || {
-            Host::admit_spawn(&spawning.inner, || {
+            Host::admit_spawn(&spawning.inner, |_| {
                 at.wait();
                 go.wait();
                 let session = Arc::new(Session::new(SessionParts {
