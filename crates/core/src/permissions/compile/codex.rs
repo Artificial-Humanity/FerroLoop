@@ -58,6 +58,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     let off = cx.policy.sandbox == SandboxChoice::Off;
 
     // 1. Approval axis.
+    if cx.axes_only && posture == Posture::Ask {
+        return Err(CompileRefusal::PostureNotEnforceable {
+            vendor,
+            posture,
+            reason: "the interactive CLI no longer accepts approval untrusted; choose accept-edits, auto or plan".into(),
+        });
+    }
     let (mut approval, approval_class, approval_note) = match posture {
         Posture::Ask => (
             "untrusted",
@@ -169,15 +176,16 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     let mut disabled_mcp: BTreeSet<String> = BTreeSet::new();
 
     // 3. Capabilities.
-    for cap in Capability::ALL {
-        let rules = cx.rules(cap);
-        let surface = surface_of(cap);
-        let sub = ReceiptSubject::Capability(cap);
-        if rules.is_empty() {
-            if cx.policy.posture == Posture::Bypass {
-                continue;
-            }
-            match cap {
+    if !cx.axes_only {
+        for cap in Capability::ALL {
+            let rules = cx.rules(cap);
+            let surface = surface_of(cap);
+            let sub = ReceiptSubject::Capability(cap);
+            if rules.is_empty() {
+                if cx.policy.posture == Posture::Bypass {
+                    continue;
+                }
+                match cap {
                 Capability::FsReadWorkspace => cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
                     "workspace reads are not gated by the sandbox; the ask default is not enforced"),
                 Capability::FsWriteProtected if mode == Mode::ReadOnly => cx.default_line(cap, surface,
@@ -201,13 +209,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                 Capability::ShellExec => cx.default_line(cap, surface, vec![], ReceiptClass::Exact,
                     "the approval policy decides unmatched commands"),
             }
-            continue;
-        }
-        let restricted = rules.iter().any(|r| r.effect != Effect::Allow);
-        match cap {
-            Capability::FsReadWorkspace => {
-                for r in &rules {
-                    match r.effect {
+                continue;
+            }
+            let restricted = rules.iter().any(|r| r.effect != Effect::Allow);
+            match cap {
+                Capability::FsReadWorkspace => {
+                    for r in &rules {
+                        match r.effect {
                         Effect::Deny => return Err(cx.refuse_deny(r, "the sandbox cannot hide workspace files from reads")),
                         Effect::Ask => return Err(CompileRefusal::UnenforceableAsk {
                             vendor, rule: r.describe(), reason: "workspace reads are never prompted, so the ask would run".into() }),
@@ -217,11 +225,11 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                             vec![], ReceiptClass::Unsupported, surface,
                             "no path scope exists for reads; the whole workspace stays readable and nothing was emitted"),
                     }
+                    }
                 }
-            }
-            Capability::FsReadExternal => {
-                for r in &rules {
-                    match r.effect {
+                Capability::FsReadExternal => {
+                    for r in &rules {
+                        match r.effect {
                         Effect::Deny | Effect::Ask if mode == Mode::DangerFullAccess => {
                             return Err(if r.effect == Effect::Deny {
                                 cx.refuse_deny(r, "sandbox off reads the whole disk")
@@ -249,77 +257,81 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         }
                         Effect::Allow => cx.dropped_allow(r, surface, "no path-scoped read grant exists; the only grant is full-disk"),
                     }
+                    }
                 }
-            }
-            Capability::FsWriteWorkspace => {
-                for r in &rules {
-                    match r.effect {
-                        Effect::Deny | Effect::Ask => {
-                            let exact = r.effect == Effect::Deny && r.pattern.is_none();
-                            cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), vec![format!("sandbox_mode={}", mode.as_str())],
+                Capability::FsWriteWorkspace => {
+                    for r in &rules {
+                        match r.effect {
+                            Effect::Deny | Effect::Ask => {
+                                let exact = r.effect == Effect::Deny && r.pattern.is_none();
+                                cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), vec![format!("sandbox_mode={}", mode.as_str())],
                                 if exact { ReceiptClass::Exact } else { ReceiptClass::StricterDowngrade }, surface,
                                 if exact { "read-only sandbox" } else { "the workspace-write sandbox cannot scope a path or prompt; read-only sandbox used (stricter)" });
-                        }
-                        Effect::Allow if restricted => cx.withdrawn_allow(r, surface),
-                        Effect::Allow if r.pattern.is_none() && mode != Mode::ReadOnly => {
-                            cx.push(
-                                sub,
-                                Origin::Rule,
-                                Some(Effect::Allow),
-                                r.describe(),
-                                vec![format!("sandbox_mode={}", mode.as_str())],
-                                ReceiptClass::Exact,
+                            }
+                            Effect::Allow if restricted => cx.withdrawn_allow(r, surface),
+                            Effect::Allow if r.pattern.is_none() && mode != Mode::ReadOnly => {
+                                cx.push(
+                                    sub,
+                                    Origin::Rule,
+                                    Some(Effect::Allow),
+                                    r.describe(),
+                                    vec![format!("sandbox_mode={}", mode.as_str())],
+                                    ReceiptClass::Exact,
+                                    surface,
+                                    "workspace-write sandbox",
+                                );
+                            }
+                            Effect::Allow if r.pattern.is_none() => cx.dropped_allow(
+                                r,
                                 surface,
-                                "workspace-write sandbox",
-                            );
+                                "the read-only sandbox this policy needs does not write",
+                            ),
+                            Effect::Allow => cx.dropped_allow(
+                                r,
+                                surface,
+                                "workspace-write grants the whole workspace, wider than the path",
+                            ),
                         }
-                        Effect::Allow if r.pattern.is_none() => cx.dropped_allow(
-                            r,
-                            surface,
-                            "the read-only sandbox this policy needs does not write",
-                        ),
-                        Effect::Allow => cx.dropped_allow(
-                            r,
-                            surface,
-                            "workspace-write grants the whole workspace, wider than the path",
-                        ),
                     }
                 }
-            }
-            Capability::FsWriteProtected => {
-                for r in &rules {
-                    if r.effect == Effect::Allow {
-                        cx.dropped_allow(r, surface, "the vendor has no protected-path concept");
-                    } else {
-                        cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), vec![format!("sandbox_mode={}", mode.as_str())],
+                Capability::FsWriteProtected => {
+                    for r in &rules {
+                        if r.effect == Effect::Allow {
+                            cx.dropped_allow(
+                                r,
+                                surface,
+                                "the vendor has no protected-path concept",
+                            );
+                        } else {
+                            cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), vec![format!("sandbox_mode={}", mode.as_str())],
                             ReceiptClass::StricterDowngrade, surface,
                             "no protected-path concept: the read-only sandbox denies every write (stricter)");
+                        }
+                    }
+                    if mode == Mode::ReadOnly {
+                        cx.protected_class_defaults(ReceiptClass::StricterDowngrade, vec!["sandbox_mode=read-only".to_owned()],
+                        "no protected-path concept: the read-only sandbox denies every write (stricter)");
+                    } else {
+                        cx.protected_class_defaults(ReceiptClass::Unsupported, vec![],
+                        "the vendor has no protected-path concept; the deny default is not enforced");
                     }
                 }
-                if mode == Mode::ReadOnly {
-                    cx.protected_class_defaults(ReceiptClass::StricterDowngrade, vec!["sandbox_mode=read-only".to_owned()],
-                        "no protected-path concept: the read-only sandbox denies every write (stricter)");
-                } else {
-                    cx.protected_class_defaults(ReceiptClass::Unsupported, vec![],
-                        "the vendor has no protected-path concept; the deny default is not enforced");
-                }
-            }
-            Capability::FsWriteExternal => {
-                let blocks: Vec<Option<Vec<String>>> = rules
-                    .iter()
-                    .filter(|r| r.effect != Effect::Allow)
-                    .map(|r| match &r.pattern {
-                        Some(Pattern::AbsPathGlob { glob }) => Some(
-                            literal_prefix(glob)
-                                .iter()
-                                .map(|s| (*s).to_owned())
-                                .collect(),
-                        ),
-                        _ => None,
-                    })
-                    .collect();
-                for r in &rules {
-                    match r.effect {
+                Capability::FsWriteExternal => {
+                    let blocks: Vec<Option<Vec<String>>> = rules
+                        .iter()
+                        .filter(|r| r.effect != Effect::Allow)
+                        .map(|r| match &r.pattern {
+                            Some(Pattern::AbsPathGlob { glob }) => Some(
+                                literal_prefix(glob)
+                                    .iter()
+                                    .map(|s| (*s).to_owned())
+                                    .collect(),
+                            ),
+                            _ => None,
+                        })
+                        .collect();
+                    for r in &rules {
+                        match r.effect {
                         Effect::Deny | Effect::Ask if mode == Mode::DangerFullAccess => {
                             return Err(if r.effect == Effect::Deny {
                                 cx.refuse_deny(r, "sandbox off writes anywhere")
@@ -364,32 +376,32 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                                 "explicit writable root (absolute)");
                         }
                     }
+                    }
                 }
-            }
-            Capability::ShellExec => {
-                let mut ask_unsupported = false;
-                for r in &rules {
-                    let dec = match r.effect {
-                        Effect::Allow => "allow",
-                        Effect::Ask => "prompt",
-                        Effect::Deny => "forbidden",
-                    };
-                    // Only plain tokens become pattern elements; a glob is cut at the first
-                    // token that is not plain or holds a wildcard (the cut matches more: stricter).
-                    let tokens: Option<(Vec<String>, bool)> = match &r.pattern {
-                        Some(Pattern::ArgvPrefix { argv }) => Some((argv.clone(), false)),
-                        Some(Pattern::ShellGlob { glob }) if r.effect != Effect::Allow => {
-                            let t: Vec<String> = glob
-                                .split(' ')
-                                .take_while(|t| safe_token(t))
-                                .map(str::to_owned)
-                                .collect();
-                            if t.is_empty() { None } else { Some((t, true)) }
-                        }
-                        _ => None,
-                    };
-                    let keeps_sandbox = cx.proves(&ProvenFact::ExecpolicyAllowKeepsSandbox);
-                    match (r.effect, tokens) {
+                Capability::ShellExec => {
+                    let mut ask_unsupported = false;
+                    for r in &rules {
+                        let dec = match r.effect {
+                            Effect::Allow => "allow",
+                            Effect::Ask => "prompt",
+                            Effect::Deny => "forbidden",
+                        };
+                        // Only plain tokens become pattern elements; a glob is cut at the first
+                        // token that is not plain or holds a wildcard (the cut matches more: stricter).
+                        let tokens: Option<(Vec<String>, bool)> = match &r.pattern {
+                            Some(Pattern::ArgvPrefix { argv }) => Some((argv.clone(), false)),
+                            Some(Pattern::ShellGlob { glob }) if r.effect != Effect::Allow => {
+                                let t: Vec<String> = glob
+                                    .split(' ')
+                                    .take_while(|t| safe_token(t))
+                                    .map(str::to_owned)
+                                    .collect();
+                                if t.is_empty() { None } else { Some((t, true)) }
+                            }
+                            _ => None,
+                        };
+                        let keeps_sandbox = cx.proves(&ProvenFact::ExecpolicyAllowKeepsSandbox);
+                        match (r.effect, tokens) {
                         (Effect::Allow, _) if ask_unsupported => cx.withdrawn_allow(r, surface),
                         (Effect::Allow, Some(_)) if mode == Mode::ReadOnly => cx.dropped_allow(
                             r,
@@ -424,51 +436,51 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                                 "no prompt rule form: the approval policy is tightened to untrusted and allows of shell are withdrawn");
                         }
                     }
+                    }
                 }
-            }
-            Capability::NetworkWeb => {
-                if restricted && mode == Mode::DangerFullAccess {
-                    let r = rules
-                        .iter()
-                        .find(|r| r.effect != Effect::Allow)
-                        .expect("restricted");
-                    return Err(if r.effect == Effect::Deny {
-                        cx.refuse_deny(r, "sandbox off leaves the network open")
-                    } else {
-                        CompileRefusal::UnenforceableAsk {
-                            vendor,
-                            rule: r.describe(),
-                            reason: "sandbox off leaves the network open".into(),
-                        }
-                    });
-                }
-                let mut open_scoped_net = false;
-                for r in &rules {
-                    let d = r.describe();
-                    let lines =
-                        |cx: &mut Cx,
-                         e: Effect,
-                         t: (Vec<String>, ReceiptClass, &str),
-                         h: (Vec<String>, ReceiptClass, &str),
-                         w: (Vec<String>, ReceiptClass, &str)| {
-                            for (leg, (n, c, note)) in [
-                                ("sandbox network transport", t),
-                                ("host approvals", h),
-                                ("WebSearch tool", w),
-                            ] {
-                                cx.push(
-                                    sub,
-                                    Origin::Rule,
-                                    Some(e),
-                                    format!("{d} [{leg}]"),
-                                    n,
-                                    c,
-                                    surface,
-                                    note,
-                                );
+                Capability::NetworkWeb => {
+                    if restricted && mode == Mode::DangerFullAccess {
+                        let r = rules
+                            .iter()
+                            .find(|r| r.effect != Effect::Allow)
+                            .expect("restricted");
+                        return Err(if r.effect == Effect::Deny {
+                            cx.refuse_deny(r, "sandbox off leaves the network open")
+                        } else {
+                            CompileRefusal::UnenforceableAsk {
+                                vendor,
+                                rule: r.describe(),
+                                reason: "sandbox off leaves the network open".into(),
                             }
-                        };
-                    match r.effect {
+                        });
+                    }
+                    let mut open_scoped_net = false;
+                    for r in &rules {
+                        let d = r.describe();
+                        let lines =
+                            |cx: &mut Cx,
+                             e: Effect,
+                             t: (Vec<String>, ReceiptClass, &str),
+                             h: (Vec<String>, ReceiptClass, &str),
+                             w: (Vec<String>, ReceiptClass, &str)| {
+                                for (leg, (n, c, note)) in [
+                                    ("sandbox network transport", t),
+                                    ("host approvals", h),
+                                    ("WebSearch tool", w),
+                                ] {
+                                    cx.push(
+                                        sub,
+                                        Origin::Rule,
+                                        Some(e),
+                                        format!("{d} [{leg}]"),
+                                        n,
+                                        c,
+                                        surface,
+                                        note,
+                                    );
+                                }
+                            };
+                        match r.effect {
                         Effect::Deny | Effect::Ask => {
                             search = Some("disabled");
                             let exact = r.effect == Effect::Deny && r.pattern.is_none();
@@ -509,15 +521,15 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                                 (vec![], ReceiptClass::StricterDowngrade, "search tool not enabled"));
                         }
                     }
-                }
-                if open_scoped_net && posture != Posture::Bypass {
-                    cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
+                    }
+                    if open_scoped_net && posture != Posture::Bypass {
+                        cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
                         "sandbox off leaves the network open; the ask default for every other host is not enforced");
+                    }
                 }
-            }
-            Capability::McpToolCall => {
-                for r in &rules {
-                    match r.effect {
+                Capability::McpToolCall => {
+                    for r in &rules {
+                        match r.effect {
                         Effect::Deny => {
                             let proven = cx.proves(&ProvenFact::HardDeny(Capability::McpToolCall));
                             match (&r.pattern, proven) {
@@ -535,6 +547,7 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                             vendor, rule: r.describe(),
                             reason: "no proven MCP prompt control: the approval policy does not gate arbitrary MCP servers, so the ask would run".into() }),
                         Effect::Allow => cx.dropped_allow(r, surface, "per-tool approval config covers app/connector tools, not arbitrary MCP servers"),
+                    }
                     }
                 }
             }
@@ -591,6 +604,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     }
     if search == Some("live") {
         cx.args.push("--search".to_owned());
+    }
+    if cx.axes_only {
+        return Ok(());
     }
 
     prefix_lines.sort();

@@ -235,8 +235,18 @@ impl VendorHostAdapter for CodexHostAdapter {
     ) -> Result<VendorLaunchPlan, VendorAdapterError> {
         let cfg =
             self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
+        let perms = fl_core::permissions::compile_posture(
+            fl_core::permissions::Vendor::Codex,
+            &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
+            request.posture,
+        )
+        .map_err(|e| VendorAdapterError::InvalidConfig {
+            vendor: self.vendor_id().to_string(),
+            reason: format!("posture: {e}"),
+        })?;
         let binary = self.resolve_binary(request.home_dir.as_deref());
-        let mut argv = vec![binary.clone(), "--yolo".to_string()];
+        let mut argv = vec![binary.clone()];
+        argv.extend(perms.launch_args);
         if request.remote_control {
             argv.extend(["--remote".to_string(), "unix://".to_string()]);
         }
@@ -1976,13 +1986,17 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp/work")),
             home_dir: Some(PathBuf::from("/tmp/home")),
             remote_control: true,
+            posture: fl_core::permissions::Posture::Auto,
         };
         let plan = adapter.prepare_launch(&req).unwrap();
         assert_eq!(plan.vendor_id, "codex");
         assert_eq!(
             &plan.argv[1..],
             &[
-                "--yolo",
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
                 "--remote",
                 "unix://",
                 "--model",
@@ -1999,10 +2013,19 @@ mod tests {
 
         let dash_req = VendorLaunchRequest {
             initial_prompt: "-m injected".into(),
-            ..req
+            ..req.clone()
         };
         let dash_plan = adapter.prepare_launch(&dash_req).unwrap();
         assert_eq!(dash_plan.argv.last().unwrap(), "Prompt: -m injected");
+
+        let ask_req = VendorLaunchRequest {
+            posture: fl_core::permissions::Posture::Ask,
+            ..req
+        };
+        assert!(matches!(
+            adapter.prepare_launch(&ask_req),
+            Err(VendorAdapterError::InvalidConfig { ref reason, .. }) if reason.contains("posture")
+        ));
     }
 
     #[test]

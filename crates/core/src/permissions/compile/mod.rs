@@ -38,6 +38,29 @@ pub fn compile(
     facts: &VendorFacts,
     policy: &PermissionPolicy,
 ) -> Result<CompiledPlan, CompileRefusal> {
+    compile_inner(vendor, facts, policy, false)
+}
+
+/// Compiles only the posture and vendor-default sandbox axes for `vendor` at session launch.
+///
+/// Used by spin-up and remodel before per-capability rule sets exist: it runs the same vendor
+/// axis compilers and the same bypass / sandbox-off audit as [`compile`], without emitting
+/// capability rule files or failing on omitted capability defaults.
+pub fn compile_posture(
+    vendor: Vendor,
+    facts: &VendorFacts,
+    posture: Posture,
+) -> Result<CompiledPlan, CompileRefusal> {
+    let policy = PermissionPolicy::new(posture, SandboxChoice::VendorDefault);
+    compile_inner(vendor, facts, &policy, true)
+}
+
+fn compile_inner(
+    vendor: Vendor,
+    facts: &VendorFacts,
+    policy: &PermissionPolicy,
+    axes_only: bool,
+) -> Result<CompiledPlan, CompileRefusal> {
     facts.validate().map_err(CompileRefusal::InvalidFacts)?;
     if !vendor.supports(facts.transport) {
         return Err(CompileRefusal::UnsupportedTransport {
@@ -50,6 +73,7 @@ pub fn compile(
         vendor,
         facts,
         policy: &policy,
+        axes_only,
         args: Vec::new(),
         files: Vec::new(),
         receipts: Vec::new(),
@@ -70,6 +94,8 @@ pub(crate) struct Cx<'a> {
     pub vendor: Vendor,
     pub facts: &'a VendorFacts,
     pub policy: &'a PermissionPolicy,
+    /// When `true`, only the posture and sandbox axes are compiled (see [`compile_posture`]).
+    pub axes_only: bool,
     pub args: Vec<String>,
     pub files: Vec<NativeFile>,
     pub receipts: Vec<ReceiptLine>,

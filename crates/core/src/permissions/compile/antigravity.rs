@@ -89,6 +89,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     let bypass = posture == Posture::Bypass;
 
     let (args, note, posture_class): (Vec<String>, &str, ReceiptClass) = match posture {
+        Posture::Ask if cx.axes_only => {
+            return Err(CompileRefusal::PostureNotEnforceable {
+                vendor,
+                posture,
+                reason: "no explicit ask mode exists on the Antigravity CLI".into(),
+            });
+        }
         Posture::Ask => (
             vec![],
             "no flag: no explicit ask mode exists, so the vendor's default mode governs and is not pinned by this plan",
@@ -155,6 +162,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         Surface::Posture,
         "a vendor-local review posture with no canonical counterpart: left unmanaged",
     );
+    if cx.axes_only {
+        return Ok(());
+    }
 
     let mut commands: Vec<String> = Vec::new();
     let shell_rules = cx.rules(Capability::ShellExec);

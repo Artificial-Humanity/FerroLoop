@@ -685,6 +685,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         vendor: vendor.into(),
         model: None,
         thinking_level: None,
+        posture: fl_core::permissions::Posture::Auto,
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_RUNNING.into(),

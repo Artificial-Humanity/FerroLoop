@@ -1628,6 +1628,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         vendor: "grok".into(),
         model: None,
         thinking_level: None,
+        posture: fl_core::permissions::Posture::Auto,
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_DECOMMISSIONED.into(),
@@ -1935,4 +1936,200 @@ fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_work
     )
     .unwrap();
     assert_eq!(plan3.to.cwd.as_deref(), Some(wt_str.as_str()));
+}
+
+#[test]
+fn remodel_applies_posture_emits_receipts_and_refuses_unsupported_posture_before_teardown() {
+    use fl_core::permissions::Posture;
+
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env_rt = fake.env(home.path());
+
+    spin_up(
+        &store,
+        &env_rt,
+        &SpinUpRequest {
+            persona: "ada".into(),
+            project: "FerroLoop".into(),
+            role: "assistant".into(),
+            vendor: "claude".into(),
+            posture: Posture::Plan,
+            ..SpinUpRequest::default()
+        },
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(record(&store, "claude:ada").posture, Posture::Plan);
+
+    // 1. Unsupported target (codex + ask) must fail with 400 before tearing down claude:ada.
+    let mut bad_req = remodel_req("codex");
+    bad_req.posture = Posture::Ask;
+    let err = remodel(&store, &env_rt, "claude:ada", &bad_req, Caller::Owner).unwrap_err();
+    assert!(matches!(err, LifecycleError::Invalid(_)), "{err:?}");
+    assert_eq!(err.status(), 400);
+    assert_eq!(
+        record(&store, "claude:ada").status,
+        STATUS_RUNNING,
+        "failed posture pre-flight must leave the source session running"
+    );
+    assert!(
+        find_hosted_session(&store, &["codex:ada"])
+            .unwrap()
+            .is_none(),
+        "failed posture pre-flight must not create the target session record"
+    );
+
+    // 2. Remodeling to codex with explicit bypass posture succeeds, records bypass, and emits receipts.
+    let mut bypass_req = remodel_req("codex");
+    bypass_req.posture = Posture::Bypass;
+    let out = remodel(&store, &env_rt, "claude:ada", &bypass_req, Caller::Owner).unwrap();
+    assert_eq!(out.posture, Posture::Bypass);
+    assert!(!out.permission_receipts.is_empty());
+    assert_eq!(record(&store, "codex:ada").posture, Posture::Bypass);
+    let codex_argv = fake
+        .launches
+        .borrow()
+        .last()
+        .unwrap()
+        .1
+        .clone()
+        .unwrap()
+        .argv;
+    assert!(
+        codex_argv.windows(2).any(|w| w == ["-a", "never"]),
+        "expected `-a never` on explicit bypass remodel, got {codex_argv:?}"
+    );
+
+    // 3. Remodeling with posture omitted defaults to Auto (not carrying over Bypass).
+    let out_auto = remodel(
+        &store,
+        &env_rt,
+        "codex:ada",
+        &remodel_req("grok"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out_auto.posture, Posture::Auto);
+    assert!(!out_auto.permission_receipts.is_empty());
+    assert_eq!(record(&store, "grok:ada").posture, Posture::Auto);
+    let grok_argv = fake
+        .launches
+        .borrow()
+        .last()
+        .unwrap()
+        .1
+        .clone()
+        .unwrap()
+        .argv;
+    assert!(
+        !grok_argv
+            .iter()
+            .any(|a| a == "--yolo" || a == "--always-approve"),
+        "default auto remodel must not emit bypass flags: {grok_argv:?}"
+    );
+
+    // 4. Remodeling a session whose recorded posture does not compile for `from_vendor`
+    // (e.g., `codex:ada` with `posture = Posture::Ask`) is refused with 400 before teardown.
+    let out_codex = remodel(
+        &store,
+        &env_rt,
+        "grok:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out_codex.session_id, "codex:ada");
+    let mut codex_rec = record(&store, "codex:ada");
+    codex_rec.posture = Posture::Ask;
+    persist_hosted_session(&store, &codex_rec, "owner").unwrap();
+    fake.calls.borrow_mut().clear();
+
+    let err_restore = remodel(
+        &store,
+        &env_rt,
+        "codex:ada",
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err_restore, LifecycleError::Invalid(_)),
+        "{err_restore:?}"
+    );
+    assert_eq!(err_restore.status(), 400);
+    assert!(
+        err_restore.to_string().contains(
+            "cannot build restore plan for `codex:ada` on `codex` with recorded posture `ask`"
+        ),
+        "{err_restore}"
+    );
+    assert_eq!(
+        record(&store, "codex:ada").status,
+        STATUS_RUNNING,
+        "failed restore-posture validation must not tear down the source session"
+    );
+    assert!(
+        fake.calls.borrow().is_empty(),
+        "no runtime kill or spawn may run when restore plan posture is invalid: {:?}",
+        fake.calls.borrow()
+    );
+}
+
+#[test]
+fn spin_up_and_remodel_json_contracts_parse_posture_and_serialize_receipts() {
+    use fl_core::permissions::Posture;
+
+    // Default posture when omitted or null in SpinUpRequest JSON.
+    let omitted: SpinUpRequest = serde_json::from_value(serde_json::json!({
+        "persona": "ada",
+        "project": "FerroLoop",
+        "role": "assistant",
+        "vendor": "claude"
+    }))
+    .unwrap();
+    assert_eq!(omitted.posture, Posture::Auto);
+
+    let explicit: SpinUpRequest = serde_json::from_value(serde_json::json!({
+        "persona": "ada",
+        "project": "FerroLoop",
+        "role": "assistant",
+        "vendor": "claude",
+        "posture": "accept-edits"
+    }))
+    .unwrap();
+    assert_eq!(explicit.posture, Posture::AcceptEdits);
+
+    let bad_spin: Result<SpinUpRequest, _> = serde_json::from_value(serde_json::json!({
+        "persona": "ada",
+        "project": "FerroLoop",
+        "role": "assistant",
+        "vendor": "claude",
+        "posture": "super-root"
+    }));
+    assert!(bad_spin.is_err());
+
+    let bad_remodel: Result<RemodelRequest, _> = serde_json::from_value(serde_json::json!({
+        "vendor": "codex",
+        "posture": "super-root"
+    }));
+    assert!(bad_remodel.is_err());
+
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    let out = spin_up(&store, &env, &explicit, "owner", Caller::Owner).unwrap();
+    let json = serde_json::to_value(&out).unwrap();
+    assert_eq!(json["posture"], "accept-edits");
+    let receipts = json["permission_receipts"]
+        .as_array()
+        .expect("permission_receipts array in SpinUpResponse JSON");
+    assert!(!receipts.is_empty());
+    for item in receipts {
+        assert!(item["class"].is_string(), "{item}");
+        assert!(item["summary"].is_string(), "{item}");
+        assert!(item["evidence"].is_string(), "{item}");
+    }
 }
