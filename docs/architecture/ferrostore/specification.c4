@@ -51,5 +51,7 @@ specification {
   tag legacy
   tag gap
   tag today
-  tag target
+  tag target {
+    color #2e7d32
+  }
 }

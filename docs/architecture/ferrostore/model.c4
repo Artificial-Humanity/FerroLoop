@@ -22,22 +22,22 @@ model {
     }
     councilDaemon = service 'ferrostore@the-council.service' {
       #target
-      description 'Proposed: no unit exists today.'
+      description 'Proposed: a ferrostore@ unit for the-council.fls. No unit exists today.'
     }
     websiteAltDaemon = service 'ferrostore@ferroloop-website.service' {
       #target
-      description 'Proposed: no unit exists today. Or retire the file if it is unused.'
+      description 'Proposed: a ferrostore@ unit for ferroloop-website.fls, or retire the file if it is unused. No unit exists today.'
     }
     wireDaemon = service 'ferrowire.service' {
-      description 'fl wire daemon. Opens one long-lived workspace store handle at startup; remote when ferrostore.service is up, embedded otherwise.'
+      description 'fl wire daemon. Opens one workspace store handle at startup: remote if ferrostore.service accepts, embedded fl.fls otherwise. The choice is fixed for the process lifetime; no runtime fallback or reconnect. The unit has Wants= and PartOf=ferrostore.service, so it restarts with the store daemon.'
       technology 'crates/cli/src/cmd/wire.rs, crates/wire/src/daemon.rs'
     }
     hub = service 'ferroloop-hub.service' {
-      description 'fl hub serve. Opens stores per request: workspace store under a hub-wide mutex, project stores under a per-path lock. Caches read-only code-index handles.'
+      description 'fl hub serve. Opens stores per request: workspace store under a hub-wide mutex, project stores under a per-path lock. Finds a project store by slug as ~/.local/share/fl/{slug}.redb -> .fls, not through the config.toml store binding. The gate governor opens the workspace store once on first use and keeps that handle for the hub lifetime, outside the mutex; remote or embedded is fixed at that first open. Caches read-only code-index handles.'
       technology 'crates/hub/src/lib.rs'
     }
     host = service 'ferroloop-host.service' {
-      description 'fl-host. No fl-store dependency.'
+      description 'Runs fl host serve, which opens no store; the fl-host crate has no fl-store dependency. The fl host client subcommands open the workspace store like any other fl CLI invocation.'
       technology 'crates/host'
     }
 
@@ -80,7 +80,7 @@ model {
     }
     legacyRedb = storefile '*.redb (read-only)' {
       #legacy
-      description 'Pre-migration redb copies, chmod 0400. The only backup that exists today.'
+      description 'Stale pre-migration redb snapshots from 2026-11-01, chmod 0400. Not current data and not a backup. the-council and ferroloop-website have none. No backup system exists.'
     }
 
     // ---- The fl-store library (crates/store, ~81k LOC incl. tests) -------
@@ -101,11 +101,11 @@ model {
         technology 'ferrostore/{mod,layout,container_io,group,transaction,compact}.rs'
       }
       remoteClient = module 'Remote client' {
-        description '47 Inner::Remote branches. Domain traits run client-side over a remote Txn: one txn_read per read, commit validated by read-set hash, retried up to 8 times.'
+        description '47 Inner::Remote sites in ferrostore/mod.rs (44 branches; 3 are constructors), plus 6 in traits_wire_delivery.rs. Domain traits run client-side over a remote Txn: one txn_read per read, commit validated by read-set hash, retried up to 8 times.'
         technology 'ferrostore/mod.rs, remote_txn.rs'
       }
       rpcServer = module 'RPC server' {
-        description '37 generic primitives over Unix socket (length-prefixed JSON) and ws/wss; auth, scopes, request-id dedupe. Documented as the only opener, but nothing enforces it.'
+        description '34 generic primitives (auth::METHODS) over Unix socket (length-prefixed JSON) and ws/wss; auth, scopes, request-id dedupe. Documented as the only opener, but nothing enforces it.'
         technology 'ferrostore/{server,auth,tls,ws,session}.rs'
       }
       redbEngine = module 'RedbStore' {
@@ -118,7 +118,7 @@ model {
       }
       ferroMq = module 'FerroMQ' {
         #gap
-        description 'Topics as mq:{topic} collections. No production publisher; one consumer reads mq_telemetry.'
+        description 'Topics as mq:{topic} collections. No production publisher; no topic consumer; one caller reads the mq_telemetry() API.'
         technology 'mq_buffer.rs, mq_runtime.rs, mq_tier.rs'
       }
       vectorCol = module 'Vector (HNSW) + columnar' {
@@ -160,9 +160,10 @@ model {
   ferroloop.wsDaemon -[embedded]-> ferroloop.flFls 'long-lived owner, rw' { #today }
   ferroloop.projDaemon -[embedded]-> ferroloop.projectFls 'long-lived owner, rw' { #today }
 
-  ferroloop.wireDaemon -[socket]-> ferroloop.wsDaemon 'long-lived handle, rw (embedded fl.fls if the daemon is down)' { #today }
+  ferroloop.wireDaemon -[socket]-> ferroloop.wsDaemon 'one handle fixed at startup, rw (embedded fl.fls if the daemon was down then; no reconnect)' { #today }
 
   ferroloop.hub -[socket]-> ferroloop.wsDaemon 'per request, hub-wide mutex, rw' { #today }
+  ferroloop.hub -[socket]-> ferroloop.wsDaemon 'gate governor: one long-lived handle, no mutex (embedded fl.fls if the daemon was down at first use)' { #today }
   ferroloop.hub -[socket]-> ferroloop.projDaemon 'per request, per-path lock, rw' { #today }
   ferroloop.hub -[embedded]-> ferroloop.councilFls 'per request, rw' { #today #gap }
   ferroloop.hub -[embedded]-> ferroloop.websiteAltFls 'per request, rw' { #today #gap }
@@ -178,6 +179,7 @@ model {
   ferroloop.stateMcp -[socket]-> ferroloop.wsDaemon 'new connection per tool call' { #today #gap }
   ferroloop.stateMcp -[socket]-> ferroloop.projDaemon 'new connection per tool call' { #today #gap }
   ferroloop.stateMcp -[embedded]-> ferroloop.councilFls 'full load per tool call' { #today #gap }
+  ferroloop.stateMcp -[embedded]-> ferroloop.websiteAltFls 'IRI scan opens every configured project store' { #today #gap }
   ferroloop.stateMcp -[embedded]-> ferroloop.codeFls 'open + sync per search batch, rw' { #today }
 
   ferroloop.storeCli -[embedded]-> ferroloop.flFls 'bypasses the serving daemon' { #today #gap }
@@ -191,20 +193,20 @@ model {
   // Each .fls has exactly one opener: its ferrostore daemon, holding an
   // exclusive lock. Everything else is a socket client.
 
-  ferroloop.wsDaemon -[embedded]-> ferroloop.flFls 'sole opener, exclusive lock' { #target }
-  ferroloop.projDaemon -[embedded]-> ferroloop.projectFls 'sole opener, exclusive lock' { #target }
-  ferroloop.councilDaemon -[embedded]-> ferroloop.councilFls 'sole opener, exclusive lock' { #target }
-  ferroloop.websiteAltDaemon -[embedded]-> ferroloop.websiteAltFls 'sole opener, or retire the file' { #target }
+  ferroloop.wsDaemon -[embedded]-> ferroloop.flFls 'Proposed: sole opener, exclusive lock' { #target }
+  ferroloop.projDaemon -[embedded]-> ferroloop.projectFls 'Proposed: sole opener, exclusive lock' { #target }
+  ferroloop.councilDaemon -[embedded]-> ferroloop.councilFls 'Proposed: sole opener, exclusive lock' { #target }
+  ferroloop.websiteAltDaemon -[embedded]-> ferroloop.websiteAltFls 'Proposed: sole opener, or retire the file' { #target }
 
-  ferroloop.wireDaemon -[socket]-> ferroloop.wsDaemon 'long-lived; no embedded fallback' { #target }
-  ferroloop.hub -[socket]-> ferroloop.wsDaemon 'reused connection, no hub-wide mutex' { #target }
-  ferroloop.hub -[socket]-> ferroloop.projDaemon 'reused connection' { #target }
-  ferroloop.hub -[socket]-> ferroloop.councilDaemon 'reused connection' { #target }
-  ferroloop.cli -[socket]-> ferroloop.wsDaemon 'per invocation; clear error if the daemon is down' { #target }
-  ferroloop.cli -[socket]-> ferroloop.projDaemon { #target }
-  ferroloop.cli -[socket]-> ferroloop.councilDaemon { #target }
-  ferroloop.stateMcp -[socket]-> ferroloop.wsDaemon 'one long-lived connection per MCP process' { #target }
-  ferroloop.stateMcp -[socket]-> ferroloop.projDaemon 'one long-lived connection per MCP process' { #target }
-  ferroloop.stateMcp -[socket]-> ferroloop.councilDaemon 'one long-lived connection per MCP process' { #target }
-  ferroloop.storeCli -[socket]-> ferroloop.wsDaemon 'go through the daemon when one serves the file' { #target }
+  ferroloop.wireDaemon -[socket]-> ferroloop.wsDaemon 'Proposed: long-lived; no embedded fallback' { #target }
+  ferroloop.hub -[socket]-> ferroloop.wsDaemon 'Proposed: reused connection, no hub-wide mutex' { #target }
+  ferroloop.hub -[socket]-> ferroloop.projDaemon 'Proposed: reused connection' { #target }
+  ferroloop.hub -[socket]-> ferroloop.councilDaemon 'Proposed: reused connection' { #target }
+  ferroloop.cli -[socket]-> ferroloop.wsDaemon 'Proposed: per invocation; clear error if the daemon is down' { #target }
+  ferroloop.cli -[socket]-> ferroloop.projDaemon 'Proposed: per invocation' { #target }
+  ferroloop.cli -[socket]-> ferroloop.councilDaemon 'Proposed: per invocation' { #target }
+  ferroloop.stateMcp -[socket]-> ferroloop.wsDaemon 'Proposed: one long-lived connection per MCP process' { #target }
+  ferroloop.stateMcp -[socket]-> ferroloop.projDaemon 'Proposed: one long-lived connection per MCP process' { #target }
+  ferroloop.stateMcp -[socket]-> ferroloop.councilDaemon 'Proposed: one long-lived connection per MCP process' { #target }
+  ferroloop.storeCli -[socket]-> ferroloop.wsDaemon 'Proposed: go through the daemon when one serves the file' { #target }
 }

@@ -26,25 +26,29 @@ likec4 export png -o <out-dir> docs/architecture/ferrostore
 
 ## Evidence
 
-Paths are relative to `crates/`.
+Paths are relative to `crates/`, except `docs/ferrostore-spec.md`, which is relative to the repository root.
 
 | Claim | Evidence |
 | --- | --- |
 | A `.fls` path always selects the ferro engine; other paths use `FL_STORE_BACKEND`, default ferro; `x.redb` maps to `x.fls` | `store/src/any.rs` `choose_backend`, `physical_path` |
 | An open connects to `<file>.fls.sock` when it accepts, otherwise opens the file embedded; a failed handshake is an error | `store/src/ferrostore/mod.rs` `FerroStore::auto` |
-| A second embedded open of the same file succeeds; `flock` is held only around commit, checkpoint and compaction | `store/src/ferrostore/mod.rs` (`open` doc comment), `docs/ferrostore-spec.md` |
+| A second embedded open of the same file succeeds; a short exclusive `flock` is held only around commit, checkpoint, compaction, file create and publishing a sync batch | `store/src/ferrostore/mod.rs` (`open` doc comment; sync-batch publish at `:4626`), `docs/ferrostore-spec.md:28` (create) |
+| The RPC server exposes 34 generic primitives | `store/src/ferrostore/auth.rs:159-194` `METHODS` |
 | The server is documented as "the only opener" but takes no exclusive lock | `store/src/ferrostore/server.rs:3`; no lock in `server.rs` or `cli/serve.rs` |
 | `ferrostore get/put/query` open the file embedded even while it is served | `store/src/cli/data.rs` |
-| The wire daemon keeps one long-lived workspace handle | `cli/src/cmd/wire.rs` (daemon start), `wire/src/daemon.rs` |
+| The wire daemon opens one workspace handle at startup, remote or embedded, and keeps it for the process lifetime; there is no runtime fallback or reconnect. `ferrowire.service` has `Wants=` and `PartOf=ferrostore.service`, so it restarts with the store daemon | `cli/src/cmd/wire.rs:1287-1295`, `wire/src/daemon.rs`; `systemctl --user cat ferrowire.service` |
 | The hub opens the workspace store per request under a hub-wide mutex, and project stores under a per-path lock | `hub/src/lib.rs` `open_store_at`, `open_project_store_at` |
-| `fl-host` has no `fl-store` dependency | `host/Cargo.toml` |
+| The hub finds a project store by slug as `~/.local/share/fl/{slug}.redb` (mapped to `.fls`), not through the `config.toml` store binding | `hub/src/records.rs:117-154` `project_redb_with`, `:202` |
+| The hub gate governor opens `config.store_path` once on first use and keeps that handle for the hub lifetime, outside the hub-wide mutex; remote or embedded is fixed at that first open | `hub/src/api.rs:8489-8491` `hub_gate_governor`, `hub/src/lib.rs` `GateGovernorStoreCache` (~359-391) |
+| `ferroloop-host.service` runs `fl host serve`, which opens no store; the `fl-host` crate has no `fl-store` dependency; the `fl host` client subcommands open the workspace store like any `fl` invocation | `host/Cargo.toml`; `cli/src/cmd/host.rs:244-269` `load_registry_agents`, `execute_with_db` (`Serve`) |
 | The ferrostate MCP opens the store on every tool call and the code index per search batch | `cli/src/cmd/state_mcp.rs` `open_for_scope` |
+| The ferrostate MCP IRI lookup scans every configured project store, including the unserved ones, embedded | `cli/src/cmd/state_mcp.rs:484-507` `open_for_id_or_key` |
 | The code index is always embedded, in a `<primary>.code.fls` sidecar | `store/src/code_knowledge.rs` |
-| 47 `Inner::Remote` branches; remote refuses `stats`, `configure_mq`, single publish, if-absent put, local sync publish | `store/src/ferrostore/mod.rs` |
+| 47 `Inner::Remote` sites in `ferrostore/mod.rs` (44 branches; 3 are constructors), plus 6 in `traits_wire_delivery.rs`; remote refuses `stats`, `configure_mq`, single publish, if-absent put, local sync publish | `store/src/ferrostore/mod.rs`, `store/src/ferrostore/traits_wire_delivery.rs` |
 | `WireDeliveryStore` and F1 records are disabled on every backend and have no production caller | `store/src/ferrostore/traits_wire_delivery.rs`, `store/src/f1_preparation.rs`; only `core/src/wire_delivery/conformance.rs` calls them |
-| FerroMQ has no production publisher; one consumer reads `mq_telemetry` | `watch/src/lib.rs` |
+| FerroMQ has no production publisher and no topic consumer; one caller reads the `mq_telemetry()` API | `watch/src/lib.rs:120` |
 | Served stores: `ferrostore.service` (fl.fls) and `ferrostore@{ferroloop,kaggle-gemma4,lucida,prosodia,sonora,website}`; `the-council.fls`, `ferroloop-website.fls` and `fl.code.fls` have no unit | `systemctl --user` on ai-lab-0, 2026-11-09 |
-| No backup subsystem; the read-only legacy `.redb` is the only copy | `store/src/health.rs` `backup_beside` |
+| No backup system. The read-only legacy `*.redb` files are stale pre-migration snapshots from 2026-11-01, not current data; `the-council` and `ferroloop-website` have no `.redb` at all. A manifest export exists but is not a backup system | `store/src/health.rs` `backup_beside`; `core/src/doctor/store.rs:31` ("not current data"); `store/src/any.rs` `export_manifest` (~1106); `ls ~/.local/share/fl/*.redb` on ai-lab-0, 2026-11-09 |
 
 ## Differences from the 2026-11-08 analysis notes
 
@@ -56,7 +60,9 @@ from them here:
 - There is no `Inner::Local`; the variants are `Memory`, `Disk` and `Remote`.
 - `fl-wire` and `fl-hub` do not reach the `unsupported()` wire-delivery stubs; those
   traits have no production caller.
-- `fl-host` does not open any store.
+- `ferroloop-host.service` (`fl host serve`) does not open any store, and the `fl-host` crate has
+  no `fl-store` dependency. The `fl host` client subcommands do open the workspace store, as
+  any `fl` invocation does.
 
 ## Open questions for the target
 
@@ -68,4 +74,5 @@ from them here:
    fallback for read-only use only?
 4. How does the hub reuse connections without the hub-wide mutex, given remote commits
    are validated by read-set hash and retried?
-5. What backup and restore guarantee replaces "the read-only legacy `.redb` beside the file"?
+5. What backup and restore guarantee should exist? Today there is none: the read-only legacy
+   `.redb` files are stale 2026-11-01 snapshots, not current data, and two stores have none.
