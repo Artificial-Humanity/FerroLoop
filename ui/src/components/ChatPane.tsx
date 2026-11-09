@@ -1125,6 +1125,8 @@ export interface ChatPaneProps {
   contextUsage?: SessionContextUsage | null;
   /** Vendor account quota/allowance usage when reported by the adapter/hub. */
   quotaUsage?: SessionQuotaUsage | null;
+  /** Process liveness state (`alive`, `stale`, `dead`) passed on to the agent settings modal. */
+  livenessState?: "alive" | "stale" | "dead" | null;
   isBusy?: boolean;
   inFlightUnconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
@@ -1213,6 +1215,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   turns,
   contextUsage = null,
   quotaUsage = null,
+  livenessState = null,
   isBusy,
   inFlightUnconfirmed,
   queue,
@@ -4801,6 +4804,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         contextEstimate={contextEstimate}
         quotaUsage={effectiveQuotaUsage}
+        livenessState={livenessState}
         executionMode={executionMode}
         turnCount={filteredTurns.length}
         canCompact={canCompact}

@@ -3,7 +3,13 @@ import { HubApiClient, HubApiError } from "../api/client";
 import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
 import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { projectChoices } from "../hooks/useProjects";
-import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
+import {
+  isLiveSessionStatus,
+  PinIcon,
+  togglePinnedAgent,
+  usePinnedState,
+} from "./RosterSidebar";
+import { evaluateQuotaStatus } from "../utils/quotaStatus";
 import {
   canonicalizeDefaultRole,
   CREATE_CUSTOM_ROLE_VALUE,
@@ -348,10 +354,15 @@ export interface AgentSettingsModalProps {
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
   /**
-   * Ignored. The quota summary moved out of this modal; callers that still pass it keep
-   * compiling until they drop the prop.
+   * Session usage allowance telemetry (`primary_window`, `secondary_window`, `exhausted_reason`,
+   * `observed_at_ms`) evaluated alongside liveness in the Status & Allowance detail block.
    */
   quotaUsage?: SessionQuotaUsage | null;
+  /**
+   * Process liveness state (`alive`, `stale`, `dead`) so the Status & Allowance detail can show
+   * both process liveness and usage allowance without conflating them.
+   */
+  livenessState?: "alive" | "stale" | "dead" | null;
   /**
    * Effective execution mode the hub reports for the session (`auto`, `yolo`, `plan`, `default`,
    * `accept-edits`, or a vendor value). `null` means the hub reported none ("Unknown"). When the
@@ -419,6 +430,8 @@ interface FetchedSessionState {
   model: string | null;
   thinkingLevel: string | null;
   availableModels: string[] | null;
+  quotaUsage: SessionQuotaUsage | null;
+  status: string | null;
   /** Prop values in effect when the fetch was issued. */
   props: SessionPropSnapshot;
 }
@@ -460,6 +473,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   switchingModel = false,
   onChangeModelAndThinking,
   contextEstimate,
+  quotaUsage,
+  livenessState,
   executionMode,
   turnCount,
   canCompact,
@@ -640,6 +655,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
           model: match?.model ?? null,
           thinkingLevel: match?.thinking_level ?? null,
           availableModels: match?.available_models ?? null,
+          quotaUsage: match?.quota_usage ?? null,
+          status: match?.status ?? null,
           props: propsAtRequest,
         });
       })
@@ -889,6 +906,27 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     (executionMode !== undefined ? executionMode : null);
   const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
   const executionModeIsYolo = executionModeKey === "yolo";
+  const effectiveQuotaUsage = quotaUsage ?? fetchedSession?.quotaUsage ?? null;
+  const effectiveLivenessState: "alive" | "stale" | "dead" =
+    livenessState ??
+    (fetchedSession?.status
+      ? isLiveSessionStatus(fetchedSession.status)
+        ? "alive"
+        : "dead"
+      : sessionId
+        ? "alive"
+        : "dead");
+  const quotaEval = evaluateQuotaStatus({
+    quotaUsage: effectiveQuotaUsage,
+    vendor: effectiveAdapter,
+    model: shownModel,
+  });
+  const livenessLabel =
+    effectiveLivenessState === "alive"
+      ? "Online (alive)"
+      : effectiveLivenessState === "stale"
+        ? "Stale"
+        : "Offline (dead)";
 
   return (
     <div className="fd-modal-backdrop" onClick={onClose}>
@@ -1690,6 +1728,85 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   Read-only: how this session handles tool approvals. Change it in the agent&apos;s own
                   CLI.
                 </span>
+              </div>
+
+              <div
+                data-testid="agent-settings-status-detail"
+                data-liveness-state={effectiveLivenessState}
+                data-quota-state={quotaEval.status}
+                data-quota-reason={quotaEval.reasonKind}
+                data-quota-pool={quotaEval.poolLabel ?? undefined}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  paddingTop: "4px",
+                  borderTop: "1px solid var(--border-subtle)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      textTransform: "uppercase",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    Status &amp; Allowance
+                  </span>
+                  {quotaEval.poolLabel && (
+                    <span
+                      data-testid="agent-settings-allowance-pool"
+                      className="fd-badge fd-mono"
+                      style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                    >
+                      Pool: {quotaEval.poolLabel}
+                    </span>
+                  )}
+                </div>
+                <div
+                  data-testid="agent-settings-liveness-detail"
+                  style={{ fontSize: "12px", color: "var(--text-secondary)" }}
+                >
+                  Process: <strong style={{ color: "var(--text-primary)" }}>{livenessLabel}</strong>
+                </div>
+                <div
+                  data-testid="agent-settings-allowance-detail"
+                  style={{
+                    fontSize: "12px",
+                    color:
+                      quotaEval.status === "red"
+                        ? "var(--status-dead)"
+                        : quotaEval.status === "orange"
+                          ? "#F97316"
+                          : quotaEval.status === "yellow"
+                            ? "var(--status-stale)"
+                            : "var(--text-secondary)",
+                  }}
+                >
+                  Allowance: {quotaEval.detailText}
+                </div>
+                {effectiveLivenessState === "dead" && quotaEval.status !== "unknown" && (
+                  <div
+                    data-testid="agent-settings-offline-quota-note"
+                    style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                  >
+                    Process is offline; usage allowance is reported separately (
+                    {quotaEval.reasonKind === "exhausted"
+                      ? "quota exhausted"
+                      : `${quotaEval.status} state`}
+                    ).
+                  </div>
+                )}
               </div>
             </div>
           </div>

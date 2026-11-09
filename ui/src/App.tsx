@@ -1,4 +1,8 @@
-import { codexSendNowReceipt, isPromptDeliveryFailure } from "./types/api";
+import {
+  codexSendNowReceipt,
+  isPromptDeliveryFailure,
+  resolveLivenessState,
+} from "./types/api";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError, normalizeHubSettings } from "./api/client";
@@ -27,6 +31,7 @@ import {
   classifyTurnUnreadSeverity,
   classifyWireUnreadSeverity,
   hasTrailingIncompleteWork,
+  isLiveSessionStatus,
   mergeUnreadSeverity,
   type LeftPanelTab,
   type UnreadSeverity,
@@ -2392,6 +2397,20 @@ export const App: React.FC<AppProps> = ({
   const activeHydrationWarnings = useMemo<string[]>(() => {
     return normalizeHydrationWarnings(activeSpunUp?.warnings);
   }, [activeSpunUp]);
+  const activeLivenessState = useMemo<"alive" | "stale" | "dead">(() => {
+    const hasLiveSession =
+      isLiveSessionStatus(activeSession?.status) ||
+      isLiveSessionStatus(activeRoute?.status) ||
+      isLiveSessionStatus(activeHostedSession?.status) ||
+      Boolean(activeSpunUp);
+    if (hasLiveSession) {
+      return "alive";
+    }
+    if (activeLiveness) {
+      return resolveLivenessState(activeLiveness.verdict, activeLiveness.has_route);
+    }
+    return "dead";
+  }, [activeSession, activeRoute, activeHostedSession, activeSpunUp, activeLiveness]);
   const activeAdapter = useMemo(() => {
     const candidates = [
       activeSession?.adapter,
@@ -3565,7 +3584,13 @@ export const App: React.FC<AppProps> = ({
       transcriptRefreshState={transcriptRefreshState}
       onResetSession={handleResetSession}
       contextUsage={metadataMatches ? sessionContextUsage : null}
-      quotaUsage={metadataMatches ? sessionQuotaUsage ?? activeSession?.quota_usage ?? null : null}
+      quotaUsage={
+        (metadataMatches ? sessionQuotaUsage : null) ??
+        activeSession?.quota_usage ??
+        activeRoute?.quota_usage ??
+        null
+      }
+      livenessState={activeLivenessState}
       isBusy={metadataMatches ? isSessionBusy : false}
       inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
       queue={metadataMatches ? sessionQueue : []}

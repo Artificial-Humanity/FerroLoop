@@ -5,12 +5,17 @@ import {
   type AgentRecord,
   type DiscoveredSessionSummary,
   type SessionContextUsage,
+  type SessionQuotaUsage,
   type TranscriptTurn,
   type WireInboxItem,
   type ProjectSummary,
   type WireMessage,
 } from "../types/api";
 import { projectLabel } from "../hooks/useProjects";
+import {
+  evaluateQuotaStatus,
+  resolveRosterStatusDot,
+} from "../utils/quotaStatus";
 import {
   estimateSessionContextUsage,
   formatContextMax,
@@ -337,6 +342,7 @@ export interface RosterSidebarProps {
   busyByAgent?: Record<string, boolean>;
   transcriptsByAgent?: Record<string, TranscriptTurn[]>;
   contextUsageByAgent?: Record<string, SessionContextUsage | null>;
+  quotaUsageByAgent?: Record<string, SessionQuotaUsage | null>;
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
@@ -539,6 +545,8 @@ interface EnrichedAgent {
   livenessState: "alive" | "stale" | "dead";
   activityState: "working" | "idle" | "offline";
   adapter: string | null;
+  model: string | null;
+  quotaUsage: SessionQuotaUsage | null;
   unreadCount: number;
   unreadSeverity: UnreadSeverity;
   contextEstimate: EstimatedContextUsage;
@@ -630,15 +638,16 @@ function inferSessionProject(
 }
 
 export const RosterSidebar: React.FC<RosterSidebarProps> = ({
-  agents,
-  routes,
-  sessions,
-  liveness,
-  unreadByAgent,
+  agents = [],
+  routes = [],
+  sessions = [],
+  liveness = [],
+  unreadByAgent = {},
   unreadSeverityByAgent,
   busyByAgent,
   transcriptsByAgent,
   contextUsageByAgent,
+  quotaUsageByAgent,
   selectedAgentName,
   onSelectAgent,
   onOpenAgentSettings,
@@ -863,6 +872,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         agentTurns ?? [],
         explicitContextUsage,
       );
+      const quotaUsage =
+        quotaUsageByAgent?.[key] ??
+        quotaUsageByAgent?.[record.name_key] ??
+        matchedSession?.quota_usage ??
+        route?.quota_usage ??
+        null;
+      const model = matchedSession?.model ?? route?.model ?? null;
 
       return {
         record,
@@ -871,6 +887,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         livenessState,
         activityState,
         adapter,
+        model,
+        quotaUsage,
         unreadCount,
         unreadSeverity,
         contextEstimate,
@@ -887,6 +905,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     busyByAgent,
     transcriptsByAgent,
     contextUsageByAgent,
+    quotaUsageByAgent,
   ]);
 
   const groupedByProject = useMemo(() => {
@@ -1313,16 +1332,20 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
 
                 {!isGroupCollapsed && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
-                    {items.map(({ record, livenessState, activityState, adapter, unreadCount, unreadSeverity, contextEstimate }) => {
+                    {items.map(({ record, livenessState, activityState, adapter, model, quotaUsage, unreadCount, unreadSeverity, contextEstimate }) => {
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
-                      const dotClass =
-                        livenessState === "alive"
-                          ? "fd-dot fd-dot-alive"
-                          : livenessState === "stale"
-                            ? "fd-dot fd-dot-stale"
-                            : "fd-dot fd-dot-dead";
+                      const quotaEval = evaluateQuotaStatus({
+                        quotaUsage,
+                        vendor: adapter,
+                        model,
+                      });
+                      const dotPresentation = resolveRosterStatusDot(
+                        livenessState,
+                        quotaEval,
+                      );
+                      const dotClass = dotPresentation.className;
                       const activityTitle =
                         activityState === "working"
                           ? "Activity: Working (Busy)"
@@ -1415,8 +1438,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                               <span
                                 data-testid={`liveness-dot-${key}`}
+                                data-liveness-state={livenessState}
+                                data-quota-state={quotaEval.status}
+                                data-quota-reason={quotaEval.reasonKind}
+                                data-quota-pool={quotaEval.poolLabel ?? undefined}
                                 className={dotClass}
-                                title={`Liveness: ${livenessState}`}
+                                title={dotPresentation.accessibleLabel}
+                                aria-label={dotPresentation.accessibleLabel}
                               />
                               <span style={{ fontWeight: 600, fontSize: "13px" }}>
                                 {record.display_name}

@@ -587,6 +587,21 @@ button.fd-badge:hover:not(:disabled) {
   background-color: var(--status-dead);
 }
 
+.fd-dot-quota-yellow {
+  background-color: #EAB308;
+  box-shadow: 0 0 6px rgba(234, 179, 8, 0.55);
+}
+
+.fd-dot-quota-orange {
+  background-color: #F97316;
+  box-shadow: 0 0 6px rgba(249, 115, 22, 0.65);
+}
+
+.fd-dot-quota-red {
+  background-color: var(--status-danger);
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.7);
+}
+
 .fd-adapter-muse {
   color: var(--adapter-muse);
   border-color: rgba(56, 189, 248, 0.35);
