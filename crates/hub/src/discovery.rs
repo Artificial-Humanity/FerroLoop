@@ -1046,6 +1046,8 @@ fn discover_sessions_from_routes(
         }
     }
 
+    // One TranscriptReads cache per discovery pass serves transcript and Grok unified log reads.
+    let mut files = TranscriptReads::default();
     for session in &mut out {
         if session.source == "route" && with_model_info {
             // `home` is for transcript lookup only. Production passes `None`
@@ -1053,8 +1055,6 @@ fn discover_sessions_from_routes(
             let endpoint = agy_endpoints.get(&session.id);
             let agy_address = endpoint.and_then(|(addr, _)| addr.as_deref());
             let agy_csrf = endpoint.and_then(|(_, csrf)| csrf.as_deref());
-            // One read per transcript file serves the model, quota, context and mode reads.
-            let mut files = TranscriptReads::default();
             // Muse's model comes from its transcript text, read once through `files`.
             let info = if session.adapter == "muse" {
                 muse_model_info(session.transcript_path.as_deref(), &mut files)
@@ -3109,11 +3109,15 @@ pub(crate) fn quota_live_window_count(q: &SessionQuotaUsage, now_ms: u64) -> usi
 }
 
 /// Selection key for choosing the best account-level quota reading across sibling sessions:
-/// `(live_window_count, observed_at_ms, richness)`.
-pub(crate) fn quota_selection_score(q: &SessionQuotaUsage, now_ms: u64) -> (usize, u64, usize) {
+/// `(has_observed_at, observed_at_ms, live_window_count, richness)`.
+pub(crate) fn quota_selection_score(
+    q: &SessionQuotaUsage,
+    now_ms: u64,
+) -> (bool, u64, usize, usize) {
     (
-        quota_live_window_count(q, now_ms),
+        q.observed_at_ms.is_some(),
         q.observed_at_ms.unwrap_or(0),
+        quota_live_window_count(q, now_ms),
         quota_richness(q, now_ms),
     )
 }
@@ -3155,7 +3159,7 @@ pub(crate) fn propagate_codex_sibling_quota(
     };
 
     struct BestCodexQuota {
-        score: (usize, u64, usize),
+        score: (bool, u64, usize, usize),
         updated_at: Option<String>,
         quota: SessionQuotaUsage,
     }
@@ -3168,6 +3172,9 @@ pub(crate) fn propagate_codex_sibling_quota(
         let Some(q) = session.quota_usage.as_ref() else {
             continue;
         };
+        if q.observed_at_ms.is_none() {
+            continue;
+        }
         if !codex_reading_matches_account(session, q, effective_tier.as_deref(), home_override) {
             continue;
         }
@@ -3192,20 +3199,29 @@ pub(crate) fn propagate_codex_sibling_quota(
     let Some(BestCodexQuota { quota: donor, .. }) = best else {
         return;
     };
+    let Some(donor_obs) = donor.observed_at_ms else {
+        return;
+    };
 
     for session in sessions.iter_mut() {
         if session.adapter != "codex" || !codex_session_matches_account(session, home_override) {
             continue;
         }
-        if let Some(existing) = session.quota_usage.as_ref()
-            && !codex_reading_matches_account(
+        if let Some(existing) = session.quota_usage.as_ref() {
+            if !codex_reading_matches_account(
                 session,
                 existing,
                 effective_tier.as_deref(),
                 home_override,
-            )
-        {
-            continue;
+            ) {
+                continue;
+            }
+            if existing
+                .observed_at_ms
+                .is_some_and(|existing_obs| donor_obs < existing_obs)
+            {
+                continue;
+            }
         }
         let existing_exhausted = session
             .quota_usage
@@ -3221,7 +3237,7 @@ pub(crate) fn propagate_codex_sibling_quota(
             primary_window: donor.primary_window.clone(),
             secondary_window: donor.secondary_window.clone(),
             exhausted_reason: existing_exhausted,
-            observed_at_ms: donor.observed_at_ms,
+            observed_at_ms: Some(donor_obs),
         });
     }
 }
@@ -3251,12 +3267,7 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
         else {
             continue;
         };
-        let observed_at_ms = val
-            .get("timestamp")
-            .or_else(|| val.pointer("/payload/timestamp"))
-            .or_else(|| val.get("ts"))
-            .or_else(|| val.pointer("/payload/ts"))
-            .and_then(parse_timestamp_value_ms);
+        let observed_at_ms = val.get("timestamp").and_then(parse_timestamp_value_ms);
         let tier = limits
             .get("plan_type")
             .and_then(Value::as_str)
@@ -3295,18 +3306,6 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
         let secondary_window =
             raw_secondary.filter(|w| w.resets_at_ms.is_none_or(|reset| reset > now_ms));
         if had_window_with_reset {
-            let reason_lower = exhausted_reason
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-            let names_expired_primary = primary_expired
-                && ["primary", "five_hour", "5h"]
-                    .iter()
-                    .any(|token| reason_lower.contains(token));
-            let names_expired_secondary = secondary_expired
-                && ["secondary", "weekly", "7d"]
-                    .iter()
-                    .any(|token| reason_lower.contains(token));
             let any_active_exhausted = primary_window
                 .as_ref()
                 .is_some_and(|w| w.used_percent >= 100.0)
@@ -3314,8 +3313,7 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
                     .as_ref()
                     .is_some_and(|w| w.used_percent >= 100.0);
             if (primary_window.is_none() && secondary_window.is_none())
-                || ((primary_expired || secondary_expired)
-                    && (names_expired_primary || names_expired_secondary || !any_active_exhausted))
+                || ((primary_expired || secondary_expired) && !any_active_exhausted)
             {
                 exhausted_reason = None;
             }
@@ -3360,9 +3358,10 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
         let Some(ctx) = val.get("ctx") else {
             continue;
         };
-        let line_observed_ms = ["time", "timestamp", "ts", "at"]
-            .into_iter()
-            .find_map(|key| val.get(key).and_then(parse_timestamp_value_ms));
+        let line_observed_ms = val
+            .get("time")
+            .or_else(|| val.get("timestamp"))
+            .and_then(parse_timestamp_value_ms);
         let tier = ctx
             .get("subscriptionTier")
             .and_then(Value::as_str)
@@ -3447,14 +3446,10 @@ fn muse_quota_from_session(raw: &str) -> Option<SessionQuotaUsage> {
         }
         resets_at_ms = parse_reset_instant_from_reason(reason);
         exhausted_reason = Some(reason.to_string());
-        observed_at_ms = ["timestamp", "ts", "at", "created_at"]
-            .into_iter()
-            .find_map(|k| {
-                val.get(k)
-                    .or_else(|| val.pointer(&format!("/payload/{k}")))
-                    .or_else(|| val.pointer(&format!("/payload/event/{k}")))
-                    .and_then(parse_timestamp_value_ms)
-            });
+        observed_at_ms = val
+            .get("recorded_at")
+            .or_else(|| val.get("timestamp"))
+            .and_then(parse_timestamp_value_ms);
     }
     let exhausted_reason = exhausted_reason?;
     if resets_at_ms.is_some_and(|reset| reset <= now_ms) {
@@ -3688,6 +3683,7 @@ pub(crate) struct TranscriptReads {
     raw: BTreeMap<String, String>,
     turns: BTreeMap<String, Vec<TranscriptTurn>>,
     stamps: BTreeMap<String, TranscriptStamp>,
+    grok_quota: BTreeMap<PathBuf, Option<SessionQuotaUsage>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3801,6 +3797,16 @@ impl TranscriptReads {
             self.turns.insert(path.to_string(), parsed);
         }
         self.turns.get(path).map(Vec::as_slice)
+    }
+
+    /// Reuse one parsed read of `<home>/.grok/logs/unified.jsonl` across a discovery poll.
+    fn grok_quota(&mut self, home: &Path) -> Option<SessionQuotaUsage> {
+        if let Some(cached) = self.grok_quota.get(home) {
+            return cached.clone();
+        }
+        let parsed = grok_quota_from_home(home);
+        self.grok_quota.insert(home.to_path_buf(), parsed.clone());
+        parsed
     }
 }
 
@@ -3970,7 +3976,7 @@ fn quota_for_resolved_route_locked(
             .and_then(codex_quota_from_rollout),
         "grok" => {
             let home = home?;
-            grok_quota_from_home(&home)
+            files.grok_quota(&home)
         }
         "muse" => {
             let disk = transcript_path.and_then(|path| muse_quota_from_session(files.raw(path)?));
@@ -13460,6 +13466,187 @@ mod tests {
         assert_eq!(quota.tier.as_deref(), Some("SuperGrok"));
         assert_eq!(quota.secondary_window.as_ref().unwrap().used_percent, 19.5);
         assert_eq!(quota.observed_at_ms, Some(expected_obs));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_sibling_propagation_orders_by_observed_at_first_and_never_propagates_unknown_timestamps()
+     {
+        let home = TempDir::new().unwrap();
+        let now_ms = fl_exec::stamp::now().unix_millis();
+        let nov_1_ms = fl_core::At::parse("2026-11-01T10:00:00.000Z")
+            .unwrap()
+            .unix_millis();
+        let nov_9_ms = fl_core::At::parse("2026-11-09T10:00:00.000Z")
+            .unwrap()
+            .unix_millis();
+
+        // 1. Reproduce A/B: Session A (Nov 9, secondary 90% only) vs Session B (Nov 1, primary 1% + secondary 5%).
+        // Session A is newer, so Session A wins even with 1 live window vs 2, and Session B updates to Nov 9 (90%).
+        let rollout_a = write_codex_rollout(
+            home.path(),
+            "codex-nov-9-exhausted",
+            &serde_json::json!({
+                "timestamp": "2026-11-09T10:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "secondary": { "used_percent": 90.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let rollout_b = write_codex_rollout(
+            home.path(),
+            "codex-nov-1-stale",
+            &serde_json::json!({
+                "timestamp": "2026-11-01T10:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "primary": { "used_percent": 1.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
+                        "secondary": { "used_percent": 5.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let rollout_no_ts = write_codex_rollout(
+            home.path(),
+            "codex-no-timestamp",
+            &serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": "plus",
+                        "primary": { "used_percent": 2.0, "window_minutes": 300, "resets_at": 4_100_000_000_i64 },
+                        "secondary": { "used_percent": 3.0, "window_minutes": 10080, "resets_at": 4_100_086_400_i64 }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let routes: RouteTable = serde_json::from_value(serde_json::json!({
+            "entries": {
+                "agent-a": {
+                    "persona": "agent-a",
+                    "updated_at": "2026-11-01T00:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-nov-9-exhausted", "transcript_path": rollout_a }
+                },
+                "agent-b": {
+                    "persona": "agent-b",
+                    "updated_at": "2026-11-09T12:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-nov-1-stale", "transcript_path": rollout_b }
+                },
+                "agent-c": {
+                    "persona": "agent-c",
+                    "updated_at": "2026-11-09T13:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-no-timestamp", "transcript_path": rollout_no_ts }
+                }
+            }
+        }))
+        .unwrap();
+
+        let sessions = discover_sessions_from_routes(
+            &DiscoveryStoreSnapshot::default(),
+            Some(home.path()),
+            true,
+            routes,
+            None,
+        );
+        let find = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .quota_usage
+                .as_ref()
+                .unwrap()
+        };
+        let a = find("codex-nov-9-exhausted");
+        let b = find("codex-nov-1-stale");
+        let c = find("codex-no-timestamp");
+        for q in [a, b, c] {
+            assert!(
+                q.primary_window.is_none(),
+                "older 2-window reading must not overwrite newer 1-window reading"
+            );
+            assert_eq!(q.secondary_window.as_ref().unwrap().used_percent, 90.0);
+            assert_eq!(q.observed_at_ms, Some(nov_9_ms));
+        }
+
+        // 2. Unknown timestamp (None) never outranks a known timestamp in quota_selection_score,
+        // and never acts as a donor to overwrite another session's reading.
+        let unknown_two_windows = SessionQuotaUsage {
+            tier: Some("plus".to_string()),
+            primary_window: Some(QuotaWindowUsage {
+                used_percent: 1.0,
+                window_minutes: Some(300),
+                resets_at_ms: Some(4_100_000_000_000),
+            }),
+            secondary_window: Some(QuotaWindowUsage {
+                used_percent: 2.0,
+                window_minutes: Some(10_080),
+                resets_at_ms: Some(4_100_086_400_000),
+            }),
+            exhausted_reason: None,
+            observed_at_ms: None,
+        };
+        let known_one_window = SessionQuotaUsage {
+            tier: Some("plus".to_string()),
+            primary_window: None,
+            secondary_window: Some(QuotaWindowUsage {
+                used_percent: 90.0,
+                window_minutes: Some(10_080),
+                resets_at_ms: Some(4_100_086_400_000),
+            }),
+            exhausted_reason: None,
+            observed_at_ms: Some(nov_1_ms),
+        };
+        assert!(
+            quota_selection_score(&known_one_window, now_ms)
+                > quota_selection_score(&unknown_two_windows, now_ms)
+        );
+
+        // When only an untimestamped session has windows, it must not overwrite a sibling session.
+        let rollout_idle = write_codex_rollout(home.path(), "codex-idle-only", "{}");
+        let untimestamped_only_routes: RouteTable = serde_json::from_value(serde_json::json!({
+            "entries": {
+                "agent-c": {
+                    "persona": "agent-c",
+                    "updated_at": "2026-11-09T13:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-no-timestamp", "transcript_path": rollout_no_ts }
+                },
+                "agent-idle": {
+                    "persona": "agent-idle",
+                    "updated_at": "2026-11-09T14:00:00.000Z",
+                    "route": { "kind": "codex", "thread_id": "codex-idle-only", "transcript_path": rollout_idle }
+                }
+            }
+        }))
+        .unwrap();
+        let untimestamped_sessions = discover_sessions_from_routes(
+            &DiscoveryStoreSnapshot::default(),
+            Some(home.path()),
+            true,
+            untimestamped_only_routes,
+            None,
+        );
+        let idle = untimestamped_sessions
+            .iter()
+            .find(|s| s.id == "codex-idle-only")
+            .unwrap();
+        assert!(
+            idle.quota_usage.is_none(),
+            "untimestamped reading must not propagate to sibling sessions"
+        );
     }
 
     #[test]
