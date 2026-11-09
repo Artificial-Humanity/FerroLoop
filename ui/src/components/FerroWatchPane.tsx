@@ -1390,12 +1390,15 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 flexShrink: 0,
               }}
             >
-              <span
-                className="fd-badge"
-                style={{ fontSize: "10px", fontWeight: 600 }}
-              >
-                {summary?.health?.local_host || "ai-lab-0"}
-              </span>
+              {summary?.health?.local_host ? (
+                <span
+                  className="fd-badge"
+                  data-testid="ferrowatch-local-host-badge"
+                  style={{ fontSize: "10px", fontWeight: 600 }}
+                >
+                  {summary.health.local_host}
+                </span>
+              ) : null}
 
               <button
                 type="button"
