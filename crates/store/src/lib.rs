@@ -26,6 +26,7 @@ pub mod knowledge;
 pub mod manifest;
 pub mod migrate;
 pub mod private;
+pub mod recovery;
 pub mod rollup;
 pub mod state;
 mod wire_delivery;

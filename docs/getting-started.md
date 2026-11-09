@@ -77,6 +77,7 @@ Commands:
   hub         Run and manage the FerroLoop Hub daemon and FerroDeck command center
   host        Run and manage the native FerroLoop Agent Host (`fl-host`) daemon and sessions
   store       Look at, and tend, the engine file behind the bound store
+  recovery    Inspect recovery metadata without opening stores
   vault       Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway [alias: gateway]
   auth        Owner warrants: signed, scoped, expiring grants of Owner authority (`grant`, `verify`, `list`, `revoke`)
   watch       FerroWatch: telemetry rollups, agent liveness and alerts over the workspace store

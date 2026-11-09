@@ -837,6 +837,45 @@ mod tests {
     }
 
     #[test]
+    fn recovery_inventory_matches_hub_slug_and_file_resolution() {
+        use fl_store::recovery::inventory::hub_lookup;
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        fs::write(dir.join("regular.fls"), b"metadata only").unwrap();
+        fs::write(dir.join("legacy.redb"), b"metadata only").unwrap();
+        std::os::unix::fs::symlink("regular.fls", dir.join("linked.fls")).unwrap();
+        for raw in [
+            "",
+            " Regular ",
+            "legacy",
+            "linked",
+            "missing",
+            "fl",
+            "../escape",
+            "bad.dot",
+        ] {
+            for env in [None, Some("ferro"), Some("redb")] {
+                let observed = hub_lookup(tmp.path(), raw, env).unwrap();
+                match normalize_project(Some(raw)) {
+                    Err(_) => assert_eq!(observed.refusal_status, Some(400)),
+                    Ok(slug) => match project_redb_with(tmp.path(), &slug, env) {
+                        Ok(Some(path)) => {
+                            assert_eq!(observed.logical_path, path);
+                            assert!(!observed.fallback);
+                            assert_eq!(observed.refusal_status, None);
+                        }
+                        Ok(None) => {
+                            assert!(observed.fallback);
+                            assert_eq!(observed.refusal_status, None);
+                        }
+                        Err(response) => assert_eq!(observed.refusal_status, Some(response.status)),
+                    },
+                }
+            }
+        }
+    }
+
+    #[test]
     fn project_redb_follows_the_engine_and_refuses_an_unmigrated_project() {
         let tmp = TempDir::new().unwrap();
         let dir = fl_dir(&tmp);

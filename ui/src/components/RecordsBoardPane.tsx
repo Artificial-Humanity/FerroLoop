@@ -79,9 +79,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const activeCurrency = useActiveCurrency();
 
   const [project, setProject] = useState<string>(() =>
-    selectedProject !== undefined
-      ? (selectedProject ?? "").trim().toLowerCase()
-      : "ferroloop",
+    (selectedProject ?? "").trim().toLowerCase(),
   );
   const listedProjects = useMemo(
     () => projects.map((p) => p.slug.trim().toLowerCase()),
@@ -174,11 +172,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   useEffect(() => {
     if (selectedProject !== prevSelectedProjectRef.current) {
       prevSelectedProjectRef.current = selectedProject;
-      setProject(
-        selectedProject !== undefined
-          ? (selectedProject ?? "").trim().toLowerCase()
-          : "ferroloop",
-      );
+      setProject((selectedProject ?? "").trim().toLowerCase());
     }
   }, [selectedProject]);
 
