@@ -76,24 +76,41 @@ pub fn check_codex_project_trust(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or("invalid Git directory marker")?;
-            let gitdir = project.join(gitdir);
-            let common = read_trust_file(&gitdir.join("commondir"), 8192)
-                .map_err(|why| format!("Git common directory marker: {why}"))?;
-            if common.trim().is_empty() {
-                return Err("invalid Git common directory".into());
-            }
-            let common = gitdir
-                .join(common.trim())
+            let gitdir = project
+                .join(gitdir)
                 .canonicalize()
-                .map_err(|_| "cannot resolve Git common directory")?;
-            if !common.is_dir() {
-                return Err("Git common directory is not a directory".into());
+                .map_err(|_| "cannot resolve Git directory")?;
+            if !gitdir.is_dir() {
+                return Err("Git directory is not a directory".into());
             }
-            let main = common
-                .parent()
-                .ok_or("Git common directory has no parent")?;
-            if main != project {
-                keys.push(main.into());
+            let common_marker = gitdir.join("commondir");
+            match common_marker.symlink_metadata() {
+                // Submodules and --separate-git-dir repositories do not need
+                // commondir. Its absence leaves only the explicit project key.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("cannot inspect Git common directory marker".into()),
+                Ok(_) => {
+                    // Inspect without following symlinks above, so a dangling
+                    // marker is refused rather than treated as absent.
+                    let common = read_trust_file(&common_marker, 8192)
+                        .map_err(|why| format!("Git common directory marker: {why}"))?;
+                    if common.trim().is_empty() {
+                        return Err("invalid Git common directory".into());
+                    }
+                    let common = gitdir
+                        .join(common.trim())
+                        .canonicalize()
+                        .map_err(|_| "cannot resolve Git common directory")?;
+                    if !common.is_dir() {
+                        return Err("Git common directory is not a directory".into());
+                    }
+                    let main = common
+                        .parent()
+                        .ok_or("Git common directory has no parent")?;
+                    if main != project {
+                        keys.push(main.into());
+                    }
+                }
             }
         }
         let text = read_trust_file(config_path, 1024 * 1024)?;
@@ -437,6 +454,96 @@ mod tests {
     }
 
     #[test]
+    fn trust_accepts_standalone_gitfiles_without_a_common_directory() {
+        // Faithful layouts for `git init --separate-git-dir` and an absorbed
+        // submodule: both own their objects/refs and have no commondir file.
+        for relative_gitdir in ["../separate.git", "../super/.git/modules/project"] {
+            let (_dir, cwd, config) = trust_fixture();
+            let gitdir = cwd.join(relative_gitdir);
+            std::fs::create_dir_all(gitdir.join("objects/info")).unwrap();
+            std::fs::create_dir_all(gitdir.join("objects/pack")).unwrap();
+            std::fs::create_dir_all(gitdir.join("refs/heads")).unwrap();
+            std::fs::create_dir_all(gitdir.join("refs/tags")).unwrap();
+            std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(
+                gitdir.join("config"),
+                "[core]\nrepositoryformatversion = 0\nbare = false\n",
+            )
+            .unwrap();
+            std::fs::write(cwd.join(".git"), format!("gitdir: {relative_gitdir}\n")).unwrap();
+            let sub = cwd.join("src");
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+            let checked = check_codex_project_trust(&sub, &config).unwrap();
+            assert_eq!(checked.cwd, sub);
+            assert_eq!(checked.trust_key, cwd);
+
+            // No inferred trust from the separate gitdir or superproject.
+            std::fs::write(
+                &config,
+                trust_entry(&gitdir.canonicalize().unwrap(), "trusted"),
+            )
+            .unwrap();
+            assert!(check_codex_project_trust(&sub, &config).is_err());
+            std::fs::write(&config, trust_entry(&cwd, "untrusted")).unwrap();
+            assert!(check_codex_project_trust(&sub, &config).is_err());
+        }
+    }
+
+    #[test]
+    fn trust_rejects_malformed_linked_worktree_common_directory() {
+        let (dir, cwd, config) = trust_fixture();
+        let gitdir = dir.path().join("main/.git/worktrees/project");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(gitdir.join("gitdir"), cwd.join(".git").to_str().unwrap()).unwrap();
+        std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+        // Missing optional commondir suppresses fallback, not explicit trust.
+        assert_eq!(
+            check_codex_project_trust(&cwd, &config).unwrap().trust_key,
+            cwd
+        );
+        let common = gitdir.join("commondir");
+        for bytes in [
+            b"\n".to_vec(),
+            b"missing-directory\n".to_vec(),
+            b"HEAD\n".to_vec(),
+            vec![0xff],
+            vec![b'x'; 8193],
+        ] {
+            std::fs::write(&common, bytes).unwrap();
+            assert!(check_codex_project_trust(&cwd, &config).is_err());
+        }
+        std::fs::remove_file(&common).unwrap();
+        std::fs::create_dir(&common).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_rejects_unreadable_or_dangling_common_directory_metadata() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, cwd, config) = trust_fixture();
+        let gitdir = dir.path().join("main/.git/worktrees/project");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(gitdir.join("gitdir"), cwd.join(".git").to_str().unwrap()).unwrap();
+        std::fs::write(&config, trust_entry(&cwd, "trusted")).unwrap();
+        let common = gitdir.join("commondir");
+        std::fs::write(&common, "../..\n").unwrap();
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&common).is_err() {
+            assert!(check_codex_project_trust(&cwd, &config).is_err());
+        }
+        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&common).unwrap();
+        symlink("missing-target", &common).unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+    }
+
+    #[test]
     fn trust_refusals_are_bounded_actionable_and_redacted() {
         let (_dir, cwd, config) = trust_fixture();
         for bytes in [
@@ -523,9 +630,12 @@ mod tests {
             assert!(!err.contains("PRIVATE_TOKEN"));
         }
         let gitdir = dir.path().join("gitdir");
-        std::fs::create_dir(&gitdir).unwrap();
         std::fs::write(cwd.join(".git"), format!("gitdir: {}", gitdir.display())).unwrap();
         assert!(check_codex_project_trust(&cwd, &config).is_err());
+        std::fs::write(&gitdir, "not a directory").unwrap();
+        assert!(check_codex_project_trust(&cwd, &config).is_err());
+        std::fs::remove_file(&gitdir).unwrap();
+        std::fs::create_dir(&gitdir).unwrap();
         std::fs::write(gitdir.join("commondir"), "x".repeat(8193)).unwrap();
         assert!(check_codex_project_trust(&cwd, &config).is_err());
     }
