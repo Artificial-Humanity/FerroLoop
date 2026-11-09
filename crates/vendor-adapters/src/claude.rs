@@ -452,10 +452,6 @@ impl VendorHostAdapter for ClaudeHostAdapter {
         &self,
         request: &VendorLaunchRequest,
     ) -> Result<VendorLaunchPlan, VendorAdapterError> {
-        let cfg =
-            self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
-        let binary = self.resolve_binary(request.home_dir.as_deref());
-
         // Place `--remote-control` before `--permission-mode <mode>` so `--remote-control [name]`
         // in Commander.js is always followed by a `--` flag and never consumes a trailing
         // positional `<prompt>` when `model` and `thinking_effort` are both `None`.
@@ -464,10 +460,13 @@ impl VendorHostAdapter for ClaudeHostAdapter {
             &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
             request.posture,
         )
-        .map_err(|e| VendorAdapterError::InvalidConfig {
+        .map_err(|e| VendorAdapterError::PermissionRefused {
             vendor: self.vendor_id().to_string(),
             reason: format!("posture: {e}"),
         })?;
+        let cfg =
+            self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
+        let binary = self.resolve_binary(request.home_dir.as_deref());
         let mut argv = vec![binary.clone()];
         if request.remote_control {
             argv.push("--remote-control".to_string());
@@ -513,21 +512,20 @@ impl VendorHostAdapter for ClaudeHostAdapter {
         &self,
         request: &AttachOrResumeRequest,
     ) -> Result<VendorLaunchPlan, VendorAdapterError> {
-        let session_id =
-            validate_required_session_id(&request.vendor_session_id, "prepare_resume")?;
-        let cfg =
-            self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
-        let binary = self.resolve_binary(request.home_dir.as_deref());
-
         let perms = fl_core::permissions::compile_posture(
             fl_core::permissions::Vendor::Claude,
             &fl_core::permissions::VendorFacts::new(fl_core::permissions::Transport::Pty),
             request.posture,
         )
-        .map_err(|e| VendorAdapterError::InvalidConfig {
+        .map_err(|e| VendorAdapterError::PermissionRefused {
             vendor: self.vendor_id().to_string(),
             reason: format!("posture: {e}"),
         })?;
+        let session_id =
+            validate_required_session_id(&request.vendor_session_id, "prepare_resume")?;
+        let cfg =
+            self.validate_config(request.model.as_deref(), request.thinking_effort.as_deref())?;
+        let binary = self.resolve_binary(request.home_dir.as_deref());
         let mut argv = vec![binary.clone()];
         if request.remote_control {
             argv.push("--remote-control".to_string());

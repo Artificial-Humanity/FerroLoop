@@ -294,6 +294,8 @@ pub enum TeardownOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VendorAdapterError {
+    #[error("permission policy refused for vendor `{vendor}`: {reason}")]
+    PermissionRefused { vendor: String, reason: String },
     #[error("invalid configuration for vendor `{vendor}`: {reason}")]
     InvalidConfig { vendor: String, reason: String },
     #[error("generation mismatch: expected {expected}, actual {actual}")]
