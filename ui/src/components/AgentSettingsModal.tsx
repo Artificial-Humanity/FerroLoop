@@ -9,7 +9,7 @@ import {
   togglePinnedAgent,
   usePinnedState,
 } from "./RosterSidebar";
-import { evaluateQuotaStatus } from "../utils/quotaStatus";
+import { evaluateQuotaStatus, resolveQuotaPoolKey } from "../utils/quotaStatus";
 import {
   canonicalizeDefaultRole,
   CREATE_CUSTOM_ROLE_VALUE,
@@ -563,7 +563,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const [contextWindowNotice, setContextWindowNotice] =
     useState<ContextWindowNotice | null>(null);
   const [pendingAgyModel, setPendingAgyModel] = useState<string | null>(null);
-  const [pickedModel, setPickedModel] = useState<string | null>(null);
   const contextWindowSelectRef = useRef<HTMLSelectElement | null>(null);
   const contextWindowRequestRef = useRef(0);
   const contextWindowRefocusRef = useRef(false);
@@ -576,7 +575,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setContextWindowSending(false);
     setContextWindowNotice(null);
     setPendingAgyModel(null);
-    setPickedModel(null);
   }, [isOpen, sessionId, agentName, selectedModel, selectedThinkingLevel]);
   useEffect(() => {
     // The hub reported a different window: follow the server from here on.
@@ -658,20 +656,23 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   });
   const canFetchSessions =
     Boolean(apiClient) && typeof apiClient?.getSessions === "function";
-  const lastVendorStateRef = useRef<{
-    vendor: string;
+  const quotaSourceRef = useRef<{
+    poolKey: string;
     quotaUsage: SessionQuotaUsage | null | undefined;
+    staleAcrossPoolSwitch: boolean;
   }>({
-    vendor: canonicalAdapter(adapter ?? ""),
-    quotaUsage,
+    poolKey: "",
+    quotaUsage: undefined,
+    staleAcrossPoolSwitch: false,
   });
   useEffect(() => {
     setFetchedSession(null);
     const { apiClient: client, ...propsAtRequest } = latestPropsRef.current;
     requestSnapshotRef.current = propsAtRequest;
-    lastVendorStateRef.current = {
-      vendor: canonicalAdapter(propsAtRequest.adapter ?? ""),
-      quotaUsage: propsAtRequest.quotaUsage,
+    quotaSourceRef.current = {
+      poolKey: "",
+      quotaUsage: undefined,
+      staleAcrossPoolSwitch: false,
     };
     setOverridden((prev) => (prev === NO_OVERRIDES ? prev : NO_OVERRIDES));
     if (!isOpen || !canFetchSessions || !client || (!sessionId && !agentName)) {
@@ -749,13 +750,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, recastModalOpen, recasting, onClose]);
 
-  if (!isOpen) {
-    return null;
-  }
-
-  const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
-  const agentKey = (agentName || displayTarget).trim().toLowerCase();
-  const targetSessionOrAgent = sessionId || agentName || "";
   // A field is overridden once latched, and also in the render where its prop
   // first differs from the request snapshot (before the latch effect has run).
   const isOverridden = <K extends keyof OverrideLatch>(
@@ -802,7 +796,80 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     effectiveAvailableModels,
   );
   const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
-  const shownModel = pendingAgyModel || pickedModel || effectiveModel;
+  const shownModel = pendingAgyModel || effectiveModel;
+  const isQuotaOverridden =
+    overridden.quotaUsage ||
+    !sameModalQuotaUsage(
+      quotaUsage,
+      fetchedSession !== null ? fetchedSession.props.quotaUsage : requestSnapshotRef.current.quotaUsage,
+    );
+  const isAdapterOverridden =
+    isOverridden("adapter", adapter) ||
+    adapter !== requestSnapshotRef.current.adapter;
+  const sessionVendor = canonicalAdapter(
+    (fetchedSession?.adapter && fetchedSession.adapter.trim().toLowerCase() !== "unknown"
+      ? fetchedSession.adapter
+      : requestSnapshotRef.current.adapter) ?? "",
+  );
+  const effectiveVendor = canonicalAdapter(effectiveAdapter ?? "");
+  const currentPoolKey = resolveQuotaPoolKey(effectiveAdapter, effectiveModel);
+  const candidateQuotaUsage = (() => {
+    const fetchedQuota = fetchedSession?.quotaUsage ?? null;
+    const propQuota = quotaUsage ?? null;
+    if (propQuota && fetchedQuota) {
+      const propTs = propQuota.observed_at_ms;
+      const fetchedTs = fetchedQuota.observed_at_ms;
+      if (
+        typeof propTs === "number" &&
+        Number.isFinite(propTs) &&
+        typeof fetchedTs === "number" &&
+        Number.isFinite(fetchedTs) &&
+        propTs !== fetchedTs
+      ) {
+        return propTs > fetchedTs ? propQuota : fetchedQuota;
+      }
+      return isQuotaOverridden ? propQuota : fetchedQuota;
+    }
+    if (fetchedSession !== null && !isQuotaOverridden) {
+      return fetchedQuota ?? propQuota;
+    }
+    return propQuota ?? fetchedQuota;
+  })();
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const prev = quotaSourceRef.current;
+    if (!prev.poolKey) {
+      quotaSourceRef.current = {
+        poolKey: currentPoolKey,
+        quotaUsage: candidateQuotaUsage,
+        staleAcrossPoolSwitch: false,
+      };
+      return;
+    }
+    const sameQuota = sameModalQuotaUsage(candidateQuotaUsage, prev.quotaUsage);
+    if (currentPoolKey !== prev.poolKey) {
+      quotaSourceRef.current = {
+        poolKey: currentPoolKey,
+        quotaUsage: candidateQuotaUsage,
+        staleAcrossPoolSwitch: sameQuota,
+      };
+    } else if (!sameQuota) {
+      quotaSourceRef.current = {
+        poolKey: currentPoolKey,
+        quotaUsage: candidateQuotaUsage,
+        staleAcrossPoolSwitch: false,
+      };
+    }
+  }, [isOpen, currentPoolKey, candidateQuotaUsage]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
+  const agentKey = (agentName || displayTarget).trim().toLowerCase();
+  const targetSessionOrAgent = sessionId || agentName || "";
   const effectiveThinkingLevel =
     fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
     selectedThinkingLevel;
@@ -947,56 +1014,24 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     (executionMode !== undefined ? executionMode : null);
   const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
   const executionModeIsYolo = executionModeKey === "yolo";
-  const isQuotaOverridden =
-    overridden.quotaUsage ||
-    !sameModalQuotaUsage(
-      quotaUsage,
-      fetchedSession !== null ? fetchedSession.props.quotaUsage : requestSnapshotRef.current.quotaUsage,
-    );
-  const isAdapterOverridden =
-    isOverridden("adapter", adapter) ||
-    adapter !== requestSnapshotRef.current.adapter;
-  const sessionVendor = canonicalAdapter(
-    (fetchedSession?.adapter && fetchedSession.adapter.trim().toLowerCase() !== "unknown"
-      ? fetchedSession.adapter
-      : requestSnapshotRef.current.adapter) ?? "",
+  const sameAsTrackedQuota = sameModalQuotaUsage(
+    candidateQuotaUsage,
+    quotaSourceRef.current.quotaUsage,
   );
-  const effectiveVendor = canonicalAdapter(effectiveAdapter ?? "");
-  if (effectiveVendor && effectiveVendor === lastVendorStateRef.current.vendor) {
-    lastVendorStateRef.current.quotaUsage = quotaUsage;
-  }
-  const quotaUnchangedAcrossVendorSwitch =
-    effectiveVendor !== lastVendorStateRef.current.vendor &&
-    sameModalQuotaUsage(quotaUsage, lastVendorStateRef.current.quotaUsage);
+  const isQuotaFromPreviousPool = Boolean(
+    quotaSourceRef.current.poolKey &&
+      currentPoolKey &&
+      ((currentPoolKey !== quotaSourceRef.current.poolKey && sameAsTrackedQuota) ||
+        (currentPoolKey === quotaSourceRef.current.poolKey &&
+          quotaSourceRef.current.staleAcrossPoolSwitch &&
+          sameAsTrackedQuota)),
+  );
   const adapterChangedAcrossVendors =
     isAdapterOverridden &&
     Boolean(sessionVendor && effectiveVendor && sessionVendor !== effectiveVendor) &&
-    (!isQuotaOverridden || quotaUnchangedAcrossVendorSwitch);
-  const effectiveQuotaUsage = (() => {
-    if (adapterChangedAcrossVendors) {
-      return null;
-    }
-    const fetchedQuota = fetchedSession?.quotaUsage ?? null;
-    const propQuota = quotaUsage ?? null;
-    if (propQuota && fetchedQuota) {
-      const propTs = propQuota.observed_at_ms;
-      const fetchedTs = fetchedQuota.observed_at_ms;
-      if (
-        typeof propTs === "number" &&
-        Number.isFinite(propTs) &&
-        typeof fetchedTs === "number" &&
-        Number.isFinite(fetchedTs) &&
-        propTs !== fetchedTs
-      ) {
-        return propTs > fetchedTs ? propQuota : fetchedQuota;
-      }
-      return isQuotaOverridden ? propQuota : fetchedQuota;
-    }
-    if (fetchedSession !== null && !isQuotaOverridden) {
-      return fetchedQuota ?? propQuota;
-    }
-    return propQuota ?? fetchedQuota;
-  })();
+    (!isQuotaOverridden || isQuotaFromPreviousPool);
+  const effectiveQuotaUsage =
+    adapterChangedAcrossVendors || isQuotaFromPreviousPool ? null : candidateQuotaUsage;
   const effectiveLivenessState: "alive" | "stale" | "dead" =
     livenessState ??
     (fetchedSession?.status
@@ -1009,7 +1044,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const quotaEval = evaluateQuotaStatus({
     quotaUsage: effectiveQuotaUsage,
     vendor: effectiveAdapter,
-    model: shownModel,
+    model: effectiveModel,
   });
   const livenessLabel =
     effectiveLivenessState === "alive"
@@ -1410,7 +1445,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   onChange={(e) => {
                     const nextModel = e.target.value;
                     setOverridden((prev) => (prev.model ? prev : { ...prev, model: true }));
-                    setPickedModel(nextModel);
                     if (
                       isAgySession &&
                       !effectiveThinking &&
@@ -1469,7 +1503,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     setOverridden((prev) =>
                       prev.thinkingLevel ? prev : { ...prev, thinkingLevel: true },
                     );
-                    const modelToApply = pendingAgyModel || pickedModel || effectiveModel;
+                    const modelToApply = pendingAgyModel || effectiveModel;
                     setPendingAgyModel(null);
                     onChangeModelAndThinking(modelToApply, nextThinking);
                   }}

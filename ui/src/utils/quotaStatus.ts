@@ -30,6 +30,7 @@ export interface StaleQuotaReading {
   remainingPercent: number | null;
   windowLabel: string | null;
   resetsAtMs: number | null;
+  resetInLabel: string | null;
   ageMs: number | null;
   ageLabel: string;
   summaryLabel: string;
@@ -63,10 +64,22 @@ function isAntigravityVendor(vendor?: string | null): boolean {
   );
 }
 
+const QUOTA_THRESHOLD_BOUNDARIES = [0, 1, 10, 20, 80, 90, 99, 100] as const;
+
 export function formatQuotaPercent(value: number): string {
   const clamped = Math.max(0, Math.min(100, value));
-  const rounded = Math.round(clamped * 10) / 10;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  const rounded1 = Math.round(clamped * 10) / 10;
+  const crossedBoundary = QUOTA_THRESHOLD_BOUNDARIES.find(
+    (b) => rounded1 === b && Math.abs(clamped - b) > 1e-9,
+  );
+  if (crossedBoundary !== undefined) {
+    let rounded2 = Math.round(clamped * 100) / 100;
+    if (rounded2 === crossedBoundary) {
+      rounded2 = crossedBoundary + (clamped > crossedBoundary ? 0.01 : -0.01);
+    }
+    return String(Number(rounded2.toFixed(2)));
+  }
+  return Number.isInteger(rounded1) ? String(rounded1) : rounded1.toFixed(1);
 }
 
 export function formatQuotaWindowLabel(
@@ -146,6 +159,18 @@ export function resolveAntigravityModelPool(
   return null;
 }
 
+export function resolveQuotaPoolKey(
+  vendor?: string | null,
+  model?: string | null,
+): string {
+  const cleanVendor = (vendor ?? "").trim().toLowerCase();
+  if (isAntigravityVendor(cleanVendor)) {
+    const pool = resolveAntigravityModelPool(model);
+    return pool ? `antigravity:${pool}` : "antigravity";
+  }
+  return cleanVendor && cleanVendor !== "unknown" ? cleanVendor : "";
+}
+
 export function formatQuotaPoolLabel(
   vendor?: string | null,
   tier?: string | null,
@@ -191,7 +216,8 @@ function parseQuotaWindow(
   if (
     !window ||
     typeof window.used_percent !== "number" ||
-    !Number.isFinite(window.used_percent)
+    !Number.isFinite(window.used_percent) ||
+    window.used_percent < 0
   ) {
     return {
       present: false,
@@ -351,17 +377,22 @@ export function evaluateQuotaStatus(
     const remainingPercent = limitingWindow?.remainingPercent ?? null;
     const windowLabel = limitingWindow?.windowLabel ?? null;
     const resetsAtMs = limitingWindow?.resetsAtMs ?? null;
+    const resetInLabel =
+      limitingWindow?.resetInLabel ?? formatQuotaResetIn(resetsAtMs, nowMs);
     const ageLabel = formatQuotaAge(ageMs);
     const valuePart =
       usedPercent !== null
         ? `${formatQuotaPercent(usedPercent)}% used`
         : "exhausted";
-    const summaryLabel = `${valuePart}, ${ageLabel}`;
+    const summaryLabel = [valuePart, ageLabel, resetInLabel]
+      .filter(Boolean)
+      .join(", ");
     const staleReading: StaleQuotaReading = {
       usedPercent,
       remainingPercent,
       windowLabel,
       resetsAtMs,
+      resetInLabel,
       ageMs,
       ageLabel,
       summaryLabel,
@@ -384,13 +415,28 @@ export function evaluateQuotaStatus(
     (limitingWindow !== null && limitingWindow.usedPercent >= 100);
 
   if (confirmedExhausted) {
-    const metaParts = [
-      limitingWindow ? `${limitingWindow.windowLabel} window` : null,
-      "0% remaining",
-      limitingWindow ? `${formatQuotaPercent(limitingWindow.usedPercent)}% used` : null,
-      limitingWindow?.resetInLabel ?? null,
-      activeExhaustedReason ? `reason: ${activeExhaustedReason}` : null,
-    ].filter(Boolean);
+    const isWindowUnder100 =
+      limitingWindow !== null && limitingWindow.usedPercent < 100;
+    const cleanVendor = (input.vendor ?? "").trim().toLowerCase();
+    const reportedByVendor =
+      cleanVendor && cleanVendor !== "unknown" ? cleanVendor : "vendor";
+    const headerText = isWindowUnder100
+      ? `Quota exhausted (reported by ${reportedByVendor})`
+      : "Quota exhausted";
+    const metaParts = isWindowUnder100
+      ? [
+          `${limitingWindow.windowLabel} window`,
+          `${formatQuotaPercent(limitingWindow.remainingPercent)}% remaining (${formatQuotaPercent(limitingWindow.usedPercent)}% used)`,
+          limitingWindow.resetInLabel,
+          activeExhaustedReason ? `reason: ${activeExhaustedReason}` : null,
+        ].filter(Boolean)
+      : [
+          limitingWindow ? `${limitingWindow.windowLabel} window` : null,
+          "0% remaining",
+          limitingWindow ? `${formatQuotaPercent(limitingWindow.usedPercent)}% used` : null,
+          limitingWindow?.resetInLabel ?? null,
+          activeExhaustedReason ? `reason: ${activeExhaustedReason}` : null,
+        ].filter(Boolean);
     const metaStr = metaParts.join(", ");
     return {
       status: "red",
@@ -399,8 +445,8 @@ export function evaluateQuotaStatus(
       exhaustedReason: activeExhaustedReason,
       staleReading: null,
       poolLabel,
-      shortReason: `Quota exhausted (${metaStr})`,
-      detailText: `Quota exhausted · ${metaStr}`,
+      shortReason: `${headerText} (${metaStr})`,
+      detailText: `${headerText} · ${metaStr}`,
     };
   }
 
@@ -479,7 +525,8 @@ export function resolveRosterStatusDot(
   const quotaClass =
     quotaEval.status === "yellow" ||
     quotaEval.status === "orange" ||
-    quotaEval.status === "red"
+    quotaEval.status === "red" ||
+    quotaEval.status === "unknown"
       ? ` fd-dot-quota-${quotaEval.status}`
       : "";
   const className = `${baseClass}${quotaClass}`;

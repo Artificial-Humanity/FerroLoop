@@ -199,7 +199,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
           observed_at_ms: FIXED_NOW_MS - 10_000,
           exhausted_reason: "usage_limit_reached",
           primary_window: {
-            used_percent: 94,
+            used_percent: 40,
             window_minutes: 300,
             resets_at_ms: FIXED_NOW_MS + 900_000,
           },
@@ -207,9 +207,101 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       });
       expect(byReason.status).toBe("red");
       expect(byReason.reasonKind).toBe("exhausted");
-      expect(byReason.detailText).toContain("Quota exhausted");
+      expect(byReason.shortReason).toContain("exhausted (reported by codex)");
+      expect(byReason.shortReason).toContain("60% remaining (40% used)");
+      expect(byReason.shortReason).not.toMatch(/(?:^|\D)0% remaining/);
+      expect(byReason.detailText).toContain("Quota exhausted (reported by codex)");
+      expect(byReason.detailText).toContain("60% remaining (40% used)");
+      expect(byReason.detailText).not.toMatch(/(?:^|\D)0% remaining/);
       expect(byReason.detailText).toContain("reason: usage_limit_reached");
       expect(byReason.detailText).toContain("resets in 15m");
+    });
+
+    it("preserves precision near threshold boundaries (used = 79.96 and used = 99.04) so text never rounds across a threshold", () => {
+      const near20 = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "claude",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 79.96,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 1_800_000,
+          },
+        },
+      });
+      expect(near20.status).toBe("normal");
+      expect(near20.reasonKind).toBe("normal");
+      expect(near20.shortReason).toContain("20.04% remaining");
+      expect(near20.shortReason).toContain("79.96% used");
+      expect(near20.shortReason).not.toContain("Quota: 20% remaining");
+
+      const near1 = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "claude",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 99.04,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 1_800_000,
+          },
+        },
+      });
+      expect(near1.status).toBe("red");
+      expect(near1.reasonKind).toBe("below_1_percent");
+      expect(near1.shortReason).toContain("0.96% remaining");
+      expect(near1.shortReason).toContain("99.04% used");
+      expect(near1.shortReason).not.toContain("(1% remaining");
+    });
+
+    it("treats used_percent < 0 and NaN as unknown (invalid) while clamping used_percent > 100 to 100% exhausted", () => {
+      const negativeUsed = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "claude",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: -5,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 1_800_000,
+          },
+        },
+      });
+      expect(negativeUsed.status).toBe("unknown");
+      expect(negativeUsed.reasonKind).toBe("missing");
+
+      const nanUsed = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "claude",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: Number.NaN,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 1_800_000,
+          },
+        },
+      });
+      expect(nanUsed.status).toBe("unknown");
+      expect(nanUsed.reasonKind).toBe("missing");
+
+      const over100Used = evaluateQuotaStatus({
+        nowMs: FIXED_NOW_MS,
+        vendor: "claude",
+        quotaUsage: {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 105,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 1_800_000,
+          },
+        },
+      });
+      expect(over100Used.status).toBe("red");
+      expect(over100Used.reasonKind).toBe("exhausted");
+      expect(over100Used.limitingWindow?.usedPercent).toBe(100);
+      expect(over100Used.limitingWindow?.remainingPercent).toBe(0);
     });
   });
 
@@ -348,7 +440,7 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(staleWindowless.staleReading?.summaryLabel).toBe("exhausted, 3 h ago");
     });
 
-    it("treats telemetry older than QUOTA_STALE_MS (1h) as unknown on the dot and records staleReading with age", () => {
+    it("treats telemetry older than QUOTA_STALE_MS (1h) as unknown on the dot and records staleReading with age and reset time", () => {
       const threeHoursAgo = FIXED_NOW_MS - 3 * QUOTA_STALE_MS;
       const stale = evaluateQuotaStatus({
         nowMs: FIXED_NOW_MS,
@@ -365,9 +457,11 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(stale.status).toBe("unknown");
       expect(stale.reasonKind).toBe("stale");
       expect(stale.staleReading).not.toBeNull();
-      expect(stale.staleReading?.summaryLabel).toBe("92% used, 3 h ago");
-      expect(stale.shortReason).toContain("92% used, 3 h ago");
-      expect(stale.detailText).toContain("Unknown (stale: 92% used, 3 h ago, 5h window)");
+      expect(stale.staleReading?.summaryLabel).toBe("92% used, 3 h ago, resets in 1h");
+      expect(stale.shortReason).toContain("92% used, 3 h ago, resets in 1h");
+      expect(stale.detailText).toContain(
+        "Unknown (stale: 92% used, 3 h ago, resets in 1h, 5h window)",
+      );
     });
 
     it("treats missing observed_at_ms on a window reading as unknown (stale) and never normal/healthy", () => {
@@ -385,7 +479,9 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       });
       expect(missingObserved.status).toBe("unknown");
       expect(missingObserved.reasonKind).toBe("stale");
-      expect(missingObserved.staleReading?.summaryLabel).toBe("50% used, age unknown");
+      expect(missingObserved.staleReading?.summaryLabel).toBe(
+        "50% used, age unknown, resets in 1h",
+      );
     });
 
     it("treats null / unsupported quota_usage as unknown (missing)", () => {
@@ -524,9 +620,10 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(athenaDot).toHaveAttribute("data-liveness-state", "alive");
       expect(athenaDot).toHaveAttribute("data-quota-state", "unknown");
       expect(athenaDot).toHaveAttribute("data-quota-reason", "stale");
-      expect(athenaDot.className).toBe("fd-dot fd-dot-alive");
+      expect(athenaDot.className).toBe("fd-dot fd-dot-alive fd-dot-quota-unknown");
+      expect(athenaDot.className).not.toBe("fd-dot fd-dot-alive");
       expect(athenaDot.getAttribute("title")).toContain(
-        "Liveness: alive · Quota: unknown (92% used, 3 h ago, 5h window)",
+        "Liveness: alive · Quota: unknown (92% used, 3 h ago, resets in 1h, 5h window)",
       );
 
       const hermesDot = screen.getByTestId("liveness-dot-hermes");
@@ -538,6 +635,117 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(hermesDot.getAttribute("title")).toContain(
         "Quota exhausted (5h window, 0% remaining, 100% used, resets in 30m, reason: 5h limit reached)",
       );
+    });
+
+    it("keeps stale liveness visually and semantically distinct across all quota states (normal, yellow, orange, red, unknown)", () => {
+      vi.spyOn(Date, "now").mockReturnValue(FIXED_NOW_MS);
+
+      const agents: AgentRecord[] = [
+        makeAgent("stale-normal", "StaleNormal"),
+        makeAgent("stale-yellow", "StaleYellow"),
+        makeAgent("stale-orange", "StaleOrange"),
+        makeAgent("stale-red", "StaleRed"),
+        makeAgent("stale-unknown", "StaleUnknown"),
+        makeAgent("alive-yellow", "AliveYellow"),
+      ];
+      const liveness: AgentLivenessItem[] = [
+        makeLiveness("stale-normal", "stale", "claude"),
+        makeLiveness("stale-yellow", "stale", "claude"),
+        makeLiveness("stale-orange", "stale", "claude"),
+        makeLiveness("stale-red", "stale", "claude"),
+        makeLiveness("stale-unknown", "stale", "claude"),
+        makeLiveness("alive-yellow", "alive", "claude"),
+      ];
+      const sessions: DiscoveredSessionSummary[] = [
+        makeSession("s-stale-normal", "stale-normal", "claude", "claude-opus-4-6", {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 40,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 3_600_000,
+          },
+        }),
+        makeSession("s-stale-yellow", "stale-yellow", "claude", "claude-opus-4-6", {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 85,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 3_600_000,
+          },
+        }),
+        makeSession("s-stale-orange", "stale-orange", "claude", "claude-opus-4-6", {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 95,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 3_600_000,
+          },
+        }),
+        makeSession("s-stale-red", "stale-red", "claude", "claude-opus-4-6", {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 100,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 3_600_000,
+          },
+        }),
+        makeSession("s-stale-unknown", "stale-unknown", "claude", "claude-opus-4-6", null),
+        makeSession("s-alive-yellow", "alive-yellow", "claude", "claude-opus-4-6", {
+          observed_at_ms: FIXED_NOW_MS - 10_000,
+          primary_window: {
+            used_percent: 85,
+            window_minutes: 300,
+            resets_at_ms: FIXED_NOW_MS + 3_600_000,
+          },
+        }),
+      ];
+
+      render(
+        <RosterSidebar
+          agents={agents}
+          routes={[]}
+          sessions={sessions}
+          liveness={liveness}
+          unreadByAgent={{}}
+          selectedAgentName={null}
+          onSelectAgent={() => {}}
+        />,
+      );
+
+      const staleNormalDot = screen.getByTestId("liveness-dot-stale-normal");
+      expect(staleNormalDot.className).toBe("fd-dot fd-dot-stale");
+      expect(staleNormalDot.getAttribute("title")).toContain(
+        "Liveness: stale · Quota: 60% remaining",
+      );
+
+      const staleYellowDot = screen.getByTestId("liveness-dot-stale-yellow");
+      expect(staleYellowDot.className).toBe("fd-dot fd-dot-stale fd-dot-quota-yellow");
+      expect(staleYellowDot.getAttribute("title")).toContain(
+        "Liveness: stale · Quota warning: 15% remaining",
+      );
+
+      const staleOrangeDot = screen.getByTestId("liveness-dot-stale-orange");
+      expect(staleOrangeDot.className).toBe("fd-dot fd-dot-stale fd-dot-quota-orange");
+      expect(staleOrangeDot.getAttribute("title")).toContain(
+        "Liveness: stale · Quota warning: 5% remaining",
+      );
+
+      const staleRedDot = screen.getByTestId("liveness-dot-stale-red");
+      expect(staleRedDot.className).toBe("fd-dot fd-dot-stale fd-dot-quota-red");
+      expect(staleRedDot.getAttribute("title")).toContain(
+        "Liveness: stale · Quota exhausted",
+      );
+
+      const staleUnknownDot = screen.getByTestId("liveness-dot-stale-unknown");
+      expect(staleUnknownDot.className).toBe("fd-dot fd-dot-stale fd-dot-quota-unknown");
+      expect(staleUnknownDot.getAttribute("title")).toContain(
+        "Liveness: stale · Quota: unknown",
+      );
+
+      const aliveYellowDot = screen.getByTestId("liveness-dot-alive-yellow");
+      expect(aliveYellowDot.className).toBe("fd-dot fd-dot-alive fd-dot-quota-yellow");
+      expect(aliveYellowDot.className).not.toBe(staleNormalDot.className);
+      expect(aliveYellowDot.className).not.toBe(staleYellowDot.className);
     });
 
     it("isolates Antigravity model pools (3p pool vs gemini pool) and separate Codex accounts across agents", () => {
@@ -708,23 +916,25 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
       expect(screen.queryByText("Vendor Account Quota")).toBeNull();
     });
 
-    it("surfaces stale reading with its age in AgentSettingsModal and updates pool attribution when model changes", () => {
+    it("surfaces stale reading with its age and reset time in AgentSettingsModal and clears quota to unknown when model pool changes until new pool telemetry arrives", () => {
       vi.spyOn(Date, "now").mockReturnValue(FIXED_NOW_MS);
+
+      const staleQuota: SessionQuotaUsage = {
+        tier: "ultra",
+        observed_at_ms: FIXED_NOW_MS - 3 * QUOTA_STALE_MS,
+        primary_window: {
+          used_percent: 92,
+          window_minutes: 300,
+          resets_at_ms: FIXED_NOW_MS + 3_600_000,
+        },
+      };
 
       const { rerender } = render(
         <AgentSettingsModal
           {...baseModalProps}
           livenessState="alive"
           selectedModel="claude-opus-5-5"
-          quotaUsage={{
-            tier: "ultra",
-            observed_at_ms: FIXED_NOW_MS - 3 * QUOTA_STALE_MS,
-            primary_window: {
-              used_percent: 92,
-              window_minutes: 300,
-              resets_at_ms: FIXED_NOW_MS + 3_600_000,
-            },
-          }}
+          quotaUsage={staleQuota}
         />,
       );
 
@@ -733,34 +943,85 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
         "unknown",
       );
       expect(screen.getByTestId("agent-settings-allowance-detail")).toHaveTextContent(
-        "Allowance: Unknown (stale: 92% used, 3 h ago, 5h window)",
+        "Allowance: Unknown (stale: 92% used, 3 h ago, resets in 1h, 5h window)",
       );
       expect(screen.getByTestId("agent-settings-allowance-pool")).toHaveTextContent(
         "Pool: antigravity · 3p pool (ultra)",
       );
 
-      // Switching model to gemini-4-argon updates pool attribution to gemini pool
-      const modelSelect = screen.getByTestId("session-model-select");
-      fireEvent.change(modelSelect, { target: { value: "gemini-4-argon" } });
+      // Fresh Gemini pool telemetry (30% used / 70% remaining)
+      const geminiPoolQuota: SessionQuotaUsage = {
+        tier: "ultra",
+        observed_at_ms: FIXED_NOW_MS - 45_000,
+        primary_window: {
+          used_percent: 30,
+          window_minutes: 300,
+          resets_at_ms: FIXED_NOW_MS + 3_600_000,
+        },
+      };
       rerender(
         <AgentSettingsModal
           {...baseModalProps}
           livenessState="alive"
           selectedModel="gemini-4-argon"
-          quotaUsage={{
-            tier: "ultra",
-            observed_at_ms: FIXED_NOW_MS - 30_000,
-            primary_window: {
-              used_percent: 88,
-              window_minutes: 300,
-              resets_at_ms: FIXED_NOW_MS + 1_800_000,
-            },
-          }}
+          quotaUsage={geminiPoolQuota}
         />,
       );
-
       expect(screen.getByTestId("agent-settings-allowance-pool")).toHaveTextContent(
         "Pool: antigravity · gemini pool (ultra)",
+      );
+      expect(screen.getByTestId("agent-settings-status-detail")).toHaveAttribute(
+        "data-quota-state",
+        "normal",
+      );
+      expect(screen.getByTestId("agent-settings-allowance-detail")).toHaveTextContent(
+        "Allowance: Normal · 70% remaining (5h window, 30% used, resets in 1h)",
+      );
+
+      // Step 1: Session switches from gemini pool to 3p pool (claude-opus-4-6) while quotaUsage is still the old geminiPoolQuota object.
+      // Must mark quota status as unknown under antigravity · 3p pool and never attribute the old Gemini 70% numbers to 3p pool.
+      rerender(
+        <AgentSettingsModal
+          {...baseModalProps}
+          livenessState="alive"
+          selectedModel="claude-opus-4-6"
+          quotaUsage={geminiPoolQuota}
+        />,
+      );
+      expect(screen.getByTestId("agent-settings-allowance-pool")).toHaveTextContent(
+        "Pool: antigravity · 3p pool",
+      );
+      expect(screen.getByTestId("agent-settings-status-detail")).toHaveAttribute(
+        "data-quota-state",
+        "unknown",
+      );
+      expect(screen.getByTestId("agent-settings-allowance-detail")).toHaveTextContent(
+        "Allowance: Unknown (no telemetry reported)",
+      );
+      expect(screen.getByTestId("agent-settings-allowance-detail")).not.toHaveTextContent(
+        "70% remaining",
+      );
+
+      // Step 2: Fresh 3p pool quotaUsage telemetry arrives -> displays the new 3p pool's numbers
+      const fresh3pQuota: SessionQuotaUsage = {
+        tier: "ultra",
+        observed_at_ms: FIXED_NOW_MS - 15_000,
+        primary_window: {
+          used_percent: 88,
+          window_minutes: 300,
+          resets_at_ms: FIXED_NOW_MS + 1_800_000,
+        },
+      };
+      rerender(
+        <AgentSettingsModal
+          {...baseModalProps}
+          livenessState="alive"
+          selectedModel="claude-opus-4-6"
+          quotaUsage={fresh3pQuota}
+        />,
+      );
+      expect(screen.getByTestId("agent-settings-allowance-pool")).toHaveTextContent(
+        "Pool: antigravity · 3p pool (ultra)",
       );
       expect(screen.getByTestId("agent-settings-status-detail")).toHaveAttribute(
         "data-quota-state",
@@ -770,22 +1031,14 @@ describe("Issue #352: Roster & AgentSettingsModal vendor usage allowance warning
         "Allowance: Approaching limit (10–20% remaining) · 12% remaining (5h window, 88% used, resets in 30m)",
       );
 
-      // Switching adapter across vendors without a new quota reading resets quota to unknown for the new vendor
+      // Step 3: Switching adapter across vendors without a new quota reading resets quota to unknown for the new vendor
       rerender(
         <AgentSettingsModal
           {...baseModalProps}
           livenessState="alive"
           adapter="codex"
           selectedModel="gpt-5.4"
-          quotaUsage={{
-            tier: "ultra",
-            observed_at_ms: FIXED_NOW_MS - 30_000,
-            primary_window: {
-              used_percent: 88,
-              window_minutes: 300,
-              resets_at_ms: FIXED_NOW_MS + 1_800_000,
-            },
-          }}
+          quotaUsage={fresh3pQuota}
         />,
       );
       expect(screen.getByTestId("agent-settings-status-detail")).toHaveAttribute(
