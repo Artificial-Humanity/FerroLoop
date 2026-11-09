@@ -3148,6 +3148,68 @@ fn memory_handoff_and_runtime_crud_and_key_lookup<S: StateStore>(s: &S) {
         .len(),
         2
     );
+
+    let proj_scope = crate::state::StateScope::Project("ferroloop".into());
+    assert!(
+        s.delete_state_by_key(
+            &proj_scope,
+            crate::state::StateConcern::Runtime,
+            "gpu_lease"
+        )
+        .unwrap()
+    );
+    assert!(
+        !s.delete_state_by_key(
+            &proj_scope,
+            crate::state::StateConcern::Runtime,
+            "gpu_lease"
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        s.get_state_by_key(
+            &proj_scope,
+            crate::state::StateConcern::Runtime,
+            "gpu_lease"
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        s.list_state(Some(&proj_scope), Some(crate::state::StateConcern::Runtime))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(s.list_state(Some(&proj_scope), None).unwrap().len(), 1);
+
+    let reupserted = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: proj_scope.clone(),
+            slug: "gpu_lease".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"holder": "ada"}),
+                merge_mode: crate::state::MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(13),
+            by: "ada".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        s.get_state_by_key(
+            &proj_scope,
+            crate::state::StateConcern::Runtime,
+            "gpu_lease"
+        )
+        .unwrap(),
+        Some(reupserted.clone())
+    );
+    assert_eq!(
+        s.list_state(Some(&proj_scope), Some(crate::state::StateConcern::Runtime))
+            .unwrap(),
+        vec![reupserted]
+    );
 }
 
 fn sensitive_flag_is_sticky_until_explicitly_cleared_and_ever_sensitive_persists<S: StateStore>(

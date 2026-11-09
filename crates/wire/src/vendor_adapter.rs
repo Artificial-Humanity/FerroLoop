@@ -473,18 +473,19 @@ pub fn launch_env_for_vendor_with_generation(
     let mut env = Vec::new();
     if vendor != "codex" {
         env.push(("AGENT_PERSONA".into(), persona.into()));
-        if let Some(generation) = hydration_generation
-            .map(str::trim)
-            .filter(|g| !g.is_empty())
-        {
-            env.push(("AGENT_HYDRATION_GENERATION".into(), generation.into()));
-        }
     }
     if vendor == "muse" {
         env.push(("MUSE_NO_AUTO_UPDATE".into(), "1".into()));
     }
     if let Some(path) = path_with_local_bin(home) {
         env.push(("PATH".into(), path));
+    }
+    if vendor != "codex"
+        && let Some(generation) = hydration_generation
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+    {
+        env.push(("AGENT_HYDRATION_GENERATION".into(), generation.into()));
     }
     env
 }

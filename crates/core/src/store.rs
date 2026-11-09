@@ -799,6 +799,9 @@ pub trait StateStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<Option<StateEntry>, StoreError>;
+    /// Local hard delete of the current key/entry (`STATE_KEYS`, `STATE_ENTRIES`,
+    /// `STATE_CONFLICTS`); historical `StateRevision` rows are kept and the deletion is not
+    /// replicated to peers.
     fn delete_state_by_key(
         &self,
         scope: &StateScope,

@@ -1751,6 +1751,27 @@ fn execute_register_with_hydration_env(
         })
         .unwrap_or_default();
     let by = name.trim().to_ascii_lowercase();
+    let env_persona = std::env::var("AGENT_PERSONA")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let persona_mismatch = env_persona
+        .as_deref()
+        .is_some_and(|p| !p.eq_ignore_ascii_case(&by))
+        || hosted_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some_and(|hid| {
+                let Some((vendor, hid_persona)) = hid.split_once(':') else {
+                    return true;
+                };
+                vendor.trim().is_empty() || !hid_persona.trim().eq_ignore_ascii_case(&by)
+            });
+    let caller_generation = if persona_mismatch {
+        None
+    } else {
+        caller_generation
+    };
     let store = env
         .open_for_scope(Some(&StateScope::Workspace))
         .map_err(|e| (1, e))?;
@@ -1791,14 +1812,15 @@ fn execute_register_with_hydration_env(
                     },
                 )?;
             }
-            fl_hub::lifecycle::record_hydration_ack(
+            if let Err(e) = fl_hub::lifecycle::record_hydration_ack(
                 &store,
                 &rec.name_key,
                 replace,
                 caller_generation,
                 hosted_id,
-            )
-            .map_err(|e| (1, e.to_string()))?;
+            ) {
+                eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
+            }
             let all_active = store.list_agents(None, false).unwrap_or_default();
             let mgr = reports_to(&rec, &all_active);
             println!(
@@ -3387,6 +3409,105 @@ pub(crate) mod tests {
             .unwrap(),
             0
         );
+
+        // I1: Inherited token for `feira` (via AGENT_PERSONA=feira or FL_HOSTED_ID=claude:feira)
+        // must not fence or write a receipt when registering a different persona `Kacey`, even
+        // when `Kacey` has a decommissioned record or a newer generation.
+        {
+            use fl_core::StateStore;
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let kacey_decom = fl_hub::lifecycle::HostedSessionRecord {
+                session_id: "claude:kacey".into(),
+                persona: "kacey".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                vendor: "claude".into(),
+                model: None,
+                thinking_level: None,
+                node_id: "local".into(),
+                hosted: true,
+                status: fl_hub::lifecycle::STATUS_DECOMMISSIONED.into(),
+                restart_policy: "on-failure".into(),
+                restart_count: 0,
+                tmux_target: Some("Kacey:claude".into()),
+                host_session_id: Some("Kacey.claude".into()),
+                cwd: None,
+                context_window: None,
+                posture: fl_core::permissions::Posture::Auto,
+                hydration_dispatched: true,
+                hydration_status: fl_hub::lifecycle::HydrationStatus::Unconfirmed,
+                hydration_generation: None,
+                runtime_spawned: false,
+                tombstone_ids: Vec::new(),
+                vendor_session_id: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                decommission_prepared_at_ms: None,
+            };
+            fl_hub::lifecycle::persist_hosted_session(&store, &kacey_decom, "owner").unwrap();
+            assert_eq!(
+                execute_register_with_hydration_env(
+                    &env,
+                    "Kacey".into(),
+                    "ferroloop".into(),
+                    "assistant".into(),
+                    None,
+                    true,
+                    Some(&g1),
+                    None,
+                )
+                .unwrap(),
+                0
+            );
+            let mut kacey_newer = kacey_decom;
+            kacey_newer.status = fl_hub::lifecycle::STATUS_RUNNING.into();
+            kacey_newer.hydration_generation = Some(g2.clone());
+            fl_hub::lifecycle::persist_hosted_session(&store, &kacey_newer, "owner").unwrap();
+            // Even if AGENT_PERSONA is unset, FL_HOSTED_ID=claude:feira prevents fencing Kacey.
+            unsafe {
+                std::env::remove_var("AGENT_PERSONA");
+            }
+            assert_eq!(
+                execute_register_with_hydration_env(
+                    &env,
+                    "Kacey".into(),
+                    "ferroloop".into(),
+                    "assistant".into(),
+                    None,
+                    true,
+                    Some(&g1),
+                    Some("claude:feira"),
+                )
+                .unwrap(),
+                0
+            );
+            unsafe {
+                std::env::set_var("AGENT_PERSONA", "feira");
+            }
+            let kacey_acks = store
+                .list_state(
+                    Some(&StateScope::Workspace),
+                    Some(fl_core::state::StateConcern::Runtime),
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|e| {
+                    e.slug
+                        .starts_with(fl_hub::lifecycle::HYDRATION_ACK_SLUG_PREFIX)
+                })
+                .filter(|e| {
+                    let fl_core::state::StatePayload::Runtime(rt) = &e.payload else {
+                        return false;
+                    };
+                    serde_json::from_value::<fl_hub::lifecycle::HydrationReceipt>(rt.value.clone())
+                        .is_ok_and(|r| r.persona.eq_ignore_ascii_case("kacey"))
+                })
+                .count();
+            assert_eq!(
+                kacey_acks, 0,
+                "no hydration receipt may be written for kacey"
+            );
+        }
 
         // 70 consecutive restart cycles on the real store prune stale hydration-ack-* entries
         // so at most 1 receipt exists at any time, and 0 remain after decommission.
