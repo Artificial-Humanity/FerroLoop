@@ -1,9 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HubApiClient } from "../api/client";
 import { formatCurrencyFromMicros, useActiveCurrency } from "../lib/currency";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
-  DEFAULT_WATCH_BALANCE_POLICY,
   DEFAULT_WATCH_THRESHOLDS,
   normalizeHydrationStatus,
   type AgentRecord,
@@ -18,7 +17,6 @@ import {
   type WatchAlert,
   type WatchBalanceApplyResponse,
   type WatchBalancePlan,
-  type WatchBalancePolicy,
   type WatchQuotaWindow,
   type WatchSeverity,
   type WatchSummaryResponse,
@@ -716,11 +714,38 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
   const [remodelHydrationDispatched, setRemodelHydrationDispatched] =
     useState<boolean | null>(null);
   const [remodelError, setRemodelError] = useState<string | null>(null);
+  const remodelControlsRef = useRef<HTMLDivElement | null>(null);
+  const remodelAgentSelectRef = useRef<HTMLSelectElement | null>(null);
+  const pendingRemodelFocusRef = useRef<boolean>(false);
 
-  // Subscription Auto-Balance Controls
-  const [balancePolicy, setBalancePolicy] = useState<WatchBalancePolicy>(
-    DEFAULT_WATCH_BALANCE_POLICY,
-  );
+  const focusRemodelAgentSelect = useCallback(() => {
+    const controlsEl = remodelControlsRef.current;
+    const selectEl = remodelAgentSelectRef.current;
+    if (controlsEl && typeof controlsEl.scrollIntoView === "function") {
+      controlsEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+    if (selectEl) {
+      selectEl.focus();
+      pendingRemodelFocusRef.current = false;
+    } else {
+      pendingRemodelFocusRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!pendingRemodelFocusRef.current) return;
+    const controlsEl = remodelControlsRef.current;
+    const selectEl = remodelAgentSelectRef.current;
+    if (controlsEl && typeof controlsEl.scrollIntoView === "function") {
+      controlsEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+    if (selectEl) {
+      selectEl.focus();
+      pendingRemodelFocusRef.current = false;
+    }
+  }, [sectionFilter]);
+
+  // Subscription Quota Balance Controls
   const [balancePlan, setBalancePlan] = useState<WatchBalancePlan | null>(null);
   const [balanceApplyRes, setBalanceApplyRes] =
     useState<WatchBalanceApplyResponse | null>(null);
@@ -734,9 +759,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       setLoading(true);
       setError(null);
       try {
-        const [summaryRes, balanceRes, hostedRes] = await Promise.all([
+        const [summaryRes, hostedRes] = await Promise.all([
           apiClient.getWatchSummary(overrides),
-          apiClient.getWatchBalance().catch(() => null),
           apiClient.getHostedSessions?.().catch(() => null) ??
             Promise.resolve(null),
         ]);
@@ -825,9 +849,6 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
           };
         }
         setSummary(nextSummary);
-        if (balanceRes?.policy) {
-          setBalancePolicy(balanceRes.policy);
-        }
       } catch (err) {
         setError(
           err instanceof Error ? err.message : "Failed to load FerroWatch summary.",
@@ -1164,44 +1185,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     }
   };
 
-  const handleSaveBalancePolicy = async () => {
-    if (!apiClient) return;
-    setBalanceBusy(true);
-    setBalanceMessage(null);
-    setBalanceError(null);
-    try {
-      const saved = await apiClient.updateWatchBalancePolicy({
-        enabled: balancePolicy.enabled,
-        primary_trigger_pct: balancePolicy.primary_trigger_pct,
-        secondary_trigger_pct: balancePolicy.secondary_trigger_pct,
-        target_max_primary_pct: balancePolicy.target_max_primary_pct,
-        target_max_secondary_pct: balancePolicy.target_max_secondary_pct,
-      });
-      setBalancePolicy(saved);
-      setBalanceMessage(
-        `Saved quota balance policy (Auto-balance: ${saved.enabled ? "Enabled" : "Disabled"}).`,
-      );
-    } catch (err) {
-      setBalanceError(
-        err instanceof Error ? err.message : "Failed to save balance policy.",
-      );
-    } finally {
-      setBalanceBusy(false);
-    }
-  };
-
   const handlePreviewBalancePlan = async () => {
     if (!apiClient) return;
     setBalanceBusy(true);
     setBalanceMessage(null);
     setBalanceError(null);
     try {
-      const plan = await apiClient.planWatchBalance({
-        primary_trigger_pct: balancePolicy.primary_trigger_pct,
-        secondary_trigger_pct: balancePolicy.secondary_trigger_pct,
-        target_max_primary_pct: balancePolicy.target_max_primary_pct,
-        target_max_secondary_pct: balancePolicy.target_max_secondary_pct,
-      });
+      const plan = await apiClient.planWatchBalance();
       setBalancePlan(plan);
       if (plan.blocked) {
         setBalanceMessage(
@@ -1992,15 +1982,21 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         type="button"
                         className="fd-btn"
                         data-testid={`watch-vendor-remodel-btn-${item.vendor}`}
+                        disabled={item.activePersonas.length === 0}
+                        title={
+                          item.activePersonas.length === 0
+                            ? `No active sessions on ${item.vendor} to re-model`
+                            : `Re-model ${item.activePersonas[0]} off ${item.vendor}`
+                        }
                         style={{ fontSize: "10px", padding: "2px 7px" }}
                         onClick={() => {
-                          if (item.activePersonas.length > 0) {
-                            setRemodelTarget(item.activePersonas[0]);
-                          }
+                          if (item.activePersonas.length === 0) return;
+                          setRemodelTarget(item.activePersonas[0]);
                           setRemodelVendor(pickLeastLoadedVendor(item.vendor));
+                          focusRemodelAgentSelect();
                         }}
                       >
-                        Re-Model / Balance
+                        Re-Model
                       </button>
                     </div>
 
@@ -2169,6 +2165,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
 
             {/* Quick Re-Model & Auto-Balance Action Box */}
             <div
+              ref={remodelControlsRef}
               data-testid="watch-quota-balance-controls"
               style={{
                 padding: "10px",
@@ -2216,6 +2213,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   >
                     <span>Agent / Session</span>
                     <select
+                      ref={remodelAgentSelectRef}
                       className="fd-input"
                       data-testid="watch-remodel-agent-select"
                       value={remodelTarget}
@@ -2423,7 +2421,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 </div>
               )}
 
-              {/* Automated Quota Balancing Policy & Dry-Run / Apply */}
+              {/* Manual Quota Balancing Dry-Run / Apply */}
               <div
                 style={{
                   borderTop: "1px solid var(--border-subtle)",
@@ -2437,49 +2435,12 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   style={{
                     display: "flex",
                     alignItems: "center",
-                    justifyContent: "space-between",
+                    justifyContent: "flex-end",
                     gap: "6px",
                     flexWrap: "wrap",
                   }}
                 >
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "6px",
-                      fontSize: "11px",
-                      color: "var(--text-secondary)",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      data-testid="watch-balance-enabled-checkbox"
-                      checked={balancePolicy.enabled}
-                      disabled={!isOwner}
-                      onChange={(e) =>
-                        setBalancePolicy((prev) => ({
-                          ...prev,
-                          enabled: e.target.checked,
-                        }))
-                      }
-                    />
-                    <span>Auto-Balance Subscriptions</span>
-                  </label>
-
                   <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                    {isOwner && (
-                      <button
-                        type="button"
-                        className="fd-btn"
-                        data-testid="watch-balance-save-policy-btn"
-                        disabled={balanceBusy}
-                        onClick={() => void handleSaveBalancePolicy()}
-                        style={{ fontSize: "11px", padding: "3px 8px" }}
-                      >
-                        Save Policy
-                      </button>
-                    )}
                     <button
                       type="button"
                       className="fd-btn"
@@ -2722,6 +2683,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                             if (sectionFilter === "liveness") {
                               setSectionFilter("all");
                             }
+                            focusRemodelAgentSelect();
                           }}
                         >
                           Re-Model

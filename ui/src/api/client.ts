@@ -100,14 +100,12 @@ import {
   type ProjectRecordItem,
   type RecordState,
   type RecordsListResponse,
-  DEFAULT_WATCH_BALANCE_POLICY,
   type RemodelSessionRequest,
   type RemodelSessionResponse,
   type WatchAlertsResponse,
   type WatchBalanceApplyResponse,
   type WatchBalancePlan,
   type WatchBalancePolicy,
-  type WatchBalanceStatusResponse,
   type WatchRollupsResponse,
   type WatchSummaryResponse,
   type WatchThresholdOverrides,
@@ -2360,42 +2358,6 @@ export class HubApiClient {
     payload: RemodelSessionRequest,
   ): Promise<RemodelSessionResponse> {
     return this.remodelSession(name, payload);
-  }
-
-  public async getWatchBalance(): Promise<WatchBalanceStatusResponse> {
-    const raw = await this.request<Record<string, unknown>>("/api/v1/watch/balance");
-    const policyRaw =
-      raw && typeof raw.policy === "object" && raw.policy !== null
-        ? (raw.policy as Partial<WatchBalancePolicy>)
-        : (raw as Partial<WatchBalancePolicy>);
-    const policy: WatchBalancePolicy = {
-      ...DEFAULT_WATCH_BALANCE_POLICY,
-      ...policyRaw,
-    };
-    const enabled =
-      typeof raw?.enabled === "boolean" ? raw.enabled : Boolean(policy.enabled);
-    return { policy, enabled };
-  }
-
-  public async updateWatchBalancePolicy(
-    patch: Partial<WatchBalancePolicy>,
-  ): Promise<WatchBalancePolicy> {
-    const raw = await this.request<Record<string, unknown>>(
-      "/api/v1/watch/balance/policy",
-      {
-        method: "POST",
-        body: JSON.stringify(patch),
-      },
-    );
-    const policyRaw =
-      raw && typeof raw.policy === "object" && raw.policy !== null
-        ? (raw.policy as Partial<WatchBalancePolicy>)
-        : (raw as Partial<WatchBalancePolicy>);
-    return {
-      ...DEFAULT_WATCH_BALANCE_POLICY,
-      ...patch,
-      ...policyRaw,
-    };
   }
 
   public async planWatchBalance(

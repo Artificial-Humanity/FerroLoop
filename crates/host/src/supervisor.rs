@@ -535,6 +535,11 @@ fn become_vendor(prep: &ExecPrep, release_r: i32, err_w: i32) -> ! {
     }
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_DFL);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        let mut signals: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, libc::SIGPIPE);
+        let _ = libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
     }
     if unsafe { libc::isatty(VENDOR_STDIN) } == 1 {
         unsafe {

@@ -158,6 +158,7 @@ pub fn spawn_supervised(
             libc::sigemptyset(&mut signals);
             libc::sigaddset(&mut signals, libc::SIGINT);
             libc::sigaddset(&mut signals, libc::SIGTERM);
+            libc::sigaddset(&mut signals, libc::SIGPIPE);
             let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
             if rc != 0 {
                 return Err(io::Error::from_raw_os_error(rc));
