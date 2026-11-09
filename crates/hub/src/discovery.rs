@@ -8475,6 +8475,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        crate::latency_tests::write_agy_identity(home, "agy-offline-1", "ferris");
         write_routes(
             home,
             &[(
@@ -8656,6 +8657,7 @@ mod tests {
         // A full discovery pass through a route that names the stub resolves the same model.
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        crate::latency_tests::write_agy_identity(home, "agy-live-1", "ferris");
         write_routes(
             home,
             &[(
@@ -8708,6 +8710,7 @@ mod tests {
         let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, "not json");
         let addr = format!("127.0.0.1:{}", stub.port);
         let tmp = TempDir::new().unwrap();
+        crate::latency_tests::write_agy_identity(tmp.path(), "agy-live-1", "ferris");
         write_routes(
             tmp.path(),
             &[(
@@ -9123,7 +9126,7 @@ mod tests {
             .join(".system_generated")
             .join("logs");
         fs::create_dir_all(&logs).unwrap();
-        fs::write(logs.join("transcript.jsonl"), "{\"step_index\":900}\n").unwrap();
+        fs::write(logs.join("transcript.jsonl"), "{\"type\":\"USER_INPUT\",\"content\":\"You will take the name of Ferris.\"}\n{\"step_index\":900}\n").unwrap();
         let stub = spawn_agy_stub_with_steps(
             AGY_CONFIG_FIXTURE,
             AGY_TRAJECTORY_FIXTURE,
@@ -9179,6 +9182,7 @@ mod tests {
             None,
         );
         let addr = format!("127.0.0.1:{}", stub.port);
+        crate::latency_tests::write_agy_identity(home, "agy-lookup-1", "ferris");
         write_routes(
             home,
             &[
@@ -10626,6 +10630,8 @@ mod tests {
     fn a_decommissioned_route_is_skipped_even_when_the_route_file_still_has_it() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        crate::latency_tests::write_agy_identity(home, "conv-1", "ada");
+        crate::latency_tests::write_agy_identity(home, "conv-2", "cara");
         let mut routes = RouteTable::default();
         routes.upsert(
             "ada",
@@ -12875,7 +12881,8 @@ mod tests {
         );
         fs::create_dir_all(home.path().join(".gemini/antigravity-cli/brain")).unwrap();
         let mut routes = RouteTable::default();
-        routes.upsert(
+        // Explicit identity keeps the malicious route visible so containment is exercised.
+        routes.upsert_explicit(
             "ada",
             VendorRoute::Agy {
                 conversation_id: "../../..".to_string(),
@@ -14239,6 +14246,7 @@ mod tests {
 
         let path = home.join(".cache").join("agent-bus").join("routes.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Use Claude aliases: passive Agy evidence can establish only one persona per source.
         // 1. Registered `sonya` (older timestamp) vs unregistered `github-44` (newer timestamp, alphabetically earlier) sharing `sess-sonya`.
         // 2. Unregistered `kayla` (newer timestamp) vs unregistered `highly` (older timestamp, alphabetically earlier) sharing `conv-kayla`.
         fs::write(
@@ -14269,16 +14277,20 @@ mod tests {
                         "persona": "highly",
                         "updated_at": "2026-11-03T10:00:00.000Z",
                         "route": {
-                            "kind": "agy",
-                            "conversation_id": "conv-kayla"
+                            "kind": "claude",
+                            "pid": 1,
+                            "session_id": "conv-kayla",
+                            "socket_path": home.join("k.sock")
                         }
                     },
                     "kayla": {
                         "persona": "kayla",
                         "updated_at": "2026-11-03T12:00:00.000Z",
                         "route": {
-                            "kind": "agy",
-                            "conversation_id": "conv-kayla"
+                            "kind": "claude",
+                            "pid": 1,
+                            "session_id": "conv-kayla",
+                            "socket_path": home.join("k.sock")
                         }
                     }
                 }
