@@ -487,8 +487,7 @@ pub(crate) fn hash_file(file: &File, l: &OperationLimits) -> Result<(u64, String
     while offset < len {
         l.check()?;
         let n = (len - offset).min(bytes.len() as u64) as usize;
-        file.read_exact_at(&mut bytes[..n], offset)
-            .map_err(|_| l.verification())?;
+        super::fs::read_exact_at(file, &mut bytes[..n], offset, l)?;
         hash.update(&bytes[..n]);
         offset += n as u64;
     }

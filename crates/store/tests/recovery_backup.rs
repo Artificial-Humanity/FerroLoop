@@ -1653,6 +1653,104 @@ fn quarantine_parent_sync_failure_is_unknown_and_preserves_other_backup() {
 }
 
 #[test]
+fn quarantine_retry_withdraws_receipt_and_resyncs_after_failure() {
+    for event in [
+        RecoveryEvent::CatalogPublish,
+        RecoveryEvent::Sync(Directory::QuarantineParent),
+        RecoveryEvent::Sync(Directory::CatalogParent),
+    ] {
+        let f = Fixture::new();
+        let r = f.request();
+        let operation = r.operation_id.to_string();
+        let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+        backup(&f.store, &r, &native, &CancelToken::new()).unwrap();
+        let receipt = f
+            .destination
+            .join(".catalog")
+            .join(format!("{operation}.json"));
+        fs::write(&receipt, b"{corrupt receipt").unwrap();
+        let faults = Arc::new(Fault::default());
+        *faults.failure.lock().unwrap() = Some(event);
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        let first = reconcile_publication(&operation, &filesystem);
+        assert!(
+            matches!(first, Ok(PublicationOutcome::OutcomeUnknown { operation_id }) if operation_id == r.operation_id)
+        );
+        let evidence = f
+            .destination
+            .join(".quarantine")
+            .join(&operation)
+            .join("receipt.json");
+        assert_eq!(receipt.exists(), event == RecoveryEvent::CatalogPublish);
+        assert_eq!(evidence.exists(), event != RecoveryEvent::CatalogPublish);
+        // A retry must still reach the durability barriers, even after rename succeeded.
+        *faults.failure.lock().unwrap() = Some(RecoveryEvent::Sync(Directory::CatalogParent));
+        faults.seen.lock().unwrap().clear();
+        assert!(matches!(
+            reconcile_publication(&operation, &filesystem),
+            Err(RecoveryError::Destination { operation_id }) if operation_id == r.operation_id
+        ));
+        assert!(
+            faults
+                .seen
+                .lock()
+                .unwrap()
+                .contains(&RecoveryEvent::Sync(Directory::CatalogParent))
+        );
+        assert!(!receipt.exists());
+        assert_eq!(fs::read(&evidence).unwrap(), b"{corrupt receipt");
+        *faults.failure.lock().unwrap() = None;
+        faults.seen.lock().unwrap().clear();
+        assert!(matches!(
+            reconcile_publication(&operation, &filesystem),
+            Err(RecoveryError::Quarantined { .. })
+        ));
+        for directory in [Directory::CatalogParent, Directory::QuarantineParent] {
+            assert!(
+                faults
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .contains(&RecoveryEvent::Sync(directory))
+            );
+        }
+        assert!(!receipt.exists());
+        assert_eq!(fs::read(&evidence).unwrap(), b"{corrupt receipt");
+    }
+}
+
+#[test]
+fn exact_two_images_plus_reserve_quota_is_admitted() {
+    let f = Fixture::new();
+    let mut r = f.request();
+    r.image_byte_limit = None;
+    use std::os::fd::AsRawFd;
+    let root = fs::File::open(&f.destination).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    assert_eq!(
+        unsafe { libc::fstatvfs(root.as_raw_fd(), stat.as_mut_ptr()) },
+        0
+    );
+    let unit = unsafe { stat.assume_init() }.f_frsize;
+    let reserve = (32 * 129 + 26) * unit + r.metadata_byte_limit;
+    r.limits.byte_limit = 2 * fs::metadata(&f.source).unwrap().len() + reserve;
+    assert!(matches!(
+        backup(
+            &f.store,
+            &r,
+            &NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits()),
+            &CancelToken::new()
+        )
+        .unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+}
+
+#[test]
 fn default_ceiling_is_admitted_with_bounded_reserve() {
     let f = Fixture::new();
     let mut r = f.request();
@@ -1735,6 +1833,81 @@ fn emfile_during_reconciliation_is_retryable_without_quarantine() {
         PublicationOutcome::Durable(_)
     ));
 }
+struct ExhaustedRead {
+    errno: i32,
+    json_only: bool,
+    reached: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for ExhaustedRead {
+    fn read_exact_at(&self, file: &fs::File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut prefix = [0];
+        file.read_exact_at(&mut prefix, 0)?;
+        if self.json_only == (prefix[0] == b'{') {
+            self.reached
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(io::Error::from_raw_os_error(self.errno))
+        } else {
+            file.read_exact_at(bytes, offset)
+        }
+    }
+}
+#[test]
+fn transient_reads_leave_good_bundle_and_receipt_untouched() {
+    for errno in [
+        libc::ENOMEM,
+        libc::EAGAIN,
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::EINTR,
+    ] {
+        for json_only in [false, true] {
+            let f = Fixture::new();
+            let r = f.request();
+            let operation = r.operation_id.to_string();
+            let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+            backup(&f.store, &r, &native, &CancelToken::new()).unwrap();
+            let receipt = f
+                .destination
+                .join(".catalog")
+                .join(format!("{operation}.json"));
+            let receipt_bytes = fs::read(&receipt).unwrap();
+            let bundle = f.destination.join(&operation);
+            let members: Vec<_> = fs::read_dir(&bundle)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect();
+            let hook = Arc::new(ExhaustedRead {
+                errno,
+                json_only,
+                reached: Default::default(),
+            });
+            let filesystem = FaultFs {
+                root: f.destination.clone(),
+                io: hook.clone(),
+                limits: reconciliation_limits(),
+            };
+            assert!(
+                matches!(reconcile_publication(&operation, &filesystem), Err(RecoveryError::Transient { errno: actual, .. }) if actual == errno)
+            );
+            assert!(hook.reached.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!f.destination.join(".quarantine").join(&operation).exists());
+            assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+            for (path, bytes) in members {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            assert!(matches!(
+                reconcile_publication(&operation, &native).unwrap(),
+                PublicationOutcome::Durable(_)
+            ));
+        }
+    }
+}
+
 #[test]
 fn thousand_operations_do_not_exhaust_shared_directories() {
     let f = Fixture::new();
@@ -2079,6 +2252,37 @@ fn space_failure_case(phase: u8, target: Option<usize>, errno: i32) -> Vec<Recov
         assert!(matches!(result, Err(RecoveryError::Quarantined { .. })));
     } else {
         assert!(matches!(result, Ok(PublicationOutcome::Durable(_))));
+    }
+    if phase == 1 {
+        let receipt = f
+            .destination
+            .join(".catalog")
+            .join(format!("{}.json", request.operation_id));
+        let evidence = f
+            .destination
+            .join(".quarantine")
+            .join(request.operation_id.to_string())
+            .join("receipt.json");
+        assert_ne!(
+            receipt.exists(),
+            evidence.exists(),
+            "receipt evidence must have exactly one location"
+        );
+        assert_eq!(
+            fs::read(if receipt.exists() {
+                &receipt
+            } else {
+                &evidence
+            })
+            .unwrap(),
+            b"{corrupt"
+        );
+        assert!(matches!(
+            reconcile_publication(&request.operation_id.to_string(), &native),
+            Err(RecoveryError::Quarantined { .. })
+        ));
+        assert!(!receipt.exists());
+        assert_eq!(fs::read(evidence).unwrap(), b"{corrupt");
     }
     assert_eq!(fs::read(old.path().join("image.fls")).unwrap(), old_image);
     assert_eq!(fs::read(old_receipt).unwrap(), old_receipt_bytes);

@@ -61,8 +61,8 @@ pub enum RecoveryEvent {
     CatalogPublish,
     RemoveVerifier,
 }
-/// Implementations may fail or shorten actual destination writes. The default
-/// implementation uses native operations; successful hooks alone prove nothing.
+/// Implementations may fail reads or fail or shorten destination writes. Native
+/// operations are the default; successful hooks alone prove nothing.
 pub trait RecoveryIo: Send + Sync {
     fn before(&self, _: RecoveryEvent) -> io::Result<()> {
         Ok(())
@@ -72,6 +72,9 @@ pub trait RecoveryIo: Send + Sync {
     }
     fn write_at(&self, file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(bytes, offset)
+    }
+    fn read_exact_at(&self, file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+        file.read_exact_at(bytes, offset)
     }
     fn available_bytes(&self, root: &File) -> io::Result<u64> {
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -942,6 +945,19 @@ pub(crate) fn write_json<T: serde::Serialize>(
     }
     Ok(actual)
 }
+pub(crate) fn read_exact_at(
+    file: &File,
+    bytes: &mut [u8],
+    offset: u64,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    let result = if let Some(control) = &l.publication_io {
+        control.io.read_exact_at(file, bytes, offset)
+    } else {
+        file.read_exact_at(bytes, offset)
+    };
+    result.map_err(|error| transient(&error, l).unwrap_or_else(|| l.verification()))
+}
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     dir: &Dir,
     name: &str,
@@ -959,9 +975,7 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     let mut bytes = vec![0; n];
     for (i, chunk) in bytes.chunks_mut(65536).enumerate() {
         l.check()?;
-        file.file
-            .read_exact_at(chunk, i as u64 * 65536)
-            .map_err(|_| l.verification())?;
+        read_exact_at(&file.file, chunk, i as u64 * 65536, l)?;
     }
     let value = serde_json::from_slice(&bytes).map_err(|_| l.verification())?;
     file.unchanged(l)?;
@@ -1015,6 +1029,39 @@ mod lock_tests {
         ));
     }
     #[test]
+    fn dropping_operation_lock_preserves_replacement_inode() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        let dir = Dir::open(root.path(), &l).unwrap();
+        let operation = uuid::Uuid::now_v7();
+        let held = StoreLock::operation(&dir, operation, &l).unwrap();
+        let path = root.path().join(format!("operation-{operation}.lock"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement lock evidence").unwrap();
+        let replacement = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            (replacement.dev(), replacement.ino()),
+            identity(&held._file, &l).unwrap()
+        );
+        drop(held);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement lock evidence");
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (replacement.dev(), replacement.ino()),
+            (after.dev(), after.ino())
+        );
+    }
+    #[test]
     fn stale_contender_cannot_acquire_unlinked_operation_inode() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(
@@ -1056,5 +1103,25 @@ mod lock_tests {
             Err(RecoveryError::ConcurrentBackup { .. })
         ));
         drop(replacement);
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    #[test]
+    fn exact_read_eof_remains_verification_failure() {
+        let file = tempfile::tempfile().unwrap();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        assert!(matches!(
+            read_exact_at(&file, &mut [0; 1], 0, &l),
+            Err(RecoveryError::Verification { .. })
+        ));
     }
 }

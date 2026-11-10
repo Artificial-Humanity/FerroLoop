@@ -387,6 +387,10 @@ pub(crate) fn reconcile(
         fs::directory_geometry(directory, unit, &l)?;
     }
     if quarantine.exists(operation, &l)? {
+        // A previous attempt can create the quarantine entry before receipt
+        // withdrawal or its directory barriers fail. Finish that same bounded
+        // operation before reporting quarantine, including an already moved receipt.
+        mark_quarantine(&root, operation, &control, &l)?;
         return Err(RecoveryError::Quarantined { operation_id: id });
     }
     let mut published = root.exists(operation, &l)?;
