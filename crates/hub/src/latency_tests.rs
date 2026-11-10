@@ -2183,6 +2183,7 @@ mod route_lookup {
                         explicit: false,
                         hosted_id: None,
                         hydration_generation: None,
+                        pid_start_time: None,
                     },
                 );
                 base.save(Some(&path)).unwrap();

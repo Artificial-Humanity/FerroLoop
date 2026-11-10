@@ -1396,13 +1396,14 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
         "conv-hosted-feira"
     );
     let reg_diags = st["registration_diagnostics"].as_array().unwrap();
-    assert_eq!(reg_diags.len(), 3);
+    assert_eq!(reg_diags.len(), 2);
     assert_eq!(reg_diags[0]["outcome"], "refused");
     assert_eq!(reg_diags[0]["reason"], "foreign_hosted_env");
+    assert_eq!(reg_diags[0]["count"], 2);
+    assert!(reg_diags[0]["last_seen_at"].is_string());
     assert_eq!(reg_diags[1]["outcome"], "refused");
-    assert_eq!(reg_diags[1]["reason"], "foreign_hosted_env");
-    assert_eq!(reg_diags[2]["outcome"], "refused");
-    assert_eq!(reg_diags[2]["reason"], "vendor_mismatch");
+    assert_eq!(reg_diags[1]["reason"], "vendor_mismatch");
+    assert_eq!(reg_diags[1]["count"], 1);
 
     let text_out = env.fl().args(["wire", "status"]).output().unwrap();
     assert!(text_out.status.success());
@@ -1562,6 +1563,8 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         runtime_spawned: true,
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
+        pid: None,
+        pid_start_time: None,
         created_at_ms: 1,
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,

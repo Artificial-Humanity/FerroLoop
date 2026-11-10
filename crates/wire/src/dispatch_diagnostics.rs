@@ -58,6 +58,8 @@ pub enum FailureStage {
     FinalReceiptReadMissing,
     UnresolvedReceiptStatus,
     WorkerPanic,
+    #[serde(other)]
+    Unsupported,
 }
 
 /// All causes are observations; none establishes trusted nonmutation.
@@ -78,6 +80,8 @@ pub enum FenceReason {
     QueueOverflow,
     WorkerSpawnFailure,
     GlobalMetadataCap,
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,10 +150,22 @@ pub enum RegistrationConflictReason {
     Unsupported,
 }
 
+fn default_one() -> u64 {
+    1
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 /// Bounded, secret-free observation of a refused or replaced explicit route registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteRegistrationDiagnostic {
     pub at: At,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<At>,
+    #[serde(default = "default_one")]
+    pub count: u64,
     pub persona: String,
     pub outcome: RegistrationDiagnosticOutcome,
     pub reason: RegistrationConflictReason,
@@ -165,6 +181,8 @@ pub struct RouteRegistrationDiagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenger_generation: Option<String>,
     pub replace: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unverified_process: bool,
 }
 
 pub fn sanitize_generation_token(raw: Option<&str>) -> Option<String> {
@@ -184,6 +202,9 @@ pub fn sanitize_generation_token(raw: Option<&str>) -> Option<String> {
 
 impl RouteRegistrationDiagnostic {
     pub fn sanitized(mut self) -> Self {
+        if self.count == 0 {
+            self.count = 1;
+        }
         self.persona =
             normalize_persona(&self.persona).unwrap_or_else(|| "invalid-persona".to_string());
         self.incumbent_hosted_id = self
@@ -200,6 +221,19 @@ impl RouteRegistrationDiagnostic {
         self.challenger_generation =
             sanitize_generation_token(self.challenger_generation.as_deref());
         self
+    }
+
+    pub fn same_dedup_key(&self, other: &Self) -> bool {
+        self.persona == other.persona
+            && self.outcome == other.outcome
+            && self.reason == other.reason
+            && self.incumbent_adapter == other.incumbent_adapter
+            && self.challenger_adapter == other.challenger_adapter
+            && self.incumbent_hosted_id == other.incumbent_hosted_id
+            && self.challenger_hosted_id == other.challenger_hosted_id
+            && self.incumbent_generation == other.incumbent_generation
+            && self.challenger_generation == other.challenger_generation
+            && self.replace == other.replace
     }
 }
 
@@ -481,6 +515,7 @@ mod tests {
             explicit: true,
             hosted_id: None,
             hydration_generation: None,
+            pid_start_time: None,
         }
     }
 
@@ -990,5 +1025,12 @@ mod tests {
             serde_json::from_value::<DispatchDiagnostics>(json).unwrap(),
             snapshot
         );
+
+        let future_stage: FailureStage =
+            serde_json::from_str(r#""future_stage_v2""#).expect("unknown stage deserializes");
+        assert_eq!(future_stage, FailureStage::Unsupported);
+        let future_reason: FenceReason =
+            serde_json::from_str(r#""future_reason_v2""#).expect("unknown reason deserializes");
+        assert_eq!(future_reason, FenceReason::Unsupported);
     }
 }

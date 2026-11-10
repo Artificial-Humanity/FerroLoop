@@ -2194,6 +2194,12 @@ pub struct HostedSessionRecord {
     /// Vendor-native session identifier (e.g., Claude `--session-id <uuid>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_session_id: Option<String>,
+    /// Root OS PID of the spawned vendor CLI process when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// `/proc/<pid>/stat` field-22 start time (clock ticks) for `pid` when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
@@ -4322,6 +4328,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         hydration_generation: Some(hydration_generation.clone()),
         tombstone_ids: Vec::new(),
         vendor_session_id,
+        pid: None,
+        pid_start_time: None,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
         // Only when the record named this same target: a runtime under another name (an older
@@ -4614,6 +4622,8 @@ fn record_for_target<S: AgentRegistry>(
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
+        pid: None,
+        pid_start_time: None,
         created_at_ms: now,
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
@@ -10535,6 +10545,8 @@ mod tests {
             runtime_spawned: spawned,
             tombstone_ids: Vec::new(),
             vendor_session_id: None,
+            pid: None,
+            pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,

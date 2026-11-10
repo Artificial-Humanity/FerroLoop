@@ -1291,6 +1291,8 @@ export type WireRegistrationConflictReason =
 
 export interface WireRouteRegistrationDiagnostic {
   at: string;
+  last_seen_at?: string | null;
+  count?: number;
   persona: string;
   outcome: WireRegistrationDiagnosticOutcome;
   reason: WireRegistrationConflictReason;
@@ -1301,6 +1303,7 @@ export interface WireRouteRegistrationDiagnostic {
   incumbent_generation?: string | null;
   challenger_generation?: string | null;
   replace: boolean;
+  unverified_process?: boolean;
 }
 
 export interface WireRecipientPendingSummary {

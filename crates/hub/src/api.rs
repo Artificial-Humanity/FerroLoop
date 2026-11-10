@@ -1707,6 +1707,10 @@ pub struct HubWireStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubRouteRegistrationDiagnostic {
     pub at: fl_core::at::At,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<fl_core::at::At>,
+    #[serde(default = "default_hub_diag_count")]
+    pub count: u64,
     pub persona: String,
     pub outcome: fl_wire::dispatch_diagnostics::RegistrationDiagnosticOutcome,
     pub reason: fl_wire::dispatch_diagnostics::RegistrationConflictReason,
@@ -1722,12 +1726,20 @@ pub struct HubRouteRegistrationDiagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenger_generation: Option<String>,
     pub replace: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverified_process: bool,
+}
+
+fn default_hub_diag_count() -> u64 {
+    1
 }
 
 impl HubRouteRegistrationDiagnostic {
     fn from_wire(diag: fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic) -> Self {
         let fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic {
             at,
+            last_seen_at,
+            count,
             persona,
             outcome,
             reason,
@@ -1738,9 +1750,12 @@ impl HubRouteRegistrationDiagnostic {
             incumbent_generation,
             challenger_generation,
             replace,
+            unverified_process,
         } = diag.sanitized();
         Self {
             at,
+            last_seen_at,
+            count,
             persona,
             outcome,
             reason,
@@ -1751,6 +1766,7 @@ impl HubRouteRegistrationDiagnostic {
             incumbent_generation,
             challenger_generation,
             replace,
+            unverified_process,
         }
     }
 }
@@ -11531,6 +11547,7 @@ mod council_guidance_tests {
                         explicit: true,
                         hosted_id: Some("antigravity:felix".into()),
                         hydration_generation: Some("gen-1".into()),
+                        pid_start_time: None,
                     },
                     RouteEntry {
                         persona: "ada".into(),
@@ -11545,6 +11562,7 @@ mod council_guidance_tests {
                         explicit: false,
                         hosted_id: None,
                         hydration_generation: None,
+                        pid_start_time: None,
                     },
                 ],
                 dispatch_diagnostics: Some(DispatchDiagnostics {
@@ -11598,6 +11616,8 @@ mod council_guidance_tests {
                 registration_diagnostics: vec![
                     fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic {
                         at: ts_for_status.clone(),
+                        last_seen_at: None,
+                        count: 1,
                         persona: "felix".into(),
                         outcome:
                             fl_wire::dispatch_diagnostics::RegistrationDiagnosticOutcome::Refused,
@@ -11610,6 +11630,7 @@ mod council_guidance_tests {
                         incumbent_generation: Some("gen-1".into()),
                         challenger_generation: Some("bad space SECRET_CSRF_TOKEN".into()),
                         replace: false,
+                        unverified_process: false,
                     },
                 ],
                 pending_recipients: vec![RecipientPendingSummary {

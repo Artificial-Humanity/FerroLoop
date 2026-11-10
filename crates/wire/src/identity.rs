@@ -181,6 +181,16 @@ impl VendorRoute {
         let id = raw_id.trim();
         (!id.is_empty()).then_some((kind, id))
     }
+
+    pub fn route_pid(&self) -> Option<u32> {
+        match self {
+            Self::Claude { pid, .. } if *pid > 0 => Some(*pid),
+            Self::Agy {
+                ls_pid: Some(pid), ..
+            } if *pid > 0 => Some(*pid),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +206,8 @@ pub struct RouteEntry {
     pub hosted_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydration_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
 }
 
 impl RouteEntry {
@@ -294,7 +306,9 @@ pub struct RegisterRouteCheckArgs {
     pub hosted_id: Option<String>,
     pub hydration_generation: Option<String>,
     pub hosted_session_verified: bool,
+    pub unverified_process: bool,
     pub allow_host_probes: bool,
+    pub incumbent_dead_override: Option<bool>,
     pub at: At,
 }
 
@@ -844,13 +858,163 @@ fn agy_host_session_running(persona: Option<&str>) -> bool {
     false
 }
 
+/// Parse `/proc/{pid}/stat` on Linux into `(ppid, starttime_ticks)`.
+pub fn proc_ppid_and_start_time(pid: u32) -> Option<(u32, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        if pid == 0 {
+            return None;
+        }
+        let stat =
+            fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+        let rparen = stat.rfind(')')?;
+        let mut fields = stat[rparen + 1..].split_whitespace();
+        let _state = fields.next()?; // field 3: state
+        let ppid = fields.next()?.parse::<u32>().ok()?; // field 4: ppid
+        // Advance from field 4 to field 22 (`starttime`): 17 fields in between (fields 5..=21),
+        // so field 22 is index 17 of the remaining iterator.
+        let starttime = fields.nth(17)?.parse::<u64>().ok()?;
+        Some((ppid, starttime))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Process start time in clock ticks since boot (field 22 of `/proc/{pid}/stat` on Linux).
+pub fn proc_start_time_ticks(pid: u32) -> Option<u64> {
+    proc_ppid_and_start_time(pid).map(|(_, st)| st)
+}
+
+/// True when `pid` is alive and, if `expected_start_time` is `Some`, its `/proc/{pid}/stat`
+/// start time matches `expected_start_time` (guarding against OS PID reuse).
+pub fn proc_alive_matching_start(pid: u32, expected_start_time: Option<u64>) -> bool {
+    if !proc_alive(pid) {
+        return false;
+    }
+    if let Some(expected) = expected_start_time
+        && let Some(actual) = proc_start_time_ticks(pid)
+        && actual != expected
+    {
+        return false;
+    }
+    true
+}
+
+/// Walk `/proc/<pid>/stat` parent pointers (up to 16 hops) from `start_pid` to check whether
+/// `target_ancestor_pid` is `start_pid` itself or an ancestor of `start_pid`.
+/// If `expected_ancestor_start_time` is `Some(ticks)`, also verifies that `target_ancestor_pid`
+/// has that exact start time.
+pub fn pid_is_self_or_ancestor(
+    start_pid: u32,
+    target_ancestor_pid: u32,
+    expected_ancestor_start_time: Option<u64>,
+) -> bool {
+    if start_pid == 0 || target_ancestor_pid == 0 {
+        return false;
+    }
+    if !proc_alive_matching_start(target_ancestor_pid, expected_ancestor_start_time) {
+        return false;
+    }
+    let mut cur = start_pid;
+    for _ in 0..=16 {
+        if cur == target_ancestor_pid {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some((ppid, _)) = proc_ppid_and_start_time(cur) else {
+                return false;
+            };
+            if ppid <= 1 || ppid == cur {
+                return target_ancestor_pid == ppid;
+            }
+            cur = ppid;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return false;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn unix_socket_has_listener(socket_path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string("/proc/net/unix") else {
+        return true;
+    };
+    let canonical = socket_path.canonicalize().ok();
+    let target_str = socket_path.to_string_lossy();
+    let canonical_str = canonical.as_deref().map(|p| p.to_string_lossy());
+    let target_file_name = socket_path.file_name();
+    for line in raw.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let _num = fields.next();
+        let _refcount = fields.next();
+        let _proto = fields.next();
+        let Some(flags_hex) = fields.next() else {
+            continue;
+        };
+        let _type = fields.next();
+        let Some(st_hex) = fields.next() else {
+            continue;
+        };
+        let _inode = fields.next();
+        let rest = fields.collect::<Vec<_>>().join(" ");
+        if rest.is_empty() {
+            continue;
+        }
+        let flags = u64::from_str_radix(flags_hex, 16).unwrap_or(0);
+        let is_listening = (flags & 0x10000) != 0 || st_hex == "01";
+        if !is_listening {
+            continue;
+        }
+        if rest == target_str.as_ref() || canonical_str.as_deref() == Some(rest.as_str()) {
+            return true;
+        }
+        if canonical.is_some()
+            && Path::new(&rest).file_name() == target_file_name
+            && Path::new(&rest).canonicalize().ok().as_deref() == canonical.as_deref()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Passive liveness check for an explicit [`RouteEntry`], including PID start-time reuse detection.
+pub fn explicit_route_entry_is_dead(
+    entry: &RouteEntry,
+    persona: Option<&str>,
+    allow_host_probes: bool,
+) -> bool {
+    explicit_route_is_dead_with_start_time(
+        &entry.route,
+        entry.pid_start_time,
+        persona,
+        allow_host_probes,
+    )
+}
+
 /// Passive liveness check for an explicit route.
 ///
 /// Never connects to Unix sockets (`Webhook` / `Claude` sockets are only checked via
-/// `symlink_metadata()`), and skips host TCP / `fl-host` / `tmux` probes whenever
-/// `allow_host_probes` is `false`.
+/// `symlink_metadata()` and `/proc/net/unix`), and skips host TCP / `fl-host` / `tmux` probes
+/// whenever `allow_host_probes` is `false`.
 pub fn explicit_route_is_dead(
     route: &VendorRoute,
+    persona: Option<&str>,
+    allow_host_probes: bool,
+) -> bool {
+    explicit_route_is_dead_with_start_time(route, None, persona, allow_host_probes)
+}
+
+pub fn explicit_route_is_dead_with_start_time(
+    route: &VendorRoute,
+    pid_start_time: Option<u64>,
     persona: Option<&str>,
     allow_host_probes: bool,
 ) -> bool {
@@ -859,7 +1023,7 @@ pub fn explicit_route_is_dead(
             pid, socket_path, ..
         } => {
             if *pid > 0 {
-                !proc_alive(*pid)
+                !proc_alive_matching_start(*pid, pid_start_time)
             } else {
                 !socket_path.as_os_str().is_empty() && socket_path.symlink_metadata().is_err()
             }
@@ -870,7 +1034,7 @@ pub fn explicit_route_is_dead(
             if let Some(pid) = *ls_pid
                 && pid > 0
             {
-                !proc_alive(pid)
+                !proc_alive_matching_start(pid, pid_start_time)
                     && (!allow_host_probes
                         || ls_address
                             .as_deref()
@@ -888,7 +1052,26 @@ pub fn explicit_route_is_dead(
             }
         }
         VendorRoute::Webhook { socket_path } => {
-            !socket_path.as_os_str().is_empty() && socket_path.symlink_metadata().is_err()
+            if socket_path.as_os_str().is_empty() {
+                return false;
+            }
+            let Ok(meta) = socket_path.symlink_metadata() else {
+                return true;
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if !meta.file_type().is_socket() {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if !unix_socket_has_listener(socket_path) {
+                    return true;
+                }
+            }
+            false
         }
         VendorRoute::Muse {
             tmux_target,
@@ -920,6 +1103,69 @@ pub fn explicit_route_is_dead(
             !targets.any(crate::dispatcher::tmux_target_alive_passive)
         }
         VendorRoute::Codex { .. } => false,
+    }
+}
+
+/// Evaluate whether an explicit `incumbent` route entry has a registration conflict with a
+/// challenger, returning `None` when the registration is a compatible same-vendor refresh
+/// (including `claude --resume` of the same native session ID or a Codex session refresh).
+pub fn incumbent_conflict_reason(
+    incumbent: &RouteEntry,
+    challenger_vendor: &str,
+    challenger_session_identity: Option<(&str, &str)>,
+    challenger_pid: Option<u32>,
+    challenger_hosted_id: Option<&str>,
+    challenger_generation: Option<&str>,
+) -> Option<RegistrationConflictReason> {
+    if !incumbent.explicit {
+        return None;
+    }
+    let inc_vendor = incumbent.route.canonical_vendor();
+    let chal_vendor = canonical_vendor_id(challenger_vendor);
+    let inc_hosted_id = incumbent
+        .hosted_id
+        .as_deref()
+        .and_then(|raw| parse_hosted_identity(raw).ok())
+        .map(|(v, p)| format!("{v}:{p}"));
+    let new_hosted_id = challenger_hosted_id
+        .and_then(|raw| parse_hosted_identity(raw).ok())
+        .map(|(v, p)| format!("{v}:{p}"));
+    let inc_generation = sanitize_generation_token(incumbent.hydration_generation.as_deref());
+    let new_generation = sanitize_generation_token(challenger_generation);
+
+    let is_codex_same_vendor = inc_vendor == "codex" && chal_vendor == "codex";
+    let is_same_native_session =
+        incumbent
+            .route
+            .session_identity()
+            .is_some_and(|(inc_kind, inc_id)| {
+                is_native_session_id(inc_id)
+                    && challenger_session_identity == Some((inc_kind, inc_id))
+            });
+
+    if inc_vendor != chal_vendor {
+        Some(RegistrationConflictReason::VendorMismatch)
+    } else if inc_generation.is_some()
+        && new_generation.is_some()
+        && inc_generation != new_generation
+    {
+        Some(RegistrationConflictReason::HydrationGenerationMismatch)
+    } else if (inc_hosted_id.is_some() && new_hosted_id.is_some() && inc_hosted_id != new_hosted_id)
+        || (inc_hosted_id.is_some()
+            && new_hosted_id.is_none()
+            && !is_codex_same_vendor
+            && !is_same_native_session)
+    {
+        Some(RegistrationConflictReason::HostedIdentityMismatch)
+    } else if let VendorRoute::Claude { pid: old_pid, .. } = incumbent.route
+        && old_pid > 0
+        && challenger_pid.is_some_and(|new_pid| new_pid > 0 && new_pid != old_pid)
+        && !is_same_native_session
+        && proc_alive_matching_start(old_pid, incumbent.pid_start_time)
+    {
+        Some(RegistrationConflictReason::HostedIdentityMismatch)
+    } else {
+        None
     }
 }
 
@@ -1261,6 +1507,35 @@ impl RouteTable {
             }
         }
         for diag in other.registration_diagnostics {
+            let diag = diag.sanitized();
+            if let Some(existing) = self
+                .registration_diagnostics
+                .iter_mut()
+                .find(|existing| existing.same_dedup_key(&diag))
+            {
+                if existing.at == diag.at
+                    && existing.last_seen_at == diag.last_seen_at
+                    && existing.count >= diag.count
+                {
+                    existing.unverified_process |= diag.unverified_process;
+                    continue;
+                }
+                if existing.at == diag.at && diag.count > existing.count {
+                    existing.count = diag.count;
+                    if let Some(other_last) = diag.last_seen_at {
+                        existing.last_seen_at = Some(
+                            existing
+                                .last_seen_at
+                                .as_ref()
+                                .filter(|cur| cur.unix_millis() >= other_last.unix_millis())
+                                .cloned()
+                                .unwrap_or(other_last),
+                        );
+                    }
+                    existing.unverified_process |= diag.unverified_process;
+                    continue;
+                }
+            }
             self.push_registration_diagnostic(diag);
         }
     }
@@ -1355,6 +1630,7 @@ impl RouteTable {
                         norm.clone(),
                         RouteEntry {
                             persona: norm,
+                            pid_start_time: route.route_pid().and_then(proc_start_time_ticks),
                             route,
                             updated_at,
                             identity_at: None,
@@ -1379,15 +1655,37 @@ impl RouteTable {
 
     pub fn push_registration_diagnostic(&mut self, diagnostic: RouteRegistrationDiagnostic) {
         let diagnostic = diagnostic.sanitized();
-        let duplicate = self.registration_diagnostics.iter().any(|existing| {
-            existing.at == diagnostic.at
-                && existing.persona == diagnostic.persona
-                && existing.outcome == diagnostic.outcome
-                && existing.reason == diagnostic.reason
-                && existing.challenger_adapter == diagnostic.challenger_adapter
-                && existing.replace == diagnostic.replace
-        });
-        if !duplicate {
+        if let Some(pos) = self
+            .registration_diagnostics
+            .iter()
+            .position(|existing| existing.same_dedup_key(&diagnostic))
+        {
+            let mut existing = self.registration_diagnostics.remove(pos);
+            let incoming_latest = diagnostic
+                .last_seen_at
+                .as_ref()
+                .filter(|t| t.unix_millis() >= diagnostic.at.unix_millis())
+                .cloned()
+                .unwrap_or_else(|| diagnostic.at.clone());
+            let prev_latest = existing
+                .last_seen_at
+                .as_ref()
+                .filter(|t| t.unix_millis() >= existing.at.unix_millis())
+                .cloned()
+                .unwrap_or_else(|| existing.at.clone());
+            let latest = if incoming_latest.unix_millis() >= prev_latest.unix_millis() {
+                incoming_latest
+            } else {
+                prev_latest
+            };
+            existing.count = existing.count.saturating_add(diagnostic.count.max(1));
+            existing.last_seen_at = Some(latest);
+            existing.unverified_process |= diagnostic.unverified_process;
+            if diagnostic.at.unix_millis() < existing.at.unix_millis() {
+                existing.at = diagnostic.at;
+            }
+            self.registration_diagnostics.push(existing);
+        } else {
             self.registration_diagnostics.push(diagnostic);
         }
         if self.registration_diagnostics.len() > MAX_REGISTRATION_DIAGNOSTICS {
@@ -1430,30 +1728,21 @@ impl RouteTable {
                 .map(|(v, p)| format!("{v}:{p}"));
             let inc_generation =
                 sanitize_generation_token(incumbent.hydration_generation.as_deref());
-            let is_codex_same_vendor = matches!(incumbent.route, VendorRoute::Codex { .. })
-                && matches!(args.route, VendorRoute::Codex { .. });
-
-            let conflict_reason =
-                if incumbent.route.canonical_vendor() != args.route.canonical_vendor() {
-                    Some(RegistrationConflictReason::VendorMismatch)
-                } else if inc_generation.is_some()
-                    && new_generation.is_some()
-                    && inc_generation != new_generation
-                {
-                    Some(RegistrationConflictReason::HydrationGenerationMismatch)
-                } else if (inc_hosted_id.is_some()
-                    && new_hosted_id.is_some()
-                    && inc_hosted_id != new_hosted_id)
-                    || (inc_hosted_id.is_some() && new_hosted_id.is_none() && !is_codex_same_vendor)
-                {
-                    Some(RegistrationConflictReason::HostedIdentityMismatch)
-                } else {
-                    None
-                };
+            let conflict_reason = incumbent_conflict_reason(
+                incumbent,
+                args.route.canonical_vendor(),
+                args.route.session_identity(),
+                args.route.route_pid(),
+                new_hosted_id.as_deref(),
+                new_generation.as_deref(),
+            );
 
             if let Some(reason) = conflict_reason {
                 clear_existing_meta = true;
-                if !explicit_route_is_dead(&incumbent.route, Some(&norm), args.allow_host_probes) {
+                let inc_dead = args.incumbent_dead_override.unwrap_or_else(|| {
+                    explicit_route_entry_is_dead(incumbent, Some(&norm), args.allow_host_probes)
+                });
+                if !inc_dead {
                     let inc_vendor = incumbent.route.canonical_vendor().to_string();
                     let inc_adapter = RouteAdapter::from_route(&incumbent.route);
                     let chal_adapter = RouteAdapter::from_route(&args.route);
@@ -1464,6 +1753,8 @@ impl RouteTable {
                     };
                     let diag = RouteRegistrationDiagnostic {
                         at: args.at.clone(),
+                        last_seen_at: None,
+                        count: 1,
                         persona: norm.clone(),
                         outcome,
                         reason,
@@ -1474,6 +1765,7 @@ impl RouteTable {
                         incumbent_generation: inc_generation,
                         challenger_generation: new_generation.clone(),
                         replace: args.replace,
+                        unverified_process: args.unverified_process,
                     }
                     .sanitized();
                     self.push_registration_diagnostic(diag.clone());
@@ -1654,8 +1946,12 @@ impl RouteTable {
             } else {
                 (normalized_hosted_id, normalized_generation)
             };
+            let mut preserved_pid_start = None;
             if let Some(existing) = self.entries.get(&norm) {
                 preserve_muse_tmux_fields(&mut route, &existing.route);
+                if route.route_pid().is_some() && route.route_pid() == existing.route.route_pid() {
+                    preserved_pid_start = existing.pid_start_time;
+                }
             }
             if let Some((target_kind, target_id)) = route
                 .session_identity()
@@ -1676,6 +1972,10 @@ impl RouteTable {
             } else {
                 identity_at.filter(|stamp| stamp.unix_millis() > 0)
             };
+            let pid_start_time = route
+                .route_pid()
+                .and_then(proc_start_time_ticks)
+                .or(preserved_pid_start);
             self.entries.insert(
                 norm.clone(),
                 RouteEntry {
@@ -1686,6 +1986,7 @@ impl RouteTable {
                     explicit,
                     hosted_id: final_hosted_id,
                     hydration_generation: final_generation,
+                    pid_start_time,
                 },
             );
         }
@@ -9220,6 +9521,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         raw_routes.entries.insert(
@@ -9232,6 +9534,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         let store = MemStore::default();
@@ -10537,6 +10840,7 @@ mod tests {
                         explicit: false,
                         hosted_id: None,
                         hydration_generation: None,
+                        pid_start_time: None,
                     },
                 );
                 base.upsert_explicit(
@@ -10614,6 +10918,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            pid_start_time: None,
                         },
                     );
                     let mut working = base.clone();
@@ -10704,6 +11009,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         merge_incumbent.entries.insert(
@@ -10716,6 +11022,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         let mut merge_challenger = RouteTable::default();
@@ -10729,6 +11036,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         merge_challenger.upsert(
@@ -10770,6 +11078,7 @@ mod tests {
                     explicit: false,
                     hosted_id: None,
                     hydration_generation: None,
+                    pid_start_time: None,
                 },
             );
             let mut newer_hook = RouteTable::default();
@@ -10783,6 +11092,7 @@ mod tests {
                     explicit: false,
                     hosted_id: None,
                     hydration_generation: None,
+                    pid_start_time: None,
                 },
             );
             for merge_mode in ["direct", "dispatch", "daemon"] {
@@ -10815,6 +11125,7 @@ mod tests {
                     explicit: false,
                     hosted_id: None,
                     hydration_generation: None,
+                    pid_start_time: None,
                 },
             );
             let mut tie_live = base.clone();
@@ -10944,6 +11255,7 @@ mod tests {
             explicit: false,
             hosted_id: None,
             hydration_generation: None,
+            pid_start_time: None,
         };
         let mut merge_unknown_inc = RouteTable::default();
         merge_unknown_inc
@@ -11002,6 +11314,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         merge_none_a.merge_newer(merge_none_b);
@@ -11201,6 +11514,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            pid_start_time: None,
                         },
                     );
                     table1.discover_routes(Some(&home), At::from_unix_millis(repaired_ms));
@@ -11291,6 +11605,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            pid_start_time: None,
                         },
                     );
                     let mut working = base.clone();
@@ -11344,6 +11659,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            pid_start_time: None,
                         },
                     );
                     let mut working = base.clone();
@@ -11420,6 +11736,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
         let mut newer_transcript = RouteTable::default();
@@ -11433,6 +11750,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
 
@@ -11497,6 +11815,7 @@ mod tests {
                     explicit: true,
                     hosted_id: None,
                     hydration_generation: None,
+                    pid_start_time: None,
                 },
             );
             table.discover_routes(Some(home), At::from_unix_millis(9000));
@@ -11621,6 +11940,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                pid_start_time: None,
             },
         );
 
@@ -11841,14 +12161,16 @@ mod tests {
         let _ = child.wait();
 
         let tmp = TempDir::new().unwrap();
-        let existing_sock = tmp.path().join("present.sock");
-        fs::write(&existing_sock, b"").unwrap();
+        let regular_file_sock = tmp.path().join("regular-file.sock");
+        fs::write(&regular_file_sock, b"").unwrap();
         let missing_sock = tmp.path().join("missing.sock");
+        let live_webhook_sock = tmp.path().join("live-webhook.sock");
+        let live_listener = std::os::unix::net::UnixListener::bind(&live_webhook_sock).unwrap();
 
         let dead_claude = VendorRoute::Claude {
             pid: dead_pid,
             session_id: "s-dead".into(),
-            socket_path: existing_sock.clone(),
+            socket_path: regular_file_sock.clone(),
             key_path: None,
         };
         assert!(explicit_route_is_dead(&dead_claude, Some("feira"), false));
@@ -11861,18 +12183,59 @@ mod tests {
         };
         assert!(!explicit_route_is_dead(&live_claude, Some("feira"), false));
 
+        // PID start-time check: matching start_time is alive (`false`), mismatched start_time
+        // (PID reuse) is treated as dead (`true`).
+        #[cfg(target_os = "linux")]
+        {
+            let actual_ticks = proc_start_time_ticks(std::process::id()).expect("self start_time");
+            assert!(actual_ticks > 0);
+            assert!(!explicit_route_is_dead_with_start_time(
+                &live_claude,
+                Some(actual_ticks),
+                Some("feira"),
+                false,
+            ));
+            assert!(explicit_route_is_dead_with_start_time(
+                &live_claude,
+                Some(actual_ticks.wrapping_add(1)),
+                Some("feira"),
+                false,
+            ));
+        }
+
         let dead_webhook = VendorRoute::Webhook {
             socket_path: missing_sock,
         };
         assert!(explicit_route_is_dead(&dead_webhook, Some("feira"), false));
+
+        // Regular file at socket_path is not a socket -> dead (`true`).
+        let regular_file_webhook = VendorRoute::Webhook {
+            socket_path: regular_file_sock,
+        };
+        assert!(explicit_route_is_dead(
+            &regular_file_webhook,
+            Some("feira"),
+            false
+        ));
+
+        // Bound UnixListener at socket_path -> alive (`false`).
         let present_webhook = VendorRoute::Webhook {
-            socket_path: existing_sock,
+            socket_path: live_webhook_sock.clone(),
         };
         assert!(!explicit_route_is_dead(
             &present_webhook,
             Some("feira"),
             false
         ));
+
+        // Dropped UnixListener without unlinking socket_path -> dead (`true`).
+        drop(live_listener);
+        assert!(live_webhook_sock.symlink_metadata().is_ok());
+        #[cfg(target_os = "linux")]
+        assert!(
+            explicit_route_is_dead(&present_webhook, Some("feira"), false),
+            "un-unlinked socket file with no listening socket in /proc/net/unix must be dead"
+        );
 
         let dead_agy = VendorRoute::Agy {
             conversation_id: "conv-dead".into(),
@@ -11894,6 +12257,46 @@ mod tests {
     }
 
     #[test]
+    fn explicit_route_is_dead_bounds_hung_tmux_probe_and_treats_timeout_as_alive() {
+        use std::os::unix::fs::PermissionsExt;
+        let _tmux_lock = crate::dispatcher::TMUX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let hung_tmux = tmp.path().join("hung-tmux.sh");
+        fs::write(&hung_tmux, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&hung_tmux, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev = std::env::var_os("FL_WIRE_TMUX_BIN");
+        unsafe {
+            std::env::set_var("FL_WIRE_TMUX_BIN", &hung_tmux);
+        }
+        let route = VendorRoute::Grok {
+            session_id: "grok-hung-probe".into(),
+            cwd: None,
+            tmux_target: Some("Feira:grok".into()),
+            tmux_pane: None,
+        };
+        let started = Instant::now();
+        let is_dead = explicit_route_is_dead(&route, Some("feira"), true);
+        let elapsed = started.elapsed();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("FL_WIRE_TMUX_BIN", v),
+                None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
+            }
+        }
+        assert!(
+            !is_dead,
+            "timed-out tmux probe must treat explicit route as alive (not dead)"
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "hung tmux probe took {elapsed:?}, expected < 600ms"
+        );
+    }
+
+    #[test]
     fn registration_guard_preserves_metadata_caps_diagnostics_and_guards_incumbent() {
         let mut table = RouteTable::default();
         let live_agy = VendorRoute::Agy {
@@ -11912,13 +12315,17 @@ mod tests {
                 hosted_id: Some("Feira.agy".into()),
                 hydration_generation: Some("gen-1".into()),
                 hosted_session_verified: true,
+                unverified_process: false,
                 allow_host_probes: false,
+                incumbent_dead_override: None,
                 at: At::from_unix_millis(1000),
             })
             .unwrap();
         let entry = table.get("feira").unwrap();
         assert_eq!(entry.hosted_id.as_deref(), Some("antigravity:feira"));
         assert_eq!(entry.hydration_generation.as_deref(), Some("gen-1"));
+        #[cfg(target_os = "linux")]
+        assert!(entry.pid_start_time.is_some());
 
         // Same-vendor explicit refresh without metadata preserves hosted_id + hydration_generation.
         table.upsert_explicit(
@@ -11940,7 +12347,9 @@ mod tests {
                 hosted_id: Some("antigravity:feira".into()),
                 hydration_generation: Some("gen-1".into()),
                 hosted_session_verified: true,
+                unverified_process: false,
                 allow_host_probes: false,
+                incumbent_dead_override: None,
                 at: At::from_unix_millis(1200),
             })
             .unwrap();
@@ -11960,7 +12369,9 @@ mod tests {
                 hosted_id: None,
                 hydration_generation: None,
                 hosted_session_verified: false,
+                unverified_process: false,
                 allow_host_probes: false,
+                incumbent_dead_override: None,
                 at: At::from_unix_millis(1300),
             })
             .unwrap_err();
@@ -11973,7 +12384,7 @@ mod tests {
         );
         assert_eq!(table.get("feira").unwrap().route, live_agy);
 
-        // Secret-free serialization and same_routes invariance + 64-cap FIFO eviction.
+        // Secret-free serialization and same_routes invariance.
         let baseline = {
             let mut b = RouteTable::default();
             b.upsert_explicit("feira", live_agy.clone(), At::from_unix_millis(1200));
@@ -11981,9 +12392,14 @@ mod tests {
         };
         assert!(table.same_routes(&baseline));
 
+        // Repeated identical refusals deduplicate into 1 entry with incremented `count` and
+        // updated `last_seen_at` instead of filling the 64-entry ring.
+        table.registration_diagnostics.clear();
         for idx in 0..70_u64 {
             table.push_registration_diagnostic(RouteRegistrationDiagnostic {
                 at: At::from_unix_millis(2000 + idx),
+                last_seen_at: None,
+                count: 1,
                 persona: "Feira".into(),
                 outcome: RegistrationDiagnosticOutcome::Refused,
                 reason: RegistrationConflictReason::ForeignHostedEnv,
@@ -11994,6 +12410,37 @@ mod tests {
                 incumbent_generation: Some("gen-1".into()),
                 challenger_generation: Some("bad token with spaces".into()),
                 replace: false,
+                unverified_process: false,
+            });
+        }
+        assert_eq!(
+            table.registration_diagnostics.len(),
+            1,
+            "70 identical refusals must deduplicate into 1 entry"
+        );
+        let deduped = &table.registration_diagnostics[0];
+        assert_eq!(deduped.count, 70);
+        assert_eq!(deduped.at, At::from_unix_millis(2000));
+        assert_eq!(deduped.last_seen_at, Some(At::from_unix_millis(2069)));
+
+        // 70 distinct diagnostics still enforce the 64-entry FIFO cap.
+        table.registration_diagnostics.clear();
+        for idx in 0..70_u64 {
+            table.push_registration_diagnostic(RouteRegistrationDiagnostic {
+                at: At::from_unix_millis(3000 + idx),
+                last_seen_at: None,
+                count: 1,
+                persona: format!("feira-{idx}"),
+                outcome: RegistrationDiagnosticOutcome::Refused,
+                reason: RegistrationConflictReason::ForeignHostedEnv,
+                incumbent_adapter: Some(RouteAdapter::Agy),
+                challenger_adapter: RouteAdapter::Claude,
+                incumbent_hosted_id: Some("antigravity:feira".into()),
+                challenger_hosted_id: Some("/tmp/not-a-hosted-id".into()),
+                incumbent_generation: Some("gen-1".into()),
+                challenger_generation: Some("bad token with spaces".into()),
+                replace: false,
+                unverified_process: false,
             });
         }
         assert_eq!(
@@ -12002,7 +12449,7 @@ mod tests {
         );
         assert_eq!(
             table.registration_diagnostics.first().unwrap().at,
-            At::from_unix_millis(2000 + 6)
+            At::from_unix_millis(3000 + 6)
         );
         let diag_json = serde_json::to_string(&table.registration_diagnostics).unwrap();
         assert!(!diag_json.contains("SECRET_SOCK"));

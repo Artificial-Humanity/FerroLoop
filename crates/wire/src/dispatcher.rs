@@ -2369,14 +2369,19 @@ fn resolve_live_host_session(
     Some((client, summary.stream.clone()))
 }
 
-pub(crate) fn tmux_target_alive_passive(target: &str) -> bool {
-    tmux_target_alive(target)
+const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxProbeOutcome {
+    Alive,
+    Dead,
+    TimedOut,
 }
 
-fn tmux_target_alive(target: &str) -> bool {
+fn probe_tmux_target(target: &str, timeout: Duration) -> TmuxProbeOutcome {
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && resolve_live_host_session(target).is_some()
     {
-        return true;
+        return TmuxProbeOutcome::Alive;
     }
     let exact = tmux_exact_target(target);
     // `display-message` answers for the current window when an exact `session:window` target
@@ -2388,14 +2393,63 @@ fn tmux_target_alive(target: &str) -> bool {
     } else {
         cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
     }
-    let Ok(out) = cmd
+    let Ok(mut child) = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     else {
-        return false;
+        return TmuxProbeOutcome::Dead;
     };
-    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    let mut stdout = child.stdout.take();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return TmuxProbeOutcome::Dead;
+                }
+                let mut buf = Vec::new();
+                if let Some(ref mut out) = stdout {
+                    let _ = out.read_to_end(&mut buf);
+                }
+                return if String::from_utf8_lossy(&buf).trim().is_empty() {
+                    TmuxProbeOutcome::Dead
+                } else {
+                    TmuxProbeOutcome::Alive
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TmuxProbeOutcome::TimedOut;
+            }
+        }
+    }
+}
+
+pub(crate) fn tmux_target_alive_passive(target: &str) -> bool {
+    match probe_tmux_target(target, TMUX_PROBE_TIMEOUT) {
+        TmuxProbeOutcome::Alive => true,
+        TmuxProbeOutcome::Dead => false,
+        TmuxProbeOutcome::TimedOut => {
+            eprintln!(
+                "fl-wire: warning: tmux liveness probe timed out after {}ms for target `{target}`; treating route as alive",
+                TMUX_PROBE_TIMEOUT.as_millis()
+            );
+            true
+        }
+    }
+}
+
+fn tmux_target_alive(target: &str) -> bool {
+    matches!(
+        probe_tmux_target(target, TMUX_PROBE_TIMEOUT),
+        TmuxProbeOutcome::Alive
+    )
 }
 
 fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
@@ -3715,8 +3769,8 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         if let Err(ref err) = pushed {
             let dead_explicit = entry.explicit
                 && (matches!(err, PushError::NotConnected(_))
-                    || crate::identity::explicit_route_is_dead(
-                        &entry.route,
+                    || crate::identity::explicit_route_entry_is_dead(
+                        &entry,
                         Some(&rcpt.recipient_name),
                         allow_probes,
                     ));
@@ -3743,8 +3797,8 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                 if let Err(ref retry_err) = pushed {
                     let retry_dead_explicit = fresh.explicit
                         && (matches!(retry_err, PushError::NotConnected(_))
-                            || crate::identity::explicit_route_is_dead(
-                                &fresh.route,
+                            || crate::identity::explicit_route_entry_is_dead(
+                                &fresh,
                                 Some(&rcpt.recipient_name),
                                 allow_probes,
                             ));
@@ -8914,6 +8968,7 @@ exit 1"#,
                     hosted_id: None,
                     hydration_generation: None,
                     hosted_session_verified: false,
+                    unverified_process: false,
                 })
                 .unwrap();
 
