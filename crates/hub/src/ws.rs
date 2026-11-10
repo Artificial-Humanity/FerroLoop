@@ -254,6 +254,7 @@ impl HubServer {
         } = self;
         let mut acceptor = make_acceptor(listener);
         crate::artifact_dirs::ensure_startup_dirs(&state);
+        let run_hosted_reconcile = boot_reconcile.is_some();
         if let Some(plan) = boot_reconcile {
             // Not awaited: the reconciliation never holds up the accept loop. It ends with
             // `serve`: a shutdown stops the passes between two of them.
@@ -268,6 +269,11 @@ impl HubServer {
         }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut hosted_reconcile_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + crate::boot_reconcile::RETRY_INTERVAL,
+            crate::boot_reconcile::RETRY_INTERVAL,
+        );
+        hosted_reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.
         let mut attachment_sweep_tick =
             tokio::time::interval(crate::attachments::ATTACHMENT_SWEEP_INTERVAL);
@@ -321,6 +327,13 @@ impl HubServer {
                             drain_ready_session_queues(&state);
                         }).await;
                     }
+                }
+                _ = hosted_reconcile_tick.tick(), if run_hosted_reconcile => {
+                    // Not awaited: hosted session reconcile and respawn never holds up the accept loop.
+                    let state = state.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        let _ = crate::lifecycle::reconcile_and_respawn_hosted_sessions_in_hub(&state);
+                    }));
                 }
                 _ = attachment_sweep_tick.tick() => {
                     // Not awaited: a sweep never holds up the accept loop.

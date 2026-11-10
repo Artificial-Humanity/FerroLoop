@@ -1038,6 +1038,36 @@ pub fn proc_alive_matching_start(pid: u32, expected_start_time: Option<u64>) -> 
     true
 }
 
+/// True ONLY when `pid` is `Some(p)` (`p > 0`), `expected_start_time` is `Some(expected_st)`,
+/// `proc_alive(p)` is `true` (not a zombie), and `proc_start_time_ticks(p) == Some(expected_st)`.
+/// Never trusts a bare PID without `expected_start_time` because OS PIDs get reused.
+pub fn pid_proven_live(pid: Option<u32>, expected_start_time: Option<u64>) -> bool {
+    let (Some(p), Some(expected_st)) = (pid, expected_start_time) else {
+        return false;
+    };
+    p > 0 && proc_alive(p) && proc_start_time_ticks(p) == Some(expected_st)
+}
+
+/// True when `entry` (together with any recorded `(record_pid, record_pid_start_time)`) is
+/// proven live by a live process whose `/proc/{pid}/stat` start time matches its recorded
+/// start time.
+pub fn route_entry_proven_live(
+    entry: &RouteEntry,
+    record_pid: Option<u32>,
+    record_pid_start_time: Option<u64>,
+) -> bool {
+    if let Some(rpid) = record_pid.filter(|&p| p > 0)
+        && !pid_proven_live(Some(rpid), record_pid_start_time)
+    {
+        return false;
+    }
+    if let Some(route_pid) = entry.route.route_pid() {
+        pid_proven_live(Some(route_pid), entry.pid_start_time)
+    } else {
+        pid_proven_live(record_pid, record_pid_start_time)
+    }
+}
+
 /// Walk `/proc/<pid>/stat` parent pointers (up to 16 hops) from `start_pid` to check whether
 /// `target_ancestor_pid` is `start_pid` itself or an ancestor of `start_pid`.
 /// If `expected_ancestor_start_time` is `Some(ticks)`, also verifies that `target_ancestor_pid`
@@ -12717,5 +12747,93 @@ mod tests {
                 home.join(".cache/fl/wire-routes.json")
             );
         }
+    }
+
+    #[test]
+    fn pid_proven_live_and_route_entry_proven_live_enforce_start_time_and_liveness() {
+        let self_pid = std::process::id();
+        let self_st = proc_start_time_ticks(self_pid).expect("proc_start_time_ticks on linux");
+
+        // Live PID + matching start_time -> true
+        assert!(pid_proven_live(Some(self_pid), Some(self_st)));
+        // Bare PID without start_time -> false (never trust bare PID)
+        assert!(!pid_proven_live(Some(self_pid), None));
+        // Live PID with mismatched start_time (PID reuse) -> false
+        assert!(!pid_proven_live(
+            Some(self_pid),
+            Some(self_st.wrapping_add(1))
+        ));
+        // Dead PID -> false
+        assert!(!pid_proven_live(Some(u32::MAX - 1), Some(self_st)));
+        assert!(!pid_proven_live(Some(0), Some(self_st)));
+        assert!(!pid_proven_live(None, Some(self_st)));
+
+        let claude_entry = RouteEntry {
+            persona: "fiona".to_string(),
+            route: VendorRoute::Claude {
+                pid: self_pid,
+                session_id: "sid-1".to_string(),
+                socket_path: PathBuf::from("/tmp/fake.sock"),
+                key_path: None,
+            },
+            updated_at: At::from_unix_millis(1_000),
+            identity_at: None,
+            explicit: true,
+            hosted_id: Some("claude:fiona".to_string()),
+            hydration_generation: None,
+            pid_start_time: Some(self_st),
+        };
+        assert!(route_entry_proven_live(&claude_entry, None, None));
+        assert!(route_entry_proven_live(
+            &claude_entry,
+            Some(self_pid),
+            Some(self_st)
+        ));
+        // If record_pid is dead or has wrong start_time, fails even if route_pid is live
+        assert!(!route_entry_proven_live(
+            &claude_entry,
+            Some(self_pid),
+            None
+        ));
+        assert!(!route_entry_proven_live(
+            &claude_entry,
+            Some(self_pid),
+            Some(self_st.wrapping_add(1))
+        ));
+
+        let mut bare_claude_entry = claude_entry.clone();
+        bare_claude_entry.pid_start_time = None;
+        assert!(!route_entry_proven_live(
+            &bare_claude_entry,
+            Some(self_pid),
+            Some(self_st)
+        ));
+
+        // Route without route_pid() (e.g. Codex) relies on record_pid + record_pid_start_time
+        let codex_entry = RouteEntry {
+            persona: "fiona".to_string(),
+            route: VendorRoute::Codex {
+                thread_id: "tid-1".to_string(),
+                cwd: None,
+            },
+            updated_at: At::from_unix_millis(1_000),
+            identity_at: None,
+            explicit: true,
+            hosted_id: Some("codex:fiona".to_string()),
+            hydration_generation: None,
+            pid_start_time: None,
+        };
+        assert!(!route_entry_proven_live(&codex_entry, None, None));
+        assert!(!route_entry_proven_live(&codex_entry, Some(self_pid), None));
+        assert!(!route_entry_proven_live(
+            &codex_entry,
+            Some(self_pid),
+            Some(self_st.wrapping_add(1))
+        ));
+        assert!(route_entry_proven_live(
+            &codex_entry,
+            Some(self_pid),
+            Some(self_st)
+        ));
     }
 }

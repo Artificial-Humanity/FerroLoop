@@ -1550,6 +1550,7 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         node_id: "local".into(),
         hosted: true,
         status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+        stop_reason: None,
         restart_policy: "on-failure".into(),
         restart_count: 0,
         tmux_target: None,
