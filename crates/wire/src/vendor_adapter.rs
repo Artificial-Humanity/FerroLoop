@@ -177,6 +177,11 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
     /// `"muse"`, `"lemonade"`, `"ollama"`).
     fn vendor_id(&self) -> &str;
 
+    /// Whether tool commands execute under the hosted CLI process tree.
+    fn tool_processes_descend_from_cli(&self) -> bool {
+        true
+    }
+
     /// Optional environment variable overriding the binary path (`FL_WIRE_*_BIN`).
     fn binary_env_var(&self) -> Option<&str>;
 
@@ -857,6 +862,10 @@ impl VendorCliAdapter for ClaudeCliAdapter {
 pub struct CodexCliAdapter;
 
 impl VendorCliAdapter for CodexCliAdapter {
+    fn tool_processes_descend_from_cli(&self) -> bool {
+        false
+    }
+
     fn vendor_id(&self) -> &str {
         "codex"
     }
@@ -1331,6 +1340,12 @@ impl HostVendorAdapterRegistry {
 
 pub fn lookup_vendor_cli_adapter(vendor: &str) -> Option<Arc<dyn VendorCliAdapter>> {
     HostVendorAdapterRegistry::global().lookup(vendor)
+}
+
+/// Unknown adapters keep ancestry verification enabled.
+pub fn tool_processes_descend_from_cli(vendor: &str) -> bool {
+    lookup_vendor_cli_adapter(crate::identity::canonical_vendor_id(vendor))
+        .is_none_or(|adapter| adapter.tool_processes_descend_from_cli())
 }
 
 pub fn register_vendor_cli_adapter(adapter: Arc<dyn VendorCliAdapter>) {

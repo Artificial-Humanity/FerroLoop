@@ -47,6 +47,12 @@ impl Env {
             .env_remove("AGENT_NAME")
             .env_remove("AGENT_HYDRATION_GENERATION")
             .env_remove("FL_HOSTED_ID")
+            .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
+            .env_remove("CLAUDE_SESSION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("MUSE_SESSION_ID")
+            .env_remove("GROK_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
             .env_remove("ANTIGRAVITY_AGENT")
             .arg("--db")
             .arg(self.store());
@@ -886,4 +892,121 @@ fn sonora_named_binding_spin_up_keeps_umbrella_cwd_without_warnings() {
             .contains(root.join("AGENTS.md").to_str().unwrap())
     );
     assert!(output.stderr.is_empty());
+}
+
+/// Exercise the real registration command from the vendor's tool-process tree. Codex uses
+/// a separate app-server process; the other tool shells descend from their hosted CLI.
+#[test]
+#[cfg(target_os = "linux")]
+fn hydration_register_live_process_shapes_confirm_and_write_routes_for_each_vendor() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::symlink;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command as Process, Stdio};
+
+    for (vendor, binary, env_key) in [
+        ("claude", "claude", "CLAUDE_CODE_MESSAGING_SOCKET"),
+        ("codex", "codex", "CODEX_THREAD_ID"),
+        ("muse", "muse", "MUSE_SESSION_ID"),
+        ("antigravity", "agy", "ANTIGRAVITY_CONVERSATION_ID"),
+        ("grok", "grok", "GROK_SESSION_ID"),
+    ] {
+        let e = Env::new();
+        let mut spin = e.spin_up("ada", "assistant", vendor);
+        spin.env("CODEX_HOME", e.path().join("codex-home"));
+        let spun = Env::json_of(spin);
+        let generation = spun["hydration_generation"].as_str().unwrap();
+        let vendor_bin = e.path().join(binary);
+        symlink("/bin/sh", &vendor_bin).unwrap();
+        let mut tui = (vendor == "codex").then(|| {
+            Process::new(&vendor_bin)
+                .args(["-c", "sleep 60"])
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        });
+        let script = if vendor == "claude" {
+            "echo $$; read go; export CLAUDE_CODE_MESSAGING_SOCKET=$1/$$.sock; shift; \"$@\""
+        } else {
+            "echo $$; read go; shift; \"$@\""
+        };
+        let mut cmd = Process::new(&vendor_bin);
+        cmd.arg("-c")
+            .arg(script)
+            .arg("tool")
+            .arg(e.path())
+            .arg(env!("CARGO_BIN_EXE_fl"))
+            .args([
+                "--db",
+                e.store().to_str().unwrap(),
+                "wire",
+                "register",
+                "Ada",
+                "--project",
+                "FerroLoop",
+                "--role",
+                "assistant",
+                "--replace",
+            ])
+            .current_dir(e.path())
+            .env("HOME", e.path())
+            .env("XDG_RUNTIME_DIR", e.path())
+            .env("XDG_CONFIG_HOME", e.path().join("config"))
+            .env("XDG_DATA_HOME", e.path().join("data"))
+            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env("AGENT_PERSONA", "ada")
+            .env("AGENT_HYDRATION_GENERATION", generation)
+            .env_remove("FL_HOSTED_ID")
+            .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
+            .env_remove("CLAUDE_SESSION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("MUSE_SESSION_ID")
+            .env_remove("GROK_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("ANTIGRAVITY_AGENT")
+            .env_remove("AGENT_NAME")
+            .env_remove("FL_DB")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        if vendor != "claude" {
+            cmd.env(env_key, "live-session-id");
+        }
+        let mut tool = cmd.spawn().unwrap();
+        let mut stdout = BufReader::new(tool.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let app_pid: u32 = line.trim().parse().unwrap();
+        let hosted_pid = tui.as_ref().map_or(app_pid, |p| p.id());
+        {
+            let store = fl_store::open_store(&e.store()).unwrap();
+            let id = format!("{vendor}:ada");
+            let mut record = fl_hub::lifecycle::find_hosted_session(&store, &[&id])
+                .unwrap()
+                .unwrap();
+            record.pid = Some(hosted_pid);
+            record.pid_start_time = fl_wire::identity::proc_start_time_ticks(hosted_pid);
+            record.runtime_leader_pid = Some(hosted_pid);
+            fl_hub::lifecycle::persist_hosted_session(&store, &record, "test").unwrap();
+        }
+        writeln!(tool.stdin.take().unwrap(), "go").unwrap();
+        let status = tool.wait().unwrap();
+        if let Some(ref mut tui) = tui {
+            let _ = tui.kill();
+            let _ = tui.wait();
+        }
+        assert!(status.success(), "{vendor}: registration failed: {status}");
+        let store = fl_store::open_store(&e.store()).unwrap();
+        let record = fl_hub::lifecycle::find_hosted_session(&store, &[&format!("{vendor}:ada")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.hydration_status,
+            fl_hub::lifecycle::HydrationStatus::Confirmed,
+            "{vendor}"
+        );
+        let table = RouteTable::load(Some(&e.routes()));
+        assert_eq!(table.get("ada").unwrap().route.canonical_vendor(), vendor);
+    }
 }

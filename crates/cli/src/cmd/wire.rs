@@ -452,8 +452,10 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
         if !env_matched {
             continue;
         }
-        // Process ancestry and start-time evidence currently require Linux /proc.
-        if !cfg!(target_os = "linux") {
+        // Some adapters run tools in an independent process tree.
+        if !fl_wire::vendor_adapter::tool_processes_descend_from_cli(&rec.vendor)
+            || !cfg!(target_os = "linux")
+        {
             out.verified = true;
             out.unverified_process = true;
             continue;

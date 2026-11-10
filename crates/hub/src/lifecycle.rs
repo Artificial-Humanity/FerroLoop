@@ -3796,6 +3796,7 @@ pub fn record_hydration_ack_with_runtime<S: StateStore>(
         }
         if let Some(cpid) = caller_pid.filter(|&p| p > 0)
             && cfg!(target_os = "linux")
+            && fl_wire::vendor_adapter::tool_processes_descend_from_cli(&rec.vendor)
         {
             let vendor_pid =
                 fl_wire::identity::find_nearest_vendor_cli_ancestor_pid(cpid).unwrap_or(cpid);
@@ -3820,6 +3821,7 @@ pub fn record_hydration_ack_with_runtime<S: StateStore>(
                     && fl_wire::identity::resolve_vendor_cli_pid(rec_pid) == Some(vendor_pid)
                     && fl_wire::identity::pid_is_nearest_vendor_ancestor(cpid, vendor_pid, None)
                 {
+                    rec.runtime_leader_pid = Some(rec_pid);
                     rec.pid = Some(vendor_pid);
                     rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(vendor_pid);
                     dirty = true;
@@ -8574,6 +8576,7 @@ fn refresh_owned_runtime_pid(env: &LifecycleEnv<'_>, unit: &str, record: &mut Ho
         .or_else(|| env.runtime.recorded_pid(unit, &record.session_id));
     if let Some(new_pid) = vendor_pid.filter(|&p| p > 0) {
         if record.pid.is_none()
+            || record.pid_start_time.is_none()
             || record.pid == Some(new_pid)
             || record.pid.is_some_and(|p| {
                 fl_wire::identity::proc_alive_matching_start(p, record.pid_start_time)
@@ -19079,6 +19082,7 @@ mod tests {
             &hydration_ack_slug(&g1),
         );
         let mut rec_shell = rec1.clone();
+        rec_shell.runtime_leader_pid = None;
         rec_shell.pid = Some(pane_pid);
         rec_shell.pid_start_time = fl_wire::identity::proc_start_time_ticks(pane_pid);
         rec_shell.hydration_status = HydrationStatus::Unconfirmed;
@@ -19123,6 +19127,7 @@ mod tests {
             .unwrap();
         assert_eq!(upgraded.pid, Some(vendor_pid));
         assert_eq!(upgraded.pid_start_time, vendor_st);
+        assert_eq!(upgraded.runtime_leader_pid, Some(pane_pid));
         assert_eq!(upgraded.hydration_status, HydrationStatus::Confirmed);
 
         // 4. Once `rec.pid` is `Some(vendor_pid)`, a child CLI (`child_cli_pid` / `child_sh_pid`) is rejected.
@@ -19158,6 +19163,15 @@ mod tests {
             .unwrap();
         assert_eq!(retained.pid, Some(child_cli_pid));
         assert_eq!(retained.runtime_leader_pid, Some(child_cli_pid));
+        // An unproven reference (no start time) yields to the owned runtime PID.
+        live_other.pid_start_time = None;
+        persist_hosted_session(&store, &live_other, "owner").unwrap();
+        reconcile_running_session_pids_with_store(&env, &store).unwrap();
+        let refreshed = get_hosted_session_by_id(&store, "grok:ada")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.pid, Some(vendor_pid));
+        assert_eq!(refreshed.runtime_leader_pid, Some(pane_pid));
 
         // 5. `reconcile_running_session_pids_with_store` backfills `pid` and `pid_start_time` when
         //    `record.pid` was `None` or a wrapper shell (`pane_pid`).

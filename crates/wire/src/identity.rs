@@ -13238,7 +13238,7 @@ mod tests {
         let updated = temp.path().join("agy.123456");
         std::fs::copy("/bin/sh", &updated).unwrap();
         let mut agent = std::process::Command::new(&updated)
-            .arg0("/home/lmcfarlin/.local/bin/agy")
+            .arg0("/opt/vendor/bin/agy")
             .args(["-c", "sh -c 'echo HOOK:$$; sleep 60; :' & wait"])
             .stdout(std::process::Stdio::piped())
             .process_group(0)
@@ -13265,7 +13265,7 @@ mod tests {
         assert_eq!(comm.trim(), "agy.123456");
         assert_eq!(
             argv.split(|&b| b == 0).next().unwrap(),
-            b"/home/lmcfarlin/.local/bin/agy"
+            b"/opt/vendor/bin/agy"
         );
         assert!(recognised);
         assert_eq!(nearest, Some(pid));

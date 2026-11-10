@@ -368,6 +368,9 @@ fn hosted_reference<S: StateStore>(
     _hosted_id: Option<&str>,
     _generation: Option<&str>,
 ) -> Option<HostedReference> {
+    if !crate::vendor_adapter::tool_processes_descend_from_cli(vendor) {
+        return None;
+    }
     let slug = format!("hosted-session-{vendor}-{persona}");
     let entry = store
         .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
@@ -403,6 +406,7 @@ fn hosted_reference<S: StateStore>(
 fn verify_peer_cred_for_hosted_claim(
     peer_cred: PeerCred,
     trusted_reference: Option<HostedReference>,
+    replace: bool,
     challenger_route: &VendorRoute,
     challenger_generation: Option<&str>,
     incumbent: Option<&RouteEntry>,
@@ -437,11 +441,13 @@ fn verify_peer_cred_for_hosted_claim(
         }
     }
     if let Some(challenger_pid) = challenger_route.route_pid()
+        && !(trusted_reference.is_some() && matches!(challenger_route, VendorRoute::Agy { .. }))
         && !crate::identity::pid_is_nearest_vendor_ancestor(peer_pid, challenger_pid, None)
     {
         return false;
     }
-    if let Some(inc) = incumbent
+    if !(replace && trusted_reference.is_some())
+        && let Some(inc) = incumbent
         && inc.explicit
         && !incumbent_is_dead
         && let Some(inc_pid) = inc.route.route_pid()
@@ -2060,6 +2066,7 @@ where
                                     hosted_id.as_deref(),
                                     hydration_generation.as_deref(),
                                 ),
+                                replace,
                                 &route,
                                 hydration_generation.as_deref(),
                                 current_incumbent.as_ref(),
@@ -7501,6 +7508,78 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn codex_app_server_tool_can_register_with_generation_and_replace() {
+        use fl_core::state::{
+            MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        let rig = rig();
+        let bin = rig._tmp.path().join("codex");
+        std::os::unix::fs::symlink("/bin/sh", &bin).unwrap();
+        let mut tui = std::process::Command::new(&bin)
+            .args(["-c", "sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut server = std::process::Command::new(&bin)
+            .args(["-c", "sh -c 'echo HOOK:$$; sleep 60; :' & wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let hook: u32 = BufReader::new(server.stdout.take().unwrap())
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap()
+            .strip_prefix("HOOK:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        rig.inner.store.upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace, slug: "hosted-session-codex-feira".into(), sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Runtime(RuntimeEntry { value: serde_json::json!({"session_id":"codex:feira", "persona":"feira", "vendor":"codex", "status":"running", "hydration_generation":"gen-1", "pid":tui.id(), "pid_start_time":crate::identity::proc_start_time_ticks(tui.id())}), merge_mode: MergeMode::LastWriter }), at: At::from_unix_millis(1), by: "test".into(),
+        }).unwrap();
+        let (response, _) = rig.inner.handle_local_request_with_peer(
+            LocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "thread".into(),
+                    cwd: None,
+                },
+                explicit: true,
+                replace: true,
+                hosted_id: None,
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: true,
+                unverified_process: true,
+            },
+            PeerCred {
+                pid: Some(hook),
+                ppid: None,
+                start_time: crate::identity::proc_start_time_ticks(hook),
+            },
+        );
+        unsafe {
+            libc::kill(-(server.id() as i32), libc::SIGKILL);
+            libc::kill(-(tui.id() as i32), libc::SIGKILL);
+        }
+        let _ = server.wait();
+        let _ = tui.wait();
+        assert!(
+            matches!(response, LocalResponse::RouteRegistered),
+            "{response:?}"
+        );
+        assert!(matches!(
+            lock(&rig.inner.routes).get("feira").unwrap().route,
+            VendorRoute::Codex { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn hosted_muse_and_grok_replace_checks_peer_against_runtime_record() {
         use fl_core::state::{
             MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
@@ -8295,5 +8374,113 @@ mod tests {
             calls_on_second_poll.is_empty(),
             "periodic poll should skip get/receipts reads for unrouted markers when routes did not change, got {calls_on_second_poll:?}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod hydration_peer_review_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn verified_replacement_ignores_unrelated_incumbent_but_not_child_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        for vendor in ["claude", "agy"] {
+            let bin = tmp.path().join(vendor);
+            std::os::unix::fs::symlink("/bin/sh", &bin).unwrap();
+            let mut process = Command::new(&bin).args(["-c", "sh -c 'echo HOOK:$$; sleep 60; :' & \"$1\" -c 'echo CHILD:$$; sleep 60; :' & wait", "_", bin.to_str().unwrap()])
+                .stdout(Stdio::piped()).process_group(0).spawn().unwrap();
+            let pid = process.id();
+            let mut hook = None;
+            let mut child = None;
+            for line in BufReader::new(process.stdout.take().unwrap()).lines() {
+                let line = line.unwrap();
+                if let Some(id) = line.strip_prefix("HOOK:") {
+                    hook = id.parse::<u32>().ok();
+                }
+                if let Some(id) = line.strip_prefix("CHILD:") {
+                    child = id.parse::<u32>().ok();
+                }
+                if hook.is_some() && child.is_some() {
+                    break;
+                }
+            }
+            let route = if vendor == "claude" {
+                VendorRoute::Claude {
+                    pid,
+                    session_id: "new".into(),
+                    socket_path: tmp.path().join("new.sock"),
+                    key_path: None,
+                }
+            } else {
+                VendorRoute::Agy {
+                    conversation_id: "new".into(),
+                    ls_pid: Some(std::process::id()),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                }
+            };
+            let mut table = crate::identity::RouteTable::default();
+            table.upsert_explicit_with_meta(
+                "ada",
+                VendorRoute::Claude {
+                    pid: std::process::id(),
+                    session_id: "old".into(),
+                    socket_path: tmp.path().join("old.sock"),
+                    key_path: None,
+                },
+                At::from_unix_millis(1),
+                None,
+                None,
+                false,
+            );
+            let incumbent = table.get("ada");
+            let peer = |pid| PeerCred {
+                pid: Some(pid),
+                ppid: None,
+                start_time: crate::identity::proc_start_time_ticks(pid),
+            };
+            let reference = Some((pid, crate::identity::proc_start_time_ticks(pid)));
+            let genuine = verify_peer_cred_for_hosted_claim(
+                peer(hook.unwrap()),
+                reference,
+                true,
+                &route,
+                Some("gen"),
+                incumbent,
+                false,
+            );
+            let nested = verify_peer_cred_for_hosted_claim(
+                peer(child.unwrap()),
+                reference,
+                true,
+                &route,
+                Some("gen"),
+                incumbent,
+                false,
+            );
+            let untrusted = verify_peer_cred_for_hosted_claim(
+                peer(hook.unwrap()),
+                None,
+                true,
+                &route,
+                Some("gen"),
+                incumbent,
+                false,
+            );
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let _ = process.wait();
+            assert!(genuine, "{vendor} genuine replacement");
+            assert!(!nested, "{vendor} nested child");
+            assert!(
+                !untrusted,
+                "{vendor} incumbent requires independently proven replacement"
+            );
+        }
     }
 }
