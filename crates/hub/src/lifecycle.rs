@@ -18303,11 +18303,12 @@ mod tests {
         let fake_locked = FakeRuntime::default();
         let env_locked = fake_locked.env(hub_home.path());
         let mutex = hosted_session_lifecycle_mutex(&env_locked, "claude:race");
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             let _held_guard = mutex.lock().unwrap();
             locked_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(80));
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
         locked_rx.recv().unwrap();
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(Duration::from_millis(10))));
@@ -18319,6 +18320,7 @@ mod tests {
         )
         .unwrap();
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
+        let _ = release_tx.send(());
         holder.join().unwrap();
         assert!(
             skipped.is_empty(),
