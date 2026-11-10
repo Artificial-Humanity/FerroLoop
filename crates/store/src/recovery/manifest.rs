@@ -30,6 +30,7 @@ pub enum MemberKind {
     Warrants,
     VaultCiphertext,
     ValidationExpectations,
+    ValidationProfile,
     VerificationReport,
     IndexConfiguration,
 }
@@ -297,6 +298,7 @@ impl BundleManifestV1 {
                 MemberKind::Warrants => "warrants.json",
                 MemberKind::VaultCiphertext => "vault.enc",
                 MemberKind::ValidationExpectations => "validation.json",
+                MemberKind::ValidationProfile => "profile.json",
                 MemberKind::VerificationReport => "report.json",
                 MemberKind::IndexConfiguration => "index-config.json",
             };
@@ -307,6 +309,9 @@ impl BundleManifestV1 {
                 return Err(limits.verification());
             }
             let checksum = match member.kind {
+                MemberKind::ValidationProfile => {
+                    Some(super::verify::serialized_checksum(profile, limits)?)
+                }
                 MemberKind::ValidationExpectations => {
                     validation = true;
                     Some(super::verify::serialized_checksum(expected, limits)?)

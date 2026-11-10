@@ -1,4 +1,7 @@
 //! Recovery inventory and explicitly bounded physical capture primitives.
+pub mod backup;
+pub mod catalog;
+pub mod fs;
 pub mod inventory;
 mod inventory_metadata;
 mod inventory_types;
@@ -9,6 +12,12 @@ pub use inventory::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
+    #[error("recovery {operation_id}: image exceeds admitted ceiling")]
+    ImageExceedsCeiling { operation_id: uuid::Uuid },
+    #[error("recovery {operation_id}: another backup holds the physical store lock")]
+    ConcurrentBackup { operation_id: uuid::Uuid },
+    #[error("recovery {operation_id}: bundle quarantined")]
+    Quarantined { operation_id: uuid::Uuid },
     #[error("inventory input refused: {0}")]
     Refused(String),
     #[error("recovery {operation_id}: input refused ({reason})")]
@@ -36,6 +45,11 @@ pub enum RecoveryError {
     Cancelled { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: image or captured expectations verification failed")]
     Verification { operation_id: uuid::Uuid },
+    #[error("recovery {operation_id}: transient resource failure ({errno})")]
+    Transient {
+        operation_id: uuid::Uuid,
+        errno: i32,
+    },
     #[error("recovery {operation_id}: destination I/O failed")]
     Destination { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: publication outcome unknown")]
@@ -46,7 +60,10 @@ pub enum RecoveryError {
 
 /// A shared cooperative cancellation flag. Cancellation never writes the source.
 #[derive(Clone, Debug, Default)]
-pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub struct CancelToken(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Vec<CancelToken>,
+);
 impl CancelToken {
     pub fn new() -> Self {
         Self::default()
@@ -54,8 +71,11 @@ impl CancelToken {
     pub fn cancel(&self) {
         self.0.store(true, std::sync::atomic::Ordering::Release);
     }
+    pub(crate) fn combined(a: &Self, b: &Self) -> Self {
+        Self(Default::default(), vec![a.clone(), b.clone()])
+    }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.0.load(std::sync::atomic::Ordering::Acquire) || self.1.iter().any(Self::is_cancelled)
     }
 }
 
@@ -107,6 +127,7 @@ pub struct OperationLimits {
     pub query_work_limit: u64,
     // Clones and both verification opens share consumption for this operation.
     query_work_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) publication_io: Option<std::sync::Arc<fs::PublicationIo>>,
     memory_admission: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl OperationLimits {
@@ -124,6 +145,7 @@ impl OperationLimits {
             operation_id: uuid::Uuid::now_v7(),
             query_work_limit: byte_limit.saturating_mul(64),
             query_work_used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            publication_io: None,
             memory_admission: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
