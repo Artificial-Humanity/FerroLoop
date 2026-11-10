@@ -201,6 +201,19 @@ impl MessageStore for FaultStore {
         lock(&self.calls).push("send");
         self.inner.send_wire(args)
     }
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        lock(&self.calls).push("send");
+        self.inner.send_wire_awaiting_daemon(args)
+    }
+    fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+        self.inner.list_wire_awaiting_daemon()
+    }
+    fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+        self.inner.clear_wire_awaiting_daemon(message_id)
+    }
     fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
         lock(&self.calls).push("get");
         match self.fault(&self.gets) {
@@ -432,16 +445,16 @@ fn daemon_store_fault_fixture() {
     );
     assert!(matches!(
         client
-            .request(&LocalRequest::RegisterRoute {
-                persona: "diagnostic-recipient".into(),
-                explicit: true,
-                route: VendorRoute::Muse {
+            .request(&LocalRequest::register(
+                "diagnostic-recipient",
+                VendorRoute::Muse {
                     session_id: "SESSION_SECRET".into(),
                     cwd: Some(home.to_path_buf()),
                     tmux_target: None,
                     tmux_pane: None
                 },
-            })
+                true,
+            ))
             .unwrap(),
         LocalResponse::RouteRegistered
     ));

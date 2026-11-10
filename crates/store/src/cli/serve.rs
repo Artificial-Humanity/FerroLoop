@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 /// [`ServerAuth`].
 #[derive(Debug, Clone, Default)]
 pub struct ServeOptions {
+    /// Versioned recovery policy. No policy means no recovery controls or recurrence.
+    pub recovery_policy: Option<PathBuf>,
     /// The Unix socket; default `<store>.fls.sock`. Not with `tcp`.
     pub socket: Option<PathBuf>,
     /// Serve TCP on this address (`127.0.0.1:7878`) instead of a socket.
@@ -146,6 +148,12 @@ pub fn serve(
     ready: impl FnOnce(&Serving) -> Result<()>,
 ) -> Result<(Serving, &'static str)> {
     check(options)?;
+    // Recovery is optional. A bad policy disables recovery, never data serving.
+    let recovery = options
+        .recovery_policy
+        .as_ref()
+        .map(|path| crate::recovery::policy::RecoveryPolicy::load(path));
+
     // Before the store or the server starts a thread.
     let signals = Signals::block()?;
     // Everything that can refuse before the store is opened, which can
@@ -177,6 +185,11 @@ pub fn serve(
             (server, format!("unix://{}", socket.display()), false)
         }
     };
+    match recovery {
+        Some(Ok(policy)) => server.configure_recovery(policy)?,
+        Some(Err(_)) => server.recovery_policy_unavailable(),
+        None => {}
+    }
     drop(migration_lock);
     if options.psk_file.is_some() {
         methods.push("psk");

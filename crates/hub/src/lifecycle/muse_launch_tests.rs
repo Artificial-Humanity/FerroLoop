@@ -1505,8 +1505,8 @@ fn the_tmux_runtime_adds_a_window_to_a_running_muse_session() {
         [
             "has-session -t =muse",
             "list-windows -t =muse -F #{window_name}",
-            "new-window -d -P -F #{window_id} -t =muse: -n ada -e AGENT_PERSONA=ada -- \
-             /bin/muse --model muse-wonder-full-1.0 hi",
+            "new-window -d -P -F #{window_id} -t =muse: -n ada -e AGENT_PERSONA=ada \
+             -e FL_HOSTED_ID=muse:ada -- /bin/muse --model muse-wonder-full-1.0 hi",
             "set-option -w -t @99 @fl_hosted muse:ada",
         ]
     );
@@ -1522,8 +1522,8 @@ fn the_tmux_runtime_creates_the_muse_session_when_it_does_not_run() {
         tmux.calls(),
         [
             "has-session -t =muse",
-            "new-session -d -P -F #{window_id} -s muse -n ada -e AGENT_PERSONA=ada -- \
-             /bin/muse --model muse-wonder-full-1.0 hi",
+            "new-session -d -P -F #{window_id} -s muse -n ada -e AGENT_PERSONA=ada \
+             -e FL_HOSTED_ID=muse:ada -- /bin/muse --model muse-wonder-full-1.0 hi",
             "set-option -w -t @99 @fl_hosted muse:ada",
         ]
     );
@@ -1684,7 +1684,10 @@ fn a_blank_persona_session_is_spawned_as_before_without_a_window_id_or_mark() {
     let dir = TempDir::new().unwrap();
     let tmux = TmuxLog::install(dir.path(), false, &[]);
     assert!(TmuxRuntime.spawn("Ada", "claude", None, None, "claude:ada"));
-    assert_eq!(tmux.calls(), ["new-session -d -s Ada -n claude"]);
+    assert_eq!(
+        tmux.calls(),
+        ["new-session -d -s Ada -n claude -e FL_HOSTED_ID=claude:ada"]
+    );
 }
 
 #[test]

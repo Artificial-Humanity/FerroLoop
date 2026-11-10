@@ -2,8 +2,9 @@
 
 use super::FerroStore;
 use super::doc::{
-    self, AGENT_BY_NAME, AGENTS, AREAS, IDS, NEXT_WIRE_MSG_SEQ, NEXT_WIRE_RCPT_SEQ, WIRE_INBOX,
-    WIRE_MESSAGES, WIRE_MSG_LOG, WIRE_MSG_SEQ, WIRE_RCPT_LOG, WIRE_REPLIES, WIRE_THREADS,
+    self, AGENT_BY_NAME, AGENTS, AREAS, IDS, NEXT_WIRE_MSG_SEQ, NEXT_WIRE_RCPT_SEQ,
+    WIRE_AWAITING_DAEMON, WIRE_INBOX, WIRE_MESSAGES, WIRE_MSG_LOG, WIRE_MSG_SEQ, WIRE_RCPT_LOG,
+    WIRE_REPLIES, WIRE_THREADS,
 };
 use crate::{FORMAT_WITH_WIRE, decode, mint};
 use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord};
@@ -159,10 +160,11 @@ fn inbox_rows(txn: &super::Txn) -> Result<Vec<(String, String, DeliveryReceipt)>
     Ok(out)
 }
 
-impl MessageStore for FerroStore {
-    fn send_wire(
+impl FerroStore {
+    fn send_wire_inner(
         &self,
         args: SendWireArgs,
+        awaiting_daemon: bool,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
         let subject = validate_subject(&args.subject)
             .map_err(|err| StoreError::InvalidState(err.to_string()))?;
@@ -281,7 +283,47 @@ impl MessageStore for FerroStore {
                 append_wire_receipt(txn, &rcpt)?;
                 receipts.push(rcpt);
             }
+            if awaiting_daemon {
+                doc::put_json(txn, WIRE_AWAITING_DAEMON, msg.id.as_str(), &msg.created_at)?;
+            }
             Ok((msg, receipts))
+        })
+    }
+}
+
+impl MessageStore for FerroStore {
+    fn send_wire(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        self.send_wire_inner(args, false)
+    }
+
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        self.send_wire_inner(args, true)
+    }
+
+    fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+        self.with_read(|txn| {
+            let mut out = Vec::new();
+            for (id, doc) in txn.scan(WIRE_AWAITING_DAEMON) {
+                let iri = Iri::parse(&id).map_err(decode)?;
+                let at: At = serde_json::from_value(doc).map_err(decode)?;
+                out.push((MessageId(iri), at));
+            }
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
+        })
+    }
+
+    fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+        let id = message_id.as_str().to_owned();
+        self.with_write(|txn| {
+            txn.delete(WIRE_AWAITING_DAEMON, &id);
+            Ok(())
         })
     }
 
@@ -625,6 +667,7 @@ impl MessageStore for FerroStore {
             for msg in &to_prune {
                 txn.delete(WIRE_MESSAGES, msg.id.as_str());
                 txn.delete(IDS, msg.id.as_str());
+                txn.delete(WIRE_AWAITING_DAEMON, msg.id.as_str());
                 txn.delete(
                     WIRE_THREADS,
                     doc::pair(msg.thread_id.as_str(), msg.id.as_str()),

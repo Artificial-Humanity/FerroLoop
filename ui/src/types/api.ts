@@ -1199,6 +1199,7 @@ export type WireFailureStage =
   | "message_lookup_error"
   | "initial_receipt_read_error"
   | "transport_error"
+  | "dead_explicit_route"
   | "receipt_write_error"
   | "receipt_write_missing"
   | "final_receipt_read_error"
@@ -1272,16 +1273,55 @@ export interface WireDispatchDiagnostics {
   omitted_evidence_total_saturated: boolean;
 }
 
+export type WirePendingHoldReason = "dead_explicit_route" | "unsupported" | string;
+
+export type WireRegistrationDiagnosticOutcome =
+  | "refused"
+  | "replaced"
+  | "unsupported"
+  | string;
+
+export type WireRegistrationConflictReason =
+  | "foreign_hosted_env"
+  | "vendor_mismatch"
+  | "hosted_identity_mismatch"
+  | "hydration_generation_mismatch"
+  | "registration_contention"
+  | "unsupported"
+  | string;
+
+export interface WireRouteRegistrationDiagnostic {
+  at: string;
+  last_seen_at?: string | null;
+  count?: number;
+  persona: string;
+  outcome: WireRegistrationDiagnosticOutcome;
+  reason: WireRegistrationConflictReason;
+  incumbent_adapter?: WireRouteAdapter | null;
+  challenger_adapter: WireRouteAdapter;
+  incumbent_hosted_id?: string | null;
+  challenger_hosted_id?: string | null;
+  incumbent_generation?: string | null;
+  challenger_generation?: string | null;
+  replace: boolean;
+  unverified_process?: boolean;
+}
+
 export interface WireRecipientPendingSummary {
   recipient: string;
   pending_count: number;
   oldest_pending_at?: string | null;
   oldest_pending_age_ms?: number | null;
+  hold_reason?: WirePendingHoldReason | null;
+  awaiting_daemon_count?: number;
+  oldest_awaiting_daemon_at?: string | null;
+  oldest_awaiting_daemon_age_ms?: number | null;
 }
 
 export interface WireStatusResponse {
   daemon: WireDaemonState;
   dispatch_diagnostics: WireDispatchDiagnostics | null;
+  registration_diagnostics?: WireRouteRegistrationDiagnostic[];
   pending_recipients_available?: boolean;
   pending_recipients: WireRecipientPendingSummary[] | null;
 }

@@ -52,11 +52,27 @@ pub fn format_push_message(msg: &WireMessage) -> String {
 }
 
 pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), String> {
-    dispatch_to_route_with_status(route, msg).map(|_| ())
+    dispatch_to_route_for_recipient(route, None, msg)
+}
+
+pub fn dispatch_to_route_for_recipient(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
+    msg: &WireMessage,
+) -> Result<(), String> {
+    dispatch_to_route_for_recipient_with_status(route, recipient_persona, msg).map(|_| ())
 }
 
 pub fn dispatch_to_route_with_status(
     route: &VendorRoute,
+    msg: &WireMessage,
+) -> Result<DeliveryStatus, String> {
+    dispatch_to_route_for_recipient_with_status(route, None, msg)
+}
+
+pub fn dispatch_to_route_for_recipient_with_status(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
     msg: &WireMessage,
 ) -> Result<DeliveryStatus, String> {
     match route {
@@ -87,10 +103,12 @@ pub fn dispatch_to_route_with_status(
             } else {
                 format_push_message(msg)
             };
-            let persona = match &msg.to {
-                fl_core::ferrowire::WireAddress::AgentName(name) => Some(name.as_str()),
-                _ => None,
-            };
+            let persona = recipient_persona
+                .filter(|s| !s.trim().is_empty())
+                .or(match &msg.to {
+                    fl_core::ferrowire::WireAddress::AgentName(name) => Some(name.as_str()),
+                    _ => None,
+                });
             deliver_to_agy_route(
                 persona,
                 conversation_id,
@@ -210,6 +228,14 @@ pub enum PushError {
     Failed(String),
 }
 
+impl PushError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::NotConnected(e) | Self::Failed(e) => e.as_str(),
+        }
+    }
+}
+
 impl std::fmt::Display for PushError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -229,9 +255,20 @@ impl From<PushError> for String {
 /// [`dispatch_to_route`], with a typed error: [`PushError::NotConnected`] when a webhook
 /// receiver could not be reached at all.
 pub fn push_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), PushError> {
+    push_to_route_for_recipient(route, None, msg)
+}
+
+/// [`dispatch_to_route_for_recipient`], with a typed error: [`PushError::NotConnected`] when a
+/// webhook receiver could not be reached at all.
+pub fn push_to_route_for_recipient(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
+    msg: &WireMessage,
+) -> Result<(), PushError> {
     match route {
         VendorRoute::Webhook { socket_path } => push_webhook_message(socket_path, msg),
-        _ => dispatch_to_route(route, msg).map_err(PushError::Failed),
+        _ => dispatch_to_route_for_recipient(route, recipient_persona, msg)
+            .map_err(PushError::Failed),
     }
 }
 
@@ -1272,9 +1309,11 @@ fn resolve_agy_host_fallback_target(
     }
     if personas.is_empty() {
         #[cfg(not(test))]
-        let route_path = std::env::var_os("FL_WIRE_ROUTES")
-            .map(PathBuf::from)
-            .or_else(|| Some(crate::identity::default_routes_path()));
+        let route_path = Some(crate::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ));
         #[cfg(test)]
         let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
         if let Some(path) = route_path {
@@ -2397,10 +2436,19 @@ fn resolve_live_host_session(
     resolve_live_host_session_with_mode(target).map(|(client, stream, _)| (client, stream))
 }
 
-fn tmux_target_alive(target: &str) -> bool {
+const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxProbeOutcome {
+    Alive,
+    Dead,
+    TimedOut,
+}
+
+fn probe_tmux_target(target: &str, timeout: Duration) -> TmuxProbeOutcome {
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && resolve_live_host_session(target).is_some()
     {
-        return true;
+        return TmuxProbeOutcome::Alive;
     }
     let exact = tmux_exact_target(target);
     // `display-message` answers for the current window when an exact `session:window` target
@@ -2412,14 +2460,63 @@ fn tmux_target_alive(target: &str) -> bool {
     } else {
         cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
     }
-    let Ok(out) = cmd
+    let Ok(mut child) = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     else {
-        return false;
+        return TmuxProbeOutcome::Dead;
     };
-    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    let mut stdout = child.stdout.take();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return TmuxProbeOutcome::Dead;
+                }
+                let mut buf = Vec::new();
+                if let Some(ref mut out) = stdout {
+                    let _ = out.read_to_end(&mut buf);
+                }
+                return if String::from_utf8_lossy(&buf).trim().is_empty() {
+                    TmuxProbeOutcome::Dead
+                } else {
+                    TmuxProbeOutcome::Alive
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TmuxProbeOutcome::TimedOut;
+            }
+        }
+    }
+}
+
+pub(crate) fn tmux_target_alive_passive(target: &str) -> bool {
+    match probe_tmux_target(target, TMUX_PROBE_TIMEOUT) {
+        TmuxProbeOutcome::Alive => true,
+        TmuxProbeOutcome::Dead => false,
+        TmuxProbeOutcome::TimedOut => {
+            eprintln!(
+                "fl-wire: warning: tmux liveness probe timed out after {}ms for target `{target}`; treating route as alive",
+                TMUX_PROBE_TIMEOUT.as_millis()
+            );
+            true
+        }
+    }
+}
+
+fn tmux_target_alive(target: &str) -> bool {
+    matches!(
+        probe_tmux_target(target, TMUX_PROBE_TIMEOUT),
+        TmuxProbeOutcome::Alive
+    )
 }
 
 const COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX: &str = "composer_occupied_by_non_wire_input:";
@@ -5090,9 +5187,11 @@ fn resolve_claude_transcript_for_target(
                 None
             };
         #[cfg(not(test))]
-        let route_path = std::env::var_os("FL_WIRE_ROUTES")
-            .map(PathBuf::from)
-            .or_else(|| Some(crate::identity::default_routes_path()));
+        let route_path = Some(crate::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ));
         #[cfg(test)]
         let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
         if let Some(path) = route_path
@@ -5184,9 +5283,11 @@ fn resolve_muse_transcript_for_target(
     let mut session_id = session_id_arg;
     if session_id.is_none() {
         #[cfg(not(test))]
-        let route_path = std::env::var_os("FL_WIRE_ROUTES")
-            .map(PathBuf::from)
-            .or_else(|| Some(crate::identity::default_routes_path()));
+        let route_path = Some(crate::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ));
         #[cfg(test)]
         let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
         if let Some(path) = route_path {
@@ -5554,6 +5655,20 @@ pub fn dispatch_operator_prompt_to_route(
     }
 }
 
+fn dispatch_to_route_for_recipient_with_push_error(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
+    msg: &WireMessage,
+) -> Result<DeliveryStatus, PushError> {
+    match route {
+        VendorRoute::Webhook { socket_path } => {
+            push_webhook_message(socket_path, msg).map(|()| DeliveryStatus::Acked)
+        }
+        _ => dispatch_to_route_for_recipient_with_status(route, recipient_persona, msg)
+            .map_err(PushError::Failed),
+    }
+}
+
 /// Attempt push delivery for all pending recipients of `msg` on this host,
 /// updating `store` receipts (`Acked` on verified push, `Pending` with `attempts + 1` on failure)
 /// and returning any modified `DeliveryReceipt`s.
@@ -5572,7 +5687,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         now,
         None,
         &mut DispatchReport::default(),
-        dispatch_to_route_with_status,
+        dispatch_to_route_for_recipient_with_push_error,
     )
     .0
 }
@@ -5616,7 +5731,7 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
         now,
         Some(recipient),
         report,
-        dispatch_to_route_with_status,
+        dispatch_to_route_for_recipient_with_push_error,
     )
 }
 
@@ -5666,12 +5781,16 @@ fn dispatch_message_selected<S: MessageStore>(
         now,
         recipient,
         report,
-        |route, msg| dispatch(route, msg).map(|()| DeliveryStatus::Acked),
+        |route, _recipient, msg| {
+            dispatch(route, msg)
+                .map(|()| DeliveryStatus::Acked)
+                .map_err(PushError::Failed)
+        },
     )
 }
 
 // The private callback keeps fault tests on this same pass without invoking vendor I/O.
-// Production callers always supply dispatch_to_route_with_status.
+// Production callers always supply dispatch_to_route_for_recipient_with_push_error.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_message_selected_with_status<S: MessageStore>(
     store: &S,
@@ -5681,7 +5800,11 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     now: At,
     recipient: Option<&str>,
     report: &mut DispatchReport,
-    mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<DeliveryStatus, String>,
+    mut dispatch: impl FnMut(
+        &VendorRoute,
+        Option<&str>,
+        &WireMessage,
+    ) -> Result<DeliveryStatus, PushError>,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
     let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
         report.record_failure(FailureStage::InitialReceiptReadError);
@@ -5712,6 +5835,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     if home_override.is_some() || missing_route || stale_table() {
         routes.discover_routes(home_override, now.clone());
     }
+    let allow_probes = crate::identity::host_probes_allowed(home_override);
     let mut updated = Vec::new();
     let mut attempted = false;
     for rcpt in receipts {
@@ -5723,7 +5847,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         };
         attempted = true;
         let slot = report.record_call_started(&entry);
-        let mut pushed = dispatch(&entry.route, msg);
+        let mut pushed = dispatch(&entry.route, Some(rcpt.recipient_name.as_str()), msg);
         report.record_call_finished(
             slot,
             if pushed.is_ok() {
@@ -5733,17 +5857,28 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
             },
         );
         if let Err(ref err) = pushed {
-            if is_composer_occupied_error(err) {
+            if is_composer_occupied_error(err.as_str()) {
                 report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
             } else {
-                report.record_failure(FailureStage::TransportError);
+                let dead_explicit = entry.explicit
+                    && (matches!(err, PushError::NotConnected(_))
+                        || crate::identity::explicit_route_entry_is_dead(
+                            &entry,
+                            Some(&rcpt.recipient_name),
+                            allow_probes,
+                        ));
+                report.record_failure(if dead_explicit {
+                    FailureStage::DeadExplicitRoute
+                } else {
+                    FailureStage::TransportError
+                });
                 // The session may have restarted since this route was learned (a new pid, socket or
                 // pane). Rescan for this persona, and push once more only when its route changed.
                 if routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
                     && let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
                 {
                     let slot = report.record_call_started(&fresh);
-                    pushed = dispatch(&fresh.route, msg);
+                    pushed = dispatch(&fresh.route, Some(rcpt.recipient_name.as_str()), msg);
                     report.record_call_finished(
                         slot,
                         if pushed.is_ok() {
@@ -5753,10 +5888,21 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                         },
                     );
                     if let Err(ref retry_err) = pushed {
-                        if is_composer_occupied_error(retry_err) {
+                        if is_composer_occupied_error(retry_err.as_str()) {
                             report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
                         } else {
-                            report.record_failure(FailureStage::TransportError);
+                            let retry_dead_explicit = fresh.explicit
+                                && (matches!(retry_err, PushError::NotConnected(_))
+                                    || crate::identity::explicit_route_entry_is_dead(
+                                        &fresh,
+                                        Some(&rcpt.recipient_name),
+                                        allow_probes,
+                                    ));
+                            report.record_failure(if retry_dead_explicit {
+                                FailureStage::DeadExplicitRoute
+                            } else {
+                                FailureStage::TransportError
+                            });
                         }
                     }
                 }
@@ -5918,6 +6064,19 @@ mod tests {
         fn prune_wire(&self, before: At) -> Result<usize, StoreError> {
             self.calls.borrow_mut().push("prune");
             self.inner.prune_wire(before)
+        }
+        fn send_wire_awaiting_daemon(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            self.calls.borrow_mut().push("send_awaiting_daemon");
+            self.inner.send_wire_awaiting_daemon(args)
+        }
+        fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+            self.inner.list_wire_awaiting_daemon()
+        }
+        fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+            self.inner.clear_wire_awaiting_daemon(message_id)
         }
     }
 
@@ -10943,6 +11102,11 @@ exit 1"#,
                     persona: "fiona".into(),
                     route: codex_route("thread-daemon"),
                     explicit: true,
+                    replace: false,
+                    hosted_id: None,
+                    hydration_generation: None,
+                    hosted_session_verified: false,
+                    unverified_process: false,
                 })
                 .unwrap();
 
@@ -17027,5 +17191,193 @@ exit 1"#,
             !route_has_unconfirmed_wire_deliveries(&route_keys),
             "route ledger must be completely cleared once rendered composer is observed empty"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_fanout_passes_member_persona_to_agy_route_delivery() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use fl_store::RedbStore;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Felicia.antigravity").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([3u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let writes_srv = Arc::clone(&writes);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { stream, bytes, .. } => {
+                                    writes.lock().unwrap().push((
+                                        stream.session.as_str().to_string(),
+                                        bytes.into_vec(),
+                                    ));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: String::new(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let store = RedbStore::open(&tmp.path().join("fanout.redb")).unwrap();
+        for name in ["felicia", "felix"] {
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: At::from_unix_millis(10),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+
+        let failing_agy = write_script(tmp.path(), "failing-agy.sh", "exit 1");
+        let routes_path = tmp.path().join("routes.json");
+        let mut routes = RouteTable::load(Some(&routes_path));
+        routes.upsert_explicit(
+            "felicia",
+            VendorRoute::Agy {
+                conversation_id: "019d0000-0000-7000-8000-00000000aaaa".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(failing_agy),
+            },
+            At::from_unix_millis(20),
+        );
+
+        // Intentionally do NOT save `routes` to `FL_WIRE_ROUTES`: `deliver_to_agy_route`
+        // must receive `Some("felicia")` directly from `rcpt.recipient_name` on `@all` fan-out!
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _no_routes = EnvGuard::remove("FL_WIRE_ROUTES");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let (msg, _) = store
+            .send_wire(fl_core::ferrowire::SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: fl_core::ferrowire::WireAddress::All,
+                kind: fl_core::ferrowire::MessageKind::Mail,
+                urgency: fl_core::ferrowire::MessageUrgency::Normal,
+                durable: true,
+                subject: "council ping".into(),
+                body: "hello group".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(30),
+            })
+            .unwrap();
+
+        let updated = dispatch_message_for_store(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(40),
+        );
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].recipient_name, "felicia");
+        assert_eq!(updated[0].status, DeliveryStatus::Acked);
+
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "Felicia.antigravity");
+        assert!(
+            String::from_utf8_lossy(&recorded[0].1).contains("hello group"),
+            "expected group body delivered to Felicia.antigravity via persona fallback: {:?}",
+            recorded[0].1
+        );
+        drop(server_thread);
     }
 }

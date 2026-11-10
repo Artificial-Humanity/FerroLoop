@@ -116,6 +116,7 @@ pub use mq_tier::{
 pub use recovery::{
     CaptureExclusion, CapturedStore, ExternalPublishStatus, ImageDescriptor, RecoveryImageWriter,
 };
+pub(crate) const RECOVERY_ENGINE: u32 = layout::ENGINE_SNAPSHOT_WAL;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
 use std::collections::{BTreeMap, HashMap};
@@ -1962,6 +1963,46 @@ impl FerroStore {
             Err(err) if refused_connect(&err) => Self::open(path),
             Err(err) => Err(backend(format!("connect {}: {err}", sock.display()))),
         }
+    }
+
+    pub(crate) fn recovery_schema_version(&self) -> Result<Option<u64>, StoreError> {
+        let state = self.read_state()?;
+        doc::schema_version_in(|collection, id| state.docs.get(collection, id).cloned())
+    }
+
+    /// Narrow recovery RPC on an explicitly connected owner. Never opens a local path.
+    pub fn recovery_control(
+        &self,
+        method: &str,
+        request: &crate::recovery::control::BatchRequest,
+    ) -> Result<crate::recovery::control::BatchReport, StoreError> {
+        if !matches!(method, "recovery_start" | "recovery_status") {
+            return Err(backend("unknown recovery control"));
+        }
+        let remote = match &self.inner {
+            Inner::Remote(remote) => remote,
+            _ => return Err(backend("recovery requires an explicit owner connection")),
+        };
+        let value = remote.call(
+            method,
+            serde_json::to_value(request).map_err(|_| backend("invalid recovery request"))?,
+        )?;
+        let report: crate::recovery::control::BatchReport =
+            serde_json::from_value(value).map_err(|_| backend("invalid recovery report"))?;
+        if report.batch_id != request.batch_id {
+            return Err(backend("recovery report batch mismatch"));
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn recovery_owner_call(
+        path: &Path,
+        method: &str,
+        request: &crate::recovery::control::BatchRequest,
+        deadline: std::time::Instant,
+    ) -> Result<crate::recovery::control::BatchReport, crate::recovery::control::OwnerCallError>
+    {
+        server::recovery_owner_call(path, method, request, deadline)
     }
 
     /// `mem://`, `file://`, `unix://`, `ws://` and `wss://`.

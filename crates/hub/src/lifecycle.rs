@@ -27,7 +27,7 @@ use fl_wire::dispatcher::{
     push_operator_prompt_with_intent,
 };
 use fl_wire::identity::{
-    RouteTable, VendorRoute, default_routes_path, is_native_session_id, legacy_routes_path,
+    RouteTable, VendorRoute, is_native_session_id, legacy_routes_path, resolve_routes_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -686,12 +686,14 @@ fn claude_resume_route_registered(
             continue;
         }
         let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, persona);
-        if let Some(hid) = raw_hid.as_deref()
+        let eff_hid = entry.hosted_id.as_deref().or(raw_hid.as_deref());
+        let eff_gen = entry.hydration_generation.as_deref().or(raw_gen.as_deref());
+        if let Some(hid) = eff_hid
             && !hid.eq_ignore_ascii_case(hosted_id)
         {
             continue;
         }
-        if let Some(g) = raw_gen.as_deref()
+        if let Some(g) = eff_gen
             && !hydration_generation.is_empty()
             && g != hydration_generation
         {
@@ -734,12 +736,10 @@ fn claude_route_confirmed_for_session(
             continue;
         }
         let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, persona);
-        let raw_meta_mismatch = raw_hid
-            .as_deref()
-            .is_some_and(|h| !h.eq_ignore_ascii_case(hosted_id))
-            || raw_gen
-                .as_deref()
-                .is_some_and(|g| hydration_generation != Some(g));
+        let eff_hid = entry.hosted_id.as_deref().or(raw_hid.as_deref());
+        let eff_gen = entry.hydration_generation.as_deref().or(raw_gen.as_deref());
+        let raw_meta_mismatch = eff_hid.is_some_and(|h| !h.eq_ignore_ascii_case(hosted_id))
+            || eff_gen.is_some_and(|g| hydration_generation != Some(g));
         let pid_ok = *pid > 0 && runtime_pid.is_none_or(|rp| rp == *pid);
         if !raw_meta_mismatch && pid_ok {
             return true;
@@ -1334,13 +1334,12 @@ fn sync_claude_vendor_session_id_from_route<S: StateStore>(
             continue;
         }
         let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, &record.persona);
-        let route_meta_matches = raw_hid
-            .as_deref()
+        let eff_hid = entry.hosted_id.as_deref().or(raw_hid.as_deref());
+        let eff_gen = entry.hydration_generation.as_deref().or(raw_gen.as_deref());
+        let route_meta_matches = eff_hid
             .is_some_and(|h| h.eq_ignore_ascii_case(&record.session_id))
-            && raw_gen
-                .as_deref()
-                .is_some_and(|g| record.hydration_generation.as_deref() == Some(g));
-        let pid_matches = resume_state.runtime_pid == Some(*pid);
+            && eff_gen.is_some_and(|g| record.hydration_generation.as_deref() == Some(g));
+        let pid_matches = resume_state.runtime_pid == Some(*pid) || record.pid == Some(*pid);
         if !route_meta_matches && !pid_matches {
             continue;
         }
@@ -3047,6 +3046,12 @@ pub struct HostedSessionRecord {
     /// Vendor-native session identifier (e.g., Claude `--session-id <uuid>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_session_id: Option<String>,
+    /// Root OS PID of the spawned vendor CLI process when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// `/proc/<pid>/stat` field-22 start time (clock ticks) for `pid` when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
@@ -3370,10 +3375,10 @@ pub fn record_hydration_ack<S: StateStore>(
     }
     let persona_lower = persona.trim().to_ascii_lowercase();
     if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
-        let Some((vendor, hid_persona)) = hid.split_once(':') else {
+        let Ok((_vendor, hid_persona)) = fl_wire::identity::parse_hosted_identity(hid) else {
             return Ok(false);
         };
-        if vendor.trim().is_empty() || !hid_persona.trim().eq_ignore_ascii_case(&persona_lower) {
+        if !hid_persona.eq_ignore_ascii_case(&persona_lower) {
             return Ok(false);
         }
     }
@@ -3392,7 +3397,9 @@ pub fn record_hydration_ack<S: StateStore>(
         return Ok(false);
     }
     let session_id = if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
-        hid.to_ascii_lowercase()
+        fl_wire::identity::parse_hosted_identity(hid)
+            .map(|(v, p)| format!("{v}:{p}"))
+            .unwrap_or_else(|_| hid.to_ascii_lowercase())
     } else {
         list_hosted_sessions(store)?
             .into_iter()
@@ -4104,7 +4111,7 @@ fn spawn_tmux_runtime(
     if session == MUSE_SESSION {
         return spawn_muse_window(window, cwd, launch, hosted_id);
     }
-    let args = tmux_new_session_args(session, window, cwd, launch);
+    let args = tmux_new_session_args_with_hosted_id(session, window, cwd, launch, hosted_id);
     tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
@@ -4131,7 +4138,7 @@ fn spawn_muse_window(
     if session_runs && listed_window_count(MUSE_SESSION, window) != Some(0) {
         return false;
     }
-    let args = tmux_muse_spawn_args(session_runs, window, cwd, launch);
+    let args = tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, hosted_id);
     let Some(out) = tmux_stdout(&args.iter().map(String::as_str).collect::<Vec<_>>()) else {
         return false;
     };
@@ -4156,41 +4163,77 @@ fn is_window_id(id: &str) -> bool {
 /// The tail every spawn shares: the working directory (when it is a directory), then with
 /// `launch` its environment and the command as an argument vector after `--` (tmux 3.2 and later
 /// run it without a shell).
-fn push_cwd_and_launch(args: &mut Vec<String>, cwd: Option<&str>, launch: Option<&LaunchSpec>) {
+fn push_cwd_and_launch_with_hosted_id(
+    args: &mut Vec<String>,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
+) {
     if let Some(dir) = cwd.filter(|d| Path::new(d).is_dir()) {
         args.extend(["-c".to_string(), dir.to_string()]);
     }
+    let has_hosted_env = launch.is_some_and(|l| l.env.iter().any(|(k, _)| k == "FL_HOSTED_ID"));
     if let Some(launch) = launch {
         for (key, value) in &launch.env {
             args.extend(["-e".to_string(), format!("{key}={value}")]);
         }
+    }
+    if !hosted_id.trim().is_empty() && !has_hosted_env {
+        args.extend([
+            "-e".to_string(),
+            format!("FL_HOSTED_ID={}", hosted_id.trim()),
+        ]);
+    }
+    if let Some(launch) = launch {
         args.push("--".to_string());
         args.extend(launch.argv.iter().cloned());
     }
 }
 
 /// The `tmux new-session` arguments: a detached session, and with `launch` the command.
+#[cfg(test)]
 fn tmux_new_session_args(
     session: &str,
     window: &str,
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
 ) -> Vec<String> {
+    tmux_new_session_args_with_hosted_id(session, window, cwd, launch, "")
+}
+
+fn tmux_new_session_args_with_hosted_id(
+    session: &str,
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
+) -> Vec<String> {
     let mut args: Vec<String> = ["new-session", "-d", "-s", session, "-n", window]
         .map(String::from)
         .into();
-    push_cwd_and_launch(&mut args, cwd, launch);
+    push_cwd_and_launch_with_hosted_id(&mut args, cwd, launch, hosted_id);
     args
 }
 
 /// The tmux arguments that open `window` in the shared Muse session: `new-window` into the
 /// session when it runs (`-t =muse:` is the session by exact name, the next free index), else
 /// `new-session`.
+#[cfg(test)]
 fn tmux_muse_spawn_args(
     session_runs: bool,
     window: &str,
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
+) -> Vec<String> {
+    tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, "")
+}
+
+fn tmux_muse_spawn_args_with_hosted_id(
+    session_runs: bool,
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
 ) -> Vec<String> {
     // `-P -F '#{window_id}'` prints the new window's id, to mark the window by.
     let mut args: Vec<String> = if session_runs {
@@ -4223,7 +4266,7 @@ fn tmux_muse_spawn_args(
         .map(String::from)
         .into()
     };
-    push_cwd_and_launch(&mut args, cwd, launch);
+    push_cwd_and_launch_with_hosted_id(&mut args, cwd, launch, hosted_id);
     args
 }
 
@@ -4934,9 +4977,13 @@ fn deliver_prompt(
 pub(crate) fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
     match home_override {
         Some(home) => vec![home.join(".cache").join("agent-bus").join("routes.json")],
-        None => std::iter::once(default_routes_path())
-            .chain(legacy_routes_path())
-            .collect(),
+        None => std::iter::once(resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ))
+        .chain(legacy_routes_path())
+        .collect(),
     }
 }
 
@@ -5342,6 +5389,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             .map(|r| r.tombstone_ids.clone())
             .unwrap_or_default(),
         vendor_session_id: vendor_session_id.clone(),
+        pid: None,
+        pid_start_time: None,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
         // Only when the record named this same target: a runtime under another name (an older
@@ -5772,6 +5821,8 @@ fn record_for_target<S: AgentRegistry>(
         runtime_spawned: false,
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
+        pid: None,
+        pid_start_time: None,
         created_at_ms: now,
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
@@ -11967,6 +12018,8 @@ mod tests {
             runtime_spawned: spawned,
             tombstone_ids: Vec::new(),
             vendor_session_id: None,
+            pid: None,
+            pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,

@@ -59,9 +59,9 @@ use tokio::sync::broadcast;
 
 pub use api::{
     HttpRequest, HttpResponse, HubDispatchDiagnostics, HubFenceDiagnostic,
-    HubRecipientPendingSummary, HubRouteDispatchObservation, HubWireStatusResponse,
-    WireDaemonState, drain_ready_session_queues, handle_http_request, parse_http_request,
-    percent_decode,
+    HubRecipientPendingSummary, HubRouteDispatchObservation, HubRouteRegistrationDiagnostic,
+    HubWireStatusResponse, WireDaemonState, drain_ready_session_queues, handle_http_request,
+    parse_http_request, percent_decode,
 };
 pub use auth::{
     AuthManager, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS, HubAuthority, PairingInfo,

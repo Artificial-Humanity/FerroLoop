@@ -246,7 +246,7 @@ fn populate(redb: &RedbStore) -> Populated {
             at: At::from_unix_millis(10),
         })
         .unwrap();
-    redb.send_wire(SendWireArgs {
+    redb.send_wire_awaiting_daemon(SendWireArgs {
         id: None,
         sender_id: None,
         sender_name: "bob".into(),
@@ -451,6 +451,7 @@ fn parity_is_clean_on_a_migrated_populated_store() {
         "wire_rcpt_log",
         "wire_threads",
         "wire_replies",
+        "wire_awaiting_daemon",
         "workflow_defs",
         "workflow_slugs",
         "workflow_runs",

@@ -40,7 +40,7 @@ pub use crate::codex_control::{
 };
 use crate::dispatch_diagnostics::{
     DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
-    FenceDiagnostic, FenceReason, SuppressionPhase,
+    FenceDiagnostic, FenceReason, RouteRegistrationDiagnostic, SuppressionPhase,
 };
 use crate::dispatcher::dispatch_message_for_recipient_with_report;
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
@@ -181,20 +181,39 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
-pub fn default_socket_path() -> PathBuf {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(rt);
-        if p.is_absolute() {
-            return p.join("fl-wire.sock");
-        }
+pub fn default_socket_path_with(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_dir: Option<&Path>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(rt) = crate::identity::runtime_dir_path_with(xdg_runtime_dir, run_user_dir) {
+        return rt.join("fl-wire.sock");
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home.filter(|s| !s.is_empty()) {
         let p = PathBuf::from(home);
         if p.is_absolute() {
             return p.join(".cache").join("fl").join("wire.sock");
         }
     }
     PathBuf::from("/tmp/fl-wire.sock")
+}
+
+pub fn default_socket_path() -> PathBuf {
+    if let Some(rt) = crate::identity::runtime_dir_path() {
+        return rt.join("fl-wire.sock");
+    }
+    default_socket_path_with(None, None, std::env::var_os("HOME").as_deref())
+}
+
+#[cfg(unix)]
+pub fn default_socket_path_for_root(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_root: &Path,
+    home: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
+) -> PathBuf {
+    let probed = crate::identity::probe_run_user_dir(run_user_root, expected_uid);
+    default_socket_path_with(xdg_runtime_dir, probed.as_deref(), home)
 }
 
 pub fn resolve_socket_path(
@@ -250,6 +269,19 @@ pub enum LocalRequest {
         route: VendorRoute,
         #[serde(default)]
         explicit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hosted_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hydration_generation: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hosted_session_verified: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unverified_process: bool,
+    },
+    RecordRegistrationDiagnostic {
+        diagnostic: RouteRegistrationDiagnostic,
     },
     UnregisterRoute {
         persona: String,
@@ -267,6 +299,104 @@ pub enum LocalRequest {
     Shutdown,
 }
 
+impl LocalRequest {
+    pub fn register(persona: impl Into<String>, route: VendorRoute, explicit: bool) -> Self {
+        Self::RegisterRoute {
+            persona: persona.into(),
+            route,
+            explicit,
+            replace: false,
+            hosted_id: None,
+            hydration_generation: None,
+            hosted_session_verified: false,
+            unverified_process: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerCred {
+    pub pid: Option<u32>,
+    pub ppid: Option<u32>,
+    pub start_time: Option<u64>,
+}
+
+fn extract_peer_cred(stream: &UnixStream) -> PeerCred {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        if rc == 0 && len == std::mem::size_of::<libc::ucred>() as libc::socklen_t && cred.pid > 0 {
+            let pid = cred.pid as u32;
+            let (ppid, start_time) = crate::identity::proc_ppid_and_start_time(pid)
+                .map(|(p, st)| (Some(p), Some(st)))
+                .unwrap_or((None, None));
+            return PeerCred {
+                pid: Some(pid),
+                ppid,
+                start_time,
+            };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+    }
+    PeerCred::default()
+}
+
+fn verify_peer_cred_for_hosted_claim(
+    peer_cred: PeerCred,
+    client_claimed_verified: bool,
+    replace: bool,
+    challenger_route: &VendorRoute,
+    challenger_generation: Option<&str>,
+    incumbent: Option<&RouteEntry>,
+    incumbent_is_dead: bool,
+) -> bool {
+    if !client_claimed_verified || replace {
+        return client_claimed_verified;
+    }
+    let Some(peer_pid) = peer_cred.pid else {
+        return client_claimed_verified;
+    };
+    if let Some(challenger_pid) = challenger_route.route_pid()
+        && !crate::identity::pid_is_self_or_ancestor(peer_pid, challenger_pid, None)
+    {
+        return false;
+    }
+    if let Some(inc) = incumbent
+        && inc.explicit
+        && !incumbent_is_dead
+        && let Some(inc_pid) = inc.route.route_pid()
+    {
+        let generation_rotated = inc.hydration_generation.is_some()
+            && challenger_generation.is_some()
+            && inc.hydration_generation.as_deref() != challenger_generation;
+        if !generation_rotated {
+            if let Some(challenger_pid) = challenger_route.route_pid()
+                && challenger_pid != inc_pid
+            {
+                return false;
+            }
+            if !crate::identity::pid_is_self_or_ancestor(peer_pid, inc_pid, inc.pid_start_time) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum LocalResponse {
@@ -281,6 +411,7 @@ pub enum LocalResponse {
         receipts: Vec<DeliveryReceipt>,
     },
     RouteRegistered,
+    RegistrationDiagnosticRecorded,
     RouteUnregistered,
     Subscribed,
     Status(DaemonStatus),
@@ -288,6 +419,18 @@ pub enum LocalResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingHoldReason {
+    DeadExplicitRoute,
+    #[serde(other)]
+    Unsupported,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +441,36 @@ pub struct RecipientPendingSummary {
     pub oldest_pending_at: Option<At>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<PendingHoldReason>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub awaiting_daemon_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_at: Option<At>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_age_ms: Option<u64>,
+}
+
+pub fn annotate_dead_explicit_pending_holds(
+    pending: &mut [RecipientPendingSummary],
+    routes: &RouteTable,
+    allow_host_probes: bool,
+) {
+    for row in pending {
+        if row.pending_count == 0 {
+            continue;
+        }
+        if let Some(entry) = routes.get(&row.recipient)
+            && entry.explicit
+            && crate::identity::explicit_route_entry_is_dead(
+                entry,
+                Some(&row.recipient),
+                allow_host_probes,
+            )
+        {
+            row.hold_reason = Some(PendingHoldReason::DeadExplicitRoute);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +483,8 @@ pub struct DaemonStatus {
     pub routes: Vec<RouteEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_diagnostics: Option<DispatchDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registration_diagnostics: Vec<RouteRegistrationDiagnostic>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_recipients: Vec<RecipientPendingSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -432,7 +607,12 @@ pub fn collect_pending_recipient_summaries<S: MessageStore>(
     store: &S,
     now: &At,
 ) -> Vec<RecipientPendingSummary> {
-    summarize_pending_map(&seed_pending_map_from_store(store), now)
+    let awaiting: BTreeMap<MessageId, At> = store
+        .list_wire_awaiting_daemon()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    summarize_pending_map_with_awaiting(&seed_pending_map_from_store(store), &awaiting, now)
 }
 
 fn seed_pending_map_from_store<S: MessageStore>(
@@ -463,8 +643,9 @@ fn seed_pending_map_from_store<S: MessageStore>(
     by_recipient
 }
 
-fn summarize_pending_map(
+fn summarize_pending_map_with_awaiting(
     by_recipient: &BTreeMap<String, BTreeMap<MessageId, At>>,
+    awaiting_by_msg: &BTreeMap<MessageId, At>,
     now: &At,
 ) -> Vec<RecipientPendingSummary> {
     let now_ms = now.unix_millis();
@@ -474,11 +655,24 @@ fn summarize_pending_map(
             continue;
         }
         let oldest_ms = messages.values().map(At::unix_millis).min();
+        let mut awaiting_count = 0usize;
+        let mut oldest_awaiting_ms: Option<u64> = None;
+        for mid in messages.keys() {
+            if let Some(queued_at) = awaiting_by_msg.get(mid) {
+                awaiting_count += 1;
+                let q_ms = queued_at.unix_millis();
+                oldest_awaiting_ms = Some(oldest_awaiting_ms.map_or(q_ms, |prev| prev.min(q_ms)));
+            }
+        }
         out.push(RecipientPendingSummary {
             recipient: recipient.clone(),
             pending_count: messages.len(),
             oldest_pending_at: oldest_ms.map(At::from_unix_millis),
             oldest_pending_age_ms: oldest_ms.map(|ms| now_ms.saturating_sub(ms)),
+            hold_reason: None,
+            awaiting_daemon_count: awaiting_count,
+            oldest_awaiting_daemon_at: oldest_awaiting_ms.map(At::from_unix_millis),
+            oldest_awaiting_daemon_age_ms: oldest_awaiting_ms.map(|ms| now_ms.saturating_sub(ms)),
         });
     }
     out
@@ -590,6 +784,8 @@ struct Subscriber {
 const MAX_SUBSCRIBER_BUFFER: usize = 256;
 const MAX_SYNC_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SYNC_BATCH_ITEMS: usize = 256;
+const MAX_REGISTER_ROUTE_ATTEMPTS: usize = 8;
+const REGISTER_ROUTE_DEADLINE: Duration = Duration::from_secs(2);
 
 fn build_sync_batches(
     registry_events: Vec<RegistryEvent>,
@@ -739,6 +935,7 @@ fn failure_reason(stage: FailureStage) -> FenceReason {
         FailureStage::MessageLookupError => FenceReason::MessageLookupError,
         FailureStage::InitialReceiptReadError => FenceReason::InitialReceiptReadError,
         FailureStage::TransportError => FenceReason::TransportError,
+        FailureStage::DeadExplicitRoute => FenceReason::DeadExplicitRoute,
         FailureStage::ComposerOccupiedByNonWireInput => FenceReason::ComposerOccupiedByNonWireInput,
         FailureStage::ReceiptWriteError => FenceReason::ReceiptWriteError,
         FailureStage::ReceiptWriteMissing => FenceReason::ReceiptWriteMissing,
@@ -746,6 +943,7 @@ fn failure_reason(stage: FailureStage) -> FenceReason {
         FailureStage::FinalReceiptReadMissing => FenceReason::FinalReceiptReadMissing,
         FailureStage::UnresolvedReceiptStatus => FenceReason::UnresolvedReceiptStatus,
         FailureStage::WorkerPanic => FenceReason::WorkerPanic,
+        FailureStage::Unsupported => FenceReason::Unsupported,
     }
 }
 
@@ -777,6 +975,26 @@ fn log_first_holds(rows: Vec<FenceDiagnostic>) {
     }
 }
 
+#[cfg(test)]
+type RegistrationProbeHook = Box<dyn FnMut(&mut RouteTable) + Send>;
+
+const MAX_AWAITING_DAEMON_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const AWAITING_DAEMON_POLL_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
+};
+
+#[derive(Default)]
+struct AwaitingDaemonEntry {
+    queued_at: Option<At>,
+    notified: bool,
+    waiting_for_route: bool,
+    scheduled_routed: BTreeSet<String>,
+    tried_unrouted: BTreeSet<String>,
+    unscheduled_recipients: BTreeSet<String>,
+}
+
 struct DaemonInner<S> {
     store: Arc<S>,
     config: DaemonConfig,
@@ -791,6 +1009,7 @@ struct DaemonInner<S> {
     overflow_capacity_exhausted: AtomicBool,
     dispatch_diagnostics: Mutex<DiagnosticsState>,
     pending_by_recipient: Mutex<BTreeMap<String, BTreeMap<MessageId, At>>>,
+    awaiting_daemon_state: Mutex<BTreeMap<MessageId, AwaitingDaemonEntry>>,
     #[cfg(test)]
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
@@ -801,6 +1020,8 @@ struct DaemonInner<S> {
     queue_limit_override: AtomicUsize,
     #[cfg(test)]
     registration_locked_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    registration_probe_hook: Mutex<Option<RegistrationProbeHook>>,
     peers: Mutex<BTreeMap<u64, (String, Sender<PeerFrame>)>>,
     peer_sync_cursors: Mutex<BTreeMap<String, (u64, u64, u64)>>,
     subscribers: Mutex<Vec<Subscriber>>,
@@ -954,8 +1175,27 @@ where
                 DispatchOutcome::NoRoute
             }
             _ => {
-                if receipt.is_some() {
-                    report.record_failure(FailureStage::UnresolvedReceiptStatus);
+                if receipt.is_some()
+                    && report.failure_stages.last() != Some(&FailureStage::DeadExplicitRoute)
+                {
+                    let allow_probes =
+                        crate::identity::host_probes_allowed(self.config.home_override.as_deref());
+                    let explicit_entry = lock(&self.routes)
+                        .get(recipient)
+                        .filter(|entry| entry.explicit)
+                        .cloned();
+                    let dead_explicit = explicit_entry.is_some_and(|entry| {
+                        crate::identity::explicit_route_entry_is_dead(
+                            &entry,
+                            Some(recipient),
+                            allow_probes,
+                        )
+                    });
+                    if dead_explicit {
+                        report.record_failure(FailureStage::DeadExplicitRoute);
+                    } else {
+                        report.record_failure(FailureStage::UnresolvedReceiptStatus);
+                    }
                 }
                 DispatchOutcome::Unconfirmed
             }
@@ -995,11 +1235,37 @@ where
                 pending.remove(&key);
             }
         }
+        drop(pending);
+        let should_clear_marker = {
+            let mut state = lock(&self.awaiting_daemon_state);
+            if let Some(entry) = state.get_mut(msg_id) {
+                entry.unscheduled_recipients.remove(&key);
+                if entry.unscheduled_recipients.is_empty() {
+                    state.remove(msg_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_clear_marker {
+            let _ = self.store.clear_wire_awaiting_daemon(msg_id);
+        }
     }
 
     fn pending_recipients_snapshot(&self, now: &At) -> Vec<RecipientPendingSummary> {
         let merged = lock(&self.pending_by_recipient).clone();
-        summarize_pending_map(&merged, now)
+        let awaiting_by_msg: BTreeMap<MessageId, At> = lock(&self.awaiting_daemon_state)
+            .iter()
+            .filter_map(|(mid, entry)| {
+                (!entry.unscheduled_recipients.is_empty())
+                    .then(|| entry.queued_at.as_ref().map(|at| (mid.clone(), at.clone())))
+                    .flatten()
+            })
+            .collect();
+        summarize_pending_map_with_awaiting(&merged, &awaiting_by_msg, now)
     }
 
     /// Start one queued worker, or retain it until an active slot becomes available.
@@ -1452,12 +1718,14 @@ where
                     && (!matches!(
                         r.first_reason,
                         FenceReason::TransportError
+                            | FenceReason::DeadExplicitRoute
                             | FenceReason::ComposerOccupiedByNonWireInput
                             | FenceReason::UnresolvedReceiptStatus
                             | FenceReason::QueueOverflow
                     ) || !matches!(
                         r.decisive_reason,
                         FenceReason::TransportError
+                            | FenceReason::DeadExplicitRoute
                             | FenceReason::ComposerOccupiedByNonWireInput
                             | FenceReason::UnresolvedReceiptStatus
                             | FenceReason::QueueOverflow
@@ -1465,6 +1733,7 @@ where
                         !matches!(
                             s,
                             FailureStage::TransportError
+                                | FailureStage::DeadExplicitRoute
                                 | FailureStage::ComposerOccupiedByNonWireInput
                                 | FailureStage::UnresolvedReceiptStatus
                         )
@@ -1511,9 +1780,18 @@ where
         log_first_holds(first_holds);
     }
 
+    #[cfg(test)]
     fn handle_local_request(
         self: &Arc<Self>,
         req: LocalRequest,
+    ) -> (LocalResponse, Option<Receiver<LocalEvent>>) {
+        self.handle_local_request_with_peer(req, PeerCred::default())
+    }
+
+    fn handle_local_request_with_peer(
+        self: &Arc<Self>,
+        req: LocalRequest,
+        peer_cred: PeerCred,
     ) -> (LocalResponse, Option<Receiver<LocalEvent>>) {
         let now = now_at();
         match req {
@@ -1651,6 +1929,11 @@ where
                 persona,
                 route,
                 explicit,
+                replace,
+                hosted_id,
+                hydration_generation,
+                hosted_session_verified,
+                unverified_process,
             } => {
                 let Some(norm) = normalize_persona(&persona) else {
                     return (
@@ -1668,68 +1951,188 @@ where
                     &DispatchReport::default(),
                 );
                 let mut first_holds = Vec::new();
-                // Publish a route only while ordered with persistence and backlog enqueue.
-                // Otherwise a concurrent send could overtake older pending messages.
-                let _order = lock(&self.enqueue_gate);
-                {
-                    let mut routes = lock(&self.routes);
-                    if !explicit {
-                        let conflicts_with_binding = routes.get(&norm).is_some_and(|entry| {
-                            entry.explicit
-                                && std::mem::discriminant(&entry.route)
-                                    != std::mem::discriminant(&route)
-                        });
-                        let claims_bound_alias = route.session_identity().is_some_and(|identity| {
-                            routes.entries.iter().any(|(name, entry)| {
-                                name != &norm
-                                    && entry.explicit
-                                    && entry.route.session_identity() == Some(identity)
-                            })
-                        });
-                        if conflicts_with_binding || claims_bound_alias {
+                let allow_probes =
+                    crate::identity::host_probes_allowed(self.config.home_override.as_deref());
+                let started_at = Instant::now();
+                for attempt in 0..MAX_REGISTER_ROUTE_ATTEMPTS {
+                    let current_incumbent = lock(&self.routes).get(&norm).cloned();
+                    let mut current_dead = None;
+                    if explicit
+                        && let Some(ref inc) = current_incumbent
+                        && inc.explicit
+                    {
+                        let conflict = crate::identity::incumbent_conflict_reason(
+                            inc,
+                            route.canonical_vendor(),
+                            route.session_identity(),
+                            route.route_pid(),
+                            hosted_id.as_deref(),
+                            hydration_generation.as_deref(),
+                        );
+                        if conflict.is_some() || inc.route.route_pid().is_some() {
+                            // Run liveness / host probes completely outside all daemon locks.
+                            current_dead = Some(crate::identity::explicit_route_entry_is_dead(
+                                inc,
+                                Some(&norm),
+                                allow_probes,
+                            ));
+                        }
+                    }
+                    let effective_verified = verify_peer_cred_for_hosted_claim(
+                        peer_cred,
+                        hosted_session_verified,
+                        replace,
+                        &route,
+                        hydration_generation.as_deref(),
+                        current_incumbent.as_ref(),
+                        current_dead.unwrap_or(false),
+                    );
+
+                    #[cfg(test)]
+                    if let Some(ref mut hook) = *lock(&self.registration_probe_hook) {
+                        let mut routes = lock(&self.routes);
+                        hook(&mut routes);
+                    }
+
+                    // Publish a route only while ordered with persistence and backlog enqueue.
+                    // Otherwise a concurrent send could overtake older pending messages.
+                    let _order = lock(&self.enqueue_gate);
+                    {
+                        let mut routes = lock(&self.routes);
+                        if explicit
+                            && !crate::identity::same_opt_registration_identity(
+                                routes.get(&norm),
+                                current_incumbent.as_ref(),
+                            )
+                        {
+                            if attempt + 1 < MAX_REGISTER_ROUTE_ATTEMPTS
+                                && started_at.elapsed() < REGISTER_ROUTE_DEADLINE
+                            {
+                                continue;
+                            }
+                            let latest_inc = routes.get(&norm);
+                            let diag = RouteRegistrationDiagnostic {
+                                at: now.clone(),
+                                last_seen_at: None,
+                                count: 1,
+                                persona: norm,
+                                outcome: crate::dispatch_diagnostics::RegistrationDiagnosticOutcome::Refused,
+                                reason: crate::dispatch_diagnostics::RegistrationConflictReason::RegistrationContention,
+                                incumbent_adapter: latest_inc.map(|e| {
+                                    crate::dispatch_diagnostics::RouteAdapter::from_route(&e.route)
+                                }),
+                                challenger_adapter:
+                                    crate::dispatch_diagnostics::RouteAdapter::from_route(&route),
+                                incumbent_hosted_id: latest_inc.and_then(|e| e.hosted_id.clone()),
+                                challenger_hosted_id: hosted_id,
+                                incumbent_generation: latest_inc
+                                    .and_then(|e| e.hydration_generation.clone()),
+                                challenger_generation: hydration_generation,
+                                replace,
+                                unverified_process,
+                            }
+                            .sanitized();
+                            routes.push_registration_diagnostic(diag);
+                            let _ = routes.save(self.config.routes_path.as_deref());
                             return (
                                 LocalResponse::Error {
-                                    message: "observed route conflicts with an explicit binding"
+                                    message: "registration_contention: incumbent route changed concurrently; retry registration"
                                         .into(),
                                 },
                                 None,
                             );
                         }
-                    }
-                    // Keep the worker from evicting its queue while a route is published.
-                    let mut queues = lock(&self.dispatch_queues);
-                    #[cfg(test)]
-                    if let Some((entered, resume)) = lock(&self.registration_locked_hook).take() {
-                        let _ = entered.send(());
-                        let _ = resume.recv_timeout(Duration::from_secs(5));
-                    }
-                    let before = routes.clone();
-                    if explicit {
-                        routes.upsert_explicit(&persona, route, now.clone());
-                    } else {
-                        routes.upsert(&persona, route, now.clone());
-                    }
-                    if let Err(error) = routes.save(self.config.routes_path.as_deref()) {
-                        *routes = before;
-                        return (
-                            LocalResponse::Error {
-                                message: format!("cannot save route: {error}"),
-                            },
-                            None,
+                        if !explicit {
+                            let conflicts_with_binding = routes.get(&norm).is_some_and(|entry| {
+                                entry.explicit
+                                    && std::mem::discriminant(&entry.route)
+                                        != std::mem::discriminant(&route)
+                            });
+                            let claims_bound_alias =
+                                route.session_identity().is_some_and(|identity| {
+                                    routes.entries.iter().any(|(name, entry)| {
+                                        name != &norm
+                                            && entry.explicit
+                                            && entry.route.session_identity() == Some(identity)
+                                    })
+                                });
+                            if conflicts_with_binding || claims_bound_alias {
+                                return (
+                                    LocalResponse::Error {
+                                        message:
+                                            "observed route conflicts with an explicit binding"
+                                                .into(),
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                        // Keep the worker from evicting its queue while a route is published.
+                        let mut queues = lock(&self.dispatch_queues);
+                        #[cfg(test)]
+                        if let Some((entered, resume)) = lock(&self.registration_locked_hook).take()
+                        {
+                            let _ = entered.send(());
+                            let _ = resume.recv_timeout(Duration::from_secs(5));
+                        }
+                        let before = routes.clone();
+                        if explicit {
+                            if let Err(refusal) = routes.register_route_checked(
+                                crate::identity::RegisterRouteCheckArgs {
+                                    persona: norm.clone(),
+                                    route,
+                                    explicit: true,
+                                    replace,
+                                    hosted_id,
+                                    hydration_generation,
+                                    hosted_session_verified: effective_verified,
+                                    unverified_process,
+                                    allow_host_probes: false,
+                                    incumbent_dead_override: current_dead,
+                                    at: now.clone(),
+                                },
+                            ) {
+                                let _ = routes.save(self.config.routes_path.as_deref());
+                                return (
+                                    LocalResponse::Error {
+                                        message: refusal.message,
+                                    },
+                                    None,
+                                );
+                            }
+                        } else {
+                            routes.upsert(&persona, route, now.clone());
+                        }
+                        if let Err(error) = routes.save(self.config.routes_path.as_deref()) {
+                            *routes = before;
+                            return (
+                                LocalResponse::Error {
+                                    message: format!("cannot save route: {error}"),
+                                },
+                                None,
+                            );
+                        }
+                        // Route publication and the worker's wake generation must be observed
+                        // together: a no-route worker may not evict in between them.
+                        self.wake_recipient_after_registration(
+                            &mut queues,
+                            &norm,
+                            &evidence,
+                            &mut first_holds,
                         );
                     }
-                    // Route publication and the worker's wake generation must be observed
-                    // together: a no-route worker may not evict in between them.
-                    self.wake_recipient_after_registration(
-                        &mut queues,
-                        &norm,
-                        &evidence,
-                        &mut first_holds,
-                    );
+                    drop(_order);
+                    break;
                 }
-                drop(_order);
                 log_first_holds(first_holds);
+                self.drain_awaiting_daemon_messages(true);
                 (LocalResponse::RouteRegistered, None)
+            }
+            LocalRequest::RecordRegistrationDiagnostic { diagnostic } => {
+                let mut routes = lock(&self.routes);
+                routes.push_registration_diagnostic(diagnostic);
+                let _ = routes.save(self.config.routes_path.as_deref());
+                (LocalResponse::RegistrationDiagnosticRecorded, None)
             }
             LocalRequest::UnregisterRoute { persona } => {
                 let Some(persona) = normalize_persona(&persona) else {
@@ -1751,7 +2154,7 @@ where
                         },
                         None,
                     );
-                }
+                };
                 (LocalResponse::RouteUnregistered, None)
             }
             LocalRequest::Subscribe {
@@ -1774,10 +2177,47 @@ where
                     .values()
                     .map(|(label, _)| label.clone())
                     .collect();
-                let routes: Vec<RouteEntry> =
-                    lock(&self.routes).entries.values().cloned().collect();
-                let pending_recipients = self.pending_recipients_snapshot(&now);
-                let dispatch_diagnostics = Some(self.diagnostics_snapshot());
+                let routes_table = lock(&self.routes).clone();
+                let routes: Vec<RouteEntry> = routes_table.entries.values().cloned().collect();
+                let registration_diagnostics = routes_table.registration_diagnostics.clone();
+                let mut pending_recipients = self.pending_recipients_snapshot(&now);
+                let allow_probes = include_codex_queues
+                    && crate::identity::host_probes_allowed(self.config.home_override.as_deref());
+                annotate_dead_explicit_pending_holds(
+                    &mut pending_recipients,
+                    &routes_table,
+                    allow_probes,
+                );
+                let mut diag_snapshot = self.diagnostics_snapshot();
+                for row in &pending_recipients {
+                    if row.hold_reason != Some(PendingHoldReason::DeadExplicitRoute) {
+                        continue;
+                    }
+                    if let Some(existing) = diag_snapshot
+                        .records
+                        .iter_mut()
+                        .find(|r| r.recipient.as_deref() == Some(row.recipient.as_str()))
+                    {
+                        if matches!(
+                            existing.decisive_reason,
+                            FenceReason::TransportError | FenceReason::UnresolvedReceiptStatus
+                        ) {
+                            existing.decisive_reason = FenceReason::DeadExplicitRoute;
+                        }
+                    } else if diag_snapshot.records.len() < 128 {
+                        let mut report = DispatchReport::default();
+                        report.record_failure(FailureStage::DeadExplicitRoute);
+                        diag_snapshot.records.push(FenceDiagnostic::from_report(
+                            &row.recipient,
+                            None,
+                            row.oldest_pending_at.clone().unwrap_or_else(|| now.clone()),
+                            SuppressionPhase::RetainedFence,
+                            FenceReason::DeadExplicitRoute,
+                            &report,
+                        ));
+                    }
+                }
+                let dispatch_diagnostics = Some(diag_snapshot);
                 // All daemon state mutexes are dropped before any store lookup or control-socket I/O.
                 let codex_queues = if include_codex_queues {
                     collect_codex_route_queues(
@@ -1798,6 +2238,7 @@ where
                         connected_peers,
                         routes,
                         dispatch_diagnostics,
+                        registration_diagnostics,
                         pending_recipients,
                         codex_queues,
                     }),
@@ -2122,6 +2563,166 @@ where
             PeerFrame::Challenge { .. } | PeerFrame::Auth { .. } => {}
         }
     }
+
+    fn drain_awaiting_daemon_messages(self: &Arc<Self>, recheck_unrouted: bool) {
+        let Ok(awaiting) = self.store.list_wire_awaiting_daemon() else {
+            return;
+        };
+        if awaiting.is_empty() {
+            lock(&self.awaiting_daemon_state).clear();
+            return;
+        }
+        let now = now_at();
+        let routed_snapshot: BTreeSet<String> =
+            lock(&self.routes).entries.keys().cloned().collect();
+
+        for (mid, queued_at) in &awaiting {
+            let expired = now.unix_millis().saturating_sub(queued_at.unix_millis())
+                >= MAX_AWAITING_DAEMON_AGE_MS;
+            if expired {
+                let _ = self.store.clear_wire_awaiting_daemon(mid);
+                lock(&self.awaiting_daemon_state).remove(mid);
+                continue;
+            }
+            if !recheck_unrouted {
+                let skip = lock(&self.awaiting_daemon_state)
+                    .get(mid)
+                    .is_some_and(|entry| {
+                        entry.waiting_for_route
+                            && !entry
+                                .unscheduled_recipients
+                                .iter()
+                                .any(|key| routed_snapshot.contains(key))
+                    });
+                if skip {
+                    continue;
+                }
+            }
+
+            // Store reads happen outside `enqueue_gate` so a slow store never blocks
+            // local accept or client sends.
+            let msg = match self.store.get_wire_message(mid) {
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    let _ = self.store.clear_wire_awaiting_daemon(mid);
+                    lock(&self.awaiting_daemon_state).remove(mid);
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let Ok(receipts) = self.store.list_wire_receipts(mid) else {
+                continue;
+            };
+            let pending_receipts: Vec<DeliveryReceipt> = receipts
+                .into_iter()
+                .filter(|r| r.status == DeliveryStatus::Pending && r.attempts == 0)
+                .collect();
+            if pending_receipts.is_empty() {
+                let _ = self.store.clear_wire_awaiting_daemon(mid);
+                lock(&self.awaiting_daemon_state).remove(mid);
+                continue;
+            }
+
+            let mut first_holds = Vec::new();
+            let clear_marker = {
+                let _order = lock(&self.enqueue_gate);
+                let routed_keys: BTreeSet<String> =
+                    lock(&self.routes).entries.keys().cloned().collect();
+                self.admit_pending_receipts(&msg, &pending_receipts);
+                let mut state = lock(&self.awaiting_daemon_state);
+                let entry = state.entry(mid.clone()).or_default();
+                entry.queued_at.get_or_insert_with(|| queued_at.clone());
+                let should_notify = !entry.notified;
+                entry.notified = true;
+                let mut to_schedule = Vec::new();
+                let mut all_routed = true;
+                let mut unscheduled = BTreeSet::new();
+                for rcpt in &pending_receipts {
+                    let key = normalize_persona(&rcpt.recipient_name)
+                        .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
+                    let is_routed = !key.is_empty() && routed_keys.contains(&key);
+                    if is_routed {
+                        if !entry.scheduled_routed.contains(&key) {
+                            to_schedule.push((key, true, rcpt.clone()));
+                        }
+                    } else {
+                        all_routed = false;
+                        if !key.is_empty() {
+                            unscheduled.insert(key.clone());
+                        }
+                        if !entry.tried_unrouted.contains(&key) {
+                            to_schedule.push((key, false, rcpt.clone()));
+                        }
+                    }
+                }
+                entry.unscheduled_recipients = unscheduled;
+                drop(state);
+
+                if should_notify {
+                    self.notify_subscribers_message(&msg, &pending_receipts);
+                    self.broadcast_to_peers(
+                        None,
+                        &PeerFrame::Publish {
+                            message: msg.clone(),
+                            receipts: pending_receipts.clone(),
+                        },
+                    );
+                }
+
+                let mut schedule_ok = true;
+                if !to_schedule.is_empty() {
+                    let rcpts_to_schedule: Vec<DeliveryReceipt> =
+                        to_schedule.iter().map(|(_, _, r)| r.clone()).collect();
+                    match self.schedule_dispatch(
+                        &msg,
+                        &rcpts_to_schedule,
+                        now.clone(),
+                        &mut first_holds,
+                    ) {
+                        Ok(()) => {
+                            let mut state = lock(&self.awaiting_daemon_state);
+                            if let Some(entry) = state.get_mut(mid) {
+                                for (key, is_routed, _) in to_schedule {
+                                    if is_routed {
+                                        entry.scheduled_routed.insert(key);
+                                    } else {
+                                        entry.tried_unrouted.insert(key);
+                                    }
+                                }
+                                entry.waiting_for_route = !all_routed;
+                            }
+                        }
+                        Err(message) => {
+                            schedule_ok = false;
+                            let mut state = lock(&self.awaiting_daemon_state);
+                            if let Some(entry) = state.get_mut(mid) {
+                                entry.waiting_for_route = false;
+                                for (key, _, _) in to_schedule {
+                                    if !key.is_empty() {
+                                        entry.unscheduled_recipients.insert(key);
+                                    }
+                                }
+                            }
+                            warn(&message);
+                        }
+                    }
+                } else {
+                    let mut state = lock(&self.awaiting_daemon_state);
+                    if let Some(entry) = state.get_mut(mid) {
+                        entry.waiting_for_route = !all_routed;
+                    }
+                }
+
+                all_routed && schedule_ok
+            };
+
+            log_first_holds(first_holds);
+            if clear_marker {
+                let _ = self.store.clear_wire_awaiting_daemon(mid);
+                lock(&self.awaiting_daemon_state).remove(mid);
+            }
+        }
+    }
 }
 
 pub struct DaemonHandle {
@@ -2129,6 +2730,7 @@ pub struct DaemonHandle {
     listen_addr: Option<String>,
     shutdown: Arc<AtomicBool>,
     join_handle: Option<std::thread::JoinHandle<()>>,
+    poll_join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DaemonHandle {
@@ -2147,6 +2749,9 @@ impl DaemonHandle {
             let _ = TcpStream::connect(addr);
         }
         if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.poll_join_handle.take() {
             let _ = h.join();
         }
         let _ = fs::remove_file(&self.socket_path);
@@ -2228,6 +2833,7 @@ where
         overflow_capacity_exhausted: AtomicBool::new(false),
         dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
         pending_by_recipient: Mutex::new(initial_pending),
+        awaiting_daemon_state: Mutex::new(BTreeMap::new()),
         #[cfg(test)]
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
@@ -2238,6 +2844,8 @@ where
         queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
         #[cfg(test)]
         registration_locked_hook: Mutex::new(None),
+        #[cfg(test)]
+        registration_probe_hook: Mutex::new(None),
         peers: Mutex::new(BTreeMap::new()),
         peer_sync_cursors: Mutex::new(BTreeMap::new()),
         subscribers: Mutex::new(Vec::new()),
@@ -2249,6 +2857,7 @@ where
     warn(
         "startup: pre-restart pending messages remain readable in the inbox; delivery may be unconfirmed",
     );
+    inner.drain_awaiting_daemon_messages(true);
 
     // Spawn outbound peer loops
     for peer_url in config.peers.clone() {
@@ -2270,6 +2879,24 @@ where
     }
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_poll = Arc::clone(&shutdown_flag);
+    let inner_poll = Arc::clone(&inner);
+    let poll_join_handle = std::thread::Builder::new()
+        .name("fl-wire-awaiting-poll".into())
+        .spawn(move || {
+            let mut last_poll = Instant::now();
+            while !shutdown_poll.load(Ordering::SeqCst)
+                && !inner_poll.shutdown.load(Ordering::SeqCst)
+            {
+                if last_poll.elapsed() >= AWAITING_DAEMON_POLL_INTERVAL {
+                    last_poll = Instant::now();
+                    inner_poll.drain_awaiting_daemon_messages(false);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        })?;
+
     let shutdown_clone = Arc::clone(&shutdown_flag);
     let inner_main = Arc::clone(&inner);
 
@@ -2287,6 +2914,7 @@ where
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT));
+                    let peer_cred = extract_peer_cred(&stream);
                     let Ok(mut writer) = stream.try_clone() else {
                         return;
                     };
@@ -2294,7 +2922,7 @@ where
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 {
                         return;
-                    }
+                    };
                     if !line.ends_with('\n') && line.len() as u64 >= MAX_LOCAL_REQUEST_BYTES {
                         let err = LocalResponse::Error {
                             message: format!(
@@ -2314,7 +2942,7 @@ where
                             return;
                         }
                     };
-                    let (resp, sub_rx) = inner_conn.handle_local_request(req);
+                    let (resp, sub_rx) = inner_conn.handle_local_request_with_peer(req, peer_cred);
                     if writeln!(writer, "{}", serde_json::to_string(&resp).unwrap()).is_err() {
                         return;
                     }
@@ -2371,6 +2999,7 @@ where
         listen_addr: config.listen_addr,
         shutdown: shutdown_flag,
         join_handle: Some(join_handle),
+        poll_join_handle: Some(poll_join_handle),
     })
 }
 
@@ -2448,11 +3077,13 @@ mod tests {
             overflow_capacity_exhausted: AtomicBool::new(false),
             dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
             pending_by_recipient: Mutex::new(BTreeMap::new()),
+            awaiting_daemon_state: Mutex::new(BTreeMap::new()),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
             fail_next_worker_spawn: AtomicBool::new(false),
             queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
             registration_locked_hook: Mutex::new(None),
+            registration_probe_hook: Mutex::new(None),
             peers: Mutex::new(BTreeMap::new()),
             peer_sync_cursors: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
@@ -2527,6 +3158,19 @@ mod tests {
         ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
             lock(&self.calls).push("send");
             self.inner.send_wire(args)
+        }
+        fn send_wire_awaiting_daemon(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            lock(&self.calls).push("send");
+            self.inner.send_wire_awaiting_daemon(args)
+        }
+        fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+            self.inner.list_wire_awaiting_daemon()
+        }
+        fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+            self.inner.clear_wire_awaiting_daemon(message_id)
         }
         fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
             lock(&self.calls).push("get");
@@ -2996,14 +3640,14 @@ mod tests {
                 message_ids: vec![id.clone()],
             });
             assert!(matches!(response, LocalResponse::Acked { .. }));
-            let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "held".into(),
-                explicit: true,
-                route: VendorRoute::Codex {
+            let (response, _) = inner.handle_local_request(LocalRequest::register(
+                "held",
+                VendorRoute::Codex {
                     thread_id: "new-session".into(),
                     cwd: None,
                 },
-            });
+                true,
+            ));
             assert!(matches!(response, LocalResponse::RouteRegistered));
             assert_eq!(inner.diagnostics_snapshot(), first);
             let calls = TRANSPORT_CALLS.with(|n| n.get());
@@ -3206,14 +3850,14 @@ mod tests {
         }
         inner.fail_next_worker_spawn.store(true, Ordering::SeqCst);
         lock(&inner.store.calls).clear();
-        let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: " ALICE ".into(),
-            explicit: true,
-            route: VendorRoute::Codex {
+        let (response, _) = inner.handle_local_request(LocalRequest::register(
+            " ALICE ",
+            VendorRoute::Codex {
                 thread_id: "registration-session".into(),
                 cwd: None,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         assert!(lock(&inner.routes).get("alice").unwrap().explicit);
         assert_eq!(
@@ -3594,13 +4238,13 @@ mod tests {
         let socket = rig._tmp.path().join("overflow.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "overflow".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "overflow",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut received = Vec::new();
@@ -3675,13 +4319,13 @@ mod tests {
         let socket = rig._tmp.path().join("limited.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "limited".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "limited",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut received = Vec::new();
@@ -3735,13 +4379,13 @@ mod tests {
         let inner = Arc::clone(&rig.inner);
         let register = std::thread::spawn(move || {
             inner
-                .handle_local_request(LocalRequest::RegisterRoute {
-                    persona: "register-race".into(),
-                    explicit: true,
-                    route: VendorRoute::Webhook {
+                .handle_local_request(LocalRequest::register(
+                    "register-race",
+                    VendorRoute::Webhook {
                         socket_path: socket,
                     },
-                })
+                    true,
+                ))
                 .0
         });
         locked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -4227,13 +4871,13 @@ mod tests {
         );
         let mut client = LocalClient::connect(&daemon_socket, Duration::from_secs(2)).unwrap();
         client
-            .request(&LocalRequest::RegisterRoute {
-                persona: "slow".into(),
-                explicit: true,
-                route: VendorRoute::Webhook {
+            .request(&LocalRequest::register(
+                "slow",
+                VendorRoute::Webhook {
                     socket_path: tmp.path().join("saved-route.sock"),
                 },
-            })
+                true,
+            ))
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(
@@ -4263,13 +4907,13 @@ mod tests {
         let socket = rig._tmp.path().join("late-route.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "new-route".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "new-route",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         std::thread::sleep(Duration::from_millis(100));
         assert!(
@@ -4298,13 +4942,13 @@ mod tests {
         let socket = rig._tmp.path().join("racing-route.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "racing-route".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "racing-route",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         resume_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -4392,14 +5036,14 @@ mod tests {
             let (send, _) = inner.handle_local_request(LocalRequest::Send {
                 args: mail("other", "independent"),
             });
-            let (register, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "third".into(),
-                explicit: true,
-                route: VendorRoute::Codex {
+            let (register, _) = inner.handle_local_request(LocalRequest::register(
+                "third",
+                VendorRoute::Codex {
                     thread_id: "thread".into(),
                     cwd: None,
                 },
-            });
+                true,
+            ));
             done_tx.send((send, register)).unwrap();
         });
         let answer = done_rx.recv_timeout(Duration::from_secs(1));
@@ -4418,14 +5062,14 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "new-persona".into(),
-                route: VendorRoute::Codex {
+            inner.handle_local_request(LocalRequest::register(
+                "new-persona",
+                VendorRoute::Codex {
                     thread_id: "test".into(),
                     cwd: None,
                 },
-                explicit: true,
-            })
+                true,
+            ))
         });
         started_rx.recv().unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
@@ -4558,13 +5202,13 @@ mod tests {
         let path = rig._tmp.path().join("routes-b.json");
         assert!(rig.inner.routes.lock().unwrap().entries.is_empty());
         assert!(!path.exists());
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "synthetic-route-owner".into(),
-            explicit: false,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "synthetic-route-owner",
+            VendorRoute::Webhook {
                 socket_path: rig._tmp.path().join("hook.sock"),
             },
-        });
+            false,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         // The registration reached the rig's own file, and `RouteTable::load(None)` / `save(None)`
         // (the real machine table) would have panicked above: they refuse under test.
@@ -4579,14 +5223,14 @@ mod tests {
     fn explicit_registration_and_unregister_update_the_live_and_saved_table() {
         let rig = rig();
         let path = rig._tmp.path().join("routes-b.json");
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Codex {
                 thread_id: "new".into(),
                 cwd: None,
             },
-            explicit: true,
-        });
+            true,
+        ));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
         assert!(lock(&rig.inner.routes).get("ada").unwrap().explicit);
         assert!(RouteTable::load(Some(&path)).get("ada").unwrap().explicit);
@@ -4607,22 +5251,20 @@ mod tests {
             thread_id: "current".into(),
             cwd: None,
         };
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: route.clone(),
-            explicit: true,
-        });
+        let (reply, _) =
+            rig.inner
+                .handle_local_request(LocalRequest::register("ada", route.clone(), true));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Muse {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Muse {
                 session_id: "old".into(),
                 cwd: None,
                 tmux_target: None,
                 tmux_pane: None,
             },
-            explicit: false,
-        });
+            false,
+        ));
         assert!(matches!(reply, LocalResponse::Error { .. }));
         assert_eq!(lock(&rig.inner.routes).get("ada").unwrap().route, route);
     }
@@ -4630,32 +5272,32 @@ mod tests {
     #[test]
     fn a_passive_alias_cannot_claim_an_explicit_session_but_same_vendor_refresh_works() {
         let rig = rig();
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Codex {
                 thread_id: "current".into(),
                 cwd: None,
             },
-            explicit: true,
-        });
+            true,
+        ));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "old-alias".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "old-alias",
+            VendorRoute::Codex {
                 thread_id: "current".into(),
                 cwd: None,
             },
-            explicit: false,
-        });
+            false,
+        ));
         assert!(matches!(reply, LocalResponse::Error { .. }));
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Codex {
                 thread_id: "refreshed".into(),
                 cwd: None,
             },
-            explicit: false,
-        });
+            false,
+        ));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
         let routes = lock(&rig.inner.routes);
         let entry = routes.get("ada").unwrap();
@@ -5125,16 +5767,16 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         };
-        request(LocalRequest::RegisterRoute {
-            persona: "lmcfarlin-e6".into(),
-            explicit: false,
-            route: VendorRoute::Claude {
+        request(LocalRequest::register(
+            "lmcfarlin-e6",
+            VendorRoute::Claude {
                 pid: 4242,
                 session_id: "s-derived".into(),
                 socket_path: tmp.path().join("claude.sock"),
                 key_path: None,
             },
-        });
+            false,
+        ));
         assert_eq!(status_personas(), vec!["lmcfarlin-e6"]);
 
         // Any send runs a dispatch. With a home override every dispatch discovers (in production
@@ -5152,44 +5794,42 @@ mod tests {
             "the pruned route must not linger in Status"
         );
         // The next RegisterRoute saves the live table; the pruned route must not come back.
-        request(LocalRequest::RegisterRoute {
-            persona: "other".into(),
-            explicit: false,
-            route: VendorRoute::Codex {
+        request(LocalRequest::register(
+            "other",
+            VendorRoute::Codex {
                 thread_id: "t".into(),
                 cwd: None,
             },
-        });
+            false,
+        ));
         let saved = fs::read_to_string(&routes_file).unwrap();
         assert!(saved.contains("other"), "{saved}");
         assert!(!saved.contains("lmcfarlin-e6"), "{saved}");
     }
 
     /// Audit D-1: the dispatch ran vendor CLIs while holding the route-table lock, so one slow
-    /// `codex` froze `Status` and `RegisterRoute` for as long as it ran.
+    /// vendor delivery froze `Status` and `RegisterRoute` for as long as it ran. Hold the fake
+    /// vendor binary open behind a filesystem gate and verify `Send`, `Status`, `RegisterRoute`,
+    /// and delivery to another recipient all complete while the gate remains closed.
     #[test]
     fn status_and_route_registration_do_not_wait_behind_a_slow_vendor_delivery() {
         use std::os::unix::fs::PermissionsExt;
-        let _codex_lock = crate::dispatcher::CODEX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
-        let slow = tmp.path().join("slow-codex.sh");
+        let slow = tmp.path().join("slow-vendor.sh");
         let started_file = tmp.path().join("started");
+        let gate_file = tmp.path().join("gate");
         let done_file = tmp.path().join("done");
         fs::write(
             &slow,
             format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 2\nprintf done > '{}'\n",
+                "#!/bin/sh\nprintf started > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nprintf done > '{}'\n",
                 started_file.display(),
+                gate_file.display(),
                 done_file.display()
             ),
         )
         .unwrap();
         fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
-        // SAFETY: serialised by CODEX_ENV_LOCK; restored below.
-        let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
-        unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &slow) };
 
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
         let cfg = test_config(tmp.path(), "slow");
@@ -5197,14 +5837,17 @@ mod tests {
         let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
 
         let mut reg = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
-        reg.request(&LocalRequest::RegisterRoute {
-            persona: "synthetic-recipient".into(),
-            explicit: false,
-            route: VendorRoute::Codex {
-                thread_id: "t1".into(),
-                cwd: None,
+        reg.request(&LocalRequest::register(
+            "synthetic-recipient",
+            VendorRoute::Agy {
+                conversation_id: "t1".into(),
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(slow.clone()),
+                ls_pid: None,
             },
-        })
+            true,
+        ))
         .unwrap();
 
         let send_sock = sock.clone();
@@ -5218,14 +5861,27 @@ mod tests {
                 .map(|_| ());
             let _ = sent_tx.send(result);
         });
-        let sent_promptly = sent_rx.recv_timeout(Duration::from_millis(400));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let sent_promptly = sent_rx.recv_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(sent_promptly, Ok(Ok(()))),
+            "send waited for vendor delivery: {sent_promptly:?}"
+        );
+        assert!(
+            !done_file.exists(),
+            "vendor delivery finished before gate was released"
+        );
+        sender.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !started_file.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(started_file.exists(), "slow delivery did not start");
+        assert!(
+            !done_file.exists(),
+            "slow delivery finished while gate was still closed"
+        );
 
-        let started = Instant::now();
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         probe
             .request(&LocalRequest::Status {
@@ -5238,21 +5894,21 @@ mod tests {
         // The daemon serves one request per connection.
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         probe
-            .request(&LocalRequest::RegisterRoute {
-                persona: "other".into(),
-                explicit: false,
-                route: VendorRoute::Webhook {
+            .request(&LocalRequest::register(
+                "other",
+                VendorRoute::Webhook {
                     socket_path: other_socket,
                 },
-            })
+                false,
+            ))
             .unwrap();
-        let mut other = LocalClient::connect(&sock, Duration::from_secs(1)).unwrap();
+        let mut other = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         other
             .request(&LocalRequest::Send {
                 args: mail("other", "fast one"),
             })
             .unwrap();
-        let other_deadline = Instant::now() + Duration::from_millis(800);
+        let other_deadline = Instant::now() + Duration::from_secs(10);
         let mut delivered_other = false;
         while Instant::now() < other_deadline {
             if other_listener.accept().is_ok() {
@@ -5263,30 +5919,19 @@ mod tests {
         }
         assert!(
             delivered_other,
-            "other recipient did not receive while slow recipient ran"
+            "other recipient did not receive while slow recipient was gate-held"
         );
-        let waited = started.elapsed();
+        assert!(
+            !done_file.exists(),
+            "slow delivery finished before gate was released"
+        );
 
-        sender.join().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        fs::write(&gate_file, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !done_file.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(done_file.exists(), "slow delivery did not finish");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("FL_WIRE_CODEX_BIN", v),
-                None => std::env::remove_var("FL_WIRE_CODEX_BIN"),
-            }
-        }
-        assert!(
-            matches!(sent_promptly, Ok(Ok(()))),
-            "send waited for vendor delivery"
-        );
-        assert!(
-            waited < Duration::from_millis(1200),
-            "Status/RegisterRoute waited {waited:?} behind a vendor delivery"
-        );
     }
 
     #[test]
@@ -5309,14 +5954,14 @@ mod tests {
         let _daemon = spawn_daemon(store, cfg).unwrap();
         LocalClient::connect(&sock, Duration::from_secs(2))
             .unwrap()
-            .request(&LocalRequest::RegisterRoute {
-                persona: "synthetic-recipient".into(),
-                explicit: false,
-                route: VendorRoute::Codex {
+            .request(&LocalRequest::register(
+                "synthetic-recipient",
+                VendorRoute::Codex {
                     thread_id: "t".into(),
                     cwd: None,
                 },
-            })
+                false,
+            ))
             .unwrap();
         for subject in ["first", "second"] {
             LocalClient::connect(&sock, Duration::from_secs(2))
@@ -5430,11 +6075,7 @@ mod tests {
         ] {
             LocalClient::connect(&sock, Duration::from_secs(2))
                 .unwrap()
-                .request(&LocalRequest::RegisterRoute {
-                    persona: persona.into(),
-                    explicit: false,
-                    route,
-                })
+                .request(&LocalRequest::register(persona, route, false))
                 .unwrap();
         }
         let mut args = mail("slow", "broadcast");
@@ -6098,11 +6739,9 @@ mod tests {
                 },
             ),
         ] {
-            let (resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: persona.into(),
-                route,
-                explicit: true,
-            });
+            let (resp, _) = rig
+                .inner
+                .handle_local_request(LocalRequest::register(persona, route, true));
             assert!(matches!(resp, LocalResponse::RouteRegistered));
         }
 
@@ -6188,13 +6827,13 @@ mod tests {
 
         // Prove no daemon state lock is held while Status waits on the control socket:
         // mutating route table, enqueue_gate, and diagnostics all complete promptly.
-        let (reg_resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "concurrent".into(),
-            route: VendorRoute::Webhook {
+        let (reg_resp, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "concurrent",
+            VendorRoute::Webhook {
                 socket_path: rig._tmp.path().join("concurrent.sock"),
             },
-            explicit: true,
-        });
+            true,
+        ));
         assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
         let (unreg_resp, _) = rig
             .inner
@@ -6380,14 +7019,14 @@ mod tests {
 
         let mut reg = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
         let reg_resp = reg
-            .request(&LocalRequest::RegisterRoute {
-                persona: "felix".into(),
-                route: VendorRoute::Codex {
+            .request(&LocalRequest::register(
+                "felix",
+                VendorRoute::Codex {
                     thread_id: "thread-felix".into(),
                     cwd: None,
                 },
-                explicit: true,
-            })
+                true,
+            ))
             .unwrap();
         assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
 
@@ -6426,6 +7065,967 @@ mod tests {
             accept_count.load(Ordering::SeqCst),
             0,
             "non-opt-in Status must open zero connections on Codex control socket"
+        );
+    }
+
+    #[test]
+    fn register_route_and_diagnostics_two_way_wire_compatibility() {
+        use crate::dispatch_diagnostics::{
+            RegistrationConflictReason, RegistrationDiagnosticOutcome, RouteAdapter,
+        };
+        use serde_json::json;
+
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum LegacyLocalRequest {
+            RegisterRoute {
+                persona: String,
+                route: VendorRoute,
+                #[serde(default)]
+                explicit: bool,
+            },
+        }
+
+        let new_req = LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "t-compat".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace: true,
+            hosted_id: Some("codex:feira".into()),
+            hydration_generation: Some("gen-2".into()),
+            hosted_session_verified: true,
+            unverified_process: true,
+        };
+        let encoded = serde_json::to_string(&new_req).unwrap();
+        let legacy_decoded: LegacyLocalRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            legacy_decoded,
+            LegacyLocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "t-compat".into(),
+                    cwd: None,
+                },
+                explicit: true,
+            }
+        );
+
+        let rig = rig();
+        let diag = RouteRegistrationDiagnostic {
+            at: At::from_unix_millis(5000),
+            last_seen_at: None,
+            count: 1,
+            persona: "Feira".into(),
+            outcome: RegistrationDiagnosticOutcome::Refused,
+            reason: RegistrationConflictReason::ForeignHostedEnv,
+            incumbent_adapter: Some(RouteAdapter::Agy),
+            challenger_adapter: RouteAdapter::Claude,
+            incumbent_hosted_id: Some("antigravity:feira".into()),
+            challenger_hosted_id: Some("antigravity:feira".into()),
+            incumbent_generation: Some("g1".into()),
+            challenger_generation: None,
+            replace: false,
+            unverified_process: false,
+        };
+        let (resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::RecordRegistrationDiagnostic { diagnostic: diag });
+        assert!(matches!(
+            resp,
+            LocalResponse::RegistrationDiagnosticRecorded
+        ));
+
+        let (LocalResponse::Status(status), _) =
+            rig.inner.handle_local_request(LocalRequest::Status {
+                include_codex_queues: false,
+            })
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(status.registration_diagnostics.len(), 1);
+        assert_eq!(status.registration_diagnostics[0].persona, "feira");
+
+        let future_diag_json = json!({
+            "at": status.registration_diagnostics[0].at,
+            "persona": "feira",
+            "outcome": "future_outcome",
+            "reason": "future_reason",
+            "challenger_adapter": "claude",
+            "replace": false,
+        });
+        let future_diag: RouteRegistrationDiagnostic =
+            serde_json::from_value(future_diag_json).unwrap();
+        assert_eq!(
+            future_diag.outcome,
+            RegistrationDiagnosticOutcome::Unsupported
+        );
+        assert_eq!(future_diag.reason, RegistrationConflictReason::Unsupported);
+    }
+
+    #[test]
+    fn dead_explicit_route_with_held_mail_reports_dead_explicit_route_in_daemon_status() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let rig = rig();
+        let dead_route = VendorRoute::Claude {
+            pid: dead_pid,
+            session_id: "s-dead".into(),
+            socket_path: rig._tmp.path().join("missing-claude.sock"),
+            key_path: None,
+        };
+        let (reg_resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::register("feira", dead_route, true));
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        let (sent_resp, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("feira", "held behind dead explicit route"),
+        });
+        assert!(matches!(sent_resp, LocalResponse::Sent { .. }));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            let (LocalResponse::Status(st), _) =
+                rig.inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+            else {
+                panic!("expected Status");
+            };
+            let settled = st
+                .dispatch_diagnostics
+                .as_ref()
+                .is_some_and(|d| !d.records.is_empty());
+            if settled || Instant::now() >= deadline {
+                break st;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let pending = status
+            .pending_recipients
+            .iter()
+            .find(|p| p.recipient == "feira")
+            .expect("feira pending summary");
+        assert_eq!(pending.pending_count, 1);
+        assert_eq!(
+            pending.hold_reason,
+            Some(PendingHoldReason::DeadExplicitRoute)
+        );
+
+        let diag = status
+            .dispatch_diagnostics
+            .as_ref()
+            .and_then(|d| {
+                d.records
+                    .iter()
+                    .find(|r| r.recipient.as_deref() == Some("feira"))
+            })
+            .expect("feira fence diagnostic");
+        assert_eq!(diag.decisive_reason, FenceReason::DeadExplicitRoute);
+    }
+
+    #[test]
+    fn status_preserves_store_and_scheduler_fence_reasons_over_dead_explicit_route() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let rig = rig();
+        let dead_route = VendorRoute::Claude {
+            pid: dead_pid,
+            session_id: "s-dead".into(),
+            socket_path: rig._tmp.path().join("missing-claude.sock"),
+            key_path: None,
+        };
+        let (reg_resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::register("feira", dead_route, true));
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        let (msg, receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("feira", "held after store fault"))
+            .unwrap();
+        rig.inner.admit_pending_receipts(&msg, &receipts);
+
+        for preserved_reason in [
+            FenceReason::ReceiptWriteError,
+            FenceReason::FinalReceiptReadError,
+            FenceReason::WorkerPanic,
+            FenceReason::GlobalMetadataCap,
+        ] {
+            {
+                let mut diags = lock(&rig.inner.dispatch_diagnostics);
+                diags.snapshot.records.clear();
+                diags.retain(FenceDiagnostic::from_report(
+                    "feira",
+                    Some(&msg.id),
+                    At::from_unix_millis(10),
+                    SuppressionPhase::RetainedFence,
+                    preserved_reason,
+                    &DispatchReport::default(),
+                ));
+            }
+            let (LocalResponse::Status(status), _) =
+                rig.inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+            else {
+                panic!("expected Status");
+            };
+            let pending = status
+                .pending_recipients
+                .iter()
+                .find(|p| p.recipient == "feira")
+                .expect("feira pending summary");
+            assert_eq!(
+                pending.hold_reason,
+                Some(PendingHoldReason::DeadExplicitRoute)
+            );
+            let diag = status
+                .dispatch_diagnostics
+                .as_ref()
+                .and_then(|d| {
+                    d.records
+                        .iter()
+                        .find(|r| r.recipient.as_deref() == Some("feira"))
+                })
+                .expect("feira fence diagnostic");
+            assert_eq!(
+                diag.decisive_reason, preserved_reason,
+                "store/scheduler fault {preserved_reason:?} must not be overwritten by DeadExplicitRoute"
+            );
+        }
+
+        for promoted_reason in [
+            FenceReason::TransportError,
+            FenceReason::UnresolvedReceiptStatus,
+        ] {
+            {
+                let mut diags = lock(&rig.inner.dispatch_diagnostics);
+                diags.snapshot.records.clear();
+                diags.retain(FenceDiagnostic::from_report(
+                    "feira",
+                    Some(&msg.id),
+                    At::from_unix_millis(10),
+                    SuppressionPhase::RetainedFence,
+                    promoted_reason,
+                    &DispatchReport::default(),
+                ));
+            }
+            let (LocalResponse::Status(status), _) =
+                rig.inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+            else {
+                panic!("expected Status");
+            };
+            let diag = status
+                .dispatch_diagnostics
+                .as_ref()
+                .and_then(|d| {
+                    d.records
+                        .iter()
+                        .find(|r| r.recipient.as_deref() == Some("feira"))
+                })
+                .expect("feira fence diagnostic");
+            assert_eq!(
+                diag.decisive_reason,
+                FenceReason::DeadExplicitRoute,
+                "transport-level {promoted_reason:?} should promote to DeadExplicitRoute"
+            );
+        }
+    }
+
+    #[test]
+    fn non_opt_in_status_skips_host_tcp_probes_for_explicit_routes() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe_listener.set_nonblocking(true).unwrap();
+        let probe_addr = probe_listener.local_addr().unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
+        let mut inner = rig_inner(&tmp, store);
+        Arc::get_mut(&mut inner)
+            .expect("unique inner")
+            .config
+            .home_override = None;
+
+        let agy_route = VendorRoute::Agy {
+            conversation_id: "conv-probe-gate".into(),
+            ls_pid: Some(dead_pid),
+            ls_address: Some(probe_addr.to_string()),
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        let (reg_resp, _) =
+            inner.handle_local_request(LocalRequest::register("feira", agy_route, true));
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        let (msg, receipts) = inner.store.send_wire(mail("feira", "pending")).unwrap();
+        inner.admit_pending_receipts(&msg, &receipts);
+
+        let (LocalResponse::Status(_), _) = inner.handle_local_request(LocalRequest::Status {
+            include_codex_queues: false,
+        }) else {
+            panic!("expected Status");
+        };
+
+        assert!(
+            matches!(
+                probe_listener.accept(),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "Status {{ include_codex_queues: false }} must not TCP-probe explicit Agy ls_address"
+        );
+    }
+
+    #[test]
+    fn so_peercred_verification_rejects_unverified_pid_claiming_hosted_session_verified() {
+        let rig = rig();
+        let mut incumbent_child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let incumbent_pid = incumbent_child.id();
+
+        let (resp1, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Claude {
+                session_id: "sid-incumbent".into(),
+                pid: incumbent_pid,
+                socket_path: PathBuf::from(format!("/tmp/claude-{incumbent_pid}.sock")),
+                key_path: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("claude:feira".into()),
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: true,
+            unverified_process: false,
+        });
+        assert!(matches!(resp1, LocalResponse::RouteRegistered));
+
+        let mut challenger_child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let challenger_pid = challenger_child.id();
+
+        // Challenger claims `hosted_session_verified: true` with the same generation,
+        // but daemon-observed PeerCred shows `challenger_pid` is not `incumbent_pid` or its child.
+        let (resp2, _) = rig.inner.handle_local_request_with_peer(
+            LocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: VendorRoute::Claude {
+                    session_id: "sid-challenger".into(),
+                    pid: challenger_pid,
+                    socket_path: PathBuf::from(format!("/tmp/claude-{challenger_pid}.sock")),
+                    key_path: None,
+                },
+                explicit: true,
+                replace: false,
+                hosted_id: Some("claude:feira".into()),
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: true,
+                unverified_process: false,
+            },
+            PeerCred {
+                pid: Some(challenger_pid),
+                ppid: Some(std::process::id()),
+                start_time: crate::identity::proc_start_time_ticks(challenger_pid),
+            },
+        );
+        let _ = incumbent_child.kill();
+        let _ = incumbent_child.wait();
+        let _ = challenger_child.kill();
+        let _ = challenger_child.wait();
+
+        assert!(
+            matches!(resp2, LocalResponse::Error { .. }),
+            "daemon must reject spoofed hosted_session_verified when PeerCred PID does not match live incumbent"
+        );
+    }
+
+    #[test]
+    fn register_route_ignores_updated_at_restamps_and_bounds_concurrent_incumbent_contention() {
+        use crate::dispatch_diagnostics::{
+            RegistrationConflictReason, RegistrationDiagnosticOutcome,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let rig = rig();
+
+        let (resp1, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "thread-inc-0".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("codex:feira".into()),
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: true,
+            unverified_process: true,
+        });
+        assert!(matches!(resp1, LocalResponse::RouteRegistered));
+
+        // 1. Restamping `updated_at` and `identity_at` between the unlocked probe and lock
+        // acquisition must NOT trigger a retry because route registration identity is unchanged.
+        let restamp_calls = Arc::new(AtomicUsize::new(0));
+        let restamp_calls_hook = Arc::clone(&restamp_calls);
+        *lock(&rig.inner.registration_probe_hook) = Some(Box::new(move |routes| {
+            restamp_calls_hook.fetch_add(1, Ordering::SeqCst);
+            if let Some(entry) = routes.entries.get_mut("feira") {
+                entry.updated_at = At::from_unix_millis(999_999);
+                entry.identity_at = Some(At::from_unix_millis(888_888));
+            }
+        }));
+
+        let (resp_restamp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "thread-inc-restamp-ok".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("codex:feira".into()),
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: false,
+            unverified_process: false,
+        });
+        assert!(matches!(resp_restamp, LocalResponse::RouteRegistered));
+        assert_eq!(
+            restamp_calls.load(Ordering::SeqCst),
+            1,
+            "updated_at restamp must not trigger retry passes"
+        );
+
+        // 2. When the incumbent's route identity changes on every attempt between the unlocked
+        // probe and lock acquisition, `RegisterRoute` must return within the deadline with
+        // `RegistrationContention`, apply nothing, and record a `RegistrationContention` diagnostic.
+        let contention_calls = Arc::new(AtomicUsize::new(0));
+        let contention_calls_hook = Arc::clone(&contention_calls);
+        *lock(&rig.inner.registration_probe_hook) = Some(Box::new(move |routes| {
+            let n = contention_calls_hook.fetch_add(1, Ordering::SeqCst) + 1;
+            routes.upsert_explicit_with_meta(
+                "feira",
+                VendorRoute::Agy {
+                    conversation_id: format!("conv-concurrent-{n}"),
+                    ls_pid: Some(std::process::id()),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                },
+                At::from_unix_millis(1000 + n as u64),
+                Some("antigravity:feira".into()),
+                Some(format!("gen-concurrent-{n}")),
+                false,
+            );
+        }));
+
+        let started = Instant::now();
+        let (resp_contention, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Claude {
+                pid: std::process::id(),
+                session_id: "claude-challenger".into(),
+                socket_path: PathBuf::from("/tmp/claude-challenger.sock"),
+                key_path: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("claude:feira".into()),
+            hydration_generation: Some("gen-challenger".into()),
+            hosted_session_verified: true,
+            unverified_process: false,
+        });
+        let elapsed = started.elapsed();
+        *lock(&rig.inner.registration_probe_hook) = None;
+
+        assert!(
+            elapsed < REGISTER_ROUTE_DEADLINE,
+            "contention bound must finish within deadline ({elapsed:?})"
+        );
+        assert_eq!(
+            contention_calls.load(Ordering::SeqCst),
+            MAX_REGISTER_ROUTE_ATTEMPTS
+        );
+        let LocalResponse::Error { message } = resp_contention else {
+            panic!("expected contention error, got {resp_contention:?}");
+        };
+        assert!(
+            message.contains("registration_contention"),
+            "unexpected error message: {message}"
+        );
+
+        let routes = lock(&rig.inner.routes);
+        let entry = routes.get("feira").expect("incumbent route preserved");
+        assert!(
+            matches!(
+                &entry.route,
+                VendorRoute::Agy { conversation_id, .. }
+                    if conversation_id == &format!("conv-concurrent-{MAX_REGISTER_ROUTE_ATTEMPTS}")
+            ),
+            "challenger must not overwrite concurrently modified incumbent: {:?}",
+            entry.route
+        );
+        let latest_diag = routes
+            .registration_diagnostics
+            .last()
+            .expect("contention diagnostic recorded");
+        assert_eq!(latest_diag.outcome, RegistrationDiagnosticOutcome::Refused);
+        assert_eq!(
+            latest_diag.reason,
+            RegistrationConflictReason::RegistrationContention
+        );
+    }
+
+    #[test]
+    fn default_socket_path_with_precedence() {
+        use std::ffi::OsStr;
+        let tmp = TempDir::new().unwrap();
+        let run_user = tmp.path().join("run-user-1000");
+        fs::create_dir_all(&run_user).unwrap();
+        let home = tmp.path().join("home");
+
+        assert_eq!(
+            default_socket_path_with(
+                Some(OsStr::new("/xdg/rt")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+            ),
+            PathBuf::from("/xdg/rt/fl-wire.sock")
+        );
+        assert_eq!(
+            default_socket_path_with(None, Some(&run_user), Some(home.as_os_str())),
+            run_user.join("fl-wire.sock")
+        );
+        assert_eq!(
+            default_socket_path_with(
+                None,
+                Some(&tmp.path().join("missing")),
+                Some(home.as_os_str()),
+            ),
+            home.join(".cache/fl/wire.sock")
+        );
+        assert_eq!(
+            default_socket_path_with(None, None, None),
+            PathBuf::from("/tmp/fl-wire.sock")
+        );
+
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::geteuid() };
+            let other_uid = uid.wrapping_add(1);
+            let run_root = tmp.path().join("run/user");
+            fs::create_dir_all(&run_root).unwrap();
+
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire.sock")
+            );
+
+            let my_dir = run_root.join(uid.to_string());
+            fs::create_dir_all(&my_dir).unwrap();
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                my_dir.join("fl-wire.sock")
+            );
+
+            let other_dir = run_root.join(other_uid.to_string());
+            fs::create_dir_all(&other_dir).unwrap();
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), other_uid),
+                home.join(".cache/fl/wire.sock")
+            );
+
+            fs::remove_dir(&my_dir).unwrap();
+            let real_target = tmp.path().join("real-target");
+            fs::create_dir_all(&real_target).unwrap();
+            std::os::unix::fs::symlink(&real_target, &my_dir).unwrap();
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire.sock")
+            );
+        }
+    }
+
+    #[test]
+    fn awaiting_daemon_store_marker_delivers_at_startup_on_poll_on_late_route_and_once_across_restart()
+     {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("queue.redb")).unwrap());
+        let sock = tmp.path().join("daemon.sock");
+        let routes_file = tmp.path().join("routes.json");
+        RouteTable::default().save(Some(&routes_file)).unwrap();
+
+        let hook_sock = tmp.path().join("felicia-hook.sock");
+        let hook_listener = UnixListener::bind(&hook_sock).unwrap();
+        hook_listener.set_nonblocking(true).unwrap();
+
+        let base_ms = now_at().unix_millis();
+
+        // 1. Pre-startup message NOT marked via `send_wire_awaiting_daemon` must NOT be replayed.
+        let (ambiguous_msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "ambiguous".into(),
+                body: "do not replay".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(base_ms),
+            })
+            .unwrap();
+
+        // 2. Message queued by offline client before daemon starts (and before route is registered).
+        let pre_at = At::from_unix_millis(base_ms + 1);
+        let (queued_pre, _) = store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "queued-pre".into(),
+                body: "deliver after route registration".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: pre_at.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.list_wire_awaiting_daemon().unwrap(),
+            vec![(queued_pre.id.clone(), pre_at.clone())]
+        );
+
+        // Stale marker (> 24h old) for a recipient that never registers is pruned at startup.
+        let stale_at =
+            At::from_unix_millis(base_ms.saturating_sub(MAX_AWAITING_DAEMON_AGE_MS + 1000));
+        let (stale_unrouted, _) = store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("never-registers".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "stale-unrouted".into(),
+                body: "prune marker after 24h".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: stale_at,
+            })
+            .unwrap();
+
+        let mut handle = spawn_daemon(
+            Arc::clone(&store),
+            DaemonConfig {
+                node_id: "node-q".into(),
+                host: "host-q".into(),
+                socket_path: sock.clone(),
+                routes_path: Some(routes_file.clone()),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+
+        // Before `felicia` registers her route, `queued_pre`'s marker remains in the store,
+        // while `stale_unrouted`'s expired marker was pruned.
+        let _ = stale_unrouted;
+        assert_eq!(
+            store.list_wire_awaiting_daemon().unwrap(),
+            vec![(queued_pre.id.clone(), pre_at)]
+        );
+
+        // Now register `felicia`'s webhook route: `queued_pre` must be delivered and marker cleared,
+        // while `ambiguous_msg` stays Pending!
+        let mut client = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        let resp = client
+            .request(&LocalRequest::register(
+                "felicia",
+                VendorRoute::Webhook {
+                    socket_path: hook_sock.clone(),
+                },
+                true,
+            ))
+            .unwrap();
+        assert!(matches!(resp, LocalResponse::RouteRegistered));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut received_subjects = Vec::new();
+        while Instant::now() < deadline && received_subjects.is_empty() {
+            if let Ok((mut stream, _)) = hook_listener.accept() {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                let val: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                received_subjects.push(val["subject"].as_str().unwrap().to_string());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(received_subjects, vec!["queued-pre".to_string()]);
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        let amb_rcpts = store.list_wire_receipts(&ambiguous_msg.id).unwrap();
+        assert_eq!(amb_rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(amb_rcpts[0].attempts, 0);
+
+        // 3. A client whose socket path is wrong while the daemon runs elsewhere writes to the
+        // shared store via `send_wire_awaiting_daemon`: the running daemon picks it up on poll,
+        // delivers it, and clears the marker.
+        let (queued_live, _) = store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "queued-live".into(),
+                body: "deliver on poll".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(base_ms + 2),
+            })
+            .unwrap();
+        let _ = queued_live;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && received_subjects.len() < 2 {
+            if let Ok((mut stream, _)) = hook_listener.accept() {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                let val: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                received_subjects.push(val["subject"].as_str().unwrap().to_string());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received_subjects,
+            vec!["queued-pre".to_string(), "queued-live".to_string()]
+        );
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        handle.stop();
+
+        // 4. Crash/restart between store write and daemon pickup -> delivered once across restarts.
+        let (_queued_restart, _) = store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "queued-restart".into(),
+                body: "deliver once after restart".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(base_ms + 3),
+            })
+            .unwrap();
+        assert_eq!(store.list_wire_awaiting_daemon().unwrap().len(), 1);
+
+        let mut handle_1 = spawn_daemon(
+            Arc::clone(&store),
+            DaemonConfig {
+                node_id: "node-q".into(),
+                host: "host-q".into(),
+                socket_path: sock.clone(),
+                routes_path: Some(routes_file.clone()),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && received_subjects.len() < 3 {
+            if let Ok((mut stream, _)) = hook_listener.accept() {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                let val: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                received_subjects.push(val["subject"].as_str().unwrap().to_string());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received_subjects,
+            vec![
+                "queued-pre".to_string(),
+                "queued-live".to_string(),
+                "queued-restart".to_string(),
+            ]
+        );
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        handle_1.stop();
+
+        // Starting a second daemon on the same store and routes must NOT re-deliver anything.
+        let mut handle_2 = spawn_daemon(
+            Arc::clone(&store),
+            DaemonConfig {
+                node_id: "node-q".into(),
+                host: "host-q".into(),
+                socket_path: sock,
+                routes_path: Some(routes_file),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(hook_listener.accept().is_err());
+        handle_2.stop();
+    }
+
+    #[test]
+    fn awaiting_daemon_keeps_marker_on_schedule_failure_and_skips_unrouted_polls_and_reports_status()
+     {
+        let (_tmp, inner) = fault_rig();
+        let now_ms = now_at().unix_millis();
+
+        // 1. Keep-on-failure: recipient "held" has an explicit route in `fault_rig()`.
+        // Force `schedule_dispatch` to fail on worker spawn and verify the store marker is retained.
+        let (msg_routed, _) = inner
+            .store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("held".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "routed-fail-spawn".into(),
+                body: "keep marker when schedule_dispatch fails".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(now_ms),
+            })
+            .unwrap();
+        inner.fail_next_worker_spawn.store(true, Ordering::SeqCst);
+        inner.drain_awaiting_daemon_messages(false);
+        assert_eq!(
+            inner.store.list_wire_awaiting_daemon().unwrap(),
+            vec![(msg_routed.id.clone(), At::from_unix_millis(now_ms))],
+            "marker must remain in store when schedule_dispatch fails"
+        );
+        inner
+            .store
+            .clear_wire_awaiting_daemon(&msg_routed.id)
+            .unwrap();
+        lock(&inner.awaiting_daemon_state).remove(&msg_routed.id);
+
+        // 2. Unrouted recipient: first poll reads message + receipts, discovers no route, and
+        // marks the entry waiting_for_route. Subsequent periodic polls (recheck_unrouted = false)
+        // must skip get_wire_message and list_wire_receipts until routes change.
+        let (_msg_unrouted, _) = inner
+            .store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("pull-only-persona".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "unrouted".into(),
+                body: "skip store reads on subsequent periodic polls".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(now_ms - 5_000),
+            })
+            .unwrap();
+        inner.drain_awaiting_daemon_messages(false);
+        assert_eq!(
+            inner.store.list_wire_awaiting_daemon().unwrap().len(),
+            1,
+            "unrouted marker stays in store while awaiting a route"
+        );
+
+        // Status snapshot surfaces aged awaiting_daemon count and age for the recipient.
+        let summaries = inner.pending_recipients_snapshot(&now_at());
+        let pull_summary = summaries
+            .iter()
+            .find(|s| s.recipient == "pull-only-persona")
+            .expect("pull-only-persona should appear in pending_recipients_snapshot");
+        assert_eq!(pull_summary.awaiting_daemon_count, 1);
+        assert!(pull_summary.oldest_awaiting_daemon_age_ms.unwrap_or(0) >= 5_000);
+
+        // Wait for the initial unrouted worker thread to finish before measuring the second poll.
+        let worker_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < worker_deadline {
+            let active = lock(&inner.dispatch_queues)
+                .get("pull-only-persona")
+                .is_some_and(|q| q.worker_active);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Clear recorded FaultStore calls and run another periodic poll (`recheck_unrouted = false`).
+        lock(&inner.store.calls).clear();
+        inner.drain_awaiting_daemon_messages(false);
+        let calls_on_second_poll = lock(&inner.store.calls).clone();
+        assert!(
+            calls_on_second_poll.is_empty(),
+            "periodic poll should skip get/receipts reads for unrouted markers when routes did not change, got {calls_on_second_poll:?}"
         );
     }
 }

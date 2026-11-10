@@ -1273,6 +1273,26 @@ impl fl_core::store::MessageStore for FaultyStore {
     > {
         self.inner.send_wire(args)
     }
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: fl_core::ferrowire::SendWireArgs,
+    ) -> Result<
+        (
+            fl_core::ferrowire::WireMessage,
+            Vec<fl_core::ferrowire::DeliveryReceipt>,
+        ),
+        StoreError,
+    > {
+        self.inner.send_wire_awaiting_daemon(args)
+    }
+    fn list_wire_awaiting_daemon(
+        &self,
+    ) -> Result<Vec<(fl_core::ids::MessageId, fl_core::At)>, StoreError> {
+        self.inner.list_wire_awaiting_daemon()
+    }
+    fn clear_wire_awaiting_daemon(&self, id: &fl_core::ids::MessageId) -> Result<(), StoreError> {
+        self.inner.clear_wire_awaiting_daemon(id)
+    }
     fn get_wire_message(
         &self,
         id: &fl_core::ids::MessageId,
@@ -1747,6 +1767,8 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         runtime_spawned: false,
         tombstone_ids: vec!["gs-old".into()],
         vendor_session_id: None,
+        pid: None,
+        pid_start_time: None,
         created_at_ms: 1,
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,

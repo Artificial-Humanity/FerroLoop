@@ -15,6 +15,44 @@ const MAX_HUB_DISCOVERY_ENTRIES: usize = 4096;
 #[derive(Subcommand)]
 pub enum Cmd {
     Inventory(InventoryArgs),
+    Batch(BatchArgs),
+    Status(BatchArgs),
+}
+#[derive(Args)]
+pub struct BatchArgs {
+    #[arg(long)]
+    endpoint: String,
+    #[arg(long)]
+    policy: String,
+    #[arg(long)]
+    batch: String,
+    #[arg(long = "member", required = true)]
+    members: Vec<String>,
+}
+fn batch(args: BatchArgs, method: &str) -> Result<i32> {
+    use fl_store::recovery::control::{BatchRequest, MemberRequest, call};
+    let request = BatchRequest {
+        policy_id: args.policy,
+        batch_id: args.batch.parse().context("invalid batch ID")?,
+        members: args
+            .members
+            .iter()
+            .map(|m| {
+                let (store_id, id) = m
+                    .split_once('=')
+                    .context("member must be STORE=OPERATION_ID")?;
+                Ok(MemberRequest {
+                    store_id: store_id.into(),
+                    operation_id: id.parse().context("invalid operation ID")?,
+                    scheduled_at_unix_seconds: None,
+                    byte_cap: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let report = call(&args.endpoint, method, &request)?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(if report.complete { 0 } else { 1 })
 }
 #[derive(Args)]
 pub struct InventoryArgs {
@@ -293,7 +331,11 @@ pub fn inventory_inputs(
 }
 
 pub fn run(cmd: Cmd, explicit_db: Option<PathBuf>) -> Result<i32> {
-    let Cmd::Inventory(args) = cmd;
+    let args = match cmd {
+        Cmd::Inventory(args) => args,
+        Cmd::Batch(args) => return batch(args, "recovery_start"),
+        Cmd::Status(args) => return batch(args, "recovery_status"),
+    };
     if args.roots.iter().any(|r| !r.is_absolute()) {
         bail!("inventory scan roots must be absolute");
     }

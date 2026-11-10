@@ -55,6 +55,7 @@ pub(super) const WIRE_INBOX: &str = "wire_inbox";
 pub(super) const WIRE_RCPT_LOG: &str = "wire_rcpt_log";
 pub(super) const WIRE_THREADS: &str = "wire_threads";
 pub(super) const WIRE_REPLIES: &str = "wire_replies";
+pub(super) const WIRE_AWAITING_DAEMON: &str = "wire_awaiting_daemon";
 pub(super) const WORKFLOW_DEFS: &str = "workflow_defs";
 pub(super) const WORKFLOW_SLUGS: &str = "workflow_slugs";
 pub(super) const WORKFLOW_RUNS: &str = "workflow_runs";

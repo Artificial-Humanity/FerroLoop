@@ -65,10 +65,13 @@ impl TestEnv {
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
             .env_remove("AGENT_NAME")
+            .env_remove("FL_HOSTED_ID")
+            .env_remove("AGENT_HYDRATION_GENERATION")
             .env_remove("CLAUDE_SESSION_ID")
             .env_remove("ANTIGRAVITY_LS_ADDRESS")
             .env_remove("ANTIGRAVITY_CSRF_TOKEN")
             .env_remove("ANTIGRAVITY_AGENTAPI_EXE")
+            .env_remove("ANTIGRAVITY_AGENT")
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
@@ -1280,4 +1283,799 @@ fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offli
         !active_text.contains("felix[ferroloop]: 0"),
         "{active_text}"
     );
+}
+
+#[test]
+fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+
+    let mut routes = fl_wire::identity::RouteTable::default();
+    routes.upsert_explicit_with_meta(
+        "feira",
+        fl_wire::identity::VendorRoute::Agy {
+            conversation_id: "conv-hosted-feira".into(),
+            ls_pid: Some(std::process::id()),
+            ls_address: Some("127.0.0.1:1".into()),
+            csrf_token: Some("SECRET_CSRF".into()),
+            agentapi_exe: Some(env.root.join("nonexistent-agy")),
+        },
+        fl_core::at::At::from_unix_millis(1_700_000_000_100),
+        Some("antigravity:feira".into()),
+        Some("gen-1".into()),
+        false,
+    );
+    routes.save(Some(&env.routes_file)).unwrap();
+
+    // Seed unread mail waiting in store for `feira`.
+    {
+        use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+        use fl_core::store::MessageStore;
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("feira".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "Hosted inbox message".into(),
+                body: "Must remain unacked across spike child hooks".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: fl_core::at::At::from_unix_millis(1_700_000_000_200),
+            })
+            .unwrap();
+    }
+
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        std::sync::Arc::clone(&store),
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-460".into(),
+            host: "host-460".into(),
+            socket_path: env.sock_file.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    let spike_sock = env.root.join("999999.sock");
+    for (idx, hosted_env) in [Some("antigravity:feira"), Some("Feira.antigravity"), None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut cmd = env.fl();
+        cmd.args(["wire", "hook", "claude"])
+            .env("AGENT_PERSONA", "feira")
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &spike_sock)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(hid) = hosted_env {
+            cmd.env("FL_HOSTED_ID", hid);
+        }
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(
+                serde_json::to_vec(&json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": format!("spike-sess-{idx}"),
+                    "cwd": env.work_dir,
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "case {idx} exited non-zero");
+        let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(parsed, json!({}), "case {idx} must return empty JSON");
+    }
+
+    // Check daemon status: route is still Agy, registration_diagnostics recorded 3 refusals,
+    // and unread mail for `feira` is still unacked!
+    let mut st_cmd = env.fl();
+    st_cmd.args(["wire", "status", "--json"]);
+    let st = run_json(st_cmd);
+    assert_eq!(st["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(st["routes"][0]["persona"], "feira");
+    assert_eq!(st["routes"][0]["route"]["kind"], "agy");
+    assert_eq!(
+        st["routes"][0]["route"]["conversation_id"],
+        "conv-hosted-feira"
+    );
+    let reg_diags = st["registration_diagnostics"].as_array().unwrap();
+    assert_eq!(reg_diags.len(), 2);
+    assert_eq!(reg_diags[0]["outcome"], "refused");
+    assert_eq!(reg_diags[0]["reason"], "foreign_hosted_env");
+    assert_eq!(reg_diags[0]["count"], 2);
+    assert!(reg_diags[0]["last_seen_at"].is_string());
+    assert_eq!(reg_diags[1]["outcome"], "refused");
+    assert_eq!(reg_diags[1]["reason"], "vendor_mismatch");
+    assert_eq!(reg_diags[1]["count"], 1);
+
+    let text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    assert!(text_out.status.success());
+    let text = String::from_utf8(text_out.stdout).unwrap();
+    assert!(
+        text.contains(
+            "registration_diagnostics=3(refused=3,replaced=0,latest=feira:refused:vendor_mismatch)"
+        ),
+        "{text}"
+    );
+
+    let mut read_cmd = env.fl();
+    read_cmd.args(["wire", "read", "--for", "feira", "--json"]);
+    let inbox = run_json(read_cmd);
+    daemon.stop();
+    let arr = inbox.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["subject"], "Hosted inbox message");
+    assert_eq!(arr[0]["status"], "pending");
+}
+
+#[test]
+fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_status() {
+    let mut exited = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+    let dead_pid = exited.id();
+    let _ = exited.wait();
+
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+
+    let mut routes = fl_wire::identity::RouteTable::default();
+    routes.upsert_explicit_with_meta(
+        "feira",
+        fl_wire::identity::VendorRoute::Claude {
+            pid: dead_pid,
+            session_id: "claude-dead-460".into(),
+            socket_path: env.root.join("missing.sock"),
+            key_path: None,
+        },
+        fl_core::at::At::from_unix_millis(1_700_000_000_100),
+        Some("claude:feira".into()),
+        Some("gen-1".into()),
+        false,
+    );
+    routes.save(Some(&env.routes_file)).unwrap();
+
+    {
+        use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+        use fl_core::store::MessageStore;
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("feira".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "Held mail".into(),
+                body: "Dead explicit PID".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: fl_core::at::At::from_unix_millis(1_700_000_000_200),
+            })
+            .unwrap();
+    }
+
+    // 1. Inactive daemon `fl wire status` (JSON + text).
+    let mut inactive_json_cmd = env.fl();
+    inactive_json_cmd.args(["wire", "status", "--json"]);
+    let inactive_json = run_json(inactive_json_cmd);
+    assert_eq!(inactive_json["daemon"], "inactive");
+    assert_eq!(
+        inactive_json["pending_recipients"][0]["hold_reason"],
+        "dead_explicit_route"
+    );
+
+    let inactive_text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    assert!(inactive_text_out.status.success());
+    let inactive_text = String::from_utf8(inactive_text_out.stdout).unwrap();
+    assert!(
+        inactive_text.contains("hold=dead_explicit_route"),
+        "{inactive_text}"
+    );
+
+    // 2. Active daemon `fl wire status` (JSON + text).
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        store,
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-dead".into(),
+            host: "host-dead".into(),
+            socket_path: env.sock_file.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    let mut active_json_cmd = env.fl();
+    active_json_cmd.args(["wire", "status", "--json"]);
+    let active_json = run_json(active_json_cmd);
+    assert_eq!(
+        active_json["pending_recipients"][0]["hold_reason"],
+        "dead_explicit_route"
+    );
+    assert_eq!(
+        active_json["dispatch_diagnostics"]["records"][0]["decisive_reason"],
+        "dead_explicit_route"
+    );
+
+    let active_text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    daemon.stop();
+    assert!(active_text_out.status.success());
+    let active_text = String::from_utf8(active_text_out.stdout).unwrap();
+    assert!(
+        active_text.contains("decisive_reasons=dead_explicit_route=1")
+            && active_text.contains("hold=dead_explicit_route"),
+        "{active_text}"
+    );
+}
+
+#[test]
+fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let g1 = fl_hub::lifecycle::next_hydration_generation();
+    let g2 = fl_hub::lifecycle::next_hydration_generation();
+
+    let hosted_agy = fl_hub::lifecycle::HostedSessionRecord {
+        session_id: "antigravity:feira".into(),
+        persona: "feira".into(),
+        project: "ferroloop".into(),
+        role: "assistant".into(),
+        vendor: "antigravity".into(),
+        model: None,
+        thinking_level: None,
+        node_id: "local".into(),
+        hosted: true,
+        status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+        restart_policy: "on-failure".into(),
+        restart_count: 0,
+        tmux_target: None,
+        host_session_id: Some("Feira.antigravity".into()),
+        cwd: None,
+        context_window: None,
+        posture: fl_core::permissions::Posture::Auto,
+        hydration_dispatched: true,
+        hydration_status: fl_hub::lifecycle::HydrationStatus::Unconfirmed,
+        hydration_generation: Some(g1.clone()),
+        runtime_spawned: true,
+        tombstone_ids: Vec::new(),
+        vendor_session_id: None,
+        pid: None,
+        pid_start_time: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        decommission_prepared_at_ms: None,
+    };
+    fl_hub::lifecycle::persist_hosted_session(&*store, &hosted_agy, "owner").unwrap();
+
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        std::sync::Arc::clone(&store),
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-rep".into(),
+            host: "host-rep".into(),
+            socket_path: env.sock_file.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    // 1. Hosted session's own `--replace` succeeds.
+    let reg1 = env
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .env("AGENT_PERSONA", "feira")
+        .env("FL_HOSTED_ID", "antigravity:feira")
+        .env("AGENT_HYDRATION_GENERATION", &g1)
+        .env("ANTIGRAVITY_CONVERSATION_ID", "conv-e2e-g1")
+        .output()
+        .unwrap();
+    assert!(
+        reg1.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&reg1.stderr)
+    );
+
+    // 2. Foreign-vendor child with `FL_HOSTED_ID=antigravity:feira` attempting `claude --replace` is refused!
+    let spike_sock = env.root.join(format!("{}.sock", std::process::id()));
+    let foreign = env
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .env("AGENT_PERSONA", "feira")
+        .env("FL_HOSTED_ID", "antigravity:feira")
+        .env("AGENT_HYDRATION_GENERATION", &g1)
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", &spike_sock)
+        .env("CLAUDE_SESSION_ID", "spike-child-replace")
+        .output()
+        .unwrap();
+    assert!(!foreign.status.success());
+
+    // 3. Remodel to `claude` with `g2` succeeds and records `Replaced`.
+    let mut remodeled = hosted_agy;
+    remodeled.session_id = "claude:feira".into();
+    remodeled.vendor = "claude".into();
+    remodeled.hydration_status = fl_hub::lifecycle::HydrationStatus::Unconfirmed;
+    remodeled.hydration_generation = Some(g2.clone());
+    fl_hub::lifecycle::persist_hosted_session(&*store, &remodeled, "owner").unwrap();
+
+    let reg2 = env
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .env("AGENT_PERSONA", "feira")
+        .env("FL_HOSTED_ID", "claude:feira")
+        .env("AGENT_HYDRATION_GENERATION", &g2)
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", &spike_sock)
+        .env("CLAUDE_SESSION_ID", "claude-e2e-g2")
+        .output()
+        .unwrap();
+    assert!(
+        reg2.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&reg2.stderr)
+    );
+
+    // 4. Operator `--replace` (no `FL_HOSTED_ID`) switches to Codex and records `Replaced`.
+    let op_reg = env
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .env("CODEX_THREAD_ID", "codex-op-e2e")
+        .output()
+        .unwrap();
+    assert!(
+        op_reg.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&op_reg.stderr)
+    );
+
+    let mut st_cmd = env.fl();
+    st_cmd.args(["wire", "status", "--json"]);
+    let st = run_json(st_cmd);
+    daemon.stop();
+    assert_eq!(st["routes"][0]["route"]["kind"], "codex");
+    assert_eq!(st["routes"][0]["route"]["thread_id"], "codex-op-e2e");
+    let diags = st["registration_diagnostics"].as_array().unwrap();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["outcome"] == "refused" && d["reason"] == "foreign_hosted_env"),
+        "{diags:?}"
+    );
+    assert!(
+        diags.iter().filter(|d| d["outcome"] == "replaced").count() >= 2,
+        "{diags:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and_fanout_agy_persona()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let run_user_dir = env.root.join("run-user-synth");
+    std::fs::create_dir_all(&run_user_dir).unwrap();
+    let sock_in_run_user = run_user_dir.join("fl-wire.sock");
+    let routes_in_run_user = run_user_dir.join("fl-wire-routes.json");
+
+    // Write a config without `[wire] socket = ...` so the CLI/MCP must resolve the socket via `/run/user/<uid>` fallback.
+    std::fs::write(
+        env.cfg_dir.join("fl/config.toml"),
+        format!("[state]\nstore = \"{}\"\n", store_path.display()),
+    )
+    .unwrap();
+
+    let agy_log = env.root.join("agy-invocations.log");
+    let fake_agy = env.root.join("fake-agy.sh");
+    std::fs::write(
+        &fake_agy,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 0\n",
+            agy_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Register felicia and felix in the store and seed `routes_in_run_user` with a bare-UUID Agy route for felicia.
+    let mut reg_felicia = env.fl();
+    reg_felicia.args([
+        "wire",
+        "register",
+        "felicia",
+        "--project",
+        "ferroloop",
+        "--role",
+        "assistant",
+    ]);
+    assert!(reg_felicia.output().unwrap().status.success());
+
+    let mut reg_felix = env.fl();
+    reg_felix.args([
+        "wire",
+        "register",
+        "felix",
+        "--project",
+        "ferroloop",
+        "--role",
+        "assistant",
+    ]);
+    assert!(reg_felix.output().unwrap().status.success());
+
+    let mut table = fl_wire::identity::RouteTable::default();
+    table.upsert_explicit(
+        "felicia",
+        fl_wire::identity::VendorRoute::Agy {
+            conversation_id: "019d0000-0000-7000-8000-00000000beef".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: Some(fake_agy),
+        },
+        fl_core::At::from_unix_millis(100),
+    );
+    table.save(Some(&routes_in_run_user)).unwrap();
+
+    // Start daemon at `<run_user_dir>/fl-wire.sock` with `<run_user_dir>/fl-wire-routes.json`.
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        store,
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-run-user".into(),
+            host: "host-run-user".into(),
+            socket_path: sock_in_run_user.clone(),
+            routes_path: Some(routes_in_run_user.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    // 1. `fl wire status --json` with `XDG_RUNTIME_DIR`, `FL_WIRE_SOCKET`, and `FL_WIRE_ROUTES` UNSET
+    //    (and `--db` omitted, discovering `/run/user/<uid>` via `FL_TEST_RUN_USER_DIR`).
+    let status_out = Command::new(env!("CARGO_BIN_EXE_fl"))
+        .current_dir(&env.work_dir)
+        .env("HOME", &env.root)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("FL_WIRE_SOCKET")
+        .env_remove("FL_WIRE_ROUTES")
+        .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env_remove("AGENT_PERSONA")
+        .env_remove("AGENT_NAME")
+        .env_remove("FL_HOSTED_ID")
+        .env_remove("AGENT_HYDRATION_GENERATION")
+        .args(["wire", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let st: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(
+        st["node_id"].as_str(),
+        Some("node-run-user"),
+        "CLI status without XDG_RUNTIME_DIR must reach the active daemon via /run/user/<uid> fallback: {st}"
+    );
+
+    // 2. `fl wire mcp` (`send_message` and `broadcast_message`) with `XDG_RUNTIME_DIR` UNSET
+    //    must connect to the daemon at `<run_user_dir>/fl-wire.sock`, deliver through the daemon's
+    //    loaded route table, and push both direct send and `@all` broadcast fan-out!
+    let mut mcp_child = Command::new(env!("CARGO_BIN_EXE_fl"))
+        .current_dir(&env.work_dir)
+        .env("HOME", &env.root)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("FL_WIRE_SOCKET")
+        .env_remove("FL_WIRE_ROUTES")
+        .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env("AGENT_PERSONA", "felix")
+        .env_remove("AGENT_NAME")
+        .env_remove("FL_HOSTED_ID")
+        .env_remove("AGENT_HYDRATION_GENERATION")
+        .args(["wire", "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = mcp_child.stdin.as_mut().unwrap();
+        let reqs = [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {
+                        "to": "felicia",
+                        "subject": "direct-via-mcp",
+                        "body": "hello direct"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "broadcast_message",
+                    "arguments": {
+                        "subject": "group-via-mcp",
+                        "body": "hello broadcast"
+                    }
+                }
+            }),
+        ];
+        for r in &reqs {
+            writeln!(stdin, "{r}").unwrap();
+        }
+    }
+    let mcp_out = mcp_child.wait_with_output().unwrap();
+    assert!(mcp_out.status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut invocations = String::new();
+    while Instant::now() < deadline {
+        invocations = std::fs::read_to_string(&agy_log).unwrap_or_default();
+        if invocations.matches("agentapi send-message").count() >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon.stop();
+
+    assert_eq!(
+        invocations.matches("agentapi send-message").count(),
+        2,
+        "expected both direct MCP send and broadcast MCP send to push via daemon Agy route, got: {invocations}"
+    );
+    assert!(
+        invocations.contains("direct-via-mcp") && invocations.contains("group-via-mcp"),
+        "expected both direct and broadcast subjects in Agy invocations: {invocations}"
+    );
+    assert!(
+        invocations.contains("019d0000-0000-7000-8000-00000000beef"),
+        "expected Agy conversation_id in invocation: {invocations}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
+    use fl_core::MessageStore;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let sock = env.root.join("delayed-daemon.sock");
+    let hook_sock = env.root.join("felicia-hook.sock");
+    let listener = UnixListener::bind(&hook_sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // Register felicia in store and save her webhook route in routes.json.
+    let mut reg_cmd = env.fl();
+    reg_cmd.args([
+        "wire",
+        "register",
+        "felicia",
+        "--project",
+        "ferroloop",
+        "--role",
+        "assistant",
+    ]);
+    assert!(reg_cmd.output().unwrap().status.success());
+
+    let mut table = fl_wire::identity::RouteTable::default();
+    table.upsert(
+        "felicia",
+        fl_wire::identity::VendorRoute::Webhook {
+            socket_path: hook_sock,
+        },
+        fl_core::At::from_unix_millis(100),
+    );
+    table.save(Some(&env.routes_file)).unwrap();
+
+    // 0. If the store write fails while the daemon is unreachable, the client returns an error
+    //    and never claims it queued anything.
+    let mut bad_send = env.fl();
+    bad_send.env("FL_WIRE_SOCKET", &sock).args([
+        "wire",
+        "send",
+        "@nonexistent-group",
+        "bad-subj",
+        "bad-body",
+        "--from",
+        "felix",
+    ]);
+    let bad_out = bad_send.output().unwrap();
+    assert!(!bad_out.status.success());
+    let bad_stderr = String::from_utf8_lossy(&bad_out.stderr);
+    assert!(
+        !bad_stderr.contains("queued, the daemon will deliver"),
+        "failed store write must not claim message was queued: {bad_stderr}"
+    );
+
+    // 1. Send with no daemon running at `sock` (and without `--no-daemon`):
+    //    must queue for the daemon (`Pending`, `attempts == 0`), print notice on stderr, and NOT push in-process.
+    let mut send_cmd = env.fl();
+    send_cmd.env("FL_WIRE_SOCKET", &sock).args([
+        "wire",
+        "send",
+        "felicia",
+        "queued-subj",
+        "queued-body",
+        "--from",
+        "felix",
+        "--json",
+    ]);
+    let send_out = send_cmd.output().unwrap();
+    assert!(
+        send_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let stderr_text = String::from_utf8_lossy(&send_out.stderr);
+    assert!(
+        stderr_text.contains("queued, the daemon will deliver"),
+        "expected queue notice on stderr, got: {stderr_text}"
+    );
+    let sent_json: Value = serde_json::from_slice(&send_out.stdout).unwrap();
+    assert_eq!(sent_json["receipts"][0]["status"], "pending");
+    assert_eq!(sent_json["receipts"][0]["attempts"], 0);
+    assert!(
+        listener.accept().is_err(),
+        "CLI send without --no-daemon must not dispatch in-process"
+    );
+
+    // 2. Start the daemon at `sock`: it drains the queued message and delivers it to `felicia`!
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        std::sync::Arc::clone(&store),
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-delayed".into(),
+            host: "host-delayed".into(),
+            socket_path: sock.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut delivered = None;
+    while Instant::now() < deadline && delivered.is_none() {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut s = String::new();
+            let _ = stream.read_to_string(&mut s);
+            delivered = Some(s);
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let payload = delivered.expect("daemon must pick up and deliver queued message");
+    assert!(payload.contains("queued-subj"));
+    assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+
+    // 3. While the daemon is running at `sock`, a client pointing at the WRONG socket path
+    //    (`wrong-client.sock`) writes to the shared store and the running daemon picks it up
+    //    via the store-backed awaiting-daemon marker and delivers it!
+    let wrong_sock = env.root.join("wrong-client.sock");
+    let mut wrong_sock_cmd = env.fl();
+    wrong_sock_cmd.env("FL_WIRE_SOCKET", &wrong_sock).args([
+        "wire",
+        "send",
+        "felicia",
+        "wrong-sock-subj",
+        "wrong-sock-body",
+        "--from",
+        "felix",
+        "--json",
+    ]);
+    let wrong_out = wrong_sock_cmd.output().unwrap();
+    assert!(
+        wrong_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrong_out.stderr)
+    );
+    let wrong_stderr = String::from_utf8_lossy(&wrong_out.stderr);
+    assert!(
+        wrong_stderr.contains("queued, the daemon will deliver"),
+        "expected queue notice on stderr, got: {wrong_stderr}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delivered_wrong_sock = None;
+    while Instant::now() < deadline && delivered_wrong_sock.is_none() {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut s = String::new();
+            let _ = stream.read_to_string(&mut s);
+            delivered_wrong_sock = Some(s);
+        } else {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    daemon.stop();
+    let payload_2 = delivered_wrong_sock
+        .expect("running daemon must pick up message from client with wrong socket path");
+    assert!(payload_2.contains("wrong-sock-subj"));
+    assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
 }

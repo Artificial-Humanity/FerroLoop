@@ -326,7 +326,13 @@ pub(crate) mod cost_counters {
 /// The route table file the hub reads: the override home's `routes.json`, else `None` (the
 /// default path merged with the legacy agent-bus file, see [`RouteTable::load`]).
 pub(crate) fn route_table_path(home_override: Option<&Path>) -> Option<PathBuf> {
-    home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"))
+    home_override
+        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"))
+        .or_else(|| {
+            std::env::var_os("FL_WIRE_ROUTES")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+        })
 }
 
 /// Load the route table and scan the host's vendor session files for live routes. This is the
@@ -454,7 +460,11 @@ struct RouteScanKey {
 impl RouteScanKey {
     fn current() -> Self {
         Self {
-            primary: fl_wire::identity::default_routes_path(),
+            primary: fl_wire::identity::resolve_routes_path(
+                None,
+                std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+                None,
+            ),
             legacy: fl_wire::identity::legacy_routes_path(),
             host_discovery_disabled: std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref()
                 == Ok("1"),
