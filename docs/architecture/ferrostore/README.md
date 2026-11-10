@@ -16,6 +16,7 @@ crate model cannot express.
 | `specification.c4` | Element kinds (`service`, `caller`, `storefile`, `module`), relationship kinds (`embedded`, `socket`, `uses`) and tags |
 | `model.c4` | Elements and relationships. `#today` relationships describe the code now; `#target` relationships are proposed and not built |
 | `views.c4` | `index` (who opens which file today), `gaps` (opens that break the single-owner rule), `library` (inside `fl-store`), `target` (proposed end state) |
+| `likec4.config.json` | Marks this folder as the LikeC4 project `ferroloop-ferrostore`, so a LikeC4 server that loads `docs/architecture/` shows it as its own project |
 
 Validate and render with the LikeC4 CLI (1.60.0 used):
 
