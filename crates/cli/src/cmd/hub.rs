@@ -190,7 +190,7 @@ pub fn run(env: &StateEnv<'_>, cmd: HubCmd) -> Result<i32, (i32, String)> {
     }
 }
 
-fn resolve_hub_store_path(env: &StateEnv<'_>) -> PathBuf {
+pub(super) fn resolve_hub_store_path(env: &StateEnv<'_>) -> PathBuf {
     if let Some(db) = env.explicit_db {
         return db.to_path_buf();
     }

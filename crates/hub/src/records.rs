@@ -853,6 +853,7 @@ mod tests {
             "fl",
             "../escape",
             "bad.dot",
+            &"a".repeat(65),
         ] {
             for env in [None, Some("ferro"), Some("redb")] {
                 let observed = hub_lookup(tmp.path(), raw, env).unwrap();
