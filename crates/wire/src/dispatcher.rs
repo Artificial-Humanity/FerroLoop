@@ -2438,7 +2438,7 @@ fn composer_occupied_by_non_wire_input_error() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnconfirmedWireDelivery {
     wire_id: String,
-    expected_placeholder_lengths: [usize; 4],
+    expected_placeholder_lengths: Vec<usize>,
     body_probes: Vec<String>,
 }
 
@@ -2446,18 +2446,51 @@ static UNCONFIRMED_WIRE_DELIVERIES: std::sync::Mutex<
     std::collections::BTreeMap<String, UnconfirmedWireDelivery>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+fn push_len_and_plus_one(out: &mut Vec<usize>, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    for base in [s.chars().count(), s.encode_utf16().count(), s.len()] {
+        if base > 0 && !out.contains(&base) {
+            out.push(base);
+        }
+        let plus_one = base.saturating_add(1);
+        if plus_one > 0 && !out.contains(&plus_one) {
+            out.push(plus_one);
+        }
+    }
+}
+
+fn expected_placeholder_char_lengths(trimmed: &str, raw_text: Option<&str>) -> Vec<usize> {
+    let mut out = Vec::with_capacity(18);
+    push_len_and_plus_one(&mut out, trimmed);
+    let body = strip_delivery_header(trimmed);
+    push_len_and_plus_one(&mut out, body);
+    if let Some(raw) = raw_text
+        && raw != trimmed
+    {
+        push_len_and_plus_one(&mut out, raw);
+    }
+    out
+}
+
+#[cfg(test)]
 fn record_unconfirmed_wire_delivery(route_keys: &[String], wire_id: &str, trimmed: &str) {
+    record_unconfirmed_wire_delivery_with_raw(route_keys, wire_id, trimmed, None);
+}
+
+fn record_unconfirmed_wire_delivery_with_raw(
+    route_keys: &[String],
+    wire_id: &str,
+    trimmed: &str,
+    raw_text: Option<&str>,
+) {
     if route_keys.is_empty() || wire_id.is_empty() {
         return;
     }
     let entry = UnconfirmedWireDelivery {
         wire_id: wire_id.to_string(),
-        expected_placeholder_lengths: [
-            trimmed.chars().count(),
-            trimmed.encode_utf16().count(),
-            trimmed.len(),
-            strip_delivery_header(trimmed).chars().count(),
-        ],
+        expected_placeholder_lengths: expected_placeholder_char_lengths(trimmed, raw_text),
         body_probes: payload_probes(trimmed),
     };
     let mut map = UNCONFIRMED_WIRE_DELIVERIES
@@ -2550,6 +2583,7 @@ struct VerifiedDeliverySpec<'a> {
     session_id: Option<&'a str>,
     is_muse_route: bool,
     verify_submission: bool,
+    raw_text: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2606,7 +2640,7 @@ fn execute_verified_paste_delivery(
     }
     if let Err(err) = send_enter() {
         if let Some(id) = wire_id {
-            record_unconfirmed_wire_delivery(&spec.route_keys, id, trimmed);
+            record_unconfirmed_wire_delivery_with_raw(&spec.route_keys, id, trimmed, spec.raw_text);
         }
         on_enter_error();
         return Err(err);
@@ -2615,8 +2649,9 @@ fn execute_verified_paste_delivery(
         clear_unconfirmed_wire_deliveries(&spec.route_keys);
         return Ok(());
     }
-    match confirm_paste_submission(
+    match confirm_paste_submission_with_raw(
         trimmed,
+        spec.raw_text,
         &mut wait,
         &mut capture_screen,
         || transcript.confirmed(trimmed),
@@ -2628,7 +2663,12 @@ fn execute_verified_paste_delivery(
         }
         Err(err) => {
             if let Some(id) = wire_id {
-                record_unconfirmed_wire_delivery(&spec.route_keys, id, trimmed);
+                record_unconfirmed_wire_delivery_with_raw(
+                    &spec.route_keys,
+                    id,
+                    trimmed,
+                    spec.raw_text,
+                );
             }
             on_unconfirmed_abort(&err);
             Err(err)
@@ -2700,6 +2740,7 @@ pub fn host_write_text_then_enter(
         session_id: None,
         is_muse_route: false,
         verify_submission: true,
+        raw_text: Some(text),
     };
     execute_verified_paste_delivery(
         &spec,
@@ -2995,6 +3036,7 @@ fn deliver_via_tmux_paste_with_opts(
             session_id: opts.session_id,
             is_muse_route: opts.is_muse_route,
             verify_submission: opts.verify_submission,
+            raw_text: None,
         };
         return execute_verified_paste_delivery(
             &spec,
@@ -3065,6 +3107,7 @@ fn deliver_via_tmux_paste_with_opts(
         session_id: opts.session_id,
         is_muse_route: opts.is_muse_route,
         verify_submission: opts.verify_submission,
+        raw_text: None,
     };
     let tmux_render = tmux.clone();
     let target_render = target.to_string();
@@ -3312,7 +3355,7 @@ fn prepare_clean_composer_before_paste_for_route(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
-    if screen_has_dialog_or_menu_markers(&contents1) {
+    if screen_has_dialog_or_menu_markers_with_context(&contents1, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if !composer_has_unsubmitted_content(&contents1, cursor1) {
@@ -3337,7 +3380,7 @@ fn prepare_clean_composer_before_paste_for_route(
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
-    if screen_has_dialog_or_menu_markers(&contents2) {
+    if screen_has_dialog_or_menu_markers_with_context(&contents2, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if !composer_has_unsubmitted_content(&contents2, cursor2) {
@@ -3367,7 +3410,7 @@ fn prepare_clean_composer_before_paste_for_route(
             let Some((contents, cursor)) = capture_rendered_only() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            if screen_has_dialog_or_menu_markers(&contents) {
+            if screen_has_dialog_or_menu_markers_with_context(&contents, None, route_keys) {
                 return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
             }
             if composer_has_unsubmitted_content(&contents, cursor) {
@@ -3400,12 +3443,31 @@ fn prepare_clean_composer_before_paste_for_route(
 
 /// Bounded confirmation and Enter retry loop after a paste and initial Enter.
 ///
-/// Never presses `Enter` when [`screen_has_dialog_or_menu_markers`] is true, and retries `Enter`
-/// only when two consecutive polls show content matching **this** delivery (`composer_holds_payload`,
-/// `composer_holds_wire_header`, or `composer_shows_target_placeholder`), never on arbitrary text
-/// typed later by a human.
+/// Never presses `Enter` when [`screen_has_dialog_or_menu_markers`] is true on a rendered screen,
+/// and retries `Enter` only when two consecutive polls show content matching **this** delivery
+/// (`composer_holds_payload`, `composer_holds_wire_header`, or `composer_shows_target_placeholder`),
+/// never on arbitrary text typed later by a human.
+#[cfg(test)]
 fn confirm_paste_submission(
     trimmed: &str,
+    wait: impl FnMut(Duration),
+    capture_screen: impl FnMut() -> Option<ScreenCapture>,
+    transcript_confirmed: impl FnMut() -> bool,
+    send_enter: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    confirm_paste_submission_with_raw(
+        trimmed,
+        None,
+        wait,
+        capture_screen,
+        transcript_confirmed,
+        send_enter,
+    )
+}
+
+fn confirm_paste_submission_with_raw(
+    trimmed: &str,
+    raw_text: Option<&str>,
     wait: impl FnMut(Duration),
     mut capture_screen: impl FnMut() -> Option<ScreenCapture>,
     transcript_confirmed: impl FnMut() -> bool,
@@ -3427,7 +3489,9 @@ fn confirm_paste_submission(
                 ScreenCapture::Rendered { contents, cursor } => (contents, cursor, false),
                 ScreenCapture::RawFallback(s) => (s, None, true),
             };
-            if screen_has_dialog_or_menu_markers(&screen) {
+            if !is_raw_fallback
+                && screen_has_dialog_or_menu_markers_with_context(&screen, Some(trimmed), &[])
+            {
                 return RetryPollDecision::Abort(
                     "prompt submission unconfirmed: active dialog or menu detected on screen; \
                      stopping without retry Enter"
@@ -3438,7 +3502,12 @@ fn confirm_paste_submission(
             let holds_wire_hdr = !holds_payload && composer_holds_wire_header(&screen, trimmed);
             let holds_placeholder = !holds_payload
                 && !holds_wire_hdr
-                && composer_shows_target_placeholder(&screen, trimmed, is_raw_fallback);
+                && composer_shows_target_placeholder_with_raw(
+                    &screen,
+                    trimmed,
+                    raw_text,
+                    is_raw_fallback,
+                );
             if holds_payload || holds_wire_hdr || holds_placeholder {
                 let exhausted_detail = if holds_placeholder {
                     "composer still shows the pasted-content placeholder"
@@ -3450,7 +3519,7 @@ fn confirm_paste_submission(
                     exhausted_detail,
                 };
             }
-            if composer_visibly_submitted_with_cursor(&screen, cursor, trimmed) {
+            if composer_visibly_submitted_with_cursor_and_raw(&screen, cursor, trimmed, raw_text) {
                 return RetryPollDecision::ConfirmedNow;
             }
             RetryPollDecision::CleanWatchTick
@@ -3474,28 +3543,24 @@ fn compact_contains_exact_wire_id(compact: &str, wire_id: &str) -> bool {
     false
 }
 
-/// `true` when `screen` shows `trimmed` inside the framed composer input region at the bottom
-/// of the terminal screen (matching `distinctive_payload_probe`, or for a `top == 0` tall scrolled
-/// composer any probe in `payload_probes`).
-fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
+fn collapse_composer_lines(composer_lines: &[&str]) -> String {
+    collapse_whitespace(
+        &composer_lines
+            .iter()
+            .map(|l| strip_composer_prompt_prefix(l))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn composer_lines_hold_payload(composer_lines: &[&str], top_rule: usize, trimmed: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
     let Some(distinctive) = distinctive_payload_probe(trimmed) else {
         return false;
     };
-    let cleaned = normalize_terminal_screen(screen);
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let Some((composer_lines, top_rule)) = composer_region_lines(&lines) else {
-        return false;
-    };
-    let composer_text = collapse_whitespace(
-        &composer_lines
-            .iter()
-            .map(|l| strip_composer_prompt_prefix(l))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    let composer_text = collapse_composer_lines(composer_lines);
     let probe_matches = |probe: &str| -> bool {
         if probe.chars().count() < MIN_SUBSTRING_PROBE_CHARS {
             composer_text == probe
@@ -3510,6 +3575,21 @@ fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
         && payload_probes(trimmed)
             .iter()
             .any(|probe| probe_matches(probe))
+}
+
+/// `true` when `screen` shows `trimmed` inside the framed composer input region at the bottom
+/// of the terminal screen (matching `distinctive_payload_probe`, or for a `top == 0` tall scrolled
+/// composer any probe in `payload_probes`).
+fn composer_holds_payload(screen: &str, trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let Some((composer_lines, top_rule)) = composer_region_lines(&lines) else {
+        return false;
+    };
+    composer_lines_hold_payload(composer_lines, top_rule, trimmed)
 }
 
 /// `true` when the framed composer lines contain `trimmed`'s exact `urn:uuid:...` message ID.
@@ -3558,29 +3638,42 @@ fn composer_placeholder_lines<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// Parse optional `<N>` from each `[Pasted Content ...]` marker in `line`:
-/// `[Pasted Content 1403 chars]` -> `Some(1403)`, `[Pasted Content]` -> `None`.
-fn parse_pasted_content_lengths(line: &str) -> Vec<Option<usize>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PastedPlaceholderKind {
+    Chars(usize),
+    OtherNumericUnit,
+    Bare,
+}
+
+/// Classify each `[Pasted Content...]` marker in `line`:
+/// - `[Pasted Content 1403 chars]` -> `Chars(1403)`
+/// - `[Pasted Content 500 lines]` / `[Pasted Content 500 bytes]` -> `OtherNumericUnit`
+/// - `[Pasted Content]` (strictly no digits/unit before `]`) -> `Bare`
+fn parse_pasted_content_lengths(line: &str) -> Vec<PastedPlaceholderKind> {
     let mut out = Vec::new();
     let mut rest = line;
     while let Some(pos) = rest.find("[Pasted Content") {
         let after = &rest[pos + "[Pasted Content".len()..];
         let trimmed_after = after.trim_start();
-        let digits: String = trimmed_after
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if !digits.is_empty() {
-            let unit = trimmed_after[digits.len()..].trim_start();
-            if unit.starts_with("char")
-                && let Ok(n) = digits.parse::<usize>()
-            {
-                out.push(Some(n));
-            } else {
-                out.push(None);
-            }
+        if trimmed_after.starts_with(']') {
+            out.push(PastedPlaceholderKind::Bare);
         } else {
-            out.push(None);
+            let digits: String = trimmed_after
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                let unit = trimmed_after[digits.len()..].trim_start();
+                if unit.starts_with("char")
+                    && let Ok(n) = digits.parse::<usize>()
+                {
+                    out.push(PastedPlaceholderKind::Chars(n));
+                } else {
+                    out.push(PastedPlaceholderKind::OtherNumericUnit);
+                }
+            } else {
+                out.push(PastedPlaceholderKind::OtherNumericUnit);
+            }
         }
         rest = after;
     }
@@ -3601,7 +3694,17 @@ fn composer_shows_pasted_placeholder(screen: &str) -> bool {
     !composer_placeholder_lines(&lines).is_empty()
 }
 
+#[cfg(test)]
 fn composer_shows_target_placeholder(screen: &str, trimmed: &str, is_raw_fallback: bool) -> bool {
+    composer_shows_target_placeholder_with_raw(screen, trimmed, None, is_raw_fallback)
+}
+
+fn composer_shows_target_placeholder_with_raw(
+    screen: &str,
+    trimmed: &str,
+    raw_text: Option<&str>,
+    is_raw_fallback: bool,
+) -> bool {
     if is_raw_fallback {
         return composer_shows_pasted_placeholder(screen);
     }
@@ -3617,21 +3720,14 @@ fn composer_shows_target_placeholder(screen: &str, trimmed: &str, is_raw_fallbac
     if composer_holds_wire_header(screen, trimmed) {
         return true;
     }
-    let body = strip_delivery_header(trimmed);
-    let expected = [
-        trimmed.chars().count(),
-        trimmed.encode_utf16().count(),
-        trimmed.len(),
-        body.chars().count(),
-        body.encode_utf16().count(),
-        body.len(),
-    ];
+    let expected = expected_placeholder_char_lengths(trimmed, raw_text);
     ph_lines
         .iter()
         .flat_map(|l| parse_pasted_content_lengths(l))
         .any(|parsed| match parsed {
-            None => true,
-            Some(n) => n > 0 && expected.contains(&n),
+            PastedPlaceholderKind::Bare => true,
+            PastedPlaceholderKind::OtherNumericUnit => false,
+            PastedPlaceholderKind::Chars(n) => n > 0 && expected.contains(&n),
         })
 }
 
@@ -3679,10 +3775,80 @@ fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
     saw_choice_1 && saw_choice_2
 }
 
+fn between_has_delivery_header(between: &[&str]) -> bool {
+    if between.iter().any(|l| line_starts_with_output_marker(l)) {
+        return false;
+    }
+    let collapsed = collapse_composer_lines(between);
+    let compact: String = between
+        .iter()
+        .flat_map(|line| {
+            strip_composer_prompt_prefix(line)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+        })
+        .collect();
+    let has_wire_header = (collapsed.starts_with("[fl-wire ") || compact.starts_with("[fl-wire"))
+        && compact
+            .split_once("(id:urn:uuid:")
+            .is_some_and(|(_, rest)| rest.chars().next().is_some_and(|c| c.is_ascii_hexdigit()));
+    let has_operator_header = collapsed.starts_with("[Operator Prompt via FerroDeck")
+        || compact.starts_with("[OperatorPromptviaFerroDeck");
+    has_wire_header || has_operator_header
+}
+
+fn between_matches_post_paste_target(between: &[&str], top: usize, trimmed: &str) -> bool {
+    let Some((first_idx, first_line)) = between
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, l)| !l.trim().is_empty())
+    else {
+        return false;
+    };
+    if line_starts_with_prompt(first_line) {
+        if between[first_idx + 1..]
+            .iter()
+            .any(|l| l.trim_start().starts_with(['❯', '›']))
+        {
+            return false;
+        }
+        let Some(first_target_line) = trimmed.lines().map(str::trim).find(|l| !l.is_empty()) else {
+            return false;
+        };
+        let first_target_compact: String = first_target_line
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if first_target_compact.is_empty() {
+            return false;
+        }
+        let mut between_compact: String = strip_composer_prompt_prefix(first_line)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for &cont in &between[first_idx + 1..] {
+            between_compact.extend(cont.chars().filter(|c| !c.is_whitespace()));
+        }
+        return between_compact.starts_with(&first_target_compact);
+    }
+    top == 0 && composer_lines_hold_payload(between, top, trimmed)
+}
+
 /// `true` when the active bottom region of `screen` shows an interactive approval, permission, or
 /// selection menu/dialog (`❯ 1.`, paired `1. ` / `2. `, `"Do you want..."`, `"Esc to cancel"`,
-/// `"Allow once"`, `"[y/n]"`, etc.), ignoring `"esc to interrupt"` tool spinners in scrollback.
+/// `"Allow once"`, `"[y/n]"`, etc.), ignoring `"esc to interrupt"` tool spinners in scrollback and
+/// message body text inside a known `[fl-wire ...]` / `[Operator Prompt via FerroDeck` composer.
+#[cfg(test)]
 fn screen_has_dialog_or_menu_markers(screen: &str) -> bool {
+    screen_has_dialog_or_menu_markers_with_context(screen, None, &[])
+}
+
+fn screen_has_dialog_or_menu_markers_with_context(
+    screen: &str,
+    post_paste_trimmed: Option<&str>,
+    route_keys: &[String],
+) -> bool {
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
     if lines.is_empty() {
@@ -3699,6 +3865,28 @@ fn screen_has_dialog_or_menu_markers(screen: &str) -> bool {
         let between = &lines[top + 1..bottom];
         let after = &lines[bottom + 1..];
         let non_empty_after = after.iter().filter(|l| !l.trim().is_empty()).count();
+        let skip_between_body = composer_region_lines(&lines).is_some()
+            && (between_has_delivery_header(between)
+                || post_paste_trimmed.is_some_and(|trimmed| {
+                    between_matches_post_paste_target(between, top, trimmed)
+                })
+                || (top == 0
+                    && !route_keys.is_empty()
+                    && unconfirmed_wire_delivery_matches_scrolled_composer(
+                        route_keys,
+                        &collapse_composer_lines(between),
+                    )));
+        if skip_between_body {
+            if non_empty_after <= 6 {
+                return lines_have_dialog_or_menu_markers(after);
+            }
+            let after_marker = after
+                .iter()
+                .rposition(|l| line_starts_with_output_marker(l))
+                .map_or(0, |idx| idx + 1);
+            let sub = &after[after_marker..];
+            return lines_have_dialog_or_menu_markers(&sub[sub.len().saturating_sub(12)..]);
+        }
         if non_empty_after <= 6 {
             let mut combined = Vec::with_capacity(between.len() + after.len());
             combined.extend_from_slice(between);
@@ -3741,19 +3929,13 @@ fn screen_has_dialog_or_menu_markers(screen: &str) -> bool {
 /// (c) composer is a `top == 0` tall scrolled composer matching recorded `UNCONFIRMED_WIRE_DELIVERIES`
 ///     body probes for `route_keys`.
 fn composer_proven_earlier_wire_delivery(screen: &str, route_keys: &[String]) -> bool {
-    if screen_has_dialog_or_menu_markers(screen) {
+    if screen_has_dialog_or_menu_markers_with_context(screen, None, route_keys) {
         return false;
     }
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
     if let Some((composer_lines, top_rule)) = composer_region_lines(&lines) {
-        let collapsed = collapse_whitespace(
-            &composer_lines
-                .iter()
-                .map(|l| strip_composer_prompt_prefix(l))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
+        let collapsed = collapse_composer_lines(composer_lines);
         let compact: String = composer_lines
             .iter()
             .flat_map(|line| {
@@ -3780,8 +3962,12 @@ fn composer_proven_earlier_wire_delivery(screen: &str, route_keys: &[String]) ->
     composer_placeholder_lines(&lines)
         .iter()
         .flat_map(|l| parse_pasted_content_lengths(l))
-        .flatten()
-        .any(|n| unconfirmed_wire_delivery_matches_placeholder(route_keys, n))
+        .any(|kind| match kind {
+            PastedPlaceholderKind::Chars(n) => {
+                unconfirmed_wire_delivery_matches_placeholder(route_keys, n)
+            }
+            PastedPlaceholderKind::Bare | PastedPlaceholderKind::OtherNumericUnit => false,
+        })
 }
 
 fn is_known_static_ghost_placeholder(ghost_text: &str) -> bool {
@@ -4012,18 +4198,19 @@ fn composer_matches_target_payload(screen: &str, trimmed: &str) -> bool {
 /// framed composer box already contains all probes for `trimmed`.
 #[cfg(test)]
 fn composer_visibly_submitted(screen: &str, trimmed: &str) -> bool {
-    composer_visibly_submitted_with_cursor(screen, None, trimmed)
+    composer_visibly_submitted_with_cursor_and_raw(screen, None, trimmed, None)
 }
 
-fn composer_visibly_submitted_with_cursor(
+fn composer_visibly_submitted_with_cursor_and_raw(
     screen: &str,
     _cursor: Option<CursorState>,
     trimmed: &str,
+    raw_text: Option<&str>,
 ) -> bool {
     if trimmed.is_empty()
         || composer_holds_payload(screen, trimmed)
         || composer_holds_wire_header(screen, trimmed)
-        || composer_shows_target_placeholder(screen, trimmed, false)
+        || composer_shows_target_placeholder_with_raw(screen, trimmed, raw_text, false)
     {
         return false;
     }
@@ -4221,9 +4408,11 @@ fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], usi
         && (1..=4).contains(&non_empty_after)
         && between.iter().any(|l| !l.trim().is_empty())
         && between.iter().filter(|l| !l.trim().is_empty()).all(|l| {
-            l.starts_with("  ") || l.starts_with("[fl-wire ") || l.starts_with("[Pasted Content")
+            (l.starts_with("  ") && !line_starts_with_prompt(l))
+                || l.starts_with("[fl-wire ")
+                || l.starts_with("[Operator Prompt via FerroDeck")
+                || l.starts_with("[Pasted Content")
         })
-        && !lines_have_dialog_or_menu_markers(between)
         && !lines_have_dialog_or_menu_markers(after);
     if (!has_prompt_or_paste && !is_tall_scrolled_composer)
         || between.iter().any(|l| line_starts_with_output_marker(l))
@@ -4351,27 +4540,45 @@ fn is_valid_uuid_str(s: &str) -> bool {
 
 fn claude_jsonl_line_is_user_turn_with_wire_id(line: &str, wire_id: &str) -> bool {
     let trimmed = line.trim();
-    if !trimmed.contains("urn:uuid:") || !trimmed.contains("\"user\"") {
+    if wire_id.is_empty() || !trimmed.contains("urn:uuid:") || !trimmed.contains("\"user\"") {
         return false;
     }
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if val.get("type").and_then(|v| v.as_str()) != Some("user") {
-            return false;
-        }
-        let compact: String = val
-            .to_string()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        return compact_contains_exact_wire_id(&compact, wire_id);
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    if val.get("type").and_then(|v| v.as_str()) != Some("user") {
+        return false;
     }
-    let normalized = trimmed
-        .replace("\\n", " ")
-        .replace("\\r", " ")
-        .replace("\\t", " ")
-        .replace("\\\"", "\"");
-    let compact: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
-    compact.contains("\"type\":\"user\"") && compact_contains_exact_wire_id(&compact, wire_id)
+    if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true) {
+        return false;
+    }
+    if val.get("toolUseResult").is_some() {
+        return false;
+    }
+    let mut user_text = String::new();
+    match val.pointer("/message/content") {
+        Some(serde_json::Value::String(s)) => user_text.push_str(s),
+        Some(serde_json::Value::Array(blocks)) => {
+            for block in blocks {
+                if block.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && let Some(text) = block.get("text").and_then(|v| v.as_str())
+                {
+                    if !user_text.is_empty() {
+                        user_text.push('\n');
+                    }
+                    user_text.push_str(text);
+                }
+            }
+        }
+        _ => return false,
+    }
+    if user_text.is_empty() {
+        return false;
+    }
+    let compact: String = user_text.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("[fl-wire")
+        && compact.contains("(id:")
+        && compact_contains_exact_wire_id(&compact, wire_id)
 }
 
 struct MuseTranscriptTracker {
@@ -14223,8 +14430,7 @@ exit 1"#,
                  ;;\n\
                load-buffer)\n\
                  raw_bytes=$(wc -c | tr -d ' ')\n\
-                 trimmed_bytes=$((raw_bytes - 1))\n\
-                 printf '◆ Ready.\\n{rule}\\n❯ [Pasted Content %s chars]\\n{rule}\\n  muse-wonder-full-1.0\\n' \"$trimmed_bytes\" > {pane}\n\
+                 printf '◆ Ready.\\n{rule}\\n❯ [Pasted Content %s chars]\\n{rule}\\n  muse-wonder-full-1.0\\n' \"$raw_bytes\" > {pane}\n\
                  ;;\n\
                paste-buffer)\n\
                  ;;\n\
@@ -14303,5 +14509,934 @@ exit 1"#,
             enter_sends, 2,
             "expected initial Enter + 1 retry Enter even when FL_WIRE_TMUX_BIN is set, got:\n{ok_calls}"
         );
+    }
+
+    #[test]
+    fn rereview_finding_1_claude_tool_result_with_wire_id_never_drops_delivery_while_user_turn_dedups()
+     {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let store = MemStore::default();
+        let mut claude_mail = mail_to(&store, "hector");
+        claude_mail.body = "Please review the FerroWire transcript dedup rules".into();
+        let fmt_claude_mail = format_push_message(&claude_mail);
+        let wire_id = claude_mail.id.as_str();
+
+        // Direct unit assertions on `claude_jsonl_line_is_user_turn_with_wire_id`:
+        let tool_result_line = serde_json::json!({
+            "uuid": "t-1",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_01",
+                    "content": fmt_claude_mail,
+                }]
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&tool_result_line, wire_id),
+            "tool_result record with type=user must NEVER count as accepted user turn"
+        );
+
+        let tool_use_result_meta_line = serde_json::json!({
+            "uuid": "t-2",
+            "type": "user",
+            "toolUseResult": { "stdout": fmt_claude_mail },
+            "message": {
+                "role": "user",
+                "content": fmt_claude_mail,
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&tool_use_result_meta_line, wire_id),
+            "record carrying toolUseResult must NEVER count as accepted user turn"
+        );
+
+        let is_meta_line = serde_json::json!({
+            "uuid": "m-1",
+            "type": "user",
+            "isMeta": true,
+            "message": {
+                "role": "user",
+                "content": fmt_claude_mail,
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&is_meta_line, wire_id),
+            "isMeta=true record must NEVER count as accepted user turn"
+        );
+
+        let unparseable_line =
+            format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{fmt_claude_mail}");
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&unparseable_line, wire_id),
+            "unparseable JSON line must NOT fall back to raw string matching"
+        );
+
+        let plain_mention_without_wire_header = serde_json::json!({
+            "uuid": "u-plain",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": format!("Can you inspect message {wire_id} in inbox?"),
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(
+                &plain_mention_without_wire_id_hdr(&plain_mention_without_wire_header),
+                wire_id
+            ),
+            "user text without [fl-wire ... (id: ...) header must not match"
+        );
+        fn plain_mention_without_wire_id_hdr(s: &str) -> String {
+            s.to_string()
+        }
+
+        let real_string_turn = serde_json::json!({
+            "uuid": "u-real-1",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": fmt_claude_mail,
+            }
+        })
+        .to_string();
+        assert!(claude_jsonl_line_is_user_turn_with_wire_id(
+            &real_string_turn,
+            wire_id
+        ));
+
+        let real_text_block_turn = serde_json::json!({
+            "uuid": "u-real-2",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_ignore", "content": "ignored" },
+                    { "type": "text", "text": fmt_claude_mail }
+                ]
+            }
+        })
+        .to_string();
+        assert!(claude_jsonl_line_is_user_turn_with_wire_id(
+            &real_text_block_turn,
+            wire_id
+        ));
+
+        // End-to-end: Claude transcript has `tool_result` containing `fmt_claude_mail` (e.g. from
+        // `fl wire inbox`). `already_accepted_wire_id` MUST return `false` and `dispatch_to_route`
+        // MUST actually deliver the message; once the real user turn is written, a subsequent
+        // retry deduplicates with 0 writes.
+        let claude_uuid = "550e8400-e29b-41d4-a716-446655440101";
+        let claude_pdir = home.join(".claude/projects/-home-test-ferroloop");
+        fs::create_dir_all(&claude_pdir).unwrap();
+        let claude_tpath = claude_pdir.join(format!("{claude_uuid}.jsonl"));
+        fs::write(&claude_tpath, format!("{tool_result_line}\n")).unwrap();
+
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let claude_host_sid = SessionId::new(claude_uuid).unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([31u8; 16]),
+                session: claude_host_sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: claude_host_sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+
+        let rule = "─".repeat(120);
+        let rendered = Arc::new(Mutex::new(format!(
+            "⏺ Ready.\n\n{rule}\n❯ \n{rule}\n  claude-opus-4-6"
+        )));
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let rendered_srv = Arc::clone(&rendered);
+        let writes_srv = Arc::clone(&writes);
+        let rule_srv = rule.clone();
+        let ep_srv = endpoint;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let summary = summary.clone();
+                    let rendered = Arc::clone(&rendered_srv);
+                    let writes = Arc::clone(&writes_srv);
+                    let rule = rule_srv.clone();
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    let raw = bytes.into_vec();
+                                    writes.lock().unwrap().push(raw.clone());
+                                    if raw.as_slice() == b"\r" {
+                                        *rendered.lock().unwrap() = format!(
+                                            "⏺ Submitted.\n\n{rule}\n❯ \n{rule}\n  claude-opus-4-6"
+                                        );
+                                    }
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: rendered.lock().unwrap().clone(),
+                                            cursor_row: 3,
+                                            cursor_col: 2,
+                                            rows: 40,
+                                            cols: 120,
+                                            generation: 1,
+                                            output_seq: 1,
+                                            output_bytes: 256,
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let tracker = MuseTranscriptTracker::capture(claude_uuid, Some(claude_uuid), false);
+        assert!(
+            !tracker.already_accepted_wire_id(wire_id),
+            "tool_result mentioning wire_id must not satisfy already_accepted_wire_id"
+        );
+
+        let claude_route = VendorRoute::Claude {
+            pid: 0,
+            session_id: claude_uuid.into(),
+            socket_path: tmp.path().join("missing-claude.sock"),
+            key_path: None,
+        };
+        dispatch_to_route(&claude_route, &claude_mail)
+            .expect("Claude delivery must proceed when only tool_result had wire_id");
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            2,
+            "expected bracketed paste write + Enter write"
+        );
+
+        // Append the real accepted user turn and verify retry now deduplicates with 0 writes:
+        writes.lock().unwrap().clear();
+        fs::write(
+            &claude_tpath,
+            format!("{tool_result_line}\n{real_string_turn}\n"),
+        )
+        .unwrap();
+        let tracker_after = MuseTranscriptTracker::capture(claude_uuid, Some(claude_uuid), false);
+        assert!(tracker_after.already_accepted_wire_id(wire_id));
+        dispatch_to_route(&claude_route, &claude_mail)
+            .expect("Claude delivery must dedup once real user turn is in transcript");
+        assert!(writes.lock().unwrap().is_empty());
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn rereview_finding_2_wire_numbered_list_and_do_you_want_retry_and_flush_without_dialog_false_positive()
+     {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rule = "─".repeat(120);
+        let store = MemStore::default();
+        let mut review_mail = mail_to(&store, "melisandre");
+        review_mail.subject = "Re-review findings".into();
+        review_mail.body = "1. First item\n2. Second item\nDo you want to proceed?".into();
+        let fmt_review = format_push_message(&review_mail);
+
+        // (a) `ScreenCapture::RawFallback` containing `"Do you want to proceed?"` and `"1. "`/`"2. "`
+        // MUST NEVER trigger dialog abort in `confirm_paste_submission`!
+        let mut raw_retries = 0u32;
+        confirm_paste_submission(
+            &fmt_review,
+            |_| {},
+            || {
+                Some(ScreenCapture::RawFallback(format!(
+                    "{fmt_review}\n[Pasted Content {} chars]",
+                    fmt_review.chars().count()
+                )))
+            },
+            || false,
+            || {
+                raw_retries += 1;
+                Ok(())
+            },
+        )
+        .expect("RawFallback with numbered list and 'Do you want to proceed?' must not abort");
+        assert_eq!(
+            raw_retries, 1,
+            "RawFallback must still perform its single retry Enter"
+        );
+
+        // (b) Framed composer carrying `[fl-wire ...]` or `[Operator Prompt via FerroDeck` header
+        // with `"1. First item\n2. Second item\nDo you want to proceed?"` has NO dialog markers
+        // (`false`), whereas a real dialog (`"Do you want to proceed?\n❯ 1. Yes\n  2. No"`) DOES
+        // trigger `screen_has_dialog_or_menu_markers == true`!
+        let wire_composer_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ {}\n{rule}\n  muse-wonder-full-1.0",
+            fmt_review.replace('\n', "\n  ")
+        );
+        assert!(!screen_has_dialog_or_menu_markers(&wire_composer_screen));
+
+        let operator_composer_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [Operator Prompt via FerroDeck — from owner]\n  \n  1. First item\n  2. Second item\n  Do you want to proceed?\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert!(!screen_has_dialog_or_menu_markers(
+            &operator_composer_screen
+        ));
+
+        let real_dialog_screen = format!(
+            "◆ Ready.\n\n{rule}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  Esc to cancel"
+        );
+        assert!(screen_has_dialog_or_menu_markers(&real_dialog_screen));
+        let real_dialog_without_footer = format!(
+            "◆ Ready.\n\n{rule}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  claude-opus-4-6"
+        );
+        assert!(screen_has_dialog_or_menu_markers(
+            &real_dialog_without_footer
+        ));
+
+        // Plain non-header multi-line prompt in `confirm_paste_submission` whose first line matches
+        // `trimmed` also retries cleanly without false dialog abort:
+        let plain_multiline = "Checklist:\n1. First item\n2. Second item\nDo you want to proceed?";
+        let plain_composer = format!(
+            "◆ Ready.\n\n{rule}\n❯ Checklist:\n  1. First item\n  2. Second item\n  Do you want to proceed?\n{rule}\n  muse-wonder-full-1.0"
+        );
+        let plain_submitted = format!(
+            "◆ Ready.\n❯ Checklist:\n  1. First item\n  2. Second item\n  Do you want to proceed?\n◈ Working...\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        );
+        let plain_polls = std::cell::Cell::new(0u32);
+        let mut plain_enters = 0u32;
+        confirm_paste_submission(
+            plain_multiline,
+            |_| {},
+            || {
+                let p = plain_polls.get() + 1;
+                plain_polls.set(p);
+                let s = if p <= 2 {
+                    plain_composer.clone()
+                } else {
+                    plain_submitted.clone()
+                };
+                Some(ScreenCapture::rendered(s))
+            },
+            || false,
+            || {
+                plain_enters += 1;
+                Ok(())
+            },
+        )
+        .expect(
+            "plain multi-line target in composer must retry Enter without dialog false positive",
+        );
+        assert_eq!(plain_enters, 1);
+
+        // (c) End-to-end `fl-host` PTY test:
+        //   (i) Deliver `review_mail` (`1. First item\n2. Second item\nDo you want to proceed?`)
+        //       when the first `Enter` is dropped -> post-paste retries `Enter` and confirms!
+        //   (ii) Leave `review_mail` unconfirmed in the composer (both visible header AND tall 40-row
+        //        scrolled body in `UNCONFIRMED_WIRE_DELIVERIES`), then deliver `followup_mail` ->
+        //        pre-paste flushes `review_mail` and delivers `followup_mail` without dialog abort!
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("muse.reviewlist").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([32u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+
+        let rendered = Arc::new(Mutex::new(format!(
+            "◆ Ready.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        )));
+        let active_text = Arc::new(Mutex::new(Option::<String>::None));
+        let submitted_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let drop_first_enter = Arc::new(AtomicUsize::new(1));
+
+        let rendered_srv = Arc::clone(&rendered);
+        let active_srv = Arc::clone(&active_text);
+        let submitted_srv = Arc::clone(&submitted_texts);
+        let drop_srv = Arc::clone(&drop_first_enter);
+        let rule_srv = rule.clone();
+        let ep_srv = endpoint;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let summary = summary.clone();
+                    let rendered = Arc::clone(&rendered_srv);
+                    let active = Arc::clone(&active_srv);
+                    let submitted = Arc::clone(&submitted_srv);
+                    let drop_enter = Arc::clone(&drop_srv);
+                    let rule = rule_srv.clone();
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    let raw = bytes.into_vec();
+                                    if raw.as_slice() == b"\r" {
+                                        let rem = drop_enter.load(Ordering::SeqCst);
+                                        if rem > 0 {
+                                            drop_enter.store(rem - 1, Ordering::SeqCst);
+                                        } else if let Some(item) = active.lock().unwrap().take() {
+                                            submitted.lock().unwrap().push(item.clone());
+                                            *rendered.lock().unwrap() = format!(
+                                                "◆ Ready.\n❯ {}\n◈ Processing...\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0",
+                                                item.replace('\n', "\n  ")
+                                            );
+                                        }
+                                    } else {
+                                        let text = String::from_utf8_lossy(&raw)
+                                            .trim_start_matches("\x1b[200~")
+                                            .trim_end_matches("\x1b[201~")
+                                            .to_string();
+                                        *active.lock().unwrap() = Some(text.clone());
+                                        *rendered.lock().unwrap() = format!(
+                                            "◆ Ready.\n\n{rule}\n❯ {}\n{rule}\n  muse-wonder-full-1.0",
+                                            text.replace('\n', "\n  ")
+                                        );
+                                    }
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: rendered.lock().unwrap().clone(),
+                                            cursor_row: 5,
+                                            cursor_col: 26,
+                                            rows: 40,
+                                            cols: 120,
+                                            generation: 1,
+                                            output_seq: 1,
+                                            output_bytes: 512,
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_muse = EnvGuard::remove("FL_WIRE_MUSE_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let route = VendorRoute::Muse {
+            session_id: "01a1c218-44dc-7000-8000-bea1904c0e02".into(),
+            cwd: None,
+            tmux_target: Some("muse:reviewlist".into()),
+            tmux_pane: Some("muse.reviewlist".into()),
+        };
+
+        // (i) First `Enter` is dropped while composer shows `1. First item / 2. Second item / Do you want to proceed?`:
+        dispatch_to_route(&route, &review_mail)
+            .expect("post-paste must retry dropped Enter on wire message with numbered list and 'Do you want to proceed?'");
+        assert_eq!(
+            submitted_texts.lock().unwrap().clone(),
+            vec![fmt_review.clone()]
+        );
+
+        // (ii) Leave `review_mail` unconfirmed in composer (visible header) and deliver `followup_mail`:
+        let mut followup_mail = mail_to(&store, "melisandre");
+        followup_mail.body = "Followup ack after numbered review".into();
+        let fmt_followup = format_push_message(&followup_mail);
+        submitted_texts.lock().unwrap().clear();
+        drop_first_enter.store(0, Ordering::SeqCst);
+        *active_text.lock().unwrap() = Some(fmt_review.clone());
+        *rendered.lock().unwrap() = wire_composer_screen;
+
+        dispatch_to_route(&route, &followup_mail)
+            .expect("pre-paste must flush unconfirmed wire message containing numbered list and 'Do you want to proceed?'");
+        assert_eq!(
+            submitted_texts.lock().unwrap().clone(),
+            vec![fmt_review, fmt_followup.clone()]
+        );
+
+        // (iii) Tall 40-row scrolled wire message in `UNCONFIRMED_WIRE_DELIVERIES` whose body has
+        // `"  1. First item\n  2. Second item\n  Do you want to proceed?"` and scrolled header:
+        let mut tall_review = mail_to(&store, "melisandre");
+        let mut tall_body_lines: Vec<String> = (0..34)
+            .map(|i| format!("  Review context paragraph line {i:02} with details"))
+            .collect();
+        tall_body_lines.push("  1. First item".into());
+        tall_body_lines.push("  2. Second item".into());
+        tall_body_lines.push("  Do you want to proceed?".into());
+        tall_review.body = tall_body_lines.join("\n");
+        let fmt_tall_review = format_push_message(&tall_review);
+
+        let mut tall_screen_rows = vec![rule.clone()];
+        tall_screen_rows.extend(tall_body_lines.iter().skip(1).cloned());
+        tall_screen_rows.push(rule);
+        tall_screen_rows.push("  muse-wonder-full-1.0 · high".into());
+        let tall_screen = tall_screen_rows.join("\n");
+
+        record_unconfirmed_wire_delivery(
+            &["host:muse.reviewlist".to_string()],
+            tall_review.id.as_str(),
+            &fmt_tall_review,
+        );
+        let mut followup_mail_2 = mail_to(&store, "melisandre");
+        followup_mail_2.body = "Second followup after tall scrolled numbered list".into();
+        let fmt_followup_2 = format_push_message(&followup_mail_2);
+
+        submitted_texts.lock().unwrap().clear();
+        *active_text.lock().unwrap() = Some(fmt_tall_review.clone());
+        *rendered.lock().unwrap() = tall_screen;
+
+        dispatch_to_route(&route, &followup_mail_2)
+            .expect("pre-paste must flush tall scrolled wire body containing numbered list and 'Do you want to proceed?'");
+        assert_eq!(
+            submitted_texts.lock().unwrap().clone(),
+            vec![fmt_tall_review, fmt_followup_2]
+        );
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn rereview_finding_3_placeholder_plus_one_newline_untrimmed_raw_and_non_char_unit_rejection() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // (a) `parse_pasted_content_lengths` typed classification:
+        assert_eq!(
+            parse_pasted_content_lengths("❯ [Pasted Content 1403 chars]"),
+            vec![PastedPlaceholderKind::Chars(1403)]
+        );
+        assert_eq!(
+            parse_pasted_content_lengths("❯ [Pasted Content 1 char]"),
+            vec![PastedPlaceholderKind::Chars(1)]
+        );
+        assert_eq!(
+            parse_pasted_content_lengths("❯ [Pasted Content]"),
+            vec![PastedPlaceholderKind::Bare]
+        );
+        assert_eq!(
+            parse_pasted_content_lengths("❯ [Pasted Content 500 lines]"),
+            vec![PastedPlaceholderKind::OtherNumericUnit]
+        );
+        assert_eq!(
+            parse_pasted_content_lengths("❯ [Pasted Content 500 bytes]"),
+            vec![PastedPlaceholderKind::OtherNumericUnit]
+        );
+        assert_eq!(
+            parse_pasted_content_lengths("❯ [Pasted Content #1 +42 lines]"),
+            vec![PastedPlaceholderKind::OtherNumericUnit]
+        );
+
+        let rule = "─".repeat(120);
+        let store = MemStore::default();
+        let mut mail = mail_to(&store, "melisandre");
+        mail.body = "x".repeat(400);
+        let fmt_mail = format_push_message(&mail);
+        let trimmed_chars = fmt_mail.chars().count();
+        let body_chars = strip_delivery_header(&fmt_mail).chars().count();
+
+        // `OtherNumericUnit` (`500 lines`, `500 bytes`) WITHOUT visible wire header MUST return `false`:
+        for non_char_ph in [
+            format!("◆ Ready.\n{rule}\n❯ [Pasted Content 500 lines]\n{rule}\n  status"),
+            format!("◆ Ready.\n{rule}\n❯ [Pasted Content 500 bytes]\n{rule}\n  status"),
+            format!("◆ Ready.\n{rule}\n❯ [Pasted Content {trimmed_chars} lines]\n{rule}\n  status"),
+        ] {
+            assert!(
+                !composer_shows_target_placeholder(&non_char_ph, &fmt_mail, false),
+                "OtherNumericUnit without wire header must be rejected: {non_char_ph}"
+            );
+            // And `confirm_paste_submission` must NOT press retry Enter on human `[Pasted Content 500 lines]`:
+            let mut retries = 0u32;
+            confirm_paste_submission(
+                &fmt_mail,
+                |_| {},
+                || Some(ScreenCapture::rendered(non_char_ph.clone())),
+                || false,
+                || {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(retries, 0);
+        }
+
+        // `OtherNumericUnit` WITH visible wire header returns `true`:
+        let with_hdr = format!(
+            "◆ Ready.\n{rule}\n❯ {}\n  [Pasted Content 500 lines]\n{rule}\n  status",
+            format_push_header(&mail)
+        );
+        assert!(composer_shows_target_placeholder(
+            &with_hdr, &fmt_mail, false
+        ));
+
+        // `Bare` `[Pasted Content]` returns `true`:
+        let bare_ph = format!("◆ Ready.\n{rule}\n❯ [Pasted Content]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder(
+            &bare_ph, &fmt_mail, false
+        ));
+
+        // (b) `+ 1` trailing-newline variants match in BOTH `composer_shows_target_placeholder` and
+        // `UNCONFIRMED_WIRE_DELIVERIES`:
+        for matching_len in [trimmed_chars, trimmed_chars + 1, body_chars, body_chars + 1] {
+            let ph_screen = format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted Content {matching_len} chars]\n{rule}\n  status"
+            );
+            assert!(
+                composer_shows_target_placeholder(&ph_screen, &fmt_mail, false),
+                "expected composer_shows_target_placeholder to match length {matching_len}"
+            );
+        }
+
+        record_unconfirmed_wire_delivery(&["tmux:%99".to_string()], mail.id.as_str(), &fmt_mail);
+        assert!(unconfirmed_wire_delivery_matches_placeholder(
+            &["tmux:%99".to_string()],
+            trimmed_chars + 1
+        ));
+        assert!(unconfirmed_wire_delivery_matches_placeholder(
+            &["tmux:%99".to_string()],
+            body_chars + 1
+        ));
+        let plus_one_screen = format!(
+            "◆ Ready.\n{rule}\n❯ [Pasted Content {} chars]\n{rule}\n  status",
+            trimmed_chars + 1
+        );
+        assert!(composer_proven_earlier_wire_delivery(
+            &plus_one_screen,
+            &["tmux:%99".to_string()]
+        ));
+        let lines_unit_screen = format!(
+            "◆ Ready.\n{rule}\n❯ [Pasted Content {} lines]\n{rule}\n  status",
+            trimmed_chars + 1
+        );
+        assert!(!composer_proven_earlier_wire_delivery(
+            &lines_unit_screen,
+            &["tmux:%99".to_string()]
+        ));
+
+        // End-to-end `host_write_text_then_enter` with untrimmed `text` (leading/trailing spaces +
+        // newlines) where the PTY displays `[Pasted Content <text.chars().count()> chars]` and drops
+        // the first `Enter`:
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("muse.untrimmed").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([33u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+
+        let rendered = Arc::new(Mutex::new(format!(
+            "◆ Ready.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        )));
+        let enter_cnt = Arc::new(AtomicUsize::new(0));
+        let rendered_srv = Arc::clone(&rendered);
+        let enter_srv = Arc::clone(&enter_cnt);
+        let rule_srv = rule.clone();
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let summary = summary.clone();
+                    let rendered = Arc::clone(&rendered_srv);
+                    let enter_cnt = Arc::clone(&enter_srv);
+                    let rule = rule_srv.clone();
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    let raw = bytes.into_vec();
+                                    if raw.as_slice() == b"\r" {
+                                        let n = enter_cnt.fetch_add(1, Ordering::SeqCst) + 1;
+                                        if n >= 2 {
+                                            *rendered.lock().unwrap() = format!(
+                                                "◆ Submitted.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+                                            );
+                                        }
+                                    } else {
+                                        let untrimmed_len =
+                                            String::from_utf8_lossy(&raw).chars().count();
+                                        *rendered.lock().unwrap() = format!(
+                                            "◆ Ready.\n\n{rule}\n❯ [Pasted Content {untrimmed_len} chars]\n{rule}\n  muse-wonder-full-1.0"
+                                        );
+                                    }
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: rendered.lock().unwrap().clone(),
+                                            cursor_row: 3,
+                                            cursor_col: 28,
+                                            rows: 40,
+                                            cols: 120,
+                                            generation: 1,
+                                            output_seq: 1,
+                                            output_bytes: 256,
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let untrimmed_payload = format!("  {fmt_mail}\n\n  ");
+        assert_eq!(
+            untrimmed_payload.chars().count(),
+            fmt_mail.chars().count() + 6
+        );
+        let mut client = fl_host_proto::BlockingHostClient::connect(&endpoint).unwrap();
+        let stream_id = client.list_sessions().unwrap()[0].stream.clone();
+        let grant = client.claim_controller(stream_id.clone()).unwrap();
+        host_write_text_then_enter(&mut client, stream_id, grant.lease, &untrimmed_payload).expect(
+            "host_write_text_then_enter must match untrimmed raw payload placeholder length",
+        );
+        assert_eq!(
+            enter_cnt.load(Ordering::SeqCst),
+            2,
+            "expected initial Enter + 1 retry Enter for untrimmed raw placeholder length"
+        );
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
     }
 }
