@@ -365,8 +365,8 @@ fn hosted_reference<S: StateStore>(
     store: &S,
     persona: &str,
     vendor: &str,
-    hosted_id: Option<&str>,
-    generation: Option<&str>,
+    _hosted_id: Option<&str>,
+    _generation: Option<&str>,
 ) -> Option<HostedReference> {
     let slug = format!("hosted-session-{vendor}-{persona}");
     let entry = store
@@ -391,15 +391,8 @@ fn hosted_reference<S: StateStore>(
     {
         return None;
     }
-    let generation_matches = generation
-        .is_some_and(|g| value.get("hydration_generation").and_then(|v| v.as_str()) == Some(g));
-    let id_matches = hosted_id
-        .and_then(|id| crate::identity::parse_hosted_identity(id).ok())
-        .as_ref()
-        == Some(&pair);
-    if !generation_matches && !id_matches {
-        return None;
-    }
+    // A claim is untrusted input: even a malformed ID or stale generation must not
+    // suppress checking the independently selected persona/vendor reference PID.
     let pid = u32::try_from(value.get("pid")?.as_u64()?)
         .ok()
         .filter(|p| *p > 0)?;
@@ -7592,10 +7585,50 @@ mod tests {
                     .handle_local_request_with_peer(request(with_hosted_id), peer(child_pid));
                 (ok, bad)
             });
+            // A caller cannot bypass the trusted runtime PID by changing its claim.
+            // The actual hosted process remains eligible for process verification.
+            let mut altered_results = Vec::new();
+            for (hosted_id, generation) in [
+                (None, Some("stale-gen".to_owned())),
+                (Some("malformed".to_owned()), None),
+                (Some(format!("{vendor}:someone-else")), None),
+            ] {
+                let altered_request = || LocalRequest::RegisterRoute {
+                    persona: "feira".into(),
+                    route: route.clone(),
+                    explicit: true,
+                    replace: true,
+                    hosted_id: hosted_id.clone(),
+                    hydration_generation: generation.clone(),
+                    hosted_session_verified: false,
+                    unverified_process: false,
+                };
+                let (genuine, _) = rig
+                    .inner
+                    .handle_local_request_with_peer(altered_request(), peer(hook_pid));
+                let (child, _) = rig
+                    .inner
+                    .handle_local_request_with_peer(altered_request(), peer(child_pid));
+                altered_results.push((genuine, child));
+            }
             unsafe {
                 libc::kill(-(parent_pid as i32), libc::SIGKILL);
             }
             let _ = child.wait();
+            for (genuine, child) in altered_results {
+                assert!(
+                    matches!(child, LocalResponse::Error { .. }),
+                    "{vendor} altered claim: {child:?}"
+                );
+                // An independently checked genuine peer must never be mistaken for a child.
+                // Other registration fences may still refuse a conflicting claim.
+                if let LocalResponse::Error { message } = genuine {
+                    assert!(
+                        !message.contains("process_mismatch"),
+                        "{vendor} genuine peer: {message}"
+                    );
+                }
+            }
             for (ok, bad) in results {
                 assert!(
                     matches!(ok, LocalResponse::RouteRegistered),
