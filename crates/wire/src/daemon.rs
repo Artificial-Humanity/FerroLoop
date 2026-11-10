@@ -260,7 +260,10 @@ pub enum LocalRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<MessageId>,
     },
-    Status,
+    Status {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_codex_queues: bool,
+    },
     Shutdown,
 }
 
@@ -1759,7 +1762,9 @@ where
                 });
                 (LocalResponse::Subscribed, Some(rx))
             }
-            LocalRequest::Status => {
+            LocalRequest::Status {
+                include_codex_queues,
+            } => {
                 let connected_peers = lock(&self.peers)
                     .values()
                     .map(|(label, _)| label.clone())
@@ -1769,12 +1774,16 @@ where
                 let pending_recipients = self.pending_recipients_snapshot(&now);
                 let dispatch_diagnostics = Some(self.diagnostics_snapshot());
                 // All daemon state mutexes are dropped before any store lookup or control-socket I/O.
-                let codex_queues = collect_codex_route_queues(
-                    &routes,
-                    Some(self.store.as_ref() as &dyn AgentRegistry),
-                    self.config.home_override.as_deref(),
-                    now.unix_millis(),
-                );
+                let codex_queues = if include_codex_queues {
+                    collect_codex_route_queues(
+                        &routes,
+                        Some(self.store.as_ref() as &dyn AgentRegistry),
+                        self.config.home_override.as_deref(),
+                        now.unix_millis(),
+                    )
+                } else {
+                    Vec::new()
+                };
                 (
                     LocalResponse::Status(DaemonStatus {
                         node_id: self.config.node_id.clone(),
@@ -3386,7 +3395,9 @@ mod tests {
             routes: Vec<RouteEntry>,
         }
         let (_tmp, inner) = fault_rig();
-        let (response, subscription) = inner.handle_local_request(LocalRequest::Status);
+        let (response, subscription) = inner.handle_local_request(LocalRequest::Status {
+            include_codex_queues: false,
+        });
         assert!(subscription.is_none());
         let LocalResponse::Status(status) = response else {
             panic!("expected Status")
@@ -3458,7 +3469,9 @@ mod tests {
             lock(&inner.store.gets).push_back(Fault::Panic);
             lock(&inner.store.reads).push_back(Fault::Panic);
             for _ in 0..5 {
-                let (response, _) = inner.handle_local_request(LocalRequest::Status);
+                let (response, _) = inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                });
                 // Serialize while explicitly owning the diagnostics lock: Status returned
                 // an owned clone, so serialization needs no daemon guard.
                 let _guard = lock(&inner.dispatch_diagnostics);
@@ -3499,7 +3512,9 @@ mod tests {
         let store_calls = lock(&inner.store.calls).clone();
         for _ in 0..3 {
             let (LocalResponse::Status(status), _) =
-                inner.handle_local_request(LocalRequest::Status)
+                inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
             else {
                 panic!("expected Status");
             };
@@ -5063,7 +5078,9 @@ mod tests {
                 .request(&req)
                 .unwrap()
         };
-        let status_personas = || match request(LocalRequest::Status) {
+        let status_personas = || match request(LocalRequest::Status {
+            include_codex_queues: false,
+        }) {
             LocalResponse::Status(st) => {
                 st.routes.into_iter().map(|r| r.persona).collect::<Vec<_>>()
             }
@@ -5171,7 +5188,11 @@ mod tests {
 
         let started = Instant::now();
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
-        probe.request(&LocalRequest::Status).unwrap();
+        probe
+            .request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .unwrap();
         let other_socket = tmp.path().join("other.sock");
         let other_listener = UnixListener::bind(&other_socket).unwrap();
         other_listener.set_nonblocking(true).unwrap();
@@ -5437,7 +5458,10 @@ mod tests {
 
         let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         assert!(matches!(
-            ok.request(&LocalRequest::Status).unwrap(),
+            ok.request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .unwrap(),
             LocalResponse::Status(_)
         ));
     }
@@ -5465,7 +5489,12 @@ mod tests {
         // A client that connects and hangs up sends nothing; the daemon must shrug it off.
         drop(UnixStream::connect(&sock).unwrap());
         let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
-        assert!(ok.request(&LocalRequest::Status).is_ok());
+        assert!(
+            ok.request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -5656,7 +5685,9 @@ mod tests {
             writer.write_all(reply.as_bytes()).unwrap();
         });
         let mut client = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
-        let resp = client.request(&LocalRequest::Status);
+        let resp = client.request(&LocalRequest::Status {
+            include_codex_queues: false,
+        });
         fake.join().unwrap();
         assert!(
             matches!(resp, Ok(LocalResponse::RouteRegistered)),
@@ -6105,8 +6136,11 @@ mod tests {
         });
 
         let inner_for_status = Arc::clone(&rig.inner);
-        let status_thread =
-            std::thread::spawn(move || inner_for_status.handle_local_request(LocalRequest::Status));
+        let status_thread = std::thread::spawn(move || {
+            inner_for_status.handle_local_request(LocalRequest::Status {
+                include_codex_queues: true,
+            })
+        });
 
         // Wait until LocalRequest::Status is parked inside codex_control socket I/O.
         entered_rx
@@ -6199,5 +6233,160 @@ mod tests {
         legacy_json.as_object_mut().unwrap().remove("codex_queues");
         let parsed: DaemonStatus = serde_json::from_value(legacy_json).unwrap();
         assert!(parsed.codex_queues.is_empty());
+
+        // Future daemon JSON with an unrecognized queue `state` and extra unknown fields
+        // deserializes cleanly to `CodexQueueInspection::Unsupported`.
+        let mut future_json = serde_json::to_value(&status).unwrap();
+        future_json["codex_queues"] = json!([
+            {
+                "persona": "felix",
+                "project": "ferroloop",
+                "queue": {
+                    "state": "future_v2",
+                    "extra": 42,
+                    "nested": {"hint": "ignored"}
+                }
+            }
+        ]);
+        let future_parsed: DaemonStatus = serde_json::from_str(&future_json.to_string()).unwrap();
+        assert_eq!(future_parsed.codex_queues.len(), 1);
+        assert_eq!(
+            future_parsed.codex_queues[0].queue,
+            CodexQueueInspection::Unsupported
+        );
+    }
+
+    #[test]
+    fn status_without_opt_in_is_wire_compatible_and_opens_zero_codex_control_connections() {
+        use serde_json::json;
+
+        // 1. Wire-format backward compatibility with older clients and older daemons.
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum OldLocalRequest {
+            Status,
+        }
+
+        let legacy_req: LocalRequest = serde_json::from_str(r#"{"op":"status"}"#).unwrap();
+        assert!(matches!(
+            legacy_req,
+            LocalRequest::Status {
+                include_codex_queues: false
+            }
+        ));
+        let default_serialized = serde_json::to_value(&LocalRequest::Status {
+            include_codex_queues: false,
+        })
+        .unwrap();
+        assert_eq!(default_serialized, json!({"op": "status"}));
+        assert_eq!(
+            serde_json::from_value::<OldLocalRequest>(default_serialized).unwrap(),
+            OldLocalRequest::Status
+        );
+
+        let opt_in_serialized = serde_json::to_value(&LocalRequest::Status {
+            include_codex_queues: true,
+        })
+        .unwrap();
+        assert_eq!(
+            opt_in_serialized,
+            json!({"op": "status", "include_codex_queues": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<OldLocalRequest>(opt_in_serialized.clone()).unwrap(),
+            OldLocalRequest::Status
+        );
+        let opt_in_roundtrip: LocalRequest = serde_json::from_value(opt_in_serialized).unwrap();
+        assert!(matches!(
+            opt_in_roundtrip,
+            LocalRequest::Status {
+                include_codex_queues: true
+            }
+        ));
+
+        // 2. Daemon with registered Codex routes + live mock Codex control socket listener:
+        //    non-opt-in Status (both Rust variant and raw legacy `{"op":"status"}` wire JSON)
+        //    must open ZERO connections on the Codex control socket and return empty `codex_queues`.
+        let tmp = TempDir::new().unwrap();
+        let control_sock = tmp
+            .path()
+            .join(".codex/app-server-control/app-server-control.sock");
+        fs::create_dir_all(control_sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&control_sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let stop_accept = Arc::new(AtomicBool::new(false));
+        let accept_count_bg = Arc::clone(&accept_count);
+        let stop_accept_bg = Arc::clone(&stop_accept);
+        let accept_watcher = std::thread::spawn(move || {
+            while !stop_accept_bg.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        accept_count_bg.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let mut cfg = test_config(tmp.path(), "no-codex-probe");
+        cfg.home_override = Some(tmp.path().to_path_buf());
+        let daemon_sock = cfg.socket_path.clone();
+        let mut daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+
+        let mut reg = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+        let reg_resp = reg
+            .request(&LocalRequest::RegisterRoute {
+                persona: "felix".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "thread-felix".into(),
+                    cwd: None,
+                },
+                explicit: true,
+            })
+            .unwrap();
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        // Default non-opt-in LocalRequest::Status via LocalClient.
+        let mut c1 = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+        let LocalResponse::Status(st1) = c1
+            .request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(st1.routes.len(), 1);
+        assert!(st1.codex_queues.is_empty());
+
+        // Legacy raw `{"op":"status"}` line from an older client.
+        let mut raw = UnixStream::connect(&daemon_sock).unwrap();
+        raw.set_read_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT))
+            .unwrap();
+        raw.write_all(b"{\"op\":\"status\"}\n").unwrap();
+        let mut reply_line = String::new();
+        BufReader::new(&raw).read_line(&mut reply_line).unwrap();
+        let LocalResponse::Status(st2) = serde_json::from_str(&reply_line).unwrap() else {
+            panic!("expected Status from legacy raw JSON, got {reply_line}");
+        };
+        assert_eq!(st2.routes.len(), 1);
+        assert!(st2.codex_queues.is_empty());
+
+        std::thread::sleep(Duration::from_millis(30));
+        stop_accept.store(true, Ordering::SeqCst);
+        accept_watcher.join().unwrap();
+        daemon.stop();
+
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            0,
+            "non-opt-in Status must open zero connections on Codex control socket"
+        );
     }
 }

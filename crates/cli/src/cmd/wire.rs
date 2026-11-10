@@ -576,7 +576,9 @@ fn process_exists(pid: u32) -> bool {
 fn existing_route_for(env: &StateEnv<'_>, persona: &str) -> Option<VendorRoute> {
     let sock = resolve_socket_path(env, None);
     if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
-        && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status)
+        && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status {
+            include_codex_queues: false,
+        })
     {
         return st
             .routes
@@ -1207,7 +1209,9 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
         WireCmd::Status { json } => {
             let sock = resolve_socket_path(env, None);
             if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
-                && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status)
+                && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status {
+                    include_codex_queues: true,
+                })
             {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&st).unwrap());
@@ -2030,6 +2034,9 @@ fn format_codex_route_queue(row: &fl_wire::daemon::CodexRouteQueueStatus) -> Str
             } else {
                 format!("unknown ({clean})")
             }
+        }
+        fl_wire::daemon::CodexQueueInspection::Unsupported => {
+            "unknown (unsupported queue state)".to_string()
         }
     };
     format!("{label}: {detail}")
@@ -3657,13 +3664,77 @@ pub(crate) mod tests {
                     detected_codex_version: None,
                 },
             },
+            CodexRouteQueueStatus {
+                persona: "future".into(),
+                project: None,
+                thread_id: None,
+                queue: CodexQueueInspection::Unsupported,
+            },
         ];
 
         let summary = codex_queues_summary(&rows);
         assert_eq!(
             summary,
-            "\tcodex_queues=felix[ferroloop]: at least 100 queued, oldest ~12s (estimated from queue id); kacey[ferroloop]: 3 queued; offline: unknown (Codex app-server control socket is offline)"
+            "\tcodex_queues=felix[ferroloop]: at least 100 queued, oldest ~12s (estimated from queue id); kacey[ferroloop]: 3 queued; offline: unknown (Codex app-server control socket is offline); future: unknown (unsupported queue state)"
         );
         assert!(!summary.contains("offline: 0"));
+        assert!(!summary.contains("future: 0"));
+    }
+
+    #[test]
+    fn existing_route_for_requests_status_without_codex_queue_inspection_opt_in() {
+        use fl_wire::daemon::{DaemonStatus, LocalResponse};
+        use fl_wire::identity::RouteEntry;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let rig = HookRig::new(Some("ada"));
+        let sock_path = rig.dir.path().join("none.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let sock_for_srv = sock_path;
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let raw: serde_json::Value = serde_json::from_str(&line).unwrap();
+            // Must serialize `{"op":"status"}` with no `include_codex_queues` field.
+            assert_eq!(raw, serde_json::json!({"op": "status"}));
+            let resp = LocalResponse::Status(DaemonStatus {
+                node_id: "n".into(),
+                host: "h".into(),
+                socket_path: sock_for_srv,
+                listen_addr: None,
+                connected_peers: vec![],
+                routes: vec![RouteEntry {
+                    persona: "ada".into(),
+                    route: VendorRoute::Codex {
+                        thread_id: "t-ada".into(),
+                        cwd: None,
+                    },
+                    updated_at: now_at(),
+                    explicit: true,
+                }],
+                dispatch_diagnostics: None,
+                pending_recipients: vec![],
+                codex_queues: vec![],
+            });
+            writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+        });
+
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let route = existing_route_for(&env, "ada");
+        server.join().unwrap();
+        assert!(matches!(
+            route,
+            Some(VendorRoute::Codex { ref thread_id, .. }) if thread_id == "t-ada"
+        ));
     }
 }

@@ -857,7 +857,7 @@ fn scripted_status(env: &TestEnv, diagnostics: Option<Value>, json_output: bool)
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap(),
-            json!({"op":"status"})
+            json!({"op":"status","include_codex_queues":true})
         );
         writeln!(stream, "{response}").unwrap();
     });
@@ -1108,6 +1108,13 @@ fn wire_status_renders_codex_queues_known_bounded_estimated_age_and_unknown_neve
                     "verified_codex_version": "0.167.0",
                     "detected_codex_version": "0.168.0"
                 }
+            },
+            {
+                "persona": "future",
+                "queue": {
+                    "state": "future_v2",
+                    "extra": 42
+                }
             }
         ]
     });
@@ -1122,6 +1129,9 @@ fn wire_status_renders_codex_queues_known_bounded_estimated_age_and_unknown_neve
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
                 .unwrap();
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["op"], "status");
+            assert_eq!(req["include_codex_queues"], true);
             writeln!(stream, "{resp_json}").unwrap();
         }
     });
@@ -1144,6 +1154,10 @@ fn wire_status_renders_codex_queues_known_bounded_estimated_age_and_unknown_neve
         st["codex_queues"][2]["queue"]["detected_codex_version"],
         "0.168.0"
     );
+    assert_eq!(st["codex_queues"][3]["persona"], "future");
+    assert_eq!(st["codex_queues"][3]["queue"]["state"], "unsupported");
+    assert!(st["codex_queues"][3]["queue"].get("depth").is_none());
+    assert!(st["codex_queues"][3]["queue"].get("extra").is_none());
 
     let text_out = env.fl().args(["wire", "status"]).output().unwrap();
     peer.join().unwrap();
@@ -1152,11 +1166,12 @@ fn wire_status_renders_codex_queues_known_bounded_estimated_age_and_unknown_neve
     let text = String::from_utf8(text_out.stdout).unwrap();
     assert!(
         text.contains(
-            "codex_queues=felix[ferroloop]: at least 100 queued, oldest ~42s (estimated from queue id); kacey[ferroloop]: 0 queued; ghost: unknown (unverified Codex app-server version 0.168.0 (verified 0.167.0))"
+            "codex_queues=felix[ferroloop]: at least 100 queued, oldest ~42s (estimated from queue id); kacey[ferroloop]: 0 queued; ghost: unknown (unverified Codex app-server version 0.168.0 (verified 0.167.0)); future: unknown (unsupported queue state)"
         ),
         "{text}"
     );
     assert!(!text.contains("ghost: 0"), "{text}");
+    assert!(!text.contains("future: 0"), "{text}");
 }
 
 #[test]

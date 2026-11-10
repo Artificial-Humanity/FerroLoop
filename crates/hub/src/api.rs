@@ -1878,6 +1878,17 @@ impl HubCodexRouteQueueStatus {
             queue,
         } = row;
         let queue = match queue {
+            fl_wire::daemon::CodexQueueInspection::Known {
+                depth,
+                has_more,
+                estimated_oldest_age_secs,
+                verified_codex_version,
+            } => fl_wire::daemon::CodexQueueInspection::Known {
+                depth,
+                has_more,
+                estimated_oldest_age_secs,
+                verified_codex_version,
+            },
             fl_wire::daemon::CodexQueueInspection::Unknown {
                 reason,
                 verified_codex_version,
@@ -1887,7 +1898,9 @@ impl HubCodexRouteQueueStatus {
                 verified_codex_version,
                 detected_codex_version,
             },
-            known => known,
+            fl_wire::daemon::CodexQueueInspection::Unsupported => {
+                fl_wire::daemon::CodexQueueInspection::Unsupported
+            }
         };
         Self {
             persona,
@@ -2111,7 +2124,9 @@ fn probe_wire_daemon(socket_path: PathBuf, timeout: Duration) -> WireDaemonProbe
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let outcome = match fl_wire::daemon::LocalClient::connect(&socket_path, timeout) {
-            Ok(mut client) => match client.request(&fl_wire::daemon::LocalRequest::Status) {
+            Ok(mut client) => match client.request(&fl_wire::daemon::LocalRequest::Status {
+                include_codex_queues: true,
+            }) {
                 Ok(fl_wire::daemon::LocalResponse::Status(status)) => {
                     WireDaemonProbe::Active(Box::new(status))
                 }
@@ -11393,6 +11408,9 @@ mod council_guidance_tests {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut req_line = String::new();
             let _ = reader.read_line(&mut req_line);
+            let req_val: serde_json::Value = serde_json::from_str(&req_line).unwrap();
+            assert_eq!(req_val["op"], "status");
+            assert_eq!(req_val["include_codex_queues"], true);
             let resp = LocalResponse::Status(DaemonStatus {
                 node_id: "secret-node".into(),
                 host: "secret-host".into(),
@@ -11610,5 +11628,60 @@ mod council_guidance_tests {
             "{reason}"
         );
         assert!(reason.ends_with("[redacted]."), "{reason}");
+
+        // Future daemon state with unknown extra fields deserializes cleanly on GET /api/v1/wire/status
+        // without degrading to Unreachable and without leaking unknown fields.
+        let (tmp, state) = wire_status_fixture();
+        let future_sock = tmp.path().join("future-state.sock");
+        let future_listener = std::os::unix::net::UnixListener::bind(&future_sock).unwrap();
+        let future_sock_for_json = future_sock.clone();
+        let future_srv = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (mut stream, _) = future_listener.accept().unwrap();
+            let mut req_line = String::new();
+            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut req_line);
+            let req_val: serde_json::Value = serde_json::from_str(&req_line).unwrap();
+            assert_eq!(req_val["include_codex_queues"], true);
+            let raw_resp = json!({
+                "status": "status",
+                "node_id": "future-node",
+                "host": "future-host",
+                "socket_path": future_sock_for_json,
+                "listen_addr": null,
+                "connected_peers": [],
+                "routes": [],
+                "dispatch_diagnostics": null,
+                "pending_recipients": [],
+                "codex_queues": [
+                    {
+                        "persona": "felix",
+                        "project": "ferroloop",
+                        "thread_id": "SECRET_FUTURE_THREAD",
+                        "queue": {
+                            "state": "future_v2",
+                            "extra": 42,
+                            "secret_path": "/secret/future-codex.sock"
+                        }
+                    }
+                ]
+            });
+            writeln!(stream, "{raw_resp}").unwrap();
+            stream.flush().unwrap();
+        });
+        state.set_wire_socket(Some(future_sock));
+        let resp = get_wire_status(&state);
+        future_srv.join().unwrap();
+        assert_eq!(resp.status, 200);
+        let raw_body = String::from_utf8(resp.body.clone()).unwrap();
+        assert!(!raw_body.contains("SECRET_FUTURE_THREAD"), "{raw_body}");
+        assert!(!raw_body.contains("future-codex.sock"), "{raw_body}");
+        assert!(!raw_body.contains("\"extra\""), "{raw_body}");
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["daemon"], "active");
+        assert_eq!(body["codex_queues"][0]["persona"], "felix");
+        assert_eq!(
+            body["codex_queues"][0]["queue"],
+            json!({"state": "unsupported"})
+        );
     }
 }

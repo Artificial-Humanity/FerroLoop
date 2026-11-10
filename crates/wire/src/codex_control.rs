@@ -34,7 +34,7 @@ pub(crate) const STEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Exact Codex CLI / app-server release against which `thread/queue/list` was verified.
 /// Any missing or differing server version fails closed to [`CodexQueueInspection::Unknown`].
 pub const VERIFIED_CODEX_QUEUE_RPC_VERSION: &str = "0.167.0";
-/// Page size requested from `thread/queue/list`. When `nextCursor` is non-empty, `has_more`
+/// Page size requested from `thread/queue/list`. When `nextCursor` is non-null, `has_more`
 /// marks the returned depth as a lower bound (`"at least N"`).
 pub const CODEX_QUEUE_LIST_LIMIT: u32 = 100;
 const _: () = assert!(CODEX_QUEUE_LIST_LIMIT > 0);
@@ -141,7 +141,8 @@ pub(crate) fn compact_thread(
 /// Read-only inspection result for a single Codex route's app-server submission queue.
 ///
 /// An unverified, unreachable, timed-out, or rejected query is always [`Self::Unknown`] and
-/// never reports `depth: 0`.
+/// never reports `depth: 0`. Unrecognized future daemon states deserialize to
+/// [`Self::Unsupported`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CodexQueueInspection {
@@ -159,6 +160,8 @@ pub enum CodexQueueInspection {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detected_codex_version: Option<String>,
     },
+    #[serde(other)]
+    Unsupported,
 }
 
 impl CodexQueueInspection {
@@ -227,11 +230,12 @@ pub fn parse_uuid_v7_unix_ms(id: &str) -> Option<u64> {
     Some(ts_ms)
 }
 
+#[cfg(test)]
 pub(crate) fn estimate_uuid_v7_age_secs(id: &str, now_ms: u64) -> Option<u64> {
     let ts_ms = parse_uuid_v7_unix_ms(id)?;
     if ts_ms <= now_ms {
         Some((now_ms - ts_ms) / 1000)
-    } else if ts_ms - now_ms <= 5_000 {
+    } else if ts_ms <= now_ms.saturating_add(5_000) {
         Some(0)
     } else {
         None
@@ -253,6 +257,12 @@ fn sanitize_version_token(raw: &str) -> Option<String> {
 
 /// Extract the Codex server semver from `InitializeResponse` (`userAgent` product token
 /// `<originator>/<version> ...` or fallback `serverInfo.version`).
+///
+/// Note on `codex-cli 0.167.0` `app-server`: the first `initialize` RPC in an `app-server`
+/// process lifetime latches the `<originator>` prefix of `userAgent` (while the trailing
+/// `(<clientInfo.name>; <clientInfo.version>)` suffix is per-connection). Parsing after `/` in
+/// the first whitespace-delimited token handles any latched originator (`codex-tui`,
+/// `codex_cli_rs`, `ferroloop`, etc.).
 pub(crate) fn extract_codex_server_version(init_result: &Value) -> Option<String> {
     if let Some(ua_val) = init_result.get("userAgent") {
         let ua = ua_val.as_str()?;
@@ -290,7 +300,7 @@ fn parse_queue_list_result(
     }
     let has_more = match result.get("nextCursor") {
         None | Some(Value::Null) => false,
-        Some(Value::String(cursor)) => !cursor.trim().is_empty(),
+        Some(Value::String(_)) => true,
         Some(_) => {
             return CodexQueueInspection::unknown(
                 "Codex app-server sent a malformed `thread/queue/list` response: invalid `nextCursor`",
@@ -304,11 +314,16 @@ fn parse_queue_list_result(
             detected.clone(),
         );
     }
+    // `thread/queue/reorder` can place newer or non-UUIDv7 entries at `data[0]`; scan the whole
+    // page and use the minimum plausible RFC 9562 UUIDv7 timestamp as the oldest queued age.
+    let max_plausible_ms = now_ms.saturating_add(5_000);
     let estimated_oldest_age_secs = data
-        .first()
-        .and_then(|first| first.get("id"))
-        .and_then(Value::as_str)
-        .and_then(|id| estimate_uuid_v7_age_secs(id, now_ms));
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .filter_map(parse_uuid_v7_unix_ms)
+        .filter(|&ts_ms| ts_ms <= max_plausible_ms)
+        .min()
+        .map(|oldest_ms| now_ms.saturating_sub(oldest_ms) / 1000);
     CodexQueueInspection::Known {
         depth: data.len(),
         has_more,
@@ -373,7 +388,8 @@ pub(crate) fn inspect_thread_queues(
                     verified_codex_version,
                     detected_codex_version,
                 },
-                known => known,
+                known @ CodexQueueInspection::Known { .. } => known,
+                CodexQueueInspection::Unsupported => CodexQueueInspection::Unsupported,
             })
             .collect()
     };
@@ -3170,5 +3186,282 @@ mod tests {
             &out[0],
             CodexQueueInspection::Unknown { reason, .. } if reason.contains("timed out")
         ));
+    }
+
+    #[test]
+    fn inspect_thread_queues_hung_handshake_completes_under_850ms() {
+        let now_ms: u64 = 1_762_000_100_000;
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), |c| {
+            c.read_upgrade_request();
+            c.drain_until_eof(); // accepts and reads upgrade request, never sends HTTP 101
+        });
+        let started = Instant::now();
+        let out =
+            inspect_thread_queues(&sock, &["thread-hung"], now_ms, CODEX_QUEUE_INSPECT_TIMEOUT);
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(850),
+            "hung handshake took {elapsed:?} (expected < 850ms)"
+        );
+        assert!(matches!(
+            &out[0],
+            CodexQueueInspection::Unknown { reason, .. } if reason.contains("timed out")
+        ));
+    }
+
+    #[test]
+    fn inspect_thread_queues_multi_route_stall_completes_under_850ms() {
+        let now_ms: u64 = 1_762_000_100_000;
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(&verified_init_reply(1));
+            c.expect_json(); // initialized
+            let q1 = c.expect_json();
+            assert_eq!(q1["params"]["threadId"], "t-1");
+            // Answer first route slowly, then stall on second route so 4 routes share one budget.
+            std::thread::sleep(Duration::from_millis(150));
+            c.send_text(
+                r#"{"id":2,"result":{"data":[{"id":"msg-1","clientUserMessageId":"c1","input":[]}],"nextCursor":null}}"#,
+            );
+            let q2 = c.expect_json();
+            assert_eq!(q2["params"]["threadId"], "t-2");
+            c.drain_until_eof();
+        });
+        let started = Instant::now();
+        let out = inspect_thread_queues(
+            &sock,
+            &["t-1", "t-2", "t-3", "t-4"],
+            now_ms,
+            CODEX_QUEUE_INSPECT_TIMEOUT,
+        );
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(850),
+            "4-route stall took {elapsed:?} (expected < 850ms)"
+        );
+        assert_eq!(out.len(), 4);
+        assert_eq!(
+            out[0],
+            CodexQueueInspection::Known {
+                depth: 1,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+        for item in &out[1..] {
+            assert!(
+                matches!(
+                    item,
+                    CodexQueueInspection::Unknown { reason, .. } if reason.contains("timed out")
+                ),
+                "expected Unknown timeout for stalled sibling route, got {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_string_and_whitespace_cursors_and_reordered_pages_behave_strictly() {
+        let now_ms: u64 = 1_762_000_100_000;
+        let detected = Some(VERIFIED_CODEX_QUEUE_RPC_VERSION.to_string());
+        let newer_v7 = make_uuid_v7(now_ms - 4_200, 0x8); // ~4s old
+        let middle_v7 = make_uuid_v7(now_ms - 19_800, 0x9); // ~19s old
+        let oldest_v7 = make_uuid_v7(now_ms - 47_600, 0xA); // ~47s old
+        let future_implausible_v7 = make_uuid_v7(now_ms + 9_000, 0x8); // > +5s, ignored
+
+        // 1. Unit: non-null string cursor `""` or `"   "` on non-empty page -> Known { has_more: true },
+        //    and on empty page (`data: []`) -> Unknown.
+        for cursor in ["", "   "] {
+            let non_empty = parse_queue_list_result(
+                &json!({
+                    "data": [{"id": "custom-1", "clientUserMessageId": "c1", "input": []}],
+                    "nextCursor": cursor,
+                }),
+                now_ms,
+                &detected,
+            );
+            assert_eq!(
+                non_empty,
+                CodexQueueInspection::Known {
+                    depth: 1,
+                    has_more: true,
+                    estimated_oldest_age_secs: None,
+                    verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+                },
+                "cursor {cursor:?} on non-empty page must set has_more = true"
+            );
+
+            let empty = parse_queue_list_result(
+                &json!({ "data": [], "nextCursor": cursor }),
+                now_ms,
+                &detected,
+            );
+            assert!(
+                matches!(
+                    &empty,
+                    CodexQueueInspection::Unknown { reason, .. }
+                        if reason.contains("empty page with `nextCursor`")
+                ),
+                "cursor {cursor:?} on empty page must fail closed to Unknown, got {empty:?}"
+            );
+        }
+
+        // 2. Unit: reordered page uses minimum plausible UUIDv7 timestamp across all items.
+        let reordered_newer_first = parse_queue_list_result(
+            &json!({
+                "data": [
+                    {"id": newer_v7, "clientUserMessageId": "c1", "input": []},
+                    {"id": oldest_v7, "clientUserMessageId": "c2", "input": []},
+                    {"id": middle_v7, "clientUserMessageId": "c3", "input": []},
+                ],
+                "nextCursor": null,
+            }),
+            now_ms,
+            &detected,
+        );
+        assert_eq!(
+            reordered_newer_first,
+            CodexQueueInspection::Known {
+                depth: 3,
+                has_more: false,
+                estimated_oldest_age_secs: Some(47),
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+
+        let reordered_non_v7_and_future_first = parse_queue_list_result(
+            &json!({
+                "data": [
+                    {"id": "custom-id", "clientUserMessageId": "c1", "input": []},
+                    {"id": future_implausible_v7, "clientUserMessageId": "c2", "input": []},
+                    {"id": middle_v7, "clientUserMessageId": "c3", "input": []},
+                ],
+                "nextCursor": null,
+            }),
+            now_ms,
+            &detected,
+        );
+        assert_eq!(
+            reordered_non_v7_and_future_first,
+            CodexQueueInspection::Known {
+                depth: 3,
+                has_more: false,
+                estimated_oldest_age_secs: Some(19),
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+
+        let no_valid_v7 = parse_queue_list_result(
+            &json!({
+                "data": [
+                    {"id": "custom-id", "clientUserMessageId": "c1", "input": []},
+                    {"id": "550e8400-e29b-41d4-a716-446655440000", "clientUserMessageId": "c2", "input": []},
+                    {"id": future_implausible_v7, "clientUserMessageId": "c3", "input": []},
+                ],
+                "nextCursor": null,
+            }),
+            now_ms,
+            &detected,
+        );
+        assert_eq!(
+            no_valid_v7,
+            CodexQueueInspection::Known {
+                depth: 3,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+
+        // 3. Mock socket end-to-end verification of `""` cursor and reordered page.
+        let newer_for_srv = newer_v7;
+        let oldest_for_srv = oldest_v7;
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), move |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(&verified_init_reply(1));
+            c.expect_json(); // initialized
+
+            // Route 0: non-empty page with `nextCursor: ""` and reordered IDs (`custom-id`, newer, oldest).
+            c.expect_json();
+            c.send_text(
+                &json!({
+                    "id": 2,
+                    "result": {
+                        "data": [
+                            {"id": "custom-id", "clientUserMessageId": "c0", "input": []},
+                            {"id": newer_for_srv, "clientUserMessageId": "c1", "input": []},
+                            {"id": oldest_for_srv, "clientUserMessageId": "c2", "input": []},
+                        ],
+                        "nextCursor": "",
+                    }
+                })
+                .to_string(),
+            );
+
+            // Route 1: empty page with `nextCursor: ""` -> Unknown.
+            c.expect_json();
+            c.send_text(r#"{"id":3,"result":{"data":[],"nextCursor":""}}"#);
+
+            // Route 2: page with no UUIDv7 IDs -> None age.
+            c.expect_json();
+            c.send_text(
+                r#"{"id":4,"result":{"data":[{"id":"opaque-a","clientUserMessageId":"c3","input":[]},{"id":"opaque-b","clientUserMessageId":"c4","input":[]}],"nextCursor":null}}"#,
+            );
+            c.drain_until_eof();
+        });
+
+        let out = inspect_thread_queues(
+            &sock,
+            &[
+                "t-reordered-empty-cursor",
+                "t-empty-page-empty-cursor",
+                "t-opaque",
+            ],
+            now_ms,
+            SHORT,
+        );
+        server.join().unwrap();
+        assert_eq!(
+            out[0],
+            CodexQueueInspection::Known {
+                depth: 3,
+                has_more: true,
+                estimated_oldest_age_secs: Some(47),
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+        assert!(matches!(
+            &out[1],
+            CodexQueueInspection::Unknown { reason, .. }
+                if reason.contains("empty page with `nextCursor`")
+        ));
+        assert_eq!(
+            out[2],
+            CodexQueueInspection::Known {
+                depth: 2,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_queue_inspection_deserializes_unknown_future_state_with_extra_fields() {
+        let parsed: CodexQueueInspection =
+            serde_json::from_str(r#"{"state":"future_v2","extra":42,"nested":{"items":[1,2,3]}}"#)
+                .expect("future queue state with extra fields must deserialize to Unsupported");
+        assert_eq!(parsed, CodexQueueInspection::Unsupported);
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            json!({"state": "unsupported"})
+        );
     }
 }
