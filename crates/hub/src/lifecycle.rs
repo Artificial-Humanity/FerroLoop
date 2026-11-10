@@ -105,6 +105,7 @@ pub const AUTO_RESPAWN_MAX_IN_WINDOW: usize = 3;
 pub const AUTO_RESPAWN_WINDOW_MS: u64 = 10 * 60 * 1_000;
 pub const AUTO_RESPAWN_BACKOFF_SECS: [u64; 3] = [30, 60, 120];
 pub const DEAD_STREAK_MIN_SPACING_MS: u64 = 10_000;
+pub const DEAD_STREAK_MAX_AGE_MS: u64 = 2 * 60 * 1_000;
 
 /// Failure of a lifecycle operation, with the HTTP status the hub reports for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6958,7 +6959,7 @@ fn bump_dead_streak(streak_key: &DeadStreakKey) -> u32 {
             1
         }
         Some((count, last_ms)) => {
-            if *count == 0 {
+            if *count == 0 || now.saturating_sub(*last_ms) > DEAD_STREAK_MAX_AGE_MS {
                 *count = 1;
                 *last_ms = now;
                 1
@@ -7030,8 +7031,16 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                 continue;
             }
         };
-        let Some(mut record) = get_hosted_session_by_id(store, &record.session_id)? else {
-            continue;
+        let mut record = match get_hosted_session_by_id(store, &record.session_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!(
+                    "hub: warning ({} / {}): failed to load hosted session during dead-session reconcile: {err}",
+                    record.persona, record.session_id
+                );
+                continue;
+            }
         };
         if !record.status.eq_ignore_ascii_case(STATUS_RUNNING)
             || !vendor_has_runtime(&record.vendor)
@@ -7144,7 +7153,13 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                         .to_string(),
                     );
                     record.updated_at_ms = now_ms();
-                    persist_hosted_session(store, &record, by)?;
+                    if let Err(err) = persist_hosted_session(store, &record, by) {
+                        eprintln!(
+                            "hub: warning ({} / {}): failed to persist stopped session during dead-session reconcile: {err}",
+                            record.persona, record.session_id
+                        );
+                        continue;
+                    }
                     with_dead_streaks(|streaks| {
                         streaks.remove(&streak_key);
                     });
@@ -8098,10 +8113,18 @@ fn resolve_project_lead<S: AgentRegistry>(
 ) -> Result<Option<AgentRecord>, StoreError> {
     let project_key =
         validate_slug(project.trim()).unwrap_or_else(|_| project.trim().to_ascii_lowercase());
-    let agents = store.list_agents(Some(&project_key), false)?;
-    Ok(agents
+    let active_leads: Vec<AgentRecord> = store
+        .list_agents(Some(&project_key), false)?
         .into_iter()
-        .find(|a| a.status == AgentStatus::Active && a.role == AgentRole::Lead))
+        .filter(|a| a.status == AgentStatus::Active && a.role == AgentRole::Lead)
+        .collect();
+    if let Some(own) = active_leads
+        .iter()
+        .find(|a| a.project.eq_ignore_ascii_case(&project_key))
+    {
+        return Ok(Some(own.clone()));
+    }
+    Ok(active_leads.into_iter().next())
 }
 
 fn try_notify_crash_loop_lead<S: AgentRegistry + MessageStore>(
@@ -8136,10 +8159,15 @@ fn try_notify_crash_loop_lead<S: AgentRegistry + MessageStore>(
             }) {
                 Ok(_) => true,
                 Err(err) => {
-                    eprintln!(
-                        "hub: warning ({} / {}): failed to send crash-loop wire notice to `{}`: {err}",
-                        fresh.persona, fresh.session_id, lead.name_key
-                    );
+                    if should_log_auto_respawn_warning(
+                        &fresh.session_id,
+                        current_respawn_clock_ms(),
+                    ) {
+                        eprintln!(
+                            "hub: warning ({} / {}): failed to send crash-loop wire notice to `{}`: {err}",
+                            fresh.persona, fresh.session_id, lead.name_key
+                        );
+                    }
                     false
                 }
             }
@@ -8157,10 +8185,12 @@ fn try_notify_crash_loop_lead<S: AgentRegistry + MessageStore>(
             false
         }
         Err(err) => {
-            eprintln!(
-                "hub: warning ({} / {}): failed to resolve project Lead for crash-loop notice: {err}",
-                fresh.persona, fresh.session_id
-            );
+            if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
+                eprintln!(
+                    "hub: warning ({} / {}): failed to resolve project Lead for crash-loop notice: {err}",
+                    fresh.persona, fresh.session_id
+                );
+            }
             false
         }
     }
@@ -18200,18 +18230,20 @@ mod tests {
         }
 
         // Case A: A manual `restart_hosted_session_with_store` runs deterministically between
-        // reconcile's initial candidate collection (`list_hosted_sessions`) and its per-candidate
-        // re-read (`reopen_store()` inside the candidate loop). Reconcile must observe that the
-        // session is no longer `STATUS_STOPPED` + `STOP_REASON_RUNTIME_GONE` and skip it without
-        // spawning a second runtime unit.
+        // reconcile's initial candidate collection (`list_hosted_sessions`, reopen call #1) and its
+        // per-candidate re-read (`reopen_store()` inside the candidate loop, reopen call #2).
+        // Reconcile must observe that the session is no longer `STATUS_STOPPED` +
+        // `STOP_REASON_RUNTIME_GONE` and skip it without spawning a second runtime unit.
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(Duration::from_millis(10))));
         let fake = FakeRuntime::default();
         let env = fake.env(hub_home.path());
-        let manual_interleaved = std::cell::Cell::new(false);
+        let reopen_calls = std::cell::Cell::new(0usize);
         let respawned = reconcile_and_respawn_hosted_sessions_with_store(
             state.open_store().unwrap(),
             || {
-                if !manual_interleaved.replace(true) {
+                let call = reopen_calls.get() + 1;
+                reopen_calls.set(call);
+                if call == 2 {
                     let manual_guard = state.open_store().map_err(LifecycleError::from)?;
                     let manual = restart_hosted_session_with_store(
                         manual_guard,
@@ -18230,9 +18262,10 @@ mod tests {
         .unwrap();
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
 
-        assert!(
-            manual_interleaved.get(),
-            "interleaving hook must have fired before per-candidate re-read"
+        assert_eq!(
+            reopen_calls.get(),
+            2,
+            "reopen_store must run once for candidate listing and once for per-candidate re-read"
         );
         assert!(
             respawned.is_empty(),
@@ -18254,7 +18287,9 @@ mod tests {
 
         // Case B: When the per-session lifecycle mutex is held by an in-flight manual lifecycle
         // call, `reconcile_and_respawn_hosted_sessions_with_store` skips the locked candidate via
-        // `try_lock()` without blocking or spawning.
+        // `try_lock()` without blocking or spawning. Hold the lock on a helper thread for a short
+        // bounded duration so that if `try_lock()` were replaced by a blocking lock, reconcile
+        // would wait and respawn the session (failing the assertions below rather than hanging).
         {
             let guard = state.open_store().unwrap();
             let mut stopped = get_hosted_session_by_id(&*guard, "claude:race")
@@ -18268,7 +18303,14 @@ mod tests {
         let fake_locked = FakeRuntime::default();
         let env_locked = fake_locked.env(hub_home.path());
         let mutex = hosted_session_lifecycle_mutex(&env_locked, "claude:race");
-        let _held_guard = mutex.lock().unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held_guard = mutex.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+        });
+        locked_rx.recv().unwrap();
+        TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(Duration::from_millis(10))));
         let skipped = reconcile_and_respawn_hosted_sessions_with_store(
             state.open_store().unwrap(),
             || state.open_store().map_err(LifecycleError::from),
@@ -18276,7 +18318,8 @@ mod tests {
             |_, _| {},
         )
         .unwrap();
-        drop(_held_guard);
+        TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
+        holder.join().unwrap();
         assert!(
             skipped.is_empty(),
             "reconcile must skip a candidate whose per-session lifecycle mutex is held"
@@ -18463,7 +18506,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            select_host_recorded_exit_code(&[e2_fail.clone(), e1_clean], &wanted, None),
+            select_host_recorded_exit_code(&[e2_fail.clone(), e1_clean.clone()], &wanted, None),
             Some(1)
         );
 
@@ -18477,9 +18520,20 @@ mod tests {
             Some(0)
         );
 
-        // `select_host_recorded_pid` prefers Running and highest epoch regardless of slice order.
+        // When the highest epoch is `Running`, `select_host_recorded_exit_code` returns `None`
+        // even if an older epoch exited cleanly.
         let e1_run = mk_summary(1, 1111, None, true);
         let e2_run = mk_summary(2, 2222, None, true);
+        assert_eq!(
+            select_host_recorded_exit_code(&[e1_clean.clone(), e2_run.clone()], &wanted, None),
+            None
+        );
+        assert_eq!(
+            select_host_recorded_exit_code(&[e2_run.clone(), e1_clean], &wanted, None),
+            None
+        );
+
+        // `select_host_recorded_pid` prefers Running and highest epoch regardless of slice order.
         assert_eq!(
             select_host_recorded_pid(&[e1_run.clone(), e2_run.clone()], &wanted),
             Some(2222)
@@ -18487,6 +18541,84 @@ mod tests {
         assert_eq!(
             select_host_recorded_pid(&[e2_run, e1_run], &wanted),
             Some(2222)
+        );
+
+        // Reconcile-level check (N5): when `recorded_exit_code` sees a PID mismatch on a `Gone`
+        // session (`record.pid = Some(1111)`, runtime exit PID = `2222`, exit code = `0`),
+        // `reconcile_dead_hosted_sessions` classifies the stop as `runtime_gone`, never `clean_exit`.
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let mut rec = hosted_record("claude", "pidmis", STATUS_RUNNING, true);
+        rec.pid = Some(1111);
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+        fake.presence_of
+            .borrow_mut()
+            .insert("Pidmis:claude".into(), RuntimePresence::Gone);
+        fake.exit_codes
+            .borrow_mut()
+            .insert("Pidmis:claude".into(), 0);
+        fake.set_unit_pid("Pidmis:claude", 2222);
+        let env = fake.env(home.path());
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        let stopped = get_hosted_session_by_id(&store, "claude:pidmis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(
+            stopped.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE),
+            "PID mismatch on clean exit code 0 must classify stop as runtime_gone, not clean_exit"
+        );
+    }
+
+    #[test]
+    fn resolve_project_lead_prefers_own_project_lead_over_extra_areas_lead() {
+        let store = MemStore::default();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Alpha".into(),
+                email: None,
+                project: "other".into(),
+                role: AgentRole::Lead,
+                extra_areas: vec!["ferroloop".into()],
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        // When no primary Lead exists on `ferroloop`, fallback selects the extra_areas Lead.
+        assert_eq!(
+            resolve_project_lead(&store, "ferroloop")
+                .unwrap()
+                .unwrap()
+                .name_key,
+            "alpha"
+        );
+
+        // Once `ferris` is registered with primary `project = "ferroloop"`, `resolve_project_lead`
+        // selects `ferris` even though `alpha` sorts earlier by name.
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ferris".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Lead,
+                extra_areas: vec![],
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_project_lead(&store, "ferroloop")
+                .unwrap()
+                .unwrap()
+                .name_key,
+            "ferris"
         );
     }
 
@@ -18527,5 +18659,27 @@ mod tests {
             .unwrap();
         assert_eq!(after.status, STATUS_STOPPED);
         assert_eq!(after.stop_reason.as_deref(), Some(STOP_REASON_RUNTIME_GONE));
+
+        // Expiry check (N4): a first strike older than `DEAD_STREAK_MAX_AGE_MS` (2 minutes) resets
+        // to strike 1 instead of stopping the session on a single new `Gone` observation.
+        let (store2, fake2, home2) = script_presence("expiredgone", "grok", RuntimePresence::Gone);
+        let env2 = fake2.env(home2.path());
+        TEST_RESPAWN_NOW_MS.with(|c| c.set(Some(2_000_000)));
+        reconcile_dead_hosted_sessions(&store2, &env2, "owner").unwrap();
+        assert_eq!(hosted_status(&store2, "grok:expiredgone"), STATUS_RUNNING);
+
+        // 2 minutes + 1ms later: stale strike 1 expires and resets to a fresh strike 1.
+        TEST_RESPAWN_NOW_MS.with(|c| c.set(Some(2_000_000 + DEAD_STREAK_MAX_AGE_MS + 1)));
+        reconcile_dead_hosted_sessions(&store2, &env2, "owner").unwrap();
+        assert_eq!(
+            hosted_status(&store2, "grok:expiredgone"),
+            STATUS_RUNNING,
+            "Gone observation after >2m must reset expired strike 1 rather than stopping the session"
+        );
+
+        // 15s after the fresh strike 1: strike 2 stops the session.
+        TEST_RESPAWN_NOW_MS.with(|c| c.set(Some(2_000_000 + DEAD_STREAK_MAX_AGE_MS + 15_001)));
+        reconcile_dead_hosted_sessions(&store2, &env2, "owner").unwrap();
+        assert_eq!(hosted_status(&store2, "grok:expiredgone"), STATUS_STOPPED);
     }
 }
