@@ -26,7 +26,25 @@ use fl_core::vendor_adapter::{
     VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
     VendorStartupPromptRule,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Post-compaction transcript inspection summary for `--resume` eligibility and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ClaudePostCompactionContext {
+    pub turn_count: usize,
+    pub latest_model: Option<String>,
+    pub active_context_tokens: Option<u64>,
+    pub post_compact_conversational_bytes: u64,
+    pub bridge_session_id: Option<String>,
+}
+
+impl ClaudePostCompactionContext {
+    /// Returns `true` when the transcript contains a persisted Remote Control `bridgeSessionId`.
+    pub fn has_persisted_bridge_session(&self) -> bool {
+        self.bridge_session_id.is_some()
+    }
+}
 
 /// First-launch modal printed by Claude Code when auto mode asks for environment setup.
 pub const CLAUDE_AUTO_MODE_PROMPT: &str = "Teach auto mode about your environment";
@@ -121,6 +139,237 @@ impl ClaudeHostAdapter {
             }
         }
         Ok(None)
+    }
+
+    /// Locate the active `<session-uuid>.jsonl` transcript file strictly under
+    /// `<home_dir>/.claude/projects/*/` (deterministic sorted subdirectory order; never searches
+    /// `.claude/archived/` and never scans by newest `mtime`).
+    pub fn find_active_session_transcript_path(
+        &self,
+        home_dir: &Path,
+        vendor_session_id: &str,
+    ) -> Result<Option<PathBuf>, VendorAdapterError> {
+        let session_id = validate_required_session_id(vendor_session_id, "find_active_transcript")?;
+        let target_file = format!("{session_id}.jsonl");
+        let root = home_dir.join(".claude").join("projects");
+        let Ok(entries) = fs::read_dir(&root) else {
+            return Ok(None);
+        };
+        let mut subdirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subdirs.sort();
+        for proj_dir in subdirs {
+            let candidate = proj_dir.join(&target_file);
+            if candidate.is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Inspect only the final non-empty line of `<session-uuid>.jsonl` and truncate any torn
+    /// trailing non-JSON write back to the last complete valid JSON line.
+    ///
+    /// Complete JSONL transcripts—including dangling `tool_use` turns (`stop_reason: "tool_use"`)
+    /// and unarchived `SIGKILL` transcripts—are left 100% untouched (`Ok(0)`).
+    pub fn repair_session_transcript_tail(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<usize, VendorAdapterError> {
+        let raw = fs::read(transcript_path).map_err(|e| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "failed to read Claude transcript {}: {e}",
+                transcript_path.display()
+            ),
+        })?;
+        let original_len = raw.len();
+        if original_len == 0 {
+            return Ok(0);
+        }
+
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut pos = 0;
+        while pos < original_len {
+            let next_end = match raw[pos..].iter().position(|&b| b == b'\n') {
+                Some(rel) => pos + rel + 1,
+                None => original_len,
+            };
+            spans.push((pos, next_end));
+            pos = next_end;
+        }
+
+        let is_valid_json_span = |start: usize, end: usize| -> Option<bool> {
+            let trimmed = raw[start..end].trim_ascii();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let valid = std::str::from_utf8(trimmed)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .is_some();
+            Some(valid)
+        };
+
+        let Some((last_non_empty_idx, last_is_valid)) = spans
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, &(s, e))| is_valid_json_span(s, e).map(|v| (idx, v)))
+        else {
+            return Ok(0);
+        };
+
+        if last_is_valid {
+            return Ok(0);
+        }
+
+        let truncate_to = spans[..last_non_empty_idx]
+            .iter()
+            .rev()
+            .find_map(|&(s, e)| (is_valid_json_span(s, e) == Some(true)).then_some(e))
+            .unwrap_or(0);
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(transcript_path)
+            .map_err(|e| VendorAdapterError::Transport {
+                vendor: "claude".into(),
+                reason: format!(
+                    "failed to open Claude transcript {} for tail repair: {e}",
+                    transcript_path.display()
+                ),
+            })?;
+        file.set_len(truncate_to as u64)
+            .map_err(|e| VendorAdapterError::Transport {
+                vendor: "claude".into(),
+                reason: format!(
+                    "failed to truncate torn Claude transcript {}: {e}",
+                    transcript_path.display()
+                ),
+            })?;
+
+        Ok(original_len - truncate_to)
+    }
+
+    /// Estimate post-compaction active context tokens, conversational byte volume, latest real
+    /// model ID, normalized turn count, and persisted Remote Control `bridgeSessionId`.
+    pub fn estimate_post_compaction_context(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<ClaudePostCompactionContext, VendorAdapterError> {
+        let raw =
+            fs::read_to_string(transcript_path).map_err(|e| VendorAdapterError::Transport {
+                vendor: "claude".into(),
+                reason: format!(
+                    "failed to read Claude transcript {}: {e}",
+                    transcript_path.display()
+                ),
+            })?;
+
+        let mut turn_count: usize = 0;
+        let mut latest_model: Option<String> = None;
+        let mut bridge_session_id: Option<String> = None;
+        let mut last_compact_post_tokens: Option<u64> = None;
+        let mut post_compact_assistant_tokens: Option<u64> = None;
+        let mut post_compact_conversational_bytes: u64 = 0;
+
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+
+            if classify_claude_turn_role(&val).is_some()
+                && !extract_claude_message_content(&val).is_empty()
+            {
+                turn_count += 1;
+            }
+
+            if val.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+
+            let record_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+
+            if record_type == "bridge-session" {
+                if let Some(bsid) = val
+                    .get("bridgeSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    bridge_session_id = Some(bsid.to_string());
+                }
+                continue;
+            }
+
+            if record_type == "system"
+                && val.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+            {
+                last_compact_post_tokens = val
+                    .pointer("/compactMetadata/postTokens")
+                    .and_then(Value::as_u64)
+                    .filter(|&n| n > 0);
+                post_compact_assistant_tokens = None;
+                post_compact_conversational_bytes = 0;
+                continue;
+            }
+
+            if matches!(record_type, "user" | "assistant")
+                && !is_claude_skipped_record_type(record_type)
+            {
+                post_compact_conversational_bytes =
+                    post_compact_conversational_bytes.saturating_add(line.len() as u64);
+            }
+
+            if record_type == "assistant" {
+                let model_opt = val
+                    .pointer("/message/model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if model_opt != Some("<synthetic>") {
+                    if let Some(m) = model_opt {
+                        latest_model = Some(m.to_string());
+                    }
+                    if let Some(usage) = val.pointer("/message/usage") {
+                        let input = usage
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let cache_creation = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let total = input
+                            .saturating_add(cache_creation)
+                            .saturating_add(cache_read);
+                        if total > 0 {
+                            post_compact_assistant_tokens = Some(total);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ClaudePostCompactionContext {
+            turn_count,
+            latest_model,
+            active_context_tokens: post_compact_assistant_tokens.or(last_compact_post_tokens),
+            post_compact_conversational_bytes,
+            bridge_session_id,
+        })
     }
 
     /// Read and normalize an exact-session `.jsonl` transcript file from disk, advancing
@@ -374,6 +623,7 @@ fn extract_claude_message_content(val: &Value) -> String {
 
 fn is_claude_skipped_record_type(record_type: &str) -> bool {
     record_type.starts_with("api-request")
+        || record_type.starts_with("file-history-")
         || matches!(
             record_type,
             "attachment"
@@ -384,6 +634,7 @@ fn is_claude_skipped_record_type(record_type: &str) -> bool {
                 | "permission-mode"
                 | "atis-latch"
                 | "bridge-session"
+                | "cost-state"
                 | "ai-title"
                 | "tools-used"
                 | "summary"
@@ -1357,6 +1608,231 @@ mod tests {
         assert_eq!(
             adapter.delete(&owned_target).unwrap(),
             TeardownOutcome::AlreadyAbsent
+        );
+    }
+
+    #[test]
+    fn find_active_session_transcript_path_ignores_archived_and_validates_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = ClaudeHostAdapter::new();
+
+        assert!(matches!(
+            adapter.find_active_session_transcript_path(tmp.path(), "   "),
+            Err(VendorAdapterError::MissingSessionIdentity { .. })
+        ));
+        for bad in ["../escape", "nested/id", "--continue", "-bad"] {
+            assert!(
+                matches!(
+                    adapter.find_active_session_transcript_path(tmp.path(), bad),
+                    Err(VendorAdapterError::InvalidConfig { .. })
+                ),
+                "expected InvalidConfig for {bad:?}"
+            );
+        }
+
+        let uuid = "4d9bd978-abdb-432c-9f25-e002b9b3ae61";
+        assert_eq!(
+            adapter
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            None
+        );
+
+        let archived_dir = tmp
+            .path()
+            .join(".claude")
+            .join("archived")
+            .join("ferroloop");
+        fs::create_dir_all(&archived_dir).unwrap();
+        let archived_file = archived_dir.join(format!("{uuid}.jsonl"));
+        fs::write(
+            &archived_file,
+            r#"{"uuid":"1","type":"user","content":"archived"}"#,
+        )
+        .unwrap();
+
+        // Present only in archived/: active lookup MUST return None while general lookup finds it.
+        assert_eq!(
+            adapter
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            adapter
+                .find_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            Some(archived_file)
+        );
+
+        // Present in projects/: deterministic sorted project directory selection.
+        let proj_b = tmp.path().join(".claude").join("projects").join("z-proj");
+        let proj_a = tmp.path().join(".claude").join("projects").join("a-proj");
+        fs::create_dir_all(&proj_b).unwrap();
+        fs::create_dir_all(&proj_a).unwrap();
+        let file_b = proj_b.join(format!("{uuid}.jsonl"));
+        let file_a = proj_a.join(format!("{uuid}.jsonl"));
+        fs::write(&file_b, r#"{"uuid":"b","type":"user","content":"b"}"#).unwrap();
+        fs::write(&file_a, r#"{"uuid":"a","type":"user","content":"a"}"#).unwrap();
+
+        assert_eq!(
+            adapter
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            Some(file_a)
+        );
+    }
+
+    #[test]
+    fn repair_session_transcript_tail_preserves_complete_dangling_tool_use_and_sigkill_transcripts()
+    {
+        let tmp = TempDir::new().unwrap();
+        let adapter = ClaudeHostAdapter::new();
+
+        // 1. Complete JSONL ending with a dangling tool_use + SIGKILL metadata (no Archive record).
+        let dangling_path = tmp.path().join("dangling.jsonl");
+        let complete_lines = concat!(
+            r#"{"type":"bridge-session","sessionId":"4d9bd978-abdb-432c-9f25-e002b9b3ae61","bridgeSessionId":"cse_01SP4ortBQU3hQGNi4NtM8pN"}"#,
+            "\n",
+            r#"{"uuid":"u-1","type":"user","message":{"role":"user","content":"Run sleep"}}"#,
+            "\n",
+            r#"{"uuid":"a-1","type":"assistant","message":{"model":"claude-opus-5-5","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"sleep 25"}}]}}"#,
+            "\n"
+        );
+        fs::write(&dangling_path, complete_lines).unwrap();
+        assert_eq!(
+            adapter
+                .repair_session_transcript_tail(&dangling_path)
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs::read(&dangling_path).unwrap(), complete_lines.as_bytes());
+
+        // 2. Complete JSONL without a trailing newline must also remain byte-for-byte untouched.
+        let no_nl_path = tmp.path().join("no_nl.jsonl");
+        let no_nl = complete_lines.trim_end_matches('\n');
+        fs::write(&no_nl_path, no_nl).unwrap();
+        assert_eq!(
+            adapter.repair_session_transcript_tail(&no_nl_path).unwrap(),
+            0
+        );
+        assert_eq!(fs::read(&no_nl_path).unwrap(), no_nl.as_bytes());
+
+        // 3. Torn trailing non-JSON fragment (including torn UTF-8 bytes) is truncated back to the
+        //    byte offset immediately after the last valid newline-terminated JSON record.
+        let torn_path = tmp.path().join("torn.jsonl");
+        let mut torn_bytes = complete_lines.as_bytes().to_vec();
+        let fragment = b"{\"type\":\"assistant\",\"message\":{\"content\":\"\xe2\x97";
+        torn_bytes.extend_from_slice(fragment);
+        fs::write(&torn_path, &torn_bytes).unwrap();
+
+        let removed = adapter.repair_session_transcript_tail(&torn_path).unwrap();
+        assert_eq!(removed, fragment.len());
+        assert_eq!(fs::read(&torn_path).unwrap(), complete_lines.as_bytes());
+
+        // 4. Transcript with zero valid JSON lines truncates to 0 bytes and returns original_len.
+        let all_bad_path = tmp.path().join("all_bad.jsonl");
+        let bad_payload = b"{\"type\":\"user\",\"message\":";
+        fs::write(&all_bad_path, bad_payload).unwrap();
+        assert_eq!(
+            adapter
+                .repair_session_transcript_tail(&all_bad_path)
+                .unwrap(),
+            bad_payload.len()
+        );
+        assert!(fs::read(&all_bad_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn estimate_post_compaction_context_computes_tokens_bytes_model_and_bridge_session() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = ClaudeHostAdapter::new();
+
+        // Case 1: Uncompacted SIGKILL transcript with bridge-session, telemetry bloat, sidechains,
+        // and a trailing <synthetic> 0-token interrupted-turn recovery record.
+        let uncompacted_path = tmp.path().join("uncompacted.jsonl");
+        let user_line = r#"{"uuid":"u-1","type":"user","isSidechain":false,"message":{"role":"user","content":"Inspect workspace"}}"#;
+        let asst_line = r#"{"uuid":"a-1","type":"assistant","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":974,"cache_read_input_tokens":387420,"output_tokens":612},"content":[{"type":"text","text":"Workspace clean."}]}}"#;
+        let synth_tool = r#"{"uuid":"u-2","type":"user","isSidechain":false,"toolDenialKind":"interrupted","message":{"role":"user","content":[{"type":"tool_result","is_error":true,"tool_use_id":"toolu_01","content":"[Tool call interrupted]"}]}}"#;
+        let synth_asst = r#"{"uuid":"a-2","type":"assistant","isSidechain":false,"message":{"model":"<synthetic>","role":"assistant","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"No response requested."}]}}"#;
+        let uncompacted = [
+            r#"{"type":"bridge-session","sessionId":"4d9bd978-abdb-432c-9f25-e002b9b3ae61","bridgeSessionId":"cse_01SP4ortBQU3hQGNi4NtM8pN"}"#,
+            r#"{"type":"attachment","blob":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            r#"{"type":"api-request-shape","payload":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}"#,
+            r#"{"type":"api-request","payload":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"}"#,
+            r#"{"type":"queue-operation","timestamp":"2026-11-09T20:00:00Z"}"#,
+            r#"{"type":"cost-state","costUSD":1.25}"#,
+            r#"{"type":"file-history-snapshot","files":[]}"#,
+            user_line,
+            asst_line,
+            r#"{"uuid":"sc-1","type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5","role":"assistant","usage":{"input_tokens":999999,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"sidechain"}]}}"#,
+            synth_tool,
+            synth_asst,
+        ]
+        .join("\n");
+        fs::write(&uncompacted_path, &uncompacted).unwrap();
+
+        let ctx = adapter
+            .estimate_post_compaction_context(&uncompacted_path)
+            .unwrap();
+        assert_eq!(ctx.turn_count, 4);
+        assert_eq!(ctx.latest_model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(ctx.active_context_tokens, Some(388_396));
+        assert_eq!(
+            ctx.post_compact_conversational_bytes,
+            (user_line.len() + asst_line.len() + synth_tool.len() + synth_asst.len()) as u64
+        );
+        assert_eq!(
+            ctx.bridge_session_id.as_deref(),
+            Some("cse_01SP4ortBQU3hQGNi4NtM8pN")
+        );
+        assert!(ctx.has_persisted_bridge_session());
+
+        // Case 2: Compacted transcript right after compact_boundary falls back to postTokens and
+        // drops pre-compaction bytes/tokens while keeping bridge_session_id and latest_model.
+        let compacted_path = tmp.path().join("compacted.jsonl");
+        let compact_summary = r#"{"uuid":"cs-1","type":"user","isCompactSummary":true,"message":{"role":"user","content":"Compacted summary"}}"#;
+        let compacted = [
+            r#"{"type":"bridge-session","sessionId":"032bc4ff-1451-486f-95ec-69215c9773bc","bridgeSessionId":"cse_compacted_01"}"#,
+            r#"{"uuid":"pre-u","type":"user","message":{"role":"user","content":"Huge pre-compact prompt"}}"#,
+            r#"{"uuid":"pre-a","type":"assistant","message":{"model":"claude-sonnet-5-5","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":850000},"content":[{"type":"text","text":"Pre-compact reply"}]}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto","preTokens":851010,"postTokens":21769,"cumulativeDroppedTokens":2818270}}"#,
+            compact_summary,
+        ]
+        .join("\n");
+        fs::write(&compacted_path, &compacted).unwrap();
+
+        let ctx_post_boundary = adapter
+            .estimate_post_compaction_context(&compacted_path)
+            .unwrap();
+        assert_eq!(ctx_post_boundary.turn_count, 3);
+        assert_eq!(
+            ctx_post_boundary.latest_model.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(ctx_post_boundary.active_context_tokens, Some(21_769));
+        assert_eq!(
+            ctx_post_boundary.post_compact_conversational_bytes,
+            compact_summary.len() as u64
+        );
+        assert_eq!(
+            ctx_post_boundary.bridge_session_id.as_deref(),
+            Some("cse_compacted_01")
+        );
+
+        // Case 3: Real assistant turn after compact_boundary supersedes postTokens.
+        let post_asst = r#"{"uuid":"post-a","type":"assistant","message":{"model":"claude-sonnet-5-5","role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":2085,"cache_read_input_tokens":893089},"content":[{"type":"text","text":"Post-compact reply"}]}}"#;
+        let compacted_grown = format!("{compacted}\n{post_asst}\n");
+        fs::write(&compacted_path, &compacted_grown).unwrap();
+
+        let ctx_grown = adapter
+            .estimate_post_compaction_context(&compacted_path)
+            .unwrap();
+        assert_eq!(ctx_grown.turn_count, 4);
+        assert_eq!(ctx_grown.active_context_tokens, Some(895_176));
+        assert_eq!(
+            ctx_grown.post_compact_conversational_bytes,
+            (compact_summary.len() + post_asst.len()) as u64
         );
     }
 }

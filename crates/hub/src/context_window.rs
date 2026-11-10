@@ -131,6 +131,89 @@ pub(crate) fn applicable_default(
         .map(|valid| valid.tokens)
 }
 
+/// Parse a bracketed Claude context-window tag (`[200k]` -> `200_000`, `[1m]` -> `1_000_000`)
+/// validated via [`fl_wire::vendor_adapter::split_window_tag`].
+#[allow(dead_code)]
+pub(crate) fn parse_window_tag_tokens(tag: &str) -> Option<u64> {
+    let (base, bracketed) = fl_wire::vendor_adapter::split_window_tag(tag.trim())?;
+    if !base.is_empty() {
+        return None;
+    }
+    let inner = bracketed.strip_prefix('[')?.strip_suffix(']')?;
+    let (digits, mult) = if let Some(d) = inner.strip_suffix('k') {
+        (d, 1_000_u64)
+    } else {
+        let d = inner.strip_suffix('m')?;
+        (d, 1_000_000_u64)
+    };
+    let count = digits.parse::<u64>().ok().filter(|&n| n > 0)?;
+    count.checked_mul(mult)
+}
+
+fn is_pre_5_claude_model_id(raw_model: &str) -> bool {
+    let trimmed = raw_model.trim();
+    let base = fl_wire::vendor_adapter::split_window_tag(trimmed).map_or(trimmed, |(b, _)| b);
+    let base = base.split_once('[').map_or(base, |(b, _)| b);
+    let lower = base.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("claude-") else {
+        return false;
+    };
+    let Some(ver_seg) = rest
+        .split('-')
+        .find(|seg| seg.bytes().next().is_some_and(|b| b.is_ascii_digit()))
+    else {
+        return false;
+    };
+    matches!(ver_seg, "3" | "4") || ver_seg.starts_with("3.") || ver_seg.starts_with("4.")
+}
+
+/// Resolve the effective context window (in tokens) for a Claude session from existing catalog
+/// and session metadata sources:
+/// 1. Explicit positive `record_window` on the hosted session record.
+/// 2. Explicit `[Nk]` / `[Nm]` window tag on `record_model`, then `transcript_model`.
+/// 3. Pre-5.x Claude 3 / 4 model IDs on `record_model` (or `transcript_model` when `record_model`
+///    is absent) -> `anthropic-api` default window (`200_000`).
+/// 4. Otherwise (Claude 5.x models, CLI aliases `opus`/`sonnet`/`haiku`, or `None`) ->
+///    [`crate::discovery::ASSUMED_LARGE_CONTEXT_WINDOW`] (`1_000_000`).
+#[allow(dead_code)]
+pub(crate) fn claude_session_context_window(
+    record_window: Option<u64>,
+    record_model: Option<&str>,
+    transcript_model: Option<&str>,
+) -> u64 {
+    if let Some(w) = record_window.filter(|&w| w > 0) {
+        return w;
+    }
+
+    let record_model = record_model.map(str::trim).filter(|m| !m.is_empty());
+    let transcript_model = transcript_model.map(str::trim).filter(|m| !m.is_empty());
+
+    for candidate in [record_model, transcript_model].into_iter().flatten() {
+        if let Some((_, tag)) = fl_wire::vendor_adapter::split_window_tag(candidate)
+            && let Some(tokens) = parse_window_tag_tokens(tag)
+        {
+            return tokens;
+        }
+    }
+
+    if let Some(model) = record_model.or(transcript_model)
+        && is_pre_5_claude_model_id(model)
+    {
+        return fl_core::lookup_vendor("anthropic-api")
+            .map(|d| d.default_context_window)
+            .filter(|&w| w > 0)
+            .unwrap_or(200_000);
+    }
+
+    crate::discovery::ASSUMED_LARGE_CONTEXT_WINDOW
+}
+
+/// Model-relative active-token ceiling for `claude --resume`: `min(ceiling, 75% of window_tokens)`.
+#[allow(dead_code)]
+pub(crate) fn claude_resume_active_token_cap(window_tokens: u64, ceiling: u64) -> u64 {
+    ceiling.min(window_tokens.saturating_mul(3) / 4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +379,107 @@ mod tests {
         assert_eq!(
             applicable_default(&stale, "grok", Some("grok-x"), Some(home.path())),
             None
+        );
+    }
+
+    #[test]
+    fn parse_window_tag_tokens_parses_bracketed_k_and_m_tags() {
+        assert_eq!(parse_window_tag_tokens("[200k]"), Some(200_000));
+        assert_eq!(parse_window_tag_tokens("[1m]"), Some(1_000_000));
+        assert_eq!(parse_window_tag_tokens(" [128k] "), Some(128_000));
+        for bad in ["", "[0k]", "[0m]", "[200K]", "[1M]", "200k", "opus[200k]"] {
+            assert_eq!(parse_window_tag_tokens(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn claude_context_window_and_resume_cap_scale_by_model_and_explicit_overrides() {
+        const CEILING: u64 = 750_000;
+
+        // 1M Claude 5.x models, aliases, and None -> window 1,000,000 -> cap 750,000.
+        for model in [
+            Some("claude-opus-5-5"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-fable-5-2"),
+            Some("claude-haiku-5-5"),
+            Some("claude-opus-5-4"),
+            Some("opus"),
+            Some("sonnet"),
+            Some("haiku"),
+            None,
+        ] {
+            let win = claude_session_context_window(None, model, None);
+            assert_eq!(win, 1_000_000, "expected 1M window for {model:?}");
+            let cap = claude_resume_active_token_cap(win, CEILING);
+            assert_eq!(cap, 750_000, "expected 750k cap for {model:?}");
+            assert!(
+                388_396 <= cap,
+                "388,396 tokens must pass on 1M model {model:?}"
+            );
+            assert!(
+                895_176 > cap,
+                "895,176 tokens must fail on 1M model {model:?}"
+            );
+        }
+
+        // Pre-5.x Claude 3/4 models (via record_model or transcript_model fallback) -> 200k -> cap 150,000.
+        for model in [
+            "claude-opus-4-1",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-0",
+            "claude-opus-4",
+            "claude-3-7-sonnet-20250219",
+            "claude-3.5-sonnet",
+            "claude-sonnet-3-7",
+        ] {
+            let win_rec = claude_session_context_window(None, Some(model), Some("claude-opus-5-5"));
+            let win_tx = claude_session_context_window(None, None, Some(model));
+            assert_eq!(win_rec, 200_000, "expected 200k for record_model={model}");
+            assert_eq!(
+                win_tx, 200_000,
+                "expected 200k for transcript_model={model}"
+            );
+            let cap = claude_resume_active_token_cap(win_rec, CEILING);
+            assert_eq!(cap, 150_000, "expected 150k cap for {model}");
+            assert!(
+                388_396 > cap,
+                "388,396 tokens must FAIL on 200k model {model}"
+            );
+            assert!(
+                120_000 <= cap,
+                "120,000 tokens must pass on 200k model {model}"
+            );
+        }
+
+        // Window tags override model-family defaults; explicit record_window overrides all.
+        let tagged_200k = claude_session_context_window(None, Some("claude-opus-5-5[200k]"), None);
+        assert_eq!(tagged_200k, 200_000);
+        let tagged_cap = claude_resume_active_token_cap(tagged_200k, CEILING);
+        assert_eq!(tagged_cap, 150_000);
+        assert!(388_396 > tagged_cap);
+        assert!(120_000 <= tagged_cap);
+
+        let tx_tagged_200k =
+            claude_session_context_window(None, Some("claude-opus-5-5"), Some("opus[200k]"));
+        assert_eq!(tx_tagged_200k, 200_000);
+
+        let tagged_1m = claude_session_context_window(None, Some("claude-sonnet-4-5[1m]"), None);
+        assert_eq!(tagged_1m, 1_000_000);
+        assert_eq!(claude_resume_active_token_cap(tagged_1m, CEILING), 750_000);
+
+        let explicit_rec =
+            claude_session_context_window(Some(200_000), Some("claude-opus-5-5[1m]"), None);
+        assert_eq!(explicit_rec, 200_000);
+        assert_eq!(
+            claude_resume_active_token_cap(explicit_rec, CEILING),
+            150_000
+        );
+
+        // Zero record_window is ignored.
+        assert_eq!(
+            claude_session_context_window(Some(0), Some("claude-opus-5-5"), None),
+            1_000_000
         );
     }
 }
