@@ -1,9 +1,10 @@
 //! Metadata-only store census. Never uses a store opener, header reader or socket.
 use super::RecoveryError;
 pub use super::inventory_metadata::{
-    MAX_ARTIFACT_BYTES, metadata_digest, preflight_candidates, read_metadata_artifact,
+    CandidateScan, MAX_ARTIFACT_BYTES, MAX_EXECUTABLE_BYTES, metadata_digest, preflight_candidates,
+    read_metadata_artifact, scan_candidates,
 };
-use super::inventory_metadata::{absolute, epoch, record, scan, unit_metadata};
+use super::inventory_metadata::{absolute, epoch, record, unit_metadata};
 pub use super::inventory_types::*;
 use crate::{choose_backend, physical_path};
 use serde::Serialize;
@@ -84,10 +85,10 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
     roots.sort();
     roots.dedup();
     let mut warnings = inputs.warnings.clone();
-    let mut paths = BTreeSet::new();
-    for root in &roots {
-        scan(root, &mut paths, &mut warnings);
-    }
+    let scan = scan_candidates(&roots)?;
+    let scan_complete = scan.warnings.is_empty();
+    warnings.extend(scan.warnings);
+    let mut paths: BTreeSet<_> = scan.paths.into_iter().collect();
     let mut bindings = Vec::new();
     let mut additional = BTreeSet::new();
     let mut derived = BTreeSet::new();
@@ -314,7 +315,7 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
                         .mode_sources
                         .push(format!("supplied unit metadata:{}", unit.name));
                 }
-                let unit = unit_metadata(unit, &all_paths);
+                let unit = unit_metadata(unit, &all_paths, scan_complete);
                 warnings.extend(unit.validation_warnings.clone());
                 item.ownership.units.push(unit);
             }
@@ -333,6 +334,7 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
             .clone()
             .unwrap_or_else(|| format!("path:{}", path.display()));
         if let Some(existing) = records.get_mut(&key) {
+            existing.identity.alias_status = AliasStatus::ReviewRequired;
             existing
                 .identity
                 .given_paths
@@ -387,6 +389,25 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
         store.identity.given_paths.dedup();
         store.identity.symlink_chain.sort();
         store.identity.symlink_chain.dedup();
+        if !store.identity.symlink_chain.is_empty() {
+            store.identity.alias_status = AliasStatus::ReviewRequired;
+            store
+                .ownership
+                .conflicts
+                .push("symlink alias requires ownership review".into());
+            warnings.push(format!(
+                "symlink alias requires ownership review: {}",
+                store.identity.given_paths[0].display()
+            ));
+        }
+        if store.metadata.hardlink_count.is_some_and(|n| n > 1) {
+            store
+                .ownership
+                .conflicts
+                .push("hardlink alias requires ownership review".into());
+        }
+        store.ownership.conflicts.sort();
+        store.ownership.conflicts.dedup();
         store.ownership.declared_modes.sort();
         store.ownership.declared_modes.dedup();
         store.ownership.mode_sources.sort();
@@ -661,5 +682,188 @@ mod tests {
         let config = root.path().join("config.toml");
         std::fs::write(&config, b"[state]").unwrap();
         assert_eq!(read_metadata_artifact(&config, &[]).unwrap(), b"[state]");
+    }
+    #[test]
+    fn merged_symlink_alias_has_explicit_review_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a.fls");
+        fs::write(&file, b"fixture").unwrap();
+        symlink("a.fls", root.path().join("z.fls")).unwrap();
+        let mut input = inputs(root.path());
+        input
+            .bindings
+            .push(BindingInput::config("workspace", file, None, "fixture"));
+        let map = collect_inventory(&input).unwrap();
+        let record = map
+            .stores
+            .iter()
+            .find(|s| s.identity.given_paths.len() == 2)
+            .unwrap();
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(json["identity"]["alias_status"], "review_required");
+        assert!(
+            record
+                .ownership
+                .conflicts
+                .iter()
+                .any(|s| s.contains("symlink alias"))
+        );
+        assert_eq!(record.classification, "authoritative_candidate");
+        assert_eq!(record.identity.intrinsic_lineage, None);
+    }
+
+    #[test]
+    fn incomplete_scan_defers_even_outside_unit_and_executable_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let hidden = root.path().join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        let store = root.path().join("fixture.fls");
+        fs::write(&store, b"fixture").unwrap();
+        let unit = outside.path().join("store.service");
+        let executable = outside.path().join("fl");
+        fs::write(
+            &unit,
+            format!(
+                "ExecStart=/bin/fl store serve --store {}\n",
+                store.display()
+            ),
+        )
+        .unwrap();
+        fs::write(&executable, b"fixture executable").unwrap();
+        symlink(&unit, hidden.join("unit.fls")).unwrap();
+        symlink(&executable, hidden.join("binary.fls")).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o0)).unwrap();
+        #[cfg(target_os = "linux")]
+        let watch = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let fd = unsafe { fs::File::from_raw_fd(fd) };
+            for path in [&unit, &executable] {
+                let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert!(
+                    unsafe {
+                        libc::inotify_add_watch(
+                            fd.as_raw_fd(),
+                            name.as_ptr(),
+                            libc::IN_OPEN | libc::IN_ACCESS,
+                        )
+                    } >= 0
+                );
+            }
+            fd
+        };
+        let mut input = inputs(root.path());
+        input.deployment.units.push(UnitInput {
+            name: "fixture".into(),
+            file: unit,
+            store_path: store,
+            installed_executable: Some(executable),
+            ..Default::default()
+        });
+        let map = collect_inventory(&input).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut bytes = [0u8; 4096];
+            assert_eq!(
+                unsafe { libc::read(watch.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        let unit = &map
+            .stores
+            .iter()
+            .find(|s| !s.ownership.units.is_empty())
+            .unwrap()
+            .ownership
+            .units[0];
+        assert_eq!(unit.unit_digest, None);
+        assert_eq!(unit.installed_executable_digest, None);
+        assert!(!unit.file_binding_verified);
+        assert!(
+            unit.validation_warnings
+                .iter()
+                .any(|w| w.contains("incomplete"))
+        );
+        assert!(!map.complete);
+    }
+    #[test]
+    fn alias_classification_conflicts_are_deduplicated_and_unknown_stays_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("primary.fls");
+        fs::write(&file, b"fixture").unwrap();
+        for name in ["primary.code.fls", "old.redb", "older.redb"] {
+            symlink("primary.fls", root.path().join(name)).unwrap();
+        }
+        let mut input = inputs(root.path());
+        input
+            .bindings
+            .push(BindingInput::config("workspace", file, None, "fixture"));
+        let map = collect_inventory(&input).unwrap();
+        assert_eq!(map.stores.len(), 1);
+        let store = &map.stores[0];
+        assert_eq!(store.identity.alias_status, AliasStatus::ReviewRequired);
+        assert_eq!(
+            store
+                .ownership
+                .conflicts
+                .iter()
+                .filter(|s| s.as_str() == "aliases have different classifications")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .ownership
+                .conflicts
+                .iter()
+                .filter(|s| s.contains("symlink alias"))
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .classification_evidence
+                .iter()
+                .any(|s| s.contains("sidecar"))
+        );
+        assert!(
+            store
+                .classification_evidence
+                .iter()
+                .any(|s| s.contains("configured consumer"))
+        );
+        assert!(
+            store
+                .classification_evidence
+                .iter()
+                .any(|s| s.contains("unbound redb"))
+        );
+        let missing = super::super::inventory_metadata::record(
+            &root.path().join("missing.fls"),
+            &mut Vec::new(),
+        );
+        assert_eq!(missing.identity.alias_status, AliasStatus::Unknown);
+        let mut old = serde_json::to_value(&store.identity).unwrap();
+        old.as_object_mut().unwrap().remove("alias_status");
+        assert_eq!(
+            serde_json::from_value::<StoreIdentity>(old)
+                .unwrap()
+                .alias_status,
+            AliasStatus::Unknown
+        );
+        let mut again = collect_inventory(&input).unwrap();
+        again.collected_at_unix_ms = map.collected_at_unix_ms;
+        assert_eq!(
+            serde_json::to_value(again).unwrap(),
+            serde_json::to_value(map).unwrap()
+        );
     }
 }
