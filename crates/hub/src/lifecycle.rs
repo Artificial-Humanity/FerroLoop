@@ -5216,6 +5216,25 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     by: &str,
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
+    spin_up_with_store(store, || Ok(store), env, req, by, caller)
+}
+
+/// Like [`spin_up`], but releases `store_guard` across [`resume_launch_survived`] and re-opens it
+/// via `reopen_store` afterward so hub-wide store locks are never held during the survival watch.
+pub fn spin_up_with_store<S, G, F>(
+    store_guard: G,
+    mut reopen_store: F,
+    env: &LifecycleEnv<'_>,
+    req: &SpinUpRequest,
+    by: &str,
+    caller: Caller,
+) -> Result<SpinUpResponse, LifecycleError>
+where
+    S: AgentRegistry + StateStore + Catalog + MessageStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
+    let store: &S = &store_guard;
     let mut v = req.validate()?;
     v.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
         &v.vendor,
@@ -5496,8 +5515,10 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     let mut launched = raw_spawned && launch.is_some();
     let survived;
     let mut resumed_existing = false;
-    if is_claude_resume {
+    let _reopened_guard;
+    let store: &S = if is_claude_resume {
         let resumed_sid = vendor_session_id.clone().unwrap_or_default();
+        drop(store_guard);
         let (survived_resume, hook_confirmed) = if raw_spawned {
             if launch.is_some() {
                 resume_launch_survived(
@@ -5515,6 +5536,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
         } else {
             (false, false)
         };
+        _reopened_guard = reopen_store()?;
+        let store: &S = &_reopened_guard;
         if raw_spawned && survived_resume {
             survived = true;
             resumed_existing = true;
@@ -5610,6 +5633,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &session_id, &rstate, by)?;
         }
+        store
     } else {
         survived = !launched || launch_survived(env, &unit, &session_id);
         let new_pid = if raw_spawned && survived {
@@ -5642,7 +5666,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
                 &hydration_ack_slug(prev_g),
             );
         }
-    }
+        store
+    };
     // Argv handed the prompt to the vendor, but survival does not prove acceptance.
     // A command that exited at once took its session with it: nothing to deliver to.
     let spawned = raw_spawned && survived;
@@ -7026,6 +7051,25 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     id: &str,
     by: &str,
 ) -> Result<RestartResponse, LifecycleError> {
+    restart_hosted_session_with_store(store, || Ok(store), env, id, by)
+}
+
+/// Like [`restart_hosted_session`], but releases `store_guard` across [`resume_launch_survived`]
+/// and re-opens it via `reopen_store` afterward so hub-wide store locks are never held during the
+/// survival watch.
+pub fn restart_hosted_session_with_store<S, G, F>(
+    store_guard: G,
+    mut reopen_store: F,
+    env: &LifecycleEnv<'_>,
+    id: &str,
+    by: &str,
+) -> Result<RestartResponse, LifecycleError>
+where
+    S: StateStore + AgentRegistry + Catalog + MessageStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
+    let store: &S = &store_guard;
     let mut record = find_hosted_session(store, &[id])?
         .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
     if is_decommissioned(&record) {
@@ -7268,8 +7312,10 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             launch.as_ref(),
             &record.session_id,
         );
-    if is_claude_resume {
+    let _reopened_guard;
+    let store: &S = if is_claude_resume {
         let resumed_sid = record.vendor_session_id.clone().unwrap_or_default();
+        drop(store_guard);
         let (survived_resume, hook_confirmed) = if raw_spawned {
             if launch.is_some() {
                 resume_launch_survived(
@@ -7287,6 +7333,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
         } else {
             (false, false)
         };
+        _reopened_guard = reopen_store()?;
+        let store: &S = &_reopened_guard;
         if raw_spawned && survived_resume {
             record.runtime_spawned = true;
             resumed_existing = true;
@@ -7388,6 +7436,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         }
+        store
     } else if raw_spawned {
         if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
             // The command exited at once and took its session with it: nothing to deliver to.
@@ -7412,14 +7461,18 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         }
-    } else if will_spawn && let Some(prev_g) = existing_gen.as_ref() {
-        record.hydration_generation = Some(prev_g.clone());
-        let _ = store.delete_state_by_key(
-            &StateScope::Workspace,
-            StateConcern::Runtime,
-            &hydration_ack_slug(prev_g),
-        );
-    }
+        store
+    } else {
+        if will_spawn && let Some(prev_g) = existing_gen.as_ref() {
+            record.hydration_generation = Some(prev_g.clone());
+            let _ = store.delete_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hydration_ack_slug(prev_g),
+            );
+        }
+        store
+    };
     let hydration = if resumed_existing {
         HydrationOutcome {
             dispatched: true,
@@ -16108,9 +16161,24 @@ mod tests {
         assert_eq!(CLAUDE_RESUME_SURVIVAL_WINDOW, Duration::from_secs(1));
         assert_eq!(CLAUDE_RESUME_POLL_INTERVAL, Duration::from_millis(200));
 
-        // R1: `record_hydration_ack` does not read ambient `CLAUDE_CODE_MESSAGING_SOCKET` from
-        // `std::env`, and `record_hydration_ack_with_pid` rejects a mismatched caller PID while
-        // accepting a matching PID.
+        // R1: Explicitly set `CLAUDE_CODE_MESSAGING_SOCKET` in the process environment and prove
+        // `record_hydration_ack` and `--resume` still pass without reading ambient socket PIDs,
+        // while `record_hydration_ack_with_pid` rejects a mismatched caller PID.
+        struct RestoreMessagingSocket(Option<std::ffi::OsString>);
+        impl Drop for RestoreMessagingSocket {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => unsafe { std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", v) },
+                    None => unsafe { std::env::remove_var("CLAUDE_CODE_MESSAGING_SOCKET") },
+                }
+            }
+        }
+        let _socket_guard =
+            RestoreMessagingSocket(std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET"));
+        unsafe {
+            std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/999999.sock");
+        }
+
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let fake = FakeRuntime::default();
@@ -16151,10 +16219,11 @@ mod tests {
             .unwrap(),
             "R1: mismatched caller_pid must be refused when record.pid is Some(4242)"
         );
-        // `record_hydration_ack` (`caller_pid = None`) succeeds and preserves `record.pid == Some(4242)`.
+        // `record_hydration_ack` (`caller_pid = None`) succeeds even with
+        // `CLAUDE_CODE_MESSAGING_SOCKET=/tmp/999999.sock` set in `std::env` and preserves `record.pid == Some(4242)`.
         assert!(
             record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap(),
-            "R1: record_hydration_ack with None caller_pid must succeed"
+            "R1: record_hydration_ack with None caller_pid must succeed when CLAUDE_CODE_MESSAGING_SOCKET is set"
         );
         assert_eq!(
             find_hosted_session(&store, &["claude:ada"])
@@ -16162,7 +16231,7 @@ mod tests {
                 .unwrap()
                 .pid,
             Some(4242),
-            "R1: record.pid must not be overwritten by ambient environment"
+            "R1: record.pid must not be overwritten by ambient CLAUDE_CODE_MESSAGING_SOCKET"
         );
 
         // R3 + R4:
@@ -16293,5 +16362,98 @@ mod tests {
             "R3/R4: respawn when recorded_pid is None must clear stale record.pid"
         );
         assert_eq!(restarted.record.pid_start_time, None);
+
+        // R2: Concurrent store-backed hub request (`state.open_store()` + `list_hosted_sessions`)
+        // finishes *during* a resume watch (`restart_hosted_session_with_store`) because the
+        // hub store guard is released across `resume_launch_survived`.
+        let hub_dir = TempDir::new().unwrap();
+        let hub_home = TempDir::new().unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: hub_dir.path().join("store.redb"),
+            repo_root: hub_dir.path().to_path_buf(),
+            home_override: Some(hub_home.path().to_path_buf()),
+            ..crate::HubServerConfig::default()
+        });
+
+        let sid_concurrent = {
+            let fake_init = FakeRuntime::default();
+            let env_init = fake_init.env(hub_home.path());
+            let guard = state.open_store().unwrap();
+            let spun_c = spin_up_with_store(
+                guard,
+                || state.open_store().map_err(LifecycleError::from),
+                &env_init,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g_c = spun_c.hydration_generation.unwrap();
+            let guard = state.open_store().unwrap();
+            let sid_c = find_hosted_session(&*guard, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&*guard, "ada", true, Some(&g_c), Some("claude:ada")).unwrap();
+            sid_c
+        };
+        write_claude_transcript(
+            hub_home.path(),
+            false,
+            &sid_concurrent,
+            "claude-opus-5-5",
+            10_000,
+            false,
+        );
+
+        let watch_window = Duration::from_millis(300);
+        let (concurrent_done_tx, concurrent_done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let state_ref = &state;
+            let reader = s.spawn(move || {
+                // Wait 50ms so the main thread is mid-watch inside `resume_launch_survived`.
+                std::thread::sleep(Duration::from_millis(50));
+                let t0 = Instant::now();
+                let guard = state_ref.open_store().unwrap();
+                let sessions = list_hosted_sessions(&*guard).unwrap();
+                drop(guard);
+                let elapsed = t0.elapsed();
+                concurrent_done_tx.send((sessions.len(), elapsed)).unwrap();
+            });
+
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
+            let fake_restart = FakeRuntime::default();
+            let env_restart = fake_restart.env(hub_home.path());
+            let restart_t0 = Instant::now();
+            let guard = state.open_store().unwrap();
+            let restarted_c = restart_hosted_session_with_store(
+                guard,
+                || state.open_store().map_err(LifecycleError::from),
+                &env_restart,
+                "claude:ada",
+                "owner",
+            )
+            .unwrap();
+            let restart_elapsed = restart_t0.elapsed();
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
+
+            assert_eq!(
+                restarted_c.record.vendor_session_id.as_deref(),
+                Some(sid_concurrent.as_str())
+            );
+            assert!(
+                restart_elapsed >= Duration::from_millis(250),
+                "expected resume watch to run for ~300ms, got {restart_elapsed:?}"
+            );
+            reader.join().unwrap();
+        });
+
+        let (count, reader_elapsed) = concurrent_done_rx.recv().unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            reader_elapsed < Duration::from_millis(120),
+            "R2: concurrent store-backed hub request must finish during the 300ms resume watch without waiting for it to end (took {reader_elapsed:?})"
+        );
     }
 }
