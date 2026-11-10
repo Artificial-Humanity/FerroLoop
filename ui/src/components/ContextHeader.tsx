@@ -1,3 +1,4 @@
+import type { RoleRecord } from "../types/api";
 import React from "react";
 import type {
   AgentRecord,
@@ -10,6 +11,7 @@ import { formatRoleLabel, getAdapterBadgeClass } from "./RosterSidebar";
 export type ContextTier = "agent" | "project" | "system";
 
 export interface ContextHeaderProps {
+  roles?: readonly RoleRecord[];
   selectedAgent: AgentRecord | null;
   sessions: DiscoveredSessionSummary[];
   selectedSessionId: string | null;
@@ -326,6 +328,7 @@ export function getTabContextTier(tab: CockpitTab): ContextTier {
 }
 
 export const ContextHeader: React.FC<ContextHeaderProps> = ({
+  roles = [],
   selectedAgent,
   sessions,
   selectedSessionId,
@@ -594,7 +597,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
                   border: 0,
                 }}
               >
-                {formatRoleLabel(selectedAgent.role)}
+                {formatRoleLabel(selectedAgent.role, roles)}
               </span>
             </div>
           ) : (

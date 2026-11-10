@@ -31,7 +31,6 @@ import {
   type AgentMcpPostureReport,
 } from "./AgentSettingsModal";
 import {
-  BUILTIN_ROLE_REGISTRY,
   CONSOLE_LAYOUT_MODE_STORAGE_KEY,
   DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
   DEFAULT_LOCAL_MODEL_PROVIDERS,
@@ -51,7 +50,6 @@ import {
   type VendorCloudSessionVendor,
 } from "./SettingsModal";
 export {
-  BUILTIN_ROLE_REGISTRY,
   CONSOLE_LAYOUT_MODE_STORAGE_KEY,
   DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
   DEFAULT_LOCAL_MODEL_PROVIDERS,

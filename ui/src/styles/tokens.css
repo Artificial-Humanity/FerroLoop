@@ -1235,3 +1235,12 @@ button.fd-badge:hover:not(:disabled) {
   overflow-y: auto;
   z-index: auto;
 }
+
+/* Settings categories: compact desktop/tablet icons, native phone select. */
+.fd-settings-category-select { display: none; }
+.fd-settings-category-icons { display: flex; align-items: center; gap: 6px; overflow: visible; }
+.fd-settings-category-icon { position: relative; min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+.fd-settings-category-icon[aria-selected="true"]::after { content: ""; position: absolute; inset: auto 4px 1px; border-bottom: 3px solid currentColor; }
+.fd-settings-category-tooltip { display: block; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); z-index: 20; white-space: nowrap; padding: 5px 8px; background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 12px; }
+.fd-settings-category-tooltip[hidden] { display: none; }
+@media (max-width: 767px) { .fd-settings-category-select { display: block; } .fd-settings-category-icons { display: none; } }

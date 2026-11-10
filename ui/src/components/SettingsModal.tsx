@@ -321,119 +321,6 @@ export const DEFAULT_OPERATOR_PUSH_STATE: OperatorPushSubscriptionState = {
 export type { RoleReviewPolicy } from "../types/api";
 export type ConfigurableRoleRecord = RoleRecord;
 
-export const BUILTIN_ROLE_REGISTRY: ConfigurableRoleRecord[] = [
-  {
-    slug: "lead",
-    label: "Project Lead",
-    description:
-      "Owns project planning, architecture, subordinate PR reviews, and delegation.",
-    builtin: true,
-    review_policy: "lab-manager-review",
-    prompt_template:
-      "Read .agents/roles/lead.md and lead project architecture and reviews.",
-  },
-  {
-    slug: "assistant",
-    label: "Assisting Engineer",
-    description:
-      "Executes delegated engineering tasks with local subagent pre-review.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Read .agents/roles/assistant.md and execute delegated implementation tasks.",
-  },
-  {
-    slug: "strategist",
-    label: "Research & Architecture Strategist",
-    description:
-      "Serves on the Strategy Council synthesizing research literature and architecture.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Read .agents/roles/strategist.md and synthesize research against empirical findings.",
-  },
-  {
-    slug: "ui-developer",
-    label: "UI & Full-Stack Application Developer",
-    description:
-      "Specializes in React, TypeScript, Rust web frameworks, and native cross-platform UI.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Read .agents/roles/ui-developer.md and maintain cockpit UI parity and tests.",
-  },
-  {
-    slug: "lab-manager",
-    label: "Lab Manager",
-    description:
-      "Workspace-wide authority over ai-lab-0, GPU arbitration, and Lead PR reviews.",
-    builtin: true,
-    review_policy: "peer-review",
-    prompt_template:
-      "Read .agents/roles/lab-manager.md and manage workspace infrastructure and governance.",
-  },
-  {
-    slug: "qa-tester",
-    label: "QA & Verification Engineer",
-    description:
-      "Owns regression harnesses, conformance suites, and end-to-end verification.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Run exhaustive verification suites and report deterministic reproduction cases.",
-  },
-  {
-    slug: "security-engineer",
-    label: "Security & Vault Engineer",
-    description:
-      "Audits FerroGate vault policies, credential boundaries, and sandbox isolation.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Audit secret boundaries, capability matrices, and sandbox enforcement.",
-  },
-  {
-    slug: "devops-release",
-    label: "DevOps & Release Engineer",
-    description:
-      "Maintains CI/CD pipelines, versioned release slots, and systemd supervisor units.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Manage release slot rollouts, build provenance stamps, and CI workflows.",
-  },
-  {
-    slug: "data-ml-engineer",
-    label: "Data & ML Systems Engineer",
-    description:
-      "Builds dataset pipelines, training runs, and evaluation benchmarks.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Maintain training hygiene, dataset lineage, and benchmark reproducibility.",
-  },
-  {
-    slug: "technical-writer",
-    label: "Technical Writer & Spec Maintainer",
-    description:
-      "Maintains architecture specifications, runbooks, and operator documentation.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Keep specifications, runbooks, and documentation accurate and concise.",
-  },
-  {
-    slug: "journalist",
-    label: "Journalist & Technical Scribe",
-    description:
-      "Chronicles project milestones, experiment logs, and publication drafts.",
-    builtin: true,
-    review_policy: "lead-review",
-    prompt_template:
-      "Record empirical milestones, experiment notes, and technical dispatches.",
-  },
-];
-
 /**
  * Record #71: Manage Vendor Cloud Sessions in FerroDeck.
  */
@@ -735,7 +622,7 @@ import {
   type ProjectSummary,
   type TotpEnrollmentResponse,
 } from "../types/api";
-import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
+import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import {
   findProject,
   projectChoices,
@@ -1467,6 +1354,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     null,
   );
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const [openCategoryTooltip, setOpenCategoryTooltip] = useState<SettingsTabId | null>(null);
   const [projectSubTab, setProjectSubTab] =
     useState<ProjectSettingsSubTabId>(initialProjectSubTab ?? "overview");
   const [agentsSubTab, setAgentsSubTab] = useState<AgentsSubTabId>(
@@ -1944,6 +1832,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (event.key !== "Escape") return;
       // The New Project, Edit and Delete dialogs handle their own Escape.
       if (newProjectOpen || projectModals.anyOpen) return;
+      if (openCategoryTooltip) {
+        event.preventDefault();
+        setOpenCategoryTooltip(null);
+        return;
+      }
       if (artifactsDirModalTarget) {
         if (!changingArtifactsDir) {
           setArtifactsDirModalTarget(null);
@@ -1972,6 +1865,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     isOpen,
     newProjectOpen,
     projectModals.anyOpen,
+    openCategoryTooltip,
     artifactsDirModalTarget,
     changingArtifactsDir,
     recastModalAgentKey,
@@ -3034,8 +2928,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Top-Level Tab Navigation Header (System & Auth omitted when opened from a Project cog) */}
         <div
-          role="tablist"
-          aria-label="Settings Categories"
           data-testid="settings-tab-bar"
           style={{
             display: "flex",
@@ -3051,7 +2943,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <select
             aria-label="Settings Categories"
             data-testid="settings-tab-select"
-            className="fd-select"
+            className="fd-select fd-settings-category-select"
             value={activeTab}
             onChange={(e) => setActiveTab(e.target.value as typeof activeTab)}
             style={{
@@ -3100,108 +2992,49 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </>
             )}
           </select>
-          <div
-            className="sr-only"
-            style={{
-              position: "absolute",
-              width: "1px",
-              height: "1px",
-              padding: 0,
-              margin: "-1px",
-              overflow: "hidden",
-              clip: "rect(0, 0, 0, 0)",
-              whiteSpace: "nowrap",
-              border: 0,
-            }}
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === "agents"}
-              data-testid="settings-tab-agents"
-              className={`fd-btn${activeTab === "agents" ? " fd-btn-active" : ""}`}
-              onClick={() => setActiveTab("agents")}
-            >
-              {filteredAgents.length} Agents
-            </button>
-            {!initialProject && (
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "projects"}
-                data-testid="settings-tab-projects"
-                className={`fd-btn${activeTab === "projects" ? " fd-btn-active" : ""}`}
-                onClick={() => setActiveTab("projects")}
-              >
-                Projects
-              </button>
-            )}
-            {!initialProject && (
-              <>
+          <div className="fd-settings-category-icons" role="tablist" aria-label="Settings Categories">
+            {([
+              { id: "agents", label: "Agents", path: "M16 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2 M10 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M20 8v6 M17 11h6" },
+              { id: "projects", label: "Projects", path: "M3 6h7l2 2h9v11H3z" },
+              { id: "system", label: "System", path: "M4 4h16v12H4z M8 20h8 M12 16v4" },
+              { id: "products", label: "Products", path: "M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z" },
+              { id: "runtimes", label: "Runtimes & Quotas", path: "M4 17a8 8 0 1 1 16 0 M12 13l4-4 M12 13v1 M5 20h14" },
+              { id: "appearance", label: "Appearance", path: "M12 3a9 9 0 1 0 0 18h2a2 2 0 0 0 1-4h-1a2 2 0 0 1 0-4h3a4 4 0 0 0 4-4c0-3-4-6-9-6z M7 10h.01 M10 6h.01 M15 7h.01" },
+              { id: "accessibility", label: "Accessibility", path: "M12 4a2 2 0 1 0 0-4 2 2 0 0 0 0 4 M4 7l8 2 8-2 M12 9v5 M8 22l4-8 4 8" },
+              { id: "auth", label: "Auth", path: "M5 10h14v11H5z M8 10V7a4 4 0 0 1 8 0v3 M12 14v3" },
+            ] as const).filter((tab) => !initialProject || tab.id === "agents")
+              .filter((tab) => tab.id !== "runtimes" || authority?.tier === "owner")
+              .map((tab) => (
                 <button
+                  key={tab.id}
                   type="button"
                   role="tab"
-                  aria-selected={activeTab === "system"}
-                  data-testid="settings-tab-system"
-                  className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
-                  onClick={() => setActiveTab("system")}
+                  aria-label={tab.label}
+                  aria-selected={activeTab === tab.id}
+                  aria-current={activeTab === tab.id ? "page" : undefined}
+                  tabIndex={activeTab === tab.id ? 0 : -1}
+                  data-testid={`settings-tab-${tab.id}`}
+                  className={`fd-btn fd-settings-category-icon${activeTab === tab.id ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab(tab.id)}
+                  onFocus={() => setOpenCategoryTooltip(tab.id)}
+                  onBlur={(event) => { if (!event.currentTarget.matches(":hover")) setOpenCategoryTooltip(null); }}
+                  onMouseEnter={() => setOpenCategoryTooltip(tab.id)}
+                  onMouseLeave={(event) => { if (document.activeElement !== event.currentTarget) setOpenCategoryTooltip(null); }}
+                  onKeyDown={(event) => {
+                    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+                    event.preventDefault();
+                    const tabs = Array.from(event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+                    const index = tabs.indexOf(event.currentTarget);
+                    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 :
+                      (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+                    tabs[next]?.focus();
+                    tabs[next]?.click();
+                  }}
                 >
-                  System
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={tab.path} /></svg>
+                  <span className="fd-settings-category-tooltip" data-testid={`settings-tooltip-${tab.id}`} aria-hidden="true" hidden={openCategoryTooltip !== tab.id}>{tab.label}</span>
                 </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={activeTab === "products"}
-                  data-testid="settings-tab-products"
-                  className={`fd-btn${activeTab === "products" ? " fd-btn-active" : ""}`}
-                  onClick={() => setActiveTab("products")}
-                >
-                  Products
-                </button>
-                {authority?.tier === "owner" && (
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={activeTab === "runtimes"}
-                    data-testid="settings-tab-runtimes"
-                    className={`fd-btn${activeTab === "runtimes" ? " fd-btn-active" : ""}`}
-                    onClick={() => setActiveTab("runtimes")}
-                  >
-                    Runtimes &amp; Quotas
-                  </button>
-                )}
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={activeTab === "appearance"}
-                  data-testid="settings-tab-appearance"
-                  className={`fd-btn${activeTab === "appearance" ? " fd-btn-active" : ""}`}
-                  onClick={() => setActiveTab("appearance")}
-                >
-                  Appearance
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={activeTab === "accessibility"}
-                  data-testid="settings-tab-accessibility"
-                  className={`fd-btn${activeTab === "accessibility" ? " fd-btn-active" : ""}`}
-                  onClick={() => setActiveTab("accessibility")}
-                >
-                  Accessibility
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={activeTab === "auth"}
-                  data-testid="settings-tab-auth"
-                  className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
-                  onClick={() => setActiveTab("auth")}
-                >
-                  Auth
-                </button>
-              </>
-            )}
+              ))}
           </div>
 
           {/* Sub-tab selectors pinned directly above settings-scroll-body */}
@@ -4406,7 +4239,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 gap: "6px",
               }}
             >
-              {roleRegistry.map((roleRec) => (
+              {[...roleRegistry].sort((a, b) => a.label.localeCompare(b.label)).map((roleRec) => (
                 <div
                   key={roleRec.slug}
                   data-testid={`role-registry-row-${roleRec.slug}`}
@@ -10460,9 +10293,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 label: WORKSPACE_PROJECT,
               },
             ]);
-          const hasRoleOption =
-            draft.role === CREATE_CUSTOM_ROLE_VALUE ||
-            recastRoleOptions.some((opt) => opt.value === draft.role);
 
           return (
             <div
@@ -10608,10 +10438,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         });
                       }}
                     >
-                      {!hasRoleOption && (
-                        <option value={draft.role}>{roleLabel(draft.role, roleRegistry)}</option>
-                      )}
-                      {recastRoleOptions.map((opt) => (
+                      {selectedRoleOptions(recastRoleOptions, draft.role, roleRegistry).map((opt) => (
                         <option key={opt.value} value={opt.value}>
                           {opt.label}
                         </option>
