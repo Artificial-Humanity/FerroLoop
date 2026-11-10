@@ -54,6 +54,10 @@ impl Sandbox {
             .env("TMPDIR", self.dir("tmp"))
             .env_remove("FL_DB")
             .env_remove("FL_STORE_BACKEND")
+            .env_remove("AGENT_PERSONA")
+            .env_remove("AGENT_NAME")
+            .env_remove("FL_HOSTED_ID")
+            .env_remove("AGENT_HYDRATION_GENERATION")
             .current_dir(self.dir("home"))
             .args(args);
         c
@@ -539,6 +543,37 @@ impl Server {
         (Self { child }, ready)
     }
 
+    /// Bad recovery policies must not block startup, even when they name a FIFO.
+    fn start_bounded(sb: &Sandbox, args: &[&str]) -> (Self, String) {
+        let mut server = Self {
+            child: sb
+                .cmd(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        };
+        let stdout = server.child.stdout.take().unwrap();
+        let (send, ready) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = send.send(result);
+        });
+        let result = ready.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            let _ = server.child.kill();
+            let _ = server.child.wait();
+        }
+        reader.join().unwrap();
+        (
+            server,
+            result
+                .expect("recovery policy blocked daemon startup")
+                .unwrap(),
+        )
+    }
+
     /// SIGTERM, then the exit status and stderr.
     fn stop(self) -> (std::process::ExitStatus, String) {
         self.stop_with(&[libc::SIGTERM])
@@ -556,6 +591,137 @@ impl Server {
         let mut err = String::new();
         std::io::Read::read_to_string(&mut self.child.stderr.take().unwrap(), &mut err).unwrap();
         (status, err)
+    }
+}
+
+#[test]
+fn serve_keeps_data_available_with_absent_invalid_or_gated_recovery_policy() {
+    use fl_store::recovery::{
+        control::{BatchRequest, MemberRequest},
+        policy::{RecoveryLimits, RecoveryPolicy},
+    };
+    for case in [
+        "absent",
+        "missing",
+        "malformed",
+        "gated",
+        "destination",
+        "fifo",
+    ] {
+        let sb = Sandbox::new();
+        let fls = sb.fls();
+        let policy_path = sb.dir("home").join("secret-policy.json");
+        let mut args = vec!["serve", "--create", "--store", s(&fls)];
+        if case != "absent" {
+            args.extend(["--recovery-policy", s(&policy_path)]);
+        }
+        if case == "fifo" {
+            let path = std::ffi::CString::new(policy_path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        } else if case == "malformed" {
+            std::fs::write(&policy_path, b"not json: secret policy contents").unwrap();
+        } else if matches!(case, "gated" | "destination") {
+            let policy = RecoveryPolicy {
+                enabled: case == "gated",
+                coverage_interval_seconds: 3600,
+                policy_id: "fixture".into(),
+                store_id: "workspace".into(),
+                destination: sb.dir("home").join("unavailable-secret-root"),
+                source_map_sha256: "a".repeat(64),
+                limits: Some(RecoveryLimits {
+                    retained_pin_bytes: 1 << 20,
+                    preparation_bytes: 2 << 20,
+                    memory_bytes: 32 << 20,
+                    disk_bytes: 64 << 20,
+                    image_bytes: 4096,
+                    metadata_bytes: 128 << 10,
+                    margin_bytes: 4096,
+                    total_seconds: 30,
+                }),
+                ..RecoveryPolicy::default()
+            };
+            std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        }
+        let (server, ready) = Server::start_bounded(&sb, &args);
+        assert!(
+            ready.starts_with("serving "),
+            "{case}: daemon did not start: {ready:?}"
+        );
+        let uri = format!("unix://{}", sb.dir("stores").join("fl.fls.sock").display());
+        let client = FerroStore::connect_uri(&uri).unwrap();
+        client
+            .put_doc("fixture", "available", &serde_json::json!({"ok":true}))
+            .unwrap();
+        assert_eq!(
+            client.get_doc("fixture", "available").unwrap(),
+            Some(serde_json::json!({"ok":true}))
+        );
+        let request = BatchRequest {
+            policy_id: "fixture".into(),
+            batch_id: uuid::Uuid::now_v7(),
+            members: vec![MemberRequest {
+                store_id: "workspace".into(),
+                operation_id: uuid::Uuid::now_v7(),
+                scheduled_at_unix_seconds: None,
+                byte_cap: None,
+            }],
+        };
+        assert!(
+            client.recovery_control("recovery_start", &request).is_err(),
+            "{case}"
+        );
+        if case == "absent" {
+            assert!(
+                client
+                    .recovery_control("recovery_status", &request)
+                    .is_err()
+            );
+        } else {
+            let report = client
+                .recovery_control("recovery_status", &request)
+                .unwrap();
+            assert!(!report.complete);
+            assert!(report.members.is_empty());
+            let json = serde_json::to_value(&report).unwrap();
+            if case == "gated" {
+                assert_eq!(
+                    report.missing_gates,
+                    ["capture_proof_missing", "reviewed_event_adapter_missing"]
+                );
+                assert_eq!(json["inactive_reason"], serde_json::Value::Null);
+            } else {
+                assert_eq!(report.missing_gates, ["policy_invalid"]);
+                assert!(
+                    json["inactive_reason"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("_refused")
+                );
+            }
+            let text = json.to_string();
+            assert!(!text.contains("secret"), "{text}");
+            assert!(
+                !text.contains(&sb.root.path().display().to_string()),
+                "{text}"
+            );
+        }
+        drop(client);
+        let (status, log) = server.stop();
+        assert!(status.success(), "{case}: {log}");
+        if case != "absent" {
+            assert!(
+                log.contains(if case == "gated" {
+                    "capture_proof_missing"
+                } else {
+                    "policy_invalid"
+                }),
+                "{case}: {log}"
+            );
+        } else {
+            assert_eq!(log, "stopped on SIGTERM\n");
+        }
+        assert!(!log.contains("secret"), "{case}: {log}");
+        assert!(!sb.dir("home").join("unavailable-secret-root").exists());
     }
 }
 

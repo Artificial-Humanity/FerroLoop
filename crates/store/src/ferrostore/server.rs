@@ -57,8 +57,16 @@ struct Handshake {
     tcp: bool,
 }
 
+#[derive(Clone)]
+struct RecoveryInactive {
+    missing_gates: Vec<String>,
+    reason: Option<&'static str>,
+}
+
 struct ServerState {
     store: Arc<FerroStore>,
+    recovery: Mutex<Option<crate::recovery::scheduler::RecoveryScheduler>>,
+    recovery_inactive: Mutex<Option<RecoveryInactive>>,
     shutdown: AtomicBool,
     active_conns: Arc<AtomicUsize>,
     conns: Mutex<HashMap<u64, Box<dyn JsonIo>>>,
@@ -166,6 +174,101 @@ impl MaintenanceWorker {
 }
 
 impl FerroStoreServer {
+    /// Attach dormant controls to this server's existing owner handle. No source reopen.
+    pub fn configure_recovery(
+        &self,
+        policy: crate::recovery::policy::RecoveryPolicy,
+    ) -> Result<(), StoreError> {
+        self.configure_recovery_with_io(policy, Arc::new(crate::recovery::fs::NativeRecoveryIo))
+    }
+    /// Recovery I/O seam, retaining the same capture and verification path.
+    pub fn configure_recovery_with_io(
+        &self,
+        policy: crate::recovery::policy::RecoveryPolicy,
+        io: Arc<dyn crate::recovery::fs::RecoveryIo>,
+    ) -> Result<(), StoreError> {
+        self.configure_recovery_runtime(policy, io, None)
+    }
+
+    /// Inject the reviewed upper-layer delivery adapter; policy and proof gates
+    /// remain enforced by the owner scheduler.
+    pub fn configure_recovery_with_sink(
+        &self,
+        policy: crate::recovery::policy::RecoveryPolicy,
+        sink: Arc<dyn crate::recovery::control::RecoveryEventSink>,
+    ) -> Result<(), StoreError> {
+        self.configure_recovery_runtime(
+            policy,
+            Arc::new(crate::recovery::fs::NativeRecoveryIo),
+            Some(sink),
+        )
+    }
+
+    fn configure_recovery_runtime(
+        &self,
+        policy: crate::recovery::policy::RecoveryPolicy,
+        io: Arc<dyn crate::recovery::fs::RecoveryIo>,
+        sink: Option<Arc<dyn crate::recovery::control::RecoveryEventSink>>,
+    ) -> Result<(), StoreError> {
+        use crate::recovery::scheduler::RecoveryScheduler;
+        let mut slot = lock_mutex(&self.state.recovery);
+        if slot.is_some() || lock_mutex(&self.state.recovery_inactive).is_some() {
+            return Err(backend("recovery already configured"));
+        }
+        if policy.validate().is_err() {
+            self.record_recovery_inactive(RecoveryInactive {
+                missing_gates: vec!["policy_invalid".into()],
+                reason: Some("policy_validation_refused"),
+            });
+            return Ok(());
+        }
+        // This production boundary cannot mint capture proof. Gate refusal must
+        // not touch the backup root, create a scheduler, or stop data serving.
+        let gates =
+            RecoveryScheduler::activation_missing_gates(policy.enabled, false, sink.is_some());
+        if policy.enabled && !gates.is_empty() {
+            self.record_recovery_inactive(RecoveryInactive {
+                missing_gates: gates,
+                reason: None,
+            });
+            return Ok(());
+        }
+        match RecoveryScheduler::start_shared_with_runtime(
+            Arc::clone(&self.state.store),
+            policy,
+            None,
+            io,
+            sink,
+        ) {
+            Ok(scheduler) => *slot = Some(scheduler),
+            Err(_) => self.record_recovery_inactive(RecoveryInactive {
+                missing_gates: vec!["policy_invalid".into()],
+                reason: Some("policy_configuration_refused"),
+            }),
+        }
+        Ok(())
+    }
+
+    fn record_recovery_inactive(&self, diagnostic: RecoveryInactive) {
+        // Only fixed codes are logged: never include policy contents or paths.
+        eprintln!(
+            "recovery inactive: {}{}",
+            diagnostic.missing_gates.join(","),
+            diagnostic
+                .reason
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        );
+        *lock_mutex(&self.state.recovery_inactive) = Some(diagnostic);
+    }
+
+    pub(crate) fn recovery_policy_unavailable(&self) {
+        self.record_recovery_inactive(RecoveryInactive {
+            missing_gates: vec!["policy_invalid".into()],
+            reason: Some("policy_load_refused"),
+        });
+    }
+
     /// Bind a Unix socket and serve `store`.
     ///
     /// Moves `store` in and does not open its path again. The socket is mode
@@ -378,6 +481,8 @@ fn new_state(store: FerroStore, auth: ServerAuth) -> Arc<ServerState> {
         next_conn: AtomicU64::new(1),
         sessions: Sessions::new(),
         dedup: Dedup::default(),
+        recovery: Mutex::new(None),
+        recovery_inactive: Mutex::new(None),
         auth,
         own_uid: auth::own_uid(),
         handshakes: Mutex::new(HashMap::new()),
@@ -474,6 +579,11 @@ impl FerroStoreServer {
         // inode a unix server bound, so a replacement socket is left alone.
         // A tcp server has no filesystem path.
         self.state.shutdown.store(true, Ordering::SeqCst);
+        if let Some(recovery) = lock_mutex(&self.state.recovery).as_ref() {
+            recovery
+                .shutdown()
+                .map_err(|_| backend("recovery shutdown failed"))?;
+        }
         // Wake the worker before joining the accept loop; an in-progress spill is
         // joined before the final flush so no maintenance races shutdown.
         if let Some(worker) = &self.maintenance {
@@ -890,6 +1000,7 @@ fn serve_connection(
         state: Arc::clone(&state),
         id: conn_id,
     };
+    let local_owner = matches!(&peer, Peer::Unix(Some(uid)) if *uid == state.own_uid);
     let Some((scope, principal)) = authenticate(&mut *read, &write, peer, &state, conn_id) else {
         return;
     };
@@ -920,7 +1031,7 @@ fn serve_connection(
                 let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
                 // A method the scope does not cover, or an unknown one, is an
                 // error response that ran nothing.
-                let reply = match auth::authorize(scope, method) {
+                let reply = match auth::authorize_transport(scope, method, local_owner) {
                     Err(err) => {
                         #[cfg(test)]
                         if matches!(method, "read_state" | "commit_ops" | "commit_if_seq") {
@@ -1117,6 +1228,40 @@ fn exactly_once(
     }
 }
 
+fn dispatch_recovery(
+    state: &ServerState,
+    method: &str,
+    params: &Value,
+) -> Result<Value, StoreError> {
+    let request: crate::recovery::control::BatchRequest =
+        serde_json::from_value(params.clone()).map_err(|_| backend("invalid recovery IDs"))?;
+    let scheduler = lock_mutex(&state.recovery).clone();
+    if let Some(diagnostic) = lock_mutex(&state.recovery_inactive).clone() {
+        if method == "recovery_start" {
+            return Err(backend("recovery inactive; inspect recovery_status"));
+        }
+        return serde_json::to_value(crate::recovery::control::BatchReport {
+            batch_id: request.batch_id,
+            members: Vec::new(),
+            complete: false,
+            overdue: true,
+            outbox_full: false,
+            missing_gates: diagnostic.missing_gates,
+            inactive_reason: diagnostic.reason.map(str::to_owned),
+        })
+        .map_err(|_| backend("invalid recovery report"));
+    }
+    let scheduler =
+        scheduler.ok_or_else(|| backend("recovery policy is absent; scheduling disabled"))?;
+    let report = if method == "recovery_start" {
+        scheduler.request_batch(&request)
+    } else {
+        scheduler.status(&request)
+    }
+    .map_err(|_| backend("configured recovery request refused"))?;
+    serde_json::to_value(report).map_err(|_| backend("invalid recovery report"))
+}
+
 fn dispatch(
     state: &ServerState,
     conn: u64,
@@ -1128,6 +1273,8 @@ fn dispatch(
     state.dispatched.fetch_add(1, Ordering::SeqCst);
     let store = &*state.store;
     match method {
+        "recovery_start" => dispatch_recovery(state, "recovery_start", params),
+        "recovery_status" => dispatch_recovery(state, "recovery_status", params),
         "open_session" => {
             let pinned = store.read_state()?;
             let base_seq = pinned.last_seq;
@@ -1965,7 +2112,7 @@ impl JsonIo for WsIo {
 }
 
 /// Write one frame; the bytes it took, length prefix included.
-pub(super) fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usize, StoreError> {
+pub(super) fn write_frame(stream: &mut impl Write, value: &Value) -> Result<usize, StoreError> {
     let bytes = serde_json::to_vec(value).map_err(|err| backend(format!("encode frame: {err}")))?;
     let len = u32::try_from(bytes.len()).map_err(|_| backend("frame length exceeds u32"))?;
     if len == 0 || len > MAX_FRAME_BYTES {
@@ -1980,7 +2127,7 @@ pub(super) fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usiz
 /// that declares more than `max_len` bytes (at most 16 MiB) is refused
 /// before anything is allocated for it.
 pub(super) fn read_frame(
-    stream: &mut UnixStream,
+    stream: &mut impl Read,
     max_len: usize,
 ) -> Result<(Value, usize), StoreError> {
     let mut len_buf = [0u8; 4];
@@ -2332,6 +2479,199 @@ impl Drop for RemoteClient {
 #[cfg(test)]
 pub(super) fn connect_unix(path: &str) -> Result<RemoteClient, StoreError> {
     connect_unix_with(path, &auth::ClientCred::None)
+}
+
+// Recovery uses one short-lived nonblocking connection, one absolute deadline,
+// and the ordinary peer-uid handshake and framing. Normal clients are unchanged.
+struct RecoverySocket {
+    stream: UnixStream,
+    deadline: Instant,
+}
+impl RecoverySocket {
+    fn ready(&self, events: libc::c_short) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+            let mut fd = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let ms = remaining
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let result = unsafe { libc::poll(&mut fd, 1, ms) };
+            if result > 0 {
+                if Instant::now() < self.deadline {
+                    return Ok(());
+                }
+                continue;
+            }
+            if result == 0 {
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    fn connect(path: &Path, deadline: Instant) -> std::io::Result<Self> {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        };
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        address.sun_family = libc::AF_UNIX as _;
+        for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *target = *byte as _;
+        }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let socket = Self {
+            stream: unsafe { UnixStream::from_raw_fd(fd) },
+            deadline,
+        };
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of_val(&address) as _,
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            // AF_UNIX EAGAIN means the listen backlog is full, not a pending
+            // connection. No application request has been dispatched.
+            if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(error);
+            }
+            socket.ready(libc::POLLOUT)?;
+            let mut error = 0i32;
+            let mut length = std::mem::size_of_val(&error) as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    socket.stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut error as *mut i32).cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if error != 0 {
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
+        }
+        Ok(socket)
+    }
+}
+impl Read for RecoverySocket {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            self.ready(libc::POLLIN)?;
+            match self.stream.read(bytes) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                r => return r,
+            }
+        }
+    }
+}
+impl Write for RecoverySocket {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            self.ready(libc::POLLOUT)?;
+            match self.stream.write(bytes) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                r => return r,
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct RecoveryJson(RecoverySocket);
+impl JsonIo for RecoveryJson {
+    fn read_value(&mut self, max: usize) -> Result<Incoming, StoreError> {
+        read_frame(&mut self.0, max).map(|(v, _)| Incoming::Value(v))
+    }
+    fn write_value(&mut self, value: &Value) -> Result<(), StoreError> {
+        write_frame(&mut self.0, value).map(|_| ())
+    }
+    fn set_read_timeout(&self, _: Option<Duration>) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn shutdown_both(&self) {
+        let _ = self.0.stream.shutdown(Shutdown::Both);
+    }
+}
+pub(super) fn recovery_owner_call(
+    path: &Path,
+    method: &str,
+    request: &crate::recovery::control::BatchRequest,
+    deadline: Instant,
+) -> Result<crate::recovery::control::BatchReport, crate::recovery::control::OwnerCallError> {
+    use crate::recovery::control::OwnerCallError::{NotDispatched, OutcomeUnknown};
+    let socket = RecoverySocket::connect(path, deadline).map_err(|_| NotDispatched)?;
+    let writer = socket.stream.try_clone().map_err(|_| NotDispatched)?;
+    let mut read = RecoveryJson(socket);
+    let mut write = RecoveryJson(RecoverySocket {
+        stream: writer,
+        deadline,
+    });
+    auth::client_handshake(&mut read, &mut write, &auth::ClientCred::None)
+        .map_err(|_| NotDispatched)?;
+    let value = json!({"id":1,"method":method,"params":request});
+    // From this point a partial write can have reached the owner. No error
+    // without an authoritative member report can release its reservation.
+    write.write_value(&value).map_err(|_| OutcomeUnknown)?;
+    let (response, _) = read_frame(&mut read.0, (1 << 20).min(MAX_FRAME_BYTES as usize))
+        .map_err(|_| OutcomeUnknown)?;
+    if response.get("id").and_then(Value::as_u64) != Some(1)
+        || response.get("ok").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(OutcomeUnknown);
+    }
+    let report: crate::recovery::control::BatchReport =
+        serde_json::from_value(response.get("result").cloned().ok_or(OutcomeUnknown)?)
+            .map_err(|_| OutcomeUnknown)?;
+    if report.batch_id != request.batch_id || Instant::now() >= deadline {
+        return Err(OutcomeUnknown);
+    }
+    Ok(report)
 }
 
 /// A client of the Unix socket at `path`, authenticating with `cred`.
@@ -3453,6 +3793,77 @@ mod tests {
         );
         for handle in forwarders {
             let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_deadline_tests {
+    use super::*;
+    use crate::recovery::control::{BatchRequest, MemberRequest, OwnerCallError};
+    fn request() -> BatchRequest {
+        BatchRequest {
+            policy_id: "fixture".into(),
+            batch_id: uuid::Uuid::now_v7(),
+            members: vec![MemberRequest {
+                store_id: "remote".into(),
+                operation_id: uuid::Uuid::now_v7(),
+                scheduled_at_unix_seconds: None,
+                byte_cap: None,
+            }],
+        }
+    }
+    #[test]
+    fn recovery_transport_distinguishes_no_dispatch_from_lost_reply_and_bounds_stalled_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("owner.sock");
+        let req = request();
+        assert!(matches!(
+            recovery_owner_call(
+                &socket,
+                "recovery_start",
+                &req,
+                Instant::now() + Duration::from_millis(50)
+            ),
+            Err(OwnerCallError::NotDispatched)
+        ));
+        for phase in ["handshake", "reply", "oversize", "write"] {
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (release, wait) = mpsc::channel();
+            let peer_phase = phase.to_owned();
+            let peer = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                if peer_phase != "handshake" {
+                    write_frame(&mut stream, &json!({"auth":"ok", "scope":"admin"})).unwrap();
+                    if peer_phase != "write" {
+                        let _ = read_frame(&mut stream, MAX_FRAME_BYTES as usize).unwrap();
+                    }
+                    if peer_phase == "oversize" {
+                        stream
+                            .write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes())
+                            .unwrap();
+                    }
+                }
+                let _ = wait.recv();
+            });
+            let mut dispatch = req.clone();
+            if phase == "write" {
+                dispatch.policy_id = "x".repeat(1 << 20);
+            }
+            let outcome = recovery_owner_call(
+                &socket,
+                "recovery_start",
+                &dispatch,
+                Instant::now() + Duration::from_millis(50),
+            );
+            release.send(()).unwrap();
+            peer.join().unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            if phase == "handshake" {
+                assert!(matches!(outcome, Err(OwnerCallError::NotDispatched)));
+            } else {
+                assert!(matches!(outcome, Err(OwnerCallError::OutcomeUnknown)));
+            }
         }
     }
 }

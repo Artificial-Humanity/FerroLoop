@@ -7,12 +7,16 @@ use super::{
 };
 use std::path::PathBuf;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovedConfig {
     pub kind: MemberKind,
     pub path: PathBuf,
     pub identity: (u64, u64),
     pub byte_limit: u64,
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExcludedVaultKey {
     pub path: PathBuf,
     pub identity: (u64, u64),
@@ -177,6 +181,7 @@ fn copy_config(
 ) -> Result<MemberChecksum, RecoveryError> {
     use std::os::unix::fs::FileExt;
     source.held.unchanged(l)?;
+    let source_checksum = verify::hash_file(&source.held.file, l)?;
     fs::event(&*control.io, RecoveryEvent::Create(source.io_kind), l)?;
     let target = PrivateFile::open(&stage.path.join(source.name), true, l)?;
     control.allocate(&target.file, source.len, true, l)?;
@@ -197,6 +202,9 @@ fn copy_config(
     source.held.unchanged(l)?;
     target.same_name(l)?;
     let (bytes, sha256) = verify::hash_file(&target.file, l)?;
+    if (bytes, sha256.clone()) != source_checksum {
+        return Err(l.verification());
+    }
     Ok(MemberChecksum {
         kind: source.kind.clone(),
         relative_name: source.name.into(),
@@ -209,6 +217,16 @@ fn copy_config(
 pub fn backup(
     owner: &crate::FerroStore,
     request: &BackupRequest,
+    filesystem: &dyn RecoveryFs,
+    cancel: &CancelToken,
+) -> Result<PublicationOutcome, RecoveryError> {
+    backup_with_shared_config(owner, request, None, filesystem, cancel)
+}
+/// A checksum-bound config reference never substitutes for ordinary local member verification.
+pub fn backup_with_shared_config(
+    owner: &crate::FerroStore,
+    request: &BackupRequest,
+    shared_config: Option<&super::manifest::SharedConfigReference>,
     filesystem: &dyn RecoveryFs,
     cancel: &CancelToken,
 ) -> Result<PublicationOutcome, RecoveryError> {
@@ -253,6 +271,22 @@ pub fn backup(
         return Err(fs::refused(&l, "inventory physical identity changed"));
     }
     let root = Dir::open(filesystem.root(), &l)?;
+    let shared_held = if let Some(reference) = shared_config {
+        if !request.configs.is_empty() {
+            return Err(fs::refused(
+                &l,
+                "shared configs must not be duplicated in leaf",
+            ));
+        }
+        super::catalog::check_shared_config(
+            &root,
+            reference,
+            request.batch_id.map(|id| id.to_string()).as_deref(),
+            &l,
+        )?
+    } else {
+        Vec::new()
+    };
     let io = filesystem.io();
     let available = io
         .available_bytes(&root.file)
@@ -381,12 +415,16 @@ pub fn backup(
             .ok_or_else(|| l.verification())?;
         fs::event(&*io, RecoveryEvent::RemoveVerifier, &l)?;
         stage.remove_file("verification.fls", evidence.verified_file_identity, &l)?;
+        for (_, file) in &shared_held {
+            file.unchanged(&l)?;
+        }
         let manifest = BundleManifestV1::verified_unpublished(
             &expected,
             &request.profile,
             &report,
             ManifestContext {
                 batch_id: request.batch_id.map(|id| id.to_string()),
+                shared_config: shared_config.cloned(),
                 source_map_sha256: request.source_map_sha256.clone(),
                 creator_build_identity: BuildIdentity::current(),
                 retained_members: members,
@@ -572,4 +610,107 @@ pub fn publication_status(
     })?;
     result.quarantined_allocated_bytes = allocated(&quarantine, l, 0)?;
     Ok(result)
+}
+
+/// Publish approved secret-bearing configs once, before any batch leaf. No
+/// vault key path is opened. Allocation, source identities and all names retain
+/// Task 4's private-file checks and bounded PublicationIo accounting.
+pub fn publish_batch_configs(
+    request: &BackupRequest,
+    filesystem: &dyn RecoveryFs,
+) -> Result<super::manifest::SharedConfigReference, RecoveryError> {
+    use super::manifest::{BatchConfigV1, SharedConfigReference};
+    let mut l = request.limits.clone();
+    let batch = request
+        .batch_id
+        .filter(|b| !b.is_nil())
+        .ok_or_else(|| fs::refused(&l, "batch config needs batch ID"))?;
+    l.operation_id = batch;
+    if request.destination != filesystem.root() {
+        return Err(fs::refused(&l, "configured root required"));
+    }
+    let root = Dir::open(filesystem.root(), &l)?;
+    let unit = fs::allocation_geometry(&root, &l)?;
+    let reserve = request
+        .metadata_byte_limit
+        .checked_add(fs::overhead_bytes(unit, &l)?)
+        .and_then(|n| n.checked_add(unit.checked_mul(16)?))
+        .ok_or_else(|| quota(&l))?;
+    if reserve > 512 << 20
+        || reserve.checked_mul(2).is_none_or(|n| n > l.byte_limit)
+        || filesystem
+            .io()
+            .available_bytes(&root.file)
+            .map_err(|_| fs::destination(&l))?
+            .checked_sub(request.space_margin_bytes)
+            .is_none_or(|n| reserve.checked_mul(2).is_none_or(|twice| twice > n))
+    {
+        return Err(quota(&l));
+    }
+    let control = Arc::new(PublicationIo::new(
+        filesystem.io(),
+        reserve,
+        reserve,
+        0,
+        unit,
+    ));
+    l.publication_io = Some(control.clone());
+    control.charge(fs::overhead_bytes(unit, &l)?, true, &l)?;
+    let locks = root.child(".locks", false, &l)?;
+    let _lock = StoreLock::operation(&locks, batch, &l)?;
+    let parent = root.child(".batch-config", false, &l)?;
+    let name = batch.to_string();
+    let stage_name = format!("{batch}.staging");
+    if parent.exists(&name, &l)? {
+        let dir = Dir::open(&parent.path.join(&name), &l)?;
+        let file = PrivateFile::open(&dir.path.join("config.json"), false, &l)?;
+        let (_, digest) = verify::hash_file(&file.file, &l)?;
+        let reference = SharedConfigReference {
+            batch_id: batch,
+            descriptor_sha256: digest,
+        };
+        let held = super::catalog::check_shared_config(&root, &reference, Some(&name), &l)?;
+        for (kind, file) in &held {
+            control.sync(&file.file, *kind, &l)?;
+            file.unchanged(&l)?;
+        }
+        dir.sync(&*control.io, Directory::PublicationParent, &l)?;
+        parent.sync(&*control.io, Directory::PublicationParent, &l)?;
+        root.sync(&*control.io, Directory::PublicationParent, &l)?;
+        return Ok(reference);
+    }
+    l.admit_memory(65536)?;
+    let stage = parent.child(&stage_name, true, &l)?;
+    let members = configs(request, &l)?
+        .iter()
+        .map(|source| copy_config(source, &stage, &control, &l))
+        .collect::<Result<Vec<_>, _>>()?;
+    let descriptor = BatchConfigV1 {
+        version: 1,
+        batch_id: batch,
+        members,
+    };
+    let (_, digest) = fs::write_json(
+        &stage,
+        "config.json",
+        &descriptor,
+        Member::Manifest,
+        &control,
+        &l,
+    )?;
+    stage.sync(&*control.io, Directory::StagingBeforePublish, &l)?;
+    parent.rename(
+        &stage_name,
+        &parent,
+        &name,
+        &*control.io,
+        RecoveryEvent::Publish,
+        &l,
+    )?;
+    parent.sync(&*control.io, Directory::PublicationParent, &l)?;
+    root.sync(&*control.io, Directory::PublicationParent, &l)?;
+    Ok(SharedConfigReference {
+        batch_id: batch,
+        descriptor_sha256: digest,
+    })
 }
