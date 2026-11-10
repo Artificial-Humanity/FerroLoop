@@ -6,7 +6,6 @@ import type { HubWsClient } from "../api/ws";
 import {
   resolveSpinUpProject,
   SpinUpAgentModal,
-  SPIN_UP_ROLES,
 } from "../components/SpinUpAgentModal";
 import {
   canonicalizeDefaultRole,
@@ -311,27 +310,11 @@ describe("SpinUpAgentModal", () => {
   it("offers all 11 default SPIN_UP_ROLES, matching RECAST_ROLE_OPTIONS, and Codex 6.1 models at the top of Codex options", () => {
     render(<SpinUpAgentModal isOpen onClose={() => {}} />);
 
-    expect(SPIN_UP_ROLES).toEqual([
-      { value: "assistant", label: "assistant (Assisting Engineer)" },
-      { value: "ui-developer", label: "ui-developer (UI & Full-Stack)" },
-      { value: "web-developer", label: "web-developer (Web Developer)" },
-      { value: "mobile-developer", label: "mobile-developer (Mobile Developer)" },
-      { value: "system-developer", label: "system-developer (System / Backend Developer)" },
-      { value: "data-engineer", label: "data-engineer (Data Engineer)" },
-      { value: "tester", label: "tester (QA & Tester)" },
-      { value: "strategist", label: "strategist (Research & Architecture Strategist)" },
-      { value: "journalist", label: "journalist (Journalist / Technical Scribe)" },
-      { value: "lead", label: "lead (Project Lead)" },
-      { value: "lab-manager", label: "lab-manager (Lab Manager)" },
-    ]);
-
     const roleSelect = screen.getByTestId("spin-up-role-select") as HTMLSelectElement;
-    expect(
-      Array.from(roleSelect.options).map((o) => ({
-        value: o.value,
-        label: o.textContent,
-      })),
-    ).toEqual([...SPIN_UP_ROLES]);
+    const options = Array.from(roleSelect.options);
+    expect(options.map(o => o.value).sort()).toEqual(RECAST_ROLE_OPTIONS.map(o => o.value === "lab_manager" ? "lab-manager" : o.value).sort());
+    expect(options.map(o => o.textContent)).toEqual(options.map(o => o.textContent).sort((a, b) => (a ?? "").localeCompare(b ?? "")));
+    expect(options.find(o => o.value === "assistant")?.textContent).toBe("Software Engineer");
 
     expect(RECAST_ROLE_OPTIONS).toEqual([
       { value: "lead", label: "lead" },

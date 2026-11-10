@@ -175,7 +175,7 @@ describe("authenticated editable role catalog", () => {
       "tester",
     ])
       expect(
-        within(select).getByRole("option", { name: new RegExp(value) }),
+        within(select).getByRole("option", { name: new RegExp(value.replace(/-/g, " "), "i") }),
       ).toHaveValue(value);
     fireEvent.change(select, { target: { value: "custom:council-chair" } });
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
@@ -209,7 +209,7 @@ describe("authenticated editable role catalog", () => {
         await within(select).findByRole("option", { name: "Council Chair" }),
       ).toHaveValue("custom:council-chair");
       expect(
-        within(select).getByRole("option", { name: "web-developer" }),
+        within(select).getByRole("option", { name: "Web Developer" }),
       ).toHaveValue("web-developer");
       fireEvent.change(select, { target: { value: "custom:council-chair" } });
       fireEvent.click(screen.getByTestId("recast-submit-btn-felix"));

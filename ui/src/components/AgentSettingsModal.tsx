@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
-import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
+import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { projectChoices } from "../hooks/useProjects";
 import {
@@ -139,10 +139,10 @@ export function formatExecutionMode(mode?: string | null): string {
 }
 
 export const THINKING_LEVEL_OPTIONS = [
-  { value: "low", label: "low (Fast)" },
-  { value: "medium", label: "medium (Balanced)" },
-  { value: "high", label: "high (Default)" },
-  { value: "xhigh", label: "xhigh (Maximum Reasoning)" },
+  { value: "low", label: "Fast" },
+  { value: "medium", label: "Balanced" },
+  { value: "high", label: "Default" },
+  { value: "xhigh", label: "Maximum Reasoning" },
 ] as const;
 
 export const CANONICAL_DESIRED_MCP_SERVERS = [
@@ -1000,12 +1000,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const baseThinkingOptions: ReadonlyArray<{ value: string; label: string }> =
     isAgySession
       ? THINKING_LEVEL_OPTIONS.map((opt) =>
-          opt.value === "high" ? { value: "high", label: "high" } : opt,
+          opt.value === "high" ? { value: "high", label: "High" } : opt,
         )
       : THINKING_LEVEL_OPTIONS;
   const thinkingOptions: ReadonlyArray<{ value: string; label: string }> =
     !effectiveThinking
-      ? [{ value: "", label: "unknown (select level)" }, ...baseThinkingOptions]
+      ? [{ value: "", label: "Select a thinking level" }, ...baseThinkingOptions]
       : !baseThinkingOptions.some((opt) => opt.value === effectiveThinking)
         ? [{ value: effectiveThinking, label: effectiveThinking }, ...baseThinkingOptions]
         : baseThinkingOptions;
@@ -3045,9 +3045,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
           // The hub takes a project slug; the dropdown shows the display name.
           const { choices: projectOptions, value: recastProjectValue } =
             projectChoices(projects, recastProject);
-          const hasRoleOption =
-            recastRole === CREATE_CUSTOM_ROLE_VALUE ||
-            recastRoleOptions.some((opt) => opt.value === recastRole);
 
           return (
             <div
@@ -3174,10 +3171,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                         setRecastConflict(null);
                       }}
                     >
-                      {!hasRoleOption && (
-                        <option value={recastRole}>{roleLabel(recastRole, roleCatalog.roles)}</option>
-                      )}
-                      {recastRoleOptions.map((opt) => (
+                      {selectedRoleOptions(recastRoleOptions, recastRole, roleCatalog.roles).map((opt) => (
                         <option key={opt.value} value={opt.value}>
                           {opt.label}
                         </option>

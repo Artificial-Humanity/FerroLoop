@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
-import { roleLabel, roleOptions, useRoles } from "../hooks/useRoles";
+import { roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import {
   formatModelOptionLabel,
   getVendorModelOptions,
 } from "./ChatPane";
+import { RECAST_ROLE_OPTIONS } from "./SettingsModal";
 import { projectLabel } from "../hooks/useProjects";
 import {
   normalizeHydrationStatus,
@@ -27,30 +28,16 @@ export function spinUpProjectOptions(
 ): SpinUpProjectOption[] {
   return projects.map((p) => {
     const value = p.slug.trim().toLowerCase();
-    return { value, label: `${value} (${projectLabel(p)})` };
+    return { value, label: projectLabel(p) };
   });
 }
 
-export const SPIN_UP_ROLES = [
-  { value: "assistant", label: "assistant (Assisting Engineer)" },
-  { value: "ui-developer", label: "ui-developer (UI & Full-Stack)" },
-  { value: "web-developer", label: "web-developer (Web Developer)" },
-  { value: "mobile-developer", label: "mobile-developer (Mobile Developer)" },
-  { value: "system-developer", label: "system-developer (System / Backend Developer)" },
-  { value: "data-engineer", label: "data-engineer (Data Engineer)" },
-  { value: "tester", label: "tester (QA & Tester)" },
-  { value: "strategist", label: "strategist (Research & Architecture Strategist)" },
-  { value: "journalist", label: "journalist (Journalist / Technical Scribe)" },
-  { value: "lead", label: "lead (Project Lead)" },
-  { value: "lab-manager", label: "lab-manager (Lab Manager)" },
-] as const;
-
 export const SPIN_UP_VENDORS = [
-  { value: "claude", label: "claude (Claude Code CLI)" },
-  { value: "antigravity", label: "antigravity (Google Antigravity)" },
-  { value: "codex", label: "codex (OpenAI Codex)" },
-  { value: "grok", label: "grok (xAI Grok)" },
-  { value: "muse", label: "muse (Muse Code)" },
+  { value: "claude", label: "Claude Code CLI" },
+  { value: "antigravity", label: "Google Antigravity" },
+  { value: "codex", label: "OpenAI Codex" },
+  { value: "grok", label: "xAI Grok" },
+  { value: "muse", label: "Muse Code" },
 ] as const;
 
 export interface SpinUpAgentModalProps {
@@ -849,7 +836,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   apiClient,
 }) => {
   const catalog = useRoles(isOpen, apiClient);
-  const roles = roleOptions(SPIN_UP_ROLES, catalog.roles);
+  const roles = roleOptions(RECAST_ROLE_OPTIONS.map((r) => r.value === "lab_manager" ? { ...r, value: "lab-manager" } : r), catalog.roles);
   const [persona, setPersona] = useState("");
   const [project, setProject] = useState<string>(() =>
     resolveSpinUpProject(initialProject, projects),
@@ -1208,8 +1195,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 disabled={submitting}
                 style={{ width: "100%" }}
               >
-                {!roles.some((r) => r.value === role) && <option value={role}>{roleLabel(role, catalog.roles)}</option>}
-                {roles.map((r) => (
+                {selectedRoleOptions(roles, role, catalog.roles).map((r) => (
                   <option key={r.value} value={r.value}>
                     {r.label}
                   </option>
