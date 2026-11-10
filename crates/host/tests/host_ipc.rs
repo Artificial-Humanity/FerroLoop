@@ -374,8 +374,9 @@ impl EventLog {
     fn subscribe(endpoint: &HostEndpoint, filter: Option<&str>) -> Self {
         let events = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let (subscribed_tx, subscribed_rx) = std::sync::mpsc::sync_channel(1);
         let endpoint = endpoint.clone();
-        let filter = filter.map(sid);
+        let session_filter = filter.map(sid);
         let sink = Arc::clone(&events);
         let flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
@@ -384,18 +385,22 @@ impl EventLog {
                 .build()
                 .expect("runtime");
             let mut stream = None;
+            let mut last_err = None;
             let deadline = Instant::now() + Duration::from_secs(3);
             while stream.is_none() && Instant::now() < deadline {
-                stream = runtime
-                    .block_on(fl_host_proto::events(&endpoint, filter.clone()))
-                    .ok();
-                if stream.is_none() {
-                    thread::sleep(Duration::from_millis(20));
+                match runtime.block_on(fl_host_proto::events(&endpoint, session_filter.clone())) {
+                    Ok(s) => stream = Some(s),
+                    Err(err) => {
+                        last_err = Some(err);
+                        thread::sleep(Duration::from_millis(20));
+                    }
                 }
             }
             let Some(mut stream) = stream else {
+                let _ = subscribed_tx.send(Err(last_err));
                 return;
             };
+            let _ = subscribed_tx.send(Ok(()));
             while !flag.load(Ordering::SeqCst) {
                 match runtime.block_on(async {
                     tokio::time::timeout(Duration::from_millis(100), stream.next()).await
@@ -406,6 +411,18 @@ impl EventLog {
                 }
             }
         });
+        match subscribed_rx
+            .recv()
+            .expect("EventLog subscriber thread exited before handshake")
+        {
+            Ok(()) => {}
+            Err(last_err) => {
+                let _ = thread.join();
+                panic!(
+                    "EventLog::subscribe timed out waiting for HostResponse::Subscribed (filter={filter:?}, last_err={last_err:?})"
+                );
+            }
+        }
         Self {
             events,
             stop,
@@ -1355,7 +1372,12 @@ fn subscriber_count_queue_and_terminal_slot_are_bounded() {
     for _ in 0..16 {
         parked.push(EventLog::subscribe(&endpoint, None));
     }
-    thread::sleep(Duration::from_millis(200));
+    for id in 1..=16 {
+        wait_file(
+            &daemon.paths.subscriber.join(format!("subscribed-{id}")),
+            |bytes| bytes == b"1",
+        );
+    }
     let mut rpc = Rpc::connect(&endpoint);
     let reason = failed_reason(
         rpc.call(|id| HostRequest::Events { id, session: None })
@@ -1366,7 +1388,9 @@ fn subscriber_count_queue_and_terminal_slot_are_bounded() {
 
     arm(&daemon.paths.subscriber, "before-exited");
     let log = EventLog::subscribe(&endpoint, Some("slot"));
-    thread::sleep(Duration::from_millis(100));
+    wait_file(&daemon.paths.subscriber.join("subscribed-17"), |bytes| {
+        bytes == b"1"
+    });
     let child = rpc.spawn("slot", &["stall"]);
     let epoch = epoch_of(&child);
     rpc.kill("slot", epoch, None).expect("kill");

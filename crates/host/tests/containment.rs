@@ -2333,11 +2333,13 @@ fn shutdown_cancels_retained_epoch_both_pumps() {
 
 #[test]
 fn hosted_owner_leader_exit_cleans_up_lingering_descendants() {
-    let (_dir, endpoint) = harness();
+    let (dir, endpoint) = harness();
     let host = open_host(&endpoint);
     for (idx, mode) in ["orphan", "orphan-linger"].into_iter().enumerate() {
         let name = format!("hosted-auto-{idx}");
-        let mut child_spec = spec(&name, &[mode]);
+        let gate = dir.path().join(format!("leader-exit-gate-{idx}"));
+        let gate_str = gate.to_str().expect("utf-8 gate path");
+        let mut child_spec = spec(&name, &[mode, gate_str]);
         child_spec
             .env
             .insert("FL_HOSTED_ID".into(), format!("hosted-owner-{idx}"));
@@ -2352,18 +2354,32 @@ fn hosted_owner_leader_exit_cleans_up_lingering_descendants() {
         let supervisor_start = process_identity(session.supervisor_pid())
             .expect("supervisor")
             .start;
-        let exit = session.wait_leader(Duration::from_secs(5)).expect("leader");
-        let leader_exited_at = Instant::now();
-        assert_eq!(exit.code, Some(0));
         assert!(
             same_process(pid, start),
-            "lingering child ({mode}) exited before post-leader-exit grace window"
+            "lingering child ({mode}) exited before leader exit"
         );
+        // Gate leader exit and stamp before releasing it so T_before_leader_exit < T_leader_exit <= T_daemon,
+        // avoiding race undercounts when the daemon observes leader exit before wait_leader returns.
+        let before_leader_exit = Instant::now();
+        std::fs::write(&gate, b"go").expect("release leader exit gate");
+        let exit = session.wait_leader(Duration::from_secs(5)).expect("leader");
+        assert_eq!(exit.code, Some(0));
+        let alive_after_leader = same_process(pid, start);
+        if before_leader_exit.elapsed() < HOSTED_LEADER_EXIT_GRACE {
+            assert!(
+                alive_after_leader,
+                "lingering child ({mode}) exited before post-leader-exit grace window"
+            );
+        }
         let report = session
             .wait_cleanup(HOSTED_LEADER_EXIT_GRACE + CLEANUP_DEADLINE + Duration::from_secs(2))
             .expect("auto cleanup after grace");
+        let elapsed = before_leader_exit.elapsed();
         assert!(report.complete);
-        assert!(leader_exited_at.elapsed() >= HOSTED_LEADER_EXIT_GRACE);
+        assert!(
+            elapsed >= HOSTED_LEADER_EXIT_GRACE,
+            "hosted post-leader-exit cleanup completed in {elapsed:?}, before {HOSTED_LEADER_EXIT_GRACE:?} grace ({mode})"
+        );
         assert!(matches!(session.state(), ChildState::CleanupComplete(_)));
         assert!(host.session_phase(session.session()).is_none());
         let registry = read_registry(host.endpoint()).expect("registry");
