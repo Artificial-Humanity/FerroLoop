@@ -3715,6 +3715,7 @@ pub(crate) mod tests {
                         cwd: None,
                     },
                     updated_at: now_at(),
+                    identity_at: None,
                     explicit: true,
                 }],
                 dispatch_diagnostics: None,
