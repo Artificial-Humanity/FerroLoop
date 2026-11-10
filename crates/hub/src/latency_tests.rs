@@ -2128,6 +2128,97 @@ mod route_lookup {
         assert_eq!(remover.join().unwrap(), 1);
         assert!(RouteTable::load(Some(&path)).get("ada").is_none());
     }
+
+    #[test]
+    fn hub_save_route_scan_replaces_scan_stamped_passive_agy_with_newer_codex_and_keeps_concurrent_explicit()
+     {
+        for initial_identity in [None, Some(At::from_unix_millis(9000))] {
+            for concurrent_explicit in [false, true] {
+                let home = TempDir::new().unwrap();
+                let path = routes_file(home.path());
+                let agy_transcript = home
+                    .path()
+                    .join(".gemini/antigravity-cli/brain/conv-kayla-100/.system_generated/logs/transcript.jsonl");
+                std::fs::create_dir_all(agy_transcript.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &agy_transcript,
+                    "{\"type\":\"USER_INPUT\",\"content\":\"fl wire register Kayla\"}\n",
+                )
+                .unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&agy_transcript)
+                    .unwrap()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(100))
+                    .unwrap();
+
+                let codex_tid = "01900000-0000-7000-8000-000000000209";
+                let codex_rollout = home.path().join(format!(
+                    ".codex/sessions/2026/11/09/rollout-2026-11-09T00-00-00-{codex_tid}.jsonl"
+                ));
+                std::fs::create_dir_all(codex_rollout.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &codex_rollout,
+                    format!(
+                        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{codex_tid}\",\"cwd\":\"/tmp\"}}}}\n\
+                         {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"fl wire register Kayla\"}}]}}}}\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&codex_rollout)
+                    .unwrap()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(200))
+                    .unwrap();
+
+                let mut base = RouteTable::default();
+                base.entries.insert(
+                    "kayla".into(),
+                    fl_wire::identity::RouteEntry {
+                        persona: "kayla".into(),
+                        route: agy("conv-kayla-100"),
+                        updated_at: At::from_unix_millis(9000),
+                        identity_at: initial_identity.clone(),
+                        explicit: false,
+                    },
+                );
+                base.save(Some(&path)).unwrap();
+
+                let mut scanned = RouteTable::load(Some(&path));
+                scanned.discover_routes(Some(home.path()), At::from_unix_millis(9500));
+
+                if concurrent_explicit {
+                    let mut live_writer = RouteTable::load(Some(&path));
+                    live_writer.upsert_explicit(
+                        "kayla",
+                        agy("conv-explicit-9200"),
+                        At::from_unix_millis(9200),
+                    );
+                    live_writer.save(Some(&path)).unwrap();
+                }
+
+                crate::discovery::save_route_scan(
+                    Some(home.path()),
+                    &base,
+                    &scanned,
+                    Instant::now(),
+                );
+                let saved = RouteTable::load(Some(&path));
+                let entry = saved.get("kayla").expect("kayla in saved routes");
+                if concurrent_explicit {
+                    assert!(entry.explicit);
+                    assert_eq!(entry.route, agy("conv-explicit-9200"));
+                } else {
+                    assert!(
+                        matches!(&entry.route, VendorRoute::Codex { thread_id, .. } if thread_id == codex_tid),
+                        "init={initial_identity:?}: expected Codex(200), got {entry:?}"
+                    );
+                    assert_eq!(entry.identity_at, Some(At::from_unix_millis(200)));
+                }
+            }
+        }
+    }
 }
 
 mod wire_send {
