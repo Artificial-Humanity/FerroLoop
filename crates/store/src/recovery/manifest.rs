@@ -34,6 +34,22 @@ pub enum MemberKind {
     VerificationReport,
     IndexConfiguration,
 }
+/// Config object lives only at `.batch-config/<batch_id>` under the configured
+/// backup root. Old strict readers reject this additive V1 field; new readers
+/// preserve old V1 encoding when the reference is absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedConfigReference {
+    pub batch_id: uuid::Uuid,
+    pub descriptor_sha256: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchConfigV1 {
+    pub version: u32,
+    pub batch_id: uuid::Uuid,
+    pub members: Vec<MemberChecksum>,
+}
 /// Typed members deliberately have no vault-key or arbitrary secret-path variant.
 /// The later publisher must allowlist paths/identities before copying anything.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +88,8 @@ pub struct BundleManifestV1 {
     pub manifest_version: u32,
     pub operation_id: String,
     pub batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_config: Option<SharedConfigReference>,
     pub catalog_store_identity: String,
     pub intrinsic_lineage: Availability<String>,
     pub source_map_sha256: String,
@@ -246,6 +264,7 @@ impl BuildIdentity {
 #[derive(Clone, Debug)]
 pub struct ManifestContext {
     pub batch_id: Option<String>,
+    pub shared_config: Option<SharedConfigReference>,
     pub source_map_sha256: String,
     pub creator_build_identity: BuildIdentity,
     pub retained_members: Vec<MemberChecksum>,
@@ -354,6 +373,7 @@ impl BundleManifestV1 {
             manifest_version: 1,
             operation_id: report.operation_id.clone(),
             batch_id: context.batch_id,
+            shared_config: context.shared_config,
             catalog_store_identity: expected.catalog_identity.clone(),
             intrinsic_lineage: d
                 .lineage

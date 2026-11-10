@@ -135,6 +135,7 @@ pub(super) struct MethodRule {
     pub(super) name: &'static str,
     pub(super) scope: Scope,
     pub(super) writes: bool,
+    pub(super) local_owner_only: bool,
 }
 
 const fn method(name: &'static str, scope: Scope, writes: bool) -> MethodRule {
@@ -142,6 +143,7 @@ const fn method(name: &'static str, scope: Scope, writes: bool) -> MethodRule {
         name,
         scope,
         writes,
+        local_owner_only: false,
     }
 }
 
@@ -188,6 +190,18 @@ pub(super) const METHODS: &[MethodRule] = &[
     method("create_vector_collection", Scope::Write, true),
     method("upsert_vector", Scope::Write, true),
     method("delete_vector", Scope::Write, true),
+    MethodRule {
+        name: "recovery_start",
+        scope: Scope::Admin,
+        writes: false,
+        local_owner_only: true,
+    },
+    MethodRule {
+        name: "recovery_status",
+        scope: Scope::Admin,
+        writes: false,
+        local_owner_only: true,
+    },
     method("checkpoint", Scope::Admin, false),
     method("compact", Scope::Admin, false),
     method("apply_sync_batches", Scope::Admin, true),
@@ -210,6 +224,21 @@ pub(super) fn authorize(scope: Scope, method: &str) -> Result<&'static MethodRul
             rule.scope.name(),
             scope.name()
         )));
+    }
+    Ok(rule)
+}
+
+/// Transport restriction comes from the same method capability row as scope.
+pub(super) fn authorize_transport(
+    scope: Scope,
+    method: &str,
+    local_owner: bool,
+) -> Result<&'static MethodRule, StoreError> {
+    let rule = authorize(scope, method)?;
+    if rule.local_owner_only && !local_owner {
+        return Err(backend(
+            "recovery control requires the local owner administrative principal",
+        ));
     }
     Ok(rule)
 }

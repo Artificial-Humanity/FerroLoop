@@ -31,6 +31,7 @@ pub(crate) struct CheckedBundle {
     bytes: u64,
     metadata_bytes: u64,
     held: Vec<(Member, PrivateFile)>,
+    shared_held: Vec<(Member, PrivateFile)>,
     directory_identity: (u64, u64),
 }
 impl CheckedBundle {
@@ -43,6 +44,9 @@ impl CheckedBundle {
         }
         for (_, file) in &self.held {
             file.unchanged_in(&dir.path, l)?;
+        }
+        for (_, file) in &self.shared_held {
+            file.unchanged(l)?;
         }
         let latest = check_bundle(dir, &self.manifest.operation_id, l)?;
         if !self.same_manifest(&latest) {
@@ -58,7 +62,7 @@ impl CheckedBundle {
         control: &PublicationIo,
         l: &OperationLimits,
     ) -> Result<(), RecoveryError> {
-        for (member, file) in &self.held {
+        for (member, file) in self.held.iter().chain(self.shared_held.iter()) {
             file.unchanged(l)?;
             control.sync(&file.file, *member, l)?;
             file.unchanged(l)?;
@@ -144,6 +148,30 @@ pub(crate) fn check_bundle(
         };
         held.push((kind, file));
     }
+    let shared_held = if let Some(reference) = &manifest.shared_config {
+        if manifest.retained_members.iter().any(|m| {
+            matches!(
+                m.kind,
+                MemberKind::ProtectedConfig | MemberKind::Warrants | MemberKind::VaultCiphertext
+            )
+        }) {
+            return Err(l.verification());
+        }
+        let parent = dir.path.parent().ok_or_else(|| l.verification())?;
+        let root = if parent.file_name().is_some_and(|n| n == ".staging") {
+            parent.parent().ok_or_else(|| l.verification())?
+        } else {
+            parent
+        };
+        check_shared_config(
+            &Dir::open(root, l)?,
+            reference,
+            manifest.batch_id.as_deref(),
+            l,
+        )?
+    } else {
+        Vec::new()
+    };
     let expected: ValidationExpectations = fs::read_json(dir, "validation.json", l)?;
     let profile: ValidationProfile = fs::read_json(dir, "profile.json", l)?;
     let report: VerificationReport = fs::read_json(dir, "report.json", l)?;
@@ -156,6 +184,7 @@ pub(crate) fn check_bundle(
         &report,
         ManifestContext {
             batch_id: manifest.batch_id.clone(),
+            shared_config: manifest.shared_config.clone(),
             source_map_sha256: manifest.source_map_sha256.clone(),
             creator_build_identity: manifest.creator_build_identity.clone(),
             retained_members: manifest.retained_members.clone(),
@@ -181,6 +210,7 @@ pub(crate) fn check_bundle(
         bytes,
         metadata_bytes,
         held,
+        shared_held,
         directory_identity: fs::identity(&dir.file, l)?,
     })
 }
@@ -469,4 +499,85 @@ pub(crate) fn reconcile(
         Err(_) if published => Ok(PublicationOutcome::OutcomeUnknown { operation_id: id }),
         Err(error) => Err(error),
     }
+}
+
+/// Verify the independent immutable config object under the configured root.
+/// Canonical batch IDs and fixed member names provide the entire path grammar.
+pub(crate) fn check_shared_config(
+    root: &Dir,
+    reference: &super::manifest::SharedConfigReference,
+    expected_batch: Option<&str>,
+    l: &OperationLimits,
+) -> Result<Vec<(Member, PrivateFile)>, RecoveryError> {
+    use super::manifest::BatchConfigV1;
+    if reference.batch_id.is_nil()
+        || expected_batch != Some(reference.batch_id.to_string().as_str())
+    {
+        return Err(l.verification());
+    }
+    let parent = Dir::open(&root.path.join(".batch-config"), l)?;
+    let dir = Dir::open(&parent.path.join(reference.batch_id.to_string()), l)?;
+    let descriptor = PrivateFile::open(&dir.path.join("config.json"), false, l)?;
+    let (descriptor_bytes, digest) = verify::hash_file(&descriptor.file, l)?;
+    if digest != reference.descriptor_sha256 {
+        return Err(l.verification());
+    }
+    let value: BatchConfigV1 = fs::read_json(&dir, "config.json", l)?;
+    if value.version != 1 || value.batch_id != reference.batch_id || value.members.len() > 3 {
+        return Err(l.verification());
+    }
+    let mut names = vec!["config.json".to_owned()];
+    let mut held = vec![(Member::Manifest, descriptor)];
+    let mut bytes = descriptor_bytes;
+    for member in value.members {
+        let (name, kind) = match member.kind {
+            MemberKind::ProtectedConfig => ("config.toml", Member::Config),
+            MemberKind::Warrants => ("warrants.json", Member::Warrants),
+            MemberKind::VaultCiphertext => ("vault.enc", Member::VaultCiphertext),
+            _ => return Err(l.verification()),
+        };
+        if member.relative_name != name || names.iter().any(|n| n == name) {
+            return Err(l.verification());
+        }
+        names.push(name.into());
+        bytes = bytes
+            .checked_add(member.bytes)
+            .ok_or_else(|| l.verification())?;
+        l.quota(bytes, l.byte_limit.min(512 << 20), "batch configuration")?;
+        let file = PrivateFile::open(&dir.path.join(name), false, l)?;
+        if verify::hash_file(&file.file, l)? != (member.bytes, member.sha256) {
+            return Err(l.verification());
+        }
+        held.push((kind, file));
+    }
+    names.sort();
+    if dir.members(l)? != names {
+        return Err(l.verification());
+    }
+    for (_, file) in &held {
+        file.unchanged(l)?;
+    }
+    dir.same_name(l)?;
+    parent.same_name(l)?;
+    root.same_name(l)?;
+    Ok(held)
+}
+
+pub(crate) fn retention_manifest(
+    bundle: &VerifiedBundle,
+    l: &OperationLimits,
+) -> Result<BundleManifestV1, RecoveryError> {
+    let dir = Dir::open(bundle.path(), l)?;
+    let operation = dir
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| l.verification())?;
+    let root = Dir::open(dir.path.parent().ok_or_else(|| l.verification())?, l)?;
+    let catalog = Dir::open(&root.path.join(".catalog"), l)?;
+    let checked = check_bundle(&dir, operation, l)?;
+    let receipt = checked_receipt(&catalog, &format!("{operation}.json"), &checked, l)?;
+    checked.validate_at(&dir, l)?;
+    receipt.unchanged(l)?;
+    Ok(checked.manifest)
 }

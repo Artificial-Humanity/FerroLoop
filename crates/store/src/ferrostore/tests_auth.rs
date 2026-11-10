@@ -1538,3 +1538,44 @@ fn a_request_id_is_per_credential(net: Net) {
     assert_eq!(store.get_doc("d", "x").unwrap(), None);
     assert_eq!(store.last_seq().unwrap(), seq + 1);
 }
+
+#[test]
+fn recovery_controls_require_local_owner_transport_in_addition_to_admin_scope() {
+    for method in ["recovery_start", "recovery_status"] {
+        assert!(auth::authorize_transport(Scope::Admin, method, true).is_ok());
+        for scope in [Scope::Read, Scope::Write, Scope::Admin] {
+            assert!(auth::authorize_transport(scope, method, false).is_err());
+        }
+        for scope in [Scope::Read, Scope::Write] {
+            assert!(auth::authorize_transport(scope, method, true).is_err());
+        }
+    }
+    for net in NETS {
+        let mut server = net.serve(FerroStore::in_memory(), psk_auth());
+        let client = net.psk_client(server.local_addr());
+        let request = crate::recovery::control::BatchRequest {
+            policy_id: "fixture".into(),
+            batch_id: uuid::Uuid::now_v7(),
+            members: vec![crate::recovery::control::MemberRequest {
+                store_id: "fixture".into(),
+                operation_id: uuid::Uuid::now_v7(),
+                scheduled_at_unix_seconds: None,
+                byte_cap: None,
+            }],
+        };
+        for method in ["recovery_start", "recovery_status"] {
+            assert!(
+                client
+                    .recovery_control(method, &request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("local owner administrative principal")
+            );
+        }
+        client
+            .put_doc("fixture", "after", &json!({"ok":true}))
+            .unwrap();
+        drop(client);
+        server.shutdown().unwrap();
+    }
+}

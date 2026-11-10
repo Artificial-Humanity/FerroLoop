@@ -2315,3 +2315,150 @@ fn enospc_and_edquot_at_every_actual_entry_write_and_allocation_are_clean() {
         );
     }
 }
+
+#[test]
+fn shared_batch_config_mutation_refuses_leaf_publication() {
+    use fl_store::recovery::backup::{
+        ApprovedConfig, ExcludedVaultKey, backup_with_shared_config, publish_batch_configs,
+    };
+    use fl_store::recovery::manifest::MemberKind;
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    let config = f._root.path().join("config.toml");
+    let key = f._root.path().join("vault.key");
+    fs::write(&config, b"fixture=true\n").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&key, b"EXCLUDED-SECRET-KEY").unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    let cm = fs::metadata(&config).unwrap();
+    let km = fs::metadata(&key).unwrap();
+    let mut request = f.request();
+    request.configs.push(ApprovedConfig {
+        kind: MemberKind::ProtectedConfig,
+        path: config,
+        identity: (cm.dev(), cm.ino()),
+        byte_limit: 4096,
+    });
+    request.excluded_vault_key = Some(ExcludedVaultKey {
+        path: key,
+        identity: (km.dev(), km.ino()),
+    });
+    let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let reference = publish_batch_configs(&request, &filesystem).unwrap();
+    request.configs.clear();
+    let copied = f
+        .destination
+        .join(".batch-config")
+        .join(reference.batch_id.to_string())
+        .join("config.toml");
+    fs::write(copied, b"tampered=true\n").unwrap();
+    assert!(
+        backup_with_shared_config(
+            &f.store,
+            &request,
+            Some(&reference),
+            &filesystem,
+            &CancelToken::new()
+        )
+        .is_err()
+    );
+    f.assert_source_usable();
+}
+
+#[test]
+fn shared_config_reference_is_once_per_batch_and_missing_or_cross_batch_is_refused() {
+    use fl_store::recovery::{
+        backup::{backup_with_shared_config, publish_batch_configs},
+        policy::{RecoveryLimits, RecoveryPolicy, select_retained},
+    };
+    let f = Fixture::new();
+    let request = f.request();
+    let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let reference = publish_batch_configs(&request, &filesystem).unwrap();
+    let repeated = publish_batch_configs(&request, &filesystem).unwrap();
+    assert_eq!(reference, repeated);
+    assert_eq!(
+        fs::read_dir(f.destination.join(".batch-config"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let mut wrong = reference.clone();
+    wrong.batch_id = uuid::Uuid::now_v7();
+    assert!(
+        backup_with_shared_config(
+            &f.store,
+            &request,
+            Some(&wrong),
+            &filesystem,
+            &CancelToken::new()
+        )
+        .is_err()
+    );
+    let bundle = match backup_with_shared_config(
+        &f.store,
+        &request,
+        Some(&reference),
+        &filesystem,
+        &CancelToken::new(),
+    )
+    .unwrap()
+    {
+        PublicationOutcome::Durable(b) => b,
+        other => panic!("{other:?}"),
+    };
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle.path().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["shared_config"]["batch_id"],
+        reference.batch_id.to_string()
+    );
+    let policy = RecoveryPolicy {
+        destination: f.destination.clone(),
+        policy_id: "fixture".into(),
+        store_id: "fixture".into(),
+        source_map_sha256: "a".repeat(64),
+        limits: Some(RecoveryLimits {
+            retained_pin_bytes: 64 << 20,
+            preparation_bytes: 128 << 20,
+            memory_bytes: 256 << 20,
+            disk_bytes: 64 << 20,
+            image_bytes: 16 << 10,
+            metadata_bytes: 128 << 10,
+            margin_bytes: 4096,
+            total_seconds: 30,
+        }),
+        ..RecoveryPolicy::default()
+    };
+    let selected = select_retained(
+        std::slice::from_ref(&bundle),
+        &policy,
+        std::time::SystemTime::now(),
+    )
+    .unwrap();
+    assert!(
+        selected
+            .retained_config_batches
+            .contains(&reference.batch_id.to_string())
+    );
+    assert!(selected.removable_config_batches.is_empty());
+    let object = f
+        .destination
+        .join(".batch-config")
+        .join(reference.batch_id.to_string());
+    fs::rename(&object, object.with_extension("missing")).unwrap();
+    assert!(select_retained(&[bundle], &policy, std::time::SystemTime::now()).is_err());
+    let mut second = f.request();
+    second.batch_id = request.batch_id;
+    assert!(
+        backup_with_shared_config(
+            &f.store,
+            &second,
+            Some(&reference),
+            &filesystem,
+            &CancelToken::new()
+        )
+        .is_err()
+    );
+    f.assert_source_usable();
+}
