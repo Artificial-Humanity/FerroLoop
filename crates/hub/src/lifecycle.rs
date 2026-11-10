@@ -8104,6 +8104,68 @@ fn resolve_project_lead<S: AgentRegistry>(
         .find(|a| a.status == AgentStatus::Active && a.role == AgentRole::Lead))
 }
 
+fn try_notify_crash_loop_lead<S: AgentRegistry + MessageStore>(
+    store: &S,
+    fresh: &HostedSessionRecord,
+) -> bool {
+    let subject = format!(
+        "Crash loop: {} stopped after {} automatic respawns",
+        fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
+    );
+    let body = format!(
+        "Hosted session `{}` (persona `{}`, vendor `{}`) stopped again after {} automatic respawns within a 10-minute window and has been left stopped (`stop_reason = \"crash_loop\"`). Inspect the failure and run manual restart once resolved.",
+        fresh.session_id, fresh.persona, fresh.vendor, AUTO_RESPAWN_MAX_IN_WINDOW
+    );
+    match resolve_project_lead(store, &fresh.project) {
+        Ok(Some(lead)) if !lead.name_key.eq_ignore_ascii_case(&fresh.persona) => {
+            match store.send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "system".to_string(),
+                sender_host: None,
+                to: WireAddress::AgentName(lead.name_key.clone()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject,
+                body,
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: stamp::now(),
+            }) {
+                Ok(_) => true,
+                Err(err) => {
+                    eprintln!(
+                        "hub: warning ({} / {}): failed to send crash-loop wire notice to `{}`: {err}",
+                        fresh.persona, fresh.session_id, lead.name_key
+                    );
+                    false
+                }
+            }
+        }
+        Ok(Some(_lead)) => {
+            // When the crash-looping session is itself the project Lead, do not send a
+            // self-addressed wire notice to a stopped session; the `session.crash_loop`
+            // FerroDeck WebSocket broadcast and hub warning log are the notice.
+            true
+        }
+        Ok(None) => {
+            // No active Lead is registered in this project; leave `crash_loop_notified`
+            // false so the wire notice is delivered if a Lead is registered before
+            // manual restart.
+            false
+        }
+        Err(err) => {
+            eprintln!(
+                "hub: warning ({} / {}): failed to resolve project Lead for crash-loop notice: {err}",
+                fresh.persona, fresh.session_id
+            );
+            false
+        }
+    }
+}
+
 /// Reconcile dead hosted sessions and automatically respawn eligible `on-failure` sessions that
 /// stopped due to [`STOP_REASON_RUNTIME_GONE`], enforcing exponential backoff (`30s`, `60s`, `120s`)
 /// and a crash-loop guard (`3` automatic respawns in `10` minutes).
@@ -8142,7 +8204,10 @@ where
                     && vendor_has_runtime(&r.vendor)
                     && r.status.eq_ignore_ascii_case(STATUS_STOPPED)
                     && r.restart_policy.eq_ignore_ascii_case("on-failure")
-                    && r.stop_reason.as_deref() == Some(STOP_REASON_RUNTIME_GONE)
+                    && matches!(
+                        r.stop_reason.as_deref(),
+                        Some(STOP_REASON_RUNTIME_GONE | STOP_REASON_CRASH_LOOP)
+                    )
             })
             .collect()
     };
@@ -8179,11 +8244,31 @@ where
             || !vendor_has_runtime(&fresh.vendor)
             || !fresh.status.eq_ignore_ascii_case(STATUS_STOPPED)
             || !fresh.restart_policy.eq_ignore_ascii_case("on-failure")
-            || fresh.stop_reason.as_deref() != Some(STOP_REASON_RUNTIME_GONE)
+            || !matches!(
+                fresh.stop_reason.as_deref(),
+                Some(STOP_REASON_RUNTIME_GONE | STOP_REASON_CRASH_LOOP)
+            )
         {
             continue;
         }
         let mut rstate = load_hosted_respawn_state(&*guard, &record.session_id);
+        if fresh.stop_reason.as_deref() == Some(STOP_REASON_CRASH_LOOP) {
+            if !rstate.crash_loop_notified && try_notify_crash_loop_lead(&*guard, &fresh) {
+                rstate.crash_loop_notified = true;
+                if let Err(err) = save_hosted_respawn_state(
+                    &*guard,
+                    &fresh.session_id,
+                    &rstate,
+                    AUTO_RESPAWN_ACTOR,
+                ) {
+                    eprintln!(
+                        "hub: warning ({} / {}): failed to save crash-loop respawn state: {err}",
+                        fresh.persona, fresh.session_id
+                    );
+                }
+            }
+            continue;
+        }
         let now = current_respawn_clock_ms();
         rstate
             .respawn_timestamps_ms
@@ -8199,83 +8284,9 @@ where
                 continue;
             }
             if !rstate.crash_loop_notified {
-                let subject = format!(
-                    "Crash loop: {} stopped after {} automatic respawns",
-                    fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
-                );
-                let body = format!(
-                    "Hosted session `{}` (persona `{}`, vendor `{}`) stopped again after {} automatic respawns within a 10-minute window and has been left stopped (`stop_reason = \"crash_loop\"`). Inspect the failure and run manual restart once resolved.",
-                    fresh.session_id, fresh.persona, fresh.vendor, AUTO_RESPAWN_MAX_IN_WINDOW
-                );
-                let notified = match resolve_project_lead(&*guard, &fresh.project) {
-                    Ok(Some(lead)) if !lead.name_key.eq_ignore_ascii_case(&fresh.persona) => {
-                        match guard.send_wire(SendWireArgs {
-                            id: None,
-                            sender_id: None,
-                            sender_name: "system".to_string(),
-                            sender_host: None,
-                            to: WireAddress::AgentName(lead.name_key.clone()),
-                            kind: MessageKind::Mail,
-                            urgency: MessageUrgency::Normal,
-                            durable: true,
-                            subject,
-                            body,
-                            reply_to: None,
-                            thread_id: None,
-                            deadline_at: None,
-                            at: stamp::now(),
-                        }) {
-                            Ok(_) => true,
-                            Err(err) => {
-                                eprintln!(
-                                    "hub: warning ({} / {}): failed to send crash-loop wire notice to `{}`: {err}",
-                                    fresh.persona, fresh.session_id, lead.name_key
-                                );
-                                false
-                            }
-                        }
-                    }
-                    Ok(Some(_lead)) => {
-                        // When the crash-looping session is itself the project Lead, do not send a
-                        // self-addressed wire notice to a stopped session; the `session.crash_loop`
-                        // FerroDeck WebSocket broadcast and hub warning log below are the notice.
-                        true
-                    }
-                    Ok(None) => {
-                        // No active Lead is registered in this project; leave `crash_loop_notified`
-                        // false so the wire notice is delivered if a Lead is registered before
-                        // manual restart.
-                        false
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "hub: warning ({} / {}): failed to resolve project Lead for crash-loop notice: {err}",
-                            fresh.persona, fresh.session_id
-                        );
-                        false
-                    }
-                };
-                rstate.crash_loop_notified = notified;
-                if let Err(err) = save_hosted_respawn_state(
-                    &*guard,
-                    &fresh.session_id,
-                    &rstate,
-                    AUTO_RESPAWN_ACTOR,
-                ) {
-                    eprintln!(
-                        "hub: warning ({} / {}): failed to save crash-loop respawn state: {err}",
-                        fresh.persona, fresh.session_id
-                    );
-                }
-                eprintln!(
-                    "hub: warning ({} / {}): crash-loop guard tripped after {} automatic respawns in 10 minutes; leaving session stopped",
-                    fresh.persona, fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
-                );
-                on_event(
-                    "session.crash_loop",
-                    serde_json::to_value(&fresh).unwrap_or_default(),
-                );
-            } else if let Err(err) =
+                rstate.crash_loop_notified = try_notify_crash_loop_lead(&*guard, &fresh);
+            }
+            if let Err(err) =
                 save_hosted_respawn_state(&*guard, &fresh.session_id, &rstate, AUTO_RESPAWN_ACTOR)
             {
                 eprintln!(
@@ -8283,6 +8294,14 @@ where
                     fresh.persona, fresh.session_id
                 );
             }
+            eprintln!(
+                "hub: warning ({} / {}): crash-loop guard tripped after {} automatic respawns in 10 minutes; leaving session stopped",
+                fresh.persona, fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
+            );
+            on_event(
+                "session.crash_loop",
+                serde_json::to_value(&fresh).unwrap_or_default(),
+            );
             continue;
         }
         if let Some(next_ms) = rstate.next_allowed_at_ms
@@ -17971,19 +17990,6 @@ mod tests {
         rec.cwd = Some(cwd.to_string_lossy().into_owned());
         {
             let guard = state.open_store().unwrap();
-            guard
-                .register_agent(RegisterAgentArgs {
-                    display_name: "Ferris".into(),
-                    email: None,
-                    project: "ferroloop".into(),
-                    role: AgentRole::Lead,
-                    extra_areas: vec![],
-                    create_area: true,
-                    replace: true,
-                    at: stamp::now(),
-                    by: "owner".into(),
-                })
-                .unwrap();
             persist_hosted_session(&*guard, &rec, "owner").unwrap();
         }
 
@@ -18043,6 +18049,9 @@ mod tests {
         assert_eq!(fake.launches.borrow().len(), 3);
 
         // Crash #4 within 10 minutes (at t = base_ms + 100_000) -> trips crash-loop guard!
+        // Because no Lead is registered yet on `ferroloop`, `stop_reason` becomes `crash_loop` and
+        // `session.crash_loop` is broadcast, while `crash_loop_notified` stays `false` so the wire
+        // notice will be retried on a subsequent pass once a Lead exists.
         simulate_crash();
         assert!(mark_gone_and_step(base_ms + 95_000, &mut events).is_empty());
         assert!(
@@ -18050,7 +18059,14 @@ mod tests {
             "4th stop within 10m must trip crash-loop guard and not respawn"
         );
         assert_eq!(fake.launches.borrow().len(), 3);
-
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(ev, _)| ev == "session.crash_loop")
+                .count(),
+            1,
+            "must broadcast session.crash_loop once on transition to crash_loop"
+        );
         {
             let guard = state.open_store().unwrap();
             let stopped = find_hosted_session(&*guard, &["codex:crashy"])
@@ -18060,8 +18076,37 @@ mod tests {
             assert_eq!(stopped.stop_reason.as_deref(), Some(STOP_REASON_CRASH_LOOP));
             let rstate = load_hosted_respawn_state(&*guard, "codex:crashy");
             assert!(
+                !rstate.crash_loop_notified,
+                "crash_loop_notified must stay false when no project Lead was registered yet"
+            );
+
+            // Register Ferris as Lead on `ferroloop`; the next reconcile pass must retry and deliver
+            // the deferred wire notice even though `stop_reason` is already `crash_loop`.
+            guard
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Ferris".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Lead,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+
+        assert!(mark_gone_and_step(base_ms + 101_000, &mut events).is_empty());
+        // A second pass after notification must not send a duplicate wire notice or event.
+        assert!(mark_gone_and_step(base_ms + 102_000, &mut events).is_empty());
+
+        {
+            let guard = state.open_store().unwrap();
+            let rstate = load_hosted_respawn_state(&*guard, "codex:crashy");
+            assert!(
                 rstate.crash_loop_notified,
-                "crash_loop_notified must be saved after send_wire succeeds"
+                "crash_loop_notified must be saved as true after retry delivers wire notice"
             );
 
             let ferris_inbox = guard
@@ -18073,7 +18118,7 @@ mod tests {
             assert_eq!(
                 ferris_inbox.len(),
                 1,
-                "must send exactly one crash-loop wire notice to project lead ferris"
+                "must send exactly one crash-loop wire notice to project lead ferris on retry"
             );
             assert!(
                 ferris_inbox[0]
@@ -18084,9 +18129,13 @@ mod tests {
                 ferris_inbox[0].message.subject
             );
         }
-        assert!(
-            events.iter().any(|(ev, _)| ev == "session.crash_loop"),
-            "must broadcast session.crash_loop event"
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(ev, _)| ev == "session.crash_loop")
+                .count(),
+            1,
+            "session.crash_loop must not be re-emitted on retry passes"
         );
 
         // Manual restart resets the crash-loop state and allows automatic respawn again.
