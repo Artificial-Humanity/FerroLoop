@@ -299,6 +299,22 @@ pub(super) fn validate_row_group_with(
     Ok(())
 }
 
+/// Recovery-only bounded row visitor. Normal open/scan paths remain unchanged.
+pub(super) fn visit_rows_for_recovery(
+    columns: &[ColumnDef],
+    groups: &[Vec<u8>],
+    limits: &Limits,
+    visit: &mut dyn FnMut(&[ColumnValue]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    for group in groups {
+        let indexed = index_group_with(group, columns, limits)?;
+        for row in decode_indexed_with(columns, &indexed, limits)? {
+            visit(&row)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn encode_row_group(
     columns: &[ColumnDef],
     rows: &[Vec<ColumnValue>],
