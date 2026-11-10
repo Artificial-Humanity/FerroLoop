@@ -130,8 +130,8 @@ fn main() {
         }
         "grandchild" => grandchild(false),
         "detach" => grandchild(true),
-        "orphan" => orphan(false),
-        "orphan-linger" => orphan(true),
+        "orphan" => orphan(false, rest.first().map(String::as_str)),
+        "orphan-linger" => orphan(true, rest.first().map(String::as_str)),
         "term-ignore" => term_ignore(),
         "dual-exit" => dual_exit(),
         "survive-eof" => {
@@ -178,15 +178,25 @@ fn main() {
             }
             let mut out = io::stdout();
             let batches = std::path::Path::new(rest.get(2).expect("batch gates"));
+            let mut producer_elapsed = std::time::Duration::ZERO;
             for batch in 0..20 {
                 while !batches.join(batch.to_string()).exists() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
+                // Measure the producer only after this batch is admitted. The
+                // parent deliberately gates batches on healthy-peer observation.
+                let started = std::time::Instant::now();
                 for index in batch * 10..(batch + 1) * 10 {
                     writeln!(out, "L{index}").expect("line");
                 }
                 out.flush().expect("batch flush");
+                producer_elapsed += started.elapsed();
             }
+            std::fs::write(
+                batches.join("producer-ns"),
+                format!("{}\n", producer_elapsed.as_nanos()),
+            )
+            .expect("producer timing");
             park();
         }
         "lines" => {
@@ -625,8 +635,17 @@ fn grandchild(detach: bool) {
     park();
 }
 
+fn wait_exit_gate(exit_gate: Option<&str>) {
+    if let Some(path) = exit_gate {
+        let gate = std::path::Path::new(path);
+        while !gate.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 #[cfg(unix)]
-fn orphan(ignore_signals: bool) {
+fn orphan(ignore_signals: bool, exit_gate: Option<&str>) {
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         exit(2);
@@ -655,12 +674,13 @@ fn orphan(ignore_signals: bool) {
     ready();
     println!("CHILD {} END", buf.trim());
     let _ = io::stdout().flush();
+    wait_exit_gate(exit_gate);
     unsafe { libc::_exit(0) };
 }
 
 #[cfg(not(unix))]
 #[allow(clippy::zombie_processes)] // The fixture deliberately orphans a live descendant.
-fn orphan(ignore_signals: bool) {
+fn orphan(ignore_signals: bool, exit_gate: Option<&str>) {
     let mode = if ignore_signals {
         "term-ignore"
     } else {
@@ -673,6 +693,7 @@ fn orphan(ignore_signals: bool) {
     ready();
     println!("CHILD {} END", child.id());
     let _ = io::stdout().flush();
+    wait_exit_gate(exit_gate);
     exit(0);
 }
 

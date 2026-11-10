@@ -76,6 +76,20 @@ aliases, unknown overrides and omitted roots prevent a complete status. No open,
 repair, migration, discovery query or auto-creating helper may be used to resolve
 an inventory entry. Metadata collection must not contact a store socket.
 
+The inventory implementation reports partial scans as `complete = false`. The
+CLI can return that metadata map when no config or deployment artifact needs to
+be read. Otherwise an incomplete candidate preflight refuses the artifact read:
+a hidden reverse `.fls` symlink could name even an artifact outside the unreadable
+directory. Library collection likewise defers all unit and executable reads when
+its candidate scan is incomplete, leaving digests unknown with explicit warnings.
+
+Config, deployment and unit artifacts retain the 1 MiB read limit. Installed
+executables are never invoked; their SHA-256 is streamed through a fixed 64 KiB
+buffer under a separate 512 MiB cap, including growth during the read. At most one
+extra byte is read to detect overflow. Oversized or unsafe artifacts have no
+digest. Both readers retain no-follow, regular-file, single-link, identity and
+store-alias guards. These are metadata digests, not store-content reads.
+
 For each file record:
 
 | Field group | Required data |
@@ -93,13 +107,21 @@ persistent store UUID and changes on compaction or restore. Resolve symlinks for
 identity but preserve each caller's acceptance rules: the hub refuses a symlinked
 project file even where library paths follow it. Report hardlinks as an unresolved
 ownership risk; no automatic unlink, merge or alias rewrite. Distinct files with
-similar names remain distinct.
+similar names remain distinct. Inventory identity metadata carries an explicit
+`alias_status` (`unknown`, `no_alias_observed`, or `review_required`); symlink and
+hardlink conflicts require ownership review. Older maps without the field decode
+as unknown. This adds no persistent store schema or intrinsic identity field.
 
 The collector must reuse or test parity with production path-resolution rules;
 it must not independently invent a third resolver. A `.fls` suffix forces ferro;
 otherwise `FL_STORE_BACKEND` selects the engine (default ferro), and a ferro
 logical `x.redb` resolves to `x.fls`. Legacy `.redb` siblings are listed separately
-as migration/history evidence, never treated as up-to-date backups.
+as migration/history evidence, never treated as up-to-date backups. Invalid
+`FL_STORE_BACKEND` values are refused by inventory engine selection (a `.fls`
+suffix still forces ferro). This deliberately differs from the hub's
+`physical_store_file_with` metadata helper, which falls back to the logical path
+on an invalid value and leaves the later opener to report the error. Inventory
+has no later store open, so it must not imply successful engine resolution.
 
 `config.toml` maps `project:<slug>` to `[[project]].store`; an absent binding can
 fall back to the workspace state store. The hub instead resolves a validated slug
@@ -107,6 +129,11 @@ under `~/.local/share/fl/{slug}.redb`, maps its backend, and can fall back to it
 own store when the project file is absent. An unmigrated redb-only project is a
 409, not that fallback. Preserve these as separate edges even when equal today.
 Explicitly flag a future config/hub disagreement before any recovery or cutover.
+The hub's own workspace edge is also distinct, even when it selects `fl.fls` at
+the same path as config. It reuses `resolve_hub_store_path`: `--db` then `FL_DB`,
+`[state].store`, the cwd-bound project, then the workspace default. Project hub
+fallbacks use this selected store. These edges describe source-derived selection
+for the supplied invocation/config/cwd, not an observed running daemon binding.
 
 No current explicit managed/standalone policy is established by these bindings.
 Record `declared_mode = unspecified_legacy_auto` for auto-open consumers, and
