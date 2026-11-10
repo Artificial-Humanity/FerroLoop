@@ -336,8 +336,9 @@ pub fn resolve_caller_with_source(
     let rpath = resolve_routes_path_for(env);
     let (persona, source) =
         resolve_persona_with_source(explicit, transcript, env.cwd, reg, Some(&rpath));
-    let has_env_persona_override =
-        std::env::var_os("AGENT_PERSONA").is_some() || std::env::var_os("AGENT_NAME").is_some();
+    let has_env_persona_override = std::env::var_os("AGENT_PERSONA").is_some()
+        || std::env::var_os("AGENT_NAME").is_some()
+        || std::env::var_os("FL_HOSTED_ID").is_some();
     let allow_route_capture = env.explicit_db.is_none() || resolve_routes_path().is_some();
     if explicit.is_none()
         && !has_env_persona_override
@@ -6563,5 +6564,96 @@ pub(crate) mod tests {
             std::env::remove_var("FL_WIRE_SOCKET");
             std::env::remove_var("FL_WIRE_ROUTES");
         }
+    }
+    fn muse_hook_resolves_persona_past_50_lines_and_via_fl_hosted_id() {
+        let rig = HookRig::new(None);
+        let session_dir = rig
+            .home()
+            .join(".local/share/muse/sessions/2026/11/10/muse-long-sid");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let transcript = session_dir.join("session.jsonl");
+
+        let mut lines: Vec<String> = (0..65)
+            .map(|i| {
+                json!({
+                    "schema_version": 1,
+                    "recorded_at": 1_793_104_000_000_000_i64 + i,
+                    "payload_type": "runtime.session",
+                    "payload": {
+                        "kind": "run",
+                        "event": { "kind": "step_completed", "step": i }
+                    }
+                })
+                .to_string()
+            })
+            .collect();
+        lines.push(
+            json!({
+                "schema_version": 1,
+                "recorded_at": 1_793_104_670_899_152_i64,
+                "payload_type": "runtime.user_intent.accepted",
+                "payload": {
+                    "model_messages": [{
+                        "role": "user",
+                        "content": "Take the name of Melisandre and take up residence in FerroLoop/ as the assistant."
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        for i in 0..10 {
+            lines.push(
+                json!({
+                    "schema_version": 1,
+                    "recorded_at": 1_793_105_000_000_000_i64 + i,
+                    "payload_type": "runtime.session",
+                    "payload": {
+                        "kind": "run",
+                        "event": { "kind": "tool_completed", "seq": i }
+                    }
+                })
+                .to_string(),
+            );
+        }
+        std::fs::write(&transcript, lines.join("\n")).unwrap();
+
+        // 1. Without FL_HOSTED_ID, the hook scans the bounded tail of the >50-line Muse transcript.
+        let out = rig.run(
+            "muse",
+            json!({
+                "event": "turn_end",
+                "session_id": "muse-long-sid",
+                "transcript_path": transcript,
+                "cwd": rig.dir.path(),
+            }),
+        );
+        assert_eq!(out, json!({}));
+        assert!(matches!(
+            rig.route_of("melisandre"),
+            Some(VendorRoute::Muse { ref session_id, .. }) if session_id == "muse-long-sid"
+        ));
+
+        // 2. With FL_HOSTED_ID=muse:melisandre, the hook resolves the persona even before/without
+        // transcript evidence.
+        let bare_transcript = session_dir.join("bare.jsonl");
+        std::fs::write(&bare_transcript, "{}\n").unwrap();
+        // SAFETY: `HookRig` holds `HOOK_ENV_LOCK` and restores `FL_HOSTED_ID` on drop.
+        unsafe {
+            std::env::set_var("FL_HOSTED_ID", "muse:melisandre");
+        }
+        let out = rig.run(
+            "muse",
+            json!({
+                "event": "turn_end",
+                "session_id": "muse-hosted-sid",
+                "transcript_path": bare_transcript,
+                "cwd": rig.dir.path(),
+            }),
+        );
+        assert_eq!(out, json!({}));
+        assert!(matches!(
+            rig.route_of("melisandre"),
+            Some(VendorRoute::Muse { ref session_id, .. }) if session_id == "muse-hosted-sid"
+        ));
     }
 }

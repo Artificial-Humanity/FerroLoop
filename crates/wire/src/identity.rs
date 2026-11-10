@@ -4894,34 +4894,98 @@ fn passive_agy_source(path: &Path) -> Result<(u64, String), &'static str> {
 }
 
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
-    scan_text_for_persona(&read_head_lines(path, max_lines)?, max_lines)
+    let (head_text, hit_eof) = read_head_lines_with_eof(path, max_lines)?;
+    if hit_eof {
+        return scan_text_for_persona(&head_text, max_lines);
+    }
+    if first_system_message_is_grok_subagent(&head_text)
+        || first_message_is_agy_subagent(&head_text)
+    {
+        return None;
+    }
+    let tail_lines = max_lines.max(TRANSCRIPT_TAIL_MIN_LINES);
+    let tail_text = read_tail_lines(path, tail_lines).unwrap_or_default();
+    if tail_text.is_empty() {
+        return scan_text_for_persona(&head_text, max_lines);
+    }
+    let combined = format!("{head_text}\n{tail_text}");
+    scan_text_for_persona(&combined, max_lines.saturating_add(tail_lines))
 }
 
 /// The most bytes [`read_head_lines`] reads for a transcript head.
 const TRANSCRIPT_HEAD_MAX_BYTES: u64 = 1 << 20;
 
+/// The most bytes [`read_tail_lines`] reads for a transcript tail.
+const TRANSCRIPT_TAIL_MAX_BYTES: u64 = 1 << 20;
+
+/// Minimum line window read from the tail of a long transcript when scanning for a persona.
+const TRANSCRIPT_TAIL_MIN_LINES: usize = 200;
+
 /// The first `max_lines` lines of `path` (at most [`TRANSCRIPT_HEAD_MAX_BYTES`] of it), without
 /// reading the rest of a transcript that may be many megabytes.
 fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
+    read_head_lines_with_eof(path, max_lines).map(|(text, _)| text)
+}
+
+fn read_head_lines_with_eof(path: &Path, max_lines: usize) -> Option<(String, bool)> {
     use std::io::{BufRead, Read};
 
     let file = fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file.take(TRANSCRIPT_HEAD_MAX_BYTES));
     let mut text = String::new();
     let mut line = Vec::new();
+    let mut hit_eof = false;
     for _ in 0..max_lines {
         line.clear();
         if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            hit_eof = reader.get_ref().limit() > 0;
             break;
         }
         text.push_str(&String::from_utf8_lossy(&line));
     }
-    Some(text)
+    if !hit_eof {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 && reader.get_ref().limit() > 0 {
+            hit_eof = true;
+        }
+    }
+    Some((text, hit_eof))
 }
 
-/// [`scan_transcript_for_persona`] for a Muse transcript: reads only the head of the file.
+/// The last `max_lines` lines of `path` (at most [`TRANSCRIPT_TAIL_MAX_BYTES`] from the end),
+/// dropping any partial leading line when seeking into the middle of the file.
+fn read_tail_lines(path: &Path, max_lines: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if max_lines == 0 {
+        return Some(String::new());
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(String::new());
+    }
+    let start = len.saturating_sub(TRANSCRIPT_TAIL_MAX_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.take(TRANSCRIPT_TAIL_MAX_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let slice = if start > 0 {
+        let idx = buf.iter().position(|&b| b == b'\n')?;
+        &buf[idx + 1..]
+    } else {
+        &buf[..]
+    };
+    let text = String::from_utf8_lossy(slice);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let keep_from = lines.len().saturating_sub(max_lines);
+    Some(lines[keep_from..].join("\n"))
+}
+
+/// [`scan_transcript_for_persona`] for a Muse transcript: reads the bounded head and tail of the file.
 fn scan_muse_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
-    scan_text_for_persona(&read_head_lines(path, max_lines)?, max_lines)
+    scan_transcript_for_persona(path, max_lines)
 }
 
 fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
@@ -5225,7 +5289,7 @@ pub fn detect_current_route() -> Option<VendorRoute> {
 
 /// Resolve the caller's persona name in strict priority order (spec §3.1):
 /// 1. Explicit flag/argument (`explicit`)
-/// 2. `AGENT_PERSONA` or `AGENT_NAME` environment variable
+/// 2. `AGENT_PERSONA`, `AGENT_NAME`, or `FL_HOSTED_ID` (`<vendor>:<persona>`) environment variable
 /// 3. Vendor transcript / session / route-cache inspection
 /// 4. CWD ancestor project lead lookup in `AgentRegistry`
 /// 5. `"unknown"`
@@ -5249,7 +5313,7 @@ pub fn resolve_persona(
 /// [`resolve_persona`] with its ambient sources injected: `load_routes`
 /// loads the route table (invoked only at the vendor route-matching
 /// stage, so earlier hits never touch disk) and `get_env` supplies every
-/// environment lookup (`AGENT_PERSONA`, vendor session ids, and the
+/// environment lookup (`AGENT_PERSONA`, `FL_HOSTED_ID`, vendor session ids, and the
 /// `HOME` + socket pair behind the Claude pid/process-tree probe). Tests
 /// pass a loader returning an empty table and a `get_env` that answers
 /// `None`, so a live agent session on the host can never leak into the
@@ -5273,10 +5337,10 @@ fn resolve_persona_with_sources(
     .0
 }
 
-/// Where a resolved persona came from. A persona the caller named (flag, `AGENT_PERSONA`) or
-/// that the hook session's own transcript declares is trusted to replace a route of another
-/// vendor. Everything else is inferred from the surroundings: the parent-process tree,
-/// inherited vendor session ids, the cwd.
+/// Where a resolved persona came from. A persona the caller named (flag, `AGENT_PERSONA`,
+/// `FL_HOSTED_ID`) or that the hook session's own transcript declares is trusted to replace a
+/// route of another vendor. Everything else is inferred from the surroundings: the parent-process
+/// tree, inherited vendor session ids, the cwd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersonaSource {
     Explicit,
@@ -5310,6 +5374,23 @@ pub fn resolve_persona_with_source(
     )
 }
 
+fn persona_from_hosted_id(raw: &str) -> Option<String> {
+    let (vendor, persona) = raw.trim().split_once(':')?;
+    let vendor = vendor.trim();
+    if vendor.is_empty()
+        || !vendor
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let persona = persona.trim();
+    if persona.contains(':') {
+        return None;
+    }
+    normalize_persona(persona)
+}
+
 fn resolve_persona_traced(
     explicit: Option<&str>,
     transcript_path: Option<&Path>,
@@ -5331,6 +5412,12 @@ fn resolve_persona_traced(
         {
             return (norm, PersonaSource::Env);
         }
+    }
+
+    if let Some(hosted_id) = get_str("FL_HOSTED_ID")
+        && let Some(norm) = persona_from_hosted_id(&hosted_id)
+    {
+        return (norm, PersonaSource::Env);
     }
 
     if let Some(tp) = transcript_path
@@ -13341,5 +13428,144 @@ mod tests {
             libc::kill(-(pane_pid as i32), libc::SIGKILL);
         }
         let _ = pane_shell.wait();
+    fn resolve_persona_traced_resolves_fl_hosted_id_before_transcript_and_after_agent_persona() {
+        assert_eq!(
+            persona_from_hosted_id("muse:Melisandre"),
+            Some("melisandre".to_string())
+        );
+        assert_eq!(
+            persona_from_hosted_id("claude:ferris"),
+            Some("ferris".to_string())
+        );
+        assert_eq!(persona_from_hosted_id("inherited"), None);
+        assert_eq!(persona_from_hosted_id(":melisandre"), None);
+        assert_eq!(persona_from_hosted_id("muse:"), None);
+        assert_eq!(persona_from_hosted_id("muse:a:b"), None);
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let tp = cwd.join("session.jsonl");
+        fs::write(
+            &tp,
+            "{\"type\":\"user\",\"content\":\"fl wire register Katie\"}\n",
+        )
+        .unwrap();
+
+        let hosted_env =
+            |k: &str| (k == "FL_HOSTED_ID").then(|| std::ffi::OsString::from("muse:Melisandre"));
+        let r =
+            resolve_persona_traced(None, Some(&tp), cwd, None, RouteTable::default, &hosted_env);
+        assert_eq!(r, ("melisandre".to_string(), PersonaSource::Env));
+
+        let both_env = |k: &str| match k {
+            "AGENT_PERSONA" => Some(std::ffi::OsString::from("Wesley")),
+            "FL_HOSTED_ID" => Some(std::ffi::OsString::from("muse:Melisandre")),
+            _ => None,
+        };
+        let r = resolve_persona_traced(None, Some(&tp), cwd, None, RouteTable::default, &both_env);
+        assert_eq!(r, ("wesley".to_string(), PersonaSource::Env));
+
+        let r = resolve_persona_traced(
+            Some("Wendy"),
+            Some(&tp),
+            cwd,
+            None,
+            RouteTable::default,
+            &both_env,
+        );
+        assert_eq!(r, ("wendy".to_string(), PersonaSource::Explicit));
+    }
+
+    #[test]
+    fn muse_transcript_over_50_lines_resolves_persona_from_bounded_tail_and_head() {
+        let tmp = TempDir::new().unwrap();
+        let dir = muse_sessions_dir(tmp.path())
+            .join("2026/10/27")
+            .join(MUSE_SESSION_A);
+        let mut lines: Vec<String> = (0..65)
+            .map(|i| {
+                serde_json::json!({
+                    "schema_version": 1,
+                    "recorded_at": 1_793_104_000_000_000_i64 + i,
+                    "payload_type": "runtime.session",
+                    "payload": {
+                        "kind": "run",
+                        "event": { "kind": "step_completed", "step": i }
+                    }
+                })
+                .to_string()
+            })
+            .collect();
+        lines.push(muse_transcript_rows(&muse_hydration_prompt("Melisandre")));
+        for i in 0..15 {
+            lines.push(
+                serde_json::json!({
+                    "schema_version": 1,
+                    "recorded_at": 1_793_105_000_000_000_i64 + i,
+                    "payload_type": "runtime.session",
+                    "payload": {
+                        "kind": "run",
+                        "event": { "kind": "tool_completed", "seq": i }
+                    }
+                })
+                .to_string(),
+            );
+        }
+        let session_path = write_muse_transcript(&dir, &lines.join("\n"));
+
+        assert_eq!(
+            scan_muse_transcript_for_persona(&session_path, 50).as_deref(),
+            Some("melisandre")
+        );
+        assert_eq!(
+            scan_transcript_for_persona(&session_path, 50).as_deref(),
+            Some("melisandre")
+        );
+        let none_env = |_: &str| None;
+        assert_eq!(
+            resolve_persona_traced(
+                None,
+                Some(&session_path),
+                tmp.path(),
+                None,
+                RouteTable::default,
+                &none_env,
+            ),
+            ("melisandre".to_string(), PersonaSource::Transcript)
+        );
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(tmp.path()), At::from_unix_millis(5));
+        let route =
+            muse_route_of(&table, "melisandre").expect("long muse transcript resolves melisandre");
+        let (session_id, _, _) = muse_parts(&route);
+        assert_eq!(session_id, MUSE_SESSION_A);
+
+        // Early hydration prompt in head + 250 lines of activity still resolves from head.
+        let mut head_lines = vec![muse_transcript_rows(&muse_hydration_prompt("Kacey"))];
+        for i in 0..250 {
+            head_lines.push(
+                serde_json::json!({
+                    "schema_version": 1,
+                    "recorded_at": 1_793_106_000_000_000_i64 + i,
+                    "payload_type": "runtime.session",
+                    "payload": {
+                        "kind": "run",
+                        "event": { "kind": "tool_completed", "seq": i }
+                    }
+                })
+                .to_string(),
+            );
+        }
+        let head_session = write_muse_transcript(
+            &muse_sessions_dir(tmp.path())
+                .join("2026/10/27")
+                .join(MUSE_SESSION_B),
+            &head_lines.join("\n"),
+        );
+        assert_eq!(
+            scan_transcript_for_persona(&head_session, 50).as_deref(),
+            Some("kacey")
+        );
     }
 }
