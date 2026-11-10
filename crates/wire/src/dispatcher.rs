@@ -8900,7 +8900,12 @@ exit 1"#,
             let deadline = Instant::now() + Duration::from_secs(3);
             let status = loop {
                 let mut c = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
-                let LocalResponse::Status(st) = c.request(&LocalRequest::Status).unwrap() else {
+                let LocalResponse::Status(st) = c
+                    .request(&LocalRequest::Status {
+                        include_codex_queues: false,
+                    })
+                    .unwrap()
+                else {
                     panic!("expected Status");
                 };
                 if st
@@ -8950,7 +8955,12 @@ exit 1"#,
             assert_eq!(items[0].receipt.status, DeliveryStatus::Acked);
 
             let mut c = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
-            let LocalResponse::Status(st_after) = c.request(&LocalRequest::Status).unwrap() else {
+            let LocalResponse::Status(st_after) = c
+                .request(&LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+                .unwrap()
+            else {
                 panic!("expected Status");
             };
             assert!(

@@ -381,7 +381,12 @@ impl FixtureClient {
 }
 
 fn status(client: &mut FixtureClient) -> serde_json::Value {
-    let LocalResponse::Status(status) = client.request(&LocalRequest::Status).unwrap() else {
+    let LocalResponse::Status(status) = client
+        .request(&LocalRequest::Status {
+            include_codex_queues: false,
+        })
+        .unwrap()
+    else {
         panic!("expected Status")
     };
     serde_json::to_value(status).unwrap()
