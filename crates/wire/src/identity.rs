@@ -1108,6 +1108,13 @@ pub fn cmdline_tokens_is_vendor_cli(tokens: &[&str]) -> bool {
         let mut idx = 1;
         while idx < tokens.len() {
             let tok = tokens[idx].trim();
+            if matches!(
+                tok,
+                "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+            ) {
+                idx += 2;
+                continue;
+            }
             if tok.is_empty() || tok.starts_with('-') || tok.contains('=') {
                 idx += 1;
                 continue;
@@ -1194,6 +1201,152 @@ pub fn proc_is_vendor_cli(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// True when `pid` is a shell or launcher wrapper process (`sh`, `bash`, `dash`, `zsh`, `fish`,
+/// `ksh`, `csh`, `tcsh`, `tmux`, `env`) and not itself a vendor CLI.
+pub fn proc_is_shell_wrapper(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if pid == 0 || proc_is_vendor_cli(pid) {
+            return false;
+        }
+        let is_shell_name = |raw: &str| -> bool {
+            let trimmed = raw.trim().trim_start_matches('-');
+            let Some(base) = Path::new(trimmed).file_name().and_then(|s| s.to_str()) else {
+                return false;
+            };
+            matches!(
+                base,
+                "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" | "tmux" | "env"
+            )
+        };
+        let proc_dir = Path::new("/proc").join(pid.to_string());
+        if let Ok(stat) = fs::read_to_string(proc_dir.join("stat"))
+            && let (Some(lparen), Some(rparen)) = (stat.find('('), stat.rfind(')'))
+            && lparen < rparen
+            && is_shell_name(&stat[lparen + 1..rparen])
+        {
+            return true;
+        }
+        if let Ok(raw) = fs::read(proc_dir.join("cmdline"))
+            && let Some(first) = raw.split(|&b| b == 0).find(|s| !s.is_empty())
+            && is_shell_name(&String::from_utf8_lossy(first))
+        {
+            return true;
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Walk `/proc/<pid>/stat` parent pointers (up to 16 hops) from `start_pid` and return the PID of
+/// `start_pid` itself or its nearest ancestor that [`proc_is_vendor_cli`] recognizes as a vendor
+/// CLI process.
+pub fn find_nearest_vendor_cli_ancestor_pid(start_pid: u32) -> Option<u32> {
+    if start_pid == 0 {
+        return None;
+    }
+    let mut cur = start_pid;
+    for _ in 0..=16 {
+        if proc_is_vendor_cli(cur) {
+            return Some(cur);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let (ppid, _) = proc_ppid_and_start_time(cur)?;
+            if ppid <= 1 || ppid == cur {
+                return proc_is_vendor_cli(ppid).then_some(ppid);
+            }
+            cur = ppid;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_direct_children(parent_pid: u32) -> Vec<u32> {
+    if parent_pid == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let children_path = Path::new("/proc")
+        .join(parent_pid.to_string())
+        .join("task")
+        .join(parent_pid.to_string())
+        .join("children");
+    if let Ok(children) = fs::read_to_string(children_path) {
+        for tok in children.split_whitespace() {
+            if let Ok(child_pid) = tok.parse::<u32>()
+                && child_pid > 0
+                && child_pid != parent_pid
+                && !out.contains(&child_pid)
+            {
+                out.push(child_pid);
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(child_pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&p| p > 0 && p != parent_pid)
+            else {
+                continue;
+            };
+            if !out.contains(&child_pid)
+                && proc_ppid_and_start_time(child_pid).is_some_and(|(ppid, _)| ppid == parent_pid)
+            {
+                out.push(child_pid);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve the vendor CLI PID for a runtime or tmux pane root PID:
+/// - Returns `None` when `root_pid == 0`.
+/// - Returns `Some(root_pid)` when `proc_is_vendor_cli(root_pid)` is `true`.
+/// - Scans `/proc` children of `root_pid` (up to depth 2 through shell wrappers
+///   [`proc_is_shell_wrapper`], e.g. `pane shell -> vendor CLI` or
+///   `pane shell -> sh -c -> vendor CLI`) for a descendant with `proc_is_vendor_cli(child_pid)`.
+/// - Otherwise falls back to `Some(root_pid)`.
+pub fn resolve_vendor_cli_pid(root_pid: u32) -> Option<u32> {
+    if root_pid == 0 {
+        return None;
+    }
+    if proc_is_vendor_cli(root_pid) {
+        return Some(root_pid);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let direct = proc_direct_children(root_pid);
+        for &child_pid in &direct {
+            if proc_is_vendor_cli(child_pid) {
+                return Some(child_pid);
+            }
+        }
+        for &child_pid in &direct {
+            if proc_is_shell_wrapper(child_pid) {
+                for grandchild_pid in proc_direct_children(child_pid) {
+                    if proc_is_vendor_cli(grandchild_pid) {
+                        return Some(grandchild_pid);
+                    }
+                }
+            }
+        }
+    }
+    Some(root_pid)
 }
 
 /// Walk `/proc/<pid>/stat` parent pointers (up to 16 hops) from `start_pid` to check whether
@@ -13050,6 +13203,12 @@ mod tests {
             "/usr/local/bin/claude"
         ]));
         assert!(cmdline_tokens_is_vendor_cli(&[
+            "env",
+            "-u",
+            "CLAUDECODE",
+            "/usr/local/bin/claude"
+        ]));
+        assert!(cmdline_tokens_is_vendor_cli(&[
             "bash",
             "/home/user/.local/bin/muse"
         ]));
@@ -13068,5 +13227,77 @@ mod tests {
             "-e",
             "console.log('claude')"
         ]));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn resolve_vendor_cli_pid_and_find_nearest_vendor_ancestor_traverse_shell_wrappers() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        assert_eq!(resolve_vendor_cli_pid(0), None);
+        // Synthetic non-zero PID with no vendor children falls back to `Some(root_pid)`.
+        assert_eq!(resolve_vendor_cli_pid(424_242), Some(424_242));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor_bin = tmp.path().join("grok");
+        std::os::unix::fs::symlink("/bin/sh", &vendor_bin).unwrap();
+
+        // Spawn: `sh (pane wrapper) -> sh -c (launcher wrapper) -> grok (vendor CLI) -> sh -c (hook shell)`
+        let script = r#"
+            sh -c '"$1" -c '\''echo "VENDOR_PID=$$"; sh -c "echo HOOK_SH_PID=\$\$; sleep 60; :" & wait'\''; :' _ "$1" &
+            wait
+        "#;
+        let mut pane_shell = Command::new("sh")
+            .args(["-c", script, "_", vendor_bin.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn pane wrapper tree");
+        let pane_pid = pane_shell.id();
+        let stdout = pane_shell.stdout.take().expect("stdout piped");
+        let mut reader = BufReader::new(stdout);
+        let mut vendor_pid: Option<u32> = None;
+        let mut hook_sh_pid: Option<u32> = None;
+        let mut line = String::new();
+        while vendor_pid.is_none() || hook_sh_pid.is_none() {
+            line.clear();
+            let n = reader.read_line(&mut line).expect("read stdout line");
+            assert!(n > 0, "unexpected EOF waiting for child PIDs");
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("VENDOR_PID=") {
+                vendor_pid = Some(rest.parse().expect("parse VENDOR_PID"));
+            } else if let Some(rest) = trimmed.strip_prefix("HOOK_SH_PID=") {
+                hook_sh_pid = Some(rest.parse().expect("parse HOOK_SH_PID"));
+            }
+        }
+        let vendor_pid = vendor_pid.unwrap();
+        let hook_sh_pid = hook_sh_pid.unwrap();
+
+        assert!(proc_is_shell_wrapper(pane_pid));
+        assert!(proc_is_vendor_cli(vendor_pid));
+        assert!(!proc_is_shell_wrapper(vendor_pid));
+        assert!(proc_is_shell_wrapper(hook_sh_pid));
+
+        // `resolve_vendor_cli_pid` resolves `pane_pid` (depth-2 through `sh -c`) to `vendor_pid`,
+        // and returns `Some(vendor_pid)` when given `vendor_pid` directly.
+        assert_eq!(resolve_vendor_cli_pid(pane_pid), Some(vendor_pid));
+        assert_eq!(resolve_vendor_cli_pid(vendor_pid), Some(vendor_pid));
+
+        // `find_nearest_vendor_cli_ancestor_pid` walks up from `hook_sh_pid` to `vendor_pid`.
+        assert_eq!(
+            find_nearest_vendor_cli_ancestor_pid(hook_sh_pid),
+            Some(vendor_pid)
+        );
+        assert_eq!(
+            find_nearest_vendor_cli_ancestor_pid(vendor_pid),
+            Some(vendor_pid)
+        );
+
+        unsafe {
+            libc::kill(-(pane_pid as i32), libc::SIGKILL);
+        }
+        let _ = pane_shell.wait();
     }
 }

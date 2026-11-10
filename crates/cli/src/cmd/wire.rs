@@ -459,6 +459,18 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
                 out.process_mismatch = true;
                 continue;
             }
+            let (effective_rec_pid, effective_rec_st) =
+                if fl_wire::identity::proc_is_shell_wrapper(rec_pid)
+                    && let Some(resolved_pid) = fl_wire::identity::resolve_vendor_cli_pid(rec_pid)
+                        .filter(|&p| p > 0 && p != rec_pid)
+                {
+                    (
+                        resolved_pid,
+                        fl_wire::identity::proc_start_time_ticks(resolved_pid),
+                    )
+                } else {
+                    (rec_pid, rec.pid_start_time)
+                };
             let same_vendor_session = match proc_ctx {
                 CallerProcessContext::Hook { session_id, .. } => {
                     !session_id.is_empty()
@@ -477,8 +489,8 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
                 CallerProcessContext::Hook { caller_pid, .. } => {
                     fl_wire::identity::pid_is_nearest_vendor_ancestor(
                         caller_pid,
-                        rec_pid,
-                        rec.pid_start_time,
+                        effective_rec_pid,
+                        effective_rec_st,
                     ) || (!fl_wire::identity::pid_is_self_or_ancestor(
                         caller_pid,
                         rec_pid,
@@ -497,14 +509,14 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
                     );
                     let ancestor_ok = fl_wire::identity::pid_is_nearest_vendor_ancestor(
                         self_pid,
-                        rec_pid,
-                        rec.pid_start_time,
+                        effective_rec_pid,
+                        effective_rec_st,
                     ) || (!is_descendant_of_rec && same_vendor_session);
                     let route_pid_ok = captured_route_pid.filter(|p| *p > 0).is_none_or(|rpid| {
                         fl_wire::identity::pid_is_nearest_vendor_ancestor(
                             rpid,
-                            rec_pid,
-                            rec.pid_start_time,
+                            effective_rec_pid,
+                            effective_rec_st,
                         ) || (!is_descendant_of_rec && same_vendor_session)
                     });
                     ancestor_ok && route_pid_ok
@@ -2543,13 +2555,16 @@ fn execute_register_with_hydration_env(
     }) {
         Ok(rec) => {
             sync_store_retired_personas(&store);
+            let ack_pid = captured_route_pid.or_else(|| {
+                fl_wire::identity::find_nearest_vendor_cli_ancestor_pid(std::process::id())
+            });
             if let Err(e) = fl_hub::lifecycle::record_hydration_ack_with_pid(
                 &store,
                 &rec.name_key,
                 replace,
                 verdict.effective_generation.as_deref(),
                 verdict.effective_hosted_id.as_deref(),
-                captured_route_pid,
+                ack_pid,
             ) {
                 eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
             }
@@ -5412,6 +5427,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn process_relationship_blocks_same_vendor_grok_muse_and_predeploy_claude_children_and_marks_unverified_process()
      {
         use std::io::{BufRead, BufReader};
