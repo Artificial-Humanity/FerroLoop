@@ -8558,7 +8558,14 @@ fn refresh_record_runtime_pid(
     unit: &str,
     record: &mut HostedSessionRecord,
 ) {
-    if !record.runtime_spawned || unit.is_empty() {
+    if !record.runtime_spawned {
+        return;
+    }
+    refresh_owned_runtime_pid(env, unit, record);
+}
+
+fn refresh_owned_runtime_pid(env: &LifecycleEnv<'_>, unit: &str, record: &mut HostedSessionRecord) {
+    if unit.is_empty() {
         return;
     }
     let leader_pid = env.runtime.recorded_leader_pid(unit, &record.session_id);
@@ -8568,9 +8575,11 @@ fn refresh_record_runtime_pid(
     if let Some(new_pid) = vendor_pid.filter(|&p| p > 0) {
         if record.pid.is_none()
             || record.pid == Some(new_pid)
-            || record
-                .pid
-                .is_some_and(fl_wire::identity::proc_is_shell_wrapper)
+            || record.pid.is_some_and(|p| {
+                fl_wire::identity::proc_alive_matching_start(p, record.pid_start_time)
+                    && fl_wire::identity::proc_is_shell_wrapper(p)
+                    && fl_wire::identity::resolve_vendor_cli_pid(p) == Some(new_pid)
+            })
             || !record.pid.is_some_and(|p| {
                 fl_wire::identity::proc_alive_matching_start(p, record.pid_start_time)
             })
@@ -8618,25 +8627,13 @@ pub fn reconcile_running_session_pids_with_store<S: StateStore>(
             .clone()
             .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
         let unit = env.runtime.unit(&target).to_string();
-        let leader_pid = if env.spawn_runtime
+        if env.spawn_runtime
             && vendor_has_runtime(&record.vendor)
             && !matches!(env.runtime.presence(&target), RuntimePresence::Gone)
-            && env.runtime.owns(&unit, &record.session_id)
         {
-            env.runtime.recorded_leader_pid(&unit, &record.session_id)
-        } else {
-            None
-        };
-        let runtime_pid = leader_pid.and_then(fl_wire::identity::resolve_vendor_cli_pid);
-        if let Some(rpid) = runtime_pid {
-            let start_ticks = fl_wire::identity::proc_start_time_ticks(rpid);
-            if record.pid != Some(rpid)
-                || (start_ticks.is_some() && record.pid_start_time != start_ticks)
-                || (leader_pid.is_some() && record.runtime_leader_pid != leader_pid)
-            {
-                record.runtime_leader_pid = leader_pid;
-                record.pid = Some(rpid);
-                record.pid_start_time = start_ticks;
+            let before = (record.pid, record.pid_start_time, record.runtime_leader_pid);
+            refresh_owned_runtime_pid(env, &unit, &mut record);
+            if before != (record.pid, record.pid_start_time, record.runtime_leader_pid) {
                 record.updated_at_ms = now_ms();
                 persist_hosted_session(store, &record, AUTO_RESPAWN_ACTOR)?;
                 updated += 1;
@@ -19147,6 +19144,20 @@ mod tests {
                 .unwrap()
             );
         }
+
+        // A replacement runtime with the same hosted id cannot overwrite a live
+        // reference belonging to a different process instance.
+        let mut live_other = upgraded.clone();
+        live_other.pid = Some(child_cli_pid);
+        live_other.pid_start_time = fl_wire::identity::proc_start_time_ticks(child_cli_pid);
+        live_other.runtime_leader_pid = Some(child_cli_pid);
+        persist_hosted_session(&store, &live_other, "owner").unwrap();
+        reconcile_running_session_pids_with_store(&env, &store).unwrap();
+        let retained = get_hosted_session_by_id(&store, "grok:ada")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.pid, Some(child_cli_pid));
+        assert_eq!(retained.runtime_leader_pid, Some(child_cli_pid));
 
         // 5. `reconcile_running_session_pids_with_store` backfills `pid` and `pid_start_time` when
         //    `record.pid` was `None` or a wrapper shell (`pane_pid`).

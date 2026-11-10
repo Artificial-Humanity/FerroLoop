@@ -13231,6 +13231,48 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn self_updated_agy_deleted_executable_is_nearest_vendor_ancestor() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        let temp = tempfile::tempdir().unwrap();
+        let updated = temp.path().join("agy.123456");
+        std::fs::copy("/bin/sh", &updated).unwrap();
+        let mut agent = std::process::Command::new(&updated)
+            .arg0("/home/lmcfarlin/.local/bin/agy")
+            .args(["-c", "sh -c 'echo HOOK:$$; sleep 60; :' & wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = agent.id();
+        let hook = BufReader::new(agent.stdout.take().unwrap())
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let hook_pid: u32 = hook.strip_prefix("HOOK:").unwrap().parse().unwrap();
+        std::fs::remove_file(&updated).unwrap();
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+        let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        let recognised = proc_is_vendor_cli(pid);
+        let nearest = find_nearest_vendor_cli_ancestor_pid(hook_pid);
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        let _ = agent.wait();
+        assert!(exe.to_string_lossy().ends_with(" (deleted)"));
+        assert_eq!(comm.trim(), "agy.123456");
+        assert_eq!(
+            argv.split(|&b| b == 0).next().unwrap(),
+            b"/home/lmcfarlin/.local/bin/agy"
+        );
+        assert!(recognised);
+        assert_eq!(nearest, Some(pid));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn resolve_vendor_cli_pid_and_find_nearest_vendor_ancestor_traverse_shell_wrappers() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::process::CommandExt;
