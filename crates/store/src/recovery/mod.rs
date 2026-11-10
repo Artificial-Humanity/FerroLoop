@@ -34,7 +34,7 @@ pub enum RecoveryError {
     Deadline { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: cancelled")]
     Cancelled { operation_id: uuid::Uuid },
-    #[error("recovery {operation_id}: source verification failed")]
+    #[error("recovery {operation_id}: image or captured expectations verification failed")]
     Verification { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: destination I/O failed")]
     Destination { operation_id: uuid::Uuid },
@@ -106,6 +106,52 @@ impl OperationLimits {
             memory_byte_limit,
             cancel,
             operation_id: uuid::Uuid::now_v7(),
+        }
+    }
+}
+
+pub mod manifest;
+pub mod profiles;
+pub(crate) mod verify;
+pub use manifest::{BundleManifestV1, ValidationExpectations, VerificationReport};
+pub use profiles::{ProfileKind, ValidationProfile};
+pub use verify::{
+    copy_and_verify, open_recovery_image_existing, reference_digest, verify_existing_copy,
+};
+
+impl OperationLimits {
+    pub(crate) fn check(&self) -> Result<(), RecoveryError> {
+        if self.cancel.is_cancelled() {
+            return Err(RecoveryError::Cancelled {
+                operation_id: self.operation_id,
+            });
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(RecoveryError::Deadline {
+                operation_id: self.operation_id,
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn quota(
+        &self,
+        bytes: u64,
+        limit: u64,
+        resource: &'static str,
+    ) -> Result<(), RecoveryError> {
+        self.check()?;
+        if bytes > limit {
+            Err(RecoveryError::Quota {
+                operation_id: self.operation_id,
+                resource,
+            })
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn verification(&self) -> RecoveryError {
+        RecoveryError::Verification {
+            operation_id: self.operation_id,
         }
     }
 }

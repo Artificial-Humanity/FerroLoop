@@ -15,7 +15,7 @@ mod manifest_ops;
 mod migrate;
 mod mq_runtime;
 mod mq_tier;
-mod recovery;
+pub(crate) mod recovery;
 mod remote_txn;
 mod retry;
 mod server;

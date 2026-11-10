@@ -71,6 +71,8 @@ pub struct CapturedStore {
     retained: u64,
     preparation: u64,
     writer_delay: Duration,
+    source_file_identity: (u64, u64),
+    captured_at_unix_ms: u128,
 }
 impl CapturedStore {
     pub fn sequence(&self) -> u64 {
@@ -460,6 +462,11 @@ impl FerroStore {
                         retained,
                         preparation: preparation_peak,
                         writer_delay: delay,
+                        source_file_identity: descriptor.id,
+                        captured_at_unix_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|_| check.verify())?
+                            .as_millis(),
                     });
                 }
                 break;
@@ -805,6 +812,91 @@ fn retained_bytes(state: &DocState, limit: u64, check: &Check<'_>) -> Result<u64
         }
     }
     Ok(a.bytes)
+}
+
+#[path = "recovery_validation.rs"]
+mod validation;
+pub(crate) use validation::expectations_from_reader;
+
+/// A fresh compatible read-only decode; never creates, migrates, refreshes a
+/// live cache or retains a disk writer. File admission is done by the caller.
+pub(crate) fn decode_existing(
+    file: &std::fs::File,
+    limits: &OperationLimits,
+) -> Result<(FerroStore, ImageDescriptor), RecoveryError> {
+    let check = Check {
+        id: limits.operation_id,
+        deadline: limits.deadline,
+        cancel: &limits.cancel,
+        clock: &RealClock,
+    };
+    check.check()?;
+    quota(
+        file.metadata().map_err(|_| check.verify())?.len(),
+        limits.byte_limit,
+        &check,
+        "image bytes",
+    )?;
+    let published = publication(file, &check)?;
+    // Recovery images have one standalone snapshot and no WAL/trailing data.
+    let end = add(
+        HEADER_BYTES,
+        published.sb.snapshot_length,
+        &check,
+        "image bytes",
+    )?;
+    if published.sb.snapshot_offset != HEADER_BYTES
+        || published.sb.snapshot_length < 12
+        || published.sb.wal_length != 0
+        || published.sb.wal_offset != end
+        || file.metadata().map_err(|_| check.verify())?.len() != end
+    {
+        return Err(check.verify());
+    }
+    let budget = CaptureBudget::new(
+        limits.deadline,
+        limits.memory_byte_limit / 2,
+        limits.memory_byte_limit / 2,
+        Duration::from_secs(1),
+    );
+    let (state, _) = prepare(file, &published.sb, &budget, &check)?;
+    let mut version = [0; 4];
+    file.read_exact_at(&mut version, HEADER_BYTES + 8)
+        .map_err(|_| check.verify())?;
+    let descriptor = validation::descriptor(&state, published, 0, &check)?;
+    if u32::from_le_bytes(version) != descriptor.snapshot_format {
+        return Err(check.verify());
+    }
+    let store = FerroStore::assemble(
+        Inner::Memory(Mutex::new(Arc::new(state))),
+        "recovery-image".into(),
+    );
+    Ok((store, descriptor))
+}
+
+impl CapturedStore {
+    pub fn expectations(
+        &self,
+        profile: &crate::recovery::ValidationProfile,
+        limits: &OperationLimits,
+    ) -> Result<crate::recovery::ValidationExpectations, RecoveryError> {
+        let check = Check {
+            id: limits.operation_id,
+            deadline: limits.deadline,
+            cancel: &limits.cancel,
+            clock: &RealClock,
+        };
+        let descriptor = validation::descriptor(&self.state, self.publication, 0, &check)?;
+        let store = FerroStore::assemble(
+            Inner::Memory(Mutex::new(Arc::clone(&self.state))),
+            "recovery-pin".into(),
+        );
+        let mut expected =
+            validation::expectations_from_reader(&store, descriptor, profile, limits)?;
+        expected.source_file_identity = Some(self.source_file_identity);
+        expected.captured_at_unix_ms = Some(self.captured_at_unix_ms);
+        Ok(expected)
+    }
 }
 
 #[cfg(test)]
