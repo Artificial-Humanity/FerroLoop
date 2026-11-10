@@ -452,9 +452,7 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
         if !env_matched {
             continue;
         }
-        if canonical_vendor == "claude"
-            && let Some(rec_pid) = rec.pid.filter(|p| *p > 0)
-        {
+        if let Some(rec_pid) = rec.pid.filter(|p| *p > 0) {
             if let Some(expected_st) = rec.pid_start_time
                 && fl_wire::identity::proc_start_time_ticks(rec_pid) != Some(expected_st)
             {
@@ -463,31 +461,52 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
             }
             let same_vendor_session = match proc_ctx {
                 CallerProcessContext::Hook { session_id, .. } => {
-                    !session_id.is_empty() && rec.vendor_session_id.as_deref() == Some(session_id)
+                    !session_id.is_empty()
+                        && fl_wire::identity::is_native_session_id(session_id)
+                        && rec.vendor_session_id.as_deref() == Some(session_id)
                 }
                 CallerProcessContext::Register { session_id, .. } => {
                     session_id.is_some_and(|sid| {
-                        !sid.is_empty() && rec.vendor_session_id.as_deref() == Some(sid)
+                        !sid.is_empty()
+                            && fl_wire::identity::is_native_session_id(sid)
+                            && rec.vendor_session_id.as_deref() == Some(sid)
                     })
                 }
             };
             let rel_ok = match proc_ctx {
                 CallerProcessContext::Hook { caller_pid, .. } => {
-                    caller_pid == rec_pid || same_vendor_session
+                    fl_wire::identity::pid_is_nearest_vendor_ancestor(
+                        caller_pid,
+                        rec_pid,
+                        rec.pid_start_time,
+                    ) || (!fl_wire::identity::pid_is_self_or_ancestor(
+                        caller_pid,
+                        rec_pid,
+                        rec.pid_start_time,
+                    ) && same_vendor_session)
                 }
                 CallerProcessContext::Register {
                     self_pid,
                     captured_route_pid,
                     ..
                 } => {
-                    let ancestor_ok = fl_wire::identity::pid_is_self_or_ancestor(
+                    let is_descendant_of_rec = fl_wire::identity::pid_is_self_or_ancestor(
                         self_pid,
                         rec_pid,
                         rec.pid_start_time,
-                    ) || same_vendor_session;
-                    let route_pid_ok = captured_route_pid
-                        .filter(|p| *p > 0)
-                        .is_none_or(|rpid| rpid == rec_pid || same_vendor_session);
+                    );
+                    let ancestor_ok = fl_wire::identity::pid_is_nearest_vendor_ancestor(
+                        self_pid,
+                        rec_pid,
+                        rec.pid_start_time,
+                    ) || (!is_descendant_of_rec && same_vendor_session);
+                    let route_pid_ok = captured_route_pid.filter(|p| *p > 0).is_none_or(|rpid| {
+                        fl_wire::identity::pid_is_nearest_vendor_ancestor(
+                            rpid,
+                            rec_pid,
+                            rec.pid_start_time,
+                        ) || (!is_descendant_of_rec && same_vendor_session)
+                    });
                     ancestor_ok && route_pid_ok
                 }
             };
@@ -500,7 +519,9 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
             }
         } else {
             out.verified = true;
-            out.unverified_process = true;
+            if !out.process_proven {
+                out.unverified_process = true;
+            }
         }
     }
     if out.live_gen_mismatch {
@@ -2049,11 +2070,10 @@ fn vendor_hook_response(
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u32>().ok())
     });
-    let hook_ppid = std::os::unix::process::parent_id();
     let hook_caller_pid = if canonical_hook_vendor == "claude" {
-        claude_sock_pid.unwrap_or(hook_ppid)
+        claude_sock_pid.unwrap_or_else(std::process::id)
     } else {
-        hook_ppid
+        std::process::id()
     };
 
     // Register route for Muse, Grok, Codex, or Claude
@@ -5394,6 +5414,9 @@ pub(crate) mod tests {
     #[test]
     fn process_relationship_blocks_same_vendor_grok_muse_and_predeploy_claude_children_and_marks_unverified_process()
      {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+
         let rig = HookRig::new(Some("feira"));
         let env = StateEnv {
             explicit_db: Some(&rig.db),
@@ -5401,31 +5424,23 @@ pub(crate) mod tests {
             cfg: &rig.cfg,
             cwd: rig.dir.path(),
         };
+        let gen0 = "01b20000-0000-7000-8000-000000000000";
         let gen1 = "01b20000-0000-7000-8000-000000000001";
         let gen2 = "01b20000-0000-7000-8000-000000000002";
 
-        let mut root_session_proc = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let root_pid = root_session_proc.id();
-        let root_st = fl_wire::identity::proc_start_time_ticks(root_pid);
-
-        // Spawn an intermediate `sh -c` process to model a realistic `CLI -> sh -c -> hook`
-        // process tree where the hook's `getppid()` is the intermediate shell (`sh_pid != root_pid`).
-        let mut sh_proc = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        let sh_pid = sh_proc.id();
-        assert_ne!(sh_pid, root_pid);
-
-        // 1. Hosted Grok and Muse sessions with `pid: Some(root_pid)`:
-        // Because Grok and Muse spawn hooks through an intermediate shell (`CLI -> sh -c -> hook`),
-        // `verify_hosted_session_in_store` must NOT refuse non-Claude vendors on `rec.pid` mismatch.
-        // Instead, the genuine hook registers cleanly and marks `unverified_process: true`.
-        let gen0 = "01b20000-0000-7000-8000-000000000000";
+        // 1. Real multi-level process-tree verification for Claude, Grok, and Muse:
+        // Positive tree: `Hosted CLI (hosted_pid) -> sh -c (hook_sh_pid) -> hook / register`
+        // Negative tree: `Hosted CLI (hosted_pid) -> sh -c -> Child CLI (child_cli_pid) -> sh -c (child_sh_pid) -> hook / register`
         for (vendor, inc_route) in [
+            (
+                "claude",
+                VendorRoute::Claude {
+                    pid: std::process::id(),
+                    session_id: "claude-old-sid".into(),
+                    socket_path: rig.dir.path().join(format!("{}.sock", std::process::id())),
+                    key_path: None,
+                },
+            ),
             (
                 "grok",
                 VendorRoute::Grok {
@@ -5445,8 +5460,92 @@ pub(crate) mod tests {
                 },
             ),
         ] {
+            let vendor_bin = rig.dir.path().join(vendor);
+            let _ = std::fs::remove_file(&vendor_bin);
+            std::os::unix::fs::symlink("/bin/sh", &vendor_bin).unwrap();
+
+            let script = r#"
+                sh -c 'echo "HOOK_SH:$$"; sleep 30; :' &
+                sh -c '"$1" -c '\''echo "CHILD_CLI:$$"; sh -c "echo CHILD_SH:\$\$; sleep 30; :" & wait'\''; :' _ "$1" &
+                wait
+            "#;
+            let mut hosted_cli = std::process::Command::new(&vendor_bin)
+                .args(["-c", script, "_", vendor_bin.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let hosted_pid = hosted_cli.id();
+            let hosted_st = fl_wire::identity::proc_start_time_ticks(hosted_pid);
+
+            let mut hook_sh_pid = None;
+            let mut child_cli_pid = None;
+            let mut child_sh_pid = None;
+            let stdout = hosted_cli.stdout.take().unwrap();
+            for line in BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if let Some(rest) = line.strip_prefix("HOOK_SH:") {
+                    hook_sh_pid = rest.trim().parse::<u32>().ok();
+                } else if let Some(rest) = line.strip_prefix("CHILD_CLI:") {
+                    child_cli_pid = rest.trim().parse::<u32>().ok();
+                } else if let Some(rest) = line.strip_prefix("CHILD_SH:") {
+                    child_sh_pid = rest.trim().parse::<u32>().ok();
+                }
+                if hook_sh_pid.is_some() && child_cli_pid.is_some() && child_sh_pid.is_some() {
+                    break;
+                }
+            }
+            let hook_sh_pid = hook_sh_pid.expect("spawned hook_sh_pid");
+            let child_cli_pid = child_cli_pid.expect("spawned child_cli_pid");
+            let child_sh_pid = child_sh_pid.expect("spawned child_sh_pid");
+
+            assert!(
+                fl_wire::identity::proc_is_vendor_cli(hosted_pid),
+                "hosted {vendor} root process must be recognized as vendor CLI"
+            );
+            assert!(
+                !fl_wire::identity::proc_is_vendor_cli(hook_sh_pid),
+                "intermediate sh -c under {vendor} must not be classified as vendor CLI"
+            );
+            assert!(
+                fl_wire::identity::proc_is_vendor_cli(child_cli_pid),
+                "child {vendor} CLI process must be recognized as vendor CLI"
+            );
+            assert!(
+                !fl_wire::identity::proc_is_vendor_cli(child_sh_pid),
+                "intermediate sh -c under child {vendor} CLI must not be classified as vendor CLI"
+            );
+            assert!(
+                fl_wire::identity::pid_is_nearest_vendor_ancestor(
+                    hook_sh_pid,
+                    hosted_pid,
+                    hosted_st
+                ),
+                "genuine {vendor} hook shell must resolve {vendor} root as nearest vendor ancestor"
+            );
+            assert!(
+                fl_wire::identity::pid_is_self_or_ancestor(child_sh_pid, hosted_pid, hosted_st),
+                "child {vendor} hook shell is still a descendant of hosted_pid"
+            );
+            assert!(
+                !fl_wire::identity::pid_is_nearest_vendor_ancestor(
+                    child_sh_pid,
+                    hosted_pid,
+                    hosted_st
+                ),
+                "child {vendor} hook shell must be stopped at child_cli_pid != hosted_pid"
+            );
+            assert!(
+                !fl_wire::identity::pid_is_nearest_vendor_ancestor(
+                    child_cli_pid,
+                    hosted_pid,
+                    hosted_st
+                ),
+                "child {vendor} CLI itself must not pass as nearest vendor ancestor for hosted_pid"
+            );
+
             let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
-            let rec = fl_hub::lifecycle::HostedSessionRecord {
+            let mut rec = fl_hub::lifecycle::HostedSessionRecord {
                 session_id: format!("{vendor}:feira"),
                 persona: "feira".into(),
                 project: "ferroloop".into(),
@@ -5470,42 +5569,19 @@ pub(crate) mod tests {
                 hydration_generation: Some(gen1.into()),
                 runtime_spawned: true,
                 tombstone_ids: Vec::new(),
-                vendor_session_id: Some(format!("{vendor}-new-sid")),
-                pid: Some(root_pid),
-                pid_start_time: root_st,
+                vendor_session_id: Some(format!("{vendor}-root-sid")),
+                pid: Some(hosted_pid),
+                pid_start_time: hosted_st,
                 created_at_ms: 1,
                 updated_at_ms: 1,
                 decommission_prepared_at_ms: None,
             };
             fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
 
-            // Verify directly with `sh_pid` (`CLI -> sh -c -> hook`) that `verify_hosted_session_in_store`
-            // succeeds (`verified: true`, `process_mismatch: false`, `unverified_process: true`).
-            let ver = verify_hosted_session_in_store(
-                &store,
-                vendor,
-                "feira",
-                Some(&format!("{vendor}:feira")),
-                Some(gen1),
-                CallerProcessContext::Hook {
-                    caller_pid: sh_pid,
-                    session_id: &format!("{vendor}-new-sid"),
-                },
-            );
-            assert!(ver.verified, "{vendor} hook via sh -c must verify");
-            assert!(
-                !ver.process_mismatch,
-                "{vendor} hook via sh -c must not fail with process_mismatch"
-            );
-            assert!(
-                ver.unverified_process,
-                "{vendor} hook must mark unverified_process: true"
-            );
-
             let mut table = RouteTable::default();
             table.upsert_explicit_with_meta(
                 "feira",
-                inc_route,
+                inc_route.clone(),
                 now_at(),
                 Some(format!("{vendor}:feira")),
                 Some(gen0.into()),
@@ -5513,11 +5589,163 @@ pub(crate) mod tests {
             );
             table.save(Some(&rig.routes_path())).unwrap();
 
+            // Positive Hook & Register (`Hosted CLI -> sh -c -> hook / register`):
+            let new_sid = format!("{vendor}-new-sid");
+            let ver_pos_hook = verify_hosted_session_in_store(
+                &store,
+                vendor,
+                "feira",
+                Some(&format!("{vendor}:feira")),
+                Some(gen1),
+                CallerProcessContext::Hook {
+                    caller_pid: hook_sh_pid,
+                    session_id: &new_sid,
+                },
+            );
+            assert!(
+                ver_pos_hook.verified && ver_pos_hook.process_proven,
+                "{vendor} hook via intermediate sh -c must verify and prove process"
+            );
+            assert!(!ver_pos_hook.process_mismatch);
+            assert!(!ver_pos_hook.unverified_process);
+
+            let ver_pos_reg = verify_hosted_session_in_store(
+                &store,
+                vendor,
+                "feira",
+                Some(&format!("{vendor}:feira")),
+                Some(gen1),
+                CallerProcessContext::Register {
+                    self_pid: hook_sh_pid,
+                    captured_route_pid: (vendor == "claude").then_some(hosted_pid),
+                    session_id: Some(&new_sid),
+                },
+            );
+            assert!(
+                ver_pos_reg.verified && ver_pos_reg.process_proven,
+                "{vendor} register via intermediate sh -c must verify and prove process"
+            );
+            assert!(!ver_pos_reg.process_mismatch);
+            assert!(!ver_pos_reg.unverified_process);
+
+            // Negative Hook & Register (`Hosted CLI -> sh -c -> Child CLI -> sh -c -> hook / register`):
+            let child_sid = format!("{vendor}-child-sid");
+            let ver_neg_hook = verify_hosted_session_in_store(
+                &store,
+                vendor,
+                "feira",
+                Some(&format!("{vendor}:feira")),
+                Some(gen1),
+                CallerProcessContext::Hook {
+                    caller_pid: child_sh_pid,
+                    session_id: &child_sid,
+                },
+            );
+            assert!(
+                !ver_neg_hook.verified && ver_neg_hook.process_mismatch,
+                "child {vendor} hook via intermediate sh -c must be rejected with process_mismatch"
+            );
+            assert!(!ver_neg_hook.unverified_process);
+
+            let guard_neg_hook = evaluate_registration_guard(RegistrationGuardArgs {
+                env: &env,
+                store: Some(&store),
+                persona: "feira",
+                challenger_vendor: Some(vendor),
+                challenger_adapter: RouteAdapter::from_vendor_str(vendor),
+                challenger_session_identity: Some((vendor, child_sid.as_str())),
+                challenger_pid: (vendor == "claude").then_some(child_cli_pid),
+                raw_hosted_id: Some(&format!("{vendor}:feira")),
+                raw_generation: Some(gen1),
+                env_persona: Some("feira"),
+                has_foreign_agy_env: false,
+                ignore_process_hosted_env: false,
+                replace: false,
+                proc_ctx: CallerProcessContext::Hook {
+                    caller_pid: child_sh_pid,
+                    session_id: &child_sid,
+                },
+            })
+            .unwrap_err();
+            assert_eq!(
+                guard_neg_hook.diagnostic.outcome,
+                RegistrationDiagnosticOutcome::Refused
+            );
+            assert_eq!(
+                guard_neg_hook.diagnostic.reason,
+                RegistrationConflictReason::HostedIdentityMismatch
+            );
+            assert!(!guard_neg_hook.diagnostic.unverified_process);
+
+            for neg_captured_pid in [
+                (vendor == "claude").then_some(child_cli_pid),
+                Some(hosted_pid),
+            ] {
+                let ver_neg_reg = verify_hosted_session_in_store(
+                    &store,
+                    vendor,
+                    "feira",
+                    Some(&format!("{vendor}:feira")),
+                    Some(gen1),
+                    CallerProcessContext::Register {
+                        self_pid: child_sh_pid,
+                        captured_route_pid: neg_captured_pid,
+                        session_id: Some(&child_sid),
+                    },
+                );
+                assert!(
+                    !ver_neg_reg.verified && ver_neg_reg.process_mismatch,
+                    "child {vendor} register via intermediate sh -c must be rejected (captured_pid={neg_captured_pid:?})"
+                );
+                let guard_neg_reg = evaluate_registration_guard(RegistrationGuardArgs {
+                    env: &env,
+                    store: Some(&store),
+                    persona: "feira",
+                    challenger_vendor: Some(vendor),
+                    challenger_adapter: RouteAdapter::from_vendor_str(vendor),
+                    challenger_session_identity: Some((vendor, child_sid.as_str())),
+                    challenger_pid: neg_captured_pid,
+                    raw_hosted_id: Some(&format!("{vendor}:feira")),
+                    raw_generation: Some(gen1),
+                    env_persona: Some("feira"),
+                    has_foreign_agy_env: false,
+                    ignore_process_hosted_env: false,
+                    replace: false,
+                    proc_ctx: CallerProcessContext::Register {
+                        self_pid: child_sh_pid,
+                        captured_route_pid: neg_captured_pid,
+                        session_id: Some(&child_sid),
+                    },
+                })
+                .unwrap_err();
+                assert_eq!(
+                    guard_neg_reg.diagnostic.outcome,
+                    RegistrationDiagnosticOutcome::Refused
+                );
+                assert_eq!(
+                    guard_neg_reg.diagnostic.reason,
+                    RegistrationConflictReason::HostedIdentityMismatch
+                );
+                assert!(!guard_neg_reg.diagnostic.unverified_process);
+            }
+
+            // End-to-end hook execution via `rig.run` when `rec.pid` matches the test process:
+            rec.pid = Some(std::process::id());
+            rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(std::process::id());
+            fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+
             unsafe {
                 std::env::set_var("FL_HOSTED_ID", format!("{vendor}:feira"));
                 std::env::set_var("AGENT_HYDRATION_GENERATION", gen1);
+                if vendor == "claude" {
+                    std::env::set_var(
+                        "CLAUDE_CODE_MESSAGING_SOCKET",
+                        rig.dir.path().join(format!("{}.sock", std::process::id())),
+                    );
+                } else {
+                    std::env::remove_var("CLAUDE_CODE_MESSAGING_SOCKET");
+                }
             }
-            let new_sid = format!("{vendor}-new-sid");
             let out = rig.run(
                 vendor,
                 json!({
@@ -5531,7 +5759,7 @@ pub(crate) mod tests {
             assert_eq!(
                 registered_route.session_identity(),
                 Some((vendor, new_sid.as_str())),
-                "genuine {vendor} hook through intermediate shell must register cleanly"
+                "genuine {vendor} hook must register cleanly"
             );
             let after = RouteTable::load(Some(&rig.routes_path()));
             let diag = after
@@ -5540,53 +5768,24 @@ pub(crate) mod tests {
                 .expect("replaced diagnostic recorded");
             assert_eq!(diag.outcome, RegistrationDiagnosticOutcome::Replaced);
             assert!(
-                diag.unverified_process,
-                "non-Claude hosted verification must record unverified_process: true"
+                !diag.unverified_process,
+                "process-proven {vendor} hosted verification must record unverified_process: false"
             );
+
+            // Clean up the spawned process group for this vendor iteration.
+            unsafe {
+                libc::kill(-(hosted_pid as i32), libc::SIGKILL);
+            }
+            let _ = hosted_cli.wait();
         }
 
-        // 1b. Hosted Claude session with `pid: Some(root_pid)`:
-        // a same-vendor Claude child process (`888999 != root_pid`) inheriting `FL_HOSTED_ID`
-        // and `AGENT_HYDRATION_GENERATION` is refused with `HostedIdentityMismatch`!
-        {
-            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
-            let rec_claude = fl_hub::lifecycle::HostedSessionRecord {
-                session_id: "claude:feira".into(),
-                persona: "feira".into(),
-                project: "ferroloop".into(),
-                role: "assistant".into(),
-                vendor: "claude".into(),
-                model: None,
-                thinking_level: None,
-                node_id: "local".into(),
-                hosted: true,
-                status: fl_hub::lifecycle::STATUS_RUNNING.into(),
-                stop_reason: None,
-                restart_policy: "on-failure".into(),
-                restart_count: 0,
-                tmux_target: Some("Feira:claude".into()),
-                host_session_id: Some("Feira.claude".into()),
-                cwd: None,
-                context_window: None,
-                posture: fl_core::permissions::Posture::Auto,
-                hydration_dispatched: true,
-                hydration_status: fl_hub::lifecycle::HydrationStatus::Confirmed,
-                hydration_generation: Some(gen1.into()),
-                runtime_spawned: true,
-                tombstone_ids: Vec::new(),
-                vendor_session_id: Some("claude-root-sid".into()),
-                pid: Some(root_pid),
-                pid_start_time: root_st,
-                created_at_ms: 1,
-                updated_at_ms: 1,
-                decommission_prepared_at_ms: None,
-            };
-            fl_hub::lifecycle::persist_hosted_session(&store, &rec_claude, "owner").unwrap();
-        }
+        // 1b. Hosted Claude session with `pid: Some(std::process::id())`:
+        // a same-vendor Claude child socket (`888999 != std::process::id()`) inheriting
+        // `FL_HOSTED_ID` and `AGENT_HYDRATION_GENERATION` is refused with `HostedIdentityMismatch`!
         let root_claude_route = VendorRoute::Claude {
-            pid: root_pid,
+            pid: std::process::id(),
             session_id: "claude-root-sid".into(),
-            socket_path: rig.dir.path().join(format!("{root_pid}.sock")),
+            socket_path: rig.dir.path().join(format!("{}.sock", std::process::id())),
             key_path: None,
         };
         let mut table = RouteTable::default();
@@ -5619,20 +5818,17 @@ pub(crate) mod tests {
         assert_eq!(rig.route_of("feira"), Some(root_claude_route));
         let after_claude_child = RouteTable::load(Some(&rig.routes_path()));
         assert_eq!(
-            after_claude_child
-                .registration_diagnostics
-                .last()
-                .map(|d| (d.outcome, d.reason)),
+            after_claude_child.registration_diagnostics.last().map(|d| (
+                d.outcome,
+                d.reason,
+                d.unverified_process
+            )),
             Some((
                 RegistrationDiagnosticOutcome::Refused,
                 RegistrationConflictReason::HostedIdentityMismatch,
+                false,
             ))
         );
-
-        let _ = sh_proc.kill();
-        let _ = sh_proc.wait();
-        let _ = root_session_proc.kill();
-        let _ = root_session_proc.wait();
 
         // 2. Pre-deploy Claude incumbent with `hydration_generation: None` and live `old_pid`
         // vs child Claude with inherited `AGENT_HYDRATION_GENERATION` and different PID (`999111 != std::process::id()`) -> refused!

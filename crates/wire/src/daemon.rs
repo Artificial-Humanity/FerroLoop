@@ -371,7 +371,7 @@ fn verify_peer_cred_for_hosted_claim(
         return client_claimed_verified;
     };
     if let Some(challenger_pid) = challenger_route.route_pid()
-        && !crate::identity::pid_is_self_or_ancestor(peer_pid, challenger_pid, None)
+        && !crate::identity::pid_is_nearest_vendor_ancestor(peer_pid, challenger_pid, None)
     {
         return false;
     }
@@ -389,7 +389,11 @@ fn verify_peer_cred_for_hosted_claim(
             {
                 return false;
             }
-            if !crate::identity::pid_is_self_or_ancestor(peer_pid, inc_pid, inc.pid_start_time) {
+            if !crate::identity::pid_is_nearest_vendor_ancestor(
+                peer_pid,
+                inc_pid,
+                inc.pid_start_time,
+            ) {
                 return false;
             }
         }

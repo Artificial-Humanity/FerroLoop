@@ -1068,6 +1068,134 @@ pub fn route_entry_proven_live(
     }
 }
 
+/// True when `name` (either a bare binary name or a path) has a basename matching one of the
+/// vendor CLI executables (`claude`, `grok`, `muse`, `codex`, `agy`, `antigravity`,
+/// `muse-bin-*`, `grok-*`).
+pub fn is_vendor_cli_binary_name(name: &str) -> bool {
+    let trimmed = name.trim().trim_start_matches('-');
+    let Some(base) = Path::new(trimmed).file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    matches!(
+        base,
+        "claude" | "grok" | "muse" | "codex" | "agy" | "antigravity"
+    ) || base.starts_with("muse-bin-")
+        || base.starts_with("grok-")
+}
+
+/// Inspect parsed `/proc/{pid}/cmdline` tokens to determine whether the command is a vendor CLI.
+///
+/// - Direct vendor binary or `arg0` override (`argv[0]` basename is a vendor CLI name): `true`.
+/// - JS runtime or `env` wrapper (`node`, `nodejs`, `bun`, `deno`, `env`): inspects the first
+///   positional script path argument after flags / `KEY=VALUE` assignments.
+/// - Shell wrapper (`sh`, `bash`, `dash`, `zsh`): returns `false` when `-c` is present (an
+///   intermediate command shell like `sh -c "..."` is not itself a vendor CLI), and otherwise
+///   checks the first positional script path argument (e.g. `bash /path/to/muse`).
+pub fn cmdline_tokens_is_vendor_cli(tokens: &[&str]) -> bool {
+    let Some(&argv0) = tokens.first() else {
+        return false;
+    };
+    if is_vendor_cli_binary_name(argv0) {
+        return true;
+    }
+    let Some(base0) = Path::new(argv0.trim().trim_start_matches('-'))
+        .file_name()
+        .and_then(|s| s.to_str())
+    else {
+        return false;
+    };
+    if base0 == "env" {
+        let mut idx = 1;
+        while idx < tokens.len() {
+            let tok = tokens[idx].trim();
+            if tok.is_empty() || tok.starts_with('-') || tok.contains('=') {
+                idx += 1;
+                continue;
+            }
+            return cmdline_tokens_is_vendor_cli(&tokens[idx..]);
+        }
+        return false;
+    }
+    if matches!(base0, "node" | "nodejs" | "bun" | "deno") {
+        let mut idx = 1;
+        while idx < tokens.len() {
+            let tok = tokens[idx].trim();
+            if tok.is_empty() {
+                idx += 1;
+                continue;
+            }
+            if matches!(tok, "-e" | "--eval" | "-p" | "--print") {
+                return false;
+            }
+            if matches!(tok, "-r" | "--require" | "--import" | "-C" | "--conditions") {
+                idx += 2;
+                continue;
+            }
+            if tok.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+            return is_vendor_cli_binary_name(tok);
+        }
+        return false;
+    }
+    if matches!(base0, "sh" | "bash" | "dash" | "zsh") {
+        for &tok in &tokens[1..] {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if tok == "-c"
+                || (tok.starts_with('-') && !tok.starts_with("--") && tok[1..].contains('c'))
+            {
+                return false;
+            }
+            if tok.starts_with('-') {
+                continue;
+            }
+            return is_vendor_cli_binary_name(tok);
+        }
+        return false;
+    }
+    false
+}
+
+/// True when `/proc/{pid}/stat` (`comm`) or `/proc/{pid}/cmdline` identifies `pid` as a vendor CLI
+/// process (`claude`, `grok`, `muse`, `codex`, `agy`, `antigravity`).
+pub fn proc_is_vendor_cli(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if pid == 0 {
+            return false;
+        }
+        let proc_dir = Path::new("/proc").join(pid.to_string());
+        if let Ok(stat) = fs::read_to_string(proc_dir.join("stat"))
+            && let (Some(lparen), Some(rparen)) = (stat.find('('), stat.rfind(')'))
+            && lparen < rparen
+            && is_vendor_cli_binary_name(&stat[lparen + 1..rparen])
+        {
+            return true;
+        }
+        if let Ok(raw) = fs::read(proc_dir.join("cmdline")) {
+            let parts: Vec<String> = raw
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            if cmdline_tokens_is_vendor_cli(&refs) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Walk `/proc/<pid>/stat` parent pointers (up to 16 hops) from `start_pid` to check whether
 /// `target_ancestor_pid` is `start_pid` itself or an ancestor of `start_pid`.
 /// If `expected_ancestor_start_time` is `Some(ticks)`, also verifies that `target_ancestor_pid`
@@ -1090,6 +1218,50 @@ pub fn pid_is_self_or_ancestor(
         }
         #[cfg(target_os = "linux")]
         {
+            let Some((ppid, _)) = proc_ppid_and_start_time(cur) else {
+                return false;
+            };
+            if ppid <= 1 || ppid == cur {
+                return target_ancestor_pid == ppid;
+            }
+            cur = ppid;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return false;
+        }
+    }
+    false
+}
+
+/// Walk `/proc/<pid>/stat` parent pointers (up to 16 hops) from `start_pid` to check whether
+/// `target_ancestor_pid` is `start_pid` itself or the *nearest* vendor CLI ancestor of `start_pid`.
+///
+/// Intermediate non-vendor processes (such as `sh -c`, `bash -c`, or `fl`) are traversed cleanly,
+/// whereas any intermediate vendor CLI process (`cur != target_ancestor_pid && proc_is_vendor_cli(cur)`)
+/// stops the walk and returns `false` so a child CLI spawned inside a hosted session cannot pass
+/// as the hosted parent session.
+pub fn pid_is_nearest_vendor_ancestor(
+    start_pid: u32,
+    target_ancestor_pid: u32,
+    expected_ancestor_start_time: Option<u64>,
+) -> bool {
+    if start_pid == 0 || target_ancestor_pid == 0 {
+        return false;
+    }
+    if !proc_alive_matching_start(target_ancestor_pid, expected_ancestor_start_time) {
+        return false;
+    }
+    let mut cur = start_pid;
+    for _ in 0..=16 {
+        if cur == target_ancestor_pid {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if proc_is_vendor_cli(cur) {
+                return false;
+            }
             let Some((ppid, _)) = proc_ppid_and_start_time(cur) else {
                 return false;
             };
@@ -12836,5 +13008,65 @@ mod tests {
             Some(self_pid),
             Some(self_st)
         ));
+    }
+
+    #[test]
+    fn vendor_cli_detection_and_nearest_vendor_ancestor_distinguish_sh_from_child_cli() {
+        for name in [
+            "claude",
+            "-claude",
+            "/usr/local/bin/claude",
+            "grok",
+            "/home/user/.npm-global/bin/grok",
+            "grok-cli",
+            "muse",
+            "/home/user/.local/bin/muse-bin-20260405",
+            "codex",
+            "agy",
+            "antigravity",
+        ] {
+            assert!(
+                is_vendor_cli_binary_name(name),
+                "expected {name} to be recognized as vendor CLI"
+            );
+        }
+        for non_vendor in ["sh", "bash", "dash", "zsh", "fl", "sleep", "node", "cargo"] {
+            assert!(
+                !is_vendor_cli_binary_name(non_vendor),
+                "expected {non_vendor} not to be recognized as vendor CLI"
+            );
+        }
+
+        assert!(cmdline_tokens_is_vendor_cli(&[
+            "node",
+            "/home/user/.npm-global/bin/grok",
+            "--version"
+        ]));
+        assert!(cmdline_tokens_is_vendor_cli(&[
+            "/usr/bin/env",
+            "FOO=1",
+            "node",
+            "--no-warnings",
+            "/usr/local/bin/claude"
+        ]));
+        assert!(cmdline_tokens_is_vendor_cli(&[
+            "bash",
+            "/home/user/.local/bin/muse"
+        ]));
+        assert!(!cmdline_tokens_is_vendor_cli(&[
+            "sh",
+            "-c",
+            "fl wire hook grok"
+        ]));
+        assert!(!cmdline_tokens_is_vendor_cli(&[
+            "bash",
+            "-lc",
+            "claude --version"
+        ]));
+        assert!(!cmdline_tokens_is_vendor_cli(&[
+            "node",
+            "-e",
+            "console.log('claude')"
+        ]));
     }
 }
