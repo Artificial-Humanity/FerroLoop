@@ -130,6 +130,10 @@ fn incoming_beats_incumbent(
             incumbent.identity_evidence_at().is_some(),
             incumbent.updated_at.unix_millis(),
         )
+    } else if challenger.route.session_identity().is_none()
+        && incumbent.route.session_identity().is_none()
+    {
+        challenger.updated_at.unix_millis() > incumbent.updated_at.unix_millis()
     } else {
         passive_identity_beats(challenger, incumbent)
     }
@@ -1143,11 +1147,43 @@ impl RouteTable {
     ///
     /// Passive sessions compete by [`RouteEntry::identity_evidence_at`]: newer known evidence
     /// wins, incumbent wins ties, and known evidence outranks unknown (`None`). `updated_ms == 0`
-    /// stays unknown (`identity_at: None`) and is never promoted to scan time.
-    fn upsert_discovered(&mut self, persona: &str, route: VendorRoute, updated_ms: u64) {
+    /// stays unknown (`identity_at: None`) for passive routes and is never promoted to scan time.
+    /// Explicit non-Antigravity incumbents retain `updated_at` ordering (`updated_ms == 0`
+    /// falling back to `now`), while explicit Antigravity routes are never replaced passively.
+    fn upsert_discovered(&mut self, persona: &str, route: VendorRoute, updated_ms: u64, now: &At) {
         let Some(norm) = normalize_persona(persona) else {
             return;
         };
+        if let Some(incumbent) = self.entries.get(&norm)
+            && incumbent.explicit
+        {
+            if matches!(incumbent.route, VendorRoute::Agy { .. })
+                || std::mem::discriminant(&incumbent.route) != std::mem::discriminant(&route)
+            {
+                return;
+            }
+            let file_at = if updated_ms > 0 {
+                At::from_unix_millis(updated_ms)
+            } else {
+                now.clone()
+            };
+            if incumbent.updated_at.unix_millis() > file_at.unix_millis() {
+                return;
+            }
+            if let Some(target_sid) = route.session_identity() {
+                let beaten_by_other = self.entries.iter().any(|(name, existing)| {
+                    name != &norm
+                        && existing.route.session_identity() == Some(target_sid)
+                        && (existing.explicit
+                            || existing.updated_at.unix_millis() > file_at.unix_millis())
+                });
+                if beaten_by_other {
+                    return;
+                }
+            }
+            self.upsert_inner(&norm, route, file_at, None, false);
+            return;
+        }
         let cand_identity = (updated_ms > 0).then(|| At::from_unix_millis(updated_ms));
         let cand_updated = cand_identity
             .clone()
@@ -1164,17 +1200,6 @@ impl RouteTable {
             return;
         }
         if let Some(existing) = self.entries.get(&norm) {
-            if existing.explicit {
-                if matches!(existing.route, VendorRoute::Agy { .. })
-                    || std::mem::discriminant(&existing.route) != std::mem::discriminant(&route)
-                    || updated_ms == 0
-                    || existing.updated_at.unix_millis() > updated_ms
-                {
-                    return;
-                }
-                self.upsert_inner(&norm, route, cand_updated, None, true);
-                return;
-            }
             if target_sid.is_some() && existing.route.session_identity() == target_sid {
                 if cand_identity.as_ref() < existing.identity_evidence_at() {
                     return;
@@ -1261,7 +1286,7 @@ impl RouteTable {
         let agy_candidates = self.revalidate_passive_agy_entries(&home);
         self.discover_claude_routes(&home, check_proc, &at);
         self.discover_agy_routes_with_candidates(&home, check_proc, &at, agy_candidates);
-        self.discover_codex_routes(&home);
+        self.discover_codex_routes(&home, &at);
         self.discover_muse_routes(&home, home_override.is_some(), &at);
         self.discover_grok_routes(&home, check_proc, &at);
         self.discover_scanner_routes(&home, &at);
@@ -1350,17 +1375,6 @@ impl RouteTable {
                     .entries
                     .get(&name)
                     .is_some_and(|existing| existing.updated_at > *at)
-                {
-                    continue;
-                }
-                if let Some(target_sid) = route.session_identity()
-                    && self.entries.iter().any(|(existing_name, existing)| {
-                        existing.route.session_identity() == Some(target_sid)
-                            && (existing_name != &name
-                                || existing.explicit
-                                || existing.identity_evidence_at().is_some()
-                                || existing.updated_at > *at)
-                    })
                 {
                     continue;
                 }
@@ -1877,13 +1891,13 @@ impl RouteTable {
                         csrf_token: accepts_shared.then(|| shared_csrf.clone()).flatten(),
                         agentapi_exe: Some(resolved_shared.clone()),
                     };
-                    self.upsert_discovered(&persona, route, file_ms);
+                    self.upsert_discovered(&persona, route, file_ms, at);
                 }
             }
         }
     }
 
-    fn discover_codex_routes(&mut self, home: &Path) {
+    fn discover_codex_routes(&mut self, home: &Path, at: &At) {
         let codex_dir = home.join(".codex");
         let mut rollout_files = Vec::new();
         collect_codex_rollout_files(&codex_dir.join("sessions"), 0, &mut rollout_files);
@@ -1951,7 +1965,7 @@ impl RouteTable {
                     .map(|stamp| stamp.unix_millis())
                     .filter(|ms| *ms > 0);
                 // Prefer the matching rollout mtime. Fall back to the line's `updated_at`,
-                // then the index mtime. Zero stays unknown and is never promoted to scan time.
+                // then the index mtime.
                 let updated_ms = rollout_mtime_by_thread
                     .get(thread_id)
                     .copied()
@@ -1965,6 +1979,7 @@ impl RouteTable {
                         cwd,
                     },
                     updated_ms,
+                    at,
                 );
             }
         }
@@ -1987,7 +2002,12 @@ impl RouteTable {
         }
         candidates.sort_by_key(|c| c.0);
         for (updated_ms, persona, thread_id, cwd) in candidates {
-            self.upsert_discovered(&persona, VendorRoute::Codex { thread_id, cwd }, updated_ms);
+            self.upsert_discovered(
+                &persona,
+                VendorRoute::Codex { thread_id, cwd },
+                updated_ms,
+                at,
+            );
         }
     }
 
@@ -2081,7 +2101,7 @@ impl RouteTable {
                     };
                     self.upsert_passive(&persona, route, file_at);
                 } else {
-                    self.upsert_discovered(&persona, route, mtime_ms(path));
+                    self.upsert_discovered(&persona, route, mtime_ms(path), at);
                 }
             }
         }
@@ -2273,6 +2293,7 @@ impl RouteTable {
                         tmux_pane: existing_pane,
                     },
                     mtime_ms(&path),
+                    at,
                 );
             }
         }
@@ -2372,7 +2393,7 @@ impl RouteTable {
             if cand.is_active {
                 self.upsert_passive(&cand.persona, route, at.clone());
             } else {
-                self.upsert_discovered(&cand.persona, route, cand.updated_ms);
+                self.upsert_discovered(&cand.persona, route, cand.updated_ms, at);
             }
         }
 
@@ -4854,6 +4875,7 @@ mod tests {
                 cwd: None,
             },
             2,
+            &At::from_unix_millis(2),
         );
         let entry = table.get("ada").unwrap();
         assert!(entry.explicit);
@@ -7940,7 +7962,7 @@ mod tests {
         };
         let mut table = RouteTable::default();
         table.upsert_explicit("ada", route.clone(), At::from_unix_millis(1));
-        table.upsert_discovered("old-alias", route.clone(), 2);
+        table.upsert_discovered("old-alias", route.clone(), 2, &At::from_unix_millis(2));
         assert_eq!(table.get("ada").map(|entry| &entry.route), Some(&route));
         assert!(table.get("old-alias").is_none());
 
@@ -9723,7 +9745,7 @@ mod tests {
 
         // 2. Reversed discovery order (Codex -> Agy) at scan time 9000.
         let mut reversed = RouteTable::default();
-        reversed.discover_codex_routes(home);
+        reversed.discover_codex_routes(home, &At::from_unix_millis(9000));
         reversed.discover_agy_routes(home, false, &At::from_unix_millis(9000));
         let rev_entry = reversed.get("kayla").expect("kayla route reversed");
         assert!(
@@ -9761,7 +9783,7 @@ mod tests {
         assert_eq!(std_winner.identity_at, Some(At::from_unix_millis(300)));
 
         let mut agy_newer_rev = RouteTable::default();
-        agy_newer_rev.discover_codex_routes(home);
+        agy_newer_rev.discover_codex_routes(home, &At::from_unix_millis(11000));
         agy_newer_rev.discover_agy_routes(home, false, &At::from_unix_millis(11000));
         let rev_winner = agy_newer_rev.get("kayla").expect("rev winner");
         assert!(
@@ -10091,13 +10113,28 @@ mod tests {
         // 1. Equal known evidence (100 vs 100 across different sessions): incumbent wins ties in
         // both upsert_discovered and merge_newer (same-vendor, cross-vendor, and cross-persona).
         let mut up_tie = RouteTable::default();
-        up_tie.upsert_discovered("kayla", agy_route("conv-incumbent-100"), 100);
-        up_tie.upsert_discovered("kayla", codex_route("codex-challenger-100"), 100);
+        up_tie.upsert_discovered(
+            "kayla",
+            agy_route("conv-incumbent-100"),
+            100,
+            &At::from_unix_millis(9000),
+        );
+        up_tie.upsert_discovered(
+            "kayla",
+            codex_route("codex-challenger-100"),
+            100,
+            &At::from_unix_millis(9500),
+        );
         assert_eq!(
             up_tie.get("kayla").unwrap().route,
             agy_route("conv-incumbent-100")
         );
-        up_tie.upsert_discovered("alias-kayla", agy_route("conv-incumbent-100"), 100);
+        up_tie.upsert_discovered(
+            "alias-kayla",
+            agy_route("conv-incumbent-100"),
+            100,
+            &At::from_unix_millis(9500),
+        );
         assert!(up_tie.get("alias-kayla").is_none());
 
         let mut merge_incumbent = RouteTable::default();
@@ -10150,48 +10187,151 @@ mod tests {
         );
         assert!(merge_incumbent.get("alias-kayla").is_none());
 
-        // Same-persona tie for `session_identity() == None` routes (e.g. Webhook).
+        // `session_identity() == None` routes (e.g. scanner Webhook socket move): newer
+        // `updated_at` (9500 > 9000) replaces the old socket across all merge paths, while an
+        // equal-`updated_at` tie (9000 vs 9000) keeps the incumbent.
         for hook_identity in [None, Some(At::from_unix_millis(100))] {
-            let mut hook_a = RouteTable::default();
-            hook_a.entries.insert(
+            let hook_a_route = VendorRoute::Webhook {
+                socket_path: PathBuf::from("/tmp/hook-a.sock"),
+            };
+            let hook_b_route = VendorRoute::Webhook {
+                socket_path: PathBuf::from("/tmp/hook-b.sock"),
+            };
+            let mut base = RouteTable::default();
+            base.entries.insert(
                 "kayla".into(),
                 RouteEntry {
                     persona: "kayla".into(),
-                    route: VendorRoute::Webhook {
-                        socket_path: PathBuf::from("/tmp/hook-a.sock"),
-                    },
+                    route: hook_a_route.clone(),
                     updated_at: At::from_unix_millis(9000),
                     identity_at: hook_identity.clone(),
                     explicit: false,
                 },
             );
-            let mut hook_b = RouteTable::default();
-            hook_b.entries.insert(
+            let mut newer_hook = RouteTable::default();
+            newer_hook.entries.insert(
                 "kayla".into(),
                 RouteEntry {
                     persona: "kayla".into(),
-                    route: VendorRoute::Webhook {
-                        socket_path: PathBuf::from("/tmp/hook-b.sock"),
-                    },
+                    route: hook_b_route.clone(),
                     updated_at: At::from_unix_millis(9500),
                     identity_at: hook_identity.clone(),
                     explicit: false,
                 },
             );
-            hook_a.merge_newer(hook_b);
-            assert_eq!(
-                hook_a.get("kayla").unwrap().route,
-                VendorRoute::Webhook {
-                    socket_path: PathBuf::from("/tmp/hook-a.sock"),
+            for merge_mode in ["direct", "dispatch", "daemon"] {
+                let mut live = base.clone();
+                match merge_mode {
+                    "direct" => live.merge_newer(newer_hook.clone()),
+                    "dispatch" => live.merge_dispatch_result(&base, newer_hook.clone()),
+                    "daemon" => live.merge_daemon_dispatch_result(&base, newer_hook.clone()),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    live.get("kayla").unwrap().route,
+                    hook_b_route,
+                    "newer Webhook must win: mode={merge_mode}, hook_identity={hook_identity:?}"
+                );
+                assert_eq!(
+                    live.get("kayla").unwrap().updated_at,
+                    At::from_unix_millis(9500)
+                );
+            }
+
+            let mut equal_hook = RouteTable::default();
+            equal_hook.entries.insert(
+                "kayla".into(),
+                RouteEntry {
+                    persona: "kayla".into(),
+                    route: hook_b_route,
+                    updated_at: At::from_unix_millis(9000),
+                    identity_at: hook_identity.clone(),
+                    explicit: false,
                 },
-                "hook_identity={hook_identity:?}"
             );
+            let mut tie_live = base.clone();
+            tie_live.merge_newer(equal_hook);
+            assert_eq!(
+                tie_live.get("kayla").unwrap().route,
+                hook_a_route,
+                "equal-updated_at Webhook tie must keep incumbent: hook_identity={hook_identity:?}"
+            );
+        }
+
+        // End-to-end scanner Webhook socket move (`sock1` at 9000 -> `sock2` at 9500) across
+        // direct scan and hub/daemon reconciliation.
+        {
+            struct MovingWebhookScanner {
+                expected_home: PathBuf,
+                current_sock: std::sync::Mutex<PathBuf>,
+            }
+            impl crate::scanner::WireVendorScanner for MovingWebhookScanner {
+                fn vendor_id(&self) -> &str {
+                    "wscan-445-webhook-move"
+                }
+                fn discover(&self, home: &Path) -> BTreeMap<String, VendorRoute> {
+                    if home == self.expected_home {
+                        let sock = self.current_sock.lock().unwrap().clone();
+                        BTreeMap::from([(
+                            "kayla".to_string(),
+                            VendorRoute::Webhook { socket_path: sock },
+                        )])
+                    } else {
+                        BTreeMap::new()
+                    }
+                }
+            }
+
+            let tmp = TempDir::new().unwrap();
+            let sock1 = tmp.path().join("sock1.sock");
+            let sock2 = tmp.path().join("sock2.sock");
+            let scanner = std::sync::Arc::new(MovingWebhookScanner {
+                expected_home: tmp.path().to_path_buf(),
+                current_sock: std::sync::Mutex::new(sock1.clone()),
+            });
+            crate::scanner::register_wire_scanner(scanner.clone()).unwrap();
+
+            let mut base = RouteTable::default();
+            base.discover_routes(Some(tmp.path()), At::from_unix_millis(9000));
+            assert_eq!(
+                base.get("kayla").map(|e| &e.route),
+                Some(&VendorRoute::Webhook { socket_path: sock1 })
+            );
+
+            *scanner.current_sock.lock().unwrap() = sock2.clone();
+            let mut working = base.clone();
+            working.discover_routes(Some(tmp.path()), At::from_unix_millis(9500));
+            let expected_sock2 = VendorRoute::Webhook { socket_path: sock2 };
+            assert_eq!(
+                working.get("kayla").map(|e| &e.route),
+                Some(&expected_sock2)
+            );
+
+            for merge_mode in ["direct", "dispatch", "daemon"] {
+                let mut live = base.clone();
+                match merge_mode {
+                    "direct" => live.merge_newer(working.clone()),
+                    "dispatch" => live.merge_dispatch_result(&base, working.clone()),
+                    "daemon" => live.merge_daemon_dispatch_result(&base, working.clone()),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    live.get("kayla").map(|e| &e.route),
+                    Some(&expected_sock2),
+                    "scanner Webhook socket move must propagate in mode={merge_mode}"
+                );
+            }
         }
 
         // 2. Unknown (0 mtime) is NEVER promoted to "now", and known (Some(100)) outranks unknown
         // (None / 0 mtime) in BOTH directions across upsert_discovered and merge_newer.
         let mut zero_first = RouteTable::default();
-        zero_first.upsert_discovered("kayla", codex_route("codex-zero"), 0);
+        zero_first.upsert_discovered(
+            "kayla",
+            codex_route("codex-zero"),
+            0,
+            &At::from_unix_millis(9000),
+        );
         let zero_entry = zero_first.get("kayla").expect("zero-mtime route");
         assert_eq!(zero_entry.identity_at, None);
         assert_eq!(zero_entry.identity_evidence_at(), None);
@@ -10201,7 +10341,12 @@ mod tests {
             "zero mtime must never be promoted to scan time"
         );
         // Known challenger (100) beats unknown incumbent (None).
-        zero_first.upsert_discovered("kayla", codex_route("codex-known-100"), 100);
+        zero_first.upsert_discovered(
+            "kayla",
+            codex_route("codex-known-100"),
+            100,
+            &At::from_unix_millis(9000),
+        );
         assert_eq!(
             zero_first.get("kayla").unwrap().route,
             codex_route("codex-known-100")
@@ -10211,7 +10356,12 @@ mod tests {
             Some(At::from_unix_millis(100))
         );
         // Unknown challenger (0 mtime) loses to known incumbent (100).
-        zero_first.upsert_discovered("kayla", codex_route("codex-zero-again"), 0);
+        zero_first.upsert_discovered(
+            "kayla",
+            codex_route("codex-zero-again"),
+            0,
+            &At::from_unix_millis(9500),
+        );
         assert_eq!(
             zero_first.get("kayla").unwrap().route,
             codex_route("codex-known-100")
@@ -10250,8 +10400,18 @@ mod tests {
         // 3. Equal unknown (None vs None across different sessions): incumbent wins ties in both
         // upsert_discovered and merge_newer.
         let mut unknown_tie = RouteTable::default();
-        unknown_tie.upsert_discovered("kayla", codex_route("unknown-first"), 0);
-        unknown_tie.upsert_discovered("kayla", codex_route("unknown-second"), 0);
+        unknown_tie.upsert_discovered(
+            "kayla",
+            codex_route("unknown-first"),
+            0,
+            &At::from_unix_millis(9000),
+        );
+        unknown_tie.upsert_discovered(
+            "kayla",
+            codex_route("unknown-second"),
+            0,
+            &At::from_unix_millis(9500),
+        );
         assert_eq!(
             unknown_tie.get("kayla").unwrap().route,
             codex_route("unknown-first")
@@ -10320,7 +10480,12 @@ mod tests {
             agy_route("explicit-agy-200"),
             At::from_unix_millis(200),
         );
-        same.upsert_discovered("ada", agy_route("conv-passive-500"), 500);
+        same.upsert_discovered(
+            "ada",
+            agy_route("conv-passive-500"),
+            500,
+            &At::from_unix_millis(9000),
+        );
         assert_eq!(
             same.get("ada").unwrap().route,
             agy_route("explicit-agy-200")
@@ -10362,7 +10527,12 @@ mod tests {
 
         // 4. Explicit alias protection: passive discovery or merge for another persona with the
         // same session ID never evicts the explicit owner.
-        hosted.upsert_discovered("alias-feira", agy_route("conv-hosted"), 9000);
+        hosted.upsert_discovered(
+            "alias-feira",
+            agy_route("conv-hosted"),
+            9000,
+            &At::from_unix_millis(9500),
+        );
         assert!(hosted.get("alias-feira").is_none());
         let mut alias_table = RouteTable::default();
         alias_table.upsert(
@@ -10600,7 +10770,7 @@ mod tests {
                     );
                     let mut working = base.clone();
                     let agy_candidates = working.revalidate_passive_agy_entries(home);
-                    working.discover_codex_routes(home);
+                    working.discover_codex_routes(home, &At::from_unix_millis(8500));
                     working.discover_agy_routes_with_candidates(
                         home,
                         false,
@@ -10770,57 +10940,209 @@ mod tests {
     }
 
     #[test]
-    fn discover_scanner_routes_keeps_cross_persona_incumbent_on_tie() {
-        struct HomeScopedScanner {
-            expected_home: PathBuf,
-            route: VendorRoute,
-        }
-        impl crate::scanner::WireVendorScanner for HomeScopedScanner {
-            fn vendor_id(&self) -> &str {
-                "wscan-445-cross-persona-tie"
+    fn explicit_non_agy_incumbent_repoints_on_zero_mtime_rollout_at_scan_time() {
+        let t1 = "01900000-0000-7000-8000-000000000401";
+        let t2 = "01900000-0000-7000-8000-000000000402";
+        let now = At::from_unix_millis(9000);
+
+        // 1. Direct `upsert_discovered` with `updated_ms == 0` falls back to `now` (9000) for an
+        // explicit Codex incumbent, re-pointing `P` from `T1` (1000) to `T2` (9000).
+        let mut direct = RouteTable::default();
+        direct.upsert_explicit("parker", codex_route(t1), At::from_unix_millis(1000));
+        direct.upsert_discovered("parker", codex_route(t2), 0, &now);
+        let direct_entry = direct.get("parker").expect("parker route");
+        assert!(direct_entry.explicit);
+        assert_eq!(direct_entry.route, codex_route(t2));
+        assert_eq!(direct_entry.updated_at, now);
+        assert_eq!(direct_entry.identity_at, None);
+
+        // 2. Full `discover_routes` (both zero-mtime rollout file and zero-mtime session_index)
+        // plus reconciliation (`merge_newer`, `merge_dispatch_result`, `merge_daemon_dispatch_result`).
+        for use_session_index in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path();
+            if use_session_index {
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                let index_path = codex_dir.join("session_index.jsonl");
+                fs::write(
+                    &index_path,
+                    serde_json::json!({
+                        "id": t2,
+                        "agentName": "Parker",
+                        "cwd": "/tmp"
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                set_mtime(&index_path, 0);
+            } else {
+                codex_rollout_fixture(home, t2, "Parker", 0);
             }
-            fn discover(&self, home: &Path) -> BTreeMap<String, VendorRoute> {
-                if home == self.expected_home {
-                    BTreeMap::from([("scanner-challenger".to_string(), self.route.clone())])
-                } else {
-                    BTreeMap::new()
+
+            let mut base = RouteTable::default();
+            base.upsert_explicit("parker", codex_route(t1), At::from_unix_millis(1000));
+            let mut working = base.clone();
+            working.discover_routes(Some(home), now.clone());
+
+            let scanned = working.get("parker").expect("scanned parker");
+            assert!(
+                scanned.explicit,
+                "use_session_index={use_session_index}: got {scanned:?}"
+            );
+            assert!(
+                matches!(&scanned.route, VendorRoute::Codex { thread_id, .. } if thread_id == t2),
+                "use_session_index={use_session_index}: got {scanned:?}"
+            );
+            assert_eq!(scanned.updated_at, now);
+            assert_eq!(scanned.identity_at, None);
+
+            for merge_mode in ["direct", "dispatch", "daemon"] {
+                let mut live = base.clone();
+                match merge_mode {
+                    "direct" => live.merge_newer(working.clone()),
+                    "dispatch" => live.merge_dispatch_result(&base, working.clone()),
+                    "daemon" => live.merge_daemon_dispatch_result(&base, working.clone()),
+                    _ => unreachable!(),
                 }
+                let merged = live.get("parker").expect("merged parker");
+                assert!(merged.explicit, "mode={merge_mode}");
+                assert!(
+                    matches!(&merged.route, VendorRoute::Codex { thread_id, .. } if thread_id == t2),
+                    "use_session_index={use_session_index}, mode={merge_mode}: got {merged:?}"
+                );
+                assert_eq!(merged.updated_at, now);
+                assert_eq!(merged.identity_at, None);
             }
         }
+    }
 
+    #[test]
+    fn explicit_non_agy_incumbent_respects_newer_passive_session_owner_across_scan_and_merge() {
+        let t1 = "01900000-0000-7000-8000-000000000411";
+        let t2 = "01900000-0000-7000-8000-000000000412";
         let tmp = TempDir::new().unwrap();
-        let shared_host_route = VendorRoute::HostCli {
-            vendor: "custom".into(),
-            session_id: "shared-scanner-sid-445".into(),
-            cwd: None,
-            tmux_target: Some("Ada:custom".into()),
-            tmux_pane: None,
-        };
-        crate::scanner::register_wire_scanner(std::sync::Arc::new(HomeScopedScanner {
-            expected_home: tmp.path().to_path_buf(),
-            route: shared_host_route.clone(),
-        }))
-        .unwrap();
+        let home = tmp.path();
+        codex_rollout_fixture(home, t2, "Parker", 5000);
 
-        let mut scan_table = RouteTable::default();
-        scan_table.entries.insert(
-            "incumbent-owner".into(),
+        let mut base = RouteTable::default();
+        base.upsert_explicit("parker", codex_route(t1), At::from_unix_millis(1000));
+        base.entries.insert(
+            "quinn".into(),
             RouteEntry {
-                persona: "incumbent-owner".into(),
-                route: shared_host_route.clone(),
-                updated_at: At::from_unix_millis(1000),
+                persona: "quinn".into(),
+                route: codex_route(t2),
+                updated_at: At::from_unix_millis(8000),
                 identity_at: None,
                 explicit: false,
             },
         );
-        scan_table.discover_routes(Some(tmp.path()), At::from_unix_millis(1000));
+
+        let assert_unchanged = |table: &RouteTable, label: &str| {
+            let p = table.get("parker").expect("parker present");
+            assert!(p.explicit, "{label}: {p:?}");
+            assert_eq!(p.route, codex_route(t1), "{label}: {p:?}");
+            assert_eq!(p.updated_at, At::from_unix_millis(1000), "{label}: {p:?}");
+            assert_eq!(p.identity_at, None, "{label}: {p:?}");
+
+            let q = table.get("quinn").expect("quinn present");
+            assert!(!q.explicit, "{label}: {q:?}");
+            assert!(
+                matches!(&q.route, VendorRoute::Codex { thread_id, .. } if thread_id == t2),
+                "{label}: {q:?}"
+            );
+            assert_eq!(q.updated_at, At::from_unix_millis(8000), "{label}: {q:?}");
+        };
+
+        // 1. Direct `upsert_discovered`.
+        let mut direct_upsert = base.clone();
+        direct_upsert.upsert_discovered(
+            "parker",
+            codex_route(t2),
+            5000,
+            &At::from_unix_millis(9000),
+        );
+        assert_unchanged(&direct_upsert, "direct upsert_discovered");
+
+        // 2. Direct `discover_routes` on `base`.
+        let mut working = base.clone();
+        working.discover_routes(Some(home), At::from_unix_millis(9000));
+        assert_unchanged(&working, "direct discover_routes");
+
+        // 3. Reconciling `working` into `live` across all merge entry points.
+        for merge_mode in ["direct", "dispatch", "daemon"] {
+            let mut live = base.clone();
+            match merge_mode {
+                "direct" => live.merge_newer(working.clone()),
+                "dispatch" => live.merge_dispatch_result(&base, working.clone()),
+                "daemon" => live.merge_daemon_dispatch_result(&base, working.clone()),
+                _ => unreachable!(),
+            }
+            assert_unchanged(&live, merge_mode);
+        }
+
+        // 4. Merging an empty-base scan (`Parker -> T2` passive at 5000) into `base` also agrees.
+        let mut fresh_scan = RouteTable::default();
+        fresh_scan.discover_routes(Some(home), At::from_unix_millis(9000));
+        let mut merged_from_fresh = base.clone();
+        merged_from_fresh.merge_newer(fresh_scan);
+        assert_unchanged(&merged_from_fresh, "merge_newer(fresh_scan)");
+    }
+
+    #[test]
+    fn merge_newer_explicit_challenger_beats_passive_incumbent_with_identity_evidence() {
+        // (a) Cross-persona on the same session `T1`: passive `Q` at 5000 (`identity_at: Some(5000)`)
+        // loses `T1` to explicit `P` at 6000 (`identity_at: None`).
+        let mut cross_persona = RouteTable::default();
+        cross_persona.upsert("quinn", codex_route("t1"), At::from_unix_millis(5000));
         assert_eq!(
-            scan_table.get("incumbent-owner").map(|e| &e.route),
-            Some(&shared_host_route)
+            cross_persona.get("quinn").unwrap().identity_at,
+            Some(At::from_unix_millis(5000))
         );
+        let mut other_a = RouteTable::default();
+        other_a.upsert_explicit("parker", codex_route("t1"), At::from_unix_millis(6000));
+        assert_eq!(other_a.get("parker").unwrap().identity_at, None);
+
+        cross_persona.merge_newer(other_a);
         assert!(
-            scan_table.get("scanner-challenger").is_none(),
-            "scanner must not steal a session already owned by another persona on a tie"
+            cross_persona.get("quinn").is_none(),
+            "passive incumbent must be evicted by newer explicit owner"
         );
+        let winner_a = cross_persona.get("parker").expect("parker won t1");
+        assert!(winner_a.explicit);
+        assert_eq!(winner_a.route, codex_route("t1"));
+        assert_eq!(winner_a.updated_at, At::from_unix_millis(6000));
+        assert_eq!(winner_a.identity_at, None);
+
+        // (b) Same-persona across different sessions (`T1` -> `T2`, both same-vendor and cross-vendor):
+        // passive `P` on `T1` at 5000 (`identity_at: Some(5000)`) moves to explicit `P` on `T2` at 6000.
+        for challenger_route in [
+            codex_route("t2"),
+            agy_route("conv-t2"),
+            VendorRoute::Webhook {
+                socket_path: PathBuf::from("/tmp/explicit-t2.sock"),
+            },
+        ] {
+            let mut same_persona = RouteTable::default();
+            same_persona.upsert("parker", codex_route("t1"), At::from_unix_millis(5000));
+            assert_eq!(
+                same_persona.get("parker").unwrap().identity_at,
+                Some(At::from_unix_millis(5000))
+            );
+            let mut other_b = RouteTable::default();
+            other_b.upsert_explicit(
+                "parker",
+                challenger_route.clone(),
+                At::from_unix_millis(6000),
+            );
+            assert_eq!(other_b.get("parker").unwrap().identity_at, None);
+
+            same_persona.merge_newer(other_b);
+            let winner_b = same_persona.get("parker").expect("parker moved to t2");
+            assert!(winner_b.explicit);
+            assert_eq!(winner_b.route, challenger_route);
+            assert_eq!(winner_b.updated_at, At::from_unix_millis(6000));
+            assert_eq!(winner_b.identity_at, None);
+        }
     }
 }
