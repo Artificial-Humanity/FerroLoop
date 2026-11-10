@@ -4787,7 +4787,11 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             crate::lifecycle::HydrationStatus::Unconfirmed
         },
         hydration_generation: Some(hydration_generation.clone()),
-        tombstone_ids: Vec::new(),
+        tombstone_ids: previous
+            .as_ref()
+            .filter(|r| !is_decommissioned(r))
+            .map(|r| r.tombstone_ids.clone())
+            .unwrap_or_default(),
         vendor_session_id: vendor_session_id.clone(),
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
@@ -6264,14 +6268,6 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = env.runtime.unit(&want_target).to_string();
     let _ = sync_claude_vendor_session_id_from_route(env, &mut record);
-    if record.vendor == "claude"
-        && record
-            .vendor_session_id
-            .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-    {
-        record.vendor_session_id = Some(uuid::Uuid::now_v7().to_string());
-    }
     // A stale `<Display>:muse` record whose old session still runs: that one Muse is the agent.
     // No second Muse is opened beside it; the prompt goes to it by delivery and the ownership
     // flag stays as recorded.
@@ -6418,6 +6414,14 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             )?
         }
         None => {
+            if record.vendor == "claude"
+                && record
+                    .vendor_session_id
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+            {
+                record.vendor_session_id = Some(uuid::Uuid::now_v7().to_string());
+            }
             if record.hosted
                 && !adopted_old_session
                 && vendor_has_runtime(&record.vendor)
@@ -14123,6 +14127,78 @@ mod tests {
                 "expected unconfirmed_hydration notice in {:?}",
                 restarted.warnings
             );
+        }
+
+        // 1b. missing_or_tombstoned_session_id (both missing None and tombstoned session_id)
+        for is_tombstoned in [false, true] {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+
+            let mut rec = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            if is_tombstoned {
+                rec.tombstone_ids.push(sid1.clone());
+            } else {
+                rec.vendor_session_id = None;
+            }
+            persist_hosted_session(&store, &rec, "owner").unwrap();
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_ne!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str())
+            );
+            assert!(
+                restarted.record.vendor_session_id.is_some(),
+                "fresh vendor_session_id must be minted on fallback"
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("missing_or_tombstoned_session_id")),
+                "expected missing_or_tombstoned_session_id (is_tombstoned={is_tombstoned}) notice in {:?}",
+                restarted.warnings
+            );
+            if is_tombstoned {
+                // Re-spinning a non-decommissioned record must also preserve tombstone_ids.
+                let respun = spin_up(
+                    &store,
+                    &env,
+                    &req("ada", "assistant", "claude"),
+                    "owner",
+                    Caller::Owner,
+                )
+                .unwrap();
+                let after = find_hosted_session(&store, &[&respun.session_id])
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    after.tombstone_ids.contains(&sid1),
+                    "spin_up on non-decommissioned record must preserve tombstone_ids, got {:?}",
+                    after.tombstone_ids
+                );
+            }
         }
 
         // 2. missing_or_archived_transcript (transcript only in .claude/archived/)
