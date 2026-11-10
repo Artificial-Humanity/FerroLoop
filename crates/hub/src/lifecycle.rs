@@ -3433,6 +3433,7 @@ pub fn record_hydration_ack_with_pid<S: StateStore>(
         }
     }
     let slug = hydration_ack_slug(g_caller);
+    let mut receipt_already_existed = false;
     if let Some(existing) =
         store.get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?
         && let StatePayload::Runtime(rt) = existing.payload
@@ -3443,8 +3444,9 @@ pub fn record_hydration_ack_with_pid<S: StateStore>(
                 "fl-hub: warning: hydration receipt `{slug}` already belongs to persona `{}`; ignoring ack for `{persona_lower}`",
                 receipt.persona
             );
+            return Ok(false);
         }
-        return Ok(false);
+        receipt_already_existed = true;
     }
     let session_id = if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
         fl_wire::identity::parse_hosted_identity(hid)
@@ -3461,26 +3463,44 @@ pub fn record_hydration_ack_with_pid<S: StateStore>(
             .unwrap_or_default()
     };
     if session_id.starts_with("claude:")
-        && let Some(cpid) = caller_pid.filter(|&p| p > 0)
         && let Some(mut rec) = find_hosted_session(store, &[&session_id])?
     {
-        if let Some(rec_pid) = rec.pid.filter(|&p| p > 0) {
-            if let Some(expected_st) = rec.pid_start_time
-                && let Some(actual_st) = fl_wire::identity::proc_start_time_ticks(rec_pid)
-                && actual_st != expected_st
-            {
-                return Ok(false);
+        let mut dirty = false;
+        if let Some(cpid) = caller_pid.filter(|&p| p > 0) {
+            if let Some(rec_pid) = rec.pid.filter(|&p| p > 0) {
+                if let Some(expected_st) = rec.pid_start_time
+                    && let Some(actual_st) = fl_wire::identity::proc_start_time_ticks(rec_pid)
+                    && actual_st != expected_st
+                {
+                    return Ok(false);
+                }
+                if rec_pid != cpid
+                    && !fl_wire::identity::pid_is_self_or_ancestor(
+                        cpid,
+                        rec_pid,
+                        rec.pid_start_time,
+                    )
+                {
+                    return Ok(false);
+                }
+            } else {
+                rec.pid = Some(cpid);
+                rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(cpid);
+                dirty = true;
             }
-            if rec_pid != cpid
-                && !fl_wire::identity::pid_is_self_or_ancestor(cpid, rec_pid, rec.pid_start_time)
-            {
-                return Ok(false);
-            }
-        } else {
-            rec.pid = Some(cpid);
-            rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(cpid);
+        }
+        if rec.hydration_generation.as_deref() == Some(g_caller)
+            && rec.hydration_status != HydrationStatus::Confirmed
+        {
+            rec.hydration_status = HydrationStatus::Confirmed;
+            dirty = true;
+        }
+        if dirty {
             persist_hosted_session(store, &rec, &persona_lower)?;
         }
+    }
+    if receipt_already_existed {
+        return Ok(false);
     }
     let receipt = HydrationReceipt {
         session_id,
@@ -5205,6 +5225,30 @@ fn resolve_project_cwd<S: Catalog>(
     None
 }
 
+type HostedSessionLockKey = (Option<PathBuf>, Option<PathBuf>, String);
+
+fn hosted_session_lifecycle_mutex(
+    env: &LifecycleEnv<'_>,
+    session_id: &str,
+) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<HostedSessionLockKey, std::sync::Arc<std::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (
+        env.home_override.map(Path::to_path_buf),
+        env.workspace_root.map(Path::to_path_buf),
+        session_id.trim().to_ascii_lowercase(),
+    );
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
 /// `caller` gates hosting an unmanaged agent: an Active agent with no LIVE hosted record for this
 /// session (none, or a decommissioned one left from an earlier teardown) becomes hosted by the
 /// spin-up, after which a peer's teardown would be allowed, so only the owner may do it. A peer
@@ -5234,8 +5278,21 @@ where
     G: std::ops::Deref<Target = S>,
     F: FnMut() -> Result<G, LifecycleError>,
 {
-    let store: &S = &store_guard;
     let mut v = req.validate()?;
+    let session_id = format!("{}:{}", v.vendor, v.persona);
+    let session_mutex = hosted_session_lifecycle_mutex(env, &session_id);
+    let _session_lifecycle_guard = match session_mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            drop(store_guard);
+            let _waited = session_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            return Err(LifecycleError::Conflict(format!(
+                "hosted session `{session_id}` already had a lifecycle operation in progress"
+            )));
+        }
+    };
+    let store: &S = &store_guard;
     v.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
         &v.vendor,
         v.posture,
@@ -5518,6 +5575,19 @@ where
     let _reopened_guard;
     let store: &S = if is_claude_resume {
         let resumed_sid = vendor_session_id.clone().unwrap_or_default();
+        if raw_spawned {
+            record.runtime_spawned = true;
+            let initial_pid = env.runtime.recorded_pid(&unit, &session_id);
+            record.pid = initial_pid;
+            record.pid_start_time = initial_pid.and_then(fl_wire::identity::proc_start_time_ticks);
+            record.updated_at_ms = now_ms();
+            persist_hosted_session(store, &record, by)?;
+            let mut pre_rstate = load_claude_resume_state(store, &session_id);
+            pre_rstate.resume_failed = false;
+            pre_rstate.resume_unconfirmed_session_id = Some(resumed_sid.clone());
+            pre_rstate.resume_launched_at_ms = Some(resume_launch_started_ms);
+            save_claude_resume_state(store, &session_id, &pre_rstate, by)?;
+        }
         drop(store_guard);
         let (survived_resume, hook_confirmed) = if raw_spawned {
             if launch.is_some() {
@@ -5538,12 +5608,39 @@ where
         };
         _reopened_guard = reopen_store()?;
         let store: &S = &_reopened_guard;
+        let Some(fresh_record) =
+            find_hosted_session(store, &[&session_id])?.filter(|r| r.session_id == session_id)
+        else {
+            if raw_spawned {
+                let _ = env.runtime.kill(&unit, &session_id);
+            }
+            return Err(LifecycleError::Conflict(format!(
+                "hosted session `{session_id}` was removed during launch survival watch"
+            )));
+        };
+        if is_decommissioned(&fresh_record) || fresh_record.status == STATUS_DECOMMISSIONING {
+            if raw_spawned {
+                let _ = env.runtime.kill(&unit, &session_id);
+            }
+            return Err(decommissioned_conflict(&session_id));
+        }
+        if fresh_record.hydration_generation.as_deref() != Some(hydration_generation.as_str()) {
+            if raw_spawned {
+                let _ = env.runtime.kill(&unit, &session_id);
+            }
+            return Err(LifecycleError::Conflict(format!(
+                "hosted session `{session_id}` launch generation changed during survival watch"
+            )));
+        }
+        record = fresh_record;
         if raw_spawned && survived_resume {
             survived = true;
             resumed_existing = true;
-            let new_pid = env.runtime.recorded_pid(&unit, &session_id);
-            record.pid = new_pid;
-            record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
+            record.runtime_spawned = true;
+            if let Some(new_pid) = env.runtime.recorded_pid(&unit, &session_id) {
+                record.pid = Some(new_pid);
+                record.pid_start_time = fl_wire::identity::proc_start_time_ticks(new_pid);
+            }
             let mut rstate = load_claude_resume_state(store, &session_id);
             rstate.resume_failed = false;
             rstate.resume_unconfirmed_session_id = if hook_confirmed {
@@ -7072,6 +7169,19 @@ where
     let store: &S = &store_guard;
     let mut record = find_hosted_session(store, &[id])?
         .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+    let session_mutex = hosted_session_lifecycle_mutex(env, &record.session_id);
+    let _session_lifecycle_guard = match session_mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let sid = record.session_id;
+            drop(store_guard);
+            let _waited = session_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            return Err(LifecycleError::Conflict(format!(
+                "hosted session `{sid}` already had a lifecycle operation in progress"
+            )));
+        }
+    };
     if is_decommissioned(&record) {
         // Its agent is retired; restarting would mark it running with no agent behind it.
         return Err(decommissioned_conflict(&record.session_id));
@@ -7315,6 +7425,19 @@ where
     let _reopened_guard;
     let store: &S = if is_claude_resume {
         let resumed_sid = record.vendor_session_id.clone().unwrap_or_default();
+        if raw_spawned {
+            record.runtime_spawned = true;
+            let initial_pid = env.runtime.recorded_pid(&unit, &record.session_id);
+            record.pid = initial_pid;
+            record.pid_start_time = initial_pid.and_then(fl_wire::identity::proc_start_time_ticks);
+            record.updated_at_ms = now_ms();
+            persist_hosted_session(store, &record, by)?;
+            let mut pre_rstate = load_claude_resume_state(store, &record.session_id);
+            pre_rstate.resume_failed = false;
+            pre_rstate.resume_unconfirmed_session_id = Some(resumed_sid.clone());
+            pre_rstate.resume_launched_at_ms = Some(resume_launch_started_ms);
+            save_claude_resume_state(store, &record.session_id, &pre_rstate, by)?;
+        }
         drop(store_guard);
         let (survived_resume, hook_confirmed) = if raw_spawned {
             if launch.is_some() {
@@ -7335,12 +7458,40 @@ where
         };
         _reopened_guard = reopen_store()?;
         let store: &S = &_reopened_guard;
+        let Some(fresh_record) = find_hosted_session(store, &[&record.session_id])?
+            .filter(|r| r.session_id == record.session_id)
+        else {
+            if raw_spawned {
+                let _ = env.runtime.kill(&unit, &record.session_id);
+            }
+            return Err(LifecycleError::Conflict(format!(
+                "hosted session `{}` was removed during launch survival watch",
+                record.session_id
+            )));
+        };
+        if is_decommissioned(&fresh_record) || fresh_record.status == STATUS_DECOMMISSIONING {
+            if raw_spawned {
+                let _ = env.runtime.kill(&unit, &record.session_id);
+            }
+            return Err(decommissioned_conflict(&record.session_id));
+        }
+        if fresh_record.hydration_generation.as_deref() != Some(hydration_generation.as_str()) {
+            if raw_spawned {
+                let _ = env.runtime.kill(&unit, &record.session_id);
+            }
+            return Err(LifecycleError::Conflict(format!(
+                "hosted session `{}` launch generation changed during survival watch",
+                record.session_id
+            )));
+        }
+        record = fresh_record;
         if raw_spawned && survived_resume {
             record.runtime_spawned = true;
             resumed_existing = true;
-            let new_pid = env.runtime.recorded_pid(&unit, &record.session_id);
-            record.pid = new_pid;
-            record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
+            if let Some(new_pid) = env.runtime.recorded_pid(&unit, &record.session_id) {
+                record.pid = Some(new_pid);
+                record.pid_start_time = fl_wire::identity::proc_start_time_ticks(new_pid);
+            }
             let mut rstate = load_claude_resume_state(store, &record.session_id);
             rstate.resume_failed = false;
             rstate.resume_unconfirmed_session_id = if hook_confirmed {
@@ -16455,5 +16606,246 @@ mod tests {
             reader_elapsed < Duration::from_millis(120),
             "R2: concurrent store-backed hub request must finish during the 300ms resume watch without waiting for it to end (took {reader_elapsed:?})"
         );
+    }
+
+    #[test]
+    fn claude_resume_round3_concurrent_restart_ack_and_decommission_during_watch() {
+        let hub_dir = TempDir::new().unwrap();
+        let hub_home = TempDir::new().unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: hub_dir.path().join("store.redb"),
+            repo_root: hub_dir.path().to_path_buf(),
+            home_override: Some(hub_home.path().to_path_buf()),
+            ..crate::HubServerConfig::default()
+        });
+
+        let (sid, g1) = {
+            let fake_init = FakeRuntime::default();
+            let env_init = fake_init.env(hub_home.path());
+            let guard = state.open_store().unwrap();
+            let spun = spin_up_with_store(
+                guard,
+                || state.open_store().map_err(LifecycleError::from),
+                &env_init,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g = spun.hydration_generation.unwrap();
+            let guard = state.open_store().unwrap();
+            let sid = find_hosted_session(&*guard, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&*guard, "ada", true, Some(&g), Some("claude:ada")).unwrap();
+            (sid, g)
+        };
+        write_claude_transcript(
+            hub_home.path(),
+            false,
+            &sid,
+            "claude-opus-5-5",
+            10_000,
+            false,
+        );
+
+        let watch_window = Duration::from_millis(250);
+
+        // 1. Two concurrent restarts of the same session produce ONE spawn, and the second waits
+        //    on the per-session lifecycle lock and reports a Conflict.
+        let (t2_tx, t2_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let state_ref = &state;
+            let home_path = hub_home.path();
+            let t2 = s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let t0 = Instant::now();
+                let fake2 = FakeRuntime::default();
+                let env2 = fake2.env(home_path);
+                let guard = state_ref.open_store().unwrap();
+                let res = restart_hosted_session_with_store(
+                    guard,
+                    || state_ref.open_store().map_err(LifecycleError::from),
+                    &env2,
+                    "claude:ada",
+                    "owner",
+                );
+                let elapsed = t0.elapsed();
+                let spawns = fake2.launches.borrow().len();
+                t2_tx.send((res, elapsed, spawns)).unwrap();
+            });
+
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
+            let fake1 = FakeRuntime::default();
+            let env1 = fake1.env(hub_home.path());
+            let guard = state.open_store().unwrap();
+            let res1 = restart_hosted_session_with_store(
+                guard,
+                || state.open_store().map_err(LifecycleError::from),
+                &env1,
+                "claude:ada",
+                "owner",
+            );
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
+            assert!(res1.is_ok(), "first restart must succeed: {res1:?}");
+            assert_eq!(
+                fake1.launches.borrow().len(),
+                1,
+                "first restart must spawn exactly 1 runtime unit"
+            );
+            t2.join().unwrap();
+        });
+        let (res2, t2_elapsed, t2_spawns) = t2_rx.recv().unwrap();
+        assert_eq!(
+            t2_spawns, 0,
+            "second concurrent restart must not spawn a duplicate unit"
+        );
+        assert!(
+            matches!(res2, Err(LifecycleError::Conflict(_))),
+            "second concurrent restart must report Conflict, got {res2:?}"
+        );
+        assert!(
+            t2_elapsed >= Duration::from_millis(120),
+            "second concurrent restart must wait on the per-session lock until the first finishes (took {t2_elapsed:?})"
+        );
+        {
+            let guard = state.open_store().unwrap();
+            delete_claude_resume_state(&*guard, "claude:ada");
+        }
+
+        // 2. A hydration ack (`record_hydration_ack_with_pid`) written during the survival watch
+        //    survives the post-watch write-back (is not overwritten by a stale in-memory record).
+        std::thread::scope(|s| {
+            let state_ref = &state;
+            let g1_ref = &g1;
+            let sid_ref = &sid;
+            let ack_thread = s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let guard = state_ref.open_store().unwrap();
+                // Pre-watch persistence wrote `pid = None` and `resume_unconfirmed_session_id = Some(sid)`.
+                let mid_rec = find_hosted_session(&*guard, &["claude:ada"])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    mid_rec.pid, None,
+                    "pre-watch record in store should have cleared stale pid before dropping store_guard"
+                );
+                let mid_rstate = load_claude_resume_state(&*guard, "claude:ada");
+                assert_eq!(
+                    mid_rstate.resume_unconfirmed_session_id.as_deref(),
+                    Some(sid_ref.as_str()),
+                    "pre-watch resume_state must be persisted before dropping store_guard"
+                );
+                // Simulate the new process's SessionStart hook recording hydration ack + PID during watch:
+                // also set hydration_status = Unconfirmed beforehand to verify it promotes back to Confirmed.
+                let mut unconfirmed_rec = mid_rec.clone();
+                unconfirmed_rec.hydration_status = HydrationStatus::Unconfirmed;
+                persist_hosted_session(&*guard, &unconfirmed_rec, "ada").unwrap();
+                let _ = guard.delete_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hydration_ack_slug(g1_ref),
+                );
+                let acked = record_hydration_ack_with_pid(
+                    &*guard,
+                    "ada",
+                    true,
+                    Some(g1_ref),
+                    Some("claude:ada"),
+                    Some(7777),
+                )
+                .unwrap();
+                assert!(acked, "hydration ack during watch should record receipt");
+            });
+
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
+            let fake_no_pid = FakeRuntime::default();
+            fake_no_pid.unit_pids.borrow_mut().remove("Ada");
+            let env_no_pid = fake_no_pid.env(hub_home.path());
+            let guard = state.open_store().unwrap();
+            let restarted = restart_hosted_session_with_store(
+                guard,
+                || state.open_store().map_err(LifecycleError::from),
+                &env_no_pid,
+                "claude:ada",
+                "owner",
+            )
+            .unwrap();
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
+            ack_thread.join().unwrap();
+
+            assert_eq!(
+                restarted.record.pid,
+                Some(7777),
+                "PID written by record_hydration_ack_with_pid during watch must survive post-watch write-back"
+            );
+            assert_eq!(
+                restarted.record.hydration_status,
+                HydrationStatus::Confirmed,
+                "hydration confirmation written during watch must survive post-watch write-back"
+            );
+        });
+        {
+            let guard = state.open_store().unwrap();
+            let persisted = find_hosted_session(&*guard, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(persisted.pid, Some(7777));
+            assert_eq!(persisted.hydration_status, HydrationStatus::Confirmed);
+            delete_claude_resume_state(&*guard, "claude:ada");
+        }
+
+        // 3. A decommission during the watch is NOT undone by the post-watch write-back, and the
+        //    newly spawned runtime unit is stopped.
+        std::thread::scope(|s| {
+            let state_ref = &state;
+            let home_path = hub_home.path();
+            let decomm_thread = s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let fake_d = FakeRuntime::default();
+                let env_d = fake_d.env(home_path);
+                let guard = state_ref.open_store().unwrap();
+                let target = SessionTarget::resolve(&*guard, "claude:ada", None).unwrap();
+                let resp =
+                    teardown_session(&*guard, &env_d, &target, "owner", Caller::Owner, |_| {})
+                        .unwrap();
+                assert_eq!(resp.status, STATUS_DECOMMISSIONED);
+            });
+
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
+            let fake_r = FakeRuntime::default();
+            let env_r = fake_r.env(hub_home.path());
+            let guard = state.open_store().unwrap();
+            let res = restart_hosted_session_with_store(
+                guard,
+                || state.open_store().map_err(LifecycleError::from),
+                &env_r,
+                "claude:ada",
+                "owner",
+            );
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
+            decomm_thread.join().unwrap();
+
+            assert!(
+                matches!(res, Err(LifecycleError::Conflict(_))),
+                "restart must return Conflict when session was decommissioned during watch, got {res:?}"
+            );
+            assert!(
+                !fake_r.exists("Ada"),
+                "restart must kill the runtime unit it spawned when session was decommissioned during watch"
+            );
+        });
+        {
+            let guard = state.open_store().unwrap();
+            let after_decomm = find_hosted_session(&*guard, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after_decomm.status, STATUS_DECOMMISSIONED,
+                "decommissioned status must not be overwritten by the finishing survival watch"
+            );
+        }
     }
 }
