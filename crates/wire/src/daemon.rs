@@ -181,20 +181,58 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
-pub fn default_socket_path() -> PathBuf {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(rt);
-        if p.is_absolute() {
-            return p.join("fl-wire.sock");
-        }
+pub fn default_socket_path_with(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_dir: Option<&Path>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(rt) = crate::identity::runtime_dir_path_with(xdg_runtime_dir, run_user_dir) {
+        return rt.join("fl-wire.sock");
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home.filter(|s| !s.is_empty()) {
         let p = PathBuf::from(home);
         if p.is_absolute() {
             return p.join(".cache").join("fl").join("wire.sock");
         }
     }
     PathBuf::from("/tmp/fl-wire.sock")
+}
+
+pub fn default_socket_path() -> PathBuf {
+    if let Some(rt) = crate::identity::runtime_dir_path() {
+        return rt.join("fl-wire.sock");
+    }
+    default_socket_path_with(None, None, std::env::var_os("HOME").as_deref())
+}
+
+pub fn daemon_queue_path(socket_path: &Path) -> PathBuf {
+    let mut os = socket_path.as_os_str().to_os_string();
+    os.push(".queue");
+    PathBuf::from(os)
+}
+
+fn daemon_draining_queue_path(socket_path: &Path) -> PathBuf {
+    let mut os = socket_path.as_os_str().to_os_string();
+    os.push(".queue.draining");
+    PathBuf::from(os)
+}
+
+/// Record `message_id` for delivery by the daemon listening (or next spawned) at `socket_path`.
+pub fn enqueue_for_daemon(socket_path: &Path, message_id: &MessageId) -> io::Result<()> {
+    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let path = daemon_queue_path(socket_path);
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    writeln!(file, "{message_id}")?;
+    file.flush()
 }
 
 pub fn resolve_socket_path(
@@ -945,6 +983,7 @@ struct DaemonInner<S> {
     overflow_capacity_exhausted: AtomicBool,
     dispatch_diagnostics: Mutex<DiagnosticsState>,
     pending_by_recipient: Mutex<BTreeMap<String, BTreeMap<MessageId, At>>>,
+    queued_for_daemon: Mutex<BTreeMap<String, Vec<MessageId>>>,
     #[cfg(test)]
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
@@ -2030,6 +2069,37 @@ where
                             &mut first_holds,
                         );
                     }
+                    let queued_ids = lock(&self.queued_for_daemon).remove(&norm);
+                    if let Some(ids) = queued_ids {
+                        for mid in ids {
+                            let Ok(Some(msg)) = self.store.get_wire_message(&mid) else {
+                                continue;
+                            };
+                            let Ok(receipts) = self.store.list_wire_receipts(&mid) else {
+                                continue;
+                            };
+                            let for_recipient: Vec<DeliveryReceipt> = receipts
+                                .into_iter()
+                                .filter(|r| {
+                                    r.status == DeliveryStatus::Pending
+                                        && r.attempts == 0
+                                        && normalize_persona(&r.recipient_name).unwrap_or_else(
+                                            || r.recipient_name.trim().to_ascii_lowercase(),
+                                        ) == norm
+                                })
+                                .collect();
+                            if !for_recipient.is_empty()
+                                && let Err(message) = self.schedule_dispatch(
+                                    &msg,
+                                    &for_recipient,
+                                    now.clone(),
+                                    &mut first_holds,
+                                )
+                            {
+                                warn(&message);
+                            }
+                        }
+                    }
                     drop(_order);
                     break;
                 }
@@ -2471,6 +2541,90 @@ where
             PeerFrame::Challenge { .. } | PeerFrame::Auth { .. } => {}
         }
     }
+
+    fn drain_queued_messages(self: &Arc<Self>) {
+        let queue_path = daemon_queue_path(&self.config.socket_path);
+        let draining_path = daemon_draining_queue_path(&self.config.socket_path);
+        if !queue_path.exists() && !draining_path.exists() {
+            return;
+        }
+        let mut first_holds = Vec::new();
+        let _order = lock(&self.enqueue_gate);
+        if queue_path.exists() {
+            if !draining_path.exists() {
+                let _ = fs::rename(&queue_path, &draining_path);
+            } else {
+                if let Ok(extra) = fs::read_to_string(&queue_path)
+                    && let Ok(mut f) = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&draining_path)
+                {
+                    let _ = f.write_all(extra.as_bytes());
+                    let _ = f.flush();
+                }
+                let _ = fs::remove_file(&queue_path);
+            }
+        }
+        let Ok(raw) = fs::read_to_string(&draining_path) else {
+            return;
+        };
+        let _ = fs::remove_file(&draining_path);
+        let mut seen = BTreeSet::new();
+        let now = now_at();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                continue;
+            }
+            let Ok(iri) = fl_core::iri::Iri::parse(trimmed) else {
+                continue;
+            };
+            let mid = MessageId(iri);
+            let Ok(Some(msg)) = self.store.get_wire_message(&mid) else {
+                continue;
+            };
+            let Ok(receipts) = self.store.list_wire_receipts(&mid) else {
+                continue;
+            };
+            let pending_receipts: Vec<DeliveryReceipt> = receipts
+                .into_iter()
+                .filter(|r| r.status == DeliveryStatus::Pending && r.attempts == 0)
+                .collect();
+            if pending_receipts.is_empty() {
+                continue;
+            }
+            {
+                let mut queued = lock(&self.queued_for_daemon);
+                for rcpt in &pending_receipts {
+                    let key = normalize_persona(&rcpt.recipient_name)
+                        .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
+                    if !key.is_empty() {
+                        let list = queued.entry(key).or_default();
+                        if !list.contains(&mid) {
+                            list.push(mid.clone());
+                        }
+                    }
+                }
+            }
+            self.admit_pending_receipts(&msg, &pending_receipts);
+            self.notify_subscribers_message(&msg, &pending_receipts);
+            self.broadcast_to_peers(
+                None,
+                &PeerFrame::Publish {
+                    message: msg.clone(),
+                    receipts: pending_receipts.clone(),
+                },
+            );
+            if let Err(message) =
+                self.schedule_dispatch(&msg, &pending_receipts, now.clone(), &mut first_holds)
+            {
+                warn(&message);
+            }
+        }
+        drop(_order);
+        log_first_holds(first_holds);
+    }
 }
 
 pub struct DaemonHandle {
@@ -2577,6 +2731,7 @@ where
         overflow_capacity_exhausted: AtomicBool::new(false),
         dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
         pending_by_recipient: Mutex::new(initial_pending),
+        queued_for_daemon: Mutex::new(BTreeMap::new()),
         #[cfg(test)]
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
@@ -2600,6 +2755,7 @@ where
     warn(
         "startup: pre-restart pending messages remain readable in the inbox; delivery may be unconfirmed",
     );
+    inner.drain_queued_messages();
 
     // Spawn outbound peer loops
     for peer_url in config.peers.clone() {
@@ -2711,6 +2867,8 @@ where
                 });
             }
 
+            inner_main.drain_queued_messages();
+
             if !did_work {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -2800,6 +2958,7 @@ mod tests {
             overflow_capacity_exhausted: AtomicBool::new(false),
             dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
             pending_by_recipient: Mutex::new(BTreeMap::new()),
+            queued_for_daemon: Mutex::new(BTreeMap::new()),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
             fail_next_worker_spawn: AtomicBool::new(false),
@@ -7307,5 +7466,176 @@ mod tests {
             latest_diag.reason,
             RegistrationConflictReason::RegistrationContention
         );
+    }
+
+    #[test]
+    fn default_socket_path_with_precedence() {
+        use std::ffi::OsStr;
+        let tmp = TempDir::new().unwrap();
+        let run_user = tmp.path().join("run-user-1000");
+        fs::create_dir_all(&run_user).unwrap();
+        let home = tmp.path().join("home");
+
+        assert_eq!(
+            default_socket_path_with(
+                Some(OsStr::new("/xdg/rt")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+            ),
+            PathBuf::from("/xdg/rt/fl-wire.sock")
+        );
+        assert_eq!(
+            default_socket_path_with(None, Some(&run_user), Some(home.as_os_str())),
+            run_user.join("fl-wire.sock")
+        );
+        assert_eq!(
+            default_socket_path_with(
+                None,
+                Some(&tmp.path().join("missing")),
+                Some(home.as_os_str()),
+            ),
+            home.join(".cache/fl/wire.sock")
+        );
+        assert_eq!(
+            default_socket_path_with(None, None, None),
+            PathBuf::from("/tmp/fl-wire.sock")
+        );
+    }
+
+    #[test]
+    fn enqueue_for_daemon_drains_at_startup_and_on_tick_and_on_late_route_registration() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("queue.redb")).unwrap());
+        let sock = tmp.path().join("daemon.sock");
+        let routes_file = tmp.path().join("routes.json");
+        RouteTable::default().save(Some(&routes_file)).unwrap();
+
+        let hook_sock = tmp.path().join("felicia-hook.sock");
+        let hook_listener = UnixListener::bind(&hook_sock).unwrap();
+        hook_listener.set_nonblocking(true).unwrap();
+
+        // 1. Pre-startup message NOT enqueued via `enqueue_for_daemon` must NOT be replayed.
+        let (ambiguous_msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "ambiguous".into(),
+                body: "do not replay".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(100),
+            })
+            .unwrap();
+
+        // 2. Message queued by offline client before daemon starts (and before route is registered).
+        let (queued_pre, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "queued-pre".into(),
+                body: "deliver after route registration".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(200),
+            })
+            .unwrap();
+        enqueue_for_daemon(&sock, &queued_pre.id).unwrap();
+
+        let mut handle = spawn_daemon(
+            Arc::clone(&store),
+            DaemonConfig {
+                node_id: "node-q".into(),
+                host: "host-q".into(),
+                socket_path: sock.clone(),
+                routes_path: Some(routes_file),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+
+        // Now register `felicia`'s webhook route: `queued_pre` must be delivered, while `ambiguous_msg` stays Pending!
+        let mut client = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        let resp = client
+            .request(&LocalRequest::register(
+                "felicia",
+                VendorRoute::Webhook {
+                    socket_path: hook_sock.clone(),
+                },
+                true,
+            ))
+            .unwrap();
+        assert!(matches!(resp, LocalResponse::RouteRegistered));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut received_subjects = Vec::new();
+        while Instant::now() < deadline && received_subjects.is_empty() {
+            if let Ok((mut stream, _)) = hook_listener.accept() {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                let val: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                received_subjects.push(val["subject"].as_str().unwrap().to_string());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(received_subjects, vec!["queued-pre".to_string()]);
+        let amb_rcpts = store.list_wire_receipts(&ambiguous_msg.id).unwrap();
+        assert_eq!(amb_rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(amb_rcpts[0].attempts, 0);
+
+        // 3. Message queued via `enqueue_for_daemon` while daemon is already running is drained on tick.
+        let (queued_live, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "queued-live".into(),
+                body: "deliver on tick".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(300),
+            })
+            .unwrap();
+        enqueue_for_daemon(&sock, &queued_live.id).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && received_subjects.len() < 2 {
+            if let Ok((mut stream, _)) = hook_listener.accept() {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                let val: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                received_subjects.push(val["subject"].as_str().unwrap().to_string());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received_subjects,
+            vec!["queued-pre".to_string(), "queued-live".to_string()]
+        );
+        handle.stop();
     }
 }

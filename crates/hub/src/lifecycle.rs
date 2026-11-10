@@ -27,7 +27,7 @@ use fl_wire::dispatcher::{
     push_operator_prompt_with_intent,
 };
 use fl_wire::identity::{
-    RouteTable, VendorRoute, default_routes_path, is_native_session_id, legacy_routes_path,
+    RouteTable, VendorRoute, is_native_session_id, legacy_routes_path, resolve_routes_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -4018,9 +4018,13 @@ fn deliver_prompt(
 pub(crate) fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
     match home_override {
         Some(home) => vec![home.join(".cache").join("agent-bus").join("routes.json")],
-        None => std::iter::once(default_routes_path())
-            .chain(legacy_routes_path())
-            .collect(),
+        None => std::iter::once(resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ))
+        .chain(legacy_routes_path())
+        .collect(),
     }
 }
 

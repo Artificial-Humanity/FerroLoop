@@ -77,6 +77,38 @@ impl HostEndpoint {
         })
     }
 
+    #[cfg(unix)]
+    pub fn discover_unix_path_with(
+        host_sock: Option<&std::ffi::OsStr>,
+        xdg_runtime_dir: Option<&std::ffi::OsStr>,
+        run_user_dir: Option<&Path>,
+        home: Option<&std::ffi::OsStr>,
+        euid: u32,
+    ) -> PathBuf {
+        if let Some(configured) = host_sock.filter(|s| !s.is_empty()) {
+            return PathBuf::from(configured);
+        }
+        if let Some(runtime) = xdg_runtime_dir.filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(runtime);
+            if p.is_absolute() {
+                return p.join("ferroloop/fl-host.sock");
+            }
+        }
+        if let Some(dir) = run_user_dir
+            && dir.is_absolute()
+            && dir.is_dir()
+        {
+            return dir.join("ferroloop/fl-host.sock");
+        }
+        if let Some(home) = home.filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(home);
+            if p.is_absolute() {
+                return p.join(".cache/fl/host.sock");
+            }
+        }
+        PathBuf::from(format!("/tmp/ferroloop-{euid}/fl-host.sock"))
+    }
+
     pub fn discover() -> Result<Self, HostError> {
         if let Ok(configured) = std::env::var("FL_HOST_SOCK")
             && !configured.is_empty()
@@ -95,15 +127,25 @@ impl HostEndpoint {
         }
         #[cfg(target_os = "linux")]
         {
-            if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
-                && !runtime.is_empty()
-            {
-                return Self::unix(PathBuf::from(runtime).join("ferroloop/fl-host.sock"));
-            }
+            use std::os::unix::fs::MetadataExt;
             let uid = unix_euid();
-            Self::unix(PathBuf::from(format!(
-                "/run/user/{uid}/ferroloop/fl-host.sock"
-            )))
+            let run_user_dir = if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
+                let p = PathBuf::from(raw);
+                (p.is_absolute() && p.is_dir()).then_some(p)
+            } else {
+                let p = PathBuf::from(format!("/run/user/{uid}"));
+                std::fs::symlink_metadata(&p)
+                    .is_ok_and(|m| m.is_dir() && m.uid() == uid)
+                    .then_some(p)
+            };
+            let path = Self::discover_unix_path_with(
+                std::env::var_os("FL_HOST_SOCK").as_deref(),
+                std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                run_user_dir.as_deref(),
+                std::env::var_os("HOME").as_deref(),
+                uid,
+            );
+            Self::unix(path)
         }
         #[cfg(target_os = "macos")]
         {
@@ -243,4 +285,68 @@ fn socket_path_fits(path: &Path) -> bool {
 pub(crate) fn unix_euid() -> u32 {
     // SAFETY: geteuid has no arguments and cannot fail.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn discover_unix_path_with_falls_back_through_xdg_run_user_home_and_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_user = tmp.path().join("run-user-1000");
+        std::fs::create_dir_all(&run_user).unwrap();
+        let home = tmp.path().join("home");
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                Some(OsStr::new("/custom/host.sock")),
+                Some(OsStr::new("/xdg/runtime")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+                1000,
+            ),
+            PathBuf::from("/custom/host.sock")
+        );
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                Some(OsStr::new("/xdg/runtime")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+                1000,
+            ),
+            PathBuf::from("/xdg/runtime/ferroloop/fl-host.sock")
+        );
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                None,
+                Some(&run_user),
+                Some(home.as_os_str()),
+                1000,
+            ),
+            run_user.join("ferroloop/fl-host.sock")
+        );
+
+        let missing_run_user = tmp.path().join("missing-run-user");
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                None,
+                Some(&missing_run_user),
+                Some(home.as_os_str()),
+                1000,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(None, None, None, None, 1000),
+            PathBuf::from("/tmp/ferroloop-1000/fl-host.sock")
+        );
+    }
 }

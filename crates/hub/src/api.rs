@@ -63,7 +63,7 @@ use fl_wire::dispatcher::{
     CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
     PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
     dispatch_operator_prompt_to_route, push_operator_prompt_to_route,
-    push_operator_prompt_with_intent, push_to_route,
+    push_operator_prompt_with_intent, push_to_route_for_recipient,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -2453,7 +2453,8 @@ fn handle_post_wire_send(
                 entry = fresh;
             }
         }
-        let mut pushed = push_to_route(&entry.route, &msg);
+        let mut pushed =
+            push_to_route_for_recipient(&entry.route, Some(rcpt.recipient_name.as_str()), &msg);
         if scan_started.is_none() && matches!(pushed, Err(PushError::NotConnected(_))) {
             // The saved route's receiver was never reached, so nothing was delivered: scan once
             // and push on the route the scan found, when it is a different one.
@@ -2462,7 +2463,11 @@ fn handle_post_wire_send(
                 .get(&rcpt.recipient_name)
                 .filter(|fresh| fresh.route != entry.route)
             {
-                pushed = push_to_route(&fresh.route, &msg);
+                pushed = push_to_route_for_recipient(
+                    &fresh.route,
+                    Some(rcpt.recipient_name.as_str()),
+                    &msg,
+                );
             }
         }
         let target_status = match pushed {

@@ -70,6 +70,8 @@ pub enum WireCmd {
         #[arg(long)]
         from: Option<String>,
         #[arg(long)]
+        no_daemon: bool,
+        #[arg(long)]
         json: bool,
     },
     /// Broadcast a message to all active agents (`@all`), excluding the sender.
@@ -82,6 +84,8 @@ pub enum WireCmd {
         durable: bool,
         #[arg(long)]
         from: Option<String>,
+        #[arg(long)]
+        no_daemon: bool,
         #[arg(long)]
         json: bool,
     },
@@ -97,6 +101,8 @@ pub enum WireCmd {
         #[arg(long)]
         from: Option<String>,
         #[arg(long)]
+        no_daemon: bool,
+        #[arg(long)]
         json: bool,
     },
     /// Reply to a message by `MessageId` (`urn:uuid:...`), inheriting its thread and correlation ID.
@@ -107,6 +113,8 @@ pub enum WireCmd {
         subject: Option<String>,
         #[arg(long)]
         from: Option<String>,
+        #[arg(long)]
+        no_daemon: bool,
         #[arg(long)]
         json: bool,
     },
@@ -300,13 +308,12 @@ pub fn resolve_routes_path() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
-pub fn resolve_routes_path_for(env: &StateEnv<'_>) -> Option<PathBuf> {
-    resolve_routes_path().or_else(|| {
-        env.explicit_db
-            .and_then(|p| p.parent())
-            .filter(|d| !d.as_os_str().is_empty())
-            .map(|d| d.join("fl-wire-routes.json"))
-    })
+pub fn resolve_routes_path_for(env: &StateEnv<'_>) -> PathBuf {
+    fl_wire::identity::resolve_routes_path(
+        None,
+        std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+        env.explicit_db,
+    )
 }
 
 pub fn resolve_caller(
@@ -328,7 +335,7 @@ pub fn resolve_caller_with_source(
     let reg = store.as_ref().map(|s| s as &dyn AgentRegistry);
     let rpath = resolve_routes_path_for(env);
     let (persona, source) =
-        resolve_persona_with_source(explicit, transcript, env.cwd, reg, rpath.as_deref());
+        resolve_persona_with_source(explicit, transcript, env.cwd, reg, Some(&rpath));
     let has_env_persona_override =
         std::env::var_os("AGENT_PERSONA").is_some() || std::env::var_os("AGENT_NAME").is_some();
     let allow_route_capture = env.explicit_db.is_none() || resolve_routes_path().is_some();
@@ -375,9 +382,9 @@ fn record_registration_diagnostic(env: &StateEnv<'_>, diagnostic: RouteRegistrat
         }
         Err(_) => {
             let rpath = resolve_routes_path_for(env);
-            let mut table = RouteTable::load(rpath.as_deref());
+            let mut table = RouteTable::load(Some(&rpath));
             table.push_registration_diagnostic(diagnostic);
-            let _ = table.save(rpath.as_deref());
+            let _ = table.save(Some(&rpath));
         }
     }
 }
@@ -791,7 +798,7 @@ fn record_caller_route_with_provenance_meta(
         }
     } else {
         let rpath = resolve_routes_path_for(env);
-        let mut table = RouteTable::load(rpath.as_deref());
+        let mut table = RouteTable::load(Some(&rpath));
         if explicit {
             if let Err(refusal) = table.register_route_checked(RegisterRouteCheckArgs {
                 persona: persona.to_string(),
@@ -806,14 +813,14 @@ fn record_caller_route_with_provenance_meta(
                 incumbent_dead_override: None,
                 at: now_at(),
             }) {
-                let _ = table.save(rpath.as_deref());
+                let _ = table.save(Some(&rpath));
                 return Err(refusal.message);
             }
         } else {
             table.upsert(persona, route, now_at());
         }
         table
-            .save(rpath.as_deref())
+            .save(Some(&rpath))
             .map_err(|error| error.to_string())?;
     }
     if prune_roster {
@@ -860,11 +867,13 @@ fn prune_muse_roster(persona: &str) -> std::io::Result<()> {
 
 pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
     let sock = resolve_socket_path(env, None);
-    let paths: Vec<PathBuf> = match resolve_routes_path_for(env) {
-        Some(path) => vec![path],
-        None => std::iter::once(fl_wire::identity::default_routes_path())
+    let rpath = resolve_routes_path_for(env);
+    let paths: Vec<PathBuf> = if env.explicit_db.is_none() && resolve_routes_path().is_none() {
+        std::iter::once(rpath)
             .chain(fl_wire::identity::legacy_routes_path())
-            .collect(),
+            .collect()
+    } else {
+        vec![rpath]
     };
     remove_route_at(&sock, &paths, persona)
 }
@@ -1036,7 +1045,7 @@ fn existing_route_entry_for(env: &StateEnv<'_>, persona: &str) -> Option<RouteEn
             .find(|r| r.persona.eq_ignore_ascii_case(persona));
     }
     let rpath = resolve_routes_path_for(env);
-    RouteTable::load(rpath.as_deref()).get(persona).cloned()
+    RouteTable::load(Some(&rpath)).get(persona).cloned()
 }
 
 /// The route currently on file for `persona`: the daemon's table when it answers, else the
@@ -1113,9 +1122,21 @@ pub fn parse_message_id(raw: &str) -> Result<MessageId, String> {
     }
 }
 
+fn wire_no_daemon_env() -> bool {
+    std::env::var("FL_WIRE_NO_DAEMON").as_deref() == Ok("1")
+}
+
 pub fn execute_send(
     env: &StateEnv<'_>,
+    args: SendWireArgs,
+) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
+    execute_send_with_options(env, args, wire_no_daemon_env())
+}
+
+pub fn execute_send_with_options(
+    env: &StateEnv<'_>,
     mut args: SendWireArgs,
+    no_daemon: bool,
 ) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
     let message_id = args
         .id
@@ -1127,24 +1148,31 @@ pub fn execute_send(
         })
         .clone();
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        let uncertain = |error: String| {
-            format!(
-                "message {message_id} may already be delivered; check its status before retrying: {error}"
-            )
-        };
-        match client
-            .request(&LocalRequest::Send { args })
-            .map_err(uncertain)?
-        {
-            LocalResponse::Sent { message, receipts } => return Ok((message, receipts)),
-            other => return Err(uncertain(format!("unexpected daemon response: {other:?}"))),
+    if !no_daemon {
+        if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+            let uncertain = |error: String| {
+                format!(
+                    "message {message_id} may already be delivered; check its status before retrying: {error}"
+                )
+            };
+            match client
+                .request(&LocalRequest::Send { args })
+                .map_err(uncertain)?
+            {
+                LocalResponse::Sent { message, receipts } => return Ok((message, receipts)),
+                other => return Err(uncertain(format!("unexpected daemon response: {other:?}"))),
+            }
         }
+        let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+        let (msg, receipts) = store.send_wire(args).map_err(|e| e.to_string())?;
+        let _ = fl_wire::daemon::enqueue_for_daemon(&sock, &msg.id);
+        eprintln!("queued, the daemon will deliver (message_id={})", msg.id);
+        return Ok((msg, receipts));
     }
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
     let (msg, receipts) = store.send_wire(args).map_err(|e| e.to_string())?;
     let rpath = resolve_routes_path_for(env);
-    let mut routes = RouteTable::load(rpath.as_deref());
+    let mut routes = RouteTable::load(Some(&rpath));
     let _ = dispatch_message_for_store(&store, &mut routes, None, &msg, now_at());
     let latest_receipts = store.list_wire_receipts(&msg.id).unwrap_or(receipts);
     Ok((msg, latest_receipts))
@@ -1219,6 +1247,24 @@ pub fn execute_reply(
     body: String,
     sender_name: String,
 ) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
+    execute_reply_with_options(
+        env,
+        parent_id,
+        subject_override,
+        body,
+        sender_name,
+        wire_no_daemon_env(),
+    )
+}
+
+pub fn execute_reply_with_options(
+    env: &StateEnv<'_>,
+    parent_id: &MessageId,
+    subject_override: Option<String>,
+    body: String,
+    sender_name: String,
+    no_daemon: bool,
+) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
     let parent = {
         let store = env.open_for_scope(Some(&StateScope::Workspace))?;
         store
@@ -1240,7 +1286,7 @@ pub fn execute_reply(
         Some(id) => WireAddress::AgentId(id),
         None => WireAddress::AgentName(parent.sender_name.clone()),
     };
-    execute_send(
+    execute_send_with_options(
         env,
         SendWireArgs {
             id: None,
@@ -1258,6 +1304,7 @@ pub fn execute_reply(
             deadline_at: None,
             at: now_at(),
         },
+        no_daemon,
     )
 }
 
@@ -1322,6 +1369,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             durable,
             thread,
             from,
+            no_daemon,
             json,
         } => {
             let parsed_to = WireAddress::parse(&to).map_err(|e| (1, e.to_string()))?;
@@ -1345,7 +1393,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             } else {
                 MessageUrgency::Normal
             };
-            let (msg, receipts) = execute_send(
+            let (msg, receipts) = execute_send_with_options(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1363,6 +1411,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     deadline_at: None,
                     at: now_at(),
                 },
+                no_daemon || wire_no_daemon_env(),
             )
             .map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);
@@ -1374,6 +1423,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             urgent,
             durable,
             from,
+            no_daemon,
             json,
         } => {
             let sender_name = resolve_caller(env, from.as_deref(), None);
@@ -1382,7 +1432,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             } else {
                 MessageUrgency::Normal
             };
-            let (msg, receipts) = execute_send(
+            let (msg, receipts) = execute_send_with_options(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1400,6 +1450,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     deadline_at: None,
                     at: now_at(),
                 },
+                no_daemon || wire_no_daemon_env(),
             )
             .map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);
@@ -1412,6 +1463,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             timeout,
             urgent,
             from,
+            no_daemon,
             json,
         } => {
             let parsed_to = WireAddress::parse(&to).map_err(|e| (1, e.to_string()))?;
@@ -1424,7 +1476,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             let now_ms = now_millis();
             let now = At::from_unix_millis(now_ms);
             let deadline_at = timeout.map(|secs| At::from_unix_millis(now_ms + secs * 1000));
-            let (ask_msg, receipts) = execute_send(
+            let (ask_msg, receipts) = execute_send_with_options(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1442,6 +1494,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     deadline_at,
                     at: now,
                 },
+                no_daemon || wire_no_daemon_env(),
             )
             .map_err(|e| (1, e))?;
 
@@ -1485,12 +1538,20 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             body,
             subject,
             from,
+            no_daemon,
             json,
         } => {
             let parent_id = parse_message_id(&message_id).map_err(|e| (1, e))?;
             let sender_name = resolve_caller(env, from.as_deref(), None);
-            let (msg, receipts) =
-                execute_reply(env, &parent_id, subject, body, sender_name).map_err(|e| (1, e))?;
+            let (msg, receipts) = execute_reply_with_options(
+                env,
+                &parent_id,
+                subject,
+                body,
+                sender_name,
+                no_daemon || wire_no_daemon_env(),
+            )
+            .map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);
             Ok(0)
         }
@@ -1703,7 +1764,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 return Ok(0);
             }
             let rpath = resolve_routes_path_for(env);
-            let routes = RouteTable::load(rpath.as_deref());
+            let routes = RouteTable::load(Some(&rpath));
             let route_entries: Vec<_> = routes.entries.values().cloned().collect();
             let now = now_at();
             let store = env.open_for_scope(Some(&StateScope::Workspace)).ok();
@@ -1794,7 +1855,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     node_id: host.clone(),
                     host,
                     socket_path: sock,
-                    routes_path: resolve_routes_path_for(env),
+                    routes_path: Some(resolve_routes_path_for(env)),
                     home_override: None,
                     listen_addr,
                     peers: peer_list,
@@ -1936,7 +1997,7 @@ fn vendor_hook_response(
         {
             (found, PersonaSource::Transcript)
         } else if !session_id.is_empty()
-            && let Some(entry) = RouteTable::load(resolve_routes_path_for(&hook_env).as_deref())
+            && let Some(entry) = RouteTable::load(Some(&resolve_routes_path_for(&hook_env)))
                 .entries
                 .values()
                 .find(|entry| {
@@ -1958,7 +2019,7 @@ fn vendor_hook_response(
             transcript_path.as_deref(),
             hook_env.cwd,
             reg,
-            rpath.as_deref(),
+            Some(&rpath),
         )
     };
     if persona == "unknown" {
@@ -2173,6 +2234,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                 durable: false,
                 thread: None,
                 from,
+                no_daemon: false,
                 json: false,
             },
         ),
@@ -2184,6 +2246,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                 urgent: false,
                 durable: false,
                 from,
+                no_daemon: false,
                 json: false,
             },
         ),
@@ -5949,5 +6012,142 @@ pub(crate) mod tests {
             rig.route_of("feira"),
             Some(VendorRoute::Codex { ref thread_id, .. }) if thread_id == "thread-codex-3"
         ));
+    }
+
+    #[test]
+    fn resolve_routes_path_for_never_returns_empty_and_respects_precedence() {
+        let _guard = hook_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let db = tmp.path().join("explicit").join("store.fls");
+        unsafe {
+            std::env::remove_var("FL_WIRE_ROUTES");
+        }
+        let env_with_db = StateEnv {
+            explicit_db: Some(&db),
+            default_store: tmp.path(),
+            cfg: &cfg,
+            cwd: tmp.path(),
+        };
+        assert_eq!(
+            resolve_routes_path_for(&env_with_db),
+            tmp.path().join("explicit").join("fl-wire-routes.json")
+        );
+
+        let env_without_db = StateEnv {
+            explicit_db: None,
+            default_store: tmp.path(),
+            cfg: &cfg,
+            cwd: tmp.path(),
+        };
+        let default_resolved = resolve_routes_path_for(&env_without_db);
+        assert!(!default_resolved.as_os_str().is_empty());
+        assert_eq!(default_resolved, fl_wire::identity::default_routes_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_send_without_daemon_queues_without_in_process_dispatch_unless_no_daemon_is_set() {
+        use std::os::unix::net::UnixListener;
+        let _guard = hook_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("store.fls");
+        let sock = tmp.path().join("unreachable.sock");
+        let routes_path = tmp.path().join("fl-wire-routes.json");
+        let hook_sock = tmp.path().join("felicia-hook.sock");
+        let listener = UnixListener::bind(&hook_sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "felicia",
+            VendorRoute::Webhook {
+                socket_path: hook_sock,
+            },
+            now_at(),
+        );
+        routes.save(Some(&routes_path)).unwrap();
+
+        unsafe {
+            std::env::set_var("FL_WIRE_SOCKET", &sock);
+            std::env::set_var("FL_WIRE_ROUTES", &routes_path);
+            std::env::remove_var("FL_WIRE_NO_DAEMON");
+        }
+        let cfg = Config::default();
+        let env = StateEnv {
+            explicit_db: Some(&db),
+            default_store: tmp.path(),
+            cfg: &cfg,
+            cwd: tmp.path(),
+        };
+
+        // 1. Default (`no_daemon = false`) when daemon socket is unreachable:
+        //    stores message (`Pending`, `attempts == 0`), enqueues for daemon, and NEVER dispatches in-process!
+        let (queued_msg, queued_rcpts) = execute_send_with_options(
+            &env,
+            SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "no-client-dispatch".into(),
+                body: "daemon will deliver".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: now_at(),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(queued_rcpts.len(), 1);
+        assert_eq!(queued_rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(queued_rcpts[0].attempts, 0);
+        assert!(
+            listener.accept().is_err(),
+            "client must never dispatch in-process when no_daemon is false"
+        );
+        let queue_contents =
+            std::fs::read_to_string(fl_wire::daemon::daemon_queue_path(&sock)).unwrap();
+        assert!(queue_contents.contains(queued_msg.id.as_str()));
+
+        // 2. Explicit `no_daemon = true` (`--no-daemon` / `FL_WIRE_NO_DAEMON=1`) dispatches in-process.
+        let (_, direct_rcpts) = execute_send_with_options(
+            &env,
+            SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "explicit-no-daemon".into(),
+                body: "offline mode".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: now_at(),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(direct_rcpts.len(), 1);
+        assert_eq!(direct_rcpts[0].status, DeliveryStatus::Acked);
+        assert_eq!(direct_rcpts[0].attempts, 1);
+        assert!(
+            listener.accept().is_ok(),
+            "explicit --no-daemon must dispatch in-process"
+        );
+
+        unsafe {
+            std::env::remove_var("FL_WIRE_SOCKET");
+            std::env::remove_var("FL_WIRE_ROUTES");
+        }
     }
 }
