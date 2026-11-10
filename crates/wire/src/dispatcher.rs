@@ -2424,6 +2424,8 @@ fn tmux_target_alive(target: &str) -> bool {
 
 const COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX: &str = "composer_occupied_by_non_wire_input:";
 const MAX_UNCONFIRMED_WIRE_DELIVERIES: usize = 256;
+const MAX_UNCONFIRMED_PER_ROUTE: usize = 8;
+const MIN_SCROLLED_SUFFIX_COMPACT_CHARS: usize = 32;
 
 fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
@@ -2438,13 +2440,17 @@ fn composer_occupied_by_non_wire_input_error() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnconfirmedWireDelivery {
     wire_id: String,
-    expected_placeholder_lengths: Vec<usize>,
-    body_probes: Vec<String>,
+    compact_full: String,
+    compact_header: Option<String>,
+    full_placeholder_lengths: Vec<usize>,
+    body_placeholder_lengths: Vec<usize>,
 }
 
-static UNCONFIRMED_WIRE_DELIVERIES: std::sync::Mutex<
-    std::collections::BTreeMap<String, UnconfirmedWireDelivery>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+type RouteDeliveryLedger =
+    std::collections::VecDeque<(String, std::collections::VecDeque<UnconfirmedWireDelivery>)>;
+
+static UNCONFIRMED_WIRE_DELIVERIES: std::sync::Mutex<RouteDeliveryLedger> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn push_len_and_plus_one(out: &mut Vec<usize>, s: &str) {
     if s.is_empty() {
@@ -2461,17 +2467,47 @@ fn push_len_and_plus_one(out: &mut Vec<usize>, s: &str) {
     }
 }
 
-fn expected_placeholder_char_lengths(trimmed: &str, raw_text: Option<&str>) -> Vec<usize> {
-    let mut out = Vec::with_capacity(18);
-    push_len_and_plus_one(&mut out, trimmed);
-    let body = strip_delivery_header(trimmed);
-    push_len_and_plus_one(&mut out, body);
+fn build_delivery_descriptor(
+    wire_id: &str,
+    trimmed: &str,
+    raw_text: Option<&str>,
+) -> UnconfirmedWireDelivery {
+    let trimmed_clean = trimmed.trim();
+    let compact_full: String = trimmed_clean
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut full_placeholder_lengths = Vec::with_capacity(12);
+    push_len_and_plus_one(&mut full_placeholder_lengths, trimmed_clean);
     if let Some(raw) = raw_text
-        && raw != trimmed
+        && raw != trimmed_clean
     {
-        push_len_and_plus_one(&mut out, raw);
+        push_len_and_plus_one(&mut full_placeholder_lengths, raw);
     }
-    out
+
+    let mut compact_header = None;
+    let mut body_placeholder_lengths = Vec::new();
+    if (trimmed_clean.starts_with("[fl-wire ")
+        || trimmed_clean.starts_with("[Operator Prompt via FerroDeck"))
+        && let Some((first_line, rest)) = trimmed_clean.split_once('\n')
+    {
+        let body = rest.trim();
+        if !body.is_empty() {
+            let hdr_compact: String = first_line.chars().filter(|c| !c.is_whitespace()).collect();
+            if !hdr_compact.is_empty() {
+                compact_header = Some(hdr_compact);
+                push_len_and_plus_one(&mut body_placeholder_lengths, body);
+            }
+        }
+    }
+
+    UnconfirmedWireDelivery {
+        wire_id: wire_id.to_string(),
+        compact_full,
+        compact_header,
+        full_placeholder_lengths,
+        body_placeholder_lengths,
+    }
 }
 
 #[cfg(test)]
@@ -2488,25 +2524,31 @@ fn record_unconfirmed_wire_delivery_with_raw(
     if route_keys.is_empty() || wire_id.is_empty() {
         return;
     }
-    let entry = UnconfirmedWireDelivery {
-        wire_id: wire_id.to_string(),
-        expected_placeholder_lengths: expected_placeholder_char_lengths(trimmed, raw_text),
-        body_probes: payload_probes(trimmed),
-    };
-    let mut map = UNCONFIRMED_WIRE_DELIVERIES
+    let entry = build_delivery_descriptor(wire_id, trimmed, raw_text);
+    let mut ledger = UNCONFIRMED_WIRE_DELIVERIES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     for key in route_keys {
         if key.is_empty() {
             continue;
         }
-        if !map.contains_key(key)
-            && map.len() >= MAX_UNCONFIRMED_WIRE_DELIVERIES
-            && let Some(oldest_key) = map.keys().next().cloned()
-        {
-            map.remove(&oldest_key);
+        if let Some((_, entries)) = ledger.iter_mut().find(|(k, _)| k == key) {
+            if let Some(existing) = entries.iter_mut().find(|e| e.wire_id == wire_id) {
+                *existing = entry.clone();
+            } else {
+                while entries.len() >= MAX_UNCONFIRMED_PER_ROUTE {
+                    entries.pop_front();
+                }
+                entries.push_back(entry.clone());
+            }
+            continue;
         }
-        map.insert(key.clone(), entry.clone());
+        while ledger.len() >= MAX_UNCONFIRMED_WIRE_DELIVERIES {
+            ledger.pop_front();
+        }
+        let mut entries = std::collections::VecDeque::with_capacity(MAX_UNCONFIRMED_PER_ROUTE);
+        entries.push_back(entry.clone());
+        ledger.push_back((key.clone(), entries));
     }
 }
 
@@ -2514,46 +2556,276 @@ fn clear_unconfirmed_wire_deliveries(route_keys: &[String]) {
     if route_keys.is_empty() {
         return;
     }
-    let mut map = UNCONFIRMED_WIRE_DELIVERIES
+    let mut ledger = UNCONFIRMED_WIRE_DELIVERIES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for key in route_keys {
-        map.remove(key);
-    }
+    ledger.retain(|(k, _)| !route_keys.iter().any(|rk| rk == k));
 }
 
-fn unconfirmed_wire_delivery_matches_placeholder(route_keys: &[String], chars_len: usize) -> bool {
-    if chars_len == 0 || route_keys.is_empty() {
-        return false;
-    }
-    let map = UNCONFIRMED_WIRE_DELIVERIES
+#[cfg(test)]
+fn route_has_unconfirmed_wire_deliveries(route_keys: &[String]) -> bool {
+    let ledger = UNCONFIRMED_WIRE_DELIVERIES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     route_keys.iter().any(|key| {
-        map.get(key)
-            .is_some_and(|entry| entry.expected_placeholder_lengths.contains(&chars_len))
+        ledger
+            .iter()
+            .any(|(k, entries)| k == key && !entries.is_empty())
     })
 }
 
-fn unconfirmed_wire_delivery_matches_scrolled_composer(
-    route_keys: &[String],
-    composer_text: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactPlaceholderPrefix<'a> {
+    Chars { len: usize, rest: &'a str },
+    Bare { rest: &'a str },
+}
+
+fn strip_compact_placeholder_prefix(rem: &str) -> Option<CompactPlaceholderPrefix<'_>> {
+    let after_open = rem.strip_prefix("[PastedContent")?;
+    if let Some(rest) = after_open.strip_prefix(']') {
+        return Some(CompactPlaceholderPrefix::Bare { rest });
+    }
+    let digit_bytes = after_open
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digit_bytes == 0 {
+        return None;
+    }
+    let n = after_open[..digit_bytes].parse::<usize>().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let after_digits = &after_open[digit_bytes..];
+    let rest = after_digits
+        .strip_prefix("chars]")
+        .or_else(|| after_digits.strip_prefix("char]"))?;
+    Some(CompactPlaceholderPrefix::Chars { len: n, rest })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeliveryPrefixMatch<'a> {
+    rest: &'a str,
+    is_placeholder: bool,
+}
+
+fn match_delivery_prefix<'a>(
+    rem: &'a str,
+    d: &UnconfirmedWireDelivery,
+    allow_bare_placeholder: bool,
+) -> Vec<DeliveryPrefixMatch<'a>> {
+    let mut out: Vec<DeliveryPrefixMatch<'a>> = Vec::with_capacity(2);
+    let push_unique = |out: &mut Vec<DeliveryPrefixMatch<'a>>, rest: &'a str, is_ph: bool| {
+        if let Some(existing) = out.iter_mut().find(|m| m.rest == rest) {
+            existing.is_placeholder |= is_ph;
+        } else {
+            out.push(DeliveryPrefixMatch {
+                rest,
+                is_placeholder: is_ph,
+            });
+        }
+    };
+
+    if !d.compact_full.is_empty()
+        && let Some(rest) = rem.strip_prefix(&d.compact_full)
+    {
+        push_unique(&mut out, rest, false);
+    }
+    match strip_compact_placeholder_prefix(rem) {
+        Some(CompactPlaceholderPrefix::Chars { len, rest })
+            if d.full_placeholder_lengths.contains(&len) =>
+        {
+            push_unique(&mut out, rest, true);
+        }
+        Some(CompactPlaceholderPrefix::Bare { rest }) if allow_bare_placeholder => {
+            push_unique(&mut out, rest, true);
+        }
+        _ => {}
+    }
+    if let Some(hdr) = &d.compact_header
+        && !hdr.is_empty()
+        && let Some(after_hdr) = rem.strip_prefix(hdr.as_str())
+    {
+        match strip_compact_placeholder_prefix(after_hdr) {
+            Some(CompactPlaceholderPrefix::Chars { len, rest })
+                if d.body_placeholder_lengths.contains(&len) =>
+            {
+                push_unique(&mut out, rest, true);
+            }
+            Some(CompactPlaceholderPrefix::Bare { rest }) if allow_bare_placeholder => {
+                push_unique(&mut out, rest, true);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn build_compact_from_composer_slice(slice: &[&str], top_is_zero: bool) -> Option<(String, bool)> {
+    let first_non_empty = slice.iter().position(|l| !l.trim().is_empty())?;
+    let first_has_prompt = line_starts_with_prompt(slice[first_non_empty]);
+    let mut compact = String::new();
+    for (idx, &line) in slice[first_non_empty..].iter().enumerate() {
+        let seg = if idx == 0 && first_has_prompt {
+            strip_composer_prompt_prefix(line)
+        } else {
+            line
+        };
+        compact.extend(seg.chars().filter(|c| !c.is_whitespace()));
+    }
+    if compact.is_empty() {
+        return None;
+    }
+    let is_top_zero_scrolled = top_is_zero && !first_has_prompt;
+    Some((compact, is_top_zero_scrolled))
+}
+
+fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
+    if lines.iter().any(|l| is_horizontal_rule_line(l)) {
+        let (between, top) = composer_region_lines(lines)?;
+        return build_compact_from_composer_slice(between, top == 0);
+    }
+    let tail_start = lines
+        .iter()
+        .rposition(|l| line_starts_with_output_marker(l))
+        .map_or(0, |idx| idx + 1);
+    let non_empty_tail: Vec<&str> = lines[tail_start..]
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if !non_empty_tail
+        .iter()
+        .rev()
+        .take(3)
+        .any(|l| l.contains("[Pasted Content"))
+    {
+        return None;
+    }
+    let slice = if let Some(prompt_pos) = non_empty_tail
+        .iter()
+        .rposition(|l| line_starts_with_prompt(l))
+    {
+        &non_empty_tail[prompt_pos..]
+    } else {
+        &non_empty_tail[non_empty_tail.len().saturating_sub(3)..]
+    };
+    build_compact_from_composer_slice(slice, false)
+}
+
+fn consumes_recorded_deliveries_to_end(
+    rem: &str,
+    entries: &std::collections::VecDeque<UnconfirmedWireDelivery>,
+    min_idx: usize,
 ) -> bool {
-    if composer_text.is_empty() || route_keys.is_empty() {
+    if rem.is_empty() {
+        return true;
+    }
+    for idx in min_idx..entries.len() {
+        for matched in match_delivery_prefix(rem, &entries[idx], false) {
+            if consumes_recorded_deliveries_to_end(matched.rest, entries, idx + 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn last_n_chars_slice(s: &str, n: usize) -> Option<&str> {
+    if n == 0 {
+        return Some("");
+    }
+    let mut rev = s.char_indices().rev();
+    let (byte_idx, _) = rev.nth(n - 1)?;
+    Some(&s[byte_idx..])
+}
+
+fn composer_matches_delivery_ledger(
+    composer_compact: &str,
+    is_top_zero_scrolled: bool,
+    entries: &std::collections::VecDeque<UnconfirmedWireDelivery>,
+) -> bool {
+    if composer_compact.is_empty() || entries.is_empty() {
         return false;
     }
-    let map = UNCONFIRMED_WIRE_DELIVERIES
+    if consumes_recorded_deliveries_to_end(composer_compact, entries, 0) {
+        return true;
+    }
+    if !is_top_zero_scrolled {
+        return false;
+    }
+    for idx in 0..entries.len() {
+        let Some(last_probe) = last_n_chars_slice(
+            &entries[idx].compact_full,
+            MIN_SCROLLED_SUFFIX_COMPACT_CHARS,
+        ) else {
+            continue;
+        };
+        for (pos, _) in composer_compact.match_indices(last_probe) {
+            let split_byte = pos + last_probe.len();
+            let prefix_slice = &composer_compact[..split_byte];
+            if entries[idx].compact_full.ends_with(prefix_slice)
+                && consumes_recorded_deliveries_to_end(
+                    &composer_compact[split_byte..],
+                    entries,
+                    idx + 1,
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn composer_equals_single_target_on_lines(
+    lines: &[&str],
+    d_target: &UnconfirmedWireDelivery,
+) -> (bool, bool) {
+    let Some((composer_compact, is_top_zero_scrolled)) = extract_composer_compact(lines) else {
+        return (false, false);
+    };
+    for matched in match_delivery_prefix(&composer_compact, d_target, true) {
+        if matched.rest.is_empty() {
+            return (true, matched.is_placeholder);
+        }
+    }
+    if is_top_zero_scrolled
+        && composer_compact.chars().count() >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS
+        && d_target.compact_full.ends_with(&composer_compact)
+    {
+        return (true, false);
+    }
+    (false, false)
+}
+
+fn composer_equals_single_target(screen: &str, d_target: &UnconfirmedWireDelivery) -> (bool, bool) {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    composer_equals_single_target_on_lines(&lines, d_target)
+}
+
+fn composer_equals_recorded_wire_deliveries_on_lines(
+    lines: &[&str],
+    route_keys: &[String],
+) -> bool {
+    if route_keys.is_empty() {
+        return false;
+    }
+    let Some((composer_compact, is_top_zero_scrolled)) = extract_composer_compact(lines) else {
+        return false;
+    };
+    let ledger = UNCONFIRMED_WIRE_DELIVERIES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     route_keys.iter().any(|key| {
-        map.get(key).is_some_and(|entry| {
-            entry.body_probes.iter().any(|probe| {
-                if probe.chars().count() < MIN_SUBSTRING_PROBE_CHARS {
-                    composer_text == probe
-                } else {
-                    composer_text.contains(probe.as_str())
-                }
-            })
+        ledger.iter().any(|(k, entries)| {
+            k == key
+                && composer_matches_delivery_ledger(
+                    &composer_compact,
+                    is_top_zero_scrolled,
+                    entries,
+                )
         })
     })
 }
@@ -3205,7 +3477,7 @@ fn deliver_via_tmux_paste_with_opts(
             }
         },
         |err| {
-            if !err.contains("active dialog or menu detected") {
+            if !err.contains("active dialog or menu detected") && !is_composer_occupied_error(err) {
                 let _ = Command::new(&tmux_abort_cu)
                     .args(["send-keys", "-t", &target_abort_cu, "C-u"])
                     .stdout(std::process::Stdio::null())
@@ -3338,9 +3610,9 @@ fn prepare_clean_composer_before_paste(
 ///
 /// Never presses `Enter` on menus/dialogs or non-wire input (owner drafts, slash commands, human
 /// pastes): those fail closed immediately with `composer_occupied_by_non_wire_input:` and `0` keys
-/// sent. Only content proven to be an earlier FerroWire delivery to this route (visible `[fl-wire `
-/// header with `(id: urn:uuid:...`, or a recorded unconfirmed wire delivery for `route_keys`) is
-/// flushed via [`run_bounded_enter_retry_loop`].
+/// sent. Only content proven to equal 1 or more ordered recorded unconfirmed FerroWire deliveries
+/// for `route_keys` ([`composer_equals_recorded_wire_deliveries`]) is flushed via
+/// [`run_bounded_enter_retry_loop`].
 fn prepare_clean_composer_before_paste_for_route(
     trimmed: &str,
     route_keys: &[String],
@@ -3355,7 +3627,7 @@ fn prepare_clean_composer_before_paste_for_route(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
-    if screen_has_dialog_or_menu_markers_with_context(&contents1, None, route_keys) {
+    if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if !composer_has_unsubmitted_content(&contents1, cursor1) {
@@ -3373,20 +3645,20 @@ fn prepare_clean_composer_before_paste_for_route(
         return Ok(PrePasteOutcome::AlreadySubmittedTarget);
     }
     let Some((contents2, cursor2)) = capture_rendered_only() else {
-        if !composer_proven_earlier_wire_delivery(&contents1, route_keys) {
+        if !composer_equals_recorded_wire_deliveries(&contents1, route_keys) {
             return Err(composer_occupied_by_non_wire_input_error());
         }
         return Err("prompt submission unconfirmed before paste: \
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
-    if screen_has_dialog_or_menu_markers_with_context(&contents2, None, route_keys) {
+    if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if !composer_has_unsubmitted_content(&contents2, cursor2) {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
-    if !composer_proven_earlier_wire_delivery(&contents2, route_keys) {
+    if !composer_equals_recorded_wire_deliveries(&contents2, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
 
@@ -3410,11 +3682,11 @@ fn prepare_clean_composer_before_paste_for_route(
             let Some((contents, cursor)) = capture_rendered_only() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            if screen_has_dialog_or_menu_markers_with_context(&contents, None, route_keys) {
+            if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
                 return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
             }
             if composer_has_unsubmitted_content(&contents, cursor) {
-                if !composer_proven_earlier_wire_delivery(&contents, route_keys) {
+                if !composer_equals_recorded_wire_deliveries(&contents, route_keys) {
                     return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
                 }
                 preexisting_matches_target.set(
@@ -3444,9 +3716,9 @@ fn prepare_clean_composer_before_paste_for_route(
 /// Bounded confirmation and Enter retry loop after a paste and initial Enter.
 ///
 /// Never presses `Enter` when [`screen_has_dialog_or_menu_markers`] is true on a rendered screen,
-/// and retries `Enter` only when two consecutive polls show content matching **this** delivery
-/// (`composer_holds_payload`, `composer_holds_wire_header`, or `composer_shows_target_placeholder`),
-/// never on arbitrary text typed later by a human.
+/// retries `Enter` only when two consecutive polls show the whole composer equalling **this**
+/// delivery (`D_target`), and aborts immediately with `composer_occupied_by_non_wire_input:` if
+/// the rendered composer holds any non-target input (such as appended or replacement human text).
 #[cfg(test)]
 fn confirm_paste_submission(
     trimmed: &str,
@@ -3476,6 +3748,7 @@ fn confirm_paste_submission_with_raw(
     if trimmed.is_empty() {
         return Ok(());
     }
+    let d_target = build_delivery_descriptor("", trimmed, raw_text);
     run_bounded_enter_retry_loop(
         false,
         "composer still held payload before capture became unavailable",
@@ -3485,44 +3758,73 @@ fn confirm_paste_submission_with_raw(
             let Some(capture) = capture_screen() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            let (screen, cursor, is_raw_fallback) = match capture {
-                ScreenCapture::Rendered { contents, cursor } => (contents, cursor, false),
-                ScreenCapture::RawFallback(s) => (s, None, true),
-            };
-            if !is_raw_fallback
-                && screen_has_dialog_or_menu_markers_with_context(&screen, Some(trimmed), &[])
-            {
-                return RetryPollDecision::Abort(
-                    "prompt submission unconfirmed: active dialog or menu detected on screen; \
-                     stopping without retry Enter"
-                        .to_string(),
-                );
+            match capture {
+                ScreenCapture::Rendered { contents, cursor } => {
+                    if screen_has_dialog_or_menu_markers_with_context(
+                        &contents,
+                        Some(trimmed),
+                        raw_text,
+                        &[],
+                    ) {
+                        return RetryPollDecision::Abort(
+                            "prompt submission unconfirmed: active dialog or menu detected on screen; \
+                             stopping without retry Enter"
+                                .to_string(),
+                        );
+                    }
+                    let (matches_target, is_placeholder) =
+                        composer_equals_single_target(&contents, &d_target);
+                    if matches_target {
+                        let exhausted_detail = if is_placeholder {
+                            "composer still shows the pasted-content placeholder"
+                        } else {
+                            "composer still holds the pasted payload"
+                        };
+                        return RetryPollDecision::StillUnsubmitted {
+                            is_raw_fallback: false,
+                            exhausted_detail,
+                        };
+                    }
+                    if composer_has_unsubmitted_content(&contents, cursor) {
+                        return RetryPollDecision::Abort(
+                            composer_occupied_by_non_wire_input_error(),
+                        );
+                    }
+                    if composer_visibly_submitted_with_cursor_and_raw(
+                        &contents, cursor, trimmed, raw_text,
+                    ) {
+                        return RetryPollDecision::ConfirmedNow;
+                    }
+                    RetryPollDecision::CleanWatchTick
+                }
+                ScreenCapture::RawFallback(screen) => {
+                    let holds_payload = composer_holds_payload(&screen, trimmed);
+                    let holds_wire_hdr =
+                        !holds_payload && composer_holds_wire_header(&screen, trimmed);
+                    let holds_placeholder = !holds_payload
+                        && !holds_wire_hdr
+                        && composer_shows_target_placeholder_with_raw(
+                            &screen, trimmed, raw_text, true,
+                        );
+                    if holds_payload || holds_wire_hdr || holds_placeholder {
+                        let exhausted_detail = if holds_placeholder {
+                            "composer still shows the pasted-content placeholder"
+                        } else {
+                            "composer still holds the pasted payload"
+                        };
+                        return RetryPollDecision::StillUnsubmitted {
+                            is_raw_fallback: true,
+                            exhausted_detail,
+                        };
+                    }
+                    if composer_visibly_submitted_with_cursor_and_raw(
+                        &screen, None, trimmed, raw_text,
+                    ) {
+                        return RetryPollDecision::ConfirmedNow;
+                    }
+                    RetryPollDecision::CleanWatchTick
+                }
             }
-            let holds_payload = composer_holds_payload(&screen, trimmed);
-            let holds_wire_hdr = !holds_payload && composer_holds_wire_header(&screen, trimmed);
-            let holds_placeholder = !holds_payload
-                && !holds_wire_hdr
-                && composer_shows_target_placeholder_with_raw(
-                    &screen,
-                    trimmed,
-                    raw_text,
-                    is_raw_fallback,
-                );
-            if holds_payload || holds_wire_hdr || holds_placeholder {
-                let exhausted_detail = if holds_placeholder {
-                    "composer still shows the pasted-content placeholder"
-                } else {
-                    "composer still holds the pasted payload"
-                };
-                return RetryPollDecision::StillUnsubmitted {
-                    is_raw_fallback,
-                    exhausted_detail,
-                };
-            }
-            if composer_visibly_submitted_with_cursor_and_raw(&screen, cursor, trimmed, raw_text) {
-                return RetryPollDecision::ConfirmedNow;
-            }
-            RetryPollDecision::CleanWatchTick
         },
         send_enter,
     )
@@ -3638,6 +3940,7 @@ fn composer_placeholder_lines<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PastedPlaceholderKind {
     Chars(usize),
@@ -3649,6 +3952,7 @@ enum PastedPlaceholderKind {
 /// - `[Pasted Content 1403 chars]` -> `Chars(1403)`
 /// - `[Pasted Content 500 lines]` / `[Pasted Content 500 bytes]` -> `OtherNumericUnit`
 /// - `[Pasted Content]` (strictly no digits/unit before `]`) -> `Bare`
+#[cfg(test)]
 fn parse_pasted_content_lengths(line: &str) -> Vec<PastedPlaceholderKind> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -3708,27 +4012,12 @@ fn composer_shows_target_placeholder_with_raw(
     if is_raw_fallback {
         return composer_shows_pasted_placeholder(screen);
     }
-    let cleaned = normalize_terminal_screen(screen);
-    if !cleaned.contains("[Pasted Content") {
+    if !screen.contains("[Pasted Content") {
         return false;
     }
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let ph_lines = composer_placeholder_lines(&lines);
-    if ph_lines.is_empty() {
-        return false;
-    }
-    if composer_holds_wire_header(screen, trimmed) {
-        return true;
-    }
-    let expected = expected_placeholder_char_lengths(trimmed, raw_text);
-    ph_lines
-        .iter()
-        .flat_map(|l| parse_pasted_content_lengths(l))
-        .any(|parsed| match parsed {
-            PastedPlaceholderKind::Bare => true,
-            PastedPlaceholderKind::OtherNumericUnit => false,
-            PastedPlaceholderKind::Chars(n) => n > 0 && expected.contains(&n),
-        })
+    let d_target = build_delivery_descriptor("", trimmed, raw_text);
+    let (matches_target, is_placeholder) = composer_equals_single_target(screen, &d_target);
+    matches_target && is_placeholder
 }
 
 fn starts_with_numbered_choice(line: &str, prefix: &str) -> bool {
@@ -3797,56 +4086,19 @@ fn between_has_delivery_header(between: &[&str]) -> bool {
     has_wire_header || has_operator_header
 }
 
-fn between_matches_post_paste_target(between: &[&str], top: usize, trimmed: &str) -> bool {
-    let Some((first_idx, first_line)) = between
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, l)| !l.trim().is_empty())
-    else {
-        return false;
-    };
-    if line_starts_with_prompt(first_line) {
-        if between[first_idx + 1..]
-            .iter()
-            .any(|l| l.trim_start().starts_with(['❯', '›']))
-        {
-            return false;
-        }
-        let Some(first_target_line) = trimmed.lines().map(str::trim).find(|l| !l.is_empty()) else {
-            return false;
-        };
-        let first_target_compact: String = first_target_line
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        if first_target_compact.is_empty() {
-            return false;
-        }
-        let mut between_compact: String = strip_composer_prompt_prefix(first_line)
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        for &cont in &between[first_idx + 1..] {
-            between_compact.extend(cont.chars().filter(|c| !c.is_whitespace()));
-        }
-        return between_compact.starts_with(&first_target_compact);
-    }
-    top == 0 && composer_lines_hold_payload(between, top, trimmed)
-}
-
 /// `true` when the active bottom region of `screen` shows an interactive approval, permission, or
 /// selection menu/dialog (`❯ 1.`, paired `1. ` / `2. `, `"Do you want..."`, `"Esc to cancel"`,
 /// `"Allow once"`, `"[y/n]"`, etc.), ignoring `"esc to interrupt"` tool spinners in scrollback and
 /// message body text inside a known `[fl-wire ...]` / `[Operator Prompt via FerroDeck` composer.
 #[cfg(test)]
 fn screen_has_dialog_or_menu_markers(screen: &str) -> bool {
-    screen_has_dialog_or_menu_markers_with_context(screen, None, &[])
+    screen_has_dialog_or_menu_markers_with_context(screen, None, None, &[])
 }
 
 fn screen_has_dialog_or_menu_markers_with_context(
     screen: &str,
     post_paste_trimmed: Option<&str>,
+    post_paste_raw: Option<&str>,
     route_keys: &[String],
 ) -> bool {
     let cleaned = normalize_terminal_screen(screen);
@@ -3866,16 +4118,17 @@ fn screen_has_dialog_or_menu_markers_with_context(
         let after = &lines[bottom + 1..];
         let non_empty_after = after.iter().filter(|l| !l.trim().is_empty()).count();
         let skip_between_body = composer_region_lines(&lines).is_some()
-            && (between_has_delivery_header(between)
-                || post_paste_trimmed.is_some_and(|trimmed| {
-                    between_matches_post_paste_target(between, top, trimmed)
-                })
-                || (top == 0
-                    && !route_keys.is_empty()
-                    && unconfirmed_wire_delivery_matches_scrolled_composer(
-                        route_keys,
-                        &collapse_composer_lines(between),
-                    )));
+            && if let Some(trimmed) = post_paste_trimmed {
+                composer_equals_single_target_on_lines(
+                    &lines,
+                    &build_delivery_descriptor("", trimmed, post_paste_raw),
+                )
+                .0
+            } else if !route_keys.is_empty() {
+                composer_equals_recorded_wire_deliveries_on_lines(&lines, route_keys)
+            } else {
+                between_has_delivery_header(between)
+            };
         if skip_between_body {
             if non_empty_after <= 6 {
                 return lines_have_dialog_or_menu_markers(after);
@@ -3921,53 +4174,26 @@ fn screen_has_dialog_or_menu_markers_with_context(
     lines_have_dialog_or_menu_markers(&sub[sub.len().saturating_sub(12)..])
 }
 
-/// `true` ONLY when `screen` has no dialog/menu markers and its dirty composer content is proven
-/// to be an earlier FerroWire delivery to this route:
-/// (a) framed composer lines visibly contain `[fl-wire ` with `(id: urn:uuid:...`, OR
-/// (b) composer shows `[Pasted Content <N> chars]` (`N > 0`) matching `UNCONFIRMED_WIRE_DELIVERIES`
-///     for `route_keys`, OR
-/// (c) composer is a `top == 0` tall scrolled composer matching recorded `UNCONFIRMED_WIRE_DELIVERIES`
-///     body probes for `route_keys`.
-fn composer_proven_earlier_wire_delivery(screen: &str, route_keys: &[String]) -> bool {
-    if screen_has_dialog_or_menu_markers_with_context(screen, None, route_keys) {
+/// `true` ONLY when `screen` has no dialog/menu markers and the ENTIRE composer content is
+/// consumed to exact `""` by 1 or more ordered recorded entries in `UNCONFIRMED_WIRE_DELIVERIES`
+/// for `route_keys` (supporting full inline `compact_full`, `[PastedContent<n>chars]` for
+/// `full_placeholder_lengths`, `compact_header + [PastedContent<n>chars]` for
+/// `body_placeholder_lengths`, and for `top == 0` tall scrolled composers a `>= 32`-char suffix of
+/// the first matched entry's `compact_full` followed by full matches of subsequent entries).
+fn composer_equals_recorded_wire_deliveries(screen: &str, route_keys: &[String]) -> bool {
+    if route_keys.is_empty()
+        || screen_has_dialog_or_menu_markers_with_context(screen, None, None, route_keys)
+    {
         return false;
     }
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
-    if let Some((composer_lines, top_rule)) = composer_region_lines(&lines) {
-        let collapsed = collapse_composer_lines(composer_lines);
-        let compact: String = composer_lines
-            .iter()
-            .flat_map(|line| {
-                strip_composer_prompt_prefix(line)
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-            })
-            .collect();
-        let has_wire_header = (collapsed.contains("[fl-wire ") || compact.starts_with("[fl-wire"))
-            && compact
-                .split_once("(id:urn:uuid:")
-                .is_some_and(|(_, rest)| {
-                    rest.chars().next().is_some_and(|c| c.is_ascii_hexdigit())
-                });
-        if has_wire_header {
-            return true;
-        }
-        if top_rule == 0
-            && unconfirmed_wire_delivery_matches_scrolled_composer(route_keys, &collapsed)
-        {
-            return true;
-        }
-    }
-    composer_placeholder_lines(&lines)
-        .iter()
-        .flat_map(|l| parse_pasted_content_lengths(l))
-        .any(|kind| match kind {
-            PastedPlaceholderKind::Chars(n) => {
-                unconfirmed_wire_delivery_matches_placeholder(route_keys, n)
-            }
-            PastedPlaceholderKind::Bare | PastedPlaceholderKind::OtherNumericUnit => false,
-        })
+    composer_equals_recorded_wire_deliveries_on_lines(&lines, route_keys)
+}
+
+#[cfg(test)]
+fn composer_proven_earlier_wire_delivery(screen: &str, route_keys: &[String]) -> bool {
+    composer_equals_recorded_wire_deliveries(screen, route_keys)
 }
 
 fn is_known_static_ghost_placeholder(ghost_text: &str) -> bool {
@@ -4331,10 +4557,6 @@ fn is_box_drawing_rule_char(ch: char) -> bool {
     matches!(ch, '─' | '━' | '═')
 }
 
-fn is_pure_rule_char(ch: char) -> bool {
-    is_box_drawing_rule_char(ch) || ch == '-'
-}
-
 fn is_horizontal_rule_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.chars().any(char::is_control) {
@@ -4344,7 +4566,7 @@ fn is_horizontal_rule_line(line: &str) -> bool {
     if total_chars < 8 {
         return false;
     }
-    if trimmed.chars().all(is_pure_rule_char) {
+    if trimmed.chars().all(is_box_drawing_rule_char) {
         return true;
     }
     let leading_box = trimmed
@@ -4538,6 +4760,129 @@ fn is_valid_uuid_str(s: &str) -> bool {
         })
 }
 
+fn header_line_carries_wire_id(line: &str, wire_id: &str) -> bool {
+    if wire_id.is_empty() || !line.starts_with("[fl-wire ") {
+        return false;
+    }
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some((_, after_id)) = compact.split_once("(id:") else {
+        return false;
+    };
+    let Some(rest) = after_id.strip_prefix(wire_id) else {
+        return false;
+    };
+    !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn muse_accepted_user_intent_texts(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    if !trimmed.contains("runtime.user_intent.accepted") {
+        return Vec::new();
+    }
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    if val.get("payload_type").and_then(serde_json::Value::as_str)
+        != Some("runtime.user_intent.accepted")
+    {
+        return Vec::new();
+    }
+    let Some(payload) = val.get("payload") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str)
+        && !text.is_empty()
+    {
+        out.push(text.to_string());
+    }
+    if let Some(msgs) = payload
+        .get("model_messages")
+        .and_then(serde_json::Value::as_array)
+    {
+        let mut msg_parts = Vec::new();
+        for msg in msgs {
+            let role_ok = msg
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|r| r == "user");
+            if !role_ok {
+                continue;
+            }
+            match msg.get("content") {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => {
+                    msg_parts.push(s.to_string());
+                }
+                Some(serde_json::Value::Array(blocks)) => {
+                    let mut block_parts = Vec::new();
+                    for block in blocks {
+                        let kind_ok = block
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|k| k == "text");
+                        let type_ok = block
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|t| t == "text");
+                        if kind_ok
+                            && type_ok
+                            && let Some(t) = block.get("text").and_then(serde_json::Value::as_str)
+                            && !t.is_empty()
+                        {
+                            block_parts.push(t);
+                        }
+                    }
+                    if !block_parts.is_empty() {
+                        msg_parts.push(block_parts.join("\n"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !msg_parts.is_empty() {
+            let joined = msg_parts.join("\n");
+            if !out.contains(&joined) {
+                out.push(joined);
+            }
+        }
+    }
+    out
+}
+
+fn muse_user_intent_carries_wire_id(intent_text: &str, wire_id: &str) -> bool {
+    let trimmed = intent_text.trim_start();
+    if !trimmed.starts_with("[fl-wire ") {
+        return false;
+    }
+    trimmed
+        .lines()
+        .any(|line| header_line_carries_wire_id(line, wire_id))
+}
+
+fn muse_jsonl_line_accepts_wire_id(line: &str, wire_id: &str) -> bool {
+    !wire_id.is_empty()
+        && muse_accepted_user_intent_texts(line)
+            .iter()
+            .any(|intent| muse_user_intent_carries_wire_id(intent, wire_id))
+}
+
+fn muse_jsonl_line_confirms_delivery(line: &str, wire_id: Option<&str>, probes: &[String]) -> bool {
+    if probes.is_empty() {
+        return false;
+    }
+    muse_accepted_user_intent_texts(line).iter().any(|intent| {
+        if let Some(id) = wire_id
+            && !muse_user_intent_carries_wire_id(intent, id)
+        {
+            return false;
+        }
+        let collapsed = collapse_whitespace(intent);
+        probes
+            .iter()
+            .all(|probe| collapsed.contains(probe.as_str()))
+    })
+}
+
 fn claude_jsonl_line_is_user_turn_with_wire_id(line: &str, wire_id: &str) -> bool {
     let trimmed = line.trim();
     if wire_id.is_empty() || !trimmed.contains("urn:uuid:") || !trimmed.contains("\"user\"") {
@@ -4550,6 +4895,12 @@ fn claude_jsonl_line_is_user_turn_with_wire_id(line: &str, wire_id: &str) -> boo
         return false;
     }
     if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true) {
+        return false;
+    }
+    if val.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true) {
+        return false;
+    }
+    if val.get("synthetic_reason").is_some() || val.pointer("/message/synthetic_reason").is_some() {
         return false;
     }
     if val.get("toolUseResult").is_some() {
@@ -4572,13 +4923,11 @@ fn claude_jsonl_line_is_user_turn_with_wire_id(line: &str, wire_id: &str) -> boo
         }
         _ => return false,
     }
-    if user_text.is_empty() {
+    let trimmed_user = user_text.trim_start();
+    let Some(first_line) = trimmed_user.lines().next() else {
         return false;
-    }
-    let compact: String = user_text.chars().filter(|c| !c.is_whitespace()).collect();
-    compact.contains("[fl-wire")
-        && compact.contains("(id:")
-        && compact_contains_exact_wire_id(&compact, wire_id)
+    };
+    header_line_carries_wire_id(first_line, wire_id)
 }
 
 struct MuseTranscriptTracker {
@@ -4617,18 +4966,9 @@ impl MuseTranscriptTracker {
         }
         if let Some((ref path, _)) = self.initial
             && let Some(tail) = read_file_tail_string(path, 0)
-            && tail.lines().any(|line| {
-                if !line.contains("runtime.user_intent.accepted") {
-                    return false;
-                }
-                let normalized = line
-                    .replace("\\n", " ")
-                    .replace("\\r", " ")
-                    .replace("\\t", " ")
-                    .replace("\\\"", "\"");
-                let compact: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
-                compact_contains_exact_wire_id(&compact, wire_id)
-            })
+            && tail
+                .lines()
+                .any(|line| muse_jsonl_line_accepts_wire_id(line, wire_id))
         {
             return true;
         }
@@ -4651,27 +4991,9 @@ impl MuseTranscriptTracker {
         let wire_id = extract_wire_message_id(trimmed);
         if let Some((ref path, initial_len)) = self.initial
             && let Some(appended) = read_file_tail_string(path, initial_len)
-            && appended.lines().any(|line| {
-                if !line.contains("runtime.user_intent.accepted") {
-                    return false;
-                }
-                let normalized = line
-                    .replace("\\n", " ")
-                    .replace("\\r", " ")
-                    .replace("\\t", " ")
-                    .replace("\\\"", "\"");
-                if let Some(id) = wire_id {
-                    let compact: String =
-                        normalized.chars().filter(|c| !c.is_whitespace()).collect();
-                    if !compact_contains_exact_wire_id(&compact, id) {
-                        return false;
-                    }
-                }
-                let collapsed = collapse_whitespace(&normalized);
-                probes
-                    .iter()
-                    .all(|probe| collapsed.contains(probe.as_str()))
-            })
+            && appended
+                .lines()
+                .any(|line| muse_jsonl_line_confirms_delivery(line, wire_id, &probes))
         {
             return true;
         }
@@ -11711,9 +12033,13 @@ exit 1"#,
         long_mail.subject = "Council convening: Ferris P2 — scope and independent challenge".into();
         long_mail.body = format!(
             "Council convening on petition P2 FerroStore architecture.\n\n{}\n\nPlease reply with Q2 verdict by 21:07 UTC.",
-            "Grounded source analysis of embedded store durability, MVCC snapshot safety, and FerroState RRF fusion. ".repeat(13)
+            "Grounded source analysis of embedded store durability, MVCC snapshot safety & FerroState RRF fusion ".repeat(13)
         );
         let formatted_long_mail = format_push_message(&long_mail);
+        assert_eq!(
+            strip_delivery_header(&formatted_long_mail).chars().count(),
+            1403
+        );
         assert!(formatted_long_mail.len() > 1400);
 
         let rule = "─".repeat(120);
@@ -12178,7 +12504,7 @@ exit 1"#,
                                             .trim_end_matches("\x1b[201~");
                                         let hdr =
                                             stripped.lines().next().unwrap_or(stripped).to_string();
-                                        let chars = stripped.chars().count();
+                                        let chars = strip_delivery_header(stripped).chars().count();
                                         let mut cur = active.lock().unwrap();
                                         if cur.is_some() {
                                             *appended.lock().unwrap() = true;
@@ -12271,10 +12597,17 @@ exit 1"#,
 
         // (2a) Dirty pre-existing composer holding Mail 1 placeholder when Mail 2 arrives:
         // must flush and confirm Mail 1 FIRST, never appending Mail 2 onto Mail 1!
+        let fmt_mail1 = format_push_message(&mail1);
+        let body1_chars = strip_delivery_header(&fmt_mail1).chars().count();
         let hdr1 = format_push_header(&mail1);
+        record_unconfirmed_wire_delivery(
+            &["host:muse.melisandre".to_string()],
+            mail1.id.as_str(),
+            &fmt_mail1,
+        );
         *scrollback_state.lock().unwrap() = "◆ Ready.".into();
-        *active_composer_item.lock().unwrap() = Some((hdr1.clone(), 1403));
-        *rendered_state.lock().unwrap() = placeholder_composer("◆ Ready.", &hdr1, 1403);
+        *active_composer_item.lock().unwrap() = Some((hdr1.clone(), body1_chars));
+        *rendered_state.lock().unwrap() = placeholder_composer("◆ Ready.", &hdr1, body1_chars);
         *appended_onto_dirty.lock().unwrap() = false;
         writes.lock().unwrap().clear();
         enter_count.store(0, Ordering::SeqCst);
@@ -12332,13 +12665,18 @@ exit 1"#,
         );
         assert!(writes.lock().unwrap().is_empty());
 
+        let tall_scrolled_body: String = (0..36)
+            .map(|idx| {
+                format!(
+                    "scrolled composer line {idx:02}: FerroStore substrate evaluation and reconciliation"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         record_unconfirmed_wire_delivery(
             &["host:muse.melisandre".to_string()],
             mail1.id.as_str(),
-            &format!(
-                "{}\n\nscrolled composer line 18: FerroStore substrate evaluation and reconciliation",
-                format_push_header(&mail1)
-            ),
+            &format!("{}\n\n{tall_scrolled_body}", format_push_header(&mail1)),
         );
         host_write_text_then_enter(
             &mut direct_client,
@@ -12355,11 +12693,18 @@ exit 1"#,
         );
 
         // (2c) Dedup when the pre-existing composer item IS the retried mail itself (`urn:uuid:...`
-        // header above `[Pasted Content 1250 chars]`): flushes once and returns Ok WITHOUT pasting
-        // Mail 2 a second time!
+        // header above `[Pasted Content <body2_chars> chars]`): flushes once and returns Ok WITHOUT
+        // pasting Mail 2 a second time!
+        let fmt_mail2 = format_push_message(&mail2);
+        let body2_chars = strip_delivery_header(&fmt_mail2).chars().count();
         let hdr2 = format_push_header(&mail2);
-        *active_composer_item.lock().unwrap() = Some((hdr2.clone(), 1250));
-        *rendered_state.lock().unwrap() = placeholder_composer("◆ Ready.", &hdr2, 1250);
+        record_unconfirmed_wire_delivery(
+            &["host:muse.melisandre".to_string()],
+            mail2.id.as_str(),
+            &fmt_mail2,
+        );
+        *active_composer_item.lock().unwrap() = Some((hdr2.clone(), body2_chars));
+        *rendered_state.lock().unwrap() = placeholder_composer("◆ Ready.", &hdr2, body2_chars);
         writes.lock().unwrap().clear();
         enter_count.store(0, Ordering::SeqCst);
         drop_enters.store(0, Ordering::SeqCst);
@@ -12430,8 +12775,13 @@ exit 1"#,
 
         // (2d) Pre-existing composer refuses to clear across all retries -> returns Err without
         // ever writing Mail 2's payload bytes!
-        *active_composer_item.lock().unwrap() = Some((hdr1.clone(), 1403));
-        *rendered_state.lock().unwrap() = placeholder_composer("◆ Ready.", &hdr1, 1403);
+        record_unconfirmed_wire_delivery(
+            &["host:muse.melisandre".to_string()],
+            mail1.id.as_str(),
+            &fmt_mail1,
+        );
+        *active_composer_item.lock().unwrap() = Some((hdr1.clone(), body1_chars));
+        *rendered_state.lock().unwrap() = placeholder_composer("◆ Ready.", &hdr1, body1_chars);
         writes.lock().unwrap().clear();
         enter_count.store(0, Ordering::SeqCst);
         drop_enters.store(99, Ordering::SeqCst);
@@ -12877,10 +13227,16 @@ exit 1"#,
         let unrecorded_calls = fs::read_to_string(&log_file).unwrap();
         assert!(!unrecorded_calls.contains("send-keys"));
 
+        let tall_tmux_body: String = (0..36)
+            .map(|idx| format!("scrolled tmux composer line {idx:02}: FerroStore reconciliation"))
+            .collect::<Vec<_>>()
+            .join("\n");
         record_unconfirmed_wire_delivery(
             &["tmux:%12".to_string()],
             "urn:uuid:00000000-0000-7000-8000-000000000099",
-            "[fl-wire mail/normal] from cassandra (id: urn:uuid:00000000-0000-7000-8000-000000000099, thread: t): s\n\nscrolled tmux composer line 35: FerroStore reconciliation",
+            &format!(
+                "[fl-wire mail/normal] from cassandra (id: urn:uuid:00000000-0000-7000-8000-000000000099, thread: t): s\n\n{tall_tmux_body}"
+            ),
         );
         fs::write(&log_file, "").unwrap();
         deliver_via_tmux_paste_opts("%12", "Follow-up after tall composer", false)
@@ -13200,6 +13556,11 @@ exit 1"#,
         // may false-dedup or prematurely confirm `ack2`!
         let baseline_tracker =
             MuseTranscriptTracker::capture("muse:melisandre", Some(muse_sid), true);
+        record_unconfirmed_wire_delivery(
+            &["host:muse.melisandre".to_string()],
+            ack1.id.as_str(),
+            &fmt_ack1,
+        );
         *active_item.lock().unwrap() = Some(fmt_ack1.clone());
         *rendered_state.lock().unwrap() =
             format!("◆ Ready.\n\n{rule}\n❯ {fmt_ack1}\n{rule}\n  muse-wonder-full-1.0");
@@ -13873,10 +14234,10 @@ exit 1"#,
                                     } else {
                                         let s = String::from_utf8_lossy(&raw).into_owned();
                                         let hdr = s.lines().next().unwrap_or(&s).to_string();
+                                        let body_len = strip_delivery_header(&s).chars().count();
                                         pasted.lock().unwrap().push(s.clone());
                                         *rendered.lock().unwrap() = format!(
-                                            "◆ Ready.\n\n{rule}\n❯ {hdr}\n  [Pasted Content {} chars]\n{rule}\n  muse-wonder-full-1.0",
-                                            s.chars().count()
+                                            "◆ Ready.\n\n{rule}\n❯ {hdr}\n  [Pasted Content {body_len} chars]\n{rule}\n  muse-wonder-full-1.0",
                                         );
                                     }
                                     ExtensionResponse::Input {
@@ -13969,22 +14330,25 @@ exit 1"#,
         mail.body = "Please verify FerroStore RRF index invariants".into();
         let formatted = format_push_message(&mail);
 
-        // (a) `trimmed` submits and a human immediately types `"hold on don't commit"` into the
-        // composer on Poll 1 & Poll 2 (tested both WITH scrollback visibility and WITHOUT scrollback
-        // visibility): `confirm_paste_submission` MUST send 0 retry Enters and return `Ok(())`!
+        // (a) When a human appends text onto our pasted payload (`"{formatted} DO NOT SEND"`) or
+        // replaces the composer (`"hold on don't commit"`, `"/clear"`, `"[Pasted Content 5120 chars]"`)
+        // during the retry window, `confirm_paste_submission` MUST abort immediately with 0 retry
+        // Enters and `composer_occupied_by_non_wire_input:`!
         for screen in [
+            format!(
+                "◈ Ready.\n{rule}\n❯ {}\n  DO NOT SEND\n{rule}\n  muse-wonder-full-1.0",
+                formatted.replace('\n', "\n  ")
+            ),
             format!(
                 "❯ {formatted}\n◈ Thinking...\n{rule}\n❯ hold on don't commit\n{rule}\n  muse-wonder-full-1.0"
             ),
-            format!(
-                "◈ Thinking...\n{rule}\n❯ hold on don't commit\n{rule}\n  muse-wonder-full-1.0"
-            ),
+            format!("◈ Thinking...\n{rule}\n❯ /clear\n{rule}\n  muse-wonder-full-1.0"),
             format!(
                 "◈ Thinking...\n{rule}\n❯ [Pasted Content 5120 chars]\n{rule}\n  muse-wonder-full-1.0"
             ),
         ] {
             let mut retries = 0u32;
-            confirm_paste_submission(
+            let err = confirm_paste_submission(
                 &formatted,
                 |_| {},
                 || Some(ScreenCapture::rendered_with_cursor(screen.clone(), (2, 22))),
@@ -13994,10 +14358,14 @@ exit 1"#,
                     Ok(())
                 },
             )
-            .expect("human typing or unrelated placeholder after submit must return Ok with 0 retry Enters");
+            .expect_err("non-target composer content during retry window must abort with 0 Enters");
             assert_eq!(
                 retries, 0,
                 "must NEVER press retry Enter on human typing:\n{screen}"
+            );
+            assert!(
+                is_composer_occupied_error(&err),
+                "expected composer_occupied_by_non_wire_input error, got: {err}"
             );
         }
 
@@ -14245,10 +14613,9 @@ exit 1"#,
             writes.lock().unwrap().is_empty(),
             "Muse late self-submit retry must perform 0 writes and 0 Enters"
         );
-        assert!(!unconfirmed_wire_delivery_matches_placeholder(
-            &["host:muse.melisandre".to_string()],
-            fmt_muse_mail.chars().count()
-        ));
+        assert!(!route_has_unconfirmed_wire_deliveries(&[
+            "host:muse.melisandre".to_string()
+        ]));
 
         // Claude retry via `fl-host` fallback:
         record_unconfirmed_wire_delivery(
@@ -14268,10 +14635,9 @@ exit 1"#,
             writes.lock().unwrap().is_empty(),
             "Claude late self-submit retry must perform 0 writes and 0 Enters"
         );
-        assert!(!unconfirmed_wire_delivery_matches_placeholder(
-            &[format!("host:{claude_uuid}")],
-            fmt_claude_mail.chars().count()
-        ));
+        assert!(!route_has_unconfirmed_wire_deliveries(&[format!(
+            "host:{claude_uuid}"
+        )]));
 
         let _ = stop_tx.send(());
         server_thread.join().unwrap();
@@ -14351,9 +14717,12 @@ exit 1"#,
     #[test]
     fn review_finding_6_titled_rules_require_box_drawing_and_tall_composer_requires_16_indented_lines()
      {
-        // Pure rules (`>= 8` chars) allow `─`, `━`, `═`, `-`; titled rules MUST use box-drawing only!
-        assert!(is_horizontal_rule_line("--------"));
+        // Rules MUST use Unicode box-drawing characters (`─`, `━`, `═`) only; plain `'-'` never counts!
+        assert!(!is_horizontal_rule_line("--------"));
+        assert!(!is_horizontal_rule_line(&"-".repeat(40)));
         assert!(is_horizontal_rule_line("────────"));
+        assert!(is_horizontal_rule_line("━━━━━━━━"));
+        assert!(is_horizontal_rule_line("════════"));
         assert!(!is_horizontal_rule_line("---- foo bar ----"));
         assert!(!is_horizontal_rule_line("---------- foo bar ----------"));
         assert!(!is_horizontal_rule_line("──── Ferris ────────────────────")); // < 8 leading box chars
@@ -14583,6 +14952,50 @@ exit 1"#,
         assert!(
             !claude_jsonl_line_is_user_turn_with_wire_id(&is_meta_line, wire_id),
             "isMeta=true record must NEVER count as accepted user turn"
+        );
+
+        let compact_summary_line = serde_json::json!({
+            "uuid": "c-1",
+            "type": "user",
+            "isCompactSummary": true,
+            "message": {
+                "role": "user",
+                "content": fmt_claude_mail,
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&compact_summary_line, wire_id),
+            "isCompactSummary=true record must NEVER count as accepted user turn"
+        );
+
+        let synthetic_reason_line = serde_json::json!({
+            "uuid": "s-1",
+            "type": "user",
+            "synthetic_reason": "compaction",
+            "message": {
+                "role": "user",
+                "content": fmt_claude_mail,
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&synthetic_reason_line, wire_id),
+            "synthetic_reason record must NEVER count as accepted user turn"
+        );
+
+        let mid_sentence_quoted_header_line = serde_json::json!({
+            "uuid": "u-quote",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": format!("what about {} -- dont send yet", format_push_header(&claude_mail)),
+            }
+        })
+        .to_string();
+        assert!(
+            !claude_jsonl_line_is_user_turn_with_wire_id(&mid_sentence_quoted_header_line, wire_id),
+            "human turn quoting wire header mid-sentence must NEVER count as accepted wire delivery"
         );
 
         let unparseable_line =
@@ -15098,6 +15511,11 @@ exit 1"#,
         );
 
         // (ii) Leave `review_mail` unconfirmed in composer (visible header) and deliver `followup_mail`:
+        record_unconfirmed_wire_delivery(
+            &["host:muse.reviewlist".to_string()],
+            review_mail.id.as_str(),
+            &fmt_review,
+        );
         let mut followup_mail = mail_to(&store, "melisandre");
         followup_mail.body = "Followup ack after numbered review".into();
         let fmt_followup = format_push_message(&followup_mail);
@@ -15201,19 +15619,23 @@ exit 1"#,
         let trimmed_chars = fmt_mail.chars().count();
         let body_chars = strip_delivery_header(&fmt_mail).chars().count();
 
-        // `OtherNumericUnit` (`500 lines`, `500 bytes`) WITHOUT visible wire header MUST return `false`:
+        // `OtherNumericUnit` (`500 lines`, `500 bytes`) MUST return `false` both without and with
+        // a visible wire header, and `confirm_paste_submission` MUST abort with 0 retry Enters:
         for non_char_ph in [
             format!("◆ Ready.\n{rule}\n❯ [Pasted Content 500 lines]\n{rule}\n  status"),
             format!("◆ Ready.\n{rule}\n❯ [Pasted Content 500 bytes]\n{rule}\n  status"),
             format!("◆ Ready.\n{rule}\n❯ [Pasted Content {trimmed_chars} lines]\n{rule}\n  status"),
+            format!(
+                "◆ Ready.\n{rule}\n❯ {}\n  [Pasted Content 500 lines]\n{rule}\n  status",
+                format_push_header(&mail)
+            ),
         ] {
             assert!(
                 !composer_shows_target_placeholder(&non_char_ph, &fmt_mail, false),
-                "OtherNumericUnit without wire header must be rejected: {non_char_ph}"
+                "OtherNumericUnit must be rejected: {non_char_ph}"
             );
-            // And `confirm_paste_submission` must NOT press retry Enter on human `[Pasted Content 500 lines]`:
             let mut retries = 0u32;
-            confirm_paste_submission(
+            let err = confirm_paste_submission(
                 &fmt_mail,
                 |_| {},
                 || Some(ScreenCapture::rendered(non_char_ph.clone())),
@@ -15223,52 +15645,61 @@ exit 1"#,
                     Ok(())
                 },
             )
-            .unwrap();
+            .expect_err("OtherNumericUnit in composer must abort with 0 retry Enters");
             assert_eq!(retries, 0);
+            assert!(is_composer_occupied_error(&err), "got: {err}");
         }
 
-        // `OtherNumericUnit` WITH visible wire header returns `true`:
-        let with_hdr = format!(
-            "◆ Ready.\n{rule}\n❯ {}\n  [Pasted Content 500 lines]\n{rule}\n  status",
-            format_push_header(&mail)
-        );
-        assert!(composer_shows_target_placeholder(
-            &with_hdr, &fmt_mail, false
-        ));
-
-        // `Bare` `[Pasted Content]` returns `true`:
+        // `Bare` `[Pasted Content]` (with no trailing text) returns `true` for post-paste target:
         let bare_ph = format!("◆ Ready.\n{rule}\n❯ [Pasted Content]\n{rule}\n  status");
         assert!(composer_shows_target_placeholder(
             &bare_ph, &fmt_mail, false
         ));
+        let bare_ph_with_trailing =
+            format!("◆ Ready.\n{rule}\n❯ [Pasted Content] hold on\n{rule}\n  status");
+        assert!(!composer_shows_target_placeholder(
+            &bare_ph_with_trailing,
+            &fmt_mail,
+            false
+        ));
 
         // (b) `+ 1` trailing-newline variants match in BOTH `composer_shows_target_placeholder` and
-        // `UNCONFIRMED_WIRE_DELIVERIES`:
-        for matching_len in [trimmed_chars, trimmed_chars + 1, body_chars, body_chars + 1] {
-            let ph_screen = format!(
-                "◆ Ready.\n{rule}\n❯ [Pasted Content {matching_len} chars]\n{rule}\n  status"
-            );
+        // `UNCONFIRMED_WIRE_DELIVERIES` (whole-paste `trimmed_chars` / `trimmed_chars + 1` and
+        // header + body `body_chars` / `body_chars + 1`):
+        for whole_len in [trimmed_chars, trimmed_chars + 1] {
+            let ph_screen =
+                format!("◆ Ready.\n{rule}\n❯ [Pasted Content {whole_len} chars]\n{rule}\n  status");
             assert!(
                 composer_shows_target_placeholder(&ph_screen, &fmt_mail, false),
-                "expected composer_shows_target_placeholder to match length {matching_len}"
+                "expected whole-paste placeholder to match length {whole_len}"
+            );
+        }
+        let hdr = format_push_header(&mail);
+        for b_len in [body_chars, body_chars + 1] {
+            let hdr_body_screen = format!(
+                "◆ Ready.\n{rule}\n❯ {hdr}\n  [Pasted Content {b_len} chars]\n{rule}\n  status"
+            );
+            assert!(
+                composer_shows_target_placeholder(&hdr_body_screen, &fmt_mail, false),
+                "expected header + body placeholder to match length {b_len}"
             );
         }
 
         record_unconfirmed_wire_delivery(&["tmux:%99".to_string()], mail.id.as_str(), &fmt_mail);
-        assert!(unconfirmed_wire_delivery_matches_placeholder(
-            &["tmux:%99".to_string()],
-            trimmed_chars + 1
-        ));
-        assert!(unconfirmed_wire_delivery_matches_placeholder(
-            &["tmux:%99".to_string()],
-            body_chars + 1
-        ));
         let plus_one_screen = format!(
             "◆ Ready.\n{rule}\n❯ [Pasted Content {} chars]\n{rule}\n  status",
             trimmed_chars + 1
         );
         assert!(composer_proven_earlier_wire_delivery(
             &plus_one_screen,
+            &["tmux:%99".to_string()]
+        ));
+        let hdr_body_plus_one_screen = format!(
+            "◆ Ready.\n{rule}\n❯ {hdr}\n  [Pasted Content {} chars]\n{rule}\n  status",
+            body_chars + 1
+        );
+        assert!(composer_proven_earlier_wire_delivery(
+            &hdr_body_plus_one_screen,
             &["tmux:%99".to_string()]
         ));
         let lines_unit_screen = format!(
@@ -15435,6 +15866,833 @@ exit 1"#,
             2,
             "expected initial Enter + 1 retry Enter for untrimmed raw placeholder length"
         );
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn r2_finding_1_whole_composer_ownership_proof_negatives_fifo_and_5_mail_before_txt_replay() {
+        use fl_core::ids::MessageId;
+        use fl_core::iri::Iri;
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 1. FIFO eviction invariants on `UNCONFIRMED_WIRE_DELIVERIES`:
+        //    (i) Route cap (`256`): inserting `"zzz-oldest-route"` FIRST and then 256 `"aaa-route-..."`
+        //        entries MUST evict `"zzz-oldest-route"` (FIFO!), NEVER `"aaa-route-000"` alphabetically!
+        //    (ii) Per-route cap (`8`): recording 10 distinct URNs on one route keeps the newest 8
+        //        in exact FIFO order (`02..=09`), and re-recording an existing `wire_id` updates in place
+        //        without duplicating or evicting.
+        UNCONFIRMED_WIRE_DELIVERIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        record_unconfirmed_wire_delivery(
+            &["zzz-oldest-route".to_string()],
+            "urn:uuid:00000000-0000-7000-8000-000000000001",
+            "[fl-wire mail/normal] from a (id: urn:uuid:00000000-0000-7000-8000-000000000001, thread: t): s\n\noldest",
+        );
+        for i in 0..MAX_UNCONFIRMED_WIRE_DELIVERIES {
+            let wid = format!("urn:uuid:00000000-0000-7000-8000-100000000{i:03}");
+            record_unconfirmed_wire_delivery(
+                &[format!("aaa-route-{i:03}")],
+                &wid,
+                &format!("[fl-wire mail/normal] from a (id: {wid}, thread: t): s\n\nbody {i}"),
+            );
+        }
+        assert!(
+            !route_has_unconfirmed_wire_deliveries(&["zzz-oldest-route".to_string()]),
+            "FIFO must evict oldest route zzz-oldest-route, never alphabetically first aaa-route-000"
+        );
+        assert!(
+            route_has_unconfirmed_wire_deliveries(&["aaa-route-000".to_string()]),
+            "aaa-route-000 must remain in ledger (inserted after zzz-oldest-route)"
+        );
+
+        let per_route_key = vec!["fifo-per-route".to_string()];
+        for idx in 0..10usize {
+            let wid = format!("urn:uuid:00000000-0000-7000-8000-2000000000{idx:02}");
+            record_unconfirmed_wire_delivery(
+                &per_route_key,
+                &wid,
+                &format!(
+                    "[fl-wire mail/normal] from a (id: {wid}, thread: t): s\n\nentry-{idx:02}"
+                ),
+            );
+        }
+        // Re-record `05` in place: must not grow beyond 8 or evict `02`.
+        record_unconfirmed_wire_delivery(
+            &per_route_key,
+            "urn:uuid:00000000-0000-7000-8000-200000000005",
+            "[fl-wire mail/normal] from a (id: urn:uuid:00000000-0000-7000-8000-200000000005, thread: t): s\n\nentry-05-updated",
+        );
+        {
+            let ledger = UNCONFIRMED_WIRE_DELIVERIES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (_, entries) = ledger
+                .iter()
+                .find(|(k, _)| k == "fifo-per-route")
+                .expect("fifo-per-route must exist");
+            assert_eq!(entries.len(), MAX_UNCONFIRMED_PER_ROUTE);
+            let ids: Vec<&str> = entries.iter().map(|e| e.wire_id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec![
+                    "urn:uuid:00000000-0000-7000-8000-200000000002",
+                    "urn:uuid:00000000-0000-7000-8000-200000000003",
+                    "urn:uuid:00000000-0000-7000-8000-200000000004",
+                    "urn:uuid:00000000-0000-7000-8000-200000000005",
+                    "urn:uuid:00000000-0000-7000-8000-200000000006",
+                    "urn:uuid:00000000-0000-7000-8000-200000000007",
+                    "urn:uuid:00000000-0000-7000-8000-200000000008",
+                    "urn:uuid:00000000-0000-7000-8000-200000000009",
+                ]
+            );
+            assert!(entries[3].compact_full.ends_with("entry-05-updated"));
+        }
+
+        // Interior Markdown blockquote (`> quoted line`) inside a recorded wire message is NOT
+        // stripped as a prompt prefix and still matches `compact_full`:
+        let rule = "─".repeat(120);
+        let bq_key = vec!["host:muse.blockquote".to_string()];
+        let bq_msg = "[fl-wire mail/normal] from cassandra (id: urn:uuid:00000000-0000-7000-8000-300000000001, thread: t): quote\n\n> quoted markdown line\nnormal line";
+        record_unconfirmed_wire_delivery(
+            &bq_key,
+            "urn:uuid:00000000-0000-7000-8000-300000000001",
+            bq_msg,
+        );
+        let bq_screen = format!(
+            "◆ Ready.\n{rule}\n❯ [fl-wire mail/normal] from cassandra (id: urn:uuid:00000000-0000-7000-8000-300000000001, thread: t): quote\n  \n  > quoted markdown line\n  normal line\n{rule}\n  status"
+        );
+        assert!(composer_equals_recorded_wire_deliveries(
+            &bq_screen, &bq_key
+        ));
+
+        // 2. End-to-end mock `fl-host` test for:
+        //    - All 4 R2 negative probes sending ZERO writes and ZERO Enters:
+        //      (a) recorded wire mail followed by owner text `"ALSO: do NOT merge #465…"`,
+        //      (b) owner draft quoting a mail header `"what about [fl-wire mail/normal] from cassandra (id: urn:uuid:…) -- dont send yet"`,
+        //      (c) recorded placeholder plus human text on the same line `"[Pasted Content 1403 chars] wait hold on"`,
+        //      (d) human placeholder next to a recorded one `"[Pasted Content 1403 chars]\n[Pasted Content 5120 chars]"`.
+        //    - Positive 5-mail `melisandre-unsubmitted-2026-11-10/before.txt` exact 40-line replay!
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("muse.melisandre").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([41u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(109),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(109),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let rendered_screen = Arc::new(Mutex::new(String::new()));
+        let active_payload = Arc::new(Mutex::new(Option::<String>::None));
+        let flushed_five_mails = Arc::new(Mutex::new(false));
+        let submitted_payloads = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let writes_srv = Arc::clone(&writes);
+        let rendered_srv = Arc::clone(&rendered_screen);
+        let active_srv = Arc::clone(&active_payload);
+        let flushed_srv = Arc::clone(&flushed_five_mails);
+        let submitted_srv = Arc::clone(&submitted_payloads);
+        let rule_srv = rule.clone();
+        let ep_srv = endpoint;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    let rendered = Arc::clone(&rendered_srv);
+                    let active = Arc::clone(&active_srv);
+                    let flushed = Arc::clone(&flushed_srv);
+                    let submitted = Arc::clone(&submitted_srv);
+                    let rule = rule_srv.clone();
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    let raw = bytes.into_vec();
+                                    writes.lock().unwrap().push(raw.clone());
+                                    if raw.as_slice() == b"\r" {
+                                        if let Some(p) = active.lock().unwrap().take() {
+                                            submitted.lock().unwrap().push(p.clone());
+                                            *rendered.lock().unwrap() = format!(
+                                                "◆ Ready.\n❯ {}\n◈ Running...\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0",
+                                                p.replace('\n', "\n  ")
+                                            );
+                                        } else {
+                                            *flushed.lock().unwrap() = true;
+                                            *rendered.lock().unwrap() = format!(
+                                                "◈ Running command · Ack messages and read final synthesis — running (4s · esc to interrupt)\n\n\
+                                                 {rule}\n❯ \n{rule}\n  \
+                                                 muse-wonder-full-1.0 · high · ~/Projects/Artificial-Humanity/the-council · Launch overrides"
+                                            );
+                                        }
+                                    } else {
+                                        let s = String::from_utf8_lossy(&raw).into_owned();
+                                        *active.lock().unwrap() = Some(s.clone());
+                                        *rendered.lock().unwrap() = format!(
+                                            "◆ Ready.\n\n{rule}\n❯ {}\n{rule}\n  muse-wonder-full-1.0",
+                                            s.replace('\n', "\n  ")
+                                        );
+                                    }
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: rendered.lock().unwrap().clone(),
+                                            cursor_row: 37,
+                                            cursor_col: 2,
+                                            rows: 40,
+                                            cols: 120,
+                                            generation: 1,
+                                            output_seq: 1,
+                                            output_bytes: 4096,
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_muse = EnvGuard::remove("FL_WIRE_MUSE_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let store = MemStore::default();
+        let mut recorded_mail = mail_to(&store, "melisandre");
+        recorded_mail.sender_name = "cassandra".into();
+        recorded_mail.subject = "P2 check".into();
+        let prefix_len = format_push_header(&recorded_mail).chars().count() + 2;
+        recorded_mail.body = "x".repeat(1403usize.saturating_sub(prefix_len));
+        let fmt_recorded = format_push_message(&recorded_mail);
+        assert_eq!(fmt_recorded.chars().count(), 1403);
+
+        let route_keys = vec![
+            "host:muse.melisandre".to_string(),
+            "target:muse:melisandre".to_string(),
+        ];
+        clear_unconfirmed_wire_deliveries(&route_keys);
+        record_unconfirmed_wire_delivery(
+            &["host:muse.melisandre".to_string()],
+            recorded_mail.id.as_str(),
+            &fmt_recorded,
+        );
+
+        let negative_probes: [(&str, String); 4] = [
+            (
+                "wire_plus_owner_text",
+                format!(
+                    "◆ Ready.\n\n{rule}\n❯ {}\n  ALSO: do NOT merge #465…\n{rule}\n  muse-wonder-full-1.0",
+                    fmt_recorded.replace('\n', "\n  ")
+                ),
+            ),
+            (
+                "owner_quoting_wire_header",
+                format!(
+                    "◆ Ready.\n\n{rule}\n❯ what about {} -- dont send yet\n{rule}\n  muse-wonder-full-1.0",
+                    format_push_header(&recorded_mail)
+                ),
+            ),
+            (
+                "recorded_placeholder_plus_inline_human_text",
+                format!(
+                    "◆ Ready.\n\n{rule}\n❯ [Pasted Content 1403 chars] wait hold on\n{rule}\n  muse-wonder-full-1.0"
+                ),
+            ),
+            (
+                "recorded_placeholder_next_to_human_placeholder",
+                format!(
+                    "◆ Ready.\n\n{rule}\n❯ [Pasted Content 1403 chars]\n  [Pasted Content 5120 chars]\n{rule}\n  muse-wonder-full-1.0"
+                ),
+            ),
+        ];
+
+        for (label, screen) in negative_probes {
+            assert!(
+                !composer_equals_recorded_wire_deliveries(&screen, &route_keys),
+                "{label}: composer_equals_recorded_wire_deliveries MUST be false"
+            );
+            writes.lock().unwrap().clear();
+            *rendered_screen.lock().unwrap() = screen;
+            let test_store = MemStore::default();
+            let incoming = mail_to(&test_store, "melisandre");
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "melisandre",
+                VendorRoute::Muse {
+                    session_id: "01a1c218-44dc-7000-8000-bea1904c0f01".into(),
+                    cwd: None,
+                    tmux_target: Some("muse:melisandre".into()),
+                    tmux_pane: Some("muse.melisandre".into()),
+                },
+                At::from_unix_millis(100),
+            );
+            let mut report = DispatchReport::default();
+            let (updated, attempted) = dispatch_message_for_recipient_with_report(
+                &test_store,
+                &mut routes,
+                Some(&home),
+                &incoming,
+                At::from_unix_millis(200),
+                "melisandre",
+                &mut report,
+            );
+            assert_eq!(attempted, Some(true), "{label}");
+            assert_eq!(updated[0].status, DeliveryStatus::Pending, "{label}");
+            assert!(
+                writes.lock().unwrap().is_empty(),
+                "{label}: MUST send 0 writes and 0 Enters, got {:?}",
+                writes.lock().unwrap()
+            );
+            assert_eq!(
+                report.failure_stages,
+                vec![FailureStage::ComposerOccupiedByNonWireInput],
+                "{label}"
+            );
+        }
+
+        // 3. Exact 40-line `melisandre-unsubmitted-2026-11-10/before.txt` 5-mail replay:
+        let before_txt_40_lines = "\
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  semantic equivalence. Disabled traits: remove dead machinery after roadmap decision but retain fail-closed shims, 
+  core spec/conformance until versioned API retirement. Please acknowledge or give material dissent by21:07UTC.
+  [fl-wire mail/normal] from cassandra (id: urn:uuid:01a1c221-eb26-72cc-97a4-704b41aaddd4, thread: urn:uuid:01a1c218-
+  acb2-747f-9bfc-e0290001a517): P2 Q2 reconciliation (2/2)
+  
+  Store ws/wss: keep existing supported contract, freeze expansion pending deployment/downstream/product census; no 
+  new multi-host consensus promise. Product peer relay/hub WS clearly separate. No automatic deletion based on local 
+  Unix use. No proven custom substrate necessity; prefer mature substrate if 1week current/redb/SQLite prototype 
+  passes semantic/recovery/platform and workload budgets, retain current through safety. SQLite FTS5 does NOT replace 
+  FerroState field weights/privacy/RRF unchanged. No <1ms or binary size claims without measurements. Send material 
+  dissent by21:07UTC; one reconciliation only.
+  [fl-wire mail/normal] from cassandra (id: urn:uuid:01a1c225-9f62-717a-9013-6bd5a7db1dfb, thread: urn:uuid:01a1c218-
+  acb2-747f-9bfc-e0290001a517): P2 final reconciliation: Chair draft ready
+  
+  Chair draft is FerroState project:the-council/ferris-petition-2-draft. Please read relevant matrix/verdicts and 
+  return only material error or dissent by21:12UTC. Prior corrections stand: no unmeasured timing/size/LOC promises, 
+  no absolute O(1) recovery, no blanket BSL disqualification from our Apache default. Conditional MQ/trait retirement; 
+  defer redb retirement; preserve supported store ws/wss pending census/product decision. Current/redb/SQLite bounded 
+  evaluation decides substrate; no immediate swap. I will record unresolved preferences explicitly.
+  [fl-wire mail/normal] from cassandra (id: urn:uuid:01a1c228-f7d0-7177-bed5-6654199ccd94, thread: urn:uuid:01a1c218-
+  acb2-747f-9bfc-e0290001a517): Ferris P2 closed — final synthesis delivered
+  
+  Final advice saved/read-back verified at project:the-council/ferris-petition-2-synthesis and delivered to Ferris on 
+  the original thread at21:13UTC. All four seats contributed; remaining preferences and evidence limits are recorded, 
+  without claiming unanimous concurrence. Ownership/recovery first; gated retirement; preserve FerroState; bounded 
+  current/redb/SQLite evaluation. No further round requested. Please send only material factual corrections if 
+  discovered. Thank you for the evidence and independent challenges.
+  [fl-wire mail/normal] from ferris (id: urn:uuid:01a1c311-412a-7795-808f-2a9f0cd78eeb, thread: 
+  urn:uuid:01a1c311-412a-7795-808f-2a9f0cd78eeb): Team rule: scrub agent identity env in spike/test child processes 
+  (#460)
+  
+  Effective now. Any spike, test or experiment that launches a vendor CLI (claude, codex, agy, gemini) or an fl 
+  process as a child must run it with: env -u AGENT_PERSONA -u AGENT_NAME -u FL_HOSTED_ID -u 
+  AGENT_HYDRATION_GENERATION. Reason: yesterday at 20:20Z a #433 spike Claude child inherited AGENT_PERSONA=feira. Its 
+  SessionStart hook replaced Feira's real route, and her mail was held for about 5 hours until Jarvis repaired it. The 
+  code fix is tracked in #460. Until it lands, this rule is the only protection.
+  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  muse-wonder-full-1.0 · high · ~/Projects/Artificial-Humanity/the-council · Launch overrides";
+        assert_eq!(before_txt_40_lines.lines().count(), 40);
+
+        let p2_thread: ThreadId =
+            MessageId(Iri::parse("urn:uuid:01a1c218-acb2-747f-9bfc-e0290001a517").unwrap());
+        let ferris_thread: ThreadId =
+            MessageId(Iri::parse("urn:uuid:01a1c311-412a-7795-808f-2a9f0cd78eeb").unwrap());
+
+        let make_mail =
+            |id_urn: &str, thread: &ThreadId, sender: &str, subject: &str, body: &str| {
+                let mut m = mail_to(&store, "melisandre");
+                m.id = MessageId(Iri::parse(id_urn).unwrap());
+                m.thread_id = thread.clone();
+                m.sender_name = sender.into();
+                m.subject = subject.into();
+                m.body = body.into();
+                m
+            };
+
+        let m1 = make_mail(
+            "urn:uuid:01a1c21f-1111-7000-8000-000000000001",
+            &p2_thread,
+            "cassandra",
+            "P2 Q2 reconciliation (1/2)",
+            "Redb and FerroMQ: defer retirement behind migration gates and semantic equivalence. Disabled traits: remove dead machinery after roadmap decision but retain fail-closed shims, core spec/conformance until versioned API retirement. Please acknowledge or give material dissent by 21:07 UTC.",
+        );
+        let m2 = make_mail(
+            "urn:uuid:01a1c221-eb26-72cc-97a4-704b41aaddd4",
+            &p2_thread,
+            "cassandra",
+            "P2 Q2 reconciliation (2/2)",
+            "Store ws/wss: keep existing supported contract, freeze expansion pending deployment/downstream/product census; no new multi-host consensus promise. Product peer relay/hub WS clearly separate. No automatic deletion based on local Unix use. No proven custom substrate necessity; prefer mature substrate if 1 week current/redb/SQLite prototype passes semantic/recovery/platform and workload budgets, retain current through safety. SQLite FTS5 does NOT replace FerroState field weights/privacy/RRF unchanged. No <1ms or binary size claims without measurements. Send material dissent by 21:07 UTC; one reconciliation only.",
+        );
+        let m3 = make_mail(
+            "urn:uuid:01a1c225-9f62-717a-9013-6bd5a7db1dfb",
+            &p2_thread,
+            "cassandra",
+            "P2 final reconciliation: Chair draft ready",
+            "Chair draft is FerroState project:the-council/ferris-petition-2-draft. Please read relevant matrix/verdicts and return only material error or dissent by 21:12 UTC. Prior corrections stand: no unmeasured timing/size/LOC promises, no absolute O(1) recovery, no blanket BSL disqualification from our Apache default. Conditional MQ/trait retirement; defer redb retirement; preserve supported store ws/wss pending census/product decision. Current/redb/SQLite bounded evaluation decides substrate; no immediate swap. I will record unresolved preferences explicitly.",
+        );
+        let m4 = make_mail(
+            "urn:uuid:01a1c228-f7d0-7177-bed5-6654199ccd94",
+            &p2_thread,
+            "cassandra",
+            "Ferris P2 closed — final synthesis delivered",
+            "Final advice saved/read-back verified at project:the-council/ferris-petition-2-synthesis and delivered to Ferris on the original thread at 21:13 UTC. All four seats contributed; remaining preferences and evidence limits are recorded, without claiming unanimous concurrence. Ownership/recovery first; gated retirement; preserve FerroState; bounded current/redb/SQLite evaluation. No further round requested. Please send only material factual corrections if discovered. Thank you for the evidence and independent challenges.",
+        );
+        let m5 = make_mail(
+            "urn:uuid:01a1c311-412a-7795-808f-2a9f0cd78eeb",
+            &ferris_thread,
+            "ferris",
+            "Team rule: scrub agent identity env in spike/test child processes (#460)",
+            "Effective now. Any spike, test or experiment that launches a vendor CLI (claude, codex, agy, gemini) or an fl process as a child must run it with: env -u AGENT_PERSONA -u AGENT_NAME -u FL_HOSTED_ID -u AGENT_HYDRATION_GENERATION. Reason: yesterday at 20:20Z a #433 spike Claude child inherited AGENT_PERSONA=feira. Its SessionStart hook replaced Feira's real route, and her mail was held for about 5 hours until Jarvis repaired it. The code fix is tracked in #460. Until it lands, this rule is the only protection.",
+        );
+
+        clear_unconfirmed_wire_deliveries(&route_keys);
+        for m in [&m1, &m2, &m3, &m4, &m5] {
+            record_unconfirmed_wire_delivery(
+                &["host:muse.melisandre".to_string()],
+                m.id.as_str(),
+                &format_push_message(m),
+            );
+        }
+        assert!(
+            composer_equals_recorded_wire_deliveries(before_txt_40_lines, &route_keys),
+            "5 recorded mails must consume exact 40-line before.txt to empty remainder"
+        );
+
+        // Appending owner text at the bottom of `before.txt` MUST reject:
+        let tainted_before = before_txt_40_lines.replacen(
+            "this rule is the only protection.",
+            "this rule is the only protection. DO NOT SEND",
+            1,
+        );
+        assert!(!composer_equals_recorded_wire_deliveries(
+            &tainted_before,
+            &route_keys
+        ));
+
+        let m6 = make_mail(
+            "urn:uuid:01a1c400-0000-7000-8000-000000000006",
+            &ferris_thread,
+            "ferris",
+            "Post-repair delivery check #6",
+            "Confirming 5-mail backlog flushed cleanly and Mail 6 delivered.",
+        );
+        let fmt_m6 = format_push_message(&m6);
+
+        writes.lock().unwrap().clear();
+        submitted_payloads.lock().unwrap().clear();
+        *active_payload.lock().unwrap() = None;
+        *flushed_five_mails.lock().unwrap() = false;
+        *rendered_screen.lock().unwrap() = before_txt_40_lines.to_string();
+
+        let muse_route = VendorRoute::Muse {
+            session_id: "01a1c218-44dc-7000-8000-bea1904c0f06".into(),
+            cwd: None,
+            tmux_target: Some("muse:melisandre".into()),
+            tmux_pane: Some("muse.melisandre".into()),
+        };
+        dispatch_to_route(&muse_route, &m6).expect(
+            "Mail 6 must flush 5-mail before.txt composer, clear ledger, and deliver Mail 6",
+        );
+        assert!(
+            *flushed_five_mails.lock().unwrap(),
+            "pre-paste Enter must have flushed the 5-mail composer"
+        );
+        assert!(
+            !route_has_unconfirmed_wire_deliveries(&route_keys),
+            "all 5 recorded unconfirmed entries must be cleared after flush + Mail 6 confirmation"
+        );
+        assert_eq!(submitted_payloads.lock().unwrap().clone(), vec![fmt_m6]);
+        let replay_writes = writes.lock().unwrap().clone();
+        assert_eq!(
+            replay_writes.len(),
+            3,
+            "expected pre-paste flush CR + Mail 6 payload + Mail 6 submit CR"
+        );
+        assert_eq!(replay_writes[0], b"\r".to_vec());
+        assert_eq!(replay_writes[2], b"\r".to_vec());
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn r2_finding_2_and_4_muse_structured_json_transcript_and_post_paste_appended_human_text() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let store = MemStore::default();
+        let mut mail = mail_to(&store, "melisandre");
+        mail.sender_name = "cassandra".into();
+        mail.subject = "Structured JSON check".into();
+        mail.body = "Verify Muse transcript JSON parsing ignores tool outputs".into();
+        let fmt_mail = format_push_message(&mail);
+        let wire_id = mail.id.as_str();
+        let probes = payload_probes(&fmt_mail);
+
+        // 1. Unit checks for Finding #2 (`runtime.tool.completed` grepping `session.jsonl`,
+        //    non-leading quoted URN in user text, metadata-only URN, and valid `model_messages`
+        //    content blocks / stacked `[fl-wire ...]` mails):
+        let tool_grep_line = serde_json::json!({
+            "payload_type": "runtime.tool.completed",
+            "payload": {
+                "output": format!(
+                    "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":{fmt_mail:?}}}}}"
+                )
+            }
+        })
+        .to_string();
+        assert!(!muse_jsonl_line_accepts_wire_id(&tool_grep_line, wire_id));
+        assert!(!muse_jsonl_line_confirms_delivery(
+            &tool_grep_line,
+            Some(wire_id),
+            &probes
+        ));
+        assert!(!muse_jsonl_line_confirms_delivery(
+            &tool_grep_line,
+            None,
+            &probes
+        ));
+
+        let quoted_mid_line = serde_json::json!({
+            "payload_type": "runtime.user_intent.accepted",
+            "payload": {
+                "text": format!("what about {fmt_mail} -- dont send")
+            }
+        })
+        .to_string();
+        assert!(!muse_jsonl_line_accepts_wire_id(&quoted_mid_line, wire_id));
+        assert!(!muse_jsonl_line_confirms_delivery(
+            &quoted_mid_line,
+            Some(wire_id),
+            &probes
+        ));
+
+        let metadata_spoof_line = serde_json::json!({
+            "payload_type": "runtime.user_intent.accepted",
+            "debug_note": fmt_mail,
+            "payload": {
+                "text": "unrelated prompt"
+            }
+        })
+        .to_string();
+        assert!(!muse_jsonl_line_confirms_delivery(
+            &metadata_spoof_line,
+            None,
+            &probes
+        ));
+
+        let blocks_stacked_line = serde_json::json!({
+            "payload_type": "runtime.user_intent.accepted",
+            "payload": {
+                "model_messages": [{
+                    "role": "user",
+                    "content": [{
+                        "kind": "text",
+                        "text": format!(
+                            "[fl-wire mail/normal] from ferris (id: urn:uuid:00000000-0000-7000-8000-999999999999, thread: t): earlier\n\nearlier body\n{fmt_mail}"
+                        )
+                    }]
+                }]
+            }
+        })
+        .to_string();
+        assert!(muse_jsonl_line_accepts_wire_id(
+            &blocks_stacked_line,
+            wire_id
+        ));
+        assert!(muse_jsonl_line_confirms_delivery(
+            &blocks_stacked_line,
+            Some(wire_id),
+            &probes
+        ));
+
+        // End-to-end: `session.jsonl` contains `tool_grep_line` BEFORE `dispatch_to_route`:
+        // must NOT dedup, and must actually deliver `mail`!
+        let muse_sid = "01a1c218-44dc-7000-8000-bea1904c0f22";
+        let tdir = home.join(".local/share/muse/sessions").join(muse_sid);
+        fs::create_dir_all(&tdir).unwrap();
+        let tpath = tdir.join("session.jsonl");
+        fs::write(&tpath, format!("{tool_grep_line}\n")).unwrap();
+
+        let rule = "─".repeat(120);
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let host_sid = SessionId::new("muse.melisandre").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([42u8; 16]),
+                session: host_sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: host_sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+
+        // Mode flag: when `append_human_during_retry` is true, on payload write the mock PTY shows
+        // `<pasted_payload> DO NOT SEND` on Polls 1 & 2!
+        let append_human_during_retry = Arc::new(Mutex::new(false));
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let rendered = Arc::new(Mutex::new(format!(
+            "◆ Ready.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        )));
+
+        let append_srv = Arc::clone(&append_human_during_retry);
+        let writes_srv = Arc::clone(&writes);
+        let rendered_srv = Arc::clone(&rendered);
+        let rule_srv = rule.clone();
+        let ep_srv = endpoint;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let summary = summary.clone();
+                    let append_human = Arc::clone(&append_srv);
+                    let writes = Arc::clone(&writes_srv);
+                    let rendered = Arc::clone(&rendered_srv);
+                    let rule = rule_srv.clone();
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    let raw = bytes.into_vec();
+                                    writes.lock().unwrap().push(raw.clone());
+                                    if raw.as_slice() == b"\r" {
+                                        if !*append_human.lock().unwrap() {
+                                            *rendered.lock().unwrap() = format!(
+                                                "◆ Submitted.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+                                            );
+                                        }
+                                    } else {
+                                        let s = String::from_utf8_lossy(&raw).into_owned();
+                                        let suffix = if *append_human.lock().unwrap() {
+                                            " DO NOT SEND"
+                                        } else {
+                                            ""
+                                        };
+                                        *rendered.lock().unwrap() = format!(
+                                            "◆ Ready.\n\n{rule}\n❯ {}{suffix}\n{rule}\n  muse-wonder-full-1.0",
+                                            s.replace('\n', "\n  ")
+                                        );
+                                    }
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: rendered.lock().unwrap().clone(),
+                                            cursor_row: 5,
+                                            cursor_col: 24,
+                                            rows: 40,
+                                            cols: 120,
+                                            generation: 1,
+                                            output_seq: 1,
+                                            output_bytes: 512,
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_muse = EnvGuard::remove("FL_WIRE_MUSE_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let route = VendorRoute::Muse {
+            session_id: muse_sid.into(),
+            cwd: None,
+            tmux_target: Some("muse:melisandre".into()),
+            tmux_pane: Some("muse.melisandre".into()),
+        };
+
+        // Tool output row in `session.jsonl` does NOT deduplicate -> payload + CR are written!
+        dispatch_to_route(&route, &mail)
+            .expect("tool output mentioning runtime.user_intent.accepted must not drop delivery");
+        assert_eq!(writes.lock().unwrap().len(), 2);
+
+        // 2. Finding #4 regression: Poll 1/2 after paste + initial Enter shows our pasted payload
+        //    + appended human text `" DO NOT SEND"` -> verifies 0 retry Enters and
+        //    `composer_occupied_by_non_wire_input`!
+        let mut mail_post = mail_to(&store, "melisandre");
+        mail_post.body = "Post-paste human append check".into();
+        writes.lock().unwrap().clear();
+        *append_human_during_retry.lock().unwrap() = true;
+        *rendered.lock().unwrap() =
+            format!("◆ Ready.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0");
+
+        let post_err = dispatch_to_route(&route, &mail_post).expect_err(
+            "human text appended during post-paste retry window must abort immediately",
+        );
+        assert!(
+            is_composer_occupied_error(&post_err),
+            "expected composer_occupied_by_non_wire_input, got: {post_err}"
+        );
+        let post_writes = writes.lock().unwrap().clone();
+        assert_eq!(
+            post_writes.len(),
+            2,
+            "expected ONLY initial paste + initial CR (0 retry Enters!), got {post_writes:?}"
+        );
+        assert_eq!(post_writes[1], b"\r".to_vec());
 
         let _ = stop_tx.send(());
         server_thread.join().unwrap();
