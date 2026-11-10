@@ -2523,12 +2523,13 @@ fn execute_register_with_hydration_env(
     }) {
         Ok(rec) => {
             sync_store_retired_personas(&store);
-            if let Err(e) = fl_hub::lifecycle::record_hydration_ack(
+            if let Err(e) = fl_hub::lifecycle::record_hydration_ack_with_pid(
                 &store,
                 &rec.name_key,
                 replace,
                 verdict.effective_generation.as_deref(),
                 verdict.effective_hosted_id.as_deref(),
+                captured_route_pid,
             ) {
                 eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
             }

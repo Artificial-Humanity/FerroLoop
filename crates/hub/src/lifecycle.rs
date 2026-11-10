@@ -576,8 +576,12 @@ fn muse_window_not_ours(env: &LifecycleEnv<'_>, vendor: &str, unit: &str, hosted
 /// How many times [`launch_survived`] asks whether the session is there.
 const LAUNCH_SURVIVAL_CHECKS: u32 = 5;
 
-/// Positive survival window for `claude --resume <uuid>` launches (`10s` in production).
-pub const CLAUDE_RESUME_SURVIVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// Positive survival window for `claude --resume <uuid>` launches (`1s` in production; post-window
+/// exits before route confirmation are caught by `resume_unconfirmed_session_id` -> `resume_failed`).
+pub const CLAUDE_RESUME_SURVIVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Poll interval inside [`CLAUDE_RESUME_SURVIVAL_WINDOW`] (`200ms` in production, at most 5 checks).
+pub const CLAUDE_RESUME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[cfg(test)]
 thread_local! {
@@ -617,35 +621,33 @@ pub(crate) fn claude_pid_is_alive(pid: u32) -> bool {
     }
 }
 
-fn raw_route_entry_provenance(path: &Path, persona: &str) -> (Option<String>, Option<String>) {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return (None, None);
-    };
-    let Some(entries) = val.get("entries").and_then(serde_json::Value::as_object) else {
-        return (None, None);
-    };
-    let Some((_, entry_val)) = entries
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(persona))
-    else {
-        return (None, None);
-    };
-    let hosted_id = entry_val
-        .get("hosted_id")
-        .and_then(serde_json::Value::as_str)
+/// `true` when `entry`'s typed provenance (`hosted_id`, `hydration_generation`) is compatible with
+/// `(hosted_id, expected_generation)`.
+fn route_entry_matches_unit_provenance(
+    entry: &fl_wire::identity::RouteEntry,
+    hosted_id: &str,
+    expected_generation: Option<&str>,
+) -> bool {
+    if let Some(hid) = entry
+        .hosted_id
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let generation = entry_val
-        .get("hydration_generation")
-        .and_then(serde_json::Value::as_str)
+        && !hid.eq_ignore_ascii_case(hosted_id)
+    {
+        return false;
+    }
+    if let Some(g) = entry
+        .hydration_generation
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    (hosted_id, generation)
+        && let Some(expected_gen) = expected_generation.map(str::trim).filter(|s| !s.is_empty())
+        && g != expected_gen
+    {
+        return false;
+    }
+    true
 }
 
 /// `true` when `persona`'s saved Claude route in `route_table_paths(env.home_override)` confirms
@@ -685,18 +687,7 @@ fn claude_resume_route_registered(
         if *pid == 0 || !claude_pid_is_alive(*pid) {
             continue;
         }
-        let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, persona);
-        let eff_hid = entry.hosted_id.as_deref().or(raw_hid.as_deref());
-        let eff_gen = entry.hydration_generation.as_deref().or(raw_gen.as_deref());
-        if let Some(hid) = eff_hid
-            && !hid.eq_ignore_ascii_case(hosted_id)
-        {
-            continue;
-        }
-        if let Some(g) = eff_gen
-            && !hydration_generation.is_empty()
-            && g != hydration_generation
-        {
+        if !route_entry_matches_unit_provenance(entry, hosted_id, Some(hydration_generation)) {
             continue;
         }
         return true;
@@ -704,9 +695,9 @@ fn claude_resume_route_registered(
     false
 }
 
-/// `true` when a saved Claude route for `persona` matches `vendor_session_id` and proves
-/// provenance for `(hosted_id, hydration_generation, runtime_pid)` (even if the process later
-/// exited).
+/// `true` when a saved Claude route for `persona` matches `vendor_session_id`, was registered at or
+/// after `launch_started_ms`, and proves provenance for `(hosted_id, hydration_generation, runtime_pid)`
+/// (even if the process later exited).
 fn claude_route_confirmed_for_session(
     env: &LifecycleEnv<'_>,
     persona: &str,
@@ -714,6 +705,7 @@ fn claude_route_confirmed_for_session(
     vendor_session_id: &str,
     hydration_generation: Option<&str>,
     runtime_pid: Option<u32>,
+    launch_started_ms: u64,
 ) -> bool {
     if vendor_session_id.trim().is_empty() {
         return false;
@@ -735,13 +727,12 @@ fn claude_route_confirmed_for_session(
         if session_id.trim() != vendor_session_id.trim() {
             continue;
         }
-        let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, persona);
-        let eff_hid = entry.hosted_id.as_deref().or(raw_hid.as_deref());
-        let eff_gen = entry.hydration_generation.as_deref().or(raw_gen.as_deref());
-        let raw_meta_mismatch = eff_hid.is_some_and(|h| !h.eq_ignore_ascii_case(hosted_id))
-            || eff_gen.is_some_and(|g| hydration_generation != Some(g));
+        if entry.updated_at.unix_millis() < launch_started_ms {
+            continue;
+        }
+        let meta_ok = route_entry_matches_unit_provenance(entry, hosted_id, hydration_generation);
         let pid_ok = *pid > 0 && runtime_pid.is_none_or(|rp| rp == *pid);
-        if !raw_meta_mismatch && pid_ok {
+        if meta_ok && pid_ok {
             return true;
         }
     }
@@ -779,21 +770,27 @@ fn resume_launch_survived(
         return (true, true);
     }
 
+    #[cfg(test)]
     let settle = env.runtime.settle_delay();
     #[cfg(test)]
-    let window = TEST_CLAUDE_RESUME_SURVIVAL_WINDOW
-        .with(|c| c.get())
-        .unwrap_or_else(|| settle.saturating_mul(LAUNCH_SURVIVAL_CHECKS));
+    let custom_window = TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.get());
+    #[cfg(test)]
+    let window = custom_window.unwrap_or_else(|| settle.saturating_mul(LAUNCH_SURVIVAL_CHECKS));
     #[cfg(not(test))]
     let window = CLAUDE_RESUME_SURVIVAL_WINDOW;
 
-    let poll_step = if settle.is_zero() {
+    #[cfg(test)]
+    let poll_step = if custom_window.is_some() {
+        CLAUDE_RESUME_POLL_INTERVAL.min(window / LAUNCH_SURVIVAL_CHECKS.max(1))
+    } else if settle.is_zero() {
         window / LAUNCH_SURVIVAL_CHECKS.max(1)
     } else {
         settle
             .min(window / LAUNCH_SURVIVAL_CHECKS.max(1))
             .max(Duration::from_millis(10))
     };
+    #[cfg(not(test))]
+    let poll_step = CLAUDE_RESUME_POLL_INTERVAL.min(window / LAUNCH_SURVIVAL_CHECKS.max(1));
     let deadline = Instant::now() + window;
     let mut post_checks = 0u32;
 
@@ -1298,9 +1295,9 @@ fn estimate_claude_post_compaction_context(
 /// Sync `record.vendor_session_id` from a `VendorRoute::Claude` for `record.persona` when an
 /// interactive `/clear` rotated the active Claude session ID, the hosted runtime unit is dead,
 /// the route's PID is dead (`*pid > 0 && !claude_pid_is_alive(*pid)`), and provenance matches this
-/// hosted session (`(hosted_id, hydration_generation)` on the route JSON or `runtime_pid == pid`).
+/// hosted session (`(hosted_id, hydration_generation)` on the route entry or `record.pid == pid`).
 fn sync_claude_vendor_session_id_from_route<S: StateStore>(
-    store: &S,
+    _store: &S,
     env: &LifecycleEnv<'_>,
     record: &mut HostedSessionRecord,
 ) -> bool {
@@ -1315,7 +1312,6 @@ fn sync_claude_vendor_session_id_from_route<S: StateStore>(
     if env.spawn_runtime && env.runtime.exists(unit) {
         return false;
     }
-    let resume_state = load_claude_resume_state(store, &record.session_id);
     for path in route_table_paths(env.home_override) {
         if !path.is_file() {
             continue;
@@ -1333,13 +1329,27 @@ fn sync_claude_vendor_session_id_from_route<S: StateStore>(
         if *pid == 0 || claude_pid_is_alive(*pid) {
             continue;
         }
-        let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, &record.persona);
-        let eff_hid = entry.hosted_id.as_deref().or(raw_hid.as_deref());
-        let eff_gen = entry.hydration_generation.as_deref().or(raw_gen.as_deref());
+        if !route_entry_matches_unit_provenance(
+            entry,
+            &record.session_id,
+            record.hydration_generation.as_deref(),
+        ) {
+            continue;
+        }
+        let eff_hid = entry
+            .hosted_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let eff_gen = entry
+            .hydration_generation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let route_meta_matches = eff_hid
             .is_some_and(|h| h.eq_ignore_ascii_case(&record.session_id))
             && eff_gen.is_some_and(|g| record.hydration_generation.as_deref() == Some(g));
-        let pid_matches = resume_state.runtime_pid == Some(*pid) || record.pid == Some(*pid);
+        let pid_matches = record.pid == Some(*pid);
         if !route_meta_matches && !pid_matches {
             continue;
         }
@@ -1402,6 +1412,9 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
     cwd: Option<&str>,
 ) -> Result<ClaudeResumeDecision, LifecycleError> {
     let mut resume_state = load_claude_resume_state(store, &record.session_id);
+    let launch_started_ms = resume_state
+        .resume_launched_at_ms
+        .unwrap_or(record.updated_at_ms);
     let unconfirmed_died = resume_state
         .resume_unconfirmed_session_id
         .as_deref()
@@ -1412,7 +1425,8 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
                 &record.session_id,
                 unconfirmed_sid,
                 record.hydration_generation.as_deref(),
-                resume_state.runtime_pid,
+                record.pid,
+                launch_started_ms,
             )
         });
     if resume_state.resume_failed || unconfirmed_died {
@@ -1422,6 +1436,7 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
             .or_else(|| record.vendor_session_id.clone())
             .unwrap_or_default();
         resume_state.resume_failed = false;
+        resume_state.resume_launched_at_ms = None;
         save_claude_resume_state(store, &record.session_id, &resume_state, "hub")?;
         if !failed_sid.is_empty() {
             push_tombstone(&mut record.tombstone_ids, &failed_sid);
@@ -1434,8 +1449,11 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
             ),
         });
     }
-    if resume_state.resume_unconfirmed_session_id.is_some() {
+    if resume_state.resume_unconfirmed_session_id.is_some()
+        || resume_state.resume_launched_at_ms.is_some()
+    {
         resume_state.resume_unconfirmed_session_id = None;
+        resume_state.resume_launched_at_ms = None;
         save_claude_resume_state(store, &record.session_id, &resume_state, "hub")?;
     }
 
@@ -1486,6 +1504,19 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
             ),
         });
     };
+    if let Ok(meta) = std::fs::metadata(&transcript_path)
+        && meta.len() > fl_core::vendor_adapter::MAX_CLAUDE_TRANSCRIPT_READ_BYTES
+    {
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "transcript_too_large",
+            detail: format!(
+                "transcript `{}` size ({} bytes) exceeds cap ({} bytes)",
+                transcript_path.display(),
+                meta.len(),
+                fl_core::vendor_adapter::MAX_CLAUDE_TRANSCRIPT_READ_BYTES
+            ),
+        });
+    }
     let ctx = match estimate_claude_post_compaction_context(env, &transcript_path) {
         Ok(ctx) if ctx.turn_count > 0 => ctx,
         Ok(_) => {
@@ -1498,8 +1529,13 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
             });
         }
         Err(err) => {
+            let reason_code = if err.to_string().contains("exceeds maximum size") {
+                "transcript_too_large"
+            } else {
+                "empty_or_unparseable_transcript"
+            };
             return Ok(ClaudeResumeDecision::FreshLaunch {
-                reason_code: "empty_or_unparseable_transcript",
+                reason_code,
                 detail: format!(
                     "transcript parse failed for `{}`: {err}",
                     transcript_path.display()
@@ -3100,7 +3136,7 @@ pub fn claude_resume_state_slug(session_id: &str) -> String {
     )
 }
 
-/// Disjoint runtime state for a hosted Claude session's `--resume` survival and PID tracking.
+/// Disjoint runtime state for a hosted Claude session's `--resume` survival tracking.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeResumeState {
     /// Set when a `--resume` launch exited before positive confirmation so the next restart
@@ -3112,9 +3148,10 @@ pub struct ClaudeResumeState {
     /// `reconcile_dead_hosted_sessions` / restart marks `resume_failed = true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_unconfirmed_session_id: Option<String>,
-    /// PID of the Claude process spawned or confirmed for this hosted session.
+    /// Timestamp (ms since epoch) when the most recent `--resume` launch was spawned, used to
+    /// reject stale pre-restart routes in [`claude_route_confirmed_for_session`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_pid: Option<u32>,
+    pub resume_launched_at_ms: Option<u64>,
 }
 
 pub fn load_claude_resume_state<S: StateStore>(store: &S, session_id: &str) -> ClaudeResumeState {
@@ -3139,7 +3176,7 @@ pub fn save_claude_resume_state<S: StateStore>(
     let slug = claude_resume_state_slug(session_id);
     if !state.resume_failed
         && state.resume_unconfirmed_session_id.is_none()
-        && state.runtime_pid.is_none()
+        && state.resume_launched_at_ms.is_none()
     {
         let _ = store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug);
         return Ok(());
@@ -3364,6 +3401,19 @@ pub fn record_hydration_ack<S: StateStore>(
     caller_generation: Option<&str>,
     hosted_id: Option<&str>,
 ) -> Result<bool, LifecycleError> {
+    record_hydration_ack_with_pid(store, persona, replace, caller_generation, hosted_id, None)
+}
+
+/// Record a disjoint `hydration-ack-<G>` receipt with an explicit optional `caller_pid` (e.g. from
+/// a captured `VendorRoute::Claude` socket) without reading ambient environment variables.
+pub fn record_hydration_ack_with_pid<S: StateStore>(
+    store: &S,
+    persona: &str,
+    replace: bool,
+    caller_generation: Option<&str>,
+    hosted_id: Option<&str>,
+    caller_pid: Option<u32>,
+) -> Result<bool, LifecycleError> {
     if !replace {
         return Ok(false);
     }
@@ -3410,20 +3460,27 @@ pub fn record_hydration_ack<S: StateStore>(
             .map(|r| r.session_id)
             .unwrap_or_default()
     };
-    let claude_socket_pid = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET")
-        .and_then(|raw| {
-            Path::new(&raw)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .filter(|&p| p > 0);
     if session_id.starts_with("claude:")
-        && let Some(pid) = claude_socket_pid
+        && let Some(cpid) = caller_pid.filter(|&p| p > 0)
+        && let Some(mut rec) = find_hosted_session(store, &[&session_id])?
     {
-        let mut rstate = load_claude_resume_state(store, &session_id);
-        rstate.runtime_pid = Some(pid);
-        let _ = save_claude_resume_state(store, &session_id, &rstate, &persona_lower);
+        if let Some(rec_pid) = rec.pid.filter(|&p| p > 0) {
+            if let Some(expected_st) = rec.pid_start_time
+                && let Some(actual_st) = fl_wire::identity::proc_start_time_ticks(rec_pid)
+                && actual_st != expected_st
+            {
+                return Ok(false);
+            }
+            if rec_pid != cpid
+                && !fl_wire::identity::pid_is_self_or_ancestor(cpid, rec_pid, rec.pid_start_time)
+            {
+                return Ok(false);
+            }
+        } else {
+            rec.pid = Some(cpid);
+            rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(cpid);
+            persist_hosted_session(store, &rec, &persona_lower)?;
+        }
     }
     let receipt = HydrationReceipt {
         session_id,
@@ -5461,6 +5518,9 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
         if raw_spawned && survived_resume {
             survived = true;
             resumed_existing = true;
+            let new_pid = env.runtime.recorded_pid(&unit, &session_id);
+            record.pid = new_pid;
+            record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
             let mut rstate = load_claude_resume_state(store, &session_id);
             rstate.resume_failed = false;
             rstate.resume_unconfirmed_session_id = if hook_confirmed {
@@ -5468,9 +5528,11 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             } else {
                 Some(resumed_sid)
             };
-            if let Some(pid) = env.runtime.recorded_pid(&unit, &session_id) {
-                rstate.runtime_pid = Some(pid);
-            }
+            rstate.resume_launched_at_ms = if hook_confirmed {
+                None
+            } else {
+                Some(resume_launch_started_ms)
+            };
             save_claude_resume_state(store, &session_id, &rstate, by)?;
         } else {
             let _ = env.runtime.kill(&unit, &session_id);
@@ -5519,6 +5581,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             record.hydration_status = HydrationStatus::Unconfirmed;
             record.hydration_dispatched = false;
             record.runtime_spawned = false;
+            record.pid = None;
+            record.pid_start_time = None;
             record.updated_at_ms = now_ms();
             persist_hosted_session(store, &record, by)?;
             raw_spawned = env.runtime.spawn(
@@ -5533,25 +5597,38 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             }
             launched = raw_spawned && launch.is_some();
             survived = !launched || launch_survived(env, &unit, &session_id);
-            let mut rstate = load_claude_resume_state(store, &session_id);
-            rstate.resume_failed = false;
-            rstate.resume_unconfirmed_session_id = None;
-            rstate.runtime_pid = if raw_spawned && survived {
+            let new_pid = if raw_spawned && survived {
                 env.runtime.recorded_pid(&unit, &session_id)
             } else {
                 None
             };
+            record.pid = new_pid;
+            record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
+            let mut rstate = load_claude_resume_state(store, &session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = None;
+            rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &session_id, &rstate, by)?;
         }
     } else {
         survived = !launched || launch_survived(env, &unit, &session_id);
+        let new_pid = if raw_spawned && survived {
+            env.runtime.recorded_pid(&unit, &session_id)
+        } else if will_spawn {
+            None
+        } else {
+            previous
+                .as_ref()
+                .filter(|r| !is_decommissioned(r))
+                .and_then(|r| r.pid)
+        };
+        record.pid = new_pid;
+        record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
         if v.vendor == "claude" {
             let mut rstate = load_claude_resume_state(store, &session_id);
             rstate.resume_failed = false;
             rstate.resume_unconfirmed_session_id = None;
-            if raw_spawned && survived {
-                rstate.runtime_pid = env.runtime.recorded_pid(&unit, &session_id);
-            }
+            rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &session_id, &rstate, by)?;
         }
         if will_spawn
@@ -6501,6 +6578,8 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
         if vendor_route_present(env.home_override, &record.persona, &record.vendor) {
             if record.vendor == "claude" {
                 let mut rstate = load_claude_resume_state(store, &record.session_id);
+                let launch_started_ms =
+                    rstate.resume_launched_at_ms.unwrap_or(record.updated_at_ms);
                 if let Some(ref unconfirmed_sid) = rstate.resume_unconfirmed_session_id
                     && claude_route_confirmed_for_session(
                         env,
@@ -6508,10 +6587,12 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                         &record.session_id,
                         unconfirmed_sid,
                         record.hydration_generation.as_deref(),
-                        rstate.runtime_pid,
+                        record.pid,
+                        launch_started_ms,
                     )
                 {
                     rstate.resume_unconfirmed_session_id = None;
+                    rstate.resume_launched_at_ms = None;
                     let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
                 }
             }
@@ -6543,6 +6624,8 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                 if streak >= 2 {
                     if record.vendor == "claude" {
                         let mut rstate = load_claude_resume_state(store, &record.session_id);
+                        let launch_started_ms =
+                            rstate.resume_launched_at_ms.unwrap_or(record.updated_at_ms);
                         if let Some(unconfirmed_sid) = rstate.resume_unconfirmed_session_id.clone()
                             && !claude_route_confirmed_for_session(
                                 env,
@@ -6550,14 +6633,28 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                                 &record.session_id,
                                 &unconfirmed_sid,
                                 record.hydration_generation.as_deref(),
-                                rstate.runtime_pid,
+                                record.pid,
+                                launch_started_ms,
                             )
                         {
                             rstate.resume_failed = true;
                             rstate.resume_unconfirmed_session_id = None;
+                            rstate.resume_launched_at_ms = None;
                             let _ =
                                 save_claude_resume_state(store, &record.session_id, &rstate, by);
                         } else {
+                            if rstate.resume_unconfirmed_session_id.is_some()
+                                || rstate.resume_launched_at_ms.is_some()
+                            {
+                                rstate.resume_unconfirmed_session_id = None;
+                                rstate.resume_launched_at_ms = None;
+                                let _ = save_claude_resume_state(
+                                    store,
+                                    &record.session_id,
+                                    &rstate,
+                                    by,
+                                );
+                            }
                             let _ =
                                 sync_claude_vendor_session_id_from_route(store, env, &mut record);
                         }
@@ -7149,6 +7246,10 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     if is_claude_resume {
         record.hydration_dispatched = true;
     }
+    if will_spawn {
+        record.pid = None;
+        record.pid_start_time = None;
+    }
     record.hydration_generation = Some(hydration_generation.clone());
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
@@ -7189,6 +7290,9 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
         if raw_spawned && survived_resume {
             record.runtime_spawned = true;
             resumed_existing = true;
+            let new_pid = env.runtime.recorded_pid(&unit, &record.session_id);
+            record.pid = new_pid;
+            record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
             let mut rstate = load_claude_resume_state(store, &record.session_id);
             rstate.resume_failed = false;
             rstate.resume_unconfirmed_session_id = if hook_confirmed {
@@ -7196,9 +7300,11 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             } else {
                 Some(resumed_sid)
             };
-            if let Some(pid) = env.runtime.recorded_pid(&unit, &record.session_id) {
-                rstate.runtime_pid = Some(pid);
-            }
+            rstate.resume_launched_at_ms = if hook_confirmed {
+                None
+            } else {
+                Some(resume_launch_started_ms)
+            };
             save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         } else {
             let _ = env.runtime.kill(&unit, &record.session_id);
@@ -7223,6 +7329,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             record.hydration_status = HydrationStatus::Unconfirmed;
             record.hydration_dispatched = false;
             record.runtime_spawned = false;
+            record.pid = None;
+            record.pid_start_time = None;
             record.updated_at_ms = now_ms();
             let fresh_guidance = registered_role_prompt_with_generation(
                 store,
@@ -7267,14 +7375,17 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
                 launch_died = true;
                 record.runtime_spawned = false;
             }
-            let mut rstate = load_claude_resume_state(store, &record.session_id);
-            rstate.resume_failed = false;
-            rstate.resume_unconfirmed_session_id = None;
-            rstate.runtime_pid = if record.runtime_spawned {
+            let new_pid = if record.runtime_spawned {
                 env.runtime.recorded_pid(&unit, &record.session_id)
             } else {
                 None
             };
+            record.pid = new_pid;
+            record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
+            let mut rstate = load_claude_resume_state(store, &record.session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = None;
+            rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         }
     } else if raw_spawned {
@@ -7287,13 +7398,18 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             // Argv already handed off the prompt; acceptance remains unconfirmed.
             launched_with_prompt = launch.is_some();
         }
+        let new_pid = if record.runtime_spawned {
+            env.runtime.recorded_pid(&unit, &record.session_id)
+        } else {
+            None
+        };
+        record.pid = new_pid;
+        record.pid_start_time = new_pid.and_then(fl_wire::identity::proc_start_time_ticks);
         if record.vendor == "claude" {
             let mut rstate = load_claude_resume_state(store, &record.session_id);
             rstate.resume_failed = false;
             rstate.resume_unconfirmed_session_id = None;
-            if record.runtime_spawned {
-                rstate.runtime_pid = env.runtime.recorded_pid(&unit, &record.session_id);
-            }
+            rstate.resume_launched_at_ms = None;
             save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         }
     } else if will_spawn && let Some(prev_g) = existing_gen.as_ref() {
@@ -15318,7 +15434,7 @@ mod tests {
         );
 
         // 2. I2: A LIVE Claude process (`pid = std::process::id()`) registered under `ada` is
-        //    never adopted even if `runtime_pid` matches.
+        //    never adopted even if `record.pid` matches.
         fake.clear();
         fake.launches.borrow_mut().clear();
         table.upsert(
@@ -15332,19 +15448,10 @@ mod tests {
             At::from_unix_millis(15),
         );
         table.save(Some(&routes_path)).unwrap();
-        save_claude_resume_state(
-            &store,
-            "claude:ada",
-            &ClaudeResumeState {
-                runtime_pid: Some(std::process::id()),
-                ..Default::default()
-            },
-            "owner",
-        )
-        .unwrap();
         let mut probe_rec = find_hosted_session(&store, &["claude:ada"])
             .unwrap()
             .unwrap();
+        probe_rec.pid = Some(std::process::id());
         assert!(
             !sync_claude_vendor_session_id_from_route(&store, &env, &mut probe_rec),
             "I2: live process route must never be adopted"
@@ -15355,18 +15462,10 @@ mod tests {
         );
 
         // 3. I2: A DEAD Claude process (`pid = 999_999_992`) with a different PID than
-        //    `runtime_pid = 999_999_991` and no matching `(hosted_id, hydration_generation)` is
+        //    `record.pid = 999_999_991` and no matching `(hosted_id, hydration_generation)` is
         //    never adopted.
-        save_claude_resume_state(
-            &store,
-            "claude:ada",
-            &ClaudeResumeState {
-                runtime_pid: Some(999_999_991),
-                ..Default::default()
-            },
-            "owner",
-        )
-        .unwrap();
+        probe_rec.pid = Some(999_999_991);
+        persist_hosted_session(&store, &probe_rec, "owner").unwrap();
         table.upsert(
             "ada",
             VendorRoute::Claude {
@@ -15387,9 +15486,9 @@ mod tests {
             Some(old_sid.as_str())
         );
 
-        // 4. Dead route from this session's own process (`pid == runtime_pid == 999_999_991`)
-        //    with non-tombstoned `/clear` session_id updates `record.vendor_session_id` and is
-        //    targeted by `--resume` on subsequent restart.
+        // 4. Minor #5: Dead route from this session's own process (`pid == record.pid == 999_999_991`)
+        //    is rejected while the unit `"Ada"` is still running (`env.runtime.exists("Ada")`),
+        //    and then adopted once `"Ada"` stops.
         table.upsert(
             "ada",
             VendorRoute::Claude {
@@ -15401,9 +15500,26 @@ mod tests {
             At::from_unix_millis(20),
         );
         table.save(Some(&routes_path)).unwrap();
+        fake.live.borrow_mut().insert("Ada".to_string());
+        assert!(
+            !sync_claude_vendor_session_id_from_route(&store, &env, &mut probe_rec),
+            "Minor #5: matching dead-PID route must be rejected while unit Ada is still running"
+        );
+        assert_eq!(
+            probe_rec.vendor_session_id.as_deref(),
+            Some(old_sid.as_str())
+        );
 
         fake.clear();
         fake.launches.borrow_mut().clear();
+        assert!(
+            sync_claude_vendor_session_id_from_route(&store, &env, &mut probe_rec),
+            "Minor #5: matching dead-PID route must be adopted once unit Ada is stopped"
+        );
+        assert_eq!(
+            probe_rec.vendor_session_id.as_deref(),
+            Some(new_sid.as_str())
+        );
         let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
         assert_eq!(
             restarted.record.vendor_session_id.as_deref(),
@@ -15802,11 +15918,13 @@ mod tests {
     fn claude_spin_up_stopped_fallback_ladder_and_model_context_window_shrunk() {
         // Minor 5: spin_up fallback ladder tests beyond tombstone:
         // (a) missing_transcript, (b) empty_or_unparseable_transcript,
-        // (c) active_context_tokens_exceeded, (d) recast_staged,
-        // plus Minor 8: (e) model_context_window_shrunk.
+        // (c) transcript_too_large (> 64 MiB, Minor #6),
+        // (d) active_context_tokens_exceeded, (e) recast_staged,
+        // plus Minor 8: (f) model_context_window_shrunk.
         enum Case {
             MissingTranscript,
             EmptyTranscript,
+            TranscriptTooLarge,
             OverCap,
             RecastStaged,
             WindowShrunk,
@@ -15814,6 +15932,7 @@ mod tests {
         for (case, expected_tag) in [
             (Case::MissingTranscript, "missing_transcript"),
             (Case::EmptyTranscript, "empty_or_unparseable_transcript"),
+            (Case::TranscriptTooLarge, "transcript_too_large"),
             (Case::OverCap, "active_context_tokens_exceeded"),
             (Case::RecastStaged, "recast_staged"),
             (Case::WindowShrunk, "model_context_window_shrunk"),
@@ -15840,6 +15959,13 @@ mod tests {
                     let proj_dir = home.path().join(".claude/projects/ferroloop");
                     std::fs::create_dir_all(&proj_dir).unwrap();
                     std::fs::write(proj_dir.join(format!("{sid1}.jsonl")), "").unwrap();
+                }
+                Case::TranscriptTooLarge => {
+                    let proj_dir = home.path().join(".claude/projects/ferroloop");
+                    std::fs::create_dir_all(&proj_dir).unwrap();
+                    let f = std::fs::File::create(proj_dir.join(format!("{sid1}.jsonl"))).unwrap();
+                    f.set_len(fl_core::vendor_adapter::MAX_CLAUDE_TRANSCRIPT_READ_BYTES + 1)
+                        .unwrap();
                 }
                 Case::OverCap => {
                     write_claude_transcript(
@@ -15974,5 +16100,198 @@ mod tests {
                 "{key} must not be in blank_allow"
             );
         }
+    }
+
+    #[test]
+    fn claude_resume_round2_r1_r2_r3_r4_guards() {
+        // R2 + Minor #7: survival window is bounded to 1s with 200ms poll interval (<= 5 checks).
+        assert_eq!(CLAUDE_RESUME_SURVIVAL_WINDOW, Duration::from_secs(1));
+        assert_eq!(CLAUDE_RESUME_POLL_INTERVAL, Duration::from_millis(200));
+
+        // R1: `record_hydration_ack` does not read ambient `CLAUDE_CODE_MESSAGING_SOCKET` from
+        // `std::env`, and `record_hydration_ack_with_pid` rejects a mismatched caller PID while
+        // accepting a matching PID.
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.set_unit_pid("Ada", 4242);
+        let env = fake.env(home.path());
+
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g1 = spun.hydration_generation.unwrap();
+        let sid1 = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap()
+            .vendor_session_id
+            .unwrap();
+        assert_eq!(
+            find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .pid,
+            Some(4242)
+        );
+        // Mismatched caller PID (99999 != 4242) is refused.
+        assert!(
+            !record_hydration_ack_with_pid(
+                &store,
+                "ada",
+                true,
+                Some(&g1),
+                Some("claude:ada"),
+                Some(99_999),
+            )
+            .unwrap(),
+            "R1: mismatched caller_pid must be refused when record.pid is Some(4242)"
+        );
+        // `record_hydration_ack` (`caller_pid = None`) succeeds and preserves `record.pid == Some(4242)`.
+        assert!(
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap(),
+            "R1: record_hydration_ack with None caller_pid must succeed"
+        );
+        assert_eq!(
+            find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .pid,
+            Some(4242),
+            "R1: record.pid must not be overwritten by ambient environment"
+        );
+
+        // R3 + R4:
+        // 1. Pre-restart route on disk (with `updated_at < launch_started_ms` or old generation)
+        //    must NOT confirm a resume even if `recorded_pid` returns `None` on respawn!
+        write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+        let routes_path = home.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(routes_path.parent().unwrap()).unwrap();
+        let pre_restart_ms = 1_000u64;
+        let launch_started_ms = 5_000u64;
+        let stale_route_json = serde_json::json!({
+            "version": 1,
+            "entries": {
+                "ada": {
+                    "persona": "ada",
+                    "route": {
+                        "kind": "claude",
+                        "pid": 4242,
+                        "session_id": sid1,
+                        "socket_path": home.path().join("claude.sock"),
+                    },
+                    "updated_at": At::from_unix_millis(pre_restart_ms),
+                    "hosted_id": "claude:ada",
+                    "hydration_generation": g1,
+                }
+            }
+        });
+        std::fs::write(
+            &routes_path,
+            serde_json::to_string_pretty(&stale_route_json).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !claude_route_confirmed_for_session(
+                &env,
+                "ada",
+                "claude:ada",
+                &sid1,
+                Some(&g1),
+                None,
+                launch_started_ms,
+            ),
+            "R3: pre-restart route with updated_at < launch_started_ms must not confirm resume"
+        );
+
+        // Route at/after `launch_started_ms` with a mismatched generation is also rejected.
+        let wrong_gen = next_hydration_generation();
+        let wrong_gen_json = serde_json::json!({
+            "version": 1,
+            "entries": {
+                "ada": {
+                    "persona": "ada",
+                    "route": {
+                        "kind": "claude",
+                        "pid": 4242,
+                        "session_id": sid1,
+                        "socket_path": home.path().join("claude.sock"),
+                    },
+                    "updated_at": At::from_unix_millis(launch_started_ms),
+                    "hosted_id": "claude:ada",
+                    "hydration_generation": wrong_gen,
+                }
+            }
+        });
+        std::fs::write(
+            &routes_path,
+            serde_json::to_string_pretty(&wrong_gen_json).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !claude_route_confirmed_for_session(
+                &env,
+                "ada",
+                "claude:ada",
+                &sid1,
+                Some(&g1),
+                Some(4242),
+                launch_started_ms,
+            ),
+            "R3/R4: route with mismatched hydration_generation must not confirm resume"
+        );
+
+        // Route at/after `launch_started_ms` with matching `hosted_id`, `hydration_generation`, and PID confirms.
+        let valid_json = serde_json::json!({
+            "version": 1,
+            "entries": {
+                "ada": {
+                    "persona": "ada",
+                    "route": {
+                        "kind": "claude",
+                        "pid": 4242,
+                        "session_id": sid1,
+                        "socket_path": home.path().join("claude.sock"),
+                    },
+                    "updated_at": At::from_unix_millis(launch_started_ms),
+                    "hosted_id": "claude:ada",
+                    "hydration_generation": g1,
+                }
+            }
+        });
+        std::fs::write(
+            &routes_path,
+            serde_json::to_string_pretty(&valid_json).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            claude_route_confirmed_for_session(
+                &env,
+                "ada",
+                "claude:ada",
+                &sid1,
+                Some(&g1),
+                Some(4242),
+                launch_started_ms,
+            ),
+            "R3/R4: route at/after launch_started_ms with matching typed RouteEntry provenance must confirm"
+        );
+
+        // 2. When `recorded_pid` returns `None` on respawn after `record.pid` was `Some(4242)`,
+        //    `restart_hosted_session` clears `record.pid` to `None` instead of keeping `Some(4242)`.
+        std::fs::remove_file(&routes_path).unwrap();
+        fake.clear();
+        fake.unit_pids.borrow_mut().remove("Ada");
+        let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            restarted.record.pid, None,
+            "R3/R4: respawn when recorded_pid is None must clear stale record.pid"
+        );
+        assert_eq!(restarted.record.pid_start_time, None);
     }
 }

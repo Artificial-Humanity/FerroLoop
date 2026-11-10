@@ -190,9 +190,6 @@ pub fn parse_claude_max_resume_active_tokens_override(raw: Option<&str>) -> (u64
     let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return (MAX_CLAUDE_RESUME_ACTIVE_TOKENS, None);
     };
-    let Some(raw_val) = raw else {
-        return (MAX_CLAUDE_RESUME_ACTIVE_TOKENS, None);
-    };
     match trimmed.parse::<u64>() {
         Ok(parsed) if (1..=MAX_ALLOWED_CLAUDE_RESUME_ACTIVE_TOKENS_OVERRIDE).contains(&parsed) => {
             (parsed, None)
@@ -200,7 +197,7 @@ pub fn parse_claude_max_resume_active_tokens_override(raw: Option<&str>) -> (u64
         _ => (
             MAX_CLAUDE_RESUME_ACTIVE_TOKENS,
             Some(format!(
-                "ignoring invalid FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS={raw_val:?}; using default {MAX_CLAUDE_RESUME_ACTIVE_TOKENS}"
+                "ignoring invalid FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS={trimmed:?}; using default {MAX_CLAUDE_RESUME_ACTIVE_TOKENS}"
             )),
         ),
     }
