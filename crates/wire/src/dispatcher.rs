@@ -17630,7 +17630,9 @@ exit 1"#,
             || {},
             |_| {},
         )
-        .expect("execute_verified_paste_delivery must succeed when first CR is swallowed mid-burst");
+        .expect(
+            "execute_verified_paste_delivery must succeed when first CR is swallowed mid-burst",
+        );
         assert_eq!(paste_writes, 1, "must write payload once");
         assert_eq!(
             enter_presses, 2,
