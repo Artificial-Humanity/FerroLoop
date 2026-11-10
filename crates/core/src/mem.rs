@@ -112,6 +112,7 @@ struct Inner {
     next_wire_rcpt_seq: u64,
     wire_threads: BTreeSet<(ThreadId, MessageId)>,
     wire_replies: BTreeSet<(MessageId, MessageId)>,
+    wire_awaiting_daemon: BTreeMap<MessageId, At>,
 
     delivery: ManagedMemory,
 
@@ -1850,10 +1851,11 @@ impl StateStore for MemStore {
     }
 }
 
-impl MessageStore for MemStore {
-    fn send_wire(
+impl MemStore {
+    fn send_wire_inner(
         &self,
         args: SendWireArgs,
+        awaiting_daemon: bool,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
         let subject =
             validate_subject(&args.subject).map_err(|e| StoreError::InvalidState(e.to_string()))?;
@@ -1972,8 +1974,42 @@ impl MessageStore for MemStore {
             s.append_wire_receipt(rcpt.clone());
             receipts.push(rcpt);
         }
+        if awaiting_daemon {
+            s.wire_awaiting_daemon
+                .insert(msg.id.clone(), msg.created_at.clone());
+        }
 
         Ok((msg, receipts))
+    }
+}
+
+impl MessageStore for MemStore {
+    fn send_wire(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        self.send_wire_inner(args, false)
+    }
+
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        self.send_wire_inner(args, true)
+    }
+
+    fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.wire_awaiting_daemon
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.wire_awaiting_daemon.remove(message_id);
+        Ok(())
     }
 
     fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
@@ -2280,6 +2316,7 @@ impl MessageStore for MemStore {
                 }
                 s.wire_inbox.retain(|(_, m), _| m != &mid);
                 s.wire_rcpt_log.retain(|_, r| r.message_id != mid);
+                s.wire_awaiting_daemon.remove(&mid);
             }
         }
         Ok(count)

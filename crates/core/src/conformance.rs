@@ -4708,6 +4708,33 @@ fn prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff<S: 
     assert_eq!(pruned_durable, 1);
     assert!(s.get_wire_message(&m_durable.id).unwrap().is_none());
     assert!(s.get_wire_message(&m_durable_pending.id).unwrap().is_some());
+
+    // 5. `send_wire_awaiting_daemon` records a marker in `list_wire_awaiting_daemon`, and
+    //    `clear_wire_awaiting_daemon` removes it.
+    let (m_awaiting, _) = s
+        .send_wire_awaiting_daemon(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Awaiting daemon".into(),
+            body: "Queued for daemon".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(16),
+        })
+        .unwrap();
+    assert_eq!(
+        s.list_wire_awaiting_daemon().unwrap(),
+        vec![(m_awaiting.id.clone(), At::from_unix_millis(16))]
+    );
+    s.clear_wire_awaiting_daemon(&m_awaiting.id).unwrap();
+    assert!(s.list_wire_awaiting_daemon().unwrap().is_empty());
 }
 
 fn sample_workflow_def(

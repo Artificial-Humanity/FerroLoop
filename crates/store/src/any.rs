@@ -1263,6 +1263,9 @@ delegate! {
         fn wire_receipts_after(&self, after_seq: u64) -> Result<Vec<(u64, DeliveryReceipt)>, StoreError>;
         fn import_wire_batch(&self, messages: &[WireMessage], receipts: &[DeliveryReceipt]) -> Result<WireImportReport, StoreError>;
         fn prune_wire(&self, before: At) -> Result<usize, StoreError>;
+        fn send_wire_awaiting_daemon(&self, args: SendWireArgs) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError>;
+        fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError>;
+        fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError>;
     }
     WorkflowStore {
         fn upsert_workflow_def(&self, def: WorkflowDef) -> Result<WorkflowDef, StoreError>;

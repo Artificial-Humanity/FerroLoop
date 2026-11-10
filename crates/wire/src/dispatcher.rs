@@ -52,11 +52,27 @@ pub fn format_push_message(msg: &WireMessage) -> String {
 }
 
 pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), String> {
-    dispatch_to_route_with_status(route, msg).map(|_| ())
+    dispatch_to_route_for_recipient(route, None, msg)
+}
+
+pub fn dispatch_to_route_for_recipient(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
+    msg: &WireMessage,
+) -> Result<(), String> {
+    dispatch_to_route_for_recipient_with_status(route, recipient_persona, msg).map(|_| ())
 }
 
 pub fn dispatch_to_route_with_status(
     route: &VendorRoute,
+    msg: &WireMessage,
+) -> Result<DeliveryStatus, String> {
+    dispatch_to_route_for_recipient_with_status(route, None, msg)
+}
+
+pub fn dispatch_to_route_for_recipient_with_status(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
     msg: &WireMessage,
 ) -> Result<DeliveryStatus, String> {
     match route {
@@ -87,10 +103,12 @@ pub fn dispatch_to_route_with_status(
             } else {
                 format_push_message(msg)
             };
-            let persona = match &msg.to {
-                fl_core::ferrowire::WireAddress::AgentName(name) => Some(name.as_str()),
-                _ => None,
-            };
+            let persona = recipient_persona
+                .filter(|s| !s.trim().is_empty())
+                .or(match &msg.to {
+                    fl_core::ferrowire::WireAddress::AgentName(name) => Some(name.as_str()),
+                    _ => None,
+                });
             deliver_to_agy_route(
                 persona,
                 conversation_id,
@@ -237,9 +255,20 @@ impl From<PushError> for String {
 /// [`dispatch_to_route`], with a typed error: [`PushError::NotConnected`] when a webhook
 /// receiver could not be reached at all.
 pub fn push_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), PushError> {
+    push_to_route_for_recipient(route, None, msg)
+}
+
+/// [`dispatch_to_route_for_recipient`], with a typed error: [`PushError::NotConnected`] when a
+/// webhook receiver could not be reached at all.
+pub fn push_to_route_for_recipient(
+    route: &VendorRoute,
+    recipient_persona: Option<&str>,
+    msg: &WireMessage,
+) -> Result<(), PushError> {
     match route {
         VendorRoute::Webhook { socket_path } => push_webhook_message(socket_path, msg),
-        _ => dispatch_to_route(route, msg).map_err(PushError::Failed),
+        _ => dispatch_to_route_for_recipient(route, recipient_persona, msg)
+            .map_err(PushError::Failed),
     }
 }
 
@@ -1280,9 +1309,11 @@ fn resolve_agy_host_fallback_target(
     }
     if personas.is_empty() {
         #[cfg(not(test))]
-        let route_path = std::env::var_os("FL_WIRE_ROUTES")
-            .map(PathBuf::from)
-            .or_else(|| Some(crate::identity::default_routes_path()));
+        let route_path = Some(crate::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ));
         #[cfg(test)]
         let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
         if let Some(path) = route_path {
@@ -5156,9 +5187,11 @@ fn resolve_claude_transcript_for_target(
                 None
             };
         #[cfg(not(test))]
-        let route_path = std::env::var_os("FL_WIRE_ROUTES")
-            .map(PathBuf::from)
-            .or_else(|| Some(crate::identity::default_routes_path()));
+        let route_path = Some(crate::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ));
         #[cfg(test)]
         let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
         if let Some(path) = route_path
@@ -5250,9 +5283,11 @@ fn resolve_muse_transcript_for_target(
     let mut session_id = session_id_arg;
     if session_id.is_none() {
         #[cfg(not(test))]
-        let route_path = std::env::var_os("FL_WIRE_ROUTES")
-            .map(PathBuf::from)
-            .or_else(|| Some(crate::identity::default_routes_path()));
+        let route_path = Some(crate::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        ));
         #[cfg(test)]
         let route_path = std::env::var_os("FL_WIRE_ROUTES").map(PathBuf::from);
         if let Some(path) = route_path {
@@ -5620,15 +5655,17 @@ pub fn dispatch_operator_prompt_to_route(
     }
 }
 
-fn dispatch_to_route_with_push_error(
+fn dispatch_to_route_for_recipient_with_push_error(
     route: &VendorRoute,
+    recipient_persona: Option<&str>,
     msg: &WireMessage,
 ) -> Result<DeliveryStatus, PushError> {
     match route {
         VendorRoute::Webhook { socket_path } => {
             push_webhook_message(socket_path, msg).map(|()| DeliveryStatus::Acked)
         }
-        _ => dispatch_to_route_with_status(route, msg).map_err(PushError::Failed),
+        _ => dispatch_to_route_for_recipient_with_status(route, recipient_persona, msg)
+            .map_err(PushError::Failed),
     }
 }
 
@@ -5650,7 +5687,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         now,
         None,
         &mut DispatchReport::default(),
-        dispatch_to_route_with_push_error,
+        dispatch_to_route_for_recipient_with_push_error,
     )
     .0
 }
@@ -5694,7 +5731,7 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
         now,
         Some(recipient),
         report,
-        dispatch_to_route_with_push_error,
+        dispatch_to_route_for_recipient_with_push_error,
     )
 }
 
@@ -5744,7 +5781,7 @@ fn dispatch_message_selected<S: MessageStore>(
         now,
         recipient,
         report,
-        |route, msg| {
+        |route, _recipient, msg| {
             dispatch(route, msg)
                 .map(|()| DeliveryStatus::Acked)
                 .map_err(PushError::Failed)
@@ -5753,7 +5790,7 @@ fn dispatch_message_selected<S: MessageStore>(
 }
 
 // The private callback keeps fault tests on this same pass without invoking vendor I/O.
-// Production callers always supply dispatch_to_route_with_push_error.
+// Production callers always supply dispatch_to_route_for_recipient_with_push_error.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_message_selected_with_status<S: MessageStore>(
     store: &S,
@@ -5763,7 +5800,11 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     now: At,
     recipient: Option<&str>,
     report: &mut DispatchReport,
-    mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<DeliveryStatus, PushError>,
+    mut dispatch: impl FnMut(
+        &VendorRoute,
+        Option<&str>,
+        &WireMessage,
+    ) -> Result<DeliveryStatus, PushError>,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
     let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
         report.record_failure(FailureStage::InitialReceiptReadError);
@@ -5806,7 +5847,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         };
         attempted = true;
         let slot = report.record_call_started(&entry);
-        let mut pushed = dispatch(&entry.route, msg);
+        let mut pushed = dispatch(&entry.route, Some(rcpt.recipient_name.as_str()), msg);
         report.record_call_finished(
             slot,
             if pushed.is_ok() {
@@ -5837,7 +5878,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                     && let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
                 {
                     let slot = report.record_call_started(&fresh);
-                    pushed = dispatch(&fresh.route, msg);
+                    pushed = dispatch(&fresh.route, Some(rcpt.recipient_name.as_str()), msg);
                     report.record_call_finished(
                         slot,
                         if pushed.is_ok() {
@@ -6023,6 +6064,19 @@ mod tests {
         fn prune_wire(&self, before: At) -> Result<usize, StoreError> {
             self.calls.borrow_mut().push("prune");
             self.inner.prune_wire(before)
+        }
+        fn send_wire_awaiting_daemon(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            self.calls.borrow_mut().push("send_awaiting_daemon");
+            self.inner.send_wire_awaiting_daemon(args)
+        }
+        fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+            self.inner.list_wire_awaiting_daemon()
+        }
+        fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+            self.inner.clear_wire_awaiting_daemon(message_id)
         }
     }
 
@@ -17137,5 +17191,193 @@ exit 1"#,
             !route_has_unconfirmed_wire_deliveries(&route_keys),
             "route ledger must be completely cleared once rendered composer is observed empty"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_fanout_passes_member_persona_to_agy_route_delivery() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionRequest, ExtensionResponse,
+            HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            InputState, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
+        };
+        use fl_store::RedbStore;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("Felicia.antigravity").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([3u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::ReliablePipe,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pipe,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+        let writes = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let writes_srv = Arc::clone(&writes);
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                while let Ok(mut conn) = listener.accept().await {
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { stream, bytes, .. } => {
+                                    writes.lock().unwrap().push((
+                                        stream.session.as_str().to_string(),
+                                        bytes.into_vec(),
+                                    ));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: String::new(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let store = RedbStore::open(&tmp.path().join("fanout.redb")).unwrap();
+        for name in ["felicia", "felix"] {
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: At::from_unix_millis(10),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+
+        let failing_agy = write_script(tmp.path(), "failing-agy.sh", "exit 1");
+        let routes_path = tmp.path().join("routes.json");
+        let mut routes = RouteTable::load(Some(&routes_path));
+        routes.upsert_explicit(
+            "felicia",
+            VendorRoute::Agy {
+                conversation_id: "019d0000-0000-7000-8000-00000000aaaa".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(failing_agy),
+            },
+            At::from_unix_millis(20),
+        );
+
+        // Intentionally do NOT save `routes` to `FL_WIRE_ROUTES`: `deliver_to_agy_route`
+        // must receive `Some("felicia")` directly from `rcpt.recipient_name` on `@all` fan-out!
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _no_routes = EnvGuard::remove("FL_WIRE_ROUTES");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let (msg, _) = store
+            .send_wire(fl_core::ferrowire::SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: fl_core::ferrowire::WireAddress::All,
+                kind: fl_core::ferrowire::MessageKind::Mail,
+                urgency: fl_core::ferrowire::MessageUrgency::Normal,
+                durable: true,
+                subject: "council ping".into(),
+                body: "hello group".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(30),
+            })
+            .unwrap();
+
+        let updated = dispatch_message_for_store(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(40),
+        );
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].recipient_name, "felicia");
+        assert_eq!(updated[0].status, DeliveryStatus::Acked);
+
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "Felicia.antigravity");
+        assert!(
+            String::from_utf8_lossy(&recorded[0].1).contains("hello group"),
+            "expected group body delivered to Felicia.antigravity via persona fallback: {:?}",
+            recorded[0].1
+        );
+        drop(server_thread);
     }
 }

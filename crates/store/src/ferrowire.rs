@@ -28,6 +28,8 @@ pub(crate) const WIRE_THREADS: TableDefinition<(&str, &str), ()> =
     TableDefinition::new("wire_threads");
 pub(crate) const WIRE_REPLIES: TableDefinition<(&str, &str), ()> =
     TableDefinition::new("wire_replies");
+pub(crate) const WIRE_AWAITING_DAEMON: TableDefinition<&str, &str> =
+    TableDefinition::new("wire_awaiting_daemon");
 
 const NEXT_WIRE_MSG_SEQ: &str = "next_wire_msg_seq";
 const NEXT_WIRE_RCPT_SEQ: &str = "next_wire_rcpt_seq";
@@ -427,15 +429,26 @@ impl RedbStore {
                 }
             }
         }
+        if let Ok(awaiting) = tx.open_table(WIRE_AWAITING_DAEMON) {
+            for row in awaiting.iter().map_err(backend)? {
+                let (k, v) = row.map_err(backend)?;
+                let mid = k.value();
+                let _: At = serde_json::from_str(v.value()).map_err(decode)?;
+                if messages.get(mid).map_err(backend)?.is_none() {
+                    return Err(decode(format!(
+                        "wire_awaiting_daemon entry references missing message `{mid}`"
+                    )));
+                }
+            }
+        }
 
         Ok(())
     }
-}
 
-impl MessageStore for RedbStore {
-    fn send_wire(
+    fn send_wire_inner(
         &self,
         args: SendWireArgs,
+        awaiting_daemon: bool,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
         let subject =
             validate_subject(&args.subject).map_err(|e| StoreError::InvalidState(e.to_string()))?;
@@ -566,9 +579,62 @@ impl MessageStore for RedbStore {
                 receipts.push(rcpt);
             }
         }
+        if awaiting_daemon {
+            let at_json = serde_json::to_string(&msg.created_at).map_err(backend)?;
+            tx.open_table(WIRE_AWAITING_DAEMON)
+                .map_err(backend)?
+                .insert(msg.id.as_str(), at_json.as_str())
+                .map_err(backend)?;
+        }
 
         tx.commit().map_err(backend)?;
         Ok((msg, receipts))
+    }
+}
+
+impl MessageStore for RedbStore {
+    fn send_wire(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        self.send_wire_inner(args, false)
+    }
+
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        self.send_wire_inner(args, true)
+    }
+
+    fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(WIRE_AWAITING_DAEMON) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(backend(e)),
+        };
+        let mut out = Vec::new();
+        for row in table.iter().map_err(backend)? {
+            let (k, v) = row.map_err(backend)?;
+            let iri = Iri::parse(k.value()).map_err(decode)?;
+            let at: At = serde_json::from_str(v.value()).map_err(decode)?;
+            out.push((MessageId(iri), at));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        if Self::wtx_has_table(&tx, WIRE_AWAITING_DAEMON.name())? {
+            tx.open_table(WIRE_AWAITING_DAEMON)
+                .map_err(backend)?
+                .remove(message_id.as_str())
+                .map_err(backend)?;
+            tx.commit().map_err(backend)?;
+        }
+        Ok(())
     }
 
     fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
@@ -1118,6 +1184,12 @@ impl MessageStore for RedbStore {
                 .map_err(backend)?
                 .remove(msg.id.as_str())
                 .map_err(backend)?;
+            if Self::wtx_has_table(&tx, WIRE_AWAITING_DAEMON.name())? {
+                tx.open_table(WIRE_AWAITING_DAEMON)
+                    .map_err(backend)?
+                    .remove(msg.id.as_str())
+                    .map_err(backend)?;
+            }
             tx.open_table(WIRE_THREADS)
                 .map_err(backend)?
                 .remove((msg.thread_id.as_str(), msg.id.as_str()))

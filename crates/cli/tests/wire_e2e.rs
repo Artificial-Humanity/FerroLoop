@@ -1707,3 +1707,375 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         "{diags:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and_fanout_agy_persona()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let run_user_dir = env.root.join("run-user-synth");
+    std::fs::create_dir_all(&run_user_dir).unwrap();
+    let sock_in_run_user = run_user_dir.join("fl-wire.sock");
+    let routes_in_run_user = run_user_dir.join("fl-wire-routes.json");
+
+    // Write a config without `[wire] socket = ...` so the CLI/MCP must resolve the socket via `/run/user/<uid>` fallback.
+    std::fs::write(
+        env.cfg_dir.join("fl/config.toml"),
+        format!("[state]\nstore = \"{}\"\n", store_path.display()),
+    )
+    .unwrap();
+
+    let agy_log = env.root.join("agy-invocations.log");
+    let fake_agy = env.root.join("fake-agy.sh");
+    std::fs::write(
+        &fake_agy,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 0\n",
+            agy_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Register felicia and felix in the store and seed `routes_in_run_user` with a bare-UUID Agy route for felicia.
+    let mut reg_felicia = env.fl();
+    reg_felicia.args([
+        "wire",
+        "register",
+        "felicia",
+        "--project",
+        "ferroloop",
+        "--role",
+        "assistant",
+    ]);
+    assert!(reg_felicia.output().unwrap().status.success());
+
+    let mut reg_felix = env.fl();
+    reg_felix.args([
+        "wire",
+        "register",
+        "felix",
+        "--project",
+        "ferroloop",
+        "--role",
+        "assistant",
+    ]);
+    assert!(reg_felix.output().unwrap().status.success());
+
+    let mut table = fl_wire::identity::RouteTable::default();
+    table.upsert_explicit(
+        "felicia",
+        fl_wire::identity::VendorRoute::Agy {
+            conversation_id: "019d0000-0000-7000-8000-00000000beef".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: Some(fake_agy),
+        },
+        fl_core::At::from_unix_millis(100),
+    );
+    table.save(Some(&routes_in_run_user)).unwrap();
+
+    // Start daemon at `<run_user_dir>/fl-wire.sock` with `<run_user_dir>/fl-wire-routes.json`.
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        store,
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-run-user".into(),
+            host: "host-run-user".into(),
+            socket_path: sock_in_run_user.clone(),
+            routes_path: Some(routes_in_run_user.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    // 1. `fl wire status --json` with `XDG_RUNTIME_DIR`, `FL_WIRE_SOCKET`, and `FL_WIRE_ROUTES` UNSET
+    //    (and `--db` omitted, discovering `/run/user/<uid>` via `FL_TEST_RUN_USER_DIR`).
+    let status_out = Command::new(env!("CARGO_BIN_EXE_fl"))
+        .current_dir(&env.work_dir)
+        .env("HOME", &env.root)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("FL_WIRE_SOCKET")
+        .env_remove("FL_WIRE_ROUTES")
+        .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env_remove("AGENT_PERSONA")
+        .env_remove("AGENT_NAME")
+        .env_remove("FL_HOSTED_ID")
+        .env_remove("AGENT_HYDRATION_GENERATION")
+        .args(["wire", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let st: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(
+        st["node_id"].as_str(),
+        Some("node-run-user"),
+        "CLI status without XDG_RUNTIME_DIR must reach the active daemon via /run/user/<uid> fallback: {st}"
+    );
+
+    // 2. `fl wire mcp` (`send_message` and `broadcast_message`) with `XDG_RUNTIME_DIR` UNSET
+    //    must connect to the daemon at `<run_user_dir>/fl-wire.sock`, deliver through the daemon's
+    //    loaded route table, and push both direct send and `@all` broadcast fan-out!
+    let mut mcp_child = Command::new(env!("CARGO_BIN_EXE_fl"))
+        .current_dir(&env.work_dir)
+        .env("HOME", &env.root)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("FL_WIRE_SOCKET")
+        .env_remove("FL_WIRE_ROUTES")
+        .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env("AGENT_PERSONA", "felix")
+        .env_remove("AGENT_NAME")
+        .env_remove("FL_HOSTED_ID")
+        .env_remove("AGENT_HYDRATION_GENERATION")
+        .args(["wire", "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = mcp_child.stdin.as_mut().unwrap();
+        let reqs = [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {
+                        "to": "felicia",
+                        "subject": "direct-via-mcp",
+                        "body": "hello direct"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "broadcast_message",
+                    "arguments": {
+                        "subject": "group-via-mcp",
+                        "body": "hello broadcast"
+                    }
+                }
+            }),
+        ];
+        for r in &reqs {
+            writeln!(stdin, "{r}").unwrap();
+        }
+    }
+    let mcp_out = mcp_child.wait_with_output().unwrap();
+    assert!(mcp_out.status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut invocations = String::new();
+    while Instant::now() < deadline {
+        invocations = std::fs::read_to_string(&agy_log).unwrap_or_default();
+        if invocations.matches("agentapi send-message").count() >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon.stop();
+
+    assert_eq!(
+        invocations.matches("agentapi send-message").count(),
+        2,
+        "expected both direct MCP send and broadcast MCP send to push via daemon Agy route, got: {invocations}"
+    );
+    assert!(
+        invocations.contains("direct-via-mcp") && invocations.contains("group-via-mcp"),
+        "expected both direct and broadcast subjects in Agy invocations: {invocations}"
+    );
+    assert!(
+        invocations.contains("019d0000-0000-7000-8000-00000000beef"),
+        "expected Agy conversation_id in invocation: {invocations}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
+    use fl_core::MessageStore;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let sock = env.root.join("delayed-daemon.sock");
+    let hook_sock = env.root.join("felicia-hook.sock");
+    let listener = UnixListener::bind(&hook_sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // Register felicia in store and save her webhook route in routes.json.
+    let mut reg_cmd = env.fl();
+    reg_cmd.args([
+        "wire",
+        "register",
+        "felicia",
+        "--project",
+        "ferroloop",
+        "--role",
+        "assistant",
+    ]);
+    assert!(reg_cmd.output().unwrap().status.success());
+
+    let mut table = fl_wire::identity::RouteTable::default();
+    table.upsert(
+        "felicia",
+        fl_wire::identity::VendorRoute::Webhook {
+            socket_path: hook_sock,
+        },
+        fl_core::At::from_unix_millis(100),
+    );
+    table.save(Some(&env.routes_file)).unwrap();
+
+    // 0. If the store write fails while the daemon is unreachable, the client returns an error
+    //    and never claims it queued anything.
+    let mut bad_send = env.fl();
+    bad_send.env("FL_WIRE_SOCKET", &sock).args([
+        "wire",
+        "send",
+        "@nonexistent-group",
+        "bad-subj",
+        "bad-body",
+        "--from",
+        "felix",
+    ]);
+    let bad_out = bad_send.output().unwrap();
+    assert!(!bad_out.status.success());
+    let bad_stderr = String::from_utf8_lossy(&bad_out.stderr);
+    assert!(
+        !bad_stderr.contains("queued, the daemon will deliver"),
+        "failed store write must not claim message was queued: {bad_stderr}"
+    );
+
+    // 1. Send with no daemon running at `sock` (and without `--no-daemon`):
+    //    must queue for the daemon (`Pending`, `attempts == 0`), print notice on stderr, and NOT push in-process.
+    let mut send_cmd = env.fl();
+    send_cmd.env("FL_WIRE_SOCKET", &sock).args([
+        "wire",
+        "send",
+        "felicia",
+        "queued-subj",
+        "queued-body",
+        "--from",
+        "felix",
+        "--json",
+    ]);
+    let send_out = send_cmd.output().unwrap();
+    assert!(
+        send_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let stderr_text = String::from_utf8_lossy(&send_out.stderr);
+    assert!(
+        stderr_text.contains("queued, the daemon will deliver"),
+        "expected queue notice on stderr, got: {stderr_text}"
+    );
+    let sent_json: Value = serde_json::from_slice(&send_out.stdout).unwrap();
+    assert_eq!(sent_json["receipts"][0]["status"], "pending");
+    assert_eq!(sent_json["receipts"][0]["attempts"], 0);
+    assert!(
+        listener.accept().is_err(),
+        "CLI send without --no-daemon must not dispatch in-process"
+    );
+
+    // 2. Start the daemon at `sock`: it drains the queued message and delivers it to `felicia`!
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        std::sync::Arc::clone(&store),
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-delayed".into(),
+            host: "host-delayed".into(),
+            socket_path: sock.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut delivered = None;
+    while Instant::now() < deadline && delivered.is_none() {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut s = String::new();
+            let _ = stream.read_to_string(&mut s);
+            delivered = Some(s);
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let payload = delivered.expect("daemon must pick up and deliver queued message");
+    assert!(payload.contains("queued-subj"));
+    assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+
+    // 3. While the daemon is running at `sock`, a client pointing at the WRONG socket path
+    //    (`wrong-client.sock`) writes to the shared store and the running daemon picks it up
+    //    via the store-backed awaiting-daemon marker and delivers it!
+    let wrong_sock = env.root.join("wrong-client.sock");
+    let mut wrong_sock_cmd = env.fl();
+    wrong_sock_cmd.env("FL_WIRE_SOCKET", &wrong_sock).args([
+        "wire",
+        "send",
+        "felicia",
+        "wrong-sock-subj",
+        "wrong-sock-body",
+        "--from",
+        "felix",
+        "--json",
+    ]);
+    let wrong_out = wrong_sock_cmd.output().unwrap();
+    assert!(
+        wrong_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrong_out.stderr)
+    );
+    let wrong_stderr = String::from_utf8_lossy(&wrong_out.stderr);
+    assert!(
+        wrong_stderr.contains("queued, the daemon will deliver"),
+        "expected queue notice on stderr, got: {wrong_stderr}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delivered_wrong_sock = None;
+    while Instant::now() < deadline && delivered_wrong_sock.is_none() {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut s = String::new();
+            let _ = stream.read_to_string(&mut s);
+            delivered_wrong_sock = Some(s);
+        } else {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    daemon.stop();
+    let payload_2 = delivered_wrong_sock
+        .expect("running daemon must pick up message from client with wrong socket path");
+    assert!(payload_2.contains("wrong-sock-subj"));
+    assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+}

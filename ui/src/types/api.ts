@@ -1313,6 +1313,9 @@ export interface WireRecipientPendingSummary {
   oldest_pending_at?: string | null;
   oldest_pending_age_ms?: number | null;
   hold_reason?: WirePendingHoldReason | null;
+  awaiting_daemon_count?: number;
+  oldest_awaiting_daemon_at?: string | null;
+  oldest_awaiting_daemon_age_ms?: number | null;
 }
 
 export interface WireStatusResponse {
