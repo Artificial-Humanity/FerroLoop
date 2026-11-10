@@ -18,8 +18,9 @@ use tempfile::TempDir;
 
 use crate::boot_reconcile::{
     EPOCH_SLUG, Host, Memory, NOTICE_BODY, NOTICE_SUBJECT, NOTICE_WINDOW, PANE_FORMAT, Pane,
-    PaneSource, Plan, TmuxPanes, parse_panes, reconcile_pass, reconcile_pass_with, run_with,
-    runs_vendor_cli, vendor_binaries,
+    PaneSource, Plan, TmuxPanes, format_host_restarted_notice, hydration_baseline_ms, parse_panes,
+    reconcile_pass, reconcile_pass_with, run_with, runs_vendor_cli,
+    send_service_resume_notice_if_unnotified, vendor_binaries,
 };
 use crate::{HubServerConfig, HubState};
 
@@ -1349,5 +1350,492 @@ async fn the_reconciliation_stops_when_the_hub_shuts_down() {
         asked.load(Ordering::SeqCst),
         after,
         "passes went on after the shutdown"
+    );
+}
+
+// #433: instruction-refresh notice formatting and service-level `--resume` notice deduplication.
+
+fn write_file_with_mtime_ms(path: &Path, content: &str, mtime_ms: u64) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let file = std::fs::File::create(path).unwrap();
+    std::io::Write::write_all(&mut &file, content.as_bytes()).unwrap();
+    let modified = std::time::UNIX_EPOCH + Duration::from_millis(mtime_ms);
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+}
+
+fn ack_all_inbox_for(state: &HubState, persona: &str) {
+    let store = state.open_store().unwrap();
+    let items = store
+        .list_wire_inbox(&WireFilter {
+            recipient: Some(persona.into()),
+            unread_only: true,
+            ..WireFilter::default()
+        })
+        .unwrap();
+    for item in items {
+        store
+            .update_wire_receipt(
+                &item.message.id,
+                persona,
+                fl_core::ferrowire::DeliveryStatus::Acked,
+                false,
+                stamp::now(),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn format_host_restarted_notice_lists_modified_instruction_and_role_files_and_deduplicates() {
+    let tmp = TempDir::new().unwrap();
+    let umbrella = tmp.path().join("umbrella");
+    let cwd = umbrella.join("FerroLoop");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let baseline_ms = 100_000;
+    write_file_with_mtime_ms(&cwd.join("AGENTS.md"), "# agents", 100_001);
+    write_file_with_mtime_ms(&cwd.join("WORKFLOW.md"), "# workflow", 100_000);
+    write_file_with_mtime_ms(&cwd.join("PERSONA.md"), "# persona", 99_999);
+    write_file_with_mtime_ms(&cwd.join("docs/roles/lead.md"), "# docs role", 105_000);
+    write_file_with_mtime_ms(&cwd.join(".agents/roles/lead.md"), "# local role", 106_000);
+    write_file_with_mtime_ms(
+        &umbrella.join(".agents/roles/lead.md"),
+        "# umbrella role",
+        107_000,
+    );
+
+    let formatted = format_host_restarted_notice(Some(&cwd), Some("  Lead "), Some(baseline_ms));
+    assert_eq!(
+        formatted,
+        "The host restarted. Re-read instruction files modified since your hydration before continuing: `AGENTS.md`, `docs/roles/lead.md`, `.agents/roles/lead.md`, `../.agents/roles/lead.md`. Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm."
+    );
+
+    // Symlink `.agents/roles/lead.md` -> `../../.agents/roles/lead.md` (same canonical target as
+    // `../.agents/roles/lead.md` relative to `cwd`) must never list the same canonical file twice.
+    std::fs::remove_file(cwd.join(".agents/roles/lead.md")).unwrap();
+    std::os::unix::fs::symlink(
+        umbrella.join(".agents/roles/lead.md"),
+        cwd.join(".agents/roles/lead.md"),
+    )
+    .unwrap();
+    let deduplicated = format_host_restarted_notice(Some(&cwd), Some("lead"), Some(baseline_ms));
+    assert_eq!(
+        deduplicated,
+        "The host restarted. Re-read instruction files modified since your hydration before continuing: `AGENTS.md`, `docs/roles/lead.md`, `.agents/roles/lead.md`. Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm."
+    );
+}
+
+#[test]
+fn format_host_restarted_notice_falls_back_to_default_body_and_rejects_unsafe_role_labels() {
+    assert_eq!(
+        NOTICE_BODY,
+        "The host restarted. Re-read any instruction files (`AGENTS.md`, `WORKFLOW.md`, `PERSONA.md`, or your role guidance file) modified since your hydration, then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm."
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let baseline_ms = 200_000;
+
+    write_file_with_mtime_ms(&cwd.join("AGENTS.md"), "# unchanged", 200_000);
+    write_file_with_mtime_ms(&cwd.join("WORKFLOW.md"), "# older", 150_000);
+    write_file_with_mtime_ms(&cwd.join("docs/secret.md"), "# traversal target", 250_000);
+    write_file_with_mtime_ms(&cwd.join(".agents/secret.md"), "# traversal 2", 250_000);
+
+    assert_eq!(
+        format_host_restarted_notice(None, Some("lead"), Some(baseline_ms)),
+        NOTICE_BODY
+    );
+    assert_eq!(
+        format_host_restarted_notice(Some(&cwd), Some("lead"), None),
+        NOTICE_BODY
+    );
+    assert_eq!(
+        format_host_restarted_notice(Some(&cwd), Some("lead"), Some(baseline_ms)),
+        NOTICE_BODY
+    );
+    for bad_role in ["../secret", "a/b", "a\\b", "..", ".", "custom:../secret"] {
+        assert_eq!(
+            format_host_restarted_notice(Some(&cwd), Some(bad_role), Some(baseline_ms)),
+            NOTICE_BODY,
+            "unsafe role `{bad_role}` must be ignored"
+        );
+    }
+}
+
+#[test]
+fn reconcile_pass_formats_notice_using_hosted_session_hydration_ack_baseline() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Ada", false);
+    fx.route("ada", true);
+
+    let cwd = fx.tmp.path().join("workspace/FerroLoop");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let generation = "019dc759-7b95-7000-8000-000000000001";
+    let rec = crate::lifecycle::HostedSessionRecord {
+        session_id: "claude:ada".into(),
+        persona: "ada".into(),
+        project: "FerroLoop".into(),
+        role: "assistant".into(),
+        vendor: "claude".into(),
+        model: None,
+        thinking_level: None,
+        posture: fl_core::permissions::Posture::Auto,
+        node_id: "local".into(),
+        hosted: true,
+        status: crate::lifecycle::STATUS_RUNNING.into(),
+        restart_policy: "on-failure".into(),
+        restart_count: 0,
+        tmux_target: Some("Ada:claude".into()),
+        host_session_id: Some("Ada.claude".into()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        context_window: None,
+        hydration_dispatched: true,
+        hydration_status: crate::lifecycle::HydrationStatus::Confirmed,
+        hydration_generation: Some(generation.into()),
+        runtime_spawned: true,
+        tombstone_ids: Vec::new(),
+        vendor_session_id: Some("019dc759-7b95-7e90-b411-579a0c7f43a5".into()),
+        pid: None,
+        pid_start_time: None,
+        created_at_ms: 10_000,
+        updated_at_ms: 10_000,
+        decommission_prepared_at_ms: None,
+    };
+    {
+        let store = state.open_store().unwrap();
+        crate::lifecycle::persist_hosted_session(&*store, &rec, "owner").unwrap();
+        assert_eq!(hydration_baseline_ms(&*store, &rec), Some(10_000));
+        let receipt = crate::lifecycle::HydrationReceipt {
+            session_id: "claude:ada".into(),
+            persona: "ada".into(),
+            generation: generation.into(),
+            accepted_at_ms: 50_000,
+        };
+        store
+            .upsert_state(fl_core::state::UpsertStateArgs {
+                scope: fl_core::state::StateScope::Workspace,
+                slug: crate::lifecycle::hydration_ack_slug(generation),
+                sensitivity: fl_core::state::SensitivityPatch::Inherit,
+                payload: fl_core::state::StatePayload::Runtime(fl_core::state::RuntimeEntry {
+                    value: serde_json::to_value(&receipt).unwrap(),
+                    merge_mode: fl_core::state::MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        assert_eq!(hydration_baseline_ms(&*store, &rec), Some(50_000));
+    }
+
+    // AGENTS.md was touched between created_at_ms (10_000) and accepted_at_ms (50_000), so it was
+    // already read during hydration; WORKFLOW.md was modified after accepted_at_ms (60_000).
+    write_file_with_mtime_ms(&cwd.join("AGENTS.md"), "# agents", 30_000);
+    write_file_with_mtime_ms(&cwd.join("WORKFLOW.md"), "# workflow", 60_000);
+
+    let report = reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+    assert_eq!(report.notified, ["ada"]);
+    let sent = inbox(&state, "ada");
+    assert_eq!(
+        sent,
+        [(
+            "system".to_string(),
+            NOTICE_SUBJECT.to_string(),
+            "The host restarted. Re-read instruction files modified since your hydration before continuing: `WORKFLOW.md`. Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.".to_string()
+        )]
+    );
+}
+
+#[test]
+fn service_resume_notice_sends_on_same_boot_id_after_prior_boot_notice_was_acked() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.route("freya", true);
+
+    let first = reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+    assert_eq!(first.notified, ["freya"]);
+    assert_eq!(inbox(&state, "freya").len(), 1);
+
+    // Agent acks the boot notice, then hours later `fl-host` restarts on the same `boot-a` and
+    // resumes the session after `PERSONA.md` was updated.
+    ack_all_inbox_for(&state, "freya");
+    let cwd = fx.tmp.path().join("repo");
+    write_file_with_mtime_ms(&cwd.join("PERSONA.md"), "# updated persona", 90_000);
+
+    let sent = send_service_resume_notice_if_unnotified(
+        &state,
+        &host("boot-a"),
+        "Freya",
+        Some(&cwd),
+        Some("lead"),
+        Some(80_000),
+    )
+    .unwrap();
+    assert!(sent, "must enqueue notice on same-boot service resume");
+
+    let all = inbox(&state, "freya");
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all[1],
+        (
+            "system".to_string(),
+            NOTICE_SUBJECT.to_string(),
+            "The host restarted. Re-read instruction files modified since your hydration before continuing: `PERSONA.md`. Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.".to_string()
+        )
+    );
+}
+
+#[test]
+fn service_resume_notice_marks_epoch_notified_and_prevents_duplicate_from_later_reconcile_pass() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.route("freya", false);
+
+    // First pass after reboot: route is not live yet, so Freya is pending in EpochRecord.
+    let first = reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+    assert!(first.notified.is_empty());
+    assert_eq!(first.pending, ["freya"]);
+    assert_eq!(fx.epoch(&state)["notified"], serde_json::json!([]));
+
+    // Service resume respawn sends the notice and records Freya in EpochRecord.notified.
+    let sent = send_service_resume_notice_if_unnotified(
+        &state,
+        &host("boot-a"),
+        "Freya",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(sent);
+    assert_eq!(inbox(&state, "freya").len(), 1);
+    assert_eq!(fx.epoch(&state)["notified"], serde_json::json!(["freya"]));
+
+    // Even if Freya acks the mail before the next `boot_reconcile` pass sees the live route,
+    // `reconcile_pass` must not send a second "Host restarted" mail for `boot-a`.
+    ack_all_inbox_for(&state, "freya");
+    fx.route("freya", true);
+    let second = reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+    assert!(second.notified.is_empty());
+    assert!(second.pending.is_empty());
+    assert_eq!(inbox(&state, "freya").len(), 1);
+}
+
+#[test]
+fn service_resume_notice_skips_duplicate_when_unread_notice_exists_and_skips_retired_or_decommissioning()
+ {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.agent(&state, "Fiona", true);
+    fx.route("freya", false);
+
+    // Create EpochRecord with Freya pending.
+    let first = reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+    assert_eq!(first.pending, ["freya"]);
+
+    // First service resume enqueues one unread notice.
+    assert!(
+        send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    );
+    assert_eq!(inbox(&state, "freya").len(), 1);
+
+    // Second call while the first notice is still unread returns Ok(false) and does not duplicate.
+    assert!(
+        !send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    );
+    assert_eq!(inbox(&state, "freya").len(), 1);
+
+    // Retired persona is skipped.
+    assert!(
+        !send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "fiona",
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    );
+    assert!(inbox(&state, "fiona").is_empty());
+
+    // Decommissioning hosted session is skipped.
+    {
+        let store = state.open_store().unwrap();
+        let rec = crate::lifecycle::HostedSessionRecord {
+            session_id: "claude:ada".into(),
+            persona: "ada".into(),
+            project: "FerroLoop".into(),
+            role: "assistant".into(),
+            vendor: "claude".into(),
+            model: None,
+            thinking_level: None,
+            posture: fl_core::permissions::Posture::Auto,
+            node_id: "local".into(),
+            hosted: true,
+            status: crate::lifecycle::STATUS_DECOMMISSIONING.into(),
+            restart_policy: "on-failure".into(),
+            restart_count: 0,
+            tmux_target: Some("Ada:claude".into()),
+            host_session_id: Some("Ada.claude".into()),
+            cwd: None,
+            context_window: None,
+            hydration_dispatched: true,
+            hydration_status: crate::lifecycle::HydrationStatus::Confirmed,
+            hydration_generation: None,
+            runtime_spawned: true,
+            tombstone_ids: Vec::new(),
+            vendor_session_id: None,
+            pid: None,
+            pid_start_time: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            decommission_prepared_at_ms: Some(1),
+        };
+        crate::lifecycle::persist_hosted_session(&*store, &rec, "owner").unwrap();
+    }
+    assert!(
+        !send_service_resume_notice_if_unnotified(&state, &host("boot-a"), "ada", None, None, None)
+            .unwrap()
+    );
+    assert!(inbox(&state, "ada").is_empty());
+
+    // Non-retired persona not yet registered in `list_agents` still receives the notice via
+    // fallback agent IRI addressing.
+    assert!(
+        send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "jarvis",
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    );
+    assert_eq!(inbox(&state, "jarvis").len(), 1);
+
+    // 1. An unread plain `"Host restarted"` notice is replaced (old receipt acked, new notice
+    //    unread) when `AGENTS.md` changes before the agent reads its inbox.
+    let ws = tempfile::TempDir::new().unwrap();
+    let baseline_ms = stamp::now().unix_millis();
+    std::thread::sleep(Duration::from_millis(5));
+    std::fs::write(ws.path().join("AGENTS.md"), "# updated agents\n").unwrap();
+    assert!(
+        send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            Some(ws.path()),
+            Some("assistant"),
+            Some(baseline_ms),
+        )
+        .unwrap(),
+        "unread plain notice must be replaced when AGENTS.md changes"
+    );
+    {
+        let store = state.open_store().unwrap();
+        let unread_freya = store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("freya".into()),
+                unread_only: true,
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            unread_freya.len(),
+            1,
+            "only the replacement notice should remain unread"
+        );
+        assert!(
+            unread_freya[0].message.body.contains("`AGENTS.md`"),
+            "replacement notice should list `AGENTS.md`: {}",
+            unread_freya[0].message.body
+        );
+    }
+
+    // 2. An unread `"Host restarted"` notice listing `` `AGENTS.md` `` is replaced with a merged
+    //    notice listing `` `AGENTS.md`, `WORKFLOW.md` `` when `WORKFLOW.md` also changes before the
+    //    first notice is read (even if the new check uses a baseline after `AGENTS.md`'s mtime).
+    let post_agents_baseline_ms = stamp::now().unix_millis();
+    std::thread::sleep(Duration::from_millis(5));
+    std::fs::write(ws.path().join("WORKFLOW.md"), "# updated workflow\n").unwrap();
+    assert!(
+        send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            Some(ws.path()),
+            Some("assistant"),
+            Some(post_agents_baseline_ms),
+        )
+        .unwrap(),
+        "unread notice with `AGENTS.md` must be replaced with merged `AGENTS.md`, `WORKFLOW.md` notice"
+    );
+    {
+        let store = state.open_store().unwrap();
+        let unread_freya = store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("freya".into()),
+                unread_only: true,
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            unread_freya.len(),
+            1,
+            "only the merged notice should remain unread"
+        );
+        assert!(
+            unread_freya[0]
+                .message
+                .body
+                .contains("`AGENTS.md`, `WORKFLOW.md`"),
+            "merged notice must list both files in canonical order: {}",
+            unread_freya[0].message.body
+        );
+        drop(store);
+        let all_freya = inbox(&state, "freya");
+        assert_eq!(
+            all_freya.len(),
+            3,
+            "two superseded notices + one active merged notice"
+        );
+    }
+
+    // Repeating with no additional changed files is a no-op.
+    assert!(
+        !send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            Some(ws.path()),
+            Some("assistant"),
+            Some(post_agents_baseline_ms),
+        )
+        .unwrap()
     );
 }

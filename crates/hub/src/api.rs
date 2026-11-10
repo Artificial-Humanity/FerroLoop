@@ -7670,8 +7670,9 @@ fn handle_post_session_spin_up(
     if payload.context_window.is_none() {
         payload.context_window = default_context_window_for(state, &payload);
     }
-    match lifecycle::spin_up(
-        &*store,
+    match lifecycle::spin_up_with_store(
+        store,
+        || state.open_store().map_err(LifecycleError::from),
         &lifecycle_env(state),
         &payload,
         authority.actor_name(),
@@ -8018,8 +8019,9 @@ fn handle_post_hosted_session_restart(
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    match lifecycle::restart_hosted_session(
-        &*store,
+    match lifecycle::restart_hosted_session_with_store(
+        store,
+        || state.open_store().map_err(LifecycleError::from),
         &lifecycle_env(state),
         id,
         authority.actor_name(),

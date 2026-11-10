@@ -4072,7 +4072,7 @@ pub(crate) fn fallback_context_window(adapter: &str) -> u64 {
 
 /// The window assumed for Claude, Muse and Antigravity when no vendor file on this machine
 /// names the session's real window.
-const ASSUMED_LARGE_CONTEXT_WINDOW: u64 = 1_000_000;
+pub(crate) const ASSUMED_LARGE_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// A model's window from the vendor model catalog: `models.<id>.info.context_window` of the
 /// Grok `models_cache.json` beside the session (in the `.grok` directory above `tpath`), and
