@@ -67,6 +67,9 @@ pub trait RecoveryIo: Send + Sync {
     fn before(&self, _: RecoveryEvent) -> io::Result<()> {
         Ok(())
     }
+    fn clone_lock_parent(&self, parent: &File) -> io::Result<File> {
+        parent.try_clone()
+    }
     fn write_at(&self, file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(bytes, offset)
     }
@@ -315,10 +318,10 @@ impl Dir {
         let old = component(name, l)?;
         let new = component(new, l)?;
         event(io, kind, l)?;
+        event(io, RecoveryEvent::RenameEntry, l)?;
         self.same_name(l)?;
         to.same_name(l)?;
         validate()?;
-        event(io, RecoveryEvent::RenameEntry, l)?;
         #[cfg(target_os = "linux")]
         // SAFETY: live directory descriptors, validated components; exclusive rename.
         let result = unsafe {
@@ -508,6 +511,19 @@ impl StoreLock {
     }
     fn named(dir: &Dir, name: &str, l: &OperationLimits) -> Result<Self, RecoveryError> {
         let name = component(name, l)?;
+        // Acquire cleanup ownership before creating a name: descriptor exhaustion
+        // must leave no operation lock for a later caller to discover.
+        let cleanup_parent = if name.to_bytes().starts_with(b"operation-") {
+            Some(
+                match &l.publication_io {
+                    Some(control) => control.io.clone_lock_parent(&dir.file),
+                    None => dir.file.try_clone(),
+                }
+                .map_err(|error| transient(&error, l).unwrap_or_else(|| destination(l)))?,
+            )
+        } else {
+            None
+        };
         dir.same_name(l)?;
         if let Some(control) = &l.publication_io {
             event(&*control.io, RecoveryEvent::LockFile, l)?;
@@ -539,11 +555,7 @@ impl StoreLock {
         // A contender may have opened the old inode before its owner unlinked
         // the operation name. Never let that descriptor become a second lock.
         Self::bound(&dir.file, &name, &file, l)?;
-        let cleanup = if name.to_bytes().starts_with(b"operation-") {
-            Some((dir.file.try_clone().map_err(|_| destination(l))?, name))
-        } else {
-            None
-        };
+        let cleanup = cleanup_parent.map(|parent| (parent, name));
         let lock = Self {
             _file: file,
             cleanup,
@@ -960,6 +972,48 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+    struct CloneEmfile;
+    impl RecoveryIo for CloneEmfile {
+        fn clone_lock_parent(&self, _: &File) -> io::Result<File> {
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        }
+    }
+    #[test]
+    fn operation_parent_clone_emfile_leaves_no_lock_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        l.publication_io = Some(Arc::new(PublicationIo::new(
+            Arc::new(CloneEmfile),
+            1 << 20,
+            1 << 20,
+            1 << 20,
+            4096,
+        )));
+        let dir = Dir::open(root.path(), &l).unwrap();
+        let operation = uuid::Uuid::now_v7();
+        let result = StoreLock::operation(&dir, operation, &l);
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().next().is_none(),
+            "parent clone failure left an operation lock name"
+        );
+        assert!(matches!(
+            result,
+            Err(RecoveryError::Transient {
+                errno: libc::EMFILE,
+                ..
+            })
+        ));
+    }
     #[test]
     fn stale_contender_cannot_acquire_unlinked_operation_inode() {
         let root = tempfile::tempdir().unwrap();

@@ -311,30 +311,29 @@ fn durable_bundle_uses_independent_copy_and_collision_preserves_old_bytes() {
 // physical size. Capture must never run merely to discover that impossibility.
 #[test]
 fn oversized_image_ceiling_refuses_before_capture() {
-    for ceiling in [Some(u64::MAX)] {
-        let f = Fixture::new();
-        let mut request = f.request();
-        request.image_byte_limit = ceiling;
-        request.profile.catalog_identity = request.store.catalog_key.clone();
-        let faults = Arc::new(Fault::default());
-        let filesystem = FaultFs {
-            root: f.destination.clone(),
-            io: faults.clone(),
-            limits: reconciliation_limits(),
-        };
-        assert!(matches!(
-            backup(&f.store, &request, &filesystem, &CancelToken::new()),
-            Err(RecoveryError::Quota { .. })
-        ));
-        assert!(
-            !faults
-                .seen
-                .lock()
-                .unwrap()
-                .contains(&RecoveryEvent::Capture)
-        );
-        f.assert_source_usable();
-    }
+    let ceiling = Some(u64::MAX);
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.image_byte_limit = ceiling;
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::Quota { .. })
+    ));
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+    f.assert_source_usable();
 }
 
 #[test]
@@ -668,6 +667,7 @@ fn physical_store_lock_excludes_a_second_process() {
 }
 
 struct Substitute {
+    event: RecoveryEvent,
     staging: PathBuf,
     operation: String,
     source: PathBuf,
@@ -676,9 +676,7 @@ struct Substitute {
 }
 impl RecoveryIo for Substitute {
     fn before(&self, event: RecoveryEvent) -> io::Result<()> {
-        if event == RecoveryEvent::Publish
-            && !self.done.swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if event == self.event && !self.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
             let stage = self.staging.join(&self.operation);
             if self.directory {
                 fs::rename(&stage, self.staging.join("held-original"))?;
@@ -698,6 +696,7 @@ fn substitution_at_publish_boundary_never_occupies_a_final_name() {
         let f = Fixture::new();
         let request = f.request();
         let hook = Arc::new(Substitute {
+            event: RecoveryEvent::Publish,
             staging: f.destination.join(".staging"),
             operation: request.operation_id.to_string(),
             source: f.source.clone(),
@@ -729,6 +728,37 @@ fn substitution_at_publish_boundary_never_occupies_a_final_name() {
         );
         assert!(f.source.is_file());
     }
+}
+#[test]
+fn substitution_at_rename_entry_never_occupies_a_final_name() {
+    let f = Fixture::new();
+    let request = f.request();
+    let hook = Arc::new(Substitute {
+        event: RecoveryEvent::RenameEntry,
+        staging: f.destination.join(".staging"),
+        operation: request.operation_id.to_string(),
+        source: f.source.clone(),
+        directory: true,
+        done: Default::default(),
+    });
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: hook.clone(),
+        limits: reconciliation_limits(),
+    };
+    let result = backup(&f.store, &request, &filesystem, &CancelToken::new());
+    assert!(hook.done.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        !f.destination
+            .join(request.operation_id.to_string())
+            .exists(),
+        "RenameEntry hook published a substituted partial bundle: {result:?}"
+    );
+    assert!(
+        matches!(result, Err(RecoveryError::Verification { .. })),
+        "{result:?}"
+    );
+    f.assert_source_usable();
 }
 #[test]
 fn shared_metadata_quota_cannot_borrow_an_unlimited_verification_budget() {
@@ -2063,8 +2093,7 @@ fn space_failure_case(phase: u8, target: Option<usize>, errno: i32) -> Vec<Recov
                 .starts_with(b"operation-")),
         "operation lock leaked after phase={phase} target={target:?}"
     );
-    let trace = hook.seen.lock().unwrap().clone();
-    trace
+    hook.seen.lock().unwrap().clone()
 }
 #[test]
 fn enospc_and_edquot_at_every_actual_entry_write_and_allocation_are_clean() {
