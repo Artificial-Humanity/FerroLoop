@@ -900,6 +900,19 @@ impl ContainerIo for SimFile {
         Ok(())
     }
 
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        let mut held = self.fs.locks.held.lock().unwrap_or_else(|p| p.into_inner());
+        if held
+            .get(&self.ino)
+            .is_some_and(|holder| *holder != self.description)
+        {
+            return Ok(false);
+        }
+        held.insert(self.ino, self.description);
+        self.fs.log_lock(IoOp::Lock { ino: self.ino });
+        Ok(true)
+    }
+
     fn unlock(&self) {
         let locks = &self.fs.locks;
         let mut held = locks

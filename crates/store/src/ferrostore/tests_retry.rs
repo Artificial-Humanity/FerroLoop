@@ -237,6 +237,10 @@ const WRITE_SITES_FLOOR: usize = 50;
 /// sites, though a line in them matches [`starts_a_write`], and why.
 const NOT_SCANNED: &[(&str, &str)] = &[
     (
+        "recovery.rs",
+        "ordinary store writes occur only in its inline fixtures; production capture reads and writes only its independent destination",
+    ),
+    (
         "compat.rs",
         "its one write call is in its own #[cfg(test)] module, on an in-memory store",
     ),
@@ -292,6 +296,13 @@ fn write_sites() -> BTreeSet<(&'static str, u32)> {
 /// go unscanned.
 #[test]
 fn every_source_file_with_a_write_call_site_is_scanned() {
+    let (recovery_production, _) = include_str!("recovery.rs")
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .expect("recovery keeps its fixture writes in one inline test module");
+    assert!(
+        !recovery_production.lines().any(starts_a_write),
+        "production recovery store-write call sites must join SOURCES instead of the test-only exemption"
+    );
     // Keep the preparatory exemption valid only while production has no write entry point.
     let (preparatory_production, _) = include_str!("traits_wire_delivery.rs")
         .split_once("\n#[cfg(test)]\nmod tests {")

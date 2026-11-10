@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 const MAX_VECTOR_BYTES: u32 = 8 * 1024 * 1024;
-const MAX_LEVEL: u8 = 16;
+pub(super) const MAX_LEVEL: u8 = 16;
 const ID_MAX: usize = 1024;
 
 fn backend(err: impl std::fmt::Display) -> StoreError {
