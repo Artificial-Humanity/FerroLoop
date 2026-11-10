@@ -1669,6 +1669,8 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         runtime_spawned: false,
         tombstone_ids: vec!["gs-old".into()],
         vendor_session_id: None,
+        pid: None,
+        pid_start_time: None,
         created_at_ms: 1,
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,

@@ -1278,6 +1278,8 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             runtime_spawned: false,
             tombstone_ids: vec![native_id.into()],
             vendor_session_id: None,
+            pid: None,
+            pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,

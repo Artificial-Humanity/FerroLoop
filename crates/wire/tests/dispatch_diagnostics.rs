@@ -432,16 +432,16 @@ fn daemon_store_fault_fixture() {
     );
     assert!(matches!(
         client
-            .request(&LocalRequest::RegisterRoute {
-                persona: "diagnostic-recipient".into(),
-                explicit: true,
-                route: VendorRoute::Muse {
+            .request(&LocalRequest::register(
+                "diagnostic-recipient",
+                VendorRoute::Muse {
                     session_id: "SESSION_SECRET".into(),
                     cwd: Some(home.to_path_buf()),
                     tmux_target: None,
                     tmux_pane: None
                 },
-            })
+                true,
+            ))
             .unwrap(),
         LocalResponse::RouteRegistered
     ));

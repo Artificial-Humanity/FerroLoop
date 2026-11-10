@@ -1311,6 +1311,16 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                 !selectedKey ||
                 item.recipient.trim().toLowerCase() === selectedKey),
           );
+          const displayedRegDiags = (effectiveWireStatus.registration_diagnostics ?? []).filter(
+            (item) =>
+              scope !== "selected" ||
+              !selectedKey ||
+              item.persona.trim().toLowerCase() === selectedKey,
+          );
+          const latestRegDiag =
+            displayedRegDiags.length > 0
+              ? displayedRegDiags[displayedRegDiags.length - 1]
+              : null;
           const isSupportedEmpty =
             diag !== null &&
             diag.records.length === 0 &&
@@ -1394,14 +1404,41 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                       data-testid={`wire-pending-recipient-${item.recipient}`}
                       className="fd-badge fd-mono"
                       style={{
-                        color: "var(--accent-hover)",
-                        borderColor: "var(--border-accent)",
-                        backgroundColor: "var(--accent-subtle)",
+                        color: item.hold_reason ? "#fbbf24" : "var(--accent-hover)",
+                        borderColor: item.hold_reason
+                          ? "rgba(251, 191, 36, 0.45)"
+                          : "var(--border-accent)",
+                        backgroundColor: item.hold_reason
+                          ? "rgba(251, 191, 36, 0.14)"
+                          : "var(--accent-subtle)",
                       }}
                     >
-                      {`${item.recipient}: ${item.pending_count} pending (oldest ${formatPendingAge(item.oldest_pending_age_ms)})`}
+                      {`${item.recipient}: ${item.pending_count} pending (oldest ${formatPendingAge(item.oldest_pending_age_ms)}${item.hold_reason ? `, hold=${item.hold_reason}` : ""})`}
                     </span>
                   ))
+                )}
+
+                {latestRegDiag !== null && (
+                  <span
+                    data-testid="wire-registration-diagnostics"
+                    className="fd-badge fd-mono"
+                    style={{
+                      color:
+                        latestRegDiag.outcome === "refused"
+                          ? "#fbbf24"
+                          : "var(--text-secondary)",
+                      borderColor:
+                        latestRegDiag.outcome === "refused"
+                          ? "rgba(251, 191, 36, 0.45)"
+                          : "var(--border-subtle)",
+                      backgroundColor:
+                        latestRegDiag.outcome === "refused"
+                          ? "rgba(251, 191, 36, 0.12)"
+                          : "var(--bg-surface)",
+                    }}
+                  >
+                    {`route_guard=${displayedRegDiags.length} (latest ${latestRegDiag.persona}:${latestRegDiag.outcome}:${latestRegDiag.reason})`}
+                  </span>
                 )}
               </div>
 
