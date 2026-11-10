@@ -696,6 +696,7 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_RUNNING.into(),
+        stop_reason: None,
         restart_policy: "on-failure".into(),
         restart_count: 0,
         tmux_target: None,

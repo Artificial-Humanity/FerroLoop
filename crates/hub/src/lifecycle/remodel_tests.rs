@@ -1756,6 +1756,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_DECOMMISSIONED.into(),
+        stop_reason: None,
         restart_policy: "never".into(),
         restart_count: 0,
         tmux_target: None,

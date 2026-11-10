@@ -1022,6 +1022,7 @@ pub(crate) fn reconcile_pass_with(
     {
         eprintln!("hub: the boot record was not saved: {e}");
     }
+    let _ = crate::lifecycle::reconcile_and_respawn_hosted_sessions_in_hub(state);
     Ok(report)
 }
 
