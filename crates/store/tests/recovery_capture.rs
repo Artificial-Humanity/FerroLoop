@@ -170,7 +170,7 @@ fn fixture_writer_delay_quantiles() {
                     writer.push(start.elapsed().as_nanos() as u64);
                     assert!(captured.sequence() < owner.stats().unwrap().last_seq);
                 }
-                Err(fl_store::recovery::RecoveryError::Unsupported { .. })
+                Err(fl_store::recovery::RecoveryError::Stale { .. })
                     if mode == "external_contention" =>
                 {
                     refused += 1

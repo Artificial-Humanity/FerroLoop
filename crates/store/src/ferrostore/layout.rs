@@ -26,9 +26,9 @@ pub(super) const FORMAT_VERSION: u32 = FORMAT_V2;
 pub(super) const ENGINE_SNAPSHOT_WAL: u32 = 0;
 /// The `incompat` feature bits this build understands. None are defined yet.
 pub(super) const KNOWN_INCOMPAT: u64 = 0;
-const SNAPSHOT_VERSION_DOCS: u32 = 1;
-const SNAPSHOT_VERSION_COLUMNAR: u32 = 2;
-const SNAPSHOT_VERSION_VECTOR: u32 = 3;
+pub(super) const SNAPSHOT_VERSION_DOCS: u32 = 1;
+pub(super) const SNAPSHOT_VERSION_COLUMNAR: u32 = 2;
+pub(super) const SNAPSHOT_VERSION_VECTOR: u32 = 3;
 const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
 const TAG_CREATE_COLUMN_TABLE: u8 = 3;
@@ -705,7 +705,10 @@ fn decode_snapshot_with(buf: &[u8], check_graph: GraphCheck) -> Result<Snapshot,
         buf,
         check_graph,
         &super::columnar::Limits::DEFAULT,
-        &mut || Ok(()),
+        &mut DecodeControl {
+            progress: &mut || Ok(()),
+            admit: None,
+        },
     )
 }
 
@@ -713,15 +716,24 @@ pub(super) fn decode_snapshot_for_recovery(
     buf: &[u8],
     limits: &super::columnar::Limits,
     progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    admit: &mut dyn FnMut(u64) -> Result<(), StoreError>,
 ) -> Result<Snapshot, StoreError> {
-    decode_snapshot_bounded(buf, vector::validate_graph, limits, progress)
+    decode_snapshot_bounded(
+        buf,
+        vector::validate_graph,
+        limits,
+        &mut DecodeControl {
+            progress,
+            admit: Some(admit),
+        },
+    )
 }
 
 fn decode_snapshot_bounded(
     buf: &[u8],
     check_graph: GraphCheck,
     limits: &super::columnar::Limits,
-    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    control: &mut DecodeControl<'_>,
 ) -> Result<Snapshot, StoreError> {
     if buf.len() < 4 {
         return Err(corrupt("snapshot is shorter than its crc"));
@@ -755,12 +767,14 @@ fn decode_snapshot_bounded(
     if usize::try_from(count).unwrap_or(usize::MAX) > cur.remaining() {
         return Err(corrupt("snapshot count exceeds the blob"));
     }
+    control.reserve(u64::from(count), 4096)?;
     let mut nested: BTreeMap<String, Collection> = BTreeMap::new();
     for _ in 0..count {
-        progress()?;
+        control.check()?;
         let collection = cur.lp_str()?;
         let id = cur.lp_str()?;
         let raw = cur.lp()?;
+        control.json(raw)?;
         let doc =
             serde_json::from_slice(raw).map_err(|_| corrupt("snapshot document is not json"))?;
         if nested
@@ -779,12 +793,12 @@ fn decode_snapshot_bounded(
             &mut cur,
             version == SNAPSHOT_VERSION_COLUMNAR,
             limits,
-            progress,
+            control,
         )?;
     }
     let mut vectors = Vectors::new();
     if version == SNAPSHOT_VERSION_VECTOR {
-        vectors = decode_vector_collections(&mut cur, check_graph, progress)?;
+        vectors = decode_vector_collections(&mut cur, check_graph, control)?;
     }
     cur.finish()?;
     Ok(Snapshot {
@@ -799,7 +813,7 @@ fn decode_column_tables(
     cur: &mut Cur<'_>,
     require_nonempty: bool,
     limits: &super::columnar::Limits,
-    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    control: &mut DecodeControl<'_>,
 ) -> Result<Tables, StoreError> {
     let table_count = cur.u32()?;
     if require_nonempty && table_count == 0 {
@@ -808,17 +822,19 @@ fn decode_column_tables(
     if usize::try_from(table_count).unwrap_or(usize::MAX) > cur.remaining() {
         return Err(corrupt("snapshot table count exceeds the blob"));
     }
+    control.reserve(u64::from(table_count), 4096)?;
     let mut tables = BTreeMap::new();
     for _ in 0..table_count {
-        progress()?;
+        control.check()?;
         let name = cur.lp_str()?;
         let col_count = cur.u32()?;
         if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
             return Err(corrupt("snapshot column count exceeds the blob"));
         }
+        control.reserve(u64::from(col_count), 128)?;
         let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
         for _ in 0..col_count {
-            progress()?;
+            control.check()?;
             let column_name = cur.lp_str()?;
             let ty = type_from_tag(cur.u8()?)?;
             columns.push(ColumnDef {
@@ -830,9 +846,10 @@ fn decode_column_tables(
         if usize::try_from(group_count).unwrap_or(usize::MAX) > cur.remaining() {
             return Err(corrupt("snapshot row-group count exceeds the blob"));
         }
+        control.reserve(u64::from(group_count), 96)?;
         let mut groups = Vec::with_capacity(usize::try_from(group_count).unwrap_or(0));
         for _ in 0..group_count {
-            progress()?;
+            control.check()?;
             groups.push(cur.lp()?.to_vec());
         }
         if tables.contains_key(&name) {
@@ -840,7 +857,7 @@ fn decode_column_tables(
         }
         check_new_table(false, &name, &columns)?;
         for group in &groups {
-            progress()?;
+            control.check()?;
             super::columnar::validate_row_group_with(&columns, group, limits)?;
         }
         tables.insert(name, Arc::new(ColumnTable { columns, groups }));
@@ -851,7 +868,7 @@ fn decode_column_tables(
 fn decode_vector_collections(
     cur: &mut Cur<'_>,
     check_graph: GraphCheck,
-    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    control: &mut DecodeControl<'_>,
 ) -> Result<Vectors, StoreError> {
     let collection_count = cur.u32()?;
     if collection_count == 0 {
@@ -860,9 +877,10 @@ fn decode_vector_collections(
     if usize::try_from(collection_count).unwrap_or(usize::MAX) > cur.remaining() {
         return Err(corrupt("snapshot vector count exceeds the blob"));
     }
+    control.reserve(u64::from(collection_count), 4096)?;
     let mut collections = BTreeMap::new();
     for _ in 0..collection_count {
-        progress()?;
+        control.check()?;
         let name = cur.lp_str()?;
         let dim = cur.u32()?;
         let storage = storage_from_tag(cur.u8()?)?;
@@ -874,12 +892,13 @@ fn decode_vector_collections(
         if usize::try_from(vector_count).unwrap_or(usize::MAX) > cur.remaining() {
             return Err(corrupt("snapshot vector count exceeds the blob"));
         }
+        control.reserve(u64::from(vector_count), 4096)?;
         let mut vectors = BTreeMap::new();
         for _ in 0..vector_count {
-            progress()?;
+            control.check()?;
             let id = cur.lp_str()?;
             let bytes = cur.lp()?.to_vec();
-            let metadata = read_metadata(cur)?;
+            let metadata = read_metadata(cur, control)?;
             if vectors
                 .insert(
                     id.clone(),
@@ -902,17 +921,28 @@ fn decode_vector_collections(
             _ => return Err(corrupt(format!("unknown vector entry flag {entry_flag}"))),
         };
         for record in vectors.values_mut() {
-            progress()?;
+            control.check()?;
             let level = cur.u8()?;
             if usize::from(level) > cur.remaining() {
                 return Err(corrupt("snapshot vector level exceeds the blob"));
             }
+            if control.admit.is_some() && level > vector::MAX_LEVEL {
+                return Err(corrupt("snapshot vector level exceeds graph limit"));
+            }
+            control.reserve(u64::from(level) + 1, 128)?;
             let mut neighbors = Vec::with_capacity(usize::from(level) + 1);
-            for _layer in 0..=level {
+            for layer in 0..=level {
                 let ncount = cur.u32()?;
                 if usize::try_from(ncount).unwrap_or(usize::MAX) > cur.remaining() {
                     return Err(corrupt("snapshot neighbor count exceeds the blob"));
                 }
+                if control.admit.is_some()
+                    && ncount as usize > vector::max_links(m, usize::from(layer))
+                {
+                    return Err(corrupt("snapshot neighbor count exceeds graph limit"));
+                }
+                // String slots, graph-validation indices and their Vec growth.
+                control.reserve(u64::from(ncount), 128)?;
                 let mut nids = Vec::with_capacity(usize::try_from(ncount).unwrap_or(0));
                 for _ in 0..ncount {
                     nids.push(cur.lp_str()?);
@@ -943,12 +973,16 @@ fn decode_vector_collections(
     Ok(collections)
 }
 
-fn read_metadata(cur: &mut Cur<'_>) -> Result<Option<Value>, StoreError> {
+fn read_metadata(
+    cur: &mut Cur<'_>,
+    control: &mut DecodeControl<'_>,
+) -> Result<Option<Value>, StoreError> {
     let flag = cur.u8()?;
     match flag {
         0 => Ok(None),
         1 => {
             let raw = cur.lp()?;
+            control.json(raw)?;
             let value =
                 serde_json::from_slice(raw).map_err(|_| corrupt("vector metadata is not json"))?;
             Ok(Some(value))
@@ -972,22 +1006,35 @@ pub(super) fn decode_wal(buf: &[u8]) -> Result<WalFrames, StoreError> {
 /// Decoding from a frame boundary decodes the same frames as decoding the
 /// whole buffer, so a tail can be decoded on its own (spec §4.1).
 pub(super) fn decode_wal_prefix(buf: &[u8]) -> Result<(WalFrames, u64), StoreError> {
-    decode_wal_prefix_controlled(buf, &mut || Ok(()))
+    decode_wal_prefix_controlled(
+        buf,
+        &mut DecodeControl {
+            progress: &mut || Ok(()),
+            admit: None,
+        },
+    )
 }
 pub(super) fn decode_wal_for_recovery(
     buf: &[u8],
     progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    admit: &mut dyn FnMut(u64) -> Result<(), StoreError>,
 ) -> Result<(WalFrames, u64), StoreError> {
-    decode_wal_prefix_controlled(buf, progress)
+    decode_wal_prefix_controlled(
+        buf,
+        &mut DecodeControl {
+            progress,
+            admit: Some(admit),
+        },
+    )
 }
 fn decode_wal_prefix_controlled(
     buf: &[u8],
-    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    control: &mut DecodeControl<'_>,
 ) -> Result<(WalFrames, u64), StoreError> {
     let mut offset = 0usize;
     let mut frames = Vec::new();
     while offset < buf.len() {
-        progress()?;
+        control.check()?;
         if buf.len() - offset < 8 {
             break;
         }
@@ -1016,7 +1063,8 @@ fn decode_wal_prefix_controlled(
                 "wal frame crc does not match and another frame follows",
             ));
         }
-        frames.push(decode_payload(payload, progress)?);
+        control.reserve(1, 128)?;
+        frames.push(decode_payload(payload, control)?);
         offset = payload_end;
     }
     let consumed = u64::try_from(offset).map_err(|_| corrupt("wal length exceeds u64"))?;
@@ -1041,7 +1089,7 @@ fn frame_fits(buf: &[u8], offset: usize) -> bool {
 
 fn decode_payload(
     buf: &[u8],
-    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+    control: &mut DecodeControl<'_>,
 ) -> Result<(u64, Vec<Op>), StoreError> {
     let mut cur = Cur::new(buf);
     let seq = cur.u64()?;
@@ -1049,15 +1097,18 @@ fn decode_payload(
     if usize::try_from(count).unwrap_or(usize::MAX) > cur.remaining() {
         return Err(corrupt("op count exceeds the wal payload"));
     }
+    // Includes WAL Vec capacity and replay's new map entries/Arc headers.
+    control.reserve(u64::from(count), 4096)?;
     let mut ops = Vec::new();
     for _ in 0..count {
-        progress()?;
+        control.check()?;
         let tag = cur.u8()?;
         let op = match tag {
             TAG_PUT => {
                 let collection = cur.lp_str()?;
                 let id = cur.lp_str()?;
                 let raw = cur.lp()?;
+                control.json(raw)?;
                 let doc =
                     serde_json::from_slice(raw).map_err(|_| corrupt("document is not json"))?;
                 Op::Put {
@@ -1077,6 +1128,7 @@ fn decode_payload(
                 if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
                     return Err(corrupt("column count exceeds the wal payload"));
                 }
+                control.reserve(u64::from(col_count), 128)?;
                 let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
                 for _ in 0..col_count {
                     let column_name = cur.lp_str()?;
@@ -1115,7 +1167,7 @@ fn decode_payload(
                 let collection = cur.lp_str()?;
                 let id = cur.lp_str()?;
                 let bytes = cur.lp()?.to_vec();
-                let metadata = read_metadata(&mut cur)?;
+                let metadata = read_metadata(&mut cur, control)?;
                 Op::UpsertVector {
                     collection,
                     id,
@@ -1134,6 +1186,63 @@ fn decode_payload(
     }
     cur.finish()?;
     Ok((seq, ops))
+}
+
+/// Recovery-only allocation admission. Ordinary open/commit uses `None`, so
+/// JSON shape scanning and recovery limits are not on normal decoder paths.
+struct DecodeControl<'a> {
+    progress: &'a mut dyn FnMut() -> Result<(), StoreError>,
+    admit: Option<&'a mut dyn FnMut(u64) -> Result<(), StoreError>>,
+}
+impl DecodeControl<'_> {
+    fn check(&mut self) -> Result<(), StoreError> {
+        (self.progress)()
+    }
+    // Units include a 2x safety factor over headers, BTree spare slots, Vec
+    // growth and simultaneous WAL/replay copies, separately from raw payloads.
+    fn reserve(&mut self, count: u64, unit: u64) -> Result<(), StoreError> {
+        if let Some(admit) = &mut self.admit {
+            admit(
+                count
+                    .checked_mul(unit)
+                    .ok_or_else(|| backend("recovery preparation memory exhausted"))?,
+            )?;
+        }
+        Ok(())
+    }
+    fn json(&mut self, raw: &[u8]) -> Result<(), StoreError> {
+        if self.admit.is_none() {
+            return Ok(());
+        }
+        // Count punctuation outside quoted strings without allocating. Each
+        // element/key/container has a delimiter. 1024 bytes per delimiter
+        // covers Value slots, worst sparse BTree nodes and a replay clone;
+        // string bytes/serde escape scratch are in the separate raw charge.
+        let mut quoted = false;
+        let mut escaped = false;
+        self.reserve(1, 1024)?;
+        for chunk in raw.chunks(64 * 1024) {
+            self.check()?;
+            let mut nodes = 0;
+            for &byte in chunk {
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        quoted = false;
+                    }
+                } else if byte == b'"' {
+                    quoted = true;
+                } else if matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':') {
+                    nodes += 1;
+                }
+            }
+            self.reserve(nodes, 1024)?;
+        }
+        Ok(())
+    }
 }
 
 struct Cur<'a> {

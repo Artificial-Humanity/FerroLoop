@@ -69,6 +69,7 @@ pub struct CapturedStore {
     state: Arc<DocState>,
     publication: Publication,
     retained: u64,
+    preparation: u64,
     writer_delay: Duration,
 }
 impl CapturedStore {
@@ -78,6 +79,12 @@ impl CapturedStore {
     /// Conservative retained heap bytes, including map/Arc overhead and capacity.
     pub fn retained_bytes(&self) -> u64 {
         self.retained
+    }
+    /// Peak preparation admission charge, including the independent pin,
+    /// codec capacity, bounded scratch and a 2x model safety factor. This is
+    /// an upper-bound reservation, not observed allocator usage or process RSS.
+    pub fn preparation_bytes(&self) -> u64 {
+        self.preparation
     }
     /// Total time this capture held any commit barrier, including stale attempts.
     pub fn writer_delay(&self) -> Duration {
@@ -156,11 +163,11 @@ impl CapturedStore {
             sequence: self.sequence(),
             container_format: self.publication.format,
             snapshot_format: if !self.state.vectors.is_empty() {
-                3
+                layout::SNAPSHOT_VERSION_VECTOR
             } else if !self.state.tables.is_empty() {
-                2
+                layout::SNAPSHOT_VERSION_COLUMNAR
             } else {
-                1
+                layout::SNAPSHOT_VERSION_DOCS
             },
             engine: self.publication.engine,
             incompatible_features: self.publication.features,
@@ -353,7 +360,9 @@ impl FerroStore {
             });
         }
         let mut delay = Duration::ZERO;
-        for _ in 0..3 {
+        let mut preparation_peak = 0;
+        // Initial attempt plus at most three stale-preparation retries.
+        for _ in 0..=3 {
             check.check()?;
             if disk.poison.is_set() {
                 return Err(check.unhealthy());
@@ -365,7 +374,9 @@ impl FerroStore {
             // it, a concurrent writer could COW an arbitrarily large collection.
             // Independent preparation bounds every allocation before decoding,
             // then moves the complete owned state into the immutable pin.
-            let state = Arc::new(prepare(&*descriptor.file, &published.sb, budget, &check)?);
+            let (state, preparation) = prepare(&*descriptor.file, &published.sb, budget, &check)?;
+            preparation_peak = preparation_peak.max(preparation);
+            let state = Arc::new(state);
             let retained = retained_bytes(
                 &state,
                 budget.pin_byte_limit.min(budget.preparation_byte_limit),
@@ -384,7 +395,20 @@ impl FerroStore {
                     cancel,
                     clock,
                 };
-                let write = mutex(&disk.write, &barrier)?;
+                let write = match disk.write.try_lock() {
+                    Ok(write) => write,
+                    Err(TryLockError::Poisoned(_)) => return Err(check.unhealthy()),
+                    Err(TryLockError::WouldBlock) => {
+                        drop(gate);
+                        delay += clock.now().duration_since(started);
+                        check.check()?;
+                        if delay >= budget.writer_delay_limit {
+                            return Err(check.expired());
+                        }
+                        clock.wait();
+                        continue;
+                    }
+                };
                 barrier.check()?;
                 if disk.poison.is_set() {
                     return Err(check.unhealthy());
@@ -434,15 +458,15 @@ impl FerroStore {
                         state,
                         publication: published,
                         retained,
+                        preparation: preparation_peak,
                         writer_delay: delay,
                     });
                 }
                 break;
             }
         }
-        Err(RecoveryError::Unsupported {
+        Err(RecoveryError::Stale {
             operation_id: check.id,
-            reason: "capture preparation stale after three attempts",
         })
     }
 }
@@ -455,24 +479,30 @@ fn prepare(
     sb: &Superblock,
     budget: &CaptureBudget,
     c: &Check<'_>,
-) -> Result<DocState, RecoveryError> {
+) -> Result<(DocState, u64), RecoveryError> {
     let input = add(sb.snapshot_length, sb.wal_length, c, "preparation memory")?;
-    // Each length-prefixed metadata element consumes input. A charge of 1024
-    // bytes per encoded byte covers maps, Values, count-based spare capacity,
-    // decoded WAL and its cloned document payloads simultaneously.
-    let decoded = add(
-        mul(input, 1024, c, "preparation memory")?,
-        65536,
-        c,
-        "preparation memory",
-    )?;
-    let row_scratch = budget.preparation_byte_limit / 4;
-    quota(
-        add(decoded, row_scratch, c, "preparation memory")?,
-        budget.preparation_byte_limit,
-        c,
-        "preparation memory",
-    )?;
+    // Two payload copies (raw/decoded or WAL/replay) with 2x safety covers
+    // escaped JSON scratch and Vec growth. Metadata is charged by actual
+    // counts/JSON shape BEFORE allocation, not by an opaque input multiplier.
+    // Column codecs account all expansion before allocation; reserve twice
+    // their permitted scratch, independently of compressed input size.
+    let row_scratch = budget.preparation_byte_limit / 8;
+    let mut memory = PreparationMemory {
+        bytes: add(
+            add(
+                mul(input, 4, c, "preparation memory")?,
+                65536,
+                c,
+                "preparation memory",
+            )?,
+            mul(row_scratch, 2, c, "preparation memory")?,
+            c,
+            "preparation memory",
+        )?,
+        limit: budget.preparation_byte_limit,
+        check: c,
+    };
+    memory.charge(0)?;
     let row_limits = super::columnar::Limits {
         max_rows: super::columnar::MAX_ROWS_PER_GROUP,
         max_bytes: usize::try_from(row_scratch).map_err(|_| c.quota("row memory"))?,
@@ -481,9 +511,13 @@ fn prepare(
         DocState::at_seq(sb.snapshot_seq)
     } else {
         let bytes = read_extent(file, sb.snapshot_offset, sb.snapshot_length, c)?;
-        let snap =
-            layout::decode_snapshot_for_recovery(&bytes, &row_limits, &mut || codec_progress(c))
-                .map_err(|err| decode_error(err, c))?;
+        let snap = layout::decode_snapshot_for_recovery(
+            &bytes,
+            &row_limits,
+            &mut || codec_progress(c),
+            &mut |n| memory.codec_charge(n),
+        )
+        .map_err(|err| decode_error(err, c))?;
         c.check()?;
         if snap.seq != sb.snapshot_seq {
             return Err(c.verify());
@@ -496,20 +530,29 @@ fn prepare(
         }
     };
     let wal = read_extent(file, sb.wal_offset, sb.wal_length, c)?;
-    let (frames, consumed) = layout::decode_wal_for_recovery(&wal, &mut || codec_progress(c))
+    let (frames, consumed) =
+        layout::decode_wal_for_recovery(&wal, &mut || codec_progress(c), &mut |n| {
+            memory.codec_charge(n)
+        })
         .map_err(|err| decode_error(err, c))?;
     c.check()?;
     if consumed != sb.wal_length {
         return Err(c.verify());
     }
-    // Rebuilding a vector graph may create neighbor IDs not present in the WAL.
-    // Bound every possible directed edge at all 17 levels, spare Vec capacity,
-    // search queues, and dequantization scratch before applying any frame.
+    // Replay may synthesize links absent from input. Bound live + inserted
+    // nodes at the maximum observed M, ID length and dimension. Deletes and
+    // replacement upserts only reduce this bound. No N-squared reservation.
     let mut nodes = 0u64;
     let mut id_size = 0u64;
+    let mut m = 0u64;
+    let mut dim = 0u64;
     for col in state.vectors.values() {
+        c.check()?;
         nodes = add(nodes, col.vectors.len() as u64, c, "graph memory")?;
+        m = m.max(u64::from(col.m));
+        dim = dim.max(u64::from(col.dim));
         for id in col.vectors.keys() {
+            c.check()?;
             id_size = id_size.max(id.capacity() as u64);
         }
     }
@@ -518,6 +561,14 @@ fn prepare(
         for op in ops {
             c.check()?;
             match op {
+                layout::Op::CreateVectorCollection {
+                    m: new_m,
+                    dim: new_dim,
+                    ..
+                } => {
+                    m = m.max(u64::from(*new_m));
+                    dim = dim.max(u64::from(*new_dim));
+                }
                 layout::Op::UpsertVector { id, .. } => {
                     nodes = add(nodes, 1, c, "graph memory")?;
                     id_size = id_size.max(id.capacity() as u64);
@@ -529,28 +580,35 @@ fn prepare(
         }
     }
     if graph_changes {
-        let graph = mul(
-            mul(nodes, nodes, c, "graph memory")?,
-            mul(
-                add(id_size, 128, c, "graph memory")?,
-                128,
+        // 2M base + MAX_LEVEL*M upper links. Four copies per link cover
+        // capacity growth plus transient repair/ranking lists; another 2x is
+        // the common safety factor. Per-node scratch covers search queues,
+        // visited sets, map slots and all layer Vec headers. Dequantization
+        // keeps only a bounded number of points, never an N*dim matrix here.
+        let links = mul(
+            m,
+            u64::from(super::vector::MAX_LEVEL) + 2,
+            c,
+            "graph memory",
+        )?;
+        let edge = mul(add(id_size, 32, c, "graph memory")?, 8, c, "graph memory")?;
+        let per_node = add(
+            mul(links, edge, c, "graph memory")?,
+            add(
+                mul(id_size, 32, c, "graph memory")?,
+                8192,
                 c,
                 "graph memory",
             )?,
             c,
             "graph memory",
         )?;
-        quota(
-            add(
-                add(decoded, row_scratch, c, "preparation memory")?,
-                graph,
-                c,
-                "preparation memory",
-            )?,
-            budget.preparation_byte_limit,
+        memory.charge(add(
+            mul(nodes, per_node, c, "graph memory")?,
+            mul(dim, 64, c, "graph memory")?,
             c,
-            "preparation memory",
-        )?;
+            "graph memory",
+        )?)?;
     }
     let mut previous = None;
     for frame in frames {
@@ -570,7 +628,24 @@ fn prepare(
         .map_err(|err| decode_error(err, c))?;
     }
     c.check()?;
-    Ok(state)
+    Ok((state, memory.bytes))
+}
+
+struct PreparationMemory<'a, 'b> {
+    bytes: u64,
+    limit: u64,
+    check: &'a Check<'b>,
+}
+impl PreparationMemory<'_, '_> {
+    fn charge(&mut self, bytes: u64) -> Result<(), RecoveryError> {
+        self.check.check()?;
+        self.bytes = add(self.bytes, bytes, self.check, "preparation memory")?;
+        quota(self.bytes, self.limit, self.check, "preparation memory")
+    }
+    fn codec_charge(&mut self, bytes: u64) -> Result<(), fl_core::StoreError> {
+        self.charge(bytes)
+            .map_err(|_| layout::backend("recovery preparation memory exhausted"))
+    }
 }
 // Existing row codecs return StoreError rather than a typed resource error.
 // Recognize only their fixed quota prefix; never expose source data/path detail.
@@ -583,6 +658,11 @@ fn decode_error(err: fl_core::StoreError, c: &Check<'_>) -> RecoveryError {
         return stopped;
     }
     match err {
+        fl_core::StoreError::Backend(message)
+            if message == "recovery preparation memory exhausted" =>
+        {
+            c.quota("preparation memory")
+        }
         fl_core::StoreError::Backend(message)
             if message
                 .starts_with("corrupt ferrostore data: row group would decode to more than ") =>
@@ -947,6 +1027,94 @@ mod tests {
         assert_eq!(refreshed.state.docs.get("unknown", "id"), Some(&json!(2)));
     }
     #[test]
+    fn capture_compaction_during_preparation_reopens_current_file() {
+        let (fs, owner) = sim();
+        owner.put_doc("c", "id", &json!(1)).unwrap();
+        let external = FerroStore::open_with(&fs, Path::new("/sim/source.fls")).unwrap();
+        fs.after_next_read(
+            |op| matches!(op, IoOp::Read { offset, .. } if *offset >= HEADER_BYTES),
+            move || {
+                external.compact().unwrap();
+                external.put_doc("c", "id", &json!(2)).unwrap();
+            },
+        );
+        let capture = owner
+            .capture_recovery(&budget(), &CancelToken::new())
+            .unwrap();
+        assert_eq!(capture.sequence(), 2);
+        assert_eq!(capture.state.docs.get("c", "id"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn capture_stale_once_then_success_reprepares_contents() {
+        let (fs, owner) = sim();
+        owner.put_doc("c", "id", &json!(1)).unwrap();
+        let external = FerroStore::open_with(&fs, Path::new("/sim/source.fls")).unwrap();
+        let mark = fs.trace().len();
+        fs.after_next_read(
+            |op| matches!(op, IoOp::Read { offset, .. } if *offset >= HEADER_BYTES),
+            move || external.put_doc("c", "id", &json!(2)).unwrap(),
+        );
+        let capture = owner
+            .capture_recovery(&budget(), &CancelToken::new())
+            .unwrap();
+        assert_eq!(capture.sequence(), 2);
+        assert_eq!(capture.state.docs.get("c", "id"), Some(&json!(2)));
+        // Both attempts decoded their own WAL; the source handle's cache stayed old.
+        assert!(
+            fs.trace()[mark..]
+                .iter()
+                .filter(|op| matches!(op,
+            IoOp::Read { offset, .. } if *offset >= HEADER_BYTES))
+                .count()
+                >= 2
+        );
+        let Inner::Disk(disk) = &owner.inner else {
+            unreachable!()
+        };
+        assert_eq!(lock_mutex(&disk.cache).as_ref().unwrap().state.last_seq, 1);
+    }
+
+    #[test]
+    fn capture_write_contention_releases_gate_before_wait() {
+        struct ReleaseClock<'a> {
+            clock: FakeClock,
+            owner: &'a FerroStore,
+            held: Mutex<Option<MutexGuard<'a, Descriptor>>>,
+        }
+        impl Clock for ReleaseClock<'_> {
+            fn now(&self) -> Instant {
+                self.clock.now()
+            }
+            fn wait(&self) {
+                assert!(
+                    self.owner.commit_gate.try_lock().is_ok(),
+                    "capture waited while holding commit_gate"
+                );
+                self.held.lock().unwrap().take();
+                self.clock.wait();
+            }
+        }
+        let (_fs, owner) = sim();
+        owner.put_doc("c", "id", &json!(1)).unwrap();
+        let Inner::Disk(disk) = &owner.inner else {
+            unreachable!()
+        };
+        let clock = ReleaseClock {
+            clock: FakeClock::new(),
+            owner: &owner,
+            held: Mutex::new(Some(lock_mutex(&disk.write))),
+        };
+        let capture = owner
+            .capture_recovery_with_clock(&budget(), &CancelToken::new(), &clock)
+            .unwrap();
+        assert_eq!(capture.sequence(), 1);
+        assert_eq!(capture.state.docs.get("c", "id"), Some(&json!(1)));
+        assert!(clock.clock.now() > clock.clock.start);
+        assert!(capture.writer_delay() <= Duration::from_secs(1));
+    }
+
+    #[test]
     fn capture_rejects_poison() {
         let (fs, store) = sim();
         fs.fail_next(|op| matches!(op, IoOp::SyncData { .. }));
@@ -1265,7 +1433,35 @@ mod tests {
     }
 
     #[test]
-    fn capture_stale_preparation_retries_at_most_three() {
+    fn capture_dense_json_shape_is_charged_before_decode() {
+        let (_fs, owner) = sim();
+        owner
+            .put_doc("dense", "array", &json!(vec![false; 50_000]))
+            .unwrap();
+        let mut b = budget();
+        b.preparation_byte_limit = 16 << 20;
+        assert!(matches!(
+            owner.capture_recovery(&b, &CancelToken::new()),
+            Err(RecoveryError::Quota {
+                resource: "preparation memory",
+                ..
+            })
+        ));
+        // The ordinary read path remains unaffected by recovery admission.
+        assert_eq!(
+            owner
+                .get_doc("dense", "array")
+                .unwrap()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            50_000
+        );
+    }
+
+    #[test]
+    fn capture_stale_preparation_retries_three_after_initial_attempt() {
         fn arm(
             fs: SimFs,
             writer: Arc<FerroStore>,
@@ -1292,11 +1488,13 @@ mod tests {
         let external = Arc::new(FerroStore::open_with(&fs, Path::new("/sim/source.fls")).unwrap());
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         arm(fs, external, Arc::clone(&count), 2);
-        assert!(matches!(
-            owner.capture_recovery(&budget(), &CancelToken::new()),
-            Err(RecoveryError::Unsupported { .. })
-        ));
-        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let Err(RecoveryError::Stale { operation_id }) =
+            owner.capture_recovery(&budget(), &CancelToken::new())
+        else {
+            panic!("stale retry exhaustion must be distinct");
+        };
+        assert!(!operation_id.is_nil());
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 4);
     }
     #[test]
     fn image_io_releases_source_barrier_and_observes_cancellation() {
@@ -1455,6 +1653,7 @@ mod tests {
                 }
                 codec_progress(&check)
             },
+            &mut |_| Ok(()),
         );
         assert!(matches!(
             decoded.map_err(|e| decode_error(e, &check)),

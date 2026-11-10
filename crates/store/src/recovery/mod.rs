@@ -23,6 +23,8 @@ pub enum RecoveryError {
         operation_id: uuid::Uuid,
         reason: &'static str,
     },
+    #[error("recovery {operation_id}: capture remained stale after three retries")]
+    Stale { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: quota exceeded ({resource})")]
     Quota {
         operation_id: uuid::Uuid,
