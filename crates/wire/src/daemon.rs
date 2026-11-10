@@ -1887,8 +1887,8 @@ where
                 let routes: Vec<RouteEntry> = routes_table.entries.values().cloned().collect();
                 let registration_diagnostics = routes_table.registration_diagnostics.clone();
                 let mut pending_recipients = self.pending_recipients_snapshot(&now);
-                let allow_probes =
-                    crate::identity::host_probes_allowed(self.config.home_override.as_deref());
+                let allow_probes = include_codex_queues
+                    && crate::identity::host_probes_allowed(self.config.home_override.as_deref());
                 annotate_dead_explicit_pending_holds(
                     &mut pending_recipients,
                     &routes_table,
@@ -1904,7 +1904,12 @@ where
                         .iter_mut()
                         .find(|r| r.recipient.as_deref() == Some(row.recipient.as_str()))
                     {
-                        existing.decisive_reason = FenceReason::DeadExplicitRoute;
+                        if matches!(
+                            existing.decisive_reason,
+                            FenceReason::TransportError | FenceReason::UnresolvedReceiptStatus
+                        ) {
+                            existing.decisive_reason = FenceReason::DeadExplicitRoute;
+                        }
                     } else if diag_snapshot.records.len() < 128 {
                         let mut report = DispatchReport::default();
                         report.record_failure(FailureStage::DeadExplicitRoute);
@@ -6688,5 +6693,172 @@ mod tests {
             })
             .expect("feira fence diagnostic");
         assert_eq!(diag.decisive_reason, FenceReason::DeadExplicitRoute);
+    }
+
+    #[test]
+    fn status_preserves_store_and_scheduler_fence_reasons_over_dead_explicit_route() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let rig = rig();
+        let dead_route = VendorRoute::Claude {
+            pid: dead_pid,
+            session_id: "s-dead".into(),
+            socket_path: rig._tmp.path().join("missing-claude.sock"),
+            key_path: None,
+        };
+        let (reg_resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::register("feira", dead_route, true));
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        let (msg, receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("feira", "held after store fault"))
+            .unwrap();
+        rig.inner.admit_pending_receipts(&msg, &receipts);
+
+        for preserved_reason in [
+            FenceReason::ReceiptWriteError,
+            FenceReason::FinalReceiptReadError,
+            FenceReason::WorkerPanic,
+            FenceReason::GlobalMetadataCap,
+        ] {
+            {
+                let mut diags = lock(&rig.inner.dispatch_diagnostics);
+                diags.snapshot.records.clear();
+                diags.retain(FenceDiagnostic::from_report(
+                    "feira",
+                    Some(&msg.id),
+                    At::from_unix_millis(10),
+                    SuppressionPhase::RetainedFence,
+                    preserved_reason,
+                    &DispatchReport::default(),
+                ));
+            }
+            let (LocalResponse::Status(status), _) =
+                rig.inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+            else {
+                panic!("expected Status");
+            };
+            let pending = status
+                .pending_recipients
+                .iter()
+                .find(|p| p.recipient == "feira")
+                .expect("feira pending summary");
+            assert_eq!(
+                pending.hold_reason,
+                Some(PendingHoldReason::DeadExplicitRoute)
+            );
+            let diag = status
+                .dispatch_diagnostics
+                .as_ref()
+                .and_then(|d| {
+                    d.records
+                        .iter()
+                        .find(|r| r.recipient.as_deref() == Some("feira"))
+                })
+                .expect("feira fence diagnostic");
+            assert_eq!(
+                diag.decisive_reason, preserved_reason,
+                "store/scheduler fault {preserved_reason:?} must not be overwritten by DeadExplicitRoute"
+            );
+        }
+
+        for promoted_reason in [
+            FenceReason::TransportError,
+            FenceReason::UnresolvedReceiptStatus,
+        ] {
+            {
+                let mut diags = lock(&rig.inner.dispatch_diagnostics);
+                diags.snapshot.records.clear();
+                diags.retain(FenceDiagnostic::from_report(
+                    "feira",
+                    Some(&msg.id),
+                    At::from_unix_millis(10),
+                    SuppressionPhase::RetainedFence,
+                    promoted_reason,
+                    &DispatchReport::default(),
+                ));
+            }
+            let (LocalResponse::Status(status), _) =
+                rig.inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+            else {
+                panic!("expected Status");
+            };
+            let diag = status
+                .dispatch_diagnostics
+                .as_ref()
+                .and_then(|d| {
+                    d.records
+                        .iter()
+                        .find(|r| r.recipient.as_deref() == Some("feira"))
+                })
+                .expect("feira fence diagnostic");
+            assert_eq!(
+                diag.decisive_reason,
+                FenceReason::DeadExplicitRoute,
+                "transport-level {promoted_reason:?} should promote to DeadExplicitRoute"
+            );
+        }
+    }
+
+    #[test]
+    fn non_opt_in_status_skips_host_tcp_probes_for_explicit_routes() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe_listener.set_nonblocking(true).unwrap();
+        let probe_addr = probe_listener.local_addr().unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
+        let mut inner = rig_inner(&tmp, store);
+        Arc::get_mut(&mut inner)
+            .expect("unique inner")
+            .config
+            .home_override = None;
+
+        let agy_route = VendorRoute::Agy {
+            conversation_id: "conv-probe-gate".into(),
+            ls_pid: Some(dead_pid),
+            ls_address: Some(probe_addr.to_string()),
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        let (reg_resp, _) =
+            inner.handle_local_request(LocalRequest::register("feira", agy_route, true));
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        let (msg, receipts) = inner.store.send_wire(mail("feira", "pending")).unwrap();
+        inner.admit_pending_receipts(&msg, &receipts);
+
+        let (LocalResponse::Status(_), _) = inner.handle_local_request(LocalRequest::Status {
+            include_codex_queues: false,
+        }) else {
+            panic!("expected Status");
+        };
+
+        assert!(
+            matches!(
+                probe_listener.accept(),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "Status {{ include_codex_queues: false }} must not TCP-probe explicit Agy ls_address"
+        );
     }
 }

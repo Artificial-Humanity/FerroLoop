@@ -762,22 +762,46 @@ pub fn agy_ls_address_listening(addr: &str) -> bool {
     TcpStream::connect_timeout(&target, Duration::from_millis(50)).is_ok()
 }
 
-/// True when `/proc/{pid}` exists and its process state is not `'Z'` (zombie).
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn unix_kill0_proc_alive(pid: u32) -> bool {
+    pid > 0
+        && i32::try_from(pid).is_ok_and(|p| {
+            // SAFETY: signal 0 sends nothing; it only checks whether `p` exists.
+            if unsafe { libc::kill(p, 0) } == 0 {
+                return true;
+            }
+            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        })
+}
+
+/// True when `pid` refers to a live process (`/proc/{pid}` non-zombie on Linux, `kill(pid, 0)`
+/// on other Unix targets, and a conservative `pid > 0` fail-safe on non-Unix targets).
 pub fn proc_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let proc_dir = Path::new("/proc").join(pid.to_string());
-    if !proc_dir.exists() {
-        return false;
-    }
-    if let Ok(stat) = fs::read_to_string(proc_dir.join("stat"))
-        && let Some(rparen) = stat.rfind(')')
-        && let Some(state) = stat[rparen + 1..].split_whitespace().next()
+    #[cfg(target_os = "linux")]
     {
-        return state != "Z";
+        if pid == 0 {
+            return false;
+        }
+        let proc_dir = Path::new("/proc").join(pid.to_string());
+        if !proc_dir.exists() {
+            return false;
+        }
+        if let Ok(stat) = fs::read_to_string(proc_dir.join("stat"))
+            && let Some(rparen) = stat.rfind(')')
+            && let Some(state) = stat[rparen + 1..].split_whitespace().next()
+        {
+            return state != "Z";
+        }
+        true
     }
-    true
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        unix_kill0_proc_alive(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        pid > 0
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -11986,5 +12010,27 @@ mod tests {
         assert!(!diag_json.contains("SECRET_CSRF"));
         assert!(!diag_json.contains("/tmp/not-a-hosted-id"));
         assert!(!diag_json.contains("bad token"));
+    }
+
+    #[test]
+    fn proc_alive_and_unix_kill0_handle_zero_live_dead_and_overflow_pids() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        assert!(!proc_alive(0));
+        assert!(proc_alive(std::process::id()));
+        assert!(!proc_alive(dead_pid));
+
+        #[cfg(unix)]
+        {
+            assert!(!unix_kill0_proc_alive(0));
+            assert!(!unix_kill0_proc_alive(u32::MAX));
+            assert!(unix_kill0_proc_alive(std::process::id()));
+            assert!(!unix_kill0_proc_alive(dead_pid));
+        }
     }
 }

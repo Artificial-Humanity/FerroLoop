@@ -1722,7 +1722,9 @@ fn vendor_hook_response(
                         && old_pid != claude_hook_pid
                         && proc_alive(old_pid)
                         && (session_id.is_empty() || old_sid.is_empty() || old_sid != &session_id)
-                        && !hosted_session_verified
+                        && !(hosted_session_verified
+                            && caller_generation.is_some()
+                            && inc.hydration_generation != caller_generation)
                     {
                         refuse_hook(
                             RegistrationConflictReason::HostedIdentityMismatch,
@@ -1826,7 +1828,11 @@ fn vendor_hook_response(
             thread_id: session_id,
             cwd: Some(hook_cwd.clone()),
         })
-    } else if let Some(sock) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET") {
+    } else if !is_muse
+        && !is_grok
+        && !is_codex
+        && let Some(sock) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET")
+    {
         let socket_path = PathBuf::from(sock);
         let pid = socket_path
             .file_stem()
@@ -1846,36 +1852,28 @@ fn vendor_hook_response(
         None
     };
     // A persona inferred from the process tree or conflicting with a live explicit incumbent
-    // must not take a route over or acknowledge unread mail.
-    if let Some(route) = route {
-        if !record_caller_route_checked_with_meta(
-            &hook_env,
-            &persona,
-            route,
-            persona_source,
-            RouteRegistrationMeta {
-                replace: false,
-                hosted_id: effective_hosted_id.as_deref(),
-                hydration_generation: effective_generation.as_deref(),
-                hosted_session_verified,
-            },
-        ) {
-            return Ok(json!({}));
-        }
-    } else if !is_codex
-        && !hosted_session_verified
+    // must not take a route over, send `RegisterRoute` to a pre-#460 daemon, or acknowledge
+    // unread mail.
+    if !hosted_session_verified
         && let Some(ref inc) = existing_entry
         && inc.explicit
     {
         let inc_vendor = inc.route.canonical_vendor();
+        let inc_hosted_id = inc
+            .hosted_id
+            .as_deref()
+            .and_then(|raw| parse_hosted_identity(raw).ok())
+            .map(|(v, p)| format!("{v}:{p}"))
+            .or_else(|| inc.hosted_id.clone());
         let conflict = if inc_vendor != canonical_hook_vendor {
             Some(RegistrationConflictReason::VendorMismatch)
-        } else if inc.hydration_generation.is_some()
+        } else if !is_codex
+            && inc.hydration_generation.is_some()
             && effective_generation.is_some()
             && inc.hydration_generation != effective_generation
         {
             Some(RegistrationConflictReason::HydrationGenerationMismatch)
-        } else if inc.hosted_id.is_some() && inc.hosted_id != effective_hosted_id {
+        } else if !is_codex && inc_hosted_id.is_some() && inc_hosted_id != effective_hosted_id {
             Some(RegistrationConflictReason::HostedIdentityMismatch)
         } else {
             None
@@ -1904,6 +1902,23 @@ fn vendor_hook_response(
             );
             return Ok(json!({}));
         }
+    }
+
+    if let Some(route) = route
+        && !record_caller_route_checked_with_meta(
+            &hook_env,
+            &persona,
+            route,
+            persona_source,
+            RouteRegistrationMeta {
+                replace: false,
+                hosted_id: effective_hosted_id.as_deref(),
+                hydration_generation: effective_generation.as_deref(),
+                hosted_session_verified,
+            },
+        )
+    {
+        return Ok(json!({}));
     }
 
     let items = execute_read(
@@ -4403,24 +4418,66 @@ pub(crate) mod tests {
             assert_eq!(latest.reason, expected_reason, "case {idx}");
         }
 
-        // Also block a Claude-inside-Claude spike child when incumbent Claude PID is alive.
+        // Also verify hosted Claude-inside-Claude behavior when a live HostedSessionRecord exists:
+        // (a) same-generation child PID while old_pid is alive -> refused, unread mail unacked;
+        // (b) in-process `/clear` (same PID, new session_id, gen-1) -> allowed;
+        // (c) verified newer generation restart (new PID, new session_id, gen-2) -> allowed.
+        let claude_gen1 = "01a10000-0000-7000-8000-000000000001";
+        let claude_gen2 = "01a10000-0000-7000-8000-000000000002";
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let hosted_claude = fl_hub::lifecycle::HostedSessionRecord {
+                session_id: "claude:feira".into(),
+                persona: "feira".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                vendor: "claude".into(),
+                model: None,
+                thinking_level: None,
+                node_id: "local".into(),
+                hosted: true,
+                status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                restart_policy: "on-failure".into(),
+                restart_count: 0,
+                tmux_target: Some("Feira:claude".into()),
+                host_session_id: Some("Feira.claude".into()),
+                cwd: None,
+                context_window: None,
+                posture: fl_core::permissions::Posture::Auto,
+                hydration_dispatched: true,
+                hydration_status: fl_hub::lifecycle::HydrationStatus::Confirmed,
+                hydration_generation: Some(claude_gen1.into()),
+                runtime_spawned: true,
+                tombstone_ids: Vec::new(),
+                vendor_session_id: Some("claude-parent-sid".into()),
+                created_at_ms: 10,
+                updated_at_ms: 10,
+                decommission_prepared_at_ms: None,
+            };
+            fl_hub::lifecycle::persist_hosted_session(&store, &hosted_claude, "owner").unwrap();
+        }
+
+        let parent_sock = rig.dir.path().join(format!("{}.sock", std::process::id()));
         let mut live_claude_table = RouteTable::default();
         live_claude_table.upsert_explicit_with_meta(
             "feira",
             VendorRoute::Claude {
                 pid: std::process::id(),
                 session_id: "claude-parent-sid".into(),
-                socket_path: rig.dir.path().join("parent.sock"),
+                socket_path: parent_sock.clone(),
                 key_path: None,
             },
             now_at(),
             Some("claude:feira".into()),
-            Some("gen-1".into()),
+            Some(claude_gen1.into()),
             false,
         );
         live_claude_table.save(Some(&rig.routes_path())).unwrap();
+
+        // (a) Same-generation child PID (`888888 != std::process::id()`) while `old_pid` is alive -> refused!
         unsafe {
             std::env::set_var("FL_HOSTED_ID", "claude:feira");
+            std::env::set_var("AGENT_HYDRATION_GENERATION", claude_gen1);
             std::env::set_var(
                 "CLAUDE_CODE_MESSAGING_SOCKET",
                 rig.dir.path().join("888888.sock"),
@@ -4447,8 +4504,328 @@ pub(crate) mod tests {
             VendorRoute::Claude { session_id, .. } if session_id == "claude-parent-sid"
         ));
         assert_eq!(
-            after_claude.registration_diagnostics.last().unwrap().reason,
-            RegistrationConflictReason::HostedIdentityMismatch
+            after_claude
+                .registration_diagnostics
+                .last()
+                .map(|d| (d.outcome, d.reason)),
+            Some((
+                RegistrationDiagnosticOutcome::Refused,
+                RegistrationConflictReason::HostedIdentityMismatch,
+            ))
+        );
+
+        // (b) In-process `/clear` (`claude_hook_pid == old_pid`, new `session_id`, `gen-1`) -> allowed!
+        unsafe {
+            std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", &parent_sock);
+        }
+        let clear_out = rig.run(
+            "claude",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-cleared-sid",
+                "cwd": rig.dir.path(),
+            }),
+        );
+        assert!(
+            clear_out["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some_and(|s| s.contains("Do not let spike child ack this")),
+            "in-process /clear must receive unread mail: {clear_out}"
+        );
+        assert_eq!(
+            store.list_wire_receipts(&msg_id).unwrap()[0].status,
+            DeliveryStatus::Acked
+        );
+        let after_clear = RouteTable::load(Some(&rig.routes_path()));
+        assert!(matches!(
+            &after_clear.get("feira").unwrap().route,
+            VendorRoute::Claude { pid, session_id, .. }
+                if *pid == std::process::id() && session_id == "claude-cleared-sid"
+        ));
+
+        // (c) Verified newer generation restart (`claude_hook_pid != old_pid`, new `session_id`, `gen-2`) -> allowed!
+        {
+            let mut restarted = fl_hub::lifecycle::find_hosted_session(&store, &["claude:feira"])
+                .unwrap()
+                .unwrap();
+            restarted.restart_count = 1;
+            restarted.hydration_generation = Some(claude_gen2.into());
+            restarted.vendor_session_id = Some("claude-restarted-gen2-sid".into());
+            restarted.updated_at_ms = 20;
+            fl_hub::lifecycle::persist_hosted_session(&store, &restarted, "owner").unwrap();
+        }
+        unsafe {
+            std::env::set_var("AGENT_HYDRATION_GENERATION", claude_gen2);
+            std::env::set_var(
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                rig.dir.path().join("777777.sock"),
+            );
+        }
+        let restart_out = rig.run(
+            "claude",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-restarted-gen2-sid",
+                "cwd": rig.dir.path(),
+            }),
+        );
+        assert_eq!(restart_out, json!({}));
+        let after_restart = RouteTable::load(Some(&rig.routes_path()));
+        let restarted_entry = after_restart.get("feira").unwrap();
+        assert!(matches!(
+            &restarted_entry.route,
+            VendorRoute::Claude { pid: 777777, session_id, .. }
+                if session_id == "claude-restarted-gen2-sid"
+        ));
+        assert_eq!(
+            restarted_entry.hydration_generation.as_deref(),
+            Some(claude_gen2)
+        );
+        assert_eq!(
+            after_restart
+                .registration_diagnostics
+                .last()
+                .map(|d| (d.outcome, d.reason)),
+            Some((
+                RegistrationDiagnosticOutcome::Replaced,
+                RegistrationConflictReason::HydrationGenerationMismatch,
+            ))
+        );
+    }
+
+    #[test]
+    fn codex_empty_session_pre_daemon_refusal_and_claude_socket_vendor_guard() {
+        use fl_wire::daemon::{DaemonStatus, LocalResponse};
+        use fl_wire::identity::RouteEntry;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // (c) Muse, Grok, and Codex hooks with empty `session_id` and `CLAUDE_CODE_MESSAGING_SOCKET`
+        // set must never construct a `VendorRoute::Claude`.
+        let rig = HookRig::new(Some("kacey"));
+        unsafe {
+            std::env::set_var(
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                rig.dir.path().join("555555.sock"),
+            );
+        }
+        let codex_transcript = rig.dir.path().join(".codex-kacey.jsonl");
+        std::fs::write(
+            &codex_transcript,
+            "{\"type\":\"user\",\"content\":\"agent-msg register Kacey\"}\n",
+        )
+        .unwrap();
+        for (vendor, payload) in [
+            (
+                "muse",
+                json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "",
+                    "cwd": rig.dir.path(),
+                }),
+            ),
+            (
+                "grok",
+                json!({
+                    "hookEventName": "SessionStart",
+                    "session_id": "",
+                    "cwd": rig.dir.path(),
+                }),
+            ),
+            (
+                "codex",
+                json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "",
+                    "cwd": rig.dir.path(),
+                    "transcript_path": codex_transcript,
+                }),
+            ),
+        ] {
+            let out = rig.run(vendor, payload);
+            assert_eq!(out, json!({}));
+            assert!(
+                rig.route_of("kacey").is_none(),
+                "{vendor} hook with empty session_id must not construct a Claude route from CLAUDE_CODE_MESSAGING_SOCKET"
+            );
+        }
+        drop(rig);
+
+        // (a) Codex hook with empty `session_id` against a live explicit `Agy` incumbent
+        // neither registers nor acknowledges unread mail.
+        let rig = HookRig::new(None);
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let live_agy = VendorRoute::Agy {
+            conversation_id: "conv-hosted-feira".into(),
+            ls_pid: Some(std::process::id()),
+            ls_address: Some("127.0.0.1:42111".into()),
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        let mut table = RouteTable::default();
+        table.upsert_explicit_with_meta(
+            "feira",
+            live_agy.clone(),
+            now_at(),
+            Some("antigravity:feira".into()),
+            Some("gen-1".into()),
+            false,
+        );
+        table.save(Some(&rig.routes_path())).unwrap();
+
+        let msg_id = {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let (msg, _) = store
+                .send_wire(SendWireArgs {
+                    id: None,
+                    sender_id: None,
+                    sender_name: "felix".into(),
+                    sender_host: None,
+                    to: WireAddress::AgentName("feira".into()),
+                    kind: MessageKind::Mail,
+                    urgency: MessageUrgency::Normal,
+                    durable: true,
+                    subject: "Hosted Feira mail".into(),
+                    body: "Codex empty-sid hook must not ack this".into(),
+                    reply_to: None,
+                    thread_id: None,
+                    deadline_at: None,
+                    at: now_at(),
+                })
+                .unwrap();
+            msg.id
+        };
+
+        let feira_codex_transcript = rig.dir.path().join(".codex-feira.jsonl");
+        std::fs::write(
+            &feira_codex_transcript,
+            "{\"type\":\"user\",\"content\":\"agent-msg register Feira\"}\n",
+        )
+        .unwrap();
+        let codex_empty_out = rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "",
+                "cwd": rig.dir.path(),
+                "transcript_path": feira_codex_transcript,
+            }),
+        );
+        assert_eq!(codex_empty_out, json!({}));
+        assert_eq!(rig.route_of("feira"), Some(live_agy.clone()));
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        assert_eq!(
+            store.list_wire_receipts(&msg_id).unwrap()[0].status,
+            DeliveryStatus::Pending,
+            "Codex hook with empty session_id must not ack live Agy incumbent's unread mail"
+        );
+        let saved_after_codex = RouteTable::load(Some(&rig.routes_path()));
+        let latest = saved_after_codex
+            .registration_diagnostics
+            .last()
+            .expect("refusal diagnostic recorded");
+        assert_eq!(latest.outcome, RegistrationDiagnosticOutcome::Refused);
+        assert_eq!(latest.reason, RegistrationConflictReason::VendorMismatch);
+        assert_eq!(latest.challenger_adapter, RouteAdapter::Codex);
+
+        // (b) Pre-daemon refusal in `vendor_hook_response` blocks cross-vendor hijack BEFORE
+        // `LocalRequest::RegisterRoute` is sent (protecting rolling upgrades with an older pre-#460 daemon).
+        let sock_path = rig.dir.path().join("none.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let register_route_calls = Arc::new(AtomicUsize::new(0));
+        let register_route_calls_srv = Arc::clone(&register_route_calls);
+        let sock_for_srv = sock_path.clone();
+        let live_agy_srv = live_agy.clone();
+
+        // Expect exactly 2 RPCs from `vendor_hook_response` on refusal:
+        // 1. `status` (from `existing_route_entry_for`)
+        // 2. `record_registration_diagnostic` (legacy daemon rejects unknown op -> CLI falls back to file)
+        // And ZERO `register_route` or `read` RPCs!
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let raw: Value = serde_json::from_str(&line).unwrap();
+                match raw.get("op").and_then(Value::as_str) {
+                    Some("status") => {
+                        let resp = LocalResponse::Status(DaemonStatus {
+                            node_id: "legacy-node".into(),
+                            host: "legacy-host".into(),
+                            socket_path: sock_for_srv.clone(),
+                            listen_addr: None,
+                            connected_peers: vec![],
+                            routes: vec![RouteEntry {
+                                persona: "feira".into(),
+                                route: live_agy_srv.clone(),
+                                updated_at: now_at(),
+                                identity_at: None,
+                                explicit: true,
+                                hosted_id: Some("antigravity:feira".into()),
+                                hydration_generation: Some("gen-1".into()),
+                            }],
+                            dispatch_diagnostics: None,
+                            registration_diagnostics: vec![],
+                            pending_recipients: vec![],
+                            codex_queues: vec![],
+                        });
+                        writeln!(stream, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+                    }
+                    Some("register_route") => {
+                        register_route_calls_srv.fetch_add(1, Ordering::SeqCst);
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::to_string(&LocalResponse::RouteRegistered).unwrap()
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        // Simulate pre-#460 daemon rejecting unknown `record_registration_diagnostic` op.
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::to_string(&LocalResponse::Error {
+                                message: "unknown variant".into(),
+                            })
+                            .unwrap()
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        });
+
+        let codex_nonempty_out = rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-hijack-attempt",
+                "cwd": rig.dir.path(),
+                "transcript_path": feira_codex_transcript,
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(codex_nonempty_out, json!({}));
+        assert_eq!(
+            register_route_calls.load(Ordering::SeqCst),
+            0,
+            "pre-daemon conflict check must refuse before sending RegisterRoute to daemon"
+        );
+        assert_eq!(rig.route_of("feira"), Some(live_agy));
+        assert_eq!(
+            store.list_wire_receipts(&msg_id).unwrap()[0].status,
+            DeliveryStatus::Pending
         );
     }
 
