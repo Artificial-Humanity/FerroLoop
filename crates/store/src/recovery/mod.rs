@@ -92,6 +92,21 @@ pub struct OperationLimits {
     pub memory_byte_limit: u64,
     pub cancel: CancelToken,
     pub operation_id: uuid::Uuid,
+    /// Cumulative synchronous-query input work: JSON/key/vector/graph bytes plus
+    /// one unit per row. Repeated scans are charged again; lexical query bytes
+    /// are charged per input row. This is an admission bound, not CPU time.
+    /// Defaults to 64 * byte_limit, conservatively capped at u64::MAX on
+    /// multiplication overflow; consumption uses checked addition and never
+    /// wraps. The default allows repeated automatic passes, not unlimited work.
+    /// Consumption lasts for this OperationLimits instance and all its clones,
+    /// including both verification opens; starting another call does not reset
+    /// it. Callers may override the ceiling before use. It never relaxes the
+    /// independent memory, image-byte or deadline limits. An admitted synchronous
+    /// API cannot be hard-preempted; cancellation is checked before/after it and
+    /// throughout input admission.
+    pub query_work_limit: u64,
+    // Clones and both verification opens share consumption for this operation.
+    query_work_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl OperationLimits {
     pub fn new(
@@ -106,6 +121,8 @@ impl OperationLimits {
             memory_byte_limit,
             cancel,
             operation_id: uuid::Uuid::now_v7(),
+            query_work_limit: byte_limit.saturating_mul(64),
+            query_work_used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -120,6 +137,23 @@ pub use verify::{
 };
 
 impl OperationLimits {
+    pub(crate) fn charge_query_work(&self, units: u64) -> Result<(), RecoveryError> {
+        self.check()?;
+        self.query_work_used
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |used| {
+                    used.checked_add(units)
+                        .filter(|next| *next <= self.query_work_limit)
+                },
+            )
+            .map_err(|_| RecoveryError::Quota {
+                operation_id: self.operation_id,
+                resource: "query work",
+            })?;
+        Ok(())
+    }
     pub(crate) fn check(&self) -> Result<(), RecoveryError> {
         if self.cancel.is_cancelled() {
             return Err(RecoveryError::Cancelled {

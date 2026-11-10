@@ -470,3 +470,126 @@ fn council_report_redacts_private_entry_payload_and_identifiers() {
         fl_store::recovery::manifest::Readiness::UnknownDomainCoverage
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn r1_sync_cursor_requires_exact_external_binding_and_reconciliation() {
+    use fl_core::{state::StateSyncCursor, store::StateStore};
+    use fl_store::recovery::{
+        manifest::Readiness,
+        profiles::{DependencyPolicy, ReferenceDependency},
+        reference_digest,
+    };
+    for commit in [Some("fixture-commit".to_string()), None] {
+        let tmp = private_dir();
+        let store = FerroStore::open(tmp.path().join("cursor.fls")).unwrap();
+        let cursor = StateSyncCursor {
+            remote: "fixture-remote".into(),
+            branch: "fixture-branch".into(),
+            last_pushed_commit: commit.clone(),
+            last_revision_seq: 17,
+            last_registry_seq: 19,
+            last_wire_msg_seq: 23,
+            last_wire_rcpt_seq: 29,
+        };
+        store.set_sync_cursor(cursor.clone()).unwrap();
+        let captured = pin(&store);
+        assert!(
+            captured.expectations(&profile(), &limits()).is_err(),
+            "cursor-only store must not claim fully verified local contents"
+        );
+        let bound = |remote: &str, branch: &str, commit: &Option<String>| {
+            let mut p = profile();
+            p.dependencies.push(ReferenceDependency {
+                reference_sha256: reference_digest(
+                    "state_sync_cursors",
+                    "fixture-remote",
+                    "",
+                    "external_state_sync_cursor",
+                    &serde_json::to_string(&json!([remote, branch, commit])).unwrap(),
+                    &limits(),
+                )
+                .unwrap(),
+                catalog_identity: "fixture-repository".into(),
+                required_sequence: None,
+                policy: DependencyPolicy::ReconcileBeforeAdmission,
+            });
+            p
+        };
+        for wrong in [
+            bound("other-remote", "fixture-branch", &commit),
+            bound("fixture-remote", "other-branch", &commit),
+            bound(
+                "fixture-remote",
+                "fixture-branch",
+                &Some("other-commit".into()),
+            ),
+        ] {
+            assert!(captured.expectations(&wrong, &limits()).is_err());
+        }
+        let p = bound("fixture-remote", "fixture-branch", &commit);
+        let expected = captured.expectations(&p, &limits()).unwrap();
+        image(&store, &tmp.path().join("copy.fls"));
+        let report =
+            verify_existing_copy(&tmp.path().join("copy.fls"), &expected, &p, &limits()).unwrap();
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(
+            report.readiness,
+            Readiness::DependenciesRequireReconciliation
+        );
+        let mut changed = cursor;
+        changed.last_wire_rcpt_seq += 1;
+        let other = FerroStore::open(tmp.path().join("other.fls")).unwrap();
+        other.set_sync_cursor(changed).unwrap();
+        assert_eq!(captured.sequence(), pin(&other).sequence());
+        image(&other, &tmp.path().join("changed.fls"));
+        assert!(
+            verify_existing_copy(&tmp.path().join("changed.fls"), &expected, &p, &limits())
+                .is_err()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn r1_query_work_budget_is_cumulative_across_both_verification_opens() {
+    use fl_store::recovery::RecoveryError;
+    let tmp = private_dir();
+    let store = FerroStore::open(tmp.path().join("work.fls")).unwrap();
+    store
+        .put_doc("fixture", "id", &json!({"body":"fixture"}))
+        .unwrap();
+    let captured = pin(&store);
+    let p = profile();
+    let expected = captured.expectations(&p, &limits()).unwrap();
+    image(&store, &tmp.path().join("copy.fls"));
+    // Find the minimum admitted input for one real pass. This black-box boundary
+    // avoids coupling the test to the number or serialization size of probes.
+    let (mut low, mut high) = (0, 1_000_000);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let mut l = limits();
+        l.query_work_limit = middle;
+        match captured.expectations(&p, &l) {
+            Ok(_) => high = middle,
+            Err(RecoveryError::Quota {
+                resource: "query work",
+                ..
+            }) => low = middle + 1,
+            Err(e) => panic!("unexpected admission error: {e}"),
+        }
+    }
+    assert!(low > 0 && low < 1_000_000);
+    let mut one_pass = limits();
+    one_pass.query_work_limit = low;
+    assert!(matches!(
+        verify_existing_copy(&tmp.path().join("copy.fls"), &expected, &p, &one_pass),
+        Err(RecoveryError::Quota {
+            resource: "query work",
+            ..
+        })
+    ));
+    let mut two_passes = limits();
+    two_passes.query_work_limit = low * 2;
+    assert!(verify_existing_copy(&tmp.path().join("copy.fls"), &expected, &p, &two_passes).is_ok());
+}

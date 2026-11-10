@@ -21,6 +21,10 @@ pub struct ValidationProfile {
     pub kind: ProfileKind,
     /// Catalog assertion, not intrinsic provenance. The engine has no lineage UUID.
     pub catalog_identity: String,
+    /// Sync cursor bindings use reference_digest("state_sync_cursors", remote,
+    /// "", "external_state_sync_cursor", target), where target is the JSON tuple
+    /// [remote, branch, last_pushed_commit] (null for an absent commit). A binding
+    /// declares a dependency; it does not establish external reconciliation.
     pub dependencies: Vec<ReferenceDependency>,
     pub preexisting_exceptions: Vec<ReferenceException>,
     /// Additional deployment-specific references, including opaque runtime state.

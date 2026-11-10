@@ -51,6 +51,7 @@ fn typed<T: DeserializeOwned>(value: &Value, l: &OperationLimits) -> Result<T, R
     serde_json::from_value(value.clone()).map_err(|_| l.verification())
 }
 fn serialized<T: serde::Serialize>(v: &T, l: &OperationLimits) -> Result<Value, RecoveryError> {
+    l.check()?;
     serde_json::to_value(v).map_err(|_| l.verification())
 }
 
@@ -249,9 +250,12 @@ pub(crate) fn expectations_from_reader(
         run_probe(store, probe, &mut out, l)?;
     }
     state_domain_probes(store, &mut out, l)?;
-    for (_, value) in state.docs.in_collection(doc::WIRE_MESSAGES) {
+    // The first key is deterministic in the immutable document BTreeMap.
+    // All rows were already hashed and domain-validated above.
+    if let Some((_, value)) = state.docs.in_collection(doc::WIRE_MESSAGES).next() {
         l.check()?;
         let msg: fl_core::ferrowire::WireMessage = typed(value, l)?;
+        admit_doc_probe(store, &[doc::WIRE_MESSAGES], 0, l)?;
         add_result(
             &mut out,
             &serialized(
@@ -262,6 +266,7 @@ pub(crate) fn expectations_from_reader(
             )?,
             l,
         )?;
+        admit_doc_probe(store, &[doc::WIRE_INBOX, doc::WIRE_MESSAGES], 0, l)?;
         add_result(
             &mut out,
             &serialized(
@@ -272,6 +277,7 @@ pub(crate) fn expectations_from_reader(
             )?,
             l,
         )?;
+        admit_doc_probe(store, &[doc::WIRE_THREADS, doc::WIRE_MESSAGES], 0, l)?;
         add_result(
             &mut out,
             &serialized(
@@ -307,6 +313,37 @@ fn add_result(
     out.query_digests.push(value_digest(value, l)?);
     Ok(())
 }
+// Existing query APIs are synchronous. Admit their complete possible input
+// before entering them, with cancellation throughout admission and again after
+// the call. An admitted call cannot be hard-preempted. Fixed representative
+// probes keep these scans linear in stored rows; the operation-wide work quota
+// also bounds caller-supplied probes across both verification opens.
+fn admit_doc_probe(
+    store: &FerroStore,
+    collections: &[&str],
+    query_bytes_per_row: u64,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    l.check()?;
+    let state = store.read_state().map_err(|_| l.verification())?;
+    l.charge_query_work(1)?;
+    for collection in collections {
+        for (id, value) in state.docs.in_collection(collection) {
+            #[cfg(test)]
+            tests::admission_row(l);
+            l.check()?;
+            let (bytes, _) = crate::recovery::verify::serialized_checksum(value, l)?;
+            l.charge_query_work(
+                bytes
+                    .saturating_add(id.len() as u64)
+                    .saturating_add(query_bytes_per_row)
+                    .saturating_add(1),
+            )?;
+        }
+    }
+    l.check()
+}
+
 fn automatic_doc_probes(
     store: &FerroStore,
     state: &DocState,
@@ -385,6 +422,26 @@ fn run_probe(
 ) -> Result<(), RecoveryError> {
     l.check()?;
     match probe {
+        QueryProbe::Point { collection, .. }
+        | QueryProbe::Absent { collection, .. }
+        | QueryProbe::Scan { collection } => admit_doc_probe(store, &[collection], 0, l)?,
+        QueryProbe::Query {
+            collection,
+            field,
+            value,
+        } => {
+            l.charge_query_work(field.len() as u64 + value.len() as u64)?;
+            admit_doc_probe(store, &[collection], 0, l)?;
+        }
+        QueryProbe::Lexical {
+            collection, query, ..
+        } => {
+            l.charge_query_work(query.len() as u64)?;
+            admit_doc_probe(store, &[collection], query.len() as u64, l)?;
+        }
+        QueryProbe::Vector { .. } => {}
+    }
+    match probe {
         QueryProbe::Point { collection, id } | QueryProbe::Absent { collection, id } => {
             let value = store
                 .get_doc(collection, id)
@@ -448,6 +505,26 @@ fn vector_probe(
     l.check()?;
     let state = store.read_state().map_err(|_| l.verification())?;
     let col = state.vectors.get(c).ok_or_else(|| l.verification())?;
+    let mut layers = 1;
+    for record in col.vectors.values() {
+        l.check()?;
+        layers = layers.max(u64::from(record.level) + 1);
+    }
+    l.charge_query_work((query.len() as u64).saturating_mul(4))?;
+    for (id, record) in &col.vectors {
+        l.check()?;
+        l.charge_query_work(
+            (record.bytes.len() as u64)
+                .saturating_mul(layers)
+                .saturating_add(id.len() as u64)
+                .saturating_add(1),
+        )?;
+        for neighbors in &record.neighbors {
+            for neighbor in neighbors {
+                l.charge_query_work(neighbor.len() as u64 + 1)?;
+            }
+        }
+    }
     let retained_results = out
         .vector_results
         .iter()
@@ -473,23 +550,81 @@ fn vector_probe(
     out.vector_results.push(private_hits);
     Ok(())
 }
+// StateStore's point reads inspect at most one alias (doc::locate), plus the
+// key/ID indexes and resolved entry. Admit those exact documents, without a scan.
+fn admit_state_point(
+    state: &DocState,
+    id: &str,
+    key: Option<&str>,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    let point = |collection: &str, id: &str| -> Result<(), RecoveryError> {
+        l.charge_query_work(id.len() as u64 + 1)?;
+        if let Some(value) = state.docs.get(collection, id) {
+            let (bytes, _) = crate::recovery::verify::serialized_checksum(value, l)?;
+            l.charge_query_work(bytes)?;
+        }
+        Ok(())
+    };
+    let id = if let Some(key) = key {
+        point(doc::STATE_KEYS, key)?;
+        state
+            .docs
+            .get(doc::STATE_KEYS, key)
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+    } else {
+        id
+    };
+    point(doc::IDS, id)?;
+    let resolved = if state.docs.get(doc::IDS, id).and_then(Value::as_str) == Some("alias") {
+        point(doc::ALIASES, id)?;
+        let primary = state
+            .docs
+            .get(doc::ALIASES, id)
+            .and_then(Value::as_str)
+            .unwrap_or(id);
+        point(doc::IDS, primary)?;
+        primary
+    } else {
+        id
+    };
+    point(doc::STATE_ENTRIES, resolved)
+}
+
 fn state_domain_probes(
     store: &FerroStore,
     out: &mut ValidationExpectations,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
+    admit_doc_probe(store, &[doc::STATE_ENTRIES], 0, l)?;
     let entries = store.list_state(None, None).map_err(|_| l.verification())?;
     add_result(out, &serialized(&entries, l)?, l)?;
     let mut exportable = Vec::new();
+    let state = store.read_state().map_err(|_| l.verification())?;
     for entry in &entries {
         l.check()?;
+        // Keep point/index consistency checks on every row; no full scan here.
+        admit_state_point(&state, entry.id.as_str(), None, l)?;
         let point = store.get_state(&entry.id).map_err(|_| l.verification())?;
+        let key = doc::triple(&entry.scope.as_wire(), entry.concern.as_wire(), &entry.slug);
+        admit_state_point(&state, entry.id.as_str(), Some(&key), l)?;
         let keyed = store
             .get_state_by_key(&entry.scope, entry.concern, &entry.slug)
             .map_err(|_| l.verification())?;
         if point.as_ref() != Some(entry) || keyed.as_ref() != Some(entry) {
             return Err(l.verification());
         }
+        if matches!(entry.payload, StatePayload::Runtime(_)) {
+            out.opaque_runtime_references = true;
+        }
+        if !entry.sensitive && !entry.ever_sensitive {
+            exportable.push(entry.clone());
+        }
+    }
+    if let Some(entry) = entries.first() {
+        admit_doc_probe(store, &[doc::STATE_REVISIONS], 0, l)?;
+        admit_state_point(&state, entry.id.as_str(), None, l)?;
         add_result(
             out,
             &serialized(
@@ -500,12 +635,6 @@ fn state_domain_probes(
             )?,
             l,
         )?;
-        if matches!(entry.payload, StatePayload::Runtime(_)) {
-            out.opaque_runtime_references = true;
-        }
-        if !entry.sensitive && !entry.ever_sensitive {
-            exportable.push(entry.clone());
-        }
     }
     // Handoff, runtime and privacy-filtered values, alongside exact lexical
     // state ranking. All operate on this reader; no sidecar or embedder writes.
@@ -514,6 +643,7 @@ fn state_domain_probes(
         fl_core::state::StateConcern::Handoff,
         fl_core::state::StateConcern::Runtime,
     ] {
+        admit_doc_probe(store, &[doc::STATE_ENTRIES], 0, l)?;
         add_result(
             out,
             &serialized(
@@ -526,6 +656,7 @@ fn state_domain_probes(
         )?;
     }
     if let Some(entry) = entries.first() {
+        admit_doc_probe(store, &[doc::STATE_ENTRIES], entry.slug.len() as u64, l)?;
         let hits =
             fl_core::state::search_state_entries(&entries, &entry.slug, None, None, entries.len());
         add_result(out, &serialized(&hits, l)?, l)?;
@@ -864,7 +995,25 @@ fn validate_domain(
             field!("/remote_head", doc::STATE_REVISION_IDS);
         }
         doc::STATE_SYNC_CURSORS => {
-            let _ = parse!(fl_core::state::StateSyncCursor);
+            let row = parse!(fl_core::state::StateSyncCursor);
+            if row.remote != id {
+                return Err(l.verification());
+            }
+            // JSON tuple framing distinguishes remote/branch boundaries and
+            // absent versus present commit, then the versioned reference digest
+            // binds the collection, key and target kind. No horizon provenance
+            // is inferred: even an unpushed cursor needs external reconciliation.
+            let target =
+                serde_json::to_string(&(&row.remote, &row.branch, &row.last_pushed_commit))
+                    .map_err(|_| l.verification())?;
+            let digest = reference_digest(c, id, "", "external_state_sync_cursor", &target, l)?;
+            if !p
+                .dependencies
+                .iter()
+                .any(|d| d.reference_sha256 == digest && !d.catalog_identity.trim().is_empty())
+            {
+                return Err(l.verification());
+            }
         }
         doc::WIRE_MESSAGES => {
             let row = parse!(WireMessage);
@@ -957,6 +1106,181 @@ mod tests {
         })
         .unwrap()
     }
+    thread_local! {
+        static ADMISSION: std::cell::Cell<(u64, Option<u64>)> = const { std::cell::Cell::new((0, None)) };
+    }
+    pub(super) fn admission_row(l: &OperationLimits) {
+        ADMISSION.with(|stats| {
+            let (n, cancel_at) = stats.get();
+            stats.set((n + 1, cancel_at));
+            if cancel_at == Some(n + 1) {
+                l.cancel.cancel();
+            }
+        });
+    }
+    #[test]
+    fn r1_cancellation_during_query_admission_stops_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FerroStore::open(dir.path().join("admission.fls")).unwrap();
+        for n in 0..64 {
+            store
+                .put_doc("fixture", &n.to_string(), &json!({"n":n}))
+                .unwrap();
+        }
+        let captured = capture(&store);
+        ADMISSION.with(|s| s.set((0, Some(10))));
+        let result = captured.expectations(&profile(), &limits());
+        let visits = ADMISSION.with(|s| {
+            let n = s.get().0;
+            s.set((0, None));
+            n
+        });
+        assert!(matches!(result, Err(RecoveryError::Cancelled { .. })));
+        assert_eq!(
+            visits, 10,
+            "admission must stop at the cancellation boundary"
+        );
+    }
+
+    // Regression: adding rows must not add full-collection domain API probes.
+    #[test]
+    fn r1_domain_probe_count_is_independent_of_state_and_wire_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FerroStore::open(dir.path().join("scaling.fls")).unwrap();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Fixture".into(),
+                email: None,
+                project: "fixture".into(),
+                role: AgentRole::Lead,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: At::from_unix_millis(1),
+                by: "test".into(),
+            })
+            .unwrap();
+        let mut counts = Vec::new();
+        let mut visits = Vec::new();
+        for n in 0..16 {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: format!("entry-{n}"),
+                    sensitivity: SensitivityPatch::Inherit,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"n": n}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: At::from_unix_millis(n + 1),
+                    by: "fixture".into(),
+                })
+                .unwrap();
+            store
+                .send_wire(SendWireArgs {
+                    id: None,
+                    sender_id: None,
+                    sender_name: "fixture".into(),
+                    sender_host: None,
+                    to: WireAddress::AgentName("fixture".into()),
+                    kind: MessageKind::Mail,
+                    urgency: MessageUrgency::Normal,
+                    durable: true,
+                    subject: "fixture".into(),
+                    body: "fixture".into(),
+                    reply_to: None,
+                    thread_id: None,
+                    deadline_at: None,
+                    at: At::from_unix_millis(n + 1),
+                })
+                .unwrap();
+            if [0, 3, 15].contains(&n) {
+                ADMISSION.with(|s| s.set((0, None)));
+                counts.push(
+                    capture(&store)
+                        .expectations(&profile(), &limits())
+                        .unwrap()
+                        .query_digests
+                        .len(),
+                );
+                visits.push(ADMISSION.with(|s| s.get().0));
+            }
+        }
+        eprintln!("fixed full-scan probe digests {counts:?}; admitted scan rows {visits:?}");
+        // Point/index consistency checks still run for every state entry. These
+        // counts specifically measure the collection-scanning query admissions.
+        assert!(visits[0] > 0);
+        assert!(visits[1] <= visits[0] * 4);
+        assert!(visits[2] <= visits[0] * 16);
+        assert_eq!(counts[0], counts[1], "four rows must use fixed probe count");
+        assert_eq!(
+            counts[0], counts[2],
+            "sixteen rows must use fixed probe count"
+        );
+    }
+
+    #[test]
+    fn r1_work_quota_is_shared_by_clones_and_refuses_before_decode() {
+        let mut l = limits();
+        l.query_work_limit = 10;
+        let other = l.clone();
+        l.charge_query_work(4).unwrap();
+        assert!(matches!(
+            other.charge_query_work(7),
+            Err(RecoveryError::Quota {
+                resource: "query work",
+                ..
+            })
+        ));
+        other.charge_query_work(6).unwrap();
+        assert!(matches!(
+            l.charge_query_work(1),
+            Err(RecoveryError::Quota { .. })
+        ));
+        let extreme = OperationLimits::new(
+            Instant::now() + Duration::from_secs(30),
+            u64::MAX,
+            256 << 20,
+            CancelToken::new(),
+        );
+        extreme.charge_query_work(u64::MAX).unwrap();
+        assert!(matches!(
+            extreme.charge_query_work(1),
+            Err(RecoveryError::Quota { .. })
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let store = FerroStore::open(dir.path().join("quota.fls")).unwrap();
+        let mut expected = capture(&store).expectations(&profile(), &limits()).unwrap();
+        store
+            .put_doc(doc::STATE_ENTRIES, "invalid", &json!({}))
+            .unwrap();
+        assert!(matches!(
+            state_domain_probes(&store, &mut expected, &l),
+            Err(RecoveryError::Quota {
+                resource: "query work",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn r1_cancelled_domain_probe_does_not_enter_synchronous_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FerroStore::open(dir.path().join("cancel.fls")).unwrap();
+        let mut expected = capture(&store).expectations(&profile(), &limits()).unwrap();
+        // A domain API entered before checking cancellation would decode this
+        // row and return Verification instead of the requested Cancelled.
+        store
+            .put_doc(doc::STATE_ENTRIES, "invalid", &json!({}))
+            .unwrap();
+        let l = limits();
+        l.cancel.cancel();
+        assert!(matches!(
+            state_domain_probes(&store, &mut expected, &l),
+            Err(RecoveryError::Cancelled { .. })
+        ));
+    }
+
     #[test]
     fn state_heads_history_handoff_and_privacy_are_validated_from_pin() {
         let dir = tempfile::tempdir().unwrap();
