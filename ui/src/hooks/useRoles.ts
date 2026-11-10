@@ -7,6 +7,22 @@ export interface RoleOption {
   label: string;
 }
 
+/** Default presentation when the catalog has not loaded or lacks a runtime role.
+ * Catalog labels remain authoritative whenever supplied by the hub. */
+const RUNTIME_ROLE_LABELS: Readonly<Record<string, string>> = {
+  assistant: "Software Engineer",
+  lead: "Project Lead",
+  "lab-manager": "Lab Manager",
+  "ui-developer": "UI & Full-Stack Application Developer",
+  "web-developer": "Web Developer",
+  "mobile-developer": "Mobile Developer",
+  "system-developer": "System / Backend Developer",
+  "data-engineer": "Data Engineer",
+  tester: "QA & Tester",
+  strategist: "Research & Architecture Strategist",
+  journalist: "Journalist & Technical Scribe",
+};
+
 /** Preserve wire identity while removing the origin prefix from fallback presentation. */
 export function roleLabel(
   value: string,
@@ -22,7 +38,7 @@ export function roleLabel(
   const catalogSlug = slug === "lab_manager" ? "lab-manager" : slug;
   const label = roles.find((role) => role.slug === catalogSlug)?.label;
   if (catalogSlug === "assistant" && (!label || label === "Assisting Engineer")) return "Software Engineer";
-  return label ?? slug.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  return label ?? RUNTIME_ROLE_LABELS[catalogSlug] ?? slug.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 /** Fixed executable IDs determine structural roles, never catalog labels or flags. */

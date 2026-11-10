@@ -151,6 +151,22 @@ describe("authenticated editable role catalog", () => {
     expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body))).toEqual(chair);
   });
 
+  it("shows established chip and picker labels when the role catalog fails", async () => {
+    const { client } = server({ get: async () => json({ error: "Unavailable" }, 500) });
+    render(<SettingsModal isOpen onClose={vi.fn()} agents={[{ ...agent, role: "strategist" }]} apiClient={client} />);
+    expect(await screen.findByText("Research & Architecture Strategist")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
+    const select = screen.getByTestId("recast-role-select-felix");
+    expect(within(select).getByRole("option", { name: "QA & Tester" })).toHaveValue("tester");
+    expect(within(select).getByRole("option", { name: "System / Backend Developer" })).toHaveValue("system-developer");
+  });
+
+  it("shows the high level alongside the default designation", () => {
+    const { client } = server();
+    render(<AgentSettingsModal {...agentProps(client)} />);
+    expect(within(screen.getByTestId("session-thinking-select")).getByRole("option", { name: "High — Default" })).toHaveValue("high");
+  });
+
   it("creates with a neutral catalog Chair choice and retains executable legacy choices", async () => {
     const { client } = server();
     const onSpinUp = vi.fn().mockResolvedValue({});
@@ -167,16 +183,14 @@ describe("authenticated editable role catalog", () => {
     const option = await screen.findByRole("option", { name: "Council Chair" });
     expect(option).toHaveValue("custom:council-chair");
     const select = screen.getByTestId("spin-up-role-select");
-    for (const value of [
-      "web-developer",
-      "mobile-developer",
-      "system-developer",
-      "data-engineer",
-      "tester",
+    for (const [value, label] of [
+      ["web-developer", "Web Developer"],
+      ["mobile-developer", "Mobile Developer"],
+      ["system-developer", "System / Backend Developer"],
+      ["data-engineer", "Data Engineer"],
+      ["tester", "QA & Tester"],
     ])
-      expect(
-        within(select).getByRole("option", { name: new RegExp(value.replace(/-/g, " "), "i") }),
-      ).toHaveValue(value);
+      expect(within(select).getByRole("option", { name: label })).toHaveValue(value);
     fireEvent.change(select, { target: { value: "custom:council-chair" } });
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "Advisor" },

@@ -141,7 +141,7 @@ export function formatExecutionMode(mode?: string | null): string {
 export const THINKING_LEVEL_OPTIONS = [
   { value: "low", label: "Fast" },
   { value: "medium", label: "Balanced" },
-  { value: "high", label: "Default" },
+  { value: "high", label: "High — Default" },
   { value: "xhigh", label: "Maximum Reasoning" },
 ] as const;
 
