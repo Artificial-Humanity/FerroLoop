@@ -249,6 +249,20 @@ pub struct RouteDispatchObservation {
     pub route_updated_at: Option<At>,
     pub explicit: bool,
     pub outcome: DispatchCallOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_settle_ms: Option<u64>,
+}
+
+thread_local! {
+    static LAST_PASTE_SETTLE_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn record_last_paste_settle_ms(ms: u64) {
+    LAST_PASTE_SETTLE_MS.with(|cell| cell.set(Some(ms)));
+}
+
+pub(crate) fn take_last_paste_settle_ms() -> Option<u64> {
+    LAST_PASTE_SETTLE_MS.with(|cell| cell.take())
 }
 
 /// Generated rows contain at most four stages and two route observations,
@@ -310,6 +324,7 @@ impl DispatchReport {
     /// Call immediately before invocation, so an unwinding call remains an
     /// observed invocation with an explicitly unknown result.
     pub(crate) fn record_call_started(&mut self, entry: &RouteEntry) -> Option<usize> {
+        let _ = take_last_paste_settle_ms();
         increment_saturating(
             &mut self.route_dispatch_calls,
             &mut self.route_dispatch_calls_saturated,
@@ -330,6 +345,7 @@ impl DispatchReport {
             route_updated_at: Some(entry.updated_at.clone()),
             explicit: entry.explicit,
             outcome: DispatchCallOutcome::Unknown,
+            paste_settle_ms: None,
         });
         Some(slot)
     }
@@ -339,10 +355,12 @@ impl DispatchReport {
         observation_slot: Option<usize>,
         outcome: DispatchCallOutcome,
     ) {
+        let paste_settle_ms = take_last_paste_settle_ms();
         if let Some(observation) =
             observation_slot.and_then(|slot| self.route_observations.get_mut(slot))
         {
             observation.outcome = outcome;
+            observation.paste_settle_ms = paste_settle_ms;
         }
     }
 }
