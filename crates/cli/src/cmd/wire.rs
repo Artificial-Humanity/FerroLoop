@@ -445,7 +445,9 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
         if !env_matched {
             continue;
         }
-        if let Some(rec_pid) = rec.pid.filter(|p| *p > 0) {
+        if canonical_vendor == "claude"
+            && let Some(rec_pid) = rec.pid.filter(|p| *p > 0)
+        {
             if let Some(expected_st) = rec.pid_start_time
                 && fl_wire::identity::proc_start_time_ticks(rec_pid) != Some(expected_st)
             {
@@ -2377,8 +2379,6 @@ fn execute_register_with_hydration_env(
     let store = env
         .open_for_scope(Some(&StateScope::Workspace))
         .map_err(|e| (1, e))?;
-    fl_hub::lifecycle::fence_hydration_register(&store, &by, fence_generation)
-        .map_err(|msg| (1, msg))?;
 
     let captured_session_id = captured_route
         .as_ref()
@@ -2415,25 +2415,28 @@ fn execute_register_with_hydration_env(
     };
 
     let existing = store.agent_by_name(&by).map_err(|e| (1, e.to_string()))?;
-    // Run the route guard and route update BEFORE writing the agent registration or hydration
-    // receipt to the store, unless `!replace` would immediately fail with `AgentCollision`.
-    if (replace || existing.is_none())
-        && let Some(route) = captured_route
-    {
-        record_caller_route_with_provenance_meta(
-            env,
-            &by,
-            route,
-            true,
-            RouteRegistrationMeta {
-                replace,
-                hosted_id: verdict.effective_hosted_id.as_deref(),
-                hydration_generation: verdict.effective_generation.as_deref(),
-                hosted_session_verified: verdict.hosted_session_verified,
-                unverified_process: verdict.unverified_process,
-            },
-        )
-        .map_err(|error| (1, format!("route registration failed: {error}")))?;
+    // Run `fence_hydration_register` and route update AFTER `evaluate_registration_guard`
+    // succeeds (and only when `replace || existing.is_none()`), BEFORE writing the agent
+    // registration or hydration receipt to the store.
+    if replace || existing.is_none() {
+        fl_hub::lifecycle::fence_hydration_register(&store, &by, fence_generation)
+            .map_err(|msg| (1, msg))?;
+        if let Some(route) = captured_route {
+            record_caller_route_with_provenance_meta(
+                env,
+                &by,
+                route,
+                true,
+                RouteRegistrationMeta {
+                    replace,
+                    hosted_id: verdict.effective_hosted_id.as_deref(),
+                    hydration_generation: verdict.effective_generation.as_deref(),
+                    hosted_session_verified: verdict.hosted_session_verified,
+                    unverified_process: verdict.unverified_process,
+                },
+            )
+            .map_err(|error| (1, format!("route registration failed: {error}")))?;
+        }
     }
 
     let (parsed_role, extras) = preserve_on_replace(
@@ -5332,14 +5335,25 @@ pub(crate) mod tests {
         let root_pid = root_session_proc.id();
         let root_st = fl_wire::identity::proc_start_time_ticks(root_pid);
 
+        // Spawn an intermediate `sh -c` process to model a realistic `CLI -> sh -c -> hook`
+        // process tree where the hook's `getppid()` is the intermediate shell (`sh_pid != root_pid`).
+        let mut sh_proc = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let sh_pid = sh_proc.id();
+        assert_ne!(sh_pid, root_pid);
+
         // 1. Hosted Grok and Muse sessions with `pid: Some(root_pid)`:
-        // a same-vendor `grok` or `muse` child process (whose hook caller PID != `root_pid`)
-        // inheriting `FL_HOSTED_ID` and `AGENT_HYDRATION_GENERATION` is refused!
+        // Because Grok and Muse spawn hooks through an intermediate shell (`CLI -> sh -c -> hook`),
+        // `verify_hosted_session_in_store` must NOT refuse non-Claude vendors on `rec.pid` mismatch.
+        // Instead, the genuine hook registers cleanly and marks `unverified_process: true`.
+        let gen0 = "01b20000-0000-7000-8000-000000000000";
         for (vendor, inc_route) in [
             (
                 "grok",
                 VendorRoute::Grok {
-                    session_id: "grok-parent-sid".into(),
+                    session_id: "grok-old-sid".into(),
                     cwd: Some(rig.dir.path().to_path_buf()),
                     tmux_target: Some("Feira:grok".into()),
                     tmux_pane: Some("%1".into()),
@@ -5348,7 +5362,7 @@ pub(crate) mod tests {
             (
                 "muse",
                 VendorRoute::Muse {
-                    session_id: "muse-parent-sid".into(),
+                    session_id: "muse-old-sid".into(),
                     cwd: Some(rig.dir.path().to_path_buf()),
                     tmux_target: Some("Feira:muse".into()),
                     tmux_pane: Some("%2".into()),
@@ -5379,7 +5393,7 @@ pub(crate) mod tests {
                 hydration_generation: Some(gen1.into()),
                 runtime_spawned: true,
                 tombstone_ids: Vec::new(),
-                vendor_session_id: Some(format!("{vendor}-parent-sid")),
+                vendor_session_id: Some(format!("{vendor}-new-sid")),
                 pid: Some(root_pid),
                 pid_start_time: root_st,
                 created_at_ms: 1,
@@ -5388,13 +5402,36 @@ pub(crate) mod tests {
             };
             fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
 
+            // Verify directly with `sh_pid` (`CLI -> sh -c -> hook`) that `verify_hosted_session_in_store`
+            // succeeds (`verified: true`, `process_mismatch: false`, `unverified_process: true`).
+            let ver = verify_hosted_session_in_store(
+                &store,
+                vendor,
+                "feira",
+                Some(&format!("{vendor}:feira")),
+                Some(gen1),
+                CallerProcessContext::Hook {
+                    caller_pid: sh_pid,
+                    session_id: &format!("{vendor}-new-sid"),
+                },
+            );
+            assert!(ver.verified, "{vendor} hook via sh -c must verify");
+            assert!(
+                !ver.process_mismatch,
+                "{vendor} hook via sh -c must not fail with process_mismatch"
+            );
+            assert!(
+                ver.unverified_process,
+                "{vendor} hook must mark unverified_process: true"
+            );
+
             let mut table = RouteTable::default();
             table.upsert_explicit_with_meta(
                 "feira",
-                inc_route.clone(),
+                inc_route,
                 now_at(),
                 Some(format!("{vendor}:feira")),
-                Some(gen1.into()),
+                Some(gen0.into()),
                 false,
             );
             table.save(Some(&rig.routes_path())).unwrap();
@@ -5403,33 +5440,119 @@ pub(crate) mod tests {
                 std::env::set_var("FL_HOSTED_ID", format!("{vendor}:feira"));
                 std::env::set_var("AGENT_HYDRATION_GENERATION", gen1);
             }
+            let new_sid = format!("{vendor}-new-sid");
             let out = rig.run(
                 vendor,
                 json!({
                     "hook_event_name": "SessionStart",
-                    "session_id": format!("{vendor}-child-spike-sid"),
+                    "session_id": new_sid,
                     "cwd": rig.dir.path(),
                 }),
             );
             assert_eq!(out, json!({}));
+            let registered_route = rig.route_of("feira").expect("route registered");
             assert_eq!(
-                rig.route_of("feira"),
-                Some(inc_route),
-                "same-vendor {vendor} child with PID != record.pid must not overwrite hosted {vendor} route"
+                registered_route.session_identity(),
+                Some((vendor, new_sid.as_str())),
+                "genuine {vendor} hook through intermediate shell must register cleanly"
             );
             let after = RouteTable::load(Some(&rig.routes_path()));
-            assert_eq!(
-                after
-                    .registration_diagnostics
-                    .last()
-                    .map(|d| (d.outcome, d.reason)),
-                Some((
-                    RegistrationDiagnosticOutcome::Refused,
-                    RegistrationConflictReason::HostedIdentityMismatch,
-                ))
+            let diag = after
+                .registration_diagnostics
+                .last()
+                .expect("replaced diagnostic recorded");
+            assert_eq!(diag.outcome, RegistrationDiagnosticOutcome::Replaced);
+            assert!(
+                diag.unverified_process,
+                "non-Claude hosted verification must record unverified_process: true"
             );
         }
 
+        // 1b. Hosted Claude session with `pid: Some(root_pid)`:
+        // a same-vendor Claude child process (`888999 != root_pid`) inheriting `FL_HOSTED_ID`
+        // and `AGENT_HYDRATION_GENERATION` is refused with `HostedIdentityMismatch`!
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let rec_claude = fl_hub::lifecycle::HostedSessionRecord {
+                session_id: "claude:feira".into(),
+                persona: "feira".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                vendor: "claude".into(),
+                model: None,
+                thinking_level: None,
+                node_id: "local".into(),
+                hosted: true,
+                status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                restart_policy: "on-failure".into(),
+                restart_count: 0,
+                tmux_target: Some("Feira:claude".into()),
+                host_session_id: Some("Feira.claude".into()),
+                cwd: None,
+                context_window: None,
+                posture: fl_core::permissions::Posture::Auto,
+                hydration_dispatched: true,
+                hydration_status: fl_hub::lifecycle::HydrationStatus::Confirmed,
+                hydration_generation: Some(gen1.into()),
+                runtime_spawned: true,
+                tombstone_ids: Vec::new(),
+                vendor_session_id: Some("claude-root-sid".into()),
+                pid: Some(root_pid),
+                pid_start_time: root_st,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                decommission_prepared_at_ms: None,
+            };
+            fl_hub::lifecycle::persist_hosted_session(&store, &rec_claude, "owner").unwrap();
+        }
+        let root_claude_route = VendorRoute::Claude {
+            pid: root_pid,
+            session_id: "claude-root-sid".into(),
+            socket_path: rig.dir.path().join(format!("{root_pid}.sock")),
+            key_path: None,
+        };
+        let mut table = RouteTable::default();
+        table.upsert_explicit_with_meta(
+            "feira",
+            root_claude_route.clone(),
+            now_at(),
+            Some("claude:feira".into()),
+            Some(gen1.into()),
+            false,
+        );
+        table.save(Some(&rig.routes_path())).unwrap();
+        unsafe {
+            std::env::set_var("FL_HOSTED_ID", "claude:feira");
+            std::env::set_var("AGENT_HYDRATION_GENERATION", gen1);
+            std::env::set_var(
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                rig.dir.path().join("888999.sock"),
+            );
+        }
+        let claude_child_out = rig.run(
+            "claude",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-child-spike-sid",
+                "cwd": rig.dir.path(),
+            }),
+        );
+        assert_eq!(claude_child_out, json!({}));
+        assert_eq!(rig.route_of("feira"), Some(root_claude_route));
+        let after_claude_child = RouteTable::load(Some(&rig.routes_path()));
+        assert_eq!(
+            after_claude_child
+                .registration_diagnostics
+                .last()
+                .map(|d| (d.outcome, d.reason)),
+            Some((
+                RegistrationDiagnosticOutcome::Refused,
+                RegistrationConflictReason::HostedIdentityMismatch,
+            ))
+        );
+
+        let _ = sh_proc.kill();
+        let _ = sh_proc.wait();
         let _ = root_session_proc.kill();
         let _ = root_session_proc.wait();
 
@@ -5563,7 +5686,44 @@ pub(crate) mod tests {
         table.save(Some(&rig.routes_path())).unwrap();
 
         // Minor #8: A refused `fl wire register` (without `--replace` or with foreign hosted env)
-        // must fail BEFORE writing the agent or `hydration-ack-*` to StateStore!
+        // must fail in `evaluate_registration_guard` BEFORE `fence_hydration_register`,
+        // `store.register_agent`, or `record_hydration_ack`!
+        let stale_gen = "01c00000-0000-7000-8000-000000000001";
+        let newer_gen = "01c00000-0000-7000-8000-000000000002";
+        {
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let rec = fl_hub::lifecycle::HostedSessionRecord {
+                session_id: "antigravity:feira".into(),
+                persona: "feira".into(),
+                project: "ferroloop".into(),
+                role: "assistant".into(),
+                vendor: "antigravity".into(),
+                model: None,
+                thinking_level: None,
+                node_id: "local".into(),
+                hosted: true,
+                status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                restart_policy: "on-failure".into(),
+                restart_count: 0,
+                tmux_target: None,
+                host_session_id: Some("Feira.antigravity".into()),
+                cwd: None,
+                context_window: None,
+                posture: fl_core::permissions::Posture::Auto,
+                hydration_dispatched: true,
+                hydration_status: fl_hub::lifecycle::HydrationStatus::Unconfirmed,
+                hydration_generation: Some(newer_gen.into()),
+                runtime_spawned: true,
+                tombstone_ids: Vec::new(),
+                vendor_session_id: None,
+                pid: None,
+                pid_start_time: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                decommission_prepared_at_ms: None,
+            };
+            fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+        }
         let child_sock = rig.dir.path().join(format!("{}.sock", std::process::id()));
         unsafe {
             std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", &child_sock);
@@ -5576,11 +5736,16 @@ pub(crate) mod tests {
             "assistant".into(),
             None,
             false,
-            Some("gen-1"),
+            Some(stale_gen),
             None,
         )
         .unwrap_err();
         assert_eq!(reg_err.0, 1);
+        assert!(
+            !reg_err.1.contains("superseded by a newer launch"),
+            "evaluate_registration_guard must refuse before fence_hydration_register runs: {}",
+            reg_err.1
+        );
         let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
         assert!(
             store.agent_by_name("feira").unwrap().is_none(),

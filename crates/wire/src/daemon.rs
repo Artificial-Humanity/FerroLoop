@@ -1855,7 +1855,7 @@ where
                 let mut first_holds = Vec::new();
                 let allow_probes =
                     crate::identity::host_probes_allowed(self.config.home_override.as_deref());
-                for attempt in 0..4 {
+                loop {
                     let current_incumbent = lock(&self.routes).get(&norm).cloned();
                     let mut current_dead = None;
                     if explicit
@@ -1894,10 +1894,7 @@ where
                     let _order = lock(&self.enqueue_gate);
                     {
                         let mut routes = lock(&self.routes);
-                        if explicit
-                            && attempt < 3
-                            && routes.get(&norm) != current_incumbent.as_ref()
-                        {
+                        if explicit && routes.get(&norm) != current_incumbent.as_ref() {
                             continue;
                         }
                         if !explicit {
