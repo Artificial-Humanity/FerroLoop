@@ -559,9 +559,14 @@ pub fn is_native_session_id(id: &str) -> bool {
     !id.is_empty() && !is_persona_derived_id(id)
 }
 
-pub fn runtime_dir_path_with(
+#[cfg(unix)]
+pub use fl_host_proto::{probe_explicit_run_user_dir, probe_run_user_dir};
+
+#[cfg(unix)]
+pub fn runtime_dir_path_with_uid(
     xdg_runtime_dir: Option<&std::ffi::OsStr>,
     run_user_dir: Option<&Path>,
+    expected_uid: u32,
 ) -> Option<PathBuf> {
     if let Some(rt) = xdg_runtime_dir.filter(|s| !s.is_empty()) {
         let p = PathBuf::from(rt);
@@ -569,13 +574,44 @@ pub fn runtime_dir_path_with(
             return Some(p);
         }
     }
-    if let Some(dir) = run_user_dir
-        && dir.is_absolute()
-        && dir.is_dir()
+    run_user_dir.and_then(|dir| probe_explicit_run_user_dir(dir, expected_uid))
+}
+
+#[cfg(unix)]
+pub fn runtime_dir_path_for_root(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_root: &Path,
+    expected_uid: u32,
+) -> Option<PathBuf> {
+    let probed = probe_run_user_dir(run_user_root, expected_uid);
+    runtime_dir_path_with_uid(xdg_runtime_dir, probed.as_deref(), expected_uid)
+}
+
+pub fn runtime_dir_path_with(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    #[cfg(unix)]
     {
-        return Some(dir.to_path_buf());
+        let uid = unsafe { libc::geteuid() };
+        runtime_dir_path_with_uid(xdg_runtime_dir, run_user_dir, uid)
     }
-    None
+    #[cfg(not(unix))]
+    {
+        if let Some(rt) = xdg_runtime_dir.filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(rt);
+            if p.is_absolute() {
+                return Some(p);
+            }
+        }
+        if let Some(dir) = run_user_dir
+            && dir.is_absolute()
+            && dir.is_dir()
+        {
+            return Some(dir.to_path_buf());
+        }
+        None
+    }
 }
 
 pub fn runtime_dir_path() -> Option<PathBuf> {
@@ -586,23 +622,26 @@ pub fn runtime_dir_path() -> Option<PathBuf> {
     }
     #[cfg(unix)]
     {
+        let uid = unsafe { libc::geteuid() };
         if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
             let p = PathBuf::from(raw);
-            if let Some(dir) = runtime_dir_path_with(None, Some(&p)) {
-                return Some(dir);
-            }
-        } else if !cfg!(test)
-            && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
-        {
-            use std::os::unix::fs::MetadataExt;
-            let uid = unsafe { libc::geteuid() };
-            let p = PathBuf::from(format!("/run/user/{uid}"));
-            if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() && m.uid() == uid) {
-                return Some(p);
-            }
+            return probe_explicit_run_user_dir(&p, uid);
+        } else if !cfg!(test) {
+            return probe_run_user_dir(Path::new("/run/user"), uid);
         }
     }
     None
+}
+
+#[cfg(unix)]
+pub fn default_routes_path_for_root(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_root: &Path,
+    home: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
+) -> PathBuf {
+    let probed = probe_run_user_dir(run_user_root, expected_uid);
+    default_routes_path_with(xdg_runtime_dir, probed.as_deref(), home)
 }
 
 pub fn default_routes_path_with(
@@ -12638,5 +12677,45 @@ mod tests {
             ),
             tmp.path().join("dbdir").join("fl-wire-routes.json")
         );
+
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::geteuid() };
+            let other_uid = uid.wrapping_add(1);
+            let run_root = tmp.path().join("run/user");
+            fs::create_dir_all(&run_root).unwrap();
+
+            // Missing `<root>/<uid>` falls back to HOME/.cache
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire-routes.json")
+            );
+
+            // Real `<root>/<uid>` owned by `uid` succeeds
+            let my_dir = run_root.join(uid.to_string());
+            fs::create_dir_all(&my_dir).unwrap();
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                my_dir.join("fl-wire-routes.json")
+            );
+
+            // Wrong owner (`<root>/<other_uid>` owned by `uid` != `other_uid`) is rejected
+            let other_dir = run_root.join(other_uid.to_string());
+            fs::create_dir_all(&other_dir).unwrap();
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), other_uid),
+                home.join(".cache/fl/wire-routes.json")
+            );
+
+            // Symlinked `<root>/<uid>` is rejected
+            fs::remove_dir(&my_dir).unwrap();
+            let real_target = tmp.path().join("real-target");
+            fs::create_dir_all(&real_target).unwrap();
+            std::os::unix::fs::symlink(&real_target, &my_dir).unwrap();
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire-routes.json")
+            );
+        }
     }
 }

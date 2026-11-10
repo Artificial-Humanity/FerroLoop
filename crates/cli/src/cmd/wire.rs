@@ -1164,8 +1164,9 @@ pub fn execute_send_with_options(
             }
         }
         let store = env.open_for_scope(Some(&StateScope::Workspace))?;
-        let (msg, receipts) = store.send_wire(args).map_err(|e| e.to_string())?;
-        let _ = fl_wire::daemon::enqueue_for_daemon(&sock, &msg.id);
+        let (msg, receipts) = store
+            .send_wire_awaiting_daemon(args)
+            .map_err(|e| e.to_string())?;
         eprintln!("queued, the daemon will deliver (message_id={})", msg.id);
         return Ok((msg, receipts));
     }
@@ -6111,9 +6112,42 @@ pub(crate) mod tests {
             listener.accept().is_err(),
             "client must never dispatch in-process when no_daemon is false"
         );
-        let queue_contents =
-            std::fs::read_to_string(fl_wire::daemon::daemon_queue_path(&sock)).unwrap();
-        assert!(queue_contents.contains(queued_msg.id.as_str()));
+        let awaiting = env
+            .open_for_scope(Some(&StateScope::Workspace))
+            .unwrap()
+            .list_wire_awaiting_daemon()
+            .unwrap();
+        assert_eq!(awaiting.len(), 1);
+        assert_eq!(awaiting[0].0, queued_msg.id);
+
+        // If the store write fails, `execute_send_with_options` returns `Err` and records no marker.
+        let err = execute_send_with_options(
+            &env,
+            SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "   ".into(),
+                body: "invalid empty subject".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: now_at(),
+            },
+            false,
+        );
+        assert!(err.is_err());
+        let awaiting_after_err = env
+            .open_for_scope(Some(&StateScope::Workspace))
+            .unwrap()
+            .list_wire_awaiting_daemon()
+            .unwrap();
+        assert_eq!(awaiting_after_err.len(), 1);
 
         // 2. Explicit `no_daemon = true` (`--no-daemon` / `FL_WIRE_NO_DAEMON=1`) dispatches in-process.
         let (_, direct_rcpts) = execute_send_with_options(

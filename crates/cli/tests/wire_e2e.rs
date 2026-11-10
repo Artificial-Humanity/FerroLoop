@@ -1916,6 +1916,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
 #[cfg(unix)]
 #[test]
 fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
+    use fl_core::MessageStore;
     use std::io::Read;
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
@@ -1949,6 +1950,26 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
         fl_core::At::from_unix_millis(100),
     );
     table.save(Some(&env.routes_file)).unwrap();
+
+    // 0. If the store write fails while the daemon is unreachable, the client returns an error
+    //    and never claims it queued anything.
+    let mut bad_send = env.fl();
+    bad_send.env("FL_WIRE_SOCKET", &sock).args([
+        "wire",
+        "send",
+        "@nonexistent-group",
+        "bad-subj",
+        "bad-body",
+        "--from",
+        "felix",
+    ]);
+    let bad_out = bad_send.output().unwrap();
+    assert!(!bad_out.status.success());
+    let bad_stderr = String::from_utf8_lossy(&bad_out.stderr);
+    assert!(
+        !bad_stderr.contains("queued, the daemon will deliver"),
+        "failed store write must not claim message was queued: {bad_stderr}"
+    );
 
     // 1. Send with no daemon running at `sock` (and without `--no-daemon`):
     //    must queue for the daemon (`Pending`, `attempts == 0`), print notice on stderr, and NOT push in-process.
@@ -1985,11 +2006,11 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
     // 2. Start the daemon at `sock`: it drains the queued message and delivers it to `felicia`!
     let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
     let mut daemon = fl_wire::daemon::spawn_daemon(
-        store,
+        std::sync::Arc::clone(&store),
         fl_wire::daemon::DaemonConfig {
             node_id: "node-delayed".into(),
             host: "host-delayed".into(),
-            socket_path: sock,
+            socket_path: sock.clone(),
             routes_path: Some(env.routes_file.clone()),
             home_override: Some(env.root.clone()),
             listen_addr: None,
@@ -2010,7 +2031,51 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    daemon.stop();
     let payload = delivered.expect("daemon must pick up and deliver queued message");
     assert!(payload.contains("queued-subj"));
+    assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+
+    // 3. While the daemon is running at `sock`, a client pointing at the WRONG socket path
+    //    (`wrong-client.sock`) writes to the shared store and the running daemon picks it up
+    //    via the store-backed awaiting-daemon marker and delivers it!
+    let wrong_sock = env.root.join("wrong-client.sock");
+    let mut wrong_sock_cmd = env.fl();
+    wrong_sock_cmd.env("FL_WIRE_SOCKET", &wrong_sock).args([
+        "wire",
+        "send",
+        "felicia",
+        "wrong-sock-subj",
+        "wrong-sock-body",
+        "--from",
+        "felix",
+        "--json",
+    ]);
+    let wrong_out = wrong_sock_cmd.output().unwrap();
+    assert!(
+        wrong_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrong_out.stderr)
+    );
+    let wrong_stderr = String::from_utf8_lossy(&wrong_out.stderr);
+    assert!(
+        wrong_stderr.contains("queued, the daemon will deliver"),
+        "expected queue notice on stderr, got: {wrong_stderr}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delivered_wrong_sock = None;
+    while Instant::now() < deadline && delivered_wrong_sock.is_none() {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut s = String::new();
+            let _ = stream.read_to_string(&mut s);
+            delivered_wrong_sock = Some(s);
+        } else {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    daemon.stop();
+    let payload_2 = delivered_wrong_sock
+        .expect("running daemon must pick up message from client with wrong socket path");
+    assert!(payload_2.contains("wrong-sock-subj"));
+    assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
 }

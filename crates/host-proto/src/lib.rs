@@ -22,6 +22,8 @@ pub use client::{
     ReliableControllerGrant, ReliableEventStream, events,
 };
 pub use endpoint::HostEndpoint;
+#[cfg(unix)]
+pub use endpoint::{probe_explicit_run_user_dir, probe_run_user_dir};
 pub use frame::{
     EventSeq, Frame, FrameKind, LineReassembler, ResponseCorrelator, checked_frame_len,
     checked_unauth_len, decode_request, decode_request_for_minor, decode_response,

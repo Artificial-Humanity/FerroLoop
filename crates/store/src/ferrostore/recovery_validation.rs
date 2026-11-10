@@ -691,6 +691,7 @@ fn known_collection(c: &str) -> bool {
             | doc::WIRE_MSG_SEQ
             | doc::WIRE_THREADS
             | doc::WIRE_REPLIES
+            | doc::WIRE_AWAITING_DAEMON
             | doc::IDS
             | doc::ALIASES
             | doc::HANDLES
@@ -1037,6 +1038,10 @@ fn validate_domain(
         doc::WIRE_THREADS | doc::WIRE_REPLIES => {
             let (_, message) = doc::split_pair(id).ok_or_else(|| l.verification())?;
             reference("/key", doc::WIRE_MESSAGES, &json!(message))?;
+        }
+        doc::WIRE_AWAITING_DAEMON => {
+            let _ = parse!(fl_core::At);
+            reference("/key", doc::WIRE_MESSAGES, &json!(id))?;
         }
         doc::ALIASES => reference("", doc::IDS, value)?,
         doc::HANDLES => reference("", doc::IDS, value)?,

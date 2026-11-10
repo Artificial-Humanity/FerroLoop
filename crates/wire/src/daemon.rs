@@ -205,72 +205,15 @@ pub fn default_socket_path() -> PathBuf {
     default_socket_path_with(None, None, std::env::var_os("HOME").as_deref())
 }
 
-pub fn daemon_queue_path(socket_path: &Path) -> PathBuf {
-    let mut os = socket_path.as_os_str().to_os_string();
-    os.push(".queue");
-    PathBuf::from(os)
-}
-
-fn daemon_draining_queue_path(socket_path: &Path) -> PathBuf {
-    let mut os = socket_path.as_os_str().to_os_string();
-    os.push(".queue.draining");
-    PathBuf::from(os)
-}
-
-fn daemon_queue_lock_path(socket_path: &Path) -> PathBuf {
-    let mut os = socket_path.as_os_str().to_os_string();
-    os.push(".queue.lock");
-    PathBuf::from(os)
-}
-
-fn with_daemon_queue_lock<T>(
-    socket_path: &Path,
-    f: impl FnOnce() -> io::Result<T>,
-) -> io::Result<T> {
-    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let lock_path = daemon_queue_lock_path(socket_path);
-    let mut opts = fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let lock_file = opts.open(lock_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    let res = f();
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
-    }
-    res
-}
-
-/// Record `message_id` for delivery by the daemon listening (or next spawned) at `socket_path`.
-pub fn enqueue_for_daemon(socket_path: &Path, message_id: &MessageId) -> io::Result<()> {
-    with_daemon_queue_lock(socket_path, || {
-        let path = daemon_queue_path(socket_path);
-        let mut opts = fs::OpenOptions::new();
-        opts.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(path)?;
-        writeln!(file, "{message_id}")?;
-        file.flush()
-    })
+#[cfg(unix)]
+pub fn default_socket_path_for_root(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_root: &Path,
+    home: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
+) -> PathBuf {
+    let probed = crate::identity::probe_run_user_dir(run_user_root, expected_uid);
+    default_socket_path_with(xdg_runtime_dir, probed.as_deref(), home)
 }
 
 pub fn resolve_socket_path(
@@ -1007,6 +950,20 @@ fn log_first_holds(rows: Vec<FenceDiagnostic>) {
 #[cfg(test)]
 type RegistrationProbeHook = Box<dyn FnMut(&mut RouteTable) + Send>;
 
+const MAX_AWAITING_DAEMON_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const AWAITING_DAEMON_POLL_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
+};
+
+#[derive(Default)]
+struct AwaitingDaemonEntry {
+    notified: bool,
+    scheduled_routed: BTreeSet<String>,
+    tried_unrouted: BTreeSet<String>,
+}
+
 struct DaemonInner<S> {
     store: Arc<S>,
     config: DaemonConfig,
@@ -1021,7 +978,7 @@ struct DaemonInner<S> {
     overflow_capacity_exhausted: AtomicBool,
     dispatch_diagnostics: Mutex<DiagnosticsState>,
     pending_by_recipient: Mutex<BTreeMap<String, BTreeMap<MessageId, At>>>,
-    queued_for_daemon: Mutex<BTreeMap<String, Vec<MessageId>>>,
+    awaiting_daemon_state: Mutex<BTreeMap<MessageId, AwaitingDaemonEntry>>,
     #[cfg(test)]
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
@@ -2107,36 +2064,10 @@ where
                             &mut first_holds,
                         );
                     }
-                    let queued_ids = lock(&self.queued_for_daemon).remove(&norm);
-                    if let Some(ids) = queued_ids {
-                        for mid in ids {
-                            let Ok(Some(msg)) = self.store.get_wire_message(&mid) else {
-                                continue;
-                            };
-                            let Ok(receipts) = self.store.list_wire_receipts(&mid) else {
-                                continue;
-                            };
-                            let for_recipient: Vec<DeliveryReceipt> = receipts
-                                .into_iter()
-                                .filter(|r| {
-                                    r.status == DeliveryStatus::Pending
-                                        && r.attempts == 0
-                                        && normalize_persona(&r.recipient_name).unwrap_or_else(
-                                            || r.recipient_name.trim().to_ascii_lowercase(),
-                                        ) == norm
-                                })
-                                .collect();
-                            if !for_recipient.is_empty()
-                                && let Err(message) = self.schedule_dispatch(
-                                    &msg,
-                                    &for_recipient,
-                                    now.clone(),
-                                    &mut first_holds,
-                                )
-                            {
-                                warn(&message);
-                            }
-                        }
+                    if let Ok(awaiting) = self.store.list_wire_awaiting_daemon()
+                        && !awaiting.is_empty()
+                    {
+                        self.drain_awaiting_daemon_locked(&awaiting, &now, &mut first_holds);
                     }
                     drop(_order);
                     break;
@@ -2580,66 +2511,75 @@ where
         }
     }
 
-    fn drain_queued_messages(self: &Arc<Self>) {
-        let queue_path = daemon_queue_path(&self.config.socket_path);
-        let draining_path = daemon_draining_queue_path(&self.config.socket_path);
-        if !queue_path.exists() && !draining_path.exists() {
+    fn drain_awaiting_daemon_messages(self: &Arc<Self>) {
+        let Ok(awaiting) = self.store.list_wire_awaiting_daemon() else {
+            return;
+        };
+        if awaiting.is_empty() {
             return;
         }
         let mut first_holds = Vec::new();
         let _order = lock(&self.enqueue_gate);
-        let mut seen = BTreeSet::new();
-        for _ in 0..2 {
-            if !draining_path.exists() && queue_path.exists() {
-                let _ = with_daemon_queue_lock(&self.config.socket_path, || {
-                    if !draining_path.exists() && queue_path.exists() {
-                        fs::rename(&queue_path, &draining_path)
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
-            let Ok(raw) = fs::read_to_string(&draining_path) else {
-                break;
+        self.drain_awaiting_daemon_locked(&awaiting, &now_at(), &mut first_holds);
+        drop(_order);
+        log_first_holds(first_holds);
+    }
+
+    /// Caller must hold `enqueue_gate`.
+    fn drain_awaiting_daemon_locked(
+        self: &Arc<Self>,
+        awaiting: &[(MessageId, At)],
+        now: &At,
+        first_holds: &mut Vec<FenceDiagnostic>,
+    ) {
+        let routed_keys: BTreeSet<String> = lock(&self.routes).entries.keys().cloned().collect();
+        for (mid, queued_at) in awaiting {
+            let msg = match self.store.get_wire_message(mid) {
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    let _ = self.store.clear_wire_awaiting_daemon(mid);
+                    lock(&self.awaiting_daemon_state).remove(mid);
+                    continue;
+                }
+                Err(_) => continue,
             };
-            let _ = fs::remove_file(&draining_path);
-            let now = now_at();
-            for line in raw.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
-                    continue;
-                }
-                let Ok(iri) = fl_core::iri::Iri::parse(trimmed) else {
-                    continue;
-                };
-                let mid = MessageId(iri);
-                let Ok(Some(msg)) = self.store.get_wire_message(&mid) else {
-                    continue;
-                };
-                let Ok(receipts) = self.store.list_wire_receipts(&mid) else {
-                    continue;
-                };
-                let pending_receipts: Vec<DeliveryReceipt> = receipts
-                    .into_iter()
-                    .filter(|r| r.status == DeliveryStatus::Pending && r.attempts == 0)
-                    .collect();
-                if pending_receipts.is_empty() {
-                    continue;
-                }
-                {
-                    let mut queued = lock(&self.queued_for_daemon);
-                    for rcpt in &pending_receipts {
-                        let key = normalize_persona(&rcpt.recipient_name)
-                            .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
-                        if !key.is_empty() {
-                            let list = queued.entry(key).or_default();
-                            if !list.contains(&mid) {
-                                list.push(mid.clone());
-                            }
-                        }
+            let Ok(receipts) = self.store.list_wire_receipts(mid) else {
+                continue;
+            };
+            let pending_receipts: Vec<DeliveryReceipt> = receipts
+                .into_iter()
+                .filter(|r| r.status == DeliveryStatus::Pending && r.attempts == 0)
+                .collect();
+            if pending_receipts.is_empty() {
+                let _ = self.store.clear_wire_awaiting_daemon(mid);
+                lock(&self.awaiting_daemon_state).remove(mid);
+                continue;
+            }
+            self.admit_pending_receipts(&msg, &pending_receipts);
+            let mut state = lock(&self.awaiting_daemon_state);
+            let entry = state.entry(mid.clone()).or_default();
+            let should_notify = !entry.notified;
+            entry.notified = true;
+            let mut to_schedule = Vec::new();
+            let mut all_routed = true;
+            for rcpt in &pending_receipts {
+                let key = normalize_persona(&rcpt.recipient_name)
+                    .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
+                let is_routed = !key.is_empty() && routed_keys.contains(&key);
+                if is_routed {
+                    if !entry.scheduled_routed.contains(&key) {
+                        to_schedule.push((key, true, rcpt.clone()));
+                    }
+                } else {
+                    all_routed = false;
+                    if !entry.tried_unrouted.contains(&key) {
+                        to_schedule.push((key, false, rcpt.clone()));
                     }
                 }
-                self.admit_pending_receipts(&msg, &pending_receipts);
+            }
+            drop(state);
+
+            if should_notify {
                 self.notify_subscribers_message(&msg, &pending_receipts);
                 self.broadcast_to_peers(
                     None,
@@ -2648,18 +2588,39 @@ where
                         receipts: pending_receipts.clone(),
                     },
                 );
-                if let Err(message) =
-                    self.schedule_dispatch(&msg, &pending_receipts, now.clone(), &mut first_holds)
-                {
-                    warn(&message);
+            }
+
+            let mut schedule_ok = true;
+            if !to_schedule.is_empty() {
+                let rcpts_to_schedule: Vec<DeliveryReceipt> =
+                    to_schedule.iter().map(|(_, _, r)| r.clone()).collect();
+                match self.schedule_dispatch(&msg, &rcpts_to_schedule, now.clone(), first_holds) {
+                    Ok(()) => {
+                        let mut state = lock(&self.awaiting_daemon_state);
+                        if let Some(entry) = state.get_mut(mid) {
+                            for (key, is_routed, _) in to_schedule {
+                                if is_routed {
+                                    entry.scheduled_routed.insert(key);
+                                } else {
+                                    entry.tried_unrouted.insert(key);
+                                }
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        schedule_ok = false;
+                        warn(&message);
+                    }
                 }
             }
-            if !queue_path.exists() {
-                break;
+
+            let expired = now.unix_millis().saturating_sub(queued_at.unix_millis())
+                >= MAX_AWAITING_DAEMON_AGE_MS;
+            if (all_routed && schedule_ok) || expired {
+                let _ = self.store.clear_wire_awaiting_daemon(mid);
+                lock(&self.awaiting_daemon_state).remove(mid);
             }
         }
-        drop(_order);
-        log_first_holds(first_holds);
     }
 }
 
@@ -2767,7 +2728,7 @@ where
         overflow_capacity_exhausted: AtomicBool::new(false),
         dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
         pending_by_recipient: Mutex::new(initial_pending),
-        queued_for_daemon: Mutex::new(BTreeMap::new()),
+        awaiting_daemon_state: Mutex::new(BTreeMap::new()),
         #[cfg(test)]
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
@@ -2791,7 +2752,7 @@ where
     warn(
         "startup: pre-restart pending messages remain readable in the inbox; delivery may be unconfirmed",
     );
-    inner.drain_queued_messages();
+    inner.drain_awaiting_daemon_messages();
 
     // Spawn outbound peer loops
     for peer_url in config.peers.clone() {
@@ -2817,6 +2778,7 @@ where
     let inner_main = Arc::clone(&inner);
 
     let join_handle = std::thread::spawn(move || {
+        let mut last_awaiting_poll = Instant::now();
         while !shutdown_clone.load(Ordering::SeqCst) && !inner_main.shutdown.load(Ordering::SeqCst)
         {
             let mut did_work = false;
@@ -2903,7 +2865,10 @@ where
                 });
             }
 
-            inner_main.drain_queued_messages();
+            if last_awaiting_poll.elapsed() >= AWAITING_DAEMON_POLL_INTERVAL {
+                last_awaiting_poll = Instant::now();
+                inner_main.drain_awaiting_daemon_messages();
+            }
 
             if !did_work {
                 std::thread::sleep(Duration::from_millis(10));
@@ -2994,7 +2959,7 @@ mod tests {
             overflow_capacity_exhausted: AtomicBool::new(false),
             dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
             pending_by_recipient: Mutex::new(BTreeMap::new()),
-            queued_for_daemon: Mutex::new(BTreeMap::new()),
+            awaiting_daemon_state: Mutex::new(BTreeMap::new()),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
             fail_next_worker_spawn: AtomicBool::new(false),
@@ -3075,6 +3040,19 @@ mod tests {
         ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
             lock(&self.calls).push("send");
             self.inner.send_wire(args)
+        }
+        fn send_wire_awaiting_daemon(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            lock(&self.calls).push("send");
+            self.inner.send_wire_awaiting_daemon(args)
+        }
+        fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+            self.inner.list_wire_awaiting_daemon()
+        }
+        fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+            self.inner.clear_wire_awaiting_daemon(message_id)
         }
         fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
             lock(&self.calls).push("get");
@@ -7536,10 +7514,47 @@ mod tests {
             default_socket_path_with(None, None, None),
             PathBuf::from("/tmp/fl-wire.sock")
         );
+
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::geteuid() };
+            let other_uid = uid.wrapping_add(1);
+            let run_root = tmp.path().join("run/user");
+            fs::create_dir_all(&run_root).unwrap();
+
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire.sock")
+            );
+
+            let my_dir = run_root.join(uid.to_string());
+            fs::create_dir_all(&my_dir).unwrap();
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                my_dir.join("fl-wire.sock")
+            );
+
+            let other_dir = run_root.join(other_uid.to_string());
+            fs::create_dir_all(&other_dir).unwrap();
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), other_uid),
+                home.join(".cache/fl/wire.sock")
+            );
+
+            fs::remove_dir(&my_dir).unwrap();
+            let real_target = tmp.path().join("real-target");
+            fs::create_dir_all(&real_target).unwrap();
+            std::os::unix::fs::symlink(&real_target, &my_dir).unwrap();
+            assert_eq!(
+                default_socket_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire.sock")
+            );
+        }
     }
 
     #[test]
-    fn enqueue_for_daemon_drains_at_startup_and_on_tick_and_on_late_route_registration() {
+    fn awaiting_daemon_store_marker_delivers_at_startup_on_poll_on_late_route_and_once_across_restart()
+     {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("queue.redb")).unwrap());
         let sock = tmp.path().join("daemon.sock");
@@ -7550,7 +7565,9 @@ mod tests {
         let hook_listener = UnixListener::bind(&hook_sock).unwrap();
         hook_listener.set_nonblocking(true).unwrap();
 
-        // 1. Pre-startup message NOT enqueued via `enqueue_for_daemon` must NOT be replayed.
+        let base_ms = now_at().unix_millis();
+
+        // 1. Pre-startup message NOT marked via `send_wire_awaiting_daemon` must NOT be replayed.
         let (ambiguous_msg, _) = store
             .send_wire(SendWireArgs {
                 id: None,
@@ -7566,13 +7583,14 @@ mod tests {
                 reply_to: None,
                 thread_id: None,
                 deadline_at: None,
-                at: At::from_unix_millis(100),
+                at: At::from_unix_millis(base_ms),
             })
             .unwrap();
 
         // 2. Message queued by offline client before daemon starts (and before route is registered).
+        let pre_at = At::from_unix_millis(base_ms + 1);
         let (queued_pre, _) = store
-            .send_wire(SendWireArgs {
+            .send_wire_awaiting_daemon(SendWireArgs {
                 id: None,
                 sender_id: None,
                 sender_name: "felix".into(),
@@ -7586,10 +7604,35 @@ mod tests {
                 reply_to: None,
                 thread_id: None,
                 deadline_at: None,
-                at: At::from_unix_millis(200),
+                at: pre_at.clone(),
             })
             .unwrap();
-        enqueue_for_daemon(&sock, &queued_pre.id).unwrap();
+        assert_eq!(
+            store.list_wire_awaiting_daemon().unwrap(),
+            vec![(queued_pre.id.clone(), pre_at.clone())]
+        );
+
+        // Stale marker (> 24h old) for a recipient that never registers is pruned at startup.
+        let stale_at =
+            At::from_unix_millis(base_ms.saturating_sub(MAX_AWAITING_DAEMON_AGE_MS + 1000));
+        let (stale_unrouted, _) = store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("never-registers".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "stale-unrouted".into(),
+                body: "prune marker after 24h".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: stale_at,
+            })
+            .unwrap();
 
         let mut handle = spawn_daemon(
             Arc::clone(&store),
@@ -7597,7 +7640,7 @@ mod tests {
                 node_id: "node-q".into(),
                 host: "host-q".into(),
                 socket_path: sock.clone(),
-                routes_path: Some(routes_file),
+                routes_path: Some(routes_file.clone()),
                 home_override: Some(tmp.path().to_path_buf()),
                 listen_addr: None,
                 peers: vec![],
@@ -7606,7 +7649,16 @@ mod tests {
         )
         .unwrap();
 
-        // Now register `felicia`'s webhook route: `queued_pre` must be delivered, while `ambiguous_msg` stays Pending!
+        // Before `felicia` registers her route, `queued_pre`'s marker remains in the store,
+        // while `stale_unrouted`'s expired marker was pruned.
+        let _ = stale_unrouted;
+        assert_eq!(
+            store.list_wire_awaiting_daemon().unwrap(),
+            vec![(queued_pre.id.clone(), pre_at)]
+        );
+
+        // Now register `felicia`'s webhook route: `queued_pre` must be delivered and marker cleared,
+        // while `ambiguous_msg` stays Pending!
         let mut client = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         let resp = client
             .request(&LocalRequest::register(
@@ -7632,13 +7684,16 @@ mod tests {
             }
         }
         assert_eq!(received_subjects, vec!["queued-pre".to_string()]);
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
         let amb_rcpts = store.list_wire_receipts(&ambiguous_msg.id).unwrap();
         assert_eq!(amb_rcpts[0].status, DeliveryStatus::Pending);
         assert_eq!(amb_rcpts[0].attempts, 0);
 
-        // 3. Message queued via `enqueue_for_daemon` while daemon is already running is drained on tick.
+        // 3. A client whose socket path is wrong while the daemon runs elsewhere writes to the
+        // shared store via `send_wire_awaiting_daemon`: the running daemon picks it up on poll,
+        // delivers it, and clears the marker.
         let (queued_live, _) = store
-            .send_wire(SendWireArgs {
+            .send_wire_awaiting_daemon(SendWireArgs {
                 id: None,
                 sender_id: None,
                 sender_name: "felix".into(),
@@ -7648,14 +7703,14 @@ mod tests {
                 urgency: MessageUrgency::Normal,
                 durable: true,
                 subject: "queued-live".into(),
-                body: "deliver on tick".into(),
+                body: "deliver on poll".into(),
                 reply_to: None,
                 thread_id: None,
                 deadline_at: None,
-                at: At::from_unix_millis(300),
+                at: At::from_unix_millis(base_ms + 2),
             })
             .unwrap();
-        enqueue_for_daemon(&sock, &queued_live.id).unwrap();
+        let _ = queued_live;
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && received_subjects.len() < 2 {
@@ -7672,6 +7727,84 @@ mod tests {
             received_subjects,
             vec!["queued-pre".to_string(), "queued-live".to_string()]
         );
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
         handle.stop();
+
+        // 4. Crash/restart between store write and daemon pickup -> delivered once across restarts.
+        let (_queued_restart, _) = store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("felicia".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "queued-restart".into(),
+                body: "deliver once after restart".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(base_ms + 3),
+            })
+            .unwrap();
+        assert_eq!(store.list_wire_awaiting_daemon().unwrap().len(), 1);
+
+        let mut handle_1 = spawn_daemon(
+            Arc::clone(&store),
+            DaemonConfig {
+                node_id: "node-q".into(),
+                host: "host-q".into(),
+                socket_path: sock.clone(),
+                routes_path: Some(routes_file.clone()),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && received_subjects.len() < 3 {
+            if let Ok((mut stream, _)) = hook_listener.accept() {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                let val: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+                received_subjects.push(val["subject"].as_str().unwrap().to_string());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received_subjects,
+            vec![
+                "queued-pre".to_string(),
+                "queued-live".to_string(),
+                "queued-restart".to_string(),
+            ]
+        );
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        handle_1.stop();
+
+        // Starting a second daemon on the same store and routes must NOT re-deliver anything.
+        let mut handle_2 = spawn_daemon(
+            Arc::clone(&store),
+            DaemonConfig {
+                node_id: "node-q".into(),
+                host: "host-q".into(),
+                socket_path: sock,
+                routes_path: Some(routes_file),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(hook_listener.accept().is_err());
+        handle_2.stop();
     }
 }

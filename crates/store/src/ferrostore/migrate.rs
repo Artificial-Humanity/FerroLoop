@@ -303,6 +303,11 @@ fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
     );
     copy_rows!(
         tx,
+        TableDefinition::<&str, &str>::new(doc::WIRE_AWAITING_DAEMON),
+        |key, value| put_json_text(txn, doc::WIRE_AWAITING_DAEMON, key, value)
+    );
+    copy_rows!(
+        tx,
         TableDefinition::<&str, &str>::new(doc::WORKFLOW_DEFS),
         |key, value| put_json_text(txn, doc::WORKFLOW_DEFS, key, value)
     );
