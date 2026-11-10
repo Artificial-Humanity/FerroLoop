@@ -42,6 +42,8 @@ pub(super) trait ContainerIo: Send + Sync {
     /// `flock(LOCK_EX)`: wait until this description holds the file's
     /// exclusive advisory lock.
     fn lock_exclusive(&self) -> io::Result<()>;
+    /// Try once, without waiting. `false` means another description holds it.
+    fn try_lock_exclusive(&self) -> io::Result<bool>;
     /// `flock(LOCK_UN)`. Releasing cannot usefully fail: a lock this
     /// description does not hold is not held.
     fn unlock(&self);
@@ -49,6 +51,7 @@ pub(super) trait ContainerIo: Send + Sync {
 
 const LOCK_EX: i32 = 2;
 const LOCK_UN: i32 = 8;
+const LOCK_NB: i32 = 4;
 
 // libc `flock`. No extra crate: the process already links libc.
 unsafe extern "C" {
@@ -93,6 +96,19 @@ impl ContainerIo for File {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        // SAFETY: this descriptor is open and LOCK_NB never waits for a holder.
+        if unsafe { flock(self.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(err)
+        }
     }
 
     fn unlock(&self) {

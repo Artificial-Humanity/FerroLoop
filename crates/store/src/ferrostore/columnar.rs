@@ -289,7 +289,7 @@ pub(super) fn validate_row_group(columns: &[ColumnDef], bytes: &[u8]) -> Result<
     validate_row_group_with(columns, bytes, &Limits::DEFAULT)
 }
 
-fn validate_row_group_with(
+pub(super) fn validate_row_group_with(
     columns: &[ColumnDef],
     bytes: &[u8],
     limits: &Limits,
