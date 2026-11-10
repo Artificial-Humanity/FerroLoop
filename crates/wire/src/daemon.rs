@@ -446,7 +446,13 @@ fn verify_peer_cred_for_hosted_claim(
     {
         return false;
     }
-    if !(replace && trusted_reference.is_some())
+    // A detached tool process cannot prove ancestry against either the hosted CLI or
+    // an incumbent. Explicit replacement still applies, but remains unverified.
+    let detached_tool_replacement = replace
+        && !crate::vendor_adapter::tool_processes_descend_from_cli(
+            challenger_route.canonical_vendor(),
+        );
+    if !(replace && trusted_reference.is_some() || detached_tool_replacement)
         && let Some(inc) = incumbent
         && inc.explicit
         && !incumbent_is_dead
@@ -2020,6 +2026,13 @@ where
                         None,
                     );
                 };
+                // This is a property of the adapter, not a trustworthy client claim.
+                let unverified_process = unverified_process
+                    || (explicit
+                        && (hosted_id.is_some() || hydration_generation.is_some())
+                        && !crate::vendor_adapter::tool_processes_descend_from_cli(
+                            route.canonical_vendor(),
+                        ));
                 let evidence = hold_evidence(
                     &norm,
                     None,
@@ -7542,40 +7555,97 @@ mod tests {
             scope: StateScope::Workspace, slug: "hosted-session-codex-feira".into(), sensitivity: SensitivityPatch::Inherit,
             payload: StatePayload::Runtime(RuntimeEntry { value: serde_json::json!({"session_id":"codex:feira", "persona":"feira", "vendor":"codex", "status":"running", "hydration_generation":"gen-1", "pid":tui.id(), "pid_start_time":crate::identity::proc_start_time_ticks(tui.id())}), merge_mode: MergeMode::LastWriter }), at: At::from_unix_millis(1), by: "test".into(),
         }).unwrap();
-        let (response, _) = rig.inner.handle_local_request_with_peer(
-            LocalRequest::RegisterRoute {
-                persona: "feira".into(),
-                route: VendorRoute::Codex {
-                    thread_id: "thread".into(),
-                    cwd: None,
-                },
-                explicit: true,
-                replace: true,
-                hosted_id: None,
-                hydration_generation: Some("gen-1".into()),
-                hosted_session_verified: true,
-                unverified_process: true,
+        let request = |replace| LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "thread".into(),
+                cwd: None,
             },
-            PeerCred {
-                pid: Some(hook),
-                ppid: None,
-                start_time: crate::identity::proc_start_time_ticks(hook),
-            },
-        );
+            explicit: true,
+            replace,
+            hosted_id: None,
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: true,
+            unverified_process: false,
+        };
+        let peer = PeerCred {
+            pid: Some(hook),
+            ppid: None,
+            start_time: crate::identity::proc_start_time_ticks(hook),
+        };
+        let mut outcomes = Vec::new();
+        for vendor in ["claude", "agy"] {
+            let incumbent = if vendor == "claude" {
+                VendorRoute::Claude {
+                    pid: std::process::id(),
+                    session_id: "incumbent".into(),
+                    socket_path: rig._tmp.path().join("incumbent.sock"),
+                    key_path: None,
+                }
+            } else {
+                VendorRoute::Agy {
+                    conversation_id: "incumbent".into(),
+                    ls_pid: Some(std::process::id()),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                }
+            };
+            {
+                let mut routes = lock(&rig.inner.routes);
+                routes.upsert_explicit_with_meta(
+                    "feira",
+                    incumbent,
+                    At::from_unix_millis(1),
+                    None,
+                    None,
+                    true,
+                );
+                let entry = routes.get("feira").unwrap();
+                assert!(!crate::identity::explicit_route_entry_is_dead(
+                    entry,
+                    Some("feira"),
+                    false
+                ));
+            }
+            let (without_replace, _) = rig
+                .inner
+                .handle_local_request_with_peer(request(false), peer);
+            let (response, _) = rig
+                .inner
+                .handle_local_request_with_peer(request(true), peer);
+            let routes = lock(&rig.inner.routes);
+            let codex_route = matches!(
+                routes.get("feira").unwrap().route,
+                VendorRoute::Codex { .. }
+            );
+            let unverified = routes
+                .registration_diagnostics
+                .last()
+                .is_some_and(|d| d.unverified_process);
+            outcomes.push((vendor, without_replace, response, codex_route, unverified));
+        }
         unsafe {
             libc::kill(-(server.id() as i32), libc::SIGKILL);
             libc::kill(-(tui.id() as i32), libc::SIGKILL);
         }
         let _ = server.wait();
         let _ = tui.wait();
-        assert!(
-            matches!(response, LocalResponse::RouteRegistered),
-            "{response:?}"
-        );
-        assert!(matches!(
-            lock(&rig.inner.routes).get("feira").unwrap().route,
-            VendorRoute::Codex { .. }
-        ));
+        for (vendor, without_replace, response, codex_route, unverified) in outcomes {
+            assert!(
+                matches!(without_replace, LocalResponse::Error { .. }),
+                "{vendor}: {without_replace:?}"
+            );
+            assert!(
+                matches!(response, LocalResponse::RouteRegistered),
+                "{vendor}: {response:?}"
+            );
+            assert!(codex_route, "{vendor}: Codex route missing");
+            assert!(
+                unverified,
+                "{vendor}: replacement must record the unverified classification"
+            );
+        }
     }
 
     #[test]
