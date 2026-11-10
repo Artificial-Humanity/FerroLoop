@@ -1695,10 +1695,64 @@ pub enum WireDaemonState {
 pub struct HubWireStatusResponse {
     pub daemon: WireDaemonState,
     pub dispatch_diagnostics: Option<HubDispatchDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registration_diagnostics: Vec<HubRouteRegistrationDiagnostic>,
     pub pending_recipients_available: bool,
     pub pending_recipients: Vec<HubRecipientPendingSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codex_queues: Vec<HubCodexRouteQueueStatus>,
+}
+
+/// Allowlist projection of [`fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubRouteRegistrationDiagnostic {
+    pub at: fl_core::at::At,
+    pub persona: String,
+    pub outcome: fl_wire::dispatch_diagnostics::RegistrationDiagnosticOutcome,
+    pub reason: fl_wire::dispatch_diagnostics::RegistrationConflictReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incumbent_adapter: Option<fl_wire::dispatch_diagnostics::RouteAdapter>,
+    pub challenger_adapter: fl_wire::dispatch_diagnostics::RouteAdapter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incumbent_hosted_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenger_hosted_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incumbent_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenger_generation: Option<String>,
+    pub replace: bool,
+}
+
+impl HubRouteRegistrationDiagnostic {
+    fn from_wire(diag: fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic) -> Self {
+        let fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic {
+            at,
+            persona,
+            outcome,
+            reason,
+            incumbent_adapter,
+            challenger_adapter,
+            incumbent_hosted_id,
+            challenger_hosted_id,
+            incumbent_generation,
+            challenger_generation,
+            replace,
+        } = diag.sanitized();
+        Self {
+            at,
+            persona,
+            outcome,
+            reason,
+            incumbent_adapter,
+            challenger_adapter,
+            incumbent_hosted_id,
+            challenger_hosted_id,
+            incumbent_generation,
+            challenger_generation,
+            replace,
+        }
+    }
 }
 
 /// Allowlist projection of [`fl_wire::daemon::CodexRouteQueueStatus`] (omits raw `thread_id`
@@ -1967,6 +2021,8 @@ pub struct HubRecipientPendingSummary {
     pub oldest_pending_at: Option<fl_core::at::At>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<fl_wire::daemon::PendingHoldReason>,
 }
 
 impl HubRecipientPendingSummary {
@@ -1976,12 +2032,14 @@ impl HubRecipientPendingSummary {
             pending_count,
             oldest_pending_at,
             oldest_pending_age_ms,
+            hold_reason,
         } = summary;
         Self {
             recipient,
             pending_count,
             oldest_pending_at,
             oldest_pending_age_ms,
+            hold_reason,
         }
     }
 }
@@ -2095,12 +2153,17 @@ impl HubWireStatusResponse {
             connected_peers: _,
             routes: _,
             dispatch_diagnostics,
+            registration_diagnostics,
             pending_recipients,
             codex_queues,
         } = status;
         Self {
             daemon: WireDaemonState::Active,
             dispatch_diagnostics: dispatch_diagnostics.map(HubDispatchDiagnostics::from_wire),
+            registration_diagnostics: registration_diagnostics
+                .into_iter()
+                .map(HubRouteRegistrationDiagnostic::from_wire)
+                .collect(),
             pending_recipients_available: true,
             pending_recipients: pending_recipients
                 .into_iter()
@@ -2148,14 +2211,43 @@ fn probe_wire_daemon(socket_path: PathBuf, timeout: Duration) -> WireDaemonProbe
         .unwrap_or(WireDaemonProbe::Unreachable)
 }
 
-fn store_pending_recipients(state: &HubState) -> Option<Vec<HubRecipientPendingSummary>> {
+fn load_hub_wire_route_table(state: &HubState) -> RouteTable {
+    if let Some(path) = crate::discovery::route_table_path(state.config.home_override.as_deref()) {
+        RouteTable::load(Some(&path))
+    } else if cfg!(test) {
+        RouteTable::default()
+    } else {
+        RouteTable::load(None)
+    }
+}
+
+fn store_pending_recipients_and_registration_diagnostics(
+    state: &HubState,
+) -> (
+    Option<Vec<HubRecipientPendingSummary>>,
+    Vec<HubRouteRegistrationDiagnostic>,
+) {
     let now = stamp::now();
-    state.open_store().ok().map(|store| {
-        fl_wire::daemon::collect_pending_recipient_summaries(&*store, &now)
-            .into_iter()
+    let routes_table = load_hub_wire_route_table(state);
+    let allow_probes =
+        fl_wire::identity::host_probes_allowed(state.config.home_override.as_deref());
+    let pending = state.open_store().ok().map(|store| {
+        let mut list = fl_wire::daemon::collect_pending_recipient_summaries(&*store, &now);
+        fl_wire::daemon::annotate_dead_explicit_pending_holds(
+            &mut list,
+            &routes_table,
+            allow_probes,
+        );
+        list.into_iter()
             .map(HubRecipientPendingSummary::from_wire)
             .collect()
-    })
+    });
+    let registration_diagnostics = routes_table
+        .registration_diagnostics
+        .into_iter()
+        .map(HubRouteRegistrationDiagnostic::from_wire)
+        .collect();
+    (pending, registration_diagnostics)
 }
 
 fn handle_get_wire_status(state: &HubState) -> HttpResponse {
@@ -2163,28 +2255,32 @@ fn handle_get_wire_status(state: &HubState) -> HttpResponse {
     let response = match probe_wire_daemon(socket_path, WIRE_STATUS_RPC_TIMEOUT) {
         WireDaemonProbe::Active(status) => HubWireStatusResponse::from_daemon_status(*status),
         WireDaemonProbe::Inactive => {
-            let (pending_recipients_available, pending_recipients) =
-                match store_pending_recipients(state) {
-                    Some(list) => (true, list),
-                    None => (false, Vec::new()),
-                };
+            let (pending_opt, registration_diagnostics) =
+                store_pending_recipients_and_registration_diagnostics(state);
+            let (pending_recipients_available, pending_recipients) = match pending_opt {
+                Some(list) => (true, list),
+                None => (false, Vec::new()),
+            };
             HubWireStatusResponse {
                 daemon: WireDaemonState::Inactive,
                 dispatch_diagnostics: None,
+                registration_diagnostics,
                 pending_recipients_available,
                 pending_recipients,
                 codex_queues: Vec::new(),
             }
         }
         WireDaemonProbe::Unreachable => {
-            let (pending_recipients_available, pending_recipients) =
-                match store_pending_recipients(state) {
-                    Some(list) => (true, list),
-                    None => (false, Vec::new()),
-                };
+            let (pending_opt, registration_diagnostics) =
+                store_pending_recipients_and_registration_diagnostics(state);
+            let (pending_recipients_available, pending_recipients) = match pending_opt {
+                Some(list) => (true, list),
+                None => (false, Vec::new()),
+            };
             HubWireStatusResponse {
                 daemon: WireDaemonState::Unreachable,
                 dispatch_diagnostics: None,
+                registration_diagnostics,
                 pending_recipients_available,
                 pending_recipients,
                 codex_queues: Vec::new(),
@@ -11319,6 +11415,7 @@ mod council_guidance_tests {
                     omitted_evidence_total: 0,
                     omitted_evidence_total_saturated: false,
                 }),
+                registration_diagnostics: vec![],
                 pending_recipients: vec![],
                 codex_queues: vec![],
             });
@@ -11358,11 +11455,13 @@ mod council_guidance_tests {
                 connected_peers: vec![],
                 routes: vec![],
                 dispatch_diagnostics: None,
+                registration_diagnostics: vec![],
                 pending_recipients: vec![RecipientPendingSummary {
                     recipient: "felix".into(),
                     pending_count: 2,
                     oldest_pending_at: Some(started_at),
                     oldest_pending_age_ms: Some(1500),
+                    hold_reason: None,
                 }],
                 codex_queues: vec![],
             });
@@ -11430,6 +11529,8 @@ mod council_guidance_tests {
                         updated_at: ts_for_status.clone(),
                         identity_at: None,
                         explicit: true,
+                        hosted_id: Some("antigravity:felix".into()),
+                        hydration_generation: Some("gen-1".into()),
                     },
                     RouteEntry {
                         persona: "ada".into(),
@@ -11442,6 +11543,8 @@ mod council_guidance_tests {
                         updated_at: ts_for_status.clone(),
                         identity_at: None,
                         explicit: false,
+                        hosted_id: None,
+                        hydration_generation: None,
                     },
                 ],
                 dispatch_diagnostics: Some(DispatchDiagnostics {
@@ -11492,11 +11595,29 @@ mod council_guidance_tests {
                     omitted_evidence_total: 0,
                     omitted_evidence_total_saturated: false,
                 }),
+                registration_diagnostics: vec![
+                    fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic {
+                        at: ts_for_status.clone(),
+                        persona: "felix".into(),
+                        outcome:
+                            fl_wire::dispatch_diagnostics::RegistrationDiagnosticOutcome::Refused,
+                        reason:
+                            fl_wire::dispatch_diagnostics::RegistrationConflictReason::ForeignHostedEnv,
+                        incumbent_adapter: Some(RouteAdapter::Agy),
+                        challenger_adapter: RouteAdapter::Claude,
+                        incumbent_hosted_id: Some("antigravity:felix".into()),
+                        challenger_hosted_id: Some("/secret/claude.sock".into()),
+                        incumbent_generation: Some("gen-1".into()),
+                        challenger_generation: Some("bad space SECRET_CSRF_TOKEN".into()),
+                        replace: false,
+                    },
+                ],
                 pending_recipients: vec![RecipientPendingSummary {
                     recipient: "felix".into(),
                     pending_count: 1,
                     oldest_pending_at: Some(ts_for_status),
                     oldest_pending_age_ms: Some(250),
+                    hold_reason: Some(fl_wire::daemon::PendingHoldReason::DeadExplicitRoute),
                 }],
                 codex_queues: vec![
                     fl_wire::daemon::CodexRouteQueueStatus {
@@ -11684,6 +11805,112 @@ mod council_guidance_tests {
         assert_eq!(
             body["codex_queues"][0]["queue"],
             json!({"state": "unsupported"})
+        );
+    }
+
+    #[test]
+    fn wire_status_dead_explicit_route_reports_dead_explicit_route_on_active_and_inactive_paths() {
+        use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+        use fl_wire::daemon::{DaemonConfig, spawn_daemon};
+        use fl_wire::identity::{RouteTable, VendorRoute};
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let (tmp, state) = wire_status_fixture();
+        let routes_path = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+        let mut table = RouteTable::default();
+        table.upsert_explicit_with_meta(
+            "feira",
+            VendorRoute::Claude {
+                pid: dead_pid,
+                session_id: "claude-dead-460".into(),
+                socket_path: PathBuf::from("/secret/dead-claude.sock"),
+                key_path: Some(PathBuf::from("/secret/dead-key")),
+            },
+            fl_core::at::At::from_unix_millis(1_700_000_000_100),
+            Some("claude:feira".into()),
+            Some("gen-1".into()),
+            false,
+        );
+        table.save(Some(&routes_path)).unwrap();
+
+        let store = state.open_store().unwrap();
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("feira".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "held mail".into(),
+                body: "waiting on dead explicit route".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: fl_core::at::At::from_unix_millis(1_700_000_000_500),
+            })
+            .unwrap();
+        drop(store);
+
+        // 1. Inactive daemon fallback annotates `hold_reason: "dead_explicit_route"` without leaking paths.
+        state.set_wire_socket(Some(tmp.path().join("inactive-wire.sock")));
+        let inactive_resp = get_wire_status(&state);
+        assert_eq!(inactive_resp.status, 200);
+        let inactive_raw = String::from_utf8(inactive_resp.body.clone()).unwrap();
+        assert!(!inactive_raw.contains("dead-claude.sock"), "{inactive_raw}");
+        assert!(!inactive_raw.contains("dead-key"), "{inactive_raw}");
+        let inactive_body = inactive_resp.json_value().unwrap();
+        assert_eq!(inactive_body["daemon"], "inactive");
+        assert_eq!(inactive_body["pending_recipients"][0]["recipient"], "feira");
+        assert_eq!(
+            inactive_body["pending_recipients"][0]["hold_reason"],
+            "dead_explicit_route"
+        );
+
+        // 2. Active daemon reports `dead_explicit_route` on both `pending_recipients` and `dispatch_diagnostics`.
+        let active_sock = tmp.path().join("active-dead-route.sock");
+        let store_arc =
+            std::sync::Arc::new(fl_store::open_store(&state.config.store_path).unwrap());
+        let mut daemon = spawn_daemon(
+            store_arc,
+            DaemonConfig {
+                node_id: "hub-test-node".into(),
+                host: "hub-test-host".into(),
+                socket_path: active_sock.clone(),
+                routes_path: Some(routes_path),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: vec![],
+            },
+        )
+        .unwrap();
+        state.set_wire_socket(Some(active_sock));
+        let active_resp = get_wire_status(&state);
+        daemon.stop();
+        assert_eq!(active_resp.status, 200);
+        let active_raw = String::from_utf8(active_resp.body.clone()).unwrap();
+        assert!(!active_raw.contains("dead-claude.sock"), "{active_raw}");
+        assert!(!active_raw.contains("dead-key"), "{active_raw}");
+        assert!(!active_raw.contains("\"routes\""), "{active_raw}");
+        let active_body = active_resp.json_value().unwrap();
+        assert_eq!(active_body["daemon"], "active");
+        assert_eq!(active_body["pending_recipients"][0]["recipient"], "feira");
+        assert_eq!(
+            active_body["pending_recipients"][0]["hold_reason"],
+            "dead_explicit_route"
+        );
+        assert_eq!(
+            active_body["dispatch_diagnostics"]["records"][0]["decisive_reason"],
+            "dead_explicit_route"
         );
     }
 }

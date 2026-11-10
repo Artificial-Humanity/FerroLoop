@@ -44,8 +44,10 @@ impl Env {
             .env("FL_TEST_SPINUP_NO_SPAWN", "1")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
+            .env_remove("AGENT_NAME")
             .env_remove("AGENT_HYDRATION_GENERATION")
             .env_remove("FL_HOSTED_ID")
+            .env_remove("ANTIGRAVITY_AGENT")
             .arg("--db")
             .arg(self.store());
         c

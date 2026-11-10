@@ -2181,6 +2181,8 @@ mod route_lookup {
                         updated_at: At::from_unix_millis(9000),
                         identity_at: initial_identity.clone(),
                         explicit: false,
+                        hosted_id: None,
+                        hydration_generation: None,
                     },
                 );
                 base.save(Some(&path)).unwrap();

@@ -37,6 +37,8 @@ impl Env {
             "FL_HUB_URL",
             "AGENT_PERSONA",
             "AGENT_NAME",
+            "FL_HOSTED_ID",
+            "AGENT_HYDRATION_GENERATION",
             "CLAUDECODE",
             "ANTIGRAVITY_AGENT",
             "CODEX_SANDBOX",

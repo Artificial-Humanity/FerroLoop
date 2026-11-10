@@ -14,6 +14,11 @@ use fl_core::store::AgentRegistry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::dispatch_diagnostics::{
+    MAX_REGISTRATION_DIAGNOSTICS, RegistrationConflictReason, RegistrationDiagnosticOutcome,
+    RouteAdapter, RouteRegistrationDiagnostic, sanitize_generation_token,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VendorRoute {
@@ -72,7 +77,95 @@ pub enum VendorRoute {
     Webhook { socket_path: PathBuf },
 }
 
+pub fn canonical_vendor_id(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("agy") || trimmed.eq_ignore_ascii_case("antigravity") {
+        "antigravity"
+    } else if trimmed.eq_ignore_ascii_case("claude") {
+        "claude"
+    } else if trimmed.eq_ignore_ascii_case("codex") {
+        "codex"
+    } else if trimmed.eq_ignore_ascii_case("muse") {
+        "muse"
+    } else if trimmed.eq_ignore_ascii_case("grok") {
+        "grok"
+    } else if trimmed.eq_ignore_ascii_case("lemonade") {
+        "lemonade"
+    } else if trimmed.eq_ignore_ascii_case("ollama") {
+        "ollama"
+    } else if trimmed.eq_ignore_ascii_case("host_cli") {
+        "host_cli"
+    } else if trimmed.eq_ignore_ascii_case("webhook") {
+        "webhook"
+    } else {
+        trimmed
+    }
+}
+
+fn is_known_hosted_vendor(vendor_lower: &str) -> bool {
+    PERSONA_DERIVED_VENDORS.contains(&vendor_lower)
+        || fl_core::lookup_vendor(vendor_lower).is_some()
+}
+
+/// Parse a `FL_HOSTED_ID` or hosted session identifier into `(canonical_vendor, normalized_persona)`.
+///
+/// Accepts `<vendor>:<persona>` (`"antigravity:feira"`, `"agy:feira"`, `"codex:fiona"`) as well as
+/// `<Persona>.<vendor>` (`"Feira.antigravity"`) and `"muse.<persona>"` (`"muse.ada"`). Fails closed
+/// (`Err`) on empty or malformed values.
+pub fn parse_hosted_identity(raw: &str) -> Result<(String, String), &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("hosted identity is empty");
+    }
+    if trimmed.contains(':') && trimmed.contains('.') {
+        return Err("hosted identity cannot mix ':' and '.' separators");
+    }
+    if let Some((vendor_raw, persona_raw)) = trimmed.split_once(':') {
+        if persona_raw.contains(':') {
+            return Err("malformed hosted identity");
+        }
+        let vendor_lower = vendor_raw.trim().to_ascii_lowercase();
+        if vendor_lower.is_empty() || !is_known_hosted_vendor(&vendor_lower) {
+            return Err("unknown vendor in hosted identity");
+        }
+        let persona = normalize_persona(persona_raw).ok_or("invalid persona in hosted identity")?;
+        return Ok((canonical_vendor_id(&vendor_lower).to_string(), persona));
+    }
+    if let Some((first_raw, second_raw)) = trimmed.split_once('.') {
+        if second_raw.contains('.') {
+            return Err("malformed hosted identity");
+        }
+        if first_raw.trim().eq_ignore_ascii_case("muse") {
+            let persona =
+                normalize_persona(second_raw).ok_or("invalid persona in hosted identity")?;
+            if persona == "muse" {
+                return Err("invalid Muse persona in hosted identity");
+            }
+            return Ok(("muse".to_string(), persona));
+        }
+        let vendor_lower = second_raw.trim().to_ascii_lowercase();
+        if vendor_lower.is_empty() || !is_known_hosted_vendor(&vendor_lower) {
+            return Err("unknown vendor in hosted identity");
+        }
+        let persona = normalize_persona(first_raw).ok_or("invalid persona in hosted identity")?;
+        return Ok((canonical_vendor_id(&vendor_lower).to_string(), persona));
+    }
+    Err("malformed hosted identity")
+}
+
 impl VendorRoute {
+    pub fn canonical_vendor(&self) -> &str {
+        match self {
+            Self::Claude { .. } => "claude",
+            Self::Agy { .. } => "antigravity",
+            Self::Codex { .. } => "codex",
+            Self::Muse { .. } => "muse",
+            Self::Grok { .. } => "grok",
+            Self::HostCli { vendor, .. } => canonical_vendor_id(vendor),
+            Self::Webhook { .. } => "webhook",
+        }
+    }
+
     pub fn session_identity(&self) -> Option<(&'static str, &str)> {
         let (kind, raw_id) = match self {
             Self::Claude { session_id, .. } => ("claude", session_id.as_str()),
@@ -99,6 +192,10 @@ pub struct RouteEntry {
     pub identity_at: Option<At>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub explicit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_generation: Option<String>,
 }
 
 impl RouteEntry {
@@ -176,6 +273,8 @@ impl PassiveAgyRevalidation {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteTable {
     pub entries: BTreeMap<String, RouteEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registration_diagnostics: Vec<RouteRegistrationDiagnostic>,
     /// When [`RouteTable::discover_routes`] last scanned this host; `None` until it has. Kept in
     /// memory only (never in the routes file), so a fresh process starts due for a scan.
     #[serde(skip)]
@@ -184,6 +283,25 @@ pub struct RouteTable {
     /// invalidation or identity-age normalization survives snapshot reconciliation.
     #[serde(skip)]
     passive_agy_revalidation: BTreeMap<String, PassiveAgyRevalidation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisterRouteCheckArgs {
+    pub persona: String,
+    pub route: VendorRoute,
+    pub explicit: bool,
+    pub replace: bool,
+    pub hosted_id: Option<String>,
+    pub hydration_generation: Option<String>,
+    pub hosted_session_verified: bool,
+    pub allow_host_probes: bool,
+    pub at: At,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisterRouteRefusal {
+    pub message: String,
+    pub diagnostic: Option<Box<RouteRegistrationDiagnostic>>,
 }
 
 /// Sidecar next to the route table. Rebuilt from hosted records that are still
@@ -644,8 +762,141 @@ pub fn agy_ls_address_listening(addr: &str) -> bool {
     TcpStream::connect_timeout(&target, Duration::from_millis(50)).is_ok()
 }
 
+/// True when `/proc/{pid}` exists and its process state is not `'Z'` (zombie).
+pub fn proc_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let proc_dir = Path::new("/proc").join(pid.to_string());
+    if !proc_dir.exists() {
+        return false;
+    }
+    if let Ok(stat) = fs::read_to_string(proc_dir.join("stat"))
+        && let Some(rparen) = stat.rfind(')')
+        && let Some(state) = stat[rparen + 1..].split_whitespace().next()
+    {
+        return state != "Z";
+    }
+    true
+}
+
 fn pid_alive(pid: u32) -> bool {
-    pid > 0 && Path::new(&format!("/proc/{pid}")).exists()
+    proc_alive(pid)
+}
+
+pub fn host_probes_allowed(home_override: Option<&Path>) -> bool {
+    home_override.is_none()
+        && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
+        && crate::dispatcher::host_discovery_allowed()
+}
+
+fn agy_host_session_running(persona: Option<&str>) -> bool {
+    let Some(norm) = persona.and_then(normalize_persona) else {
+        return false;
+    };
+    let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+        return false;
+    };
+    let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
+        return false;
+    };
+    let Ok(sessions) = client.list_sessions() else {
+        return false;
+    };
+    let mut cap = norm.clone();
+    if let Some(first) = cap.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    for target in [
+        format!("{cap}:antigravity"),
+        format!("{cap}:agy"),
+        format!("antigravity:{norm}"),
+        format!("agy:{norm}"),
+    ] {
+        if !crate::vendor_adapter::matching_live_host_sessions(&sessions, &target).is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Passive liveness check for an explicit route.
+///
+/// Never connects to Unix sockets (`Webhook` / `Claude` sockets are only checked via
+/// `symlink_metadata()`), and skips host TCP / `fl-host` / `tmux` probes whenever
+/// `allow_host_probes` is `false`.
+pub fn explicit_route_is_dead(
+    route: &VendorRoute,
+    persona: Option<&str>,
+    allow_host_probes: bool,
+) -> bool {
+    match route {
+        VendorRoute::Claude {
+            pid, socket_path, ..
+        } => {
+            if *pid > 0 {
+                !proc_alive(*pid)
+            } else {
+                !socket_path.as_os_str().is_empty() && socket_path.symlink_metadata().is_err()
+            }
+        }
+        VendorRoute::Agy {
+            ls_pid, ls_address, ..
+        } => {
+            if let Some(pid) = *ls_pid
+                && pid > 0
+            {
+                !proc_alive(pid)
+                    && (!allow_host_probes
+                        || ls_address
+                            .as_deref()
+                            .filter(|a| !a.trim().is_empty())
+                            .is_none_or(|addr| !agy_ls_address_listening(addr)))
+            } else if allow_host_probes {
+                let addr_dead = ls_address
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .is_some_and(|addr| !agy_ls_address_listening(addr));
+                addr_dead && !agy_host_session_running(persona)
+            } else {
+                false
+            }
+        }
+        VendorRoute::Webhook { socket_path } => {
+            !socket_path.as_os_str().is_empty() && socket_path.symlink_metadata().is_err()
+        }
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::HostCli {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => {
+            if !allow_host_probes {
+                return false;
+            }
+            let mut targets = [tmux_target.as_deref(), tmux_pane.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .peekable();
+            if targets.peek().is_none() {
+                return false;
+            }
+            !targets.any(crate::dispatcher::tmux_target_alive_passive)
+        }
+        VendorRoute::Codex { .. } => false,
+    }
 }
 
 fn agy_route_accepts_shared_endpoint(
@@ -845,6 +1096,12 @@ impl RouteTable {
                 }
                 v.explicit = true;
                 v.identity_at = None;
+                if v.hosted_id.is_none() {
+                    v.hosted_id = existing.hosted_id.clone();
+                }
+                if v.hydration_generation.is_none() {
+                    v.hydration_generation = existing.hydration_generation.clone();
+                }
             }
             if let Some((target_kind, target_id)) = v
                 .route
@@ -858,6 +1115,19 @@ impl RouteTable {
                         && !incoming_beats_incumbent(&v, existing, name == &k)
                     {
                         preserve_muse_tmux_fields(&mut existing.route, &v.route);
+                        if name == &k
+                            && existing.explicit
+                            && v.explicit
+                            && std::mem::discriminant(&existing.route)
+                                == std::mem::discriminant(&v.route)
+                        {
+                            if existing.hosted_id.is_none() {
+                                existing.hosted_id = v.hosted_id.clone();
+                            }
+                            if existing.hydration_generation.is_none() {
+                                existing.hydration_generation = v.hydration_generation.clone();
+                            }
+                        }
                         if name == &k && !existing.explicit && !v.explicit {
                             existing.identity_at = existing
                                 .identity_evidence_at()
@@ -874,9 +1144,33 @@ impl RouteTable {
                 if let Some(existing) = self.entries.get_mut(&k) {
                     if !incoming_beats_incumbent(&v, existing, true) {
                         preserve_muse_tmux_fields(&mut existing.route, &v.route);
+                        if existing.explicit
+                            && v.explicit
+                            && std::mem::discriminant(&existing.route)
+                                == std::mem::discriminant(&v.route)
+                        {
+                            if existing.hosted_id.is_none() {
+                                existing.hosted_id = v.hosted_id.clone();
+                            }
+                            if existing.hydration_generation.is_none() {
+                                existing.hydration_generation = v.hydration_generation.clone();
+                            }
+                        }
                         continue;
                     }
                     preserve_muse_tmux_fields(&mut v.route, &existing.route);
+                    if existing.explicit
+                        && v.explicit
+                        && std::mem::discriminant(&existing.route)
+                            == std::mem::discriminant(&v.route)
+                    {
+                        if v.hosted_id.is_none() {
+                            v.hosted_id = existing.hosted_id.clone();
+                        }
+                        if v.hydration_generation.is_none() {
+                            v.hydration_generation = existing.hydration_generation.clone();
+                        }
+                    }
                     if !existing.explicit
                         && !v.explicit
                         && existing.route.session_identity() == Some(target_sid)
@@ -901,6 +1195,18 @@ impl RouteTable {
                 match self.entries.get_mut(&k) {
                     Some(existing) if !incoming_beats_incumbent(&v, existing, true) => {
                         preserve_muse_tmux_fields(&mut existing.route, &v.route);
+                        if existing.explicit
+                            && v.explicit
+                            && std::mem::discriminant(&existing.route)
+                                == std::mem::discriminant(&v.route)
+                        {
+                            if existing.hosted_id.is_none() {
+                                existing.hosted_id = v.hosted_id.clone();
+                            }
+                            if existing.hydration_generation.is_none() {
+                                existing.hydration_generation = v.hydration_generation.clone();
+                            }
+                        }
                         if !existing.explicit && !v.explicit && existing.route == v.route {
                             if existing.identity_evidence_at().is_none() {
                                 existing.identity_at = v.identity_evidence_at().cloned();
@@ -910,6 +1216,18 @@ impl RouteTable {
                     }
                     Some(existing) => {
                         preserve_muse_tmux_fields(&mut v.route, &existing.route);
+                        if existing.explicit
+                            && v.explicit
+                            && std::mem::discriminant(&existing.route)
+                                == std::mem::discriminant(&v.route)
+                        {
+                            if v.hosted_id.is_none() {
+                                v.hosted_id = existing.hosted_id.clone();
+                            }
+                            if v.hydration_generation.is_none() {
+                                v.hydration_generation = existing.hydration_generation.clone();
+                            }
+                        }
                         self.entries.insert(k, v);
                     }
                     None => {
@@ -917,6 +1235,9 @@ impl RouteTable {
                     }
                 }
             }
+        }
+        for diag in other.registration_diagnostics {
+            self.push_registration_diagnostic(diag);
         }
     }
 
@@ -971,13 +1292,23 @@ impl RouteTable {
 
     fn load_file(path: &Path) -> Option<Self> {
         let raw = fs::read_to_string(path).ok()?;
-        if let Ok(table) = serde_json::from_str::<RouteTable>(&raw) {
+        if let Ok(mut table) = serde_json::from_str::<RouteTable>(&raw) {
+            table.registration_diagnostics = table
+                .registration_diagnostics
+                .into_iter()
+                .map(RouteRegistrationDiagnostic::sanitized)
+                .collect();
+            if table.registration_diagnostics.len() > MAX_REGISTRATION_DIAGNOSTICS {
+                let excess = table.registration_diagnostics.len() - MAX_REGISTRATION_DIAGNOSTICS;
+                table.registration_diagnostics.drain(0..excess);
+            }
             return Some(table);
         }
         // Also support flat map `{ "<persona>": RouteEntry }` or legacy agent-bus route map
         if let Ok(entries) = serde_json::from_str::<BTreeMap<String, RouteEntry>>(&raw) {
             return Some(RouteTable {
                 entries,
+                registration_diagnostics: Vec::new(),
                 last_discovery: None,
                 passive_agy_revalidation: BTreeMap::new(),
             });
@@ -1004,6 +1335,8 @@ impl RouteTable {
                             updated_at,
                             identity_at: None,
                             explicit: false,
+                            hosted_id: None,
+                            hydration_generation: None,
                         },
                     );
                 }
@@ -1011,12 +1344,137 @@ impl RouteTable {
             if !entries.is_empty() {
                 return Some(RouteTable {
                     entries,
+                    registration_diagnostics: Vec::new(),
                     last_discovery: None,
                     passive_agy_revalidation: BTreeMap::new(),
                 });
             }
         }
         None
+    }
+
+    pub fn push_registration_diagnostic(&mut self, diagnostic: RouteRegistrationDiagnostic) {
+        let diagnostic = diagnostic.sanitized();
+        let duplicate = self.registration_diagnostics.iter().any(|existing| {
+            existing.at == diagnostic.at
+                && existing.persona == diagnostic.persona
+                && existing.outcome == diagnostic.outcome
+                && existing.reason == diagnostic.reason
+                && existing.challenger_adapter == diagnostic.challenger_adapter
+                && existing.replace == diagnostic.replace
+        });
+        if !duplicate {
+            self.registration_diagnostics.push(diagnostic);
+        }
+        if self.registration_diagnostics.len() > MAX_REGISTRATION_DIAGNOSTICS {
+            let excess = self.registration_diagnostics.len() - MAX_REGISTRATION_DIAGNOSTICS;
+            self.registration_diagnostics.drain(0..excess);
+        }
+    }
+
+    pub fn register_route_checked(
+        &mut self,
+        args: RegisterRouteCheckArgs,
+    ) -> Result<Option<RouteRegistrationDiagnostic>, RegisterRouteRefusal> {
+        let Some(norm) = normalize_persona(&args.persona) else {
+            return Err(RegisterRouteRefusal {
+                message: format!("invalid persona name `{}`", args.persona),
+                diagnostic: None,
+            });
+        };
+        if !args.explicit {
+            self.upsert(&norm, args.route, args.at);
+            return Ok(None);
+        }
+        let new_hosted_id = args
+            .hosted_id
+            .as_deref()
+            .and_then(|raw| parse_hosted_identity(raw).ok())
+            .map(|(v, p)| format!("{v}:{p}"));
+        let new_generation = sanitize_generation_token(args.hydration_generation.as_deref());
+
+        let mut clear_existing_meta = false;
+        let mut recorded_diag: Option<RouteRegistrationDiagnostic> = None;
+
+        if let Some(incumbent) = self.entries.get(&norm)
+            && incumbent.explicit
+        {
+            let inc_hosted_id = incumbent
+                .hosted_id
+                .as_deref()
+                .and_then(|raw| parse_hosted_identity(raw).ok())
+                .map(|(v, p)| format!("{v}:{p}"));
+            let inc_generation =
+                sanitize_generation_token(incumbent.hydration_generation.as_deref());
+            let is_codex_same_vendor = matches!(incumbent.route, VendorRoute::Codex { .. })
+                && matches!(args.route, VendorRoute::Codex { .. });
+
+            let conflict_reason =
+                if incumbent.route.canonical_vendor() != args.route.canonical_vendor() {
+                    Some(RegistrationConflictReason::VendorMismatch)
+                } else if inc_generation.is_some()
+                    && new_generation.is_some()
+                    && inc_generation != new_generation
+                {
+                    Some(RegistrationConflictReason::HydrationGenerationMismatch)
+                } else if (inc_hosted_id.is_some()
+                    && new_hosted_id.is_some()
+                    && inc_hosted_id != new_hosted_id)
+                    || (inc_hosted_id.is_some() && new_hosted_id.is_none() && !is_codex_same_vendor)
+                {
+                    Some(RegistrationConflictReason::HostedIdentityMismatch)
+                } else {
+                    None
+                };
+
+            if let Some(reason) = conflict_reason {
+                clear_existing_meta = true;
+                if !explicit_route_is_dead(&incumbent.route, Some(&norm), args.allow_host_probes) {
+                    let inc_vendor = incumbent.route.canonical_vendor().to_string();
+                    let inc_adapter = RouteAdapter::from_route(&incumbent.route);
+                    let chal_adapter = RouteAdapter::from_route(&args.route);
+                    let outcome = if args.hosted_session_verified || args.replace {
+                        RegistrationDiagnosticOutcome::Replaced
+                    } else {
+                        RegistrationDiagnosticOutcome::Refused
+                    };
+                    let diag = RouteRegistrationDiagnostic {
+                        at: args.at.clone(),
+                        persona: norm.clone(),
+                        outcome,
+                        reason,
+                        incumbent_adapter: Some(inc_adapter),
+                        challenger_adapter: chal_adapter,
+                        incumbent_hosted_id: inc_hosted_id,
+                        challenger_hosted_id: new_hosted_id.clone(),
+                        incumbent_generation: inc_generation,
+                        challenger_generation: new_generation.clone(),
+                        replace: args.replace,
+                    }
+                    .sanitized();
+                    self.push_registration_diagnostic(diag.clone());
+                    if outcome == RegistrationDiagnosticOutcome::Refused {
+                        return Err(RegisterRouteRefusal {
+                            message: format!(
+                                "refused route registration for `{norm}` ({reason:?}): live explicit `{inc_vendor}` route is owned by incumbent session; pass --replace to override"
+                            ),
+                            diagnostic: Some(Box::new(diag)),
+                        });
+                    }
+                    recorded_diag = Some(diag);
+                }
+            }
+        }
+
+        self.upsert_explicit_with_meta(
+            &norm,
+            args.route,
+            args.at,
+            new_hosted_id,
+            new_generation,
+            clear_existing_meta,
+        );
+        Ok(recorded_diag)
     }
 
     pub fn save(&self, custom_path: Option<&Path>) -> std::io::Result<()> {
@@ -1065,7 +1523,28 @@ impl RouteTable {
 
     /// Register a route selected by the caller rather than discovered by a passive scan.
     pub fn upsert_explicit(&mut self, persona: &str, route: VendorRoute, at: At) {
-        self.upsert_inner(persona, route, at, None, true);
+        self.upsert_inner_with_meta(persona, route, at, None, true, None, None, false);
+    }
+
+    pub fn upsert_explicit_with_meta(
+        &mut self,
+        persona: &str,
+        route: VendorRoute,
+        at: At,
+        hosted_id: Option<String>,
+        hydration_generation: Option<String>,
+        clear_existing_meta: bool,
+    ) {
+        self.upsert_inner_with_meta(
+            persona,
+            route,
+            at,
+            None,
+            true,
+            hosted_id,
+            hydration_generation,
+            clear_existing_meta,
+        );
     }
 
     fn upsert_passive(&mut self, persona: &str, route: VendorRoute, at: At) {
@@ -1080,10 +1559,34 @@ impl RouteTable {
     fn upsert_inner(
         &mut self,
         persona: &str,
+        route: VendorRoute,
+        at: At,
+        identity_at: Option<At>,
+        requested_explicit: bool,
+    ) {
+        self.upsert_inner_with_meta(
+            persona,
+            route,
+            at,
+            identity_at,
+            requested_explicit,
+            None,
+            None,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_inner_with_meta(
+        &mut self,
+        persona: &str,
         mut route: VendorRoute,
         at: At,
         identity_at: Option<At>,
         requested_explicit: bool,
+        hosted_id: Option<String>,
+        hydration_generation: Option<String>,
+        clear_existing_meta: bool,
     ) {
         if let Some(norm) = normalize_persona(persona) {
             if !requested_explicit
@@ -1107,6 +1610,25 @@ impl RouteTable {
                 requested_explicit || existing.explicit
             } else {
                 requested_explicit
+            };
+            let normalized_hosted_id = hosted_id
+                .as_deref()
+                .and_then(|raw| parse_hosted_identity(raw).ok())
+                .map(|(v, p)| format!("{v}:{p}"));
+            let normalized_generation = sanitize_generation_token(hydration_generation.as_deref());
+            let (final_hosted_id, final_generation) = if !explicit {
+                (None, None)
+            } else if !clear_existing_meta
+                && let Some(existing) = self.entries.get(&norm)
+                && existing.explicit
+                && std::mem::discriminant(&existing.route) == std::mem::discriminant(&route)
+            {
+                (
+                    normalized_hosted_id.or_else(|| existing.hosted_id.clone()),
+                    normalized_generation.or_else(|| existing.hydration_generation.clone()),
+                )
+            } else {
+                (normalized_hosted_id, normalized_generation)
             };
             if let Some(existing) = self.entries.get(&norm) {
                 preserve_muse_tmux_fields(&mut route, &existing.route);
@@ -1138,6 +1660,8 @@ impl RouteTable {
                     updated_at: at,
                     identity_at,
                     explicit,
+                    hosted_id: final_hosted_id,
+                    hydration_generation: final_generation,
                 },
             );
         }
@@ -8670,6 +9194,8 @@ mod tests {
                 updated_at: At::from_unix_millis(500),
                 identity_at: None,
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         raw_routes.entries.insert(
@@ -8680,6 +9206,8 @@ mod tests {
                 updated_at: At::from_unix_millis(200),
                 identity_at: None,
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         let store = MemStore::default();
@@ -9983,6 +10511,8 @@ mod tests {
                         updated_at: At::from_unix_millis(500),
                         identity_at: initial_identity.map(At::from_unix_millis),
                         explicit: false,
+                        hosted_id: None,
+                        hydration_generation: None,
                     },
                 );
                 base.upsert_explicit(
@@ -10058,6 +10588,8 @@ mod tests {
                             updated_at: At::from_unix_millis(9000),
                             identity_at: initial_identity.map(At::from_unix_millis),
                             explicit: false,
+                            hosted_id: None,
+                            hydration_generation: None,
                         },
                     );
                     let mut working = base.clone();
@@ -10146,6 +10678,8 @@ mod tests {
                 updated_at: At::from_unix_millis(9000),
                 identity_at: Some(At::from_unix_millis(100)),
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         merge_incumbent.entries.insert(
@@ -10156,6 +10690,8 @@ mod tests {
                 updated_at: At::from_unix_millis(50),
                 identity_at: Some(At::from_unix_millis(50)),
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         let mut merge_challenger = RouteTable::default();
@@ -10167,6 +10703,8 @@ mod tests {
                 updated_at: At::from_unix_millis(9500),
                 identity_at: Some(At::from_unix_millis(100)),
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         merge_challenger.upsert(
@@ -10206,6 +10744,8 @@ mod tests {
                     updated_at: At::from_unix_millis(9000),
                     identity_at: hook_identity.clone(),
                     explicit: false,
+                    hosted_id: None,
+                    hydration_generation: None,
                 },
             );
             let mut newer_hook = RouteTable::default();
@@ -10217,6 +10757,8 @@ mod tests {
                     updated_at: At::from_unix_millis(9500),
                     identity_at: hook_identity.clone(),
                     explicit: false,
+                    hosted_id: None,
+                    hydration_generation: None,
                 },
             );
             for merge_mode in ["direct", "dispatch", "daemon"] {
@@ -10247,6 +10789,8 @@ mod tests {
                     updated_at: At::from_unix_millis(9000),
                     identity_at: hook_identity.clone(),
                     explicit: false,
+                    hosted_id: None,
+                    hydration_generation: None,
                 },
             );
             let mut tie_live = base.clone();
@@ -10374,6 +10918,8 @@ mod tests {
             updated_at: At::from_unix_millis(99_000),
             identity_at: None,
             explicit: false,
+            hosted_id: None,
+            hydration_generation: None,
         };
         let mut merge_unknown_inc = RouteTable::default();
         merge_unknown_inc
@@ -10430,6 +10976,8 @@ mod tests {
                 updated_at: At::from_unix_millis(200_000),
                 identity_at: None,
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         merge_none_a.merge_newer(merge_none_b);
@@ -10627,6 +11175,8 @@ mod tests {
                             updated_at: At::from_unix_millis(9000),
                             identity_at: Some(At::from_unix_millis(9000)),
                             explicit: false,
+                            hosted_id: None,
+                            hydration_generation: None,
                         },
                     );
                     table1.discover_routes(Some(&home), At::from_unix_millis(repaired_ms));
@@ -10715,6 +11265,8 @@ mod tests {
                             updated_at: At::from_unix_millis(9000),
                             identity_at: initial_identity.map(At::from_unix_millis),
                             explicit: false,
+                            hosted_id: None,
+                            hydration_generation: None,
                         },
                     );
                     let mut working = base.clone();
@@ -10766,6 +11318,8 @@ mod tests {
                             updated_at: At::from_unix_millis(9000),
                             identity_at: initial_identity.map(At::from_unix_millis),
                             explicit: false,
+                            hosted_id: None,
+                            hydration_generation: None,
                         },
                     );
                     let mut working = base.clone();
@@ -10840,6 +11394,8 @@ mod tests {
                 updated_at: At::from_unix_millis(9500),
                 identity_at: Some(At::from_unix_millis(100)),
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
         let mut newer_transcript = RouteTable::default();
@@ -10851,6 +11407,8 @@ mod tests {
                 updated_at: At::from_unix_millis(500),
                 identity_at: Some(At::from_unix_millis(500)),
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
 
@@ -10913,6 +11471,8 @@ mod tests {
                     updated_at: At::from_unix_millis(200),
                     identity_at: None,
                     explicit: true,
+                    hosted_id: None,
+                    hydration_generation: None,
                 },
             );
             table.discover_routes(Some(home), At::from_unix_millis(9000));
@@ -11035,6 +11595,8 @@ mod tests {
                 updated_at: At::from_unix_millis(8000),
                 identity_at: None,
                 explicit: false,
+                hosted_id: None,
+                hydration_generation: None,
             },
         );
 
@@ -11144,5 +11706,285 @@ mod tests {
             assert_eq!(winner_b.updated_at, At::from_unix_millis(6000));
             assert_eq!(winner_b.identity_at, None);
         }
+    }
+
+    #[test]
+    fn canonical_vendor_and_parse_hosted_identity_normalize_and_fail_closed() {
+        assert_eq!(agy_route("c1").canonical_vendor(), "antigravity");
+        assert_eq!(codex_route("t1").canonical_vendor(), "codex");
+        assert_eq!(
+            VendorRoute::Claude {
+                pid: 1,
+                session_id: "s1".into(),
+                socket_path: PathBuf::from("/tmp/c.sock"),
+                key_path: None,
+            }
+            .canonical_vendor(),
+            "claude"
+        );
+        assert_eq!(
+            VendorRoute::Muse {
+                session_id: "m1".into(),
+                cwd: None,
+                tmux_target: None,
+                tmux_pane: None,
+            }
+            .canonical_vendor(),
+            "muse"
+        );
+        assert_eq!(
+            VendorRoute::Grok {
+                session_id: "g1".into(),
+                cwd: None,
+                tmux_target: None,
+                tmux_pane: None,
+            }
+            .canonical_vendor(),
+            "grok"
+        );
+        assert_eq!(
+            VendorRoute::HostCli {
+                vendor: "AGY".into(),
+                session_id: "h1".into(),
+                cwd: None,
+                tmux_target: None,
+                tmux_pane: None,
+            }
+            .canonical_vendor(),
+            "antigravity"
+        );
+        assert_eq!(
+            VendorRoute::Webhook {
+                socket_path: PathBuf::from("/tmp/w.sock"),
+            }
+            .canonical_vendor(),
+            "webhook"
+        );
+
+        assert_eq!(
+            parse_hosted_identity("antigravity:feira"),
+            Ok(("antigravity".into(), "feira".into()))
+        );
+        assert_eq!(
+            parse_hosted_identity("agy:Feira"),
+            Ok(("antigravity".into(), "feira".into()))
+        );
+        assert_eq!(
+            parse_hosted_identity("codex:fiona"),
+            Ok(("codex".into(), "fiona".into()))
+        );
+        assert_eq!(
+            parse_hosted_identity("Feira.antigravity"),
+            Ok(("antigravity".into(), "feira".into()))
+        );
+        assert_eq!(
+            parse_hosted_identity("Feira.agy"),
+            Ok(("antigravity".into(), "feira".into()))
+        );
+        assert_eq!(
+            parse_hosted_identity("muse.Ada"),
+            Ok(("muse".into(), "ada".into()))
+        );
+
+        for invalid in [
+            "",
+            "   ",
+            "feira",
+            "unknown:feira",
+            "feira.unknown",
+            "claude:",
+            ":feira",
+            "claude:bad slug",
+            "claude:a:b",
+            "Feira.antigravity.extra",
+            "claude:feira.agy",
+            "muse.muse",
+        ] {
+            assert!(
+                parse_hosted_identity(invalid).is_err(),
+                "expected Err for malformed hosted identity `{invalid}`"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_route_is_dead_passive_checks_and_zero_io_codex() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let tmp = TempDir::new().unwrap();
+        let existing_sock = tmp.path().join("present.sock");
+        fs::write(&existing_sock, b"").unwrap();
+        let missing_sock = tmp.path().join("missing.sock");
+
+        let dead_claude = VendorRoute::Claude {
+            pid: dead_pid,
+            session_id: "s-dead".into(),
+            socket_path: existing_sock.clone(),
+            key_path: None,
+        };
+        assert!(explicit_route_is_dead(&dead_claude, Some("feira"), false));
+
+        let live_claude = VendorRoute::Claude {
+            pid: std::process::id(),
+            session_id: "s-live".into(),
+            socket_path: missing_sock.clone(),
+            key_path: None,
+        };
+        assert!(!explicit_route_is_dead(&live_claude, Some("feira"), false));
+
+        let dead_webhook = VendorRoute::Webhook {
+            socket_path: missing_sock,
+        };
+        assert!(explicit_route_is_dead(&dead_webhook, Some("feira"), false));
+        let present_webhook = VendorRoute::Webhook {
+            socket_path: existing_sock,
+        };
+        assert!(!explicit_route_is_dead(
+            &present_webhook,
+            Some("feira"),
+            false
+        ));
+
+        let dead_agy = VendorRoute::Agy {
+            conversation_id: "conv-dead".into(),
+            ls_pid: Some(dead_pid),
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert!(explicit_route_is_dead(&dead_agy, Some("feira"), false));
+
+        let hermetic_agy = agy_route("conv-hermetic");
+        assert!(!explicit_route_is_dead(&hermetic_agy, Some("feira"), false));
+
+        assert!(!explicit_route_is_dead(
+            &codex_route("SESSION_SECRET"),
+            Some("held"),
+            false
+        ));
+    }
+
+    #[test]
+    fn registration_guard_preserves_metadata_caps_diagnostics_and_guards_incumbent() {
+        let mut table = RouteTable::default();
+        let live_agy = VendorRoute::Agy {
+            conversation_id: "conv-live".into(),
+            ls_pid: Some(std::process::id()),
+            ls_address: None,
+            csrf_token: Some("SECRET_CSRF".into()),
+            agentapi_exe: None,
+        };
+        table
+            .register_route_checked(RegisterRouteCheckArgs {
+                persona: "Feira".into(),
+                route: live_agy.clone(),
+                explicit: true,
+                replace: true,
+                hosted_id: Some("Feira.agy".into()),
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: true,
+                allow_host_probes: false,
+                at: At::from_unix_millis(1000),
+            })
+            .unwrap();
+        let entry = table.get("feira").unwrap();
+        assert_eq!(entry.hosted_id.as_deref(), Some("antigravity:feira"));
+        assert_eq!(entry.hydration_generation.as_deref(), Some("gen-1"));
+
+        // Same-vendor explicit refresh without metadata preserves hosted_id + hydration_generation.
+        table.upsert_explicit(
+            "feira",
+            agy_route("conv-refreshed"),
+            At::from_unix_millis(1100),
+        );
+        let refreshed = table.get("feira").unwrap();
+        assert_eq!(refreshed.hosted_id.as_deref(), Some("antigravity:feira"));
+        assert_eq!(refreshed.hydration_generation.as_deref(), Some("gen-1"));
+
+        // Put back live_agy with live ls_pid so liveness check sees a live incumbent.
+        table
+            .register_route_checked(RegisterRouteCheckArgs {
+                persona: "feira".into(),
+                route: live_agy.clone(),
+                explicit: true,
+                replace: true,
+                hosted_id: Some("antigravity:feira".into()),
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: true,
+                allow_host_probes: false,
+                at: At::from_unix_millis(1200),
+            })
+            .unwrap();
+
+        // Cross-vendor unverified challenger without --replace is refused and recorded.
+        let refusal = table
+            .register_route_checked(RegisterRouteCheckArgs {
+                persona: "feira".into(),
+                route: VendorRoute::Claude {
+                    pid: std::process::id(),
+                    session_id: "spike-1".into(),
+                    socket_path: PathBuf::from("/tmp/SECRET_SOCK.sock"),
+                    key_path: Some(PathBuf::from("/tmp/SECRET_KEY")),
+                },
+                explicit: true,
+                replace: false,
+                hosted_id: None,
+                hydration_generation: None,
+                hosted_session_verified: false,
+                allow_host_probes: false,
+                at: At::from_unix_millis(1300),
+            })
+            .unwrap_err();
+        assert_eq!(
+            refusal.diagnostic.as_ref().map(|d| (d.outcome, d.reason)),
+            Some((
+                RegistrationDiagnosticOutcome::Refused,
+                RegistrationConflictReason::VendorMismatch
+            ))
+        );
+        assert_eq!(table.get("feira").unwrap().route, live_agy);
+
+        // Secret-free serialization and same_routes invariance + 64-cap FIFO eviction.
+        let baseline = {
+            let mut b = RouteTable::default();
+            b.upsert_explicit("feira", live_agy.clone(), At::from_unix_millis(1200));
+            b
+        };
+        assert!(table.same_routes(&baseline));
+
+        for idx in 0..70_u64 {
+            table.push_registration_diagnostic(RouteRegistrationDiagnostic {
+                at: At::from_unix_millis(2000 + idx),
+                persona: "Feira".into(),
+                outcome: RegistrationDiagnosticOutcome::Refused,
+                reason: RegistrationConflictReason::ForeignHostedEnv,
+                incumbent_adapter: Some(RouteAdapter::Agy),
+                challenger_adapter: RouteAdapter::Claude,
+                incumbent_hosted_id: Some("antigravity:feira".into()),
+                challenger_hosted_id: Some("/tmp/not-a-hosted-id".into()),
+                incumbent_generation: Some("gen-1".into()),
+                challenger_generation: Some("bad token with spaces".into()),
+                replace: false,
+            });
+        }
+        assert_eq!(
+            table.registration_diagnostics.len(),
+            MAX_REGISTRATION_DIAGNOSTICS
+        );
+        assert_eq!(
+            table.registration_diagnostics.first().unwrap().at,
+            At::from_unix_millis(2000 + 6)
+        );
+        let diag_json = serde_json::to_string(&table.registration_diagnostics).unwrap();
+        assert!(!diag_json.contains("SECRET_SOCK"));
+        assert!(!diag_json.contains("SECRET_KEY"));
+        assert!(!diag_json.contains("SECRET_CSRF"));
+        assert!(!diag_json.contains("/tmp/not-a-hosted-id"));
+        assert!(!diag_json.contains("bad token"));
     }
 }

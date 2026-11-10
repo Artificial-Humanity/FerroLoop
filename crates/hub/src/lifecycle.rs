@@ -2439,10 +2439,10 @@ pub fn record_hydration_ack<S: StateStore>(
     }
     let persona_lower = persona.trim().to_ascii_lowercase();
     if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
-        let Some((vendor, hid_persona)) = hid.split_once(':') else {
+        let Ok((_vendor, hid_persona)) = fl_wire::identity::parse_hosted_identity(hid) else {
             return Ok(false);
         };
-        if vendor.trim().is_empty() || !hid_persona.trim().eq_ignore_ascii_case(&persona_lower) {
+        if !hid_persona.eq_ignore_ascii_case(&persona_lower) {
             return Ok(false);
         }
     }
@@ -2461,7 +2461,9 @@ pub fn record_hydration_ack<S: StateStore>(
         return Ok(false);
     }
     let session_id = if let Some(hid) = hosted_id.map(str::trim).filter(|s| !s.is_empty()) {
-        hid.to_ascii_lowercase()
+        fl_wire::identity::parse_hosted_identity(hid)
+            .map(|(v, p)| format!("{v}:{p}"))
+            .unwrap_or_else(|_| hid.to_ascii_lowercase())
     } else {
         list_hosted_sessions(store)?
             .into_iter()
@@ -3144,7 +3146,7 @@ fn spawn_tmux_runtime(
     if session == MUSE_SESSION {
         return spawn_muse_window(window, cwd, launch, hosted_id);
     }
-    let args = tmux_new_session_args(session, window, cwd, launch);
+    let args = tmux_new_session_args_with_hosted_id(session, window, cwd, launch, hosted_id);
     tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
@@ -3171,7 +3173,7 @@ fn spawn_muse_window(
     if session_runs && listed_window_count(MUSE_SESSION, window) != Some(0) {
         return false;
     }
-    let args = tmux_muse_spawn_args(session_runs, window, cwd, launch);
+    let args = tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, hosted_id);
     let Some(out) = tmux_stdout(&args.iter().map(String::as_str).collect::<Vec<_>>()) else {
         return false;
     };
@@ -3196,41 +3198,77 @@ fn is_window_id(id: &str) -> bool {
 /// The tail every spawn shares: the working directory (when it is a directory), then with
 /// `launch` its environment and the command as an argument vector after `--` (tmux 3.2 and later
 /// run it without a shell).
-fn push_cwd_and_launch(args: &mut Vec<String>, cwd: Option<&str>, launch: Option<&LaunchSpec>) {
+fn push_cwd_and_launch_with_hosted_id(
+    args: &mut Vec<String>,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
+) {
     if let Some(dir) = cwd.filter(|d| Path::new(d).is_dir()) {
         args.extend(["-c".to_string(), dir.to_string()]);
     }
+    let has_hosted_env = launch.is_some_and(|l| l.env.iter().any(|(k, _)| k == "FL_HOSTED_ID"));
     if let Some(launch) = launch {
         for (key, value) in &launch.env {
             args.extend(["-e".to_string(), format!("{key}={value}")]);
         }
+    }
+    if !hosted_id.trim().is_empty() && !has_hosted_env {
+        args.extend([
+            "-e".to_string(),
+            format!("FL_HOSTED_ID={}", hosted_id.trim()),
+        ]);
+    }
+    if let Some(launch) = launch {
         args.push("--".to_string());
         args.extend(launch.argv.iter().cloned());
     }
 }
 
 /// The `tmux new-session` arguments: a detached session, and with `launch` the command.
+#[cfg(test)]
 fn tmux_new_session_args(
     session: &str,
     window: &str,
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
 ) -> Vec<String> {
+    tmux_new_session_args_with_hosted_id(session, window, cwd, launch, "")
+}
+
+fn tmux_new_session_args_with_hosted_id(
+    session: &str,
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
+) -> Vec<String> {
     let mut args: Vec<String> = ["new-session", "-d", "-s", session, "-n", window]
         .map(String::from)
         .into();
-    push_cwd_and_launch(&mut args, cwd, launch);
+    push_cwd_and_launch_with_hosted_id(&mut args, cwd, launch, hosted_id);
     args
 }
 
 /// The tmux arguments that open `window` in the shared Muse session: `new-window` into the
 /// session when it runs (`-t =muse:` is the session by exact name, the next free index), else
 /// `new-session`.
+#[cfg(test)]
 fn tmux_muse_spawn_args(
     session_runs: bool,
     window: &str,
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
+) -> Vec<String> {
+    tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, "")
+}
+
+fn tmux_muse_spawn_args_with_hosted_id(
+    session_runs: bool,
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
 ) -> Vec<String> {
     // `-P -F '#{window_id}'` prints the new window's id, to mark the window by.
     let mut args: Vec<String> = if session_runs {
@@ -3263,7 +3301,7 @@ fn tmux_muse_spawn_args(
         .map(String::from)
         .into()
     };
-    push_cwd_and_launch(&mut args, cwd, launch);
+    push_cwd_and_launch_with_hosted_id(&mut args, cwd, launch, hosted_id);
     args
 }
 

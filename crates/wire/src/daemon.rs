@@ -40,7 +40,7 @@ pub use crate::codex_control::{
 };
 use crate::dispatch_diagnostics::{
     DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
-    FenceDiagnostic, FenceReason, SuppressionPhase,
+    FenceDiagnostic, FenceReason, RouteRegistrationDiagnostic, SuppressionPhase,
 };
 use crate::dispatcher::dispatch_message_for_recipient_with_report;
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
@@ -250,6 +250,17 @@ pub enum LocalRequest {
         route: VendorRoute,
         #[serde(default)]
         explicit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hosted_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hydration_generation: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hosted_session_verified: bool,
+    },
+    RecordRegistrationDiagnostic {
+        diagnostic: RouteRegistrationDiagnostic,
     },
     UnregisterRoute {
         persona: String,
@@ -267,6 +278,20 @@ pub enum LocalRequest {
     Shutdown,
 }
 
+impl LocalRequest {
+    pub fn register(persona: impl Into<String>, route: VendorRoute, explicit: bool) -> Self {
+        Self::RegisterRoute {
+            persona: persona.into(),
+            route,
+            explicit,
+            replace: false,
+            hosted_id: None,
+            hydration_generation: None,
+            hosted_session_verified: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum LocalResponse {
@@ -281,6 +306,7 @@ pub enum LocalResponse {
         receipts: Vec<DeliveryReceipt>,
     },
     RouteRegistered,
+    RegistrationDiagnosticRecorded,
     RouteUnregistered,
     Subscribed,
     Status(DaemonStatus),
@@ -288,6 +314,14 @@ pub enum LocalResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingHoldReason {
+    DeadExplicitRoute,
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +332,30 @@ pub struct RecipientPendingSummary {
     pub oldest_pending_at: Option<At>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<PendingHoldReason>,
+}
+
+pub fn annotate_dead_explicit_pending_holds(
+    pending: &mut [RecipientPendingSummary],
+    routes: &RouteTable,
+    allow_host_probes: bool,
+) {
+    for row in pending {
+        if row.pending_count == 0 {
+            continue;
+        }
+        if let Some(entry) = routes.get(&row.recipient)
+            && entry.explicit
+            && crate::identity::explicit_route_is_dead(
+                &entry.route,
+                Some(&row.recipient),
+                allow_host_probes,
+            )
+        {
+            row.hold_reason = Some(PendingHoldReason::DeadExplicitRoute);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +368,8 @@ pub struct DaemonStatus {
     pub routes: Vec<RouteEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_diagnostics: Option<DispatchDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registration_diagnostics: Vec<RouteRegistrationDiagnostic>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_recipients: Vec<RecipientPendingSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -479,6 +539,7 @@ fn summarize_pending_map(
             pending_count: messages.len(),
             oldest_pending_at: oldest_ms.map(At::from_unix_millis),
             oldest_pending_age_ms: oldest_ms.map(|ms| now_ms.saturating_sub(ms)),
+            hold_reason: None,
         });
     }
     out
@@ -739,6 +800,7 @@ fn failure_reason(stage: FailureStage) -> FenceReason {
         FailureStage::MessageLookupError => FenceReason::MessageLookupError,
         FailureStage::InitialReceiptReadError => FenceReason::InitialReceiptReadError,
         FailureStage::TransportError => FenceReason::TransportError,
+        FailureStage::DeadExplicitRoute => FenceReason::DeadExplicitRoute,
         FailureStage::ReceiptWriteError => FenceReason::ReceiptWriteError,
         FailureStage::ReceiptWriteMissing => FenceReason::ReceiptWriteMissing,
         FailureStage::FinalReceiptReadError => FenceReason::FinalReceiptReadError,
@@ -953,8 +1015,24 @@ where
                 DispatchOutcome::NoRoute
             }
             _ => {
-                if receipt.is_some() {
-                    report.record_failure(FailureStage::UnresolvedReceiptStatus);
+                if receipt.is_some()
+                    && report.failure_stages.last() != Some(&FailureStage::DeadExplicitRoute)
+                {
+                    let allow_probes =
+                        crate::identity::host_probes_allowed(self.config.home_override.as_deref());
+                    let dead_explicit = lock(&self.routes).get(recipient).is_some_and(|entry| {
+                        entry.explicit
+                            && crate::identity::explicit_route_is_dead(
+                                &entry.route,
+                                Some(recipient),
+                                allow_probes,
+                            )
+                    });
+                    if dead_explicit {
+                        report.record_failure(FailureStage::DeadExplicitRoute);
+                    } else {
+                        report.record_failure(FailureStage::UnresolvedReceiptStatus);
+                    }
                 }
                 DispatchOutcome::Unconfirmed
             }
@@ -1451,17 +1529,21 @@ where
                     && (!matches!(
                         r.first_reason,
                         FenceReason::TransportError
+                            | FenceReason::DeadExplicitRoute
                             | FenceReason::UnresolvedReceiptStatus
                             | FenceReason::QueueOverflow
                     ) || !matches!(
                         r.decisive_reason,
                         FenceReason::TransportError
+                            | FenceReason::DeadExplicitRoute
                             | FenceReason::UnresolvedReceiptStatus
                             | FenceReason::QueueOverflow
                     ) || r.failure_stages.iter().any(|s| {
                         !matches!(
                             s,
-                            FailureStage::TransportError | FailureStage::UnresolvedReceiptStatus
+                            FailureStage::TransportError
+                                | FailureStage::DeadExplicitRoute
+                                | FailureStage::UnresolvedReceiptStatus
                         )
                     }) || r
                         .route_observations
@@ -1646,6 +1728,10 @@ where
                 persona,
                 route,
                 explicit,
+                replace,
+                hosted_id,
+                hydration_generation,
+                hosted_session_verified,
             } => {
                 let Some(norm) = normalize_persona(&persona) else {
                     return (
@@ -1663,6 +1749,8 @@ where
                     &DispatchReport::default(),
                 );
                 let mut first_holds = Vec::new();
+                let allow_probes =
+                    crate::identity::host_probes_allowed(self.config.home_override.as_deref());
                 // Publish a route only while ordered with persistence and backlog enqueue.
                 // Otherwise a concurrent send could overtake older pending messages.
                 let _order = lock(&self.enqueue_gate);
@@ -1700,7 +1788,27 @@ where
                     }
                     let before = routes.clone();
                     if explicit {
-                        routes.upsert_explicit(&persona, route, now.clone());
+                        if let Err(refusal) =
+                            routes.register_route_checked(crate::identity::RegisterRouteCheckArgs {
+                                persona: norm.clone(),
+                                route,
+                                explicit: true,
+                                replace,
+                                hosted_id,
+                                hydration_generation,
+                                hosted_session_verified,
+                                allow_host_probes: allow_probes,
+                                at: now.clone(),
+                            })
+                        {
+                            let _ = routes.save(self.config.routes_path.as_deref());
+                            return (
+                                LocalResponse::Error {
+                                    message: refusal.message,
+                                },
+                                None,
+                            );
+                        }
                     } else {
                         routes.upsert(&persona, route, now.clone());
                     }
@@ -1726,6 +1834,12 @@ where
                 log_first_holds(first_holds);
                 (LocalResponse::RouteRegistered, None)
             }
+            LocalRequest::RecordRegistrationDiagnostic { diagnostic } => {
+                let mut routes = lock(&self.routes);
+                routes.push_registration_diagnostic(diagnostic);
+                let _ = routes.save(self.config.routes_path.as_deref());
+                (LocalResponse::RegistrationDiagnosticRecorded, None)
+            }
             LocalRequest::UnregisterRoute { persona } => {
                 let Some(persona) = normalize_persona(&persona) else {
                     return (
@@ -1746,7 +1860,7 @@ where
                         },
                         None,
                     );
-                }
+                };
                 (LocalResponse::RouteUnregistered, None)
             }
             LocalRequest::Subscribe {
@@ -1769,10 +1883,42 @@ where
                     .values()
                     .map(|(label, _)| label.clone())
                     .collect();
-                let routes: Vec<RouteEntry> =
-                    lock(&self.routes).entries.values().cloned().collect();
-                let pending_recipients = self.pending_recipients_snapshot(&now);
-                let dispatch_diagnostics = Some(self.diagnostics_snapshot());
+                let routes_table = lock(&self.routes).clone();
+                let routes: Vec<RouteEntry> = routes_table.entries.values().cloned().collect();
+                let registration_diagnostics = routes_table.registration_diagnostics.clone();
+                let mut pending_recipients = self.pending_recipients_snapshot(&now);
+                let allow_probes =
+                    crate::identity::host_probes_allowed(self.config.home_override.as_deref());
+                annotate_dead_explicit_pending_holds(
+                    &mut pending_recipients,
+                    &routes_table,
+                    allow_probes,
+                );
+                let mut diag_snapshot = self.diagnostics_snapshot();
+                for row in &pending_recipients {
+                    if row.hold_reason != Some(PendingHoldReason::DeadExplicitRoute) {
+                        continue;
+                    }
+                    if let Some(existing) = diag_snapshot
+                        .records
+                        .iter_mut()
+                        .find(|r| r.recipient.as_deref() == Some(row.recipient.as_str()))
+                    {
+                        existing.decisive_reason = FenceReason::DeadExplicitRoute;
+                    } else if diag_snapshot.records.len() < 128 {
+                        let mut report = DispatchReport::default();
+                        report.record_failure(FailureStage::DeadExplicitRoute);
+                        diag_snapshot.records.push(FenceDiagnostic::from_report(
+                            &row.recipient,
+                            None,
+                            row.oldest_pending_at.clone().unwrap_or_else(|| now.clone()),
+                            SuppressionPhase::RetainedFence,
+                            FenceReason::DeadExplicitRoute,
+                            &report,
+                        ));
+                    }
+                }
+                let dispatch_diagnostics = Some(diag_snapshot);
                 // All daemon state mutexes are dropped before any store lookup or control-socket I/O.
                 let codex_queues = if include_codex_queues {
                     collect_codex_route_queues(
@@ -1793,6 +1939,7 @@ where
                         connected_peers,
                         routes,
                         dispatch_diagnostics,
+                        registration_diagnostics,
                         pending_recipients,
                         codex_queues,
                     }),
@@ -2957,14 +3104,14 @@ mod tests {
                 message_ids: vec![id.clone()],
             });
             assert!(matches!(response, LocalResponse::Acked { .. }));
-            let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "held".into(),
-                explicit: true,
-                route: VendorRoute::Codex {
+            let (response, _) = inner.handle_local_request(LocalRequest::register(
+                "held",
+                VendorRoute::Codex {
                     thread_id: "new-session".into(),
                     cwd: None,
                 },
-            });
+                true,
+            ));
             assert!(matches!(response, LocalResponse::RouteRegistered));
             assert_eq!(inner.diagnostics_snapshot(), first);
             let calls = TRANSPORT_CALLS.with(|n| n.get());
@@ -3167,14 +3314,14 @@ mod tests {
         }
         inner.fail_next_worker_spawn.store(true, Ordering::SeqCst);
         lock(&inner.store.calls).clear();
-        let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: " ALICE ".into(),
-            explicit: true,
-            route: VendorRoute::Codex {
+        let (response, _) = inner.handle_local_request(LocalRequest::register(
+            " ALICE ",
+            VendorRoute::Codex {
                 thread_id: "registration-session".into(),
                 cwd: None,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         assert!(lock(&inner.routes).get("alice").unwrap().explicit);
         assert_eq!(
@@ -3555,13 +3702,13 @@ mod tests {
         let socket = rig._tmp.path().join("overflow.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "overflow".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "overflow",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut received = Vec::new();
@@ -3636,13 +3783,13 @@ mod tests {
         let socket = rig._tmp.path().join("limited.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "limited".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "limited",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut received = Vec::new();
@@ -3696,13 +3843,13 @@ mod tests {
         let inner = Arc::clone(&rig.inner);
         let register = std::thread::spawn(move || {
             inner
-                .handle_local_request(LocalRequest::RegisterRoute {
-                    persona: "register-race".into(),
-                    explicit: true,
-                    route: VendorRoute::Webhook {
+                .handle_local_request(LocalRequest::register(
+                    "register-race",
+                    VendorRoute::Webhook {
                         socket_path: socket,
                     },
-                })
+                    true,
+                ))
                 .0
         });
         locked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -4188,13 +4335,13 @@ mod tests {
         );
         let mut client = LocalClient::connect(&daemon_socket, Duration::from_secs(2)).unwrap();
         client
-            .request(&LocalRequest::RegisterRoute {
-                persona: "slow".into(),
-                explicit: true,
-                route: VendorRoute::Webhook {
+            .request(&LocalRequest::register(
+                "slow",
+                VendorRoute::Webhook {
                     socket_path: tmp.path().join("saved-route.sock"),
                 },
-            })
+                true,
+            ))
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(
@@ -4224,13 +4371,13 @@ mod tests {
         let socket = rig._tmp.path().join("late-route.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "new-route".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "new-route",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         std::thread::sleep(Duration::from_millis(100));
         assert!(
@@ -4259,13 +4406,13 @@ mod tests {
         let socket = rig._tmp.path().join("racing-route.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "racing-route".into(),
-            explicit: true,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "racing-route",
+            VendorRoute::Webhook {
                 socket_path: socket,
             },
-        });
+            true,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         resume_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -4353,14 +4500,14 @@ mod tests {
             let (send, _) = inner.handle_local_request(LocalRequest::Send {
                 args: mail("other", "independent"),
             });
-            let (register, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "third".into(),
-                explicit: true,
-                route: VendorRoute::Codex {
+            let (register, _) = inner.handle_local_request(LocalRequest::register(
+                "third",
+                VendorRoute::Codex {
                     thread_id: "thread".into(),
                     cwd: None,
                 },
-            });
+                true,
+            ));
             done_tx.send((send, register)).unwrap();
         });
         let answer = done_rx.recv_timeout(Duration::from_secs(1));
@@ -4379,14 +4526,14 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "new-persona".into(),
-                route: VendorRoute::Codex {
+            inner.handle_local_request(LocalRequest::register(
+                "new-persona",
+                VendorRoute::Codex {
                     thread_id: "test".into(),
                     cwd: None,
                 },
-                explicit: true,
-            })
+                true,
+            ))
         });
         started_rx.recv().unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
@@ -4519,13 +4666,13 @@ mod tests {
         let path = rig._tmp.path().join("routes-b.json");
         assert!(rig.inner.routes.lock().unwrap().entries.is_empty());
         assert!(!path.exists());
-        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "synthetic-route-owner".into(),
-            explicit: false,
-            route: VendorRoute::Webhook {
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "synthetic-route-owner",
+            VendorRoute::Webhook {
                 socket_path: rig._tmp.path().join("hook.sock"),
             },
-        });
+            false,
+        ));
         assert!(matches!(response, LocalResponse::RouteRegistered));
         // The registration reached the rig's own file, and `RouteTable::load(None)` / `save(None)`
         // (the real machine table) would have panicked above: they refuse under test.
@@ -4540,14 +4687,14 @@ mod tests {
     fn explicit_registration_and_unregister_update_the_live_and_saved_table() {
         let rig = rig();
         let path = rig._tmp.path().join("routes-b.json");
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Codex {
                 thread_id: "new".into(),
                 cwd: None,
             },
-            explicit: true,
-        });
+            true,
+        ));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
         assert!(lock(&rig.inner.routes).get("ada").unwrap().explicit);
         assert!(RouteTable::load(Some(&path)).get("ada").unwrap().explicit);
@@ -4568,22 +4715,20 @@ mod tests {
             thread_id: "current".into(),
             cwd: None,
         };
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: route.clone(),
-            explicit: true,
-        });
+        let (reply, _) =
+            rig.inner
+                .handle_local_request(LocalRequest::register("ada", route.clone(), true));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Muse {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Muse {
                 session_id: "old".into(),
                 cwd: None,
                 tmux_target: None,
                 tmux_pane: None,
             },
-            explicit: false,
-        });
+            false,
+        ));
         assert!(matches!(reply, LocalResponse::Error { .. }));
         assert_eq!(lock(&rig.inner.routes).get("ada").unwrap().route, route);
     }
@@ -4591,32 +4736,32 @@ mod tests {
     #[test]
     fn a_passive_alias_cannot_claim_an_explicit_session_but_same_vendor_refresh_works() {
         let rig = rig();
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Codex {
                 thread_id: "current".into(),
                 cwd: None,
             },
-            explicit: true,
-        });
+            true,
+        ));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "old-alias".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "old-alias",
+            VendorRoute::Codex {
                 thread_id: "current".into(),
                 cwd: None,
             },
-            explicit: false,
-        });
+            false,
+        ));
         assert!(matches!(reply, LocalResponse::Error { .. }));
-        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "ada".into(),
-            route: VendorRoute::Codex {
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "ada",
+            VendorRoute::Codex {
                 thread_id: "refreshed".into(),
                 cwd: None,
             },
-            explicit: false,
-        });
+            false,
+        ));
         assert!(matches!(reply, LocalResponse::RouteRegistered));
         let routes = lock(&rig.inner.routes);
         let entry = routes.get("ada").unwrap();
@@ -5086,16 +5231,16 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         };
-        request(LocalRequest::RegisterRoute {
-            persona: "lmcfarlin-e6".into(),
-            explicit: false,
-            route: VendorRoute::Claude {
+        request(LocalRequest::register(
+            "lmcfarlin-e6",
+            VendorRoute::Claude {
                 pid: 4242,
                 session_id: "s-derived".into(),
                 socket_path: tmp.path().join("claude.sock"),
                 key_path: None,
             },
-        });
+            false,
+        ));
         assert_eq!(status_personas(), vec!["lmcfarlin-e6"]);
 
         // Any send runs a dispatch. With a home override every dispatch discovers (in production
@@ -5113,14 +5258,14 @@ mod tests {
             "the pruned route must not linger in Status"
         );
         // The next RegisterRoute saves the live table; the pruned route must not come back.
-        request(LocalRequest::RegisterRoute {
-            persona: "other".into(),
-            explicit: false,
-            route: VendorRoute::Codex {
+        request(LocalRequest::register(
+            "other",
+            VendorRoute::Codex {
                 thread_id: "t".into(),
                 cwd: None,
             },
-        });
+            false,
+        ));
         let saved = fs::read_to_string(&routes_file).unwrap();
         assert!(saved.contains("other"), "{saved}");
         assert!(!saved.contains("lmcfarlin-e6"), "{saved}");
@@ -5158,14 +5303,14 @@ mod tests {
         let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
 
         let mut reg = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
-        reg.request(&LocalRequest::RegisterRoute {
-            persona: "synthetic-recipient".into(),
-            explicit: false,
-            route: VendorRoute::Codex {
+        reg.request(&LocalRequest::register(
+            "synthetic-recipient",
+            VendorRoute::Codex {
                 thread_id: "t1".into(),
                 cwd: None,
             },
-        })
+            false,
+        ))
         .unwrap();
 
         let send_sock = sock.clone();
@@ -5199,13 +5344,13 @@ mod tests {
         // The daemon serves one request per connection.
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         probe
-            .request(&LocalRequest::RegisterRoute {
-                persona: "other".into(),
-                explicit: false,
-                route: VendorRoute::Webhook {
+            .request(&LocalRequest::register(
+                "other",
+                VendorRoute::Webhook {
                     socket_path: other_socket,
                 },
-            })
+                false,
+            ))
             .unwrap();
         let mut other = LocalClient::connect(&sock, Duration::from_secs(1)).unwrap();
         other
@@ -5270,14 +5415,14 @@ mod tests {
         let _daemon = spawn_daemon(store, cfg).unwrap();
         LocalClient::connect(&sock, Duration::from_secs(2))
             .unwrap()
-            .request(&LocalRequest::RegisterRoute {
-                persona: "synthetic-recipient".into(),
-                explicit: false,
-                route: VendorRoute::Codex {
+            .request(&LocalRequest::register(
+                "synthetic-recipient",
+                VendorRoute::Codex {
                     thread_id: "t".into(),
                     cwd: None,
                 },
-            })
+                false,
+            ))
             .unwrap();
         for subject in ["first", "second"] {
             LocalClient::connect(&sock, Duration::from_secs(2))
@@ -5391,11 +5536,7 @@ mod tests {
         ] {
             LocalClient::connect(&sock, Duration::from_secs(2))
                 .unwrap()
-                .request(&LocalRequest::RegisterRoute {
-                    persona: persona.into(),
-                    explicit: false,
-                    route,
-                })
+                .request(&LocalRequest::register(persona, route, false))
                 .unwrap();
         }
         let mut args = mail("slow", "broadcast");
@@ -6059,11 +6200,9 @@ mod tests {
                 },
             ),
         ] {
-            let (resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: persona.into(),
-                route,
-                explicit: true,
-            });
+            let (resp, _) = rig
+                .inner
+                .handle_local_request(LocalRequest::register(persona, route, true));
             assert!(matches!(resp, LocalResponse::RouteRegistered));
         }
 
@@ -6149,13 +6288,13 @@ mod tests {
 
         // Prove no daemon state lock is held while Status waits on the control socket:
         // mutating route table, enqueue_gate, and diagnostics all complete promptly.
-        let (reg_resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
-            persona: "concurrent".into(),
-            route: VendorRoute::Webhook {
+        let (reg_resp, _) = rig.inner.handle_local_request(LocalRequest::register(
+            "concurrent",
+            VendorRoute::Webhook {
                 socket_path: rig._tmp.path().join("concurrent.sock"),
             },
-            explicit: true,
-        });
+            true,
+        ));
         assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
         let (unreg_resp, _) = rig
             .inner
@@ -6341,14 +6480,14 @@ mod tests {
 
         let mut reg = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
         let reg_resp = reg
-            .request(&LocalRequest::RegisterRoute {
-                persona: "felix".into(),
-                route: VendorRoute::Codex {
+            .request(&LocalRequest::register(
+                "felix",
+                VendorRoute::Codex {
                     thread_id: "thread-felix".into(),
                     cwd: None,
                 },
-                explicit: true,
-            })
+                true,
+            ))
             .unwrap();
         assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
 
@@ -6388,5 +6527,166 @@ mod tests {
             0,
             "non-opt-in Status must open zero connections on Codex control socket"
         );
+    }
+
+    #[test]
+    fn register_route_and_diagnostics_two_way_wire_compatibility() {
+        use crate::dispatch_diagnostics::{
+            RegistrationConflictReason, RegistrationDiagnosticOutcome, RouteAdapter,
+        };
+        use serde_json::json;
+
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum LegacyLocalRequest {
+            RegisterRoute {
+                persona: String,
+                route: VendorRoute,
+                #[serde(default)]
+                explicit: bool,
+            },
+        }
+
+        let new_req = LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "t-compat".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace: true,
+            hosted_id: Some("codex:feira".into()),
+            hydration_generation: Some("gen-2".into()),
+            hosted_session_verified: true,
+        };
+        let encoded = serde_json::to_string(&new_req).unwrap();
+        let legacy_decoded: LegacyLocalRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            legacy_decoded,
+            LegacyLocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "t-compat".into(),
+                    cwd: None,
+                },
+                explicit: true,
+            }
+        );
+
+        let rig = rig();
+        let diag = RouteRegistrationDiagnostic {
+            at: At::from_unix_millis(5000),
+            persona: "Feira".into(),
+            outcome: RegistrationDiagnosticOutcome::Refused,
+            reason: RegistrationConflictReason::ForeignHostedEnv,
+            incumbent_adapter: Some(RouteAdapter::Agy),
+            challenger_adapter: RouteAdapter::Claude,
+            incumbent_hosted_id: Some("antigravity:feira".into()),
+            challenger_hosted_id: Some("antigravity:feira".into()),
+            incumbent_generation: Some("g1".into()),
+            challenger_generation: None,
+            replace: false,
+        };
+        let (resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::RecordRegistrationDiagnostic { diagnostic: diag });
+        assert!(matches!(
+            resp,
+            LocalResponse::RegistrationDiagnosticRecorded
+        ));
+
+        let (LocalResponse::Status(status), _) =
+            rig.inner.handle_local_request(LocalRequest::Status {
+                include_codex_queues: false,
+            })
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(status.registration_diagnostics.len(), 1);
+        assert_eq!(status.registration_diagnostics[0].persona, "feira");
+
+        let future_diag_json = json!({
+            "at": status.registration_diagnostics[0].at,
+            "persona": "feira",
+            "outcome": "future_outcome",
+            "reason": "future_reason",
+            "challenger_adapter": "claude",
+            "replace": false,
+        });
+        let future_diag: RouteRegistrationDiagnostic =
+            serde_json::from_value(future_diag_json).unwrap();
+        assert_eq!(
+            future_diag.outcome,
+            RegistrationDiagnosticOutcome::Unsupported
+        );
+        assert_eq!(future_diag.reason, RegistrationConflictReason::Unsupported);
+    }
+
+    #[test]
+    fn dead_explicit_route_with_held_mail_reports_dead_explicit_route_in_daemon_status() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let rig = rig();
+        let dead_route = VendorRoute::Claude {
+            pid: dead_pid,
+            session_id: "s-dead".into(),
+            socket_path: rig._tmp.path().join("missing-claude.sock"),
+            key_path: None,
+        };
+        let (reg_resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::register("feira", dead_route, true));
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        let (sent_resp, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("feira", "held behind dead explicit route"),
+        });
+        assert!(matches!(sent_resp, LocalResponse::Sent { .. }));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            let (LocalResponse::Status(st), _) =
+                rig.inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
+            else {
+                panic!("expected Status");
+            };
+            let settled = st
+                .dispatch_diagnostics
+                .as_ref()
+                .is_some_and(|d| !d.records.is_empty());
+            if settled || Instant::now() >= deadline {
+                break st;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let pending = status
+            .pending_recipients
+            .iter()
+            .find(|p| p.recipient == "feira")
+            .expect("feira pending summary");
+        assert_eq!(pending.pending_count, 1);
+        assert_eq!(
+            pending.hold_reason,
+            Some(PendingHoldReason::DeadExplicitRoute)
+        );
+
+        let diag = status
+            .dispatch_diagnostics
+            .as_ref()
+            .and_then(|d| {
+                d.records
+                    .iter()
+                    .find(|r| r.recipient.as_deref() == Some("feira"))
+            })
+            .expect("feira fence diagnostic");
+        assert_eq!(diag.decisive_reason, FenceReason::DeadExplicitRoute);
     }
 }

@@ -9,6 +9,7 @@ use crate::identity::{RouteEntry, VendorRoute, normalize_persona};
 
 const MAX_FAILURE_STAGES: usize = 4;
 const MAX_ROUTE_OBSERVATIONS: usize = 2;
+pub const MAX_REGISTRATION_DIAGNOSTICS: usize = 64;
 
 /// Read-only evidence from this daemon instance. Restart loses this evidence;
 /// that loss does not establish that retrying a delivery would be safe.
@@ -50,6 +51,7 @@ pub enum FailureStage {
     MessageLookupError,
     InitialReceiptReadError,
     TransportError,
+    DeadExplicitRoute,
     ReceiptWriteError,
     ReceiptWriteMissing,
     FinalReceiptReadError,
@@ -66,6 +68,7 @@ pub enum FenceReason {
     MessageLookupError,
     InitialReceiptReadError,
     TransportError,
+    DeadExplicitRoute,
     ReceiptWriteError,
     ReceiptWriteMissing,
     FinalReceiptReadError,
@@ -95,6 +98,109 @@ pub enum RouteAdapter {
     Grok,
     HostCli,
     Webhook,
+}
+
+impl RouteAdapter {
+    pub fn from_route(route: &VendorRoute) -> Self {
+        match route {
+            VendorRoute::Claude { .. } => Self::Claude,
+            VendorRoute::Agy { .. } => Self::Agy,
+            VendorRoute::Codex { .. } => Self::Codex,
+            VendorRoute::Muse { .. } => Self::Muse,
+            VendorRoute::Grok { .. } => Self::Grok,
+            VendorRoute::HostCli { .. } => Self::HostCli,
+            VendorRoute::Webhook { .. } => Self::Webhook,
+        }
+    }
+
+    pub fn from_vendor_str(vendor: &str) -> Self {
+        match vendor.trim().to_ascii_lowercase().as_str() {
+            "claude" => Self::Claude,
+            "agy" | "antigravity" => Self::Agy,
+            "codex" => Self::Codex,
+            "muse" => Self::Muse,
+            "grok" => Self::Grok,
+            "webhook" => Self::Webhook,
+            _ => Self::HostCli,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationDiagnosticOutcome {
+    Refused,
+    Replaced,
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationConflictReason {
+    ForeignHostedEnv,
+    VendorMismatch,
+    HostedIdentityMismatch,
+    HydrationGenerationMismatch,
+    #[serde(other)]
+    Unsupported,
+}
+
+/// Bounded, secret-free observation of a refused or replaced explicit route registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteRegistrationDiagnostic {
+    pub at: At,
+    pub persona: String,
+    pub outcome: RegistrationDiagnosticOutcome,
+    pub reason: RegistrationConflictReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incumbent_adapter: Option<RouteAdapter>,
+    pub challenger_adapter: RouteAdapter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incumbent_hosted_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenger_hosted_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incumbent_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenger_generation: Option<String>,
+    pub replace: bool,
+}
+
+pub fn sanitize_generation_token(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+impl RouteRegistrationDiagnostic {
+    pub fn sanitized(mut self) -> Self {
+        self.persona =
+            normalize_persona(&self.persona).unwrap_or_else(|| "invalid-persona".to_string());
+        self.incumbent_hosted_id = self
+            .incumbent_hosted_id
+            .as_deref()
+            .and_then(|raw| crate::identity::parse_hosted_identity(raw).ok())
+            .map(|(v, p)| format!("{v}:{p}"));
+        self.challenger_hosted_id = self
+            .challenger_hosted_id
+            .as_deref()
+            .and_then(|raw| crate::identity::parse_hosted_identity(raw).ok())
+            .map(|(v, p)| format!("{v}:{p}"));
+        self.incumbent_generation = sanitize_generation_token(self.incumbent_generation.as_deref());
+        self.challenger_generation =
+            sanitize_generation_token(self.challenger_generation.as_deref());
+        self
+    }
 }
 
 /// A safe projection of a snapshot actually passed to route dispatch. This
@@ -180,15 +286,7 @@ impl DispatchReport {
         }
         let slot = self.route_observations.len();
         self.route_observations.push(RouteDispatchObservation {
-            adapter: match &entry.route {
-                VendorRoute::Claude { .. } => RouteAdapter::Claude,
-                VendorRoute::Agy { .. } => RouteAdapter::Agy,
-                VendorRoute::Codex { .. } => RouteAdapter::Codex,
-                VendorRoute::Muse { .. } => RouteAdapter::Muse,
-                VendorRoute::Grok { .. } => RouteAdapter::Grok,
-                VendorRoute::HostCli { .. } => RouteAdapter::HostCli,
-                VendorRoute::Webhook { .. } => RouteAdapter::Webhook,
-            },
+            adapter: RouteAdapter::from_route(&entry.route),
             identity_digest: entry.route.session_identity().map(|(adapter, identity)| {
                 framed_digest(b"fl-wire-route-snapshot-v1\0", &[adapter, identity])
             }),
@@ -381,6 +479,8 @@ mod tests {
             updated_at: At::from_unix_millis(123),
             identity_at: None,
             explicit: true,
+            hosted_id: None,
+            hydration_generation: None,
         }
     }
 
