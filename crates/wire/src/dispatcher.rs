@@ -2422,7 +2422,7 @@ pub fn host_write_text_then_enter(
     text: &str,
 ) -> Result<(), String> {
     let trimmed = text.trim();
-    let transcript = MuseTranscriptTracker::capture(stream.session.as_str(), None, false);
+    let mut transcript = MuseTranscriptTracker::capture(stream.session.as_str(), None, false);
     let client_cell = std::cell::RefCell::new(client);
     if !trimmed.is_empty() {
         let is_pty = client_cell
@@ -2445,12 +2445,7 @@ pub fn host_write_text_then_enter(
                     .borrow_mut()
                     .capture_rendered(stream.clone())
                     .ok()
-                    .map(|screen| {
-                        (
-                            screen.contents,
-                            Some((screen.cursor_row, screen.cursor_col)),
-                        )
-                    })
+                    .map(|screen| RenderedCursorScreen::from_host(screen).into_parts())
             },
             || transcript.confirmed(trimmed),
             || {
@@ -2464,8 +2459,12 @@ pub fn host_write_text_then_enter(
                 Ok(())
             },
         )?;
-        if prep == PrePasteOutcome::AlreadySubmittedTarget {
-            return Ok(());
+        match prep {
+            PrePasteOutcome::AlreadySubmittedTarget => return Ok(()),
+            PrePasteOutcome::FlushedEarlierProceedToPaste => {
+                transcript = MuseTranscriptTracker::capture(stream.session.as_str(), None, false);
+            }
+            PrePasteOutcome::CleanProceedToPaste => {}
         }
     }
     if !text.is_empty() {
@@ -2497,10 +2496,7 @@ pub fn host_write_text_then_enter(
             client
                 .capture_rendered(stream.clone())
                 .map(|screen| {
-                    ScreenCapture::rendered_with_cursor(
-                        screen.contents,
-                        (screen.cursor_row, screen.cursor_col),
-                    )
+                    ScreenCapture::from_rendered_screen(RenderedCursorScreen::from_host(screen))
                 })
                 .ok()
                 .or_else(|| {
@@ -2547,18 +2543,76 @@ const MAX_PAYLOAD_PROBE_CHARS: usize = 36;
 const MIN_SUBSTRING_PROBE_CHARS: usize = 8;
 const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorState {
+    row: u16,
+    col: u16,
+    dims: Option<(u16, u16)>,
+}
+
+impl CursorState {
+    #[cfg(test)]
+    const fn new(row: u16, col: u16) -> Self {
+        Self {
+            row,
+            col,
+            dims: None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_dims(row: u16, col: u16, rows: u16, cols: u16) -> Self {
+        Self {
+            row,
+            col,
+            dims: Some((rows, cols)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedCursorScreen {
+    contents: String,
+    cursor: Option<(u16, u16)>,
+    dims: Option<(u16, u16)>,
+}
+
+impl RenderedCursorScreen {
+    fn from_host(screen: fl_host_proto::RenderedScreen) -> Self {
+        Self {
+            contents: screen.contents,
+            cursor: Some((screen.cursor_row, screen.cursor_col)),
+            dims: Some((screen.rows, screen.cols)),
+        }
+    }
+
+    fn cursor_state(&self) -> Option<CursorState> {
+        self.cursor.map(|(row, col)| CursorState {
+            row,
+            col,
+            dims: self.dims,
+        })
+    }
+
+    fn into_parts(self) -> (String, Option<CursorState>) {
+        let cursor = self.cursor_state();
+        (self.contents, cursor)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScreenCapture {
     /// Current terminal screen (`CaptureRendered` or `tmux capture-pane`).
     Rendered {
         contents: String,
-        cursor: Option<(u16, u16)>,
+        cursor: Option<CursorState>,
     },
     /// Raw output history tail (`CaptureOutput`) when rendered screen capture is unavailable.
     RawFallback(String),
 }
 
 impl ScreenCapture {
+    #[cfg(test)]
     fn rendered(contents: impl Into<String>) -> Self {
         Self::Rendered {
             contents: contents.into(),
@@ -2566,10 +2620,19 @@ impl ScreenCapture {
         }
     }
 
+    #[cfg(test)]
     fn rendered_with_cursor(contents: impl Into<String>, cursor: (u16, u16)) -> Self {
         Self::Rendered {
             contents: contents.into(),
-            cursor: Some(cursor),
+            cursor: Some(CursorState::new(cursor.0, cursor.1)),
+        }
+    }
+
+    fn from_rendered_screen(screen: RenderedCursorScreen) -> Self {
+        let cursor = screen.cursor_state();
+        Self::Rendered {
+            contents: screen.contents,
+            cursor,
         }
     }
 }
@@ -2592,7 +2655,8 @@ fn deliver_via_tmux_paste_with_session(
     is_muse_route: bool,
 ) -> Result<(), String> {
     let trimmed = text.trim();
-    let transcript = MuseTranscriptTracker::capture(target, session_id, is_muse_route);
+    let raw_target = target;
+    let mut transcript = MuseTranscriptTracker::capture(raw_target, session_id, is_muse_route);
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
         && let Some((client, stream, is_pty)) = resolve_live_host_session_with_mode(target)
     {
@@ -2613,12 +2677,7 @@ fn deliver_via_tmux_paste_with_session(
                         .borrow_mut()
                         .capture_rendered(stream.clone())
                         .ok()
-                        .map(|screen| {
-                            (
-                                screen.contents,
-                                Some((screen.cursor_row, screen.cursor_col)),
-                            )
-                        })
+                        .map(|screen| RenderedCursorScreen::from_host(screen).into_parts())
                 },
                 || transcript.confirmed(trimmed),
                 || {
@@ -2632,8 +2691,13 @@ fn deliver_via_tmux_paste_with_session(
                     Ok(())
                 },
             )?;
-            if prep == PrePasteOutcome::AlreadySubmittedTarget {
-                return Ok(());
+            match prep {
+                PrePasteOutcome::AlreadySubmittedTarget => return Ok(()),
+                PrePasteOutcome::FlushedEarlierProceedToPaste => {
+                    transcript =
+                        MuseTranscriptTracker::capture(raw_target, session_id, is_muse_route);
+                }
+                PrePasteOutcome::CleanProceedToPaste => {}
             }
         }
         let payload: Vec<u8> = if bracketed {
@@ -2667,10 +2731,7 @@ fn deliver_via_tmux_paste_with_session(
                 client
                     .capture_rendered(stream.clone())
                     .map(|screen| {
-                        ScreenCapture::rendered_with_cursor(
-                            screen.contents,
-                            (screen.cursor_row, screen.cursor_col),
-                        )
+                        ScreenCapture::from_rendered_screen(RenderedCursorScreen::from_host(screen))
                     })
                     .ok()
                     .or_else(|| {
@@ -2705,7 +2766,10 @@ fn deliver_via_tmux_paste_with_session(
         let prep = prepare_clean_composer_before_paste(
             trimmed,
             std::thread::sleep,
-            || capture_pane_tail(&tmux_cap, &target_cap).map(|pane| (pane, None)),
+            || {
+                capture_tmux_rendered_screen(&tmux_cap, &target_cap)
+                    .map(RenderedCursorScreen::into_parts)
+            },
             || transcript.confirmed(trimmed),
             || {
                 let status = Command::new(&tmux)
@@ -2720,8 +2784,12 @@ fn deliver_via_tmux_paste_with_session(
                 Ok(())
             },
         )?;
-        if prep == PrePasteOutcome::AlreadySubmittedTarget {
-            return Ok(());
+        match prep {
+            PrePasteOutcome::AlreadySubmittedTarget => return Ok(()),
+            PrePasteOutcome::FlushedEarlierProceedToPaste => {
+                transcript = MuseTranscriptTracker::capture(raw_target, session_id, is_muse_route);
+            }
+            PrePasteOutcome::CleanProceedToPaste => {}
         }
     }
     let nanos = std::time::SystemTime::now()
@@ -2804,7 +2872,10 @@ fn deliver_via_tmux_paste_with_session(
         if let Err(err) = confirm_paste_submission(
             trimmed,
             std::thread::sleep,
-            || capture_pane_tail(&tmux_cap, &target_cap).map(ScreenCapture::rendered),
+            || {
+                capture_tmux_rendered_screen(&tmux_cap, &target_cap)
+                    .map(ScreenCapture::from_rendered_screen)
+            },
             || transcript.confirmed(trimmed),
             || {
                 let status = Command::new(&tmux)
@@ -2833,10 +2904,14 @@ fn deliver_via_tmux_paste_with_session(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrePasteOutcome {
-    /// Composer is clean (or rendered capture is unavailable); proceed to paste `trimmed`.
-    ProceedToPaste,
+    /// Composer was already clean (or rendered capture is unavailable); no `Enter` was sent.
+    CleanProceedToPaste,
+    /// An earlier unsubmitted composer item was flushed via `Enter`; proceed to paste `trimmed`
+    /// after refreshing any transcript baseline.
+    FlushedEarlierProceedToPaste,
     /// Pre-existing composer content matched `trimmed` (or `transcript_confirmed()` observed
-    /// `trimmed`) and has now been submitted and confirmed — skip pasting `trimmed` again.
+    /// `trimmed` via its unique `[fl-wire ...]` message ID) and has now been submitted and
+    /// confirmed — skip pasting `trimmed` again.
     AlreadySubmittedTarget,
 }
 
@@ -2851,24 +2926,28 @@ enum PrePasteOutcome {
 fn prepare_clean_composer_before_paste(
     trimmed: &str,
     mut wait: impl FnMut(Duration),
-    mut capture_rendered_only: impl FnMut() -> Option<(String, Option<(u16, u16)>)>,
+    mut capture_rendered_only: impl FnMut() -> Option<(String, Option<CursorState>)>,
     mut transcript_confirmed: impl FnMut() -> bool,
     mut send_enter: impl FnMut() -> Result<(), String>,
 ) -> Result<PrePasteOutcome, String> {
     if trimmed.is_empty() {
-        return Ok(PrePasteOutcome::ProceedToPaste);
+        return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
     let Some((contents1, cursor1)) = capture_rendered_only() else {
-        return Ok(PrePasteOutcome::ProceedToPaste);
+        return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
     if !composer_has_unsubmitted_content(&contents1, cursor1) {
-        return Ok(PrePasteOutcome::ProceedToPaste);
+        return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
+
+    let has_wire_id = extract_wire_message_id(trimmed).is_some();
 
     // Re-poll once after settle delay without sending keys in case a late redraw from the prior
     // turn is clearing on its own.
     wait(TMUX_ENTER_SETTLE_DELAY);
-    if transcript_confirmed() {
+    if (has_wire_id || composer_matches_target_payload(&contents1, trimmed))
+        && transcript_confirmed()
+    {
         return Ok(PrePasteOutcome::AlreadySubmittedTarget);
     }
     let Some((contents2, cursor2)) = capture_rendered_only() else {
@@ -2877,7 +2956,7 @@ fn prepare_clean_composer_before_paste(
             .to_string());
     };
     if !composer_has_unsubmitted_content(&contents2, cursor2) {
-        return Ok(PrePasteOutcome::ProceedToPaste);
+        return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
 
     let mut preexisting_matches_target = composer_matches_target_payload(&contents2, trimmed);
@@ -2889,7 +2968,7 @@ fn prepare_clean_composer_before_paste(
     let mut pending_backoff: Option<Duration> = None;
     loop {
         wait(pending_backoff.take().unwrap_or(TMUX_ENTER_SETTLE_DELAY));
-        if transcript_confirmed() {
+        if (has_wire_id || preexisting_matches_target) && transcript_confirmed() {
             return Ok(PrePasteOutcome::AlreadySubmittedTarget);
         }
         let Some((contents, cursor)) = capture_rendered_only() else {
@@ -2922,10 +3001,10 @@ fn prepare_clean_composer_before_paste(
             pending_backoff = Some(backoff);
             continue;
         }
-        return if preexisting_matches_target || transcript_confirmed() {
+        return if preexisting_matches_target || (has_wire_id && transcript_confirmed()) {
             Ok(PrePasteOutcome::AlreadySubmittedTarget)
         } else {
-            Ok(PrePasteOutcome::ProceedToPaste)
+            Ok(PrePasteOutcome::FlushedEarlierProceedToPaste)
         };
     }
 }
@@ -3091,7 +3170,7 @@ fn composer_shows_pasted_placeholder(screen: &str) -> bool {
 /// `true` when the rendered composer region currently holds unsubmitted user input or a
 /// `[Pasted Content` placeholder, ignoring ghost prompt suggestions where the cursor still sits
 /// immediately after the prompt prefix (`❯ `).
-fn composer_has_unsubmitted_content(screen: &str, cursor: Option<(u16, u16)>) -> bool {
+fn composer_has_unsubmitted_content(screen: &str, cursor: Option<CursorState>) -> bool {
     if composer_shows_pasted_placeholder(screen) {
         return true;
     }
@@ -3113,11 +3192,23 @@ fn composer_has_unsubmitted_content(screen: &str, cursor: Option<(u16, u16)>) ->
         && line_starts_with_prompt(line)
     {
         let leading_ws = line.chars().take_while(|c| c.is_whitespace()).count();
-        if let Some((c_row, c_col)) = cursor
-            && usize::from(c_row) == top_rule + 1 + rel_idx
-            && usize::from(c_col) <= leading_ws + 2
+        if let Some(cs) = cursor
+            && usize::from(cs.col) <= leading_ws + 2
+            && cs
+                .dims
+                .is_none_or(|(_, cols)| cols == 0 || line.chars().count() < usize::from(cols))
         {
-            return false;
+            let prompt_idx = top_rule + 1 + rel_idx;
+            let lines_below = lines.len().saturating_sub(1 + prompt_idx);
+            let exact_row = usize::from(cs.row) == prompt_idx;
+            let soft_wrapped_scrollback_row = composer_lines.len() == rel_idx + 1
+                && cs.dims.is_some_and(|(rows, _)| {
+                    usize::from(cs.row) >= prompt_idx
+                        && usize::from(cs.row).saturating_add(lines_below) < usize::from(rows)
+                });
+            if exact_row || soft_wrapped_scrollback_row {
+                return false;
+            }
         }
     }
     true
@@ -3133,32 +3224,33 @@ fn extract_wire_message_id(trimmed: &str) -> Option<&str> {
     (id.starts_with("urn:uuid:") && id.len() > "urn:uuid:".len()).then_some(id)
 }
 
-/// `true` when the framed composer already holds `trimmed` (either by body probe or by matching
-/// the exact `urn:uuid:...` message ID from a `[fl-wire ... (id: urn:uuid:...` header).
+/// `true` when the framed composer already holds `trimmed` (matching the exact `urn:uuid:...`
+/// message ID whenever a `urn:uuid:` is visible for a `[fl-wire ...]` message, and falling back to
+/// `composer_holds_payload` only when no `urn:uuid:` is visible in the composer or when `trimmed`
+/// carries no `[fl-wire ...]` message ID).
 fn composer_matches_target_payload(screen: &str, trimmed: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if composer_holds_payload(screen, trimmed) {
-        return true;
+    if let Some(wire_id) = extract_wire_message_id(trimmed) {
+        let cleaned = normalize_terminal_screen(screen);
+        let lines: Vec<&str> = cleaned.lines().collect();
+        let Some((composer_lines, _)) = composer_region_lines(&lines) else {
+            return false;
+        };
+        let compact: String = composer_lines
+            .iter()
+            .flat_map(|line| {
+                strip_composer_prompt_prefix(line)
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+            })
+            .collect();
+        if compact.contains("urn:uuid:") {
+            return compact.contains(wire_id);
+        }
     }
-    let Some(wire_id) = extract_wire_message_id(trimmed) else {
-        return false;
-    };
-    let cleaned = normalize_terminal_screen(screen);
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let Some((composer_lines, _)) = composer_region_lines(&lines) else {
-        return false;
-    };
-    let compact: String = composer_lines
-        .iter()
-        .flat_map(|line| {
-            strip_composer_prompt_prefix(line)
-                .chars()
-                .filter(|c| !c.is_whitespace())
-        })
-        .collect();
-    compact.contains(wire_id)
+    composer_holds_payload(screen, trimmed)
 }
 
 /// `true` when `screen` shows an empty framed composer box and the scrollback above that box
@@ -3170,7 +3262,7 @@ fn composer_visibly_submitted(screen: &str, trimmed: &str) -> bool {
 
 fn composer_visibly_submitted_with_cursor(
     screen: &str,
-    cursor: Option<(u16, u16)>,
+    cursor: Option<CursorState>,
     trimmed: &str,
 ) -> bool {
     if trimmed.is_empty()
@@ -3190,6 +3282,17 @@ fn composer_visibly_submitted_with_cursor(
     };
     if !composer_lines.iter().any(|l| line_starts_with_prompt(l)) {
         return false;
+    }
+    if let Some(wire_id) = extract_wire_message_id(trimmed) {
+        let scrollback_compact: String = lines[..top_rule]
+            .iter()
+            .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+            .collect();
+        if (scrollback_compact.contains("urn:uuid:") || trimmed.lines().count() <= top_rule)
+            && !scrollback_compact.contains(wire_id)
+        {
+            return false;
+        }
     }
     let scrollback = collapse_whitespace(&lines[..top_rule].join(" "));
     probes
@@ -3346,7 +3449,7 @@ fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], usi
         .iter()
         .any(|l| line_starts_with_prompt(l) || l.contains("[Pasted Content"));
     let is_tall_scrolled_composer = top == 0
-        && !between.is_empty()
+        && between.len() >= 8
         && between.iter().any(|l| !l.trim().is_empty())
         && non_empty_after >= 1;
     if (!has_prompt_or_paste && !is_tall_scrolled_composer)
@@ -3471,6 +3574,7 @@ impl MuseTranscriptTracker {
         if probes.is_empty() {
             return false;
         }
+        let wire_id = extract_wire_message_id(trimmed);
         let Ok(meta) = fs::metadata(path) else {
             return false;
         };
@@ -3504,6 +3608,12 @@ impl MuseTranscriptTracker {
                 .replace("\\r", " ")
                 .replace("\\t", " ")
                 .replace("\\\"", "\"");
+            if let Some(id) = wire_id {
+                let compact: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+                if !compact.contains(id) {
+                    return false;
+                }
+            }
             let collapsed = collapse_whitespace(&normalized);
             probes
                 .iter()
@@ -3609,16 +3719,49 @@ fn poll_for_pasted_content(
     false
 }
 
-fn capture_pane_tail(tmux: &Path, target: &str) -> Option<String> {
+fn capture_tmux_rendered_screen(tmux: &Path, target: &str) -> Option<RenderedCursorScreen> {
     let cap = Command::new(tmux)
-        .args(["capture-pane", "-p", "-t", target, "-S", "-8"])
+        .args(["capture-pane", "-p", "-t", target])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    cap.status
-        .success()
-        .then(|| String::from_utf8_lossy(&cap.stdout).into_owned())
+    if !cap.status.success() {
+        return None;
+    }
+    let contents = String::from_utf8_lossy(&cap.stdout).into_owned();
+    let (cursor, dims) = Command::new(tmux)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{cursor_y} #{cursor_x} #{pane_height} #{pane_width}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut nums = text
+                .split_whitespace()
+                .filter_map(|part| part.parse::<u16>().ok());
+            let cursor_y = nums.next()?;
+            let cursor_x = nums.next()?;
+            let dims = match (nums.next(), nums.next()) {
+                (Some(h), Some(w)) => Some((h, w)),
+                _ => None,
+            };
+            Some((Some((cursor_y, cursor_x)), dims))
+        })
+        .unwrap_or((None, None));
+    Some(RenderedCursorScreen {
+        contents,
+        cursor,
+        dims,
+    })
 }
 
 /// `true` when `sender_name` names the owner (`owner`, or the owner's login `lmcfarlin`).
@@ -10751,11 +10894,11 @@ exit 1"#,
         );
         assert!(composer_has_unsubmitted_content(
             &tall_scrolled_before,
-            Some((37, 2))
+            Some(CursorState::new(37, 2))
         ));
         assert!(!composer_has_unsubmitted_content(
             &tall_scrolled_after,
-            Some((36, 2))
+            Some(CursorState::new(36, 2))
         ));
 
         let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -11029,9 +11172,9 @@ exit 1"#,
             || {
                 prep_polls += 1;
                 if prep_polls <= 2 {
-                    Some((inline_retry_screen.clone(), Some((2, 33))))
+                    Some((inline_retry_screen.clone(), Some(CursorState::new(2, 33))))
                 } else {
-                    Some((inline_cleared_screen.clone(), Some((3, 2))))
+                    Some((inline_cleared_screen.clone(), Some(CursorState::new(3, 2))))
                 }
             },
             || false,
@@ -11052,9 +11195,9 @@ exit 1"#,
             || {
                 late_prep_polls += 1;
                 if late_prep_polls == 1 {
-                    Some((inline_retry_screen.clone(), Some((2, 33))))
+                    Some((inline_retry_screen.clone(), Some(CursorState::new(2, 33))))
                 } else {
-                    Some((inline_cleared_screen.clone(), Some((3, 2))))
+                    Some((inline_cleared_screen.clone(), Some(CursorState::new(3, 2))))
                 }
             },
             || false,
@@ -11064,7 +11207,7 @@ exit 1"#,
             },
         )
         .unwrap();
-        assert_eq!(late_prep, PrePasteOutcome::ProceedToPaste);
+        assert_eq!(late_prep, PrePasteOutcome::CleanProceedToPaste);
         assert_eq!(late_prep_enters, 0);
 
         // (2d) Pre-existing composer refuses to clear across all retries -> returns Err without
@@ -11176,12 +11319,12 @@ exit 1"#,
         // Ghost suggestion with cursor right after `❯\u{a0}` at `(37, 2)` -> empty (`false`).
         assert!(!composer_has_unsubmitted_content(
             &claude_ghost_screen,
-            Some((37, 2))
+            Some(CursorState::new(37, 2))
         ));
         // Real typed text with cursor past text `(37, 33)` -> dirty (`true`).
         assert!(composer_has_unsubmitted_content(
             &claude_ghost_screen,
-            Some((37, 33))
+            Some(CursorState::new(37, 33))
         ));
         // Multi-line composer content even with cursor at column 2 -> dirty (`true`).
         let mut multiline_rows = claude_rows.clone();
@@ -11189,13 +11332,13 @@ exit 1"#,
         let claude_multiline_screen = multiline_rows.join("\n");
         assert!(composer_has_unsubmitted_content(
             &claude_multiline_screen,
-            Some((38, 2))
+            Some(CursorState::new(38, 2))
         ));
         // Unframed Codex `'› Ask Codex to do anything'` with cursor `(36, 2)` -> empty (`false`).
         let codex_unframed = "OpenAI Codex\n\n› Ask Codex to do anything\n  gpt-5.4 · 100% left";
         assert!(!composer_has_unsubmitted_content(
             codex_unframed,
-            Some((2, 2))
+            Some(CursorState::new(2, 2))
         ));
 
         // End-to-end mock-host delivery to `Hector.claude` displaying ghost suggestion at `(37, 2)`
@@ -11346,5 +11489,642 @@ exit 1"#,
 
         let _ = stop_tx.send(());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn capture_tmux_rendered_screen_preserves_cursor_dims_ghost_suggestion_and_tall_composer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake_tmux = bin_dir.join("tmux");
+        let pane_file = tmp.path().join("pane_screen.txt");
+        let after_enter_file = tmp.path().join("pane_after_enter.txt");
+        let meta_file = tmp.path().join("pane_meta.txt");
+        let log_file = tmp.path().join("tmux_calls.log");
+
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {log}\n\
+             case \"$1\" in\n\
+               capture-pane)\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = \"-S\" ]; then exit 2; fi\n\
+                 done\n\
+                 cat {pane}\n\
+                 ;;\n\
+               display-message)\n\
+                 cat {meta}\n\
+                 ;;\n\
+               load-buffer)\n\
+                 cat >/dev/null\n\
+                 ;;\n\
+               paste-buffer)\n\
+                 ;;\n\
+               send-keys)\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = \"Enter\" ] && [ -f {after} ]; then\n\
+                     cp {after} {pane}\n\
+                   fi\n\
+                 done\n\
+                 ;;\n\
+             esac\n",
+            log = log_file.display(),
+            pane = pane_file.display(),
+            after = after_enter_file.display(),
+            meta = meta_file.display(),
+        );
+        fs::write(&fake_tmux, script).unwrap();
+        fs::set_permissions(&fake_tmux, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rule = "─".repeat(120);
+        let claude_titled_top = format!("{} Hector ─", "─".repeat(111));
+        let mut claude_rows: Vec<String> = (0..36).map(|i| format!("row {i}")).collect();
+        claude_rows[35] = "⏺ Done.".to_string();
+        claude_rows.push(claude_titled_top);
+        claude_rows.push("❯\u{a0}The replacement was intentional".to_string());
+        claude_rows.push(rule.clone());
+        claude_rows.push("  claude-opus-4-6 · bypass permissions".to_string());
+        assert_eq!(claude_rows.len(), 40);
+        let claude_ghost_screen = format!("{}\n", claude_rows.join("\n"));
+
+        let mut submitted_rows = claude_rows.clone();
+        submitted_rows[34] = "❯ Check PR #460 status".to_string();
+        let submitted_claude_screen = format!("{}\n", submitted_rows.join("\n"));
+
+        fs::write(&pane_file, &claude_ghost_screen).unwrap();
+        fs::write(&after_enter_file, &submitted_claude_screen).unwrap();
+        fs::write(&meta_file, "37 2 40 120\n").unwrap();
+
+        // Direct check on `capture_tmux_rendered_screen`: no `-S -8`, populates cursor & dims.
+        let captured = capture_tmux_rendered_screen(&fake_tmux, "%12")
+            .expect("capture_tmux_rendered_screen must succeed");
+        assert_eq!(captured.cursor, Some((37, 2)));
+        assert_eq!(captured.dims, Some((40, 120)));
+        assert_eq!(captured.contents.lines().count(), 40);
+        let calls = fs::read_to_string(&log_file).unwrap();
+        assert!(
+            calls.contains("capture-pane -p -t %12\n"),
+            "expected capture-pane without -S -8, got:\n{calls}"
+        );
+        assert!(
+            calls.contains(
+                "display-message -p -t %12 #{cursor_y} #{cursor_x} #{pane_height} #{pane_width}\n"
+            ),
+            "expected display-message cursor/dims query, got:\n{calls}"
+        );
+
+        // End-to-end `!skip_sleep` tmux delivery to an idle Claude tmux pane with ghost suggestion:
+        // must send 0 pre-paste Enters and 0 post-paste retry Enters (1 Enter total, no C-u).
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = OsString::from(bin_dir.as_os_str());
+        new_path.push(":");
+        new_path.push(&old_path);
+        let _path = EnvGuard::set("PATH", Path::new(&new_path));
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let missing_sock = tmp.path().join("missing-host.sock");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &missing_sock);
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+
+        fs::write(&log_file, "").unwrap();
+        deliver_via_tmux_paste_opts("%12", "Check PR #460 status", true)
+            .expect("tmux ghost suggestion must not be treated as dirty input");
+        let ghost_calls = fs::read_to_string(&log_file).unwrap();
+        let ghost_enters = ghost_calls
+            .lines()
+            .filter(|l| *l == "send-keys -t %12 Enter")
+            .count();
+        assert_eq!(
+            ghost_enters, 1,
+            "expected exactly 1 Enter (0 pre-paste, 0 retry), got:\n{ghost_calls}"
+        );
+        assert!(
+            !ghost_calls.contains("C-u"),
+            "must not abort with C-u:\n{ghost_calls}"
+        );
+
+        // End-to-end `!skip_sleep` tmux delivery when pane holds a `top == 0` 40-row tall scrolled
+        // composer: omitting `-S -8` keeps visible row 0 at line 0 so pre-paste flushes it first!
+        let mut tall_lines = vec![rule.clone()];
+        for idx in 0..36 {
+            tall_lines.push(format!(
+                "  scrolled tmux composer line {idx:02}: FerroStore reconciliation"
+            ));
+        }
+        tall_lines.push("  ".to_string());
+        tall_lines.push(rule.clone());
+        tall_lines.push("  muse-wonder-full-1.0 · high · ~/the-council".to_string());
+        assert_eq!(tall_lines.len(), 40);
+        let tall_tmux_before = format!("{}\n", tall_lines.join("\n"));
+        let tall_tmux_after = format!(
+            "  scrolled tmux composer line 35: FerroStore reconciliation\n\
+             ◈ Processing...\n\
+             {rule}\n\
+             ❯ \n\
+             {rule}\n  \
+             muse-wonder-full-1.0 · high · ~/the-council\n"
+        );
+        fs::write(&pane_file, &tall_tmux_before).unwrap();
+        fs::write(&after_enter_file, &tall_tmux_after).unwrap();
+        fs::write(&meta_file, "37 2 40 120\n").unwrap();
+        fs::write(&log_file, "").unwrap();
+
+        deliver_via_tmux_paste_opts("%12", "Follow-up after tall composer", false)
+            .expect("top == 0 tall composer on tmux must be flushed before paste");
+        let tall_calls = fs::read_to_string(&log_file).unwrap();
+        let tall_enters = tall_calls
+            .lines()
+            .filter(|l| *l == "send-keys -t %12 Enter")
+            .count();
+        assert_eq!(
+            tall_enters, 2,
+            "expected 1 pre-paste flush Enter + 1 post-paste submit Enter, got:\n{tall_calls}"
+        );
+
+        // Finding 4: short 1-3 line 2-rule block at row 0 (between.len() < 8, no prompt) must NOT
+        // be mistaken for a tall scrolled composer.
+        let short_top_block = format!(
+            "{rule}\n  Header summary line 1\n  Header summary line 2\n  Header summary line 3\n\
+             {rule}\n  status footer"
+        );
+        let short_lines: Vec<&str> = short_top_block.lines().collect();
+        assert!(
+            composer_region_lines(&short_lines).is_none(),
+            "short 3-line 2-rule block at row 0 must not match is_tall_scrolled_composer"
+        );
+        assert!(!composer_has_unsubmitted_content(
+            &short_top_block,
+            Some(CursorState::with_dims(3, 2, 40, 120))
+        ));
+    }
+
+    #[test]
+    fn identical_body_wire_messages_and_identical_operator_prompts_do_not_false_dedup_or_premature_confirm()
+     {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let store = MemStore::default();
+        let mut ack1 = mail_to(&store, "melisandre");
+        ack1.sender_name = "cassandra".into();
+        ack1.subject = "vote".into();
+        ack1.body = "ACK".into();
+
+        let mut ack2 = mail_to(&store, "melisandre");
+        ack2.sender_name = "cassandra".into();
+        ack2.subject = "vote".into();
+        ack2.body = "ACK".into();
+        assert_ne!(ack1.id, ack2.id);
+
+        let fmt_ack1 = format_push_message(&ack1);
+        let fmt_ack2 = format_push_message(&ack2);
+        let rule = "─".repeat(120);
+
+        // Unit check (2a): composer holding ack1 matches ack1, NEVER ack2 (even with longer shared
+        // body >= MIN_SUBSTRING_PROBE_CHARS when a different urn:uuid: is visible).
+        let ack1_composer =
+            format!("◆ Ready.\n{rule}\n❯ {fmt_ack1}\n{rule}\n  muse-wonder-full-1.0");
+        assert!(composer_matches_target_payload(&ack1_composer, &fmt_ack1));
+        assert!(!composer_matches_target_payload(&ack1_composer, &fmt_ack2));
+
+        let mut long_shared1 = ack1.clone();
+        long_shared1.body = "ACK — confirmed ready for phase 2".into();
+        let mut long_shared2 = ack2.clone();
+        long_shared2.body = "ACK — confirmed ready for phase 2".into();
+        let fmt_shared1 = format_push_message(&long_shared1);
+        let fmt_shared2 = format_push_message(&long_shared2);
+        let shared1_composer =
+            format!("◆ Ready.\n{rule}\n❯ {fmt_shared1}\n{rule}\n  muse-wonder-full-1.0");
+        assert!(composer_matches_target_payload(
+            &shared1_composer,
+            &fmt_shared1
+        ));
+        assert!(
+            !composer_matches_target_payload(&shared1_composer, &fmt_shared2),
+            "visible different urn:uuid: must never fall through to body-only match"
+        );
+
+        // Fallback when header scrolled off top == 0 (no urn:uuid: visible in composer):
+        let mut scrolled_no_urn = vec![rule.clone()];
+        for _ in 0..9 {
+            scrolled_no_urn.push("  ACK — confirmed ready for phase 2".to_string());
+        }
+        scrolled_no_urn.push(rule.clone());
+        scrolled_no_urn.push("  muse-wonder-full-1.0".to_string());
+        let scrolled_no_urn_screen = scrolled_no_urn.join("\n");
+        assert!(composer_matches_target_payload(
+            &scrolled_no_urn_screen,
+            &fmt_shared2
+        ));
+
+        // Set up mock fl-host + Muse session.jsonl transcript.
+        let home = tmp.path().join("home");
+        let muse_sid = "01a1c218-44dc-7000-8000-bea1904c0a99";
+        let transcript_dir = home.join(".local/share/muse/sessions").join(muse_sid);
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join("session.jsonl");
+        fs::write(
+            &transcript_path,
+            "{\"session_id\":\"01a1c218-44dc-7000-8000-bea1904c0a99\",\"persona\":\"melisandre\"}\n\
+             {\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{\"text\":\"AGENT_PERSONA=melisandre\"}}\n",
+        )
+        .unwrap();
+
+        let sock_path = tmp.path().join("fl-host.sock");
+        let endpoint = HostEndpoint::unix(&sock_path).unwrap();
+        let sid = SessionId::new("muse.melisandre").unwrap();
+        let summary = SessionSummary {
+            stream: StreamId {
+                host: HostInstance::new([12u8; 16]),
+                session: sid.clone(),
+                epoch: SessionEpoch(1),
+            },
+            mode: SessionMode::Pty,
+            state: ChildState::Running(ChildRecord {
+                pid: std::process::id(),
+                session: sid,
+                session_epoch: SessionEpoch(1),
+                kind: SpawnKind::Pty,
+                input: InputState::Writable,
+                started_at_ms: 1000,
+                exit: None,
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Writable,
+        };
+
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let scrollback_state = Arc::new(Mutex::new("◆ Ready.".to_string()));
+        let active_item = Arc::new(Mutex::new(Option::<String>::None));
+        let rendered_state = Arc::new(Mutex::new(format!(
+            "◆ Ready.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        )));
+        // When `enter_count == drop_specific_enter`, that Enter is ignored so we prove premature
+        // transcript confirmation cannot hide a dropped post-paste Enter!
+        let enter_count = Arc::new(AtomicUsize::new(0));
+        let drop_specific_enter = Arc::new(AtomicUsize::new(0));
+        let submitted_items = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let writes_srv = Arc::clone(&writes);
+        let sb_srv = Arc::clone(&scrollback_state);
+        let active_srv = Arc::clone(&active_item);
+        let rendered_srv = Arc::clone(&rendered_state);
+        let enters_srv = Arc::clone(&enter_count);
+        let drop_srv = Arc::clone(&drop_specific_enter);
+        let submitted_srv = Arc::clone(&submitted_items);
+        let tpath_srv = transcript_path.clone();
+        let rule_srv = rule.clone();
+        let ep_srv = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cfg = HostConfig::new(ep_srv);
+                cfg.minor = 1;
+                let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let summary = summary.clone();
+                    let writes = Arc::clone(&writes_srv);
+                    let sb = Arc::clone(&sb_srv);
+                    let active = Arc::clone(&active_srv);
+                    let rendered = Arc::clone(&rendered_srv);
+                    let enters = Arc::clone(&enters_srv);
+                    let drop_enter = Arc::clone(&drop_srv);
+                    let submitted = Arc::clone(&submitted_srv);
+                    let tpath = tpath_srv.clone();
+                    let rule = rule_srv.clone();
+                    tokio::spawn(async move {
+                        while let Ok(req) = conn.recv().await {
+                            let HostRequest::Extended { id, request } = req else {
+                                break;
+                            };
+                            let resp = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: vec![summary.clone()],
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: summary.stream.host.clone(),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { .. } => {
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(1),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::Write { bytes, .. } => {
+                                    let raw = bytes.into_vec();
+                                    let is_cr = raw.as_slice() == b"\r";
+                                    writes.lock().unwrap().push(raw.clone());
+                                    if is_cr {
+                                        let idx = enters.fetch_add(1, Ordering::SeqCst) + 1;
+                                        if idx != drop_enter.load(Ordering::SeqCst)
+                                            && let Some(item) = active.lock().unwrap().take()
+                                        {
+                                            let mut f = fs::OpenOptions::new()
+                                                .append(true)
+                                                .open(&tpath)
+                                                .unwrap();
+                                            writeln!(
+                                                f,
+                                                "{{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{{\"text\":{item:?}}}}}"
+                                            )
+                                            .unwrap();
+                                            submitted.lock().unwrap().push(item.clone());
+                                            let mut sbg = sb.lock().unwrap();
+                                            if item.chars().count() > 200 {
+                                                sbg.push_str(&format!(
+                                                    "\n❯ [Pasted Content {} chars]\n◆ Processed.",
+                                                    item.chars().count()
+                                                ));
+                                            } else {
+                                                sbg.push_str(&format!("\n❯ {item}\n◆ Processed."));
+                                            }
+                                            *rendered.lock().unwrap() = format!(
+                                                "{sbg}\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+                                            );
+                                        }
+                                    } else {
+                                        let text = String::from_utf8_lossy(&raw);
+                                        let stripped = text
+                                            .trim_start_matches("\x1b[200~")
+                                            .trim_end_matches("\x1b[201~")
+                                            .to_string();
+                                        let sbg = sb.lock().unwrap().clone();
+                                        let composer_view = if stripped.chars().count() > 200 {
+                                            format!(
+                                                "{sbg}\n\n{rule}\n❯ [Pasted Content {} chars]\n{rule}\n  muse-wonder-full-1.0",
+                                                stripped.chars().count()
+                                            )
+                                        } else {
+                                            format!(
+                                                "{sbg}\n\n{rule}\n❯ {stripped}\n{rule}\n  muse-wonder-full-1.0"
+                                            )
+                                        };
+                                        *active.lock().unwrap() = Some(stripped);
+                                        *rendered.lock().unwrap() = composer_view;
+                                    }
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: rendered.lock().unwrap().clone(),
+                                            cursor_row: 37,
+                                            cursor_col: 6,
+                                            rows: 40,
+                                            cols: 120,
+                                            generation: 200,
+                                            output_seq: 20,
+                                            output_bytes: 4096,
+                                        },
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response: resp })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_muse = EnvGuard::remove("FL_WIRE_MUSE_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &sock_path);
+
+        let route = VendorRoute::Muse {
+            session_id: muse_sid.into(),
+            cwd: None,
+            tmux_target: Some("muse:melisandre".into()),
+            tmux_pane: Some("muse.melisandre".into()),
+        };
+
+        // (1) Two distinct WireMessages with identical short body `"ACK"`:
+        // `ack1` sits unsubmitted in composer when `ack2` arrives; Enter #1 flushes `ack1` into
+        // `session.jsonl`, Enter #2 (initial post-paste Enter for `ack2`) is dropped, and Enter #3
+        // (retry Enter) submits `ack2`. Neither `ack1` in composer nor `ack1` in `session.jsonl`
+        // may false-dedup or prematurely confirm `ack2`!
+        let baseline_tracker =
+            MuseTranscriptTracker::capture("muse:melisandre", Some(muse_sid), true);
+        *active_item.lock().unwrap() = Some(fmt_ack1.clone());
+        *rendered_state.lock().unwrap() =
+            format!("◆ Ready.\n\n{rule}\n❯ {fmt_ack1}\n{rule}\n  muse-wonder-full-1.0");
+        enter_count.store(0, Ordering::SeqCst);
+        drop_specific_enter.store(2, Ordering::SeqCst);
+
+        dispatch_to_route(&route, &ack2)
+            .expect("ack2 must flush ack1 first and then paste, retry, and confirm ack2");
+        assert!(baseline_tracker.confirmed(&fmt_ack1));
+        let ack_submissions = submitted_items.lock().unwrap().clone();
+        assert_eq!(
+            ack_submissions,
+            vec![fmt_ack1.clone(), fmt_ack2.clone()],
+            "both distinct ACK WireMessages must be submitted in order"
+        );
+
+        // Verify (2b) directly: a tracker captured before ack1 only confirms ack1, not a third ACK!
+        let mut ack3 = mail_to(&store, "melisandre");
+        ack3.sender_name = "cassandra".into();
+        ack3.subject = "vote".into();
+        ack3.body = "ACK".into();
+        let fmt_ack3 = format_push_message(&ack3);
+        assert!(!baseline_tracker.confirmed(&fmt_ack3));
+
+        // (2) Two identical operator prompts where the first was sitting unsubmitted in the
+        // composer (`[Pasted Content N chars]`):
+        // Enter #1 flushes the first prompt into `session.jsonl` (`FlushedEarlierProceedToPaste`),
+        // re-captures `transcript` BEFORE pasting/writing the second identical prompt, drops Enter #2
+        // (initial post-paste Enter for prompt #2), and therefore MUST send retry Enter #3 rather
+        // than prematurely confirming against prompt #1's `session.jsonl` entry!
+        let identical_op = "Verify FerroStore checkpoint durability and MVCC snapshot isolation. "
+            .repeat(6)
+            .trim()
+            .to_string();
+        assert!(identical_op.chars().count() > 200);
+
+        // (2i) Via `dispatch_operator_prompt_to_route` (`deliver_via_tmux_paste_with_session`):
+        submitted_items.lock().unwrap().clear();
+        writes.lock().unwrap().clear();
+        *scrollback_state.lock().unwrap() = "◆ Ready.".into();
+        *active_item.lock().unwrap() = Some(identical_op.clone());
+        *rendered_state.lock().unwrap() = format!(
+            "◆ Ready.\n\n{rule}\n❯ [Pasted Content {} chars]\n{rule}\n  muse-wonder-full-1.0",
+            identical_op.chars().count()
+        );
+        enter_count.store(0, Ordering::SeqCst);
+        drop_specific_enter.store(2, Ordering::SeqCst);
+
+        dispatch_operator_prompt_to_route(&route, "owner", &identical_op)
+            .expect("second identical operator prompt must flush first, refresh transcript, and retry dropped Enter");
+        assert_eq!(
+            submitted_items.lock().unwrap().clone(),
+            vec![identical_op.clone(), identical_op.clone()],
+            "both identical operator prompts must be submitted via deliver_via_tmux_paste_with_session"
+        );
+
+        // (2ii) Via `host_write_text_then_enter`:
+        submitted_items.lock().unwrap().clear();
+        writes.lock().unwrap().clear();
+        *scrollback_state.lock().unwrap() = "◆ Ready.".into();
+        *active_item.lock().unwrap() = Some(identical_op.clone());
+        *rendered_state.lock().unwrap() = format!(
+            "◆ Ready.\n\n{rule}\n❯ [Pasted Content {} chars]\n{rule}\n  muse-wonder-full-1.0",
+            identical_op.chars().count()
+        );
+        enter_count.store(0, Ordering::SeqCst);
+        drop_specific_enter.store(2, Ordering::SeqCst);
+
+        let mut direct_client = fl_host_proto::BlockingHostClient::connect(&endpoint).unwrap();
+        let stream_id = direct_client.list_sessions().unwrap()[0].stream.clone();
+        let grant = direct_client.claim_controller(stream_id.clone()).unwrap();
+        host_write_text_then_enter(&mut direct_client, stream_id, grant.lease, &identical_op)
+            .expect("host_write_text_then_enter must refresh transcript on FlushedEarlierProceedToPaste");
+        assert_eq!(
+            submitted_items.lock().unwrap().clone(),
+            vec![identical_op.clone(), identical_op],
+            "both identical operator prompts must be submitted via host_write_text_then_enter"
+        );
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn soft_wrapped_vt100_scrollback_preserves_ghost_suggestion_and_multiline_dirty_detection() {
+        let rule = "─".repeat(120);
+        let claude_titled_top = format!("{} Hector ─", "─".repeat(111));
+
+        // 40x120 `RenderedScreen` where 2 scrollback lines soft-wrapped (omitting `\n`), yielding
+        // 38 `\n`-separated lines total while physical cursor for idle ghost suggestion sits at
+        // `(37, 2)`.
+        let mut wrapped_ghost_lines: Vec<String> = (0..34)
+            .map(|i| {
+                if i < 2 {
+                    format!("soft-wrapped scrollback line {i}: {}", "x".repeat(150))
+                } else {
+                    format!("scrollback line {i}")
+                }
+            })
+            .collect();
+        wrapped_ghost_lines[33] = "⏺ Done.".to_string();
+        wrapped_ghost_lines.push(claude_titled_top); // line 34 (`top_rule`), physical row 36
+        wrapped_ghost_lines.push("❯\u{a0}The replacement was intentional".to_string()); // line 35, physical row 37
+        wrapped_ghost_lines.push(rule.clone()); // line 36, physical row 38
+        wrapped_ghost_lines.push("  claude-opus-4-6 · bypass permissions".to_string()); // line 37, physical row 39
+        assert_eq!(wrapped_ghost_lines.len(), 38);
+        let wrapped_ghost_screen = wrapped_ghost_lines.join("\n");
+
+        assert!(
+            !composer_has_unsubmitted_content(
+                &wrapped_ghost_screen,
+                Some(CursorState::with_dims(37, 2, 40, 120))
+            ),
+            "ghost suggestion on 40x120 screen with 38 logical lines and cursor (37, 2) must be clean"
+        );
+
+        let mut prep_enters = 0u32;
+        let prep = prepare_clean_composer_before_paste(
+            "Next prompt",
+            |_| {},
+            || {
+                Some((
+                    wrapped_ghost_screen.clone(),
+                    Some(CursorState::with_dims(37, 2, 40, 120)),
+                ))
+            },
+            || false,
+            || {
+                prep_enters += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(prep, PrePasteOutcome::CleanProceedToPaste);
+        assert_eq!(prep_enters, 0);
+
+        // Two-line composer `'❯ Hello Melisandre\n  '` (`composer_lines.len() == 2`) with cursor
+        // on the blank second line `(36, 2)` on a soft-wrapped 40x120 screen (38 logical lines)
+        // MUST still be treated as dirty (`true`)!
+        let mut wrapped_two_line: Vec<String> = (0..32)
+            .map(|i| {
+                if i < 2 {
+                    format!("soft-wrapped scrollback line {i}: {}", "y".repeat(150))
+                } else {
+                    format!("scrollback line {i}")
+                }
+            })
+            .collect();
+        wrapped_two_line[31] = "◆ Ready.".to_string();
+        wrapped_two_line.push(rule.clone()); // line 32 (`top_rule`), physical row 34
+        wrapped_two_line.push("❯ Hello Melisandre".to_string()); // line 33, physical row 35
+        wrapped_two_line.push("  ".to_string()); // line 34, physical row 36 (cursor `(36, 2)`)
+        wrapped_two_line.push(rule.clone()); // line 35, physical row 37
+        wrapped_two_line.push("  muse-wonder-full-1.0 · high".to_string()); // line 36, physical row 38
+        wrapped_two_line.push("  ~/Projects/Artificial-Humanity/the-council".to_string()); // line 37, physical row 39
+        assert_eq!(wrapped_two_line.len(), 38);
+        let wrapped_two_line_screen = wrapped_two_line.join("\n");
+        let two_line_refs: Vec<&str> = wrapped_two_line_screen.lines().collect();
+        assert_eq!(composer_region_lines(&two_line_refs).unwrap().0.len(), 2);
+        assert!(
+            composer_has_unsubmitted_content(
+                &wrapped_two_line_screen,
+                Some(CursorState::with_dims(36, 2, 40, 120))
+            ),
+            "two-line composer '❯ Hello Melisandre\\n  ' with cursor (36, 2) on soft-wrapped 40x120 screen must be dirty"
+        );
+
+        // Wrapped prompt line itself (`line.chars().count() >= cols`) at cursor col <= 2 must also
+        // be treated as dirty (`true`), never as a single-row ghost suggestion.
+        let mut wrapped_prompt_lines = wrapped_ghost_lines;
+        wrapped_prompt_lines[35] = format!("❯ {}", "z".repeat(125));
+        let wrapped_prompt_screen = wrapped_prompt_lines.join("\n");
+        assert!(composer_has_unsubmitted_content(
+            &wrapped_prompt_screen,
+            Some(CursorState::with_dims(37, 2, 40, 120))
+        ));
     }
 }
