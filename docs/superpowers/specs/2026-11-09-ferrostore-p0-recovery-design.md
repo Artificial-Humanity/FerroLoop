@@ -350,51 +350,90 @@ report lexical-only degraded readiness separately from full index readiness.
 
 ## 3. Offline restore
 
+The following details incorporate Ferris's 2026-11-10 Task 6 ruling; implementation
+remains fixture-only until the operational gates are separately approved.
+
 1. Select a completed verified artifact, expected store identity, compatible build
    and explicit destination. Check local/independent-copy status, manifest/image
    checksums, dependency set, versions, space and permissions. Fail closed on an
    unsupported schema or changed binding; restore is not implicit migration.
-2. Stop admission and drain store users under an announced, bounded window.
-   Retain ownership control across the operation. Stop/reopen only necessary
-   service/client handles, including cached governor, wire, MCP and sidecar users;
-   preserve resident vendor sessions/context. Current legacy writers require
-   administrative exclusion; a proposed future lifetime lock does not stop them.
-   No socket connection or file lock alone proves all old handles are gone.
-3. Restore into a private temporary directory on the target filesystem, not over
-   the active path. Keep the backup immutable. Reopen and repeat identity, S,
-   logical, domain and query verification with all external effects disabled.
-4. Preserve the pre-restore store as a verified rollback generation when readable;
-   retain an unreadable original as forensic material without calling it verified.
-   Flush the preserved generation and sync its directory before replacement.
-   Record and durably flush installation-journal intent, including old/new image
-   digests and paths, and sync the journal directory. Flush the verified staged
-   replacement and sync its staging directory **before** atomically renaming it
-   over the destination while users remain fenced. Then sync the destination
-   parent directory; if the rename crosses directories on the same filesystem,
-   sync both source and destination directories. Durably record completion before
-   admission. A crash after replacement but before directory sync has an uncertain
-   name outcome: recovery compares the journal's digests with the surviving images,
-   verifies the selected complete image, finishes its publication and directory
-   sync, and records the decision before admitting users. The durable rollback
-   generation remains available throughout. Never use stale redb files as rollback
-   for current fls data.
-5. Invalidate old RPC sessions, transactions, caches and retry assumptions. Start
-   only the intended owner and verify identity/sequence with compatible clients.
-   Reconcile replication cursors, peer histories, outbox/in-flight attempts and
-   vendor-side effects against the restored horizon before enabling dispatch.
-   Receipts newer than S may have been lost while their effects occurred: mark
-   outcome-unknown and reconcile; never blindly replay or promise exactly-once.
-   Images that may include outcome-unknown writes retain explicit unknown outcomes;
-   no automatic resend is allowed, and existing effect reconciliation is required.
-6. Rebind confirmed aliases, rebuild derived indexes within budgets, run readiness
-   checks and resume admission. Keep an audit record of selected backup, data-loss
-   horizon, reconciliation decisions and rollback point. Any unresolved identity,
-   reference or external-effect ambiguity blocks the affected operation.
+2. Stop admission and drain store users under an announced bounded window,
+   preserving resident vendor sessions/context. Require an administrative lease
+   created mode 0600 under the approved root, bound to operation/action, catalog
+   identity, canonical destination parent identity/basename, current file
+   identity/digest or explicit absence, selected bundle digest and build/profile,
+   with issuance/expiry no more than one hour apart and explicit operator
+   attestation that legacy/cached store handles and external dispatch are excluded.
+   If original bytes are unreadable, bind held filesystem identity and recorded
+   read-error/forensic classification without inventing a digest. This is not a
+   cryptographic token or P1 ownership: lease, flock and PID/socket probes prove
+   nothing about exclusion. Restart needs renewed exclusion and a renewed lease.
+   Task 7 settles who may issue leases, together with same-UID agent authority.
+3. Durably create and parent-sync a private operation-bound restore guard before
+   destination/rollback mutation. All normal create, migration, direct/auto open,
+   socket contact and serve paths check it, with an engine-open recheck. Existing,
+   unreadable or malformed guards fail closed. Lease expiry never clears it.
+   Only private operation-bound `RestoreAccess` permits existing-only, read-only
+   inspection while fenced. Before live restore, every opener must run a
+   guard-aware binary; legacy binaries bypass this sidecar, and already-open
+   handles still require administrative exclusion.
+4. Restore into a unique private sibling directory on the target filesystem,
+   keeping the backup immutable. Allocate exactly one independent candidate and
+   use `verify_existing_copy` for close/reopen identity, S, logical, domain and
+   query checks with external effects disabled. Existing target/backup bytes stay
+   capacity-accounted; new candidate, verifier scratch and all metadata must fit
+   the strict `C + R + V + M <= 2 * L` bound. Preserve the original inode itself
+   (`R = 0`), rather than allocate a rollback copy; no metadata or reflink discount
+   widens the budget. Refuse before mutation when it cannot fit.
+5. P0 installation is Linux-only. Existing targets require held `nlink == 1` and
+   inventory alias status `NoAliasObserved`; refuse non-Linux, unsupported
+   `RENAME_EXCHANGE`, ambiguous aliases or cross-filesystem operations. Verify
+   readable original data as rollback; retain an unreadable original as forensic
+   material, never a verified rollback claim. Flush the original/candidate as
+   required, then durably write and directory-sync intent before **each** step:
+   exchange candidate and destination with `RENAME_EXCHANGE`, sync both
+   directories, then `NOREPLACE`-rename the old inode from the candidate name to
+   its unique rollback/forensic name and sync both directories again. An absent
+   destination uses journaled `NOREPLACE`. Record durable installation completion.
+   Crash recovery selects only journal-bound identities and available digests,
+   verifies the selected complete image and completes directory durability; missing
+   or corrupt metadata and ambiguous names keep admission fenced. Explicit
+   rollback uses the reverse exchange, also journaled and directory-synced, while
+   preserving both generations. Never delete unreadable original material or use
+   stale redb files as current rollback.
+6. Completed installation is not readiness: keep **all ordinary opens refused**
+   until explicit operator finalize records typed evidence that stale clients,
+   RPC sessions, transactions, caches and retry assumptions were drained/restarted
+   and dependency/effect reconciliation completed. Receipts newer than S may be
+   lost despite real effects: preserve explicit outcome-unknown and reconcile;
+   never blindly resend or promise exactly-once. Unresolved identity, reference
+   or external-effect ambiguity blocks finalize. Library/CLI never contact
+   vendors or enable dispatch. Lexical/degraded/full index readiness is reported
+   separately and does not by itself block finalize. Only after durable completion
+   and recorded readiness may finalize remove the guard and sync its parent;
+   failed removal sync leaves outcome-unknown with administrative exclusion in
+   force. Keep an audit of backup, horizon, reconciliation and rollback point.
 
-Atomic replacement and directory durability need platform-specific proofs; Unix
-rename behavior is not Windows evidence. Runtime transaction IDs and restored
-persistent store lineage are distinct: new sessions must not validate old requests.
-No generation may accept new writes until its name is durably published.
+Quarantine purge is a separate explicit operation-ID action under the approved
+root and physical-store administrative exclusion. Confirmed execution completes
+any half-withdrawn receipt first; refuse remaining live catalog receipts, active
+operations, unproven
+reference closure, symlinks/replacements and unreadable digest inputs. Default to
+a dry run listing exact owned names, sizes and SHA-256 digests, with no audit
+write or receipt withdrawal; report pending reconciliation instead. Require
+matching `--confirm <op-id>` to act and revalidate after any receipt withdrawal. Before unlinking, durably write and directory-sync a
+catalog audit with operation ID, exact names/sizes/digests, time and actor; keep
+intent and completed removals distinct for crash recovery. Revalidate identity
+before each unlink and sync affected parents. Remove only that quarantined
+operation's verified-owned quarantine/staging/final names, leaving shared configs
+and other operations untouched. Never general retention, glob sweeps, legacy
+`.redb` or historic-file deletion.
+
+Native Linux filesystem fixtures must prove every claimed exchange, rollback,
+purge and directory-durability cut. Runtime transaction IDs and restored
+persistent store lineage are distinct: no generation accepts writes before its
+name is durable, and administrative exclusion is still required for legacy or
+cached users. No engine-format or exclusive-ownership claim is added.
 
 ## 4. Fixture-only proof and failure injection
 
