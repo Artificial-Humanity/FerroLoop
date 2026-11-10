@@ -272,6 +272,27 @@ Report an already unhealthy source separately. A failed backup leaves previous
 backups intact and the source usable; incomplete private artifacts are removed or
 quarantined by operation ID, never swept using a broad pattern over live paths.
 
+Task 4 publication clarification (Ferris approval, 2026-11-10,
+FerroWire `01a1c381-a9d7-74ae-a9df-3000dff52273`): use one configured approved
+backup root and a destination-side `flock` keyed by physical inventory identity
+under `.locks/`. Unknown/review-required aliases refuse. This does not lock the
+source or establish P1 ownership; multiple roots/hosts are outside P0. Before
+capture, admit an enforced per-image ceiling, defaulting to source file length L
+and only lowerable by the caller. Twice that ceiling plus bounded metadata,
+configuration and catalog reserves must fit 2L, the operation quota and free
+space minus a stated margin. A ceiling overrun is `ImageExceedsCeiling`; default L
+with positive reserves refuses. Record fixture image/L ratios for acceptance.
+
+Publication does not rewrite the immutable manifest: it remains NotPublished
+with independently Verified copy evidence. A separate catalog receipt, created
+only after final rename and parent sync, binds the manifest digest, image digest
+and member checksums and attests Durable. Its own temporary-file flush, exclusive
+rename and catalog-directory sync are required. A complete bundle without a
+receipt is unavailable to restore selection until operation-specific checksum
+reverification and durable receipt repair. Mismatched bundles are quarantined by
+operation ID, never deleted. Incomplete staging cleanup is similarly scoped to
+that exact operation, never a directory-wide sweep.
+
 ### Bundle metadata and logical verification
 
 The versioned manifest records: backup operation ID; catalog store identity and

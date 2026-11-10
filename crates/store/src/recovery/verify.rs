@@ -171,7 +171,17 @@ pub fn copy_and_verify(
     let source = PrivateFile::open(image, false, limits)?;
     let before = hash_file(&source.file, limits)?;
     // create_new is exclusive even for aliases: no existing target is truncated.
+    if let Some(control) = &limits.publication_io {
+        super::fs::event(
+            &*control.io,
+            super::fs::RecoveryEvent::Create(super::fs::Member::VerificationCopy),
+            limits,
+        )?;
+    }
     let target = PrivateFile::open(copy_path, true, limits)?;
+    if let Some(control) = &limits.publication_io {
+        control.prepare_copy(&target.file, before.0, limits)?;
+    }
     if source.identity() == target.identity() {
         return Err(limits.verification());
     }
@@ -185,21 +195,29 @@ pub fn copy_and_verify(
                 .file
                 .read_exact_at(&mut buffer[..n], offset)
                 .map_err(|_| limits.verification())?;
-            target
-                .file
-                .write_all_at(&buffer[..n], offset)
-                .map_err(|_| RecoveryError::Destination {
-                    operation_id: limits.operation_id,
-                })?;
+            if let Some(control) = &limits.publication_io {
+                control.write_copy(&target.file, &buffer[..n], offset, limits)?;
+            } else {
+                target
+                    .file
+                    .write_all_at(&buffer[..n], offset)
+                    .map_err(|_| RecoveryError::Destination {
+                        operation_id: limits.operation_id,
+                    })?;
+            }
             offset += n as u64;
         }
         limits.check()?;
-        target
-            .file
-            .sync_all()
-            .map_err(|_| RecoveryError::Destination {
-                operation_id: limits.operation_id,
-            })?;
+        if let Some(control) = &limits.publication_io {
+            control.sync(&target.file, super::fs::Member::VerificationCopy, limits)?;
+        } else {
+            target
+                .file
+                .sync_all()
+                .map_err(|_| RecoveryError::Destination {
+                    operation_id: limits.operation_id,
+                })?;
+        }
         target.same_name(limits)?;
         source.unchanged(limits)?;
         if before != hash_file(&source.file, limits)? || before != hash_file(&target.file, limits)?
@@ -256,15 +274,19 @@ fn bind_created_copy(
     Ok(())
 }
 
-struct PrivateFile {
-    file: File,
+pub(crate) struct PrivateFile {
+    pub(crate) file: File,
     parent: File,
     path: std::path::PathBuf,
     name: CString,
     initial: std::fs::Metadata,
 }
 impl PrivateFile {
-    fn open(path: &Path, create: bool, l: &OperationLimits) -> Result<Self, RecoveryError> {
+    pub(crate) fn open(
+        path: &Path,
+        create: bool,
+        l: &OperationLimits,
+    ) -> Result<Self, RecoveryError> {
         l.check()?;
         if !cfg!(target_os = "linux") {
             return Err(RecoveryError::Unsupported {
@@ -303,10 +325,10 @@ impl PrivateFile {
         held.same_name(l)?;
         Ok(held)
     }
-    fn identity(&self) -> (u64, u64) {
+    pub(crate) fn identity(&self) -> (u64, u64) {
         (self.initial.dev(), self.initial.ino())
     }
-    fn same_name(&self, l: &OperationLimits) -> Result<(), RecoveryError> {
+    pub(crate) fn same_name(&self, l: &OperationLimits) -> Result<(), RecoveryError> {
         let (parent, name) = private_parent(&self.path, l)?;
         let current = parent.metadata().map_err(|_| l.verification())?;
         let original = self.parent.metadata().map_err(|_| l.verification())?;
@@ -333,7 +355,7 @@ impl PrivateFile {
         }
         Ok(())
     }
-    fn unchanged(&self, l: &OperationLimits) -> Result<(), RecoveryError> {
+    pub(crate) fn unchanged(&self, l: &OperationLimits) -> Result<(), RecoveryError> {
         self.same_name(l)?;
         let now = self.file.metadata().map_err(|_| l.verification())?;
         if now.len() != self.initial.len()
@@ -347,7 +369,17 @@ impl PrivateFile {
         Ok(())
     }
 }
-fn private_parent(path: &Path, l: &OperationLimits) -> Result<(File, CString), RecoveryError> {
+pub(crate) fn private_parent(
+    path: &Path,
+    l: &OperationLimits,
+) -> Result<(File, CString), RecoveryError> {
+    walk_parent(path, true, l)
+}
+pub(crate) fn walk_parent(
+    path: &Path,
+    private: bool,
+    l: &OperationLimits,
+) -> Result<(File, CString), RecoveryError> {
     if !path.is_absolute() {
         return Err(RecoveryError::RefusedInput {
             operation_id: l.operation_id,
@@ -366,7 +398,9 @@ fn private_parent(path: &Path, l: &OperationLimits) -> Result<(File, CString), R
         };
         let name = CString::new(name.as_bytes()).map_err(|_| l.verification())?;
         if parts.peek().is_none() {
-            privacy(&directory, true, l)?;
+            if private {
+                privacy(&directory, true, l)?;
+            }
             return Ok((directory, name));
         }
         // SAFETY: parent is a live owned fd; name is a NUL-terminated component.
@@ -385,7 +419,11 @@ fn private_parent(path: &Path, l: &OperationLimits) -> Result<(File, CString), R
     }
     Err(l.verification())
 }
-fn privacy(file: &File, directory: bool, l: &OperationLimits) -> Result<(), RecoveryError> {
+pub(crate) fn privacy(
+    file: &File,
+    directory: bool,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
     l.check()?;
     let m = file.metadata().map_err(|_| l.verification())?;
     // SAFETY: geteuid has no preconditions.
@@ -416,7 +454,7 @@ fn privacy(file: &File, directory: bool, l: &OperationLimits) -> Result<(), Reco
     }
     Ok(())
 }
-fn hash_file(file: &File, l: &OperationLimits) -> Result<(u64, String), RecoveryError> {
+pub(crate) fn hash_file(file: &File, l: &OperationLimits) -> Result<(u64, String), RecoveryError> {
     l.quota(65536, l.memory_byte_limit, "hash working memory")?;
     let len = file.metadata().map_err(|_| l.verification())?.len();
     l.quota(len, l.byte_limit, "image bytes")?;

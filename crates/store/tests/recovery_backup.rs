@@ -1,0 +1,1302 @@
+//! Publication exercises only fixture roots; never reads user config or live stores.
+#![cfg(target_os = "linux")]
+use fl_store::{
+    FerroStore,
+    recovery::{
+        CancelToken, CaptureBudget, OperationLimits, ProfileKind, ValidationProfile,
+        backup::{BackupRequest, PublicationOutcome, backup, reconcile_publication},
+        fs::{Directory, Member, NativeRecoveryFs, RecoveryEvent, RecoveryFs, RecoveryIo},
+        inventory::{BindingInput, InventoryInputs, collect_inventory},
+    },
+};
+use serde_json::json;
+use std::{
+    fs, io,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+fn reconciliation_limits() -> OperationLimits {
+    OperationLimits::new(
+        Instant::now() + Duration::from_secs(30),
+        1 << 20,
+        256 << 20,
+        CancelToken::new(),
+    )
+}
+
+struct Fixture {
+    _root: tempfile::TempDir,
+    source: PathBuf,
+    destination: PathBuf,
+    store: FerroStore,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = root.path().join("source.fls");
+        let destination = root.path().join("backups");
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = FerroStore::open(&source).unwrap();
+        // A real append history leaves enough physical budget for two compact
+        // recovery images plus metadata. No source padding or backup exemption.
+        for n in 0..24 {
+            store
+                .put_doc(
+                    "fixture_unknown",
+                    "one",
+                    &json!({"n":n,"body":"x".repeat(4096)}),
+                )
+                .unwrap();
+        }
+        Self {
+            _root: root,
+            source,
+            destination,
+            store,
+        }
+    }
+    fn request(&self) -> BackupRequest {
+        fixture_request(self._root.path(), &self.source, &self.destination)
+    }
+    fn assert_source_usable(&self) {
+        self.store
+            .put_doc("fixture_unknown", "after", &json!({"ok":true}))
+            .unwrap();
+        assert_eq!(
+            self.store.get_doc("fixture_unknown", "after").unwrap(),
+            Some(json!({"ok":true}))
+        );
+    }
+}
+
+fn fixture_request(root: &Path, source: &Path, destination: &Path) -> BackupRequest {
+    let inventory = collect_inventory(&InventoryInputs {
+        roots: vec![root.to_path_buf()],
+        bindings: vec![BindingInput::config(
+            "fixture",
+            source.to_path_buf(),
+            Some("ferro".into()),
+            "fixture",
+        )],
+        ..Default::default()
+    })
+    .unwrap();
+    let identity = inventory
+        .stores
+        .iter()
+        .find(|r| r.identity.canonical_path.as_deref() == Some(source))
+        .unwrap()
+        .identity
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut limits = OperationLimits::new(deadline, 1 << 20, 256 << 20, CancelToken::new());
+    limits.operation_id = uuid::Uuid::now_v7();
+    let profile = ValidationProfile::new(ProfileKind::SmallEmpty, identity.catalog_key.clone());
+    BackupRequest {
+        store: identity,
+        source_map_sha256: "a".repeat(64),
+        operation_id: limits.operation_id,
+        batch_id: Some(uuid::Uuid::now_v7()),
+        destination: destination.to_path_buf(),
+        capture: CaptureBudget::new(deadline, 64 << 20, 128 << 20, Duration::from_secs(1)),
+        limits,
+        profile,
+        image_byte_limit: Some(16 << 10),
+        space_margin_bytes: 4096,
+        metadata_byte_limit: 128 << 10,
+        configs: vec![],
+        excluded_vault_key: None,
+        code_index_configuration: fl_store::recovery::manifest::Availability::Unavailable,
+    }
+}
+
+#[derive(Default)]
+struct Fault {
+    failure: Mutex<Option<RecoveryEvent>>,
+    seen: Mutex<Vec<RecoveryEvent>>,
+}
+impl RecoveryIo for Fault {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        self.seen.lock().unwrap().push(event);
+        if self.failure.lock().unwrap().as_ref() == Some(&event) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+struct FaultFs {
+    root: PathBuf,
+    io: Arc<dyn RecoveryIo>,
+    limits: OperationLimits,
+}
+impl RecoveryFs for FaultFs {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+    fn io(&self) -> Arc<dyn RecoveryIo> {
+        self.io.clone()
+    }
+    fn reconciliation_limits(&self) -> &OperationLimits {
+        &self.limits
+    }
+}
+
+// A missing parent sync must prevent both a Durable value and catalog selection.
+#[test]
+fn parent_sync_failure_is_unknown_and_reconciliation_repairs_catalog() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    let faults = Arc::new(Fault::default());
+    *faults.failure.lock().unwrap() = Some(RecoveryEvent::Sync(Directory::PublicationParent));
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    let outcome = backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap();
+    assert!(matches!(outcome, PublicationOutcome::OutcomeUnknown { .. }));
+    f.assert_source_usable();
+    assert!(
+        !f.destination
+            .join(".catalog")
+            .join(format!("{}.json", request.operation_id))
+            .exists()
+    );
+    *faults.failure.lock().unwrap() = None;
+    let recovered = reconcile_publication(&request.operation_id.to_string(), &filesystem).unwrap();
+    assert!(matches!(recovered, PublicationOutcome::Durable(_)));
+    assert!(
+        f.destination
+            .join(".catalog")
+            .join(format!("{}.json", request.operation_id))
+            .is_file()
+    );
+}
+
+// Skipping any flush or treating its error as success would publish a partial or
+// unacknowledged bundle; the independent verifier's own copy flush is included.
+#[test]
+fn prepublication_flush_failures_never_create_final_names_or_poison_source() {
+    for event in [
+        RecoveryEvent::Flush(Member::Image),
+        RecoveryEvent::Flush(Member::Validation),
+        RecoveryEvent::Flush(Member::Profile),
+        RecoveryEvent::Flush(Member::VerificationCopy),
+        RecoveryEvent::Flush(Member::Report),
+        RecoveryEvent::Flush(Member::Manifest),
+        RecoveryEvent::Sync(Directory::StagingBeforeVerify),
+        RecoveryEvent::Sync(Directory::StagingBeforePublish),
+    ] {
+        let f = Fixture::new();
+        let mut request = f.request();
+        request.profile.catalog_identity = request.store.catalog_key.clone();
+        let faults = Arc::new(Fault::default());
+        *faults.failure.lock().unwrap() = Some(event);
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(
+            backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err(),
+            "{event:?}"
+        );
+        assert!(
+            !f.destination
+                .join(request.operation_id.to_string())
+                .exists(),
+            "{event:?}"
+        );
+        assert!(
+            faults.seen.lock().unwrap().contains(&event),
+            "fault not reached: {event:?}"
+        );
+        f.assert_source_usable();
+    }
+}
+
+#[test]
+fn nofollow_destination_escape_refuses_without_capture() {
+    let f = Fixture::new();
+    let alias = f._root.path().join("alias");
+    symlink(&f.destination, &alias).unwrap();
+    let mut request = f.request();
+    request.destination = alias.clone();
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: alias,
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+    f.assert_source_usable();
+}
+
+#[test]
+fn durable_bundle_uses_independent_copy_and_collision_preserves_old_bytes() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let result = backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap();
+    let PublicationOutcome::Durable(bundle) = result else {
+        panic!("publication not durable")
+    };
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle.path().join("manifest.json")).unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle.path().join("report.json")).unwrap()).unwrap();
+    assert_eq!(manifest["independent_copy_status"], "verified");
+    assert_eq!(report["copy_evidence"]["creation"], "wrapper_created");
+    assert_ne!(
+        report["copy_evidence"]["source_image_identity"],
+        report["copy_evidence"]["verified_file_identity"]
+    );
+    assert!(!bundle.path().join("verification.fls").exists());
+    let old = fs::read(bundle.path().join("image.fls")).unwrap();
+    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert_eq!(fs::read(bundle.path().join("image.fls")).unwrap(), old);
+    f.assert_source_usable();
+}
+
+// An empty store cannot fit two full images and any metadata within twice its
+// physical size. Capture must never run merely to discover that impossibility.
+#[test]
+fn default_and_oversized_image_ceilings_refuse_before_capture() {
+    for ceiling in [None, Some(u64::MAX)] {
+        let f = Fixture::new();
+        let mut request = f.request();
+        request.image_byte_limit = ceiling;
+        request.profile.catalog_identity = request.store.catalog_key.clone();
+        let faults = Arc::new(Fault::default());
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+        assert!(
+            !faults
+                .seen
+                .lock()
+                .unwrap()
+                .contains(&RecoveryEvent::Capture)
+        );
+        f.assert_source_usable();
+    }
+}
+
+#[test]
+fn unknown_or_review_required_alias_and_wrong_configured_root_refuse_before_capture() {
+    use fl_store::recovery::inventory::AliasStatus;
+    for alias in [AliasStatus::Unknown, AliasStatus::ReviewRequired] {
+        let f = Fixture::new();
+        let mut request = f.request();
+        request.store.alias_status = alias;
+        let faults = Arc::new(Fault::default());
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+        assert!(
+            !faults
+                .seen
+                .lock()
+                .unwrap()
+                .contains(&RecoveryEvent::Capture)
+        );
+    }
+    let f = Fixture::new();
+    let request = f.request();
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f._root.path().to_path_buf(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+}
+
+#[test]
+fn small_incompressible_source_refuses_before_capture() {
+    let f = Fixture::new();
+    let compact_path = f._root.path().join("compact.fls");
+    let small = FerroStore::open(&compact_path).unwrap();
+    // JSON contains no compressible repeated string; image/header overhead and
+    // metadata still need admission even for a tiny valid source.
+    small
+        .put_doc("opaque", "one", &json!({"value":"0ca87615bf4239de"}))
+        .unwrap();
+    small.compact().unwrap();
+    let mut request = f.request();
+    let inventory = collect_inventory(&InventoryInputs {
+        roots: vec![f._root.path().to_path_buf()],
+        bindings: vec![BindingInput::config(
+            "fixture",
+            compact_path.clone(),
+            Some("ferro".into()),
+            "fixture",
+        )],
+        ..Default::default()
+    })
+    .unwrap();
+    request.store = inventory
+        .stores
+        .iter()
+        .find(|r| r.identity.canonical_path.as_deref() == Some(compact_path.as_path()))
+        .unwrap()
+        .identity
+        .clone();
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    request.image_byte_limit = Some(fs::metadata(&compact_path).unwrap().len());
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(backup(&small, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+    small.put_doc("opaque", "after", &json!(true)).unwrap();
+}
+
+#[test]
+fn streaming_ceiling_overrun_has_distinct_error_and_no_final_bundle() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    request.image_byte_limit = Some(1);
+    let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let error = backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap_err();
+    assert!(matches!(
+        error,
+        fl_store::recovery::RecoveryError::ImageExceedsCeiling { .. }
+    ));
+    assert!(
+        !f.destination
+            .join(request.operation_id.to_string())
+            .exists()
+    );
+    assert!(
+        !f.destination
+            .join(".staging")
+            .join(request.operation_id.to_string())
+            .exists()
+    );
+    f.assert_source_usable();
+}
+
+#[test]
+fn corrupted_final_member_is_quarantined_without_deletion() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    let faults = Arc::new(Fault::default());
+    *faults.failure.lock().unwrap() = Some(RecoveryEvent::Sync(Directory::PublicationParent));
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap(),
+        PublicationOutcome::OutcomeUnknown { .. }
+    ));
+    let final_path = f.destination.join(request.operation_id.to_string());
+    fs::write(final_path.join("report.json"), b"corrupt fixture report").unwrap();
+    *faults.failure.lock().unwrap() = None;
+    assert!(reconcile_publication(&request.operation_id.to_string(), &filesystem).is_err());
+    assert!(final_path.join("image.fls").is_file());
+    assert!(
+        f.destination
+            .join(".quarantine")
+            .join(request.operation_id.to_string())
+            .exists()
+    );
+    assert!(
+        !f.destination
+            .join(".catalog")
+            .join(format!("{}.json", request.operation_id))
+            .exists()
+    );
+}
+
+#[test]
+fn source_hardlink_or_request_for_a_different_owner_refuses_before_capture() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    let other = FerroStore::open(f._root.path().join("other.fls")).unwrap();
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(backup(&other, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+    fs::hard_link(&f.source, f.destination.join("alias.fls")).unwrap();
+    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+    assert_eq!(
+        fs::read(&f.source).unwrap(),
+        fs::read(f.destination.join("alias.fls")).unwrap()
+    );
+}
+
+#[test]
+fn cancellation_and_expired_deadline_refuse_before_capture() {
+    for cancel_argument in [true, false] {
+        let f = Fixture::new();
+        let request = f.request();
+        let cancel = CancelToken::new();
+        if cancel_argument {
+            cancel.cancel()
+        } else {
+            request.limits.cancel.cancel()
+        }
+        let faults = Arc::new(Fault::default());
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(matches!(
+            backup(&f.store, &request, &filesystem, &cancel),
+            Err(fl_store::recovery::RecoveryError::Cancelled { .. })
+        ));
+        assert!(
+            !faults
+                .seen
+                .lock()
+                .unwrap()
+                .contains(&RecoveryEvent::Capture)
+        );
+        f.assert_source_usable();
+    }
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.limits.deadline = Instant::now();
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(fl_store::recovery::RecoveryError::Deadline { .. })
+    ));
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+}
+
+// The child opens only the explicit fixture authorized by its parent. It never
+// invokes a vendor/CLI or inherits a production configuration or FL_DB.
+#[test]
+fn backup_lock_contender_child() {
+    let Some(root) = std::env::var_os("FERRO_RECOVERY_FIXTURE_ROOT") else {
+        return;
+    };
+    assert!(std::env::var_os("FL_DB").is_none());
+    let root = PathBuf::from(root);
+    let marker = fs::read_to_string(root.join("fixture-authority")).unwrap();
+    assert_eq!(
+        marker,
+        std::env::var("FERRO_RECOVERY_FIXTURE_TOKEN").unwrap()
+    );
+    let source = root.join("source.fls");
+    let destination = root.join("backups");
+    let owner = FerroStore::open(&source).unwrap();
+    let mut request = fixture_request(&root, &source, &destination);
+    request.profile.catalog_identity = request.store.catalog_key.clone();
+    let filesystem = NativeRecoveryFs::new(destination, reconciliation_limits());
+    assert!(matches!(
+        backup(&owner, &request, &filesystem, &CancelToken::new()),
+        Err(fl_store::recovery::RecoveryError::ConcurrentBackup { .. })
+    ));
+}
+
+#[test]
+fn physical_store_lock_excludes_a_second_process() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    let request = f.request();
+    let locks = f.destination.join(".locks");
+    fs::create_dir(&locks).unwrap();
+    fs::set_permissions(&locks, fs::Permissions::from_mode(0o700)).unwrap();
+    // Hold the public protocol's physical-identity lock, independently of the
+    // implementation's process-local state. Child success catches missing flock.
+    let identity = request.store.filesystem_identity.unwrap();
+    let lock = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .read(true)
+        .open(locks.join(format!("{identity}.lock")))
+        .unwrap();
+    fs::set_permissions(
+        locks.join(format!("{identity}.lock")),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let token = uuid::Uuid::now_v7().to_string();
+    fs::write(f._root.path().join("fixture-authority"), &token).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "backup_lock_contender_child", "--nocapture"])
+        .env_clear()
+        .env("FERRO_RECOVERY_FIXTURE_ROOT", f._root.path())
+        .env("FERRO_RECOVERY_FIXTURE_TOKEN", token)
+        .env_remove("AGENT_PERSONA")
+        .env_remove("AGENT_NAME")
+        .env_remove("FL_HOSTED_ID")
+        .env_remove("AGENT_HYDRATION_GENERATION")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failure: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    f.assert_source_usable();
+}
+
+struct Substitute {
+    staging: PathBuf,
+    operation: String,
+    source: PathBuf,
+    directory: bool,
+    done: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for Substitute {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        if event == RecoveryEvent::Publish
+            && !self.done.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let stage = self.staging.join(&self.operation);
+            if self.directory {
+                fs::rename(&stage, self.staging.join("held-original"))?;
+                fs::create_dir(&stage)?;
+                fs::set_permissions(&stage, fs::Permissions::from_mode(0o700))?;
+            } else {
+                fs::remove_file(stage.join("image.fls"))?;
+                fs::hard_link(&self.source, stage.join("image.fls"))?;
+            }
+        }
+        Ok(())
+    }
+}
+#[test]
+fn substitution_at_publish_boundary_never_occupies_a_final_name() {
+    for directory in [false, true] {
+        let f = Fixture::new();
+        let request = f.request();
+        let hook = Arc::new(Substitute {
+            staging: f.destination.join(".staging"),
+            operation: request.operation_id.to_string(),
+            source: f.source.clone(),
+            directory,
+            done: Default::default(),
+        });
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: hook.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+        assert!(hook.done.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !f.destination
+                .join(request.operation_id.to_string())
+                .exists()
+        );
+        assert!(f.source.is_file());
+    }
+}
+#[test]
+fn shared_metadata_quota_cannot_borrow_an_unlimited_verification_budget() {
+    let f = Fixture::new();
+    let mut request = f.request();
+    request.metadata_byte_limit = 65536;
+    let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(fl_store::recovery::RecoveryError::Quota { .. })
+    ));
+    assert!(
+        !f.destination
+            .join(request.operation_id.to_string())
+            .exists()
+    );
+    f.assert_source_usable();
+}
+#[test]
+fn protected_config_snapshots_allow_only_named_descriptors_and_exclude_key_aliases() {
+    use fl_store::recovery::{
+        backup::{ApprovedConfig, ExcludedVaultKey},
+        manifest::MemberKind,
+    };
+    use std::os::unix::fs::MetadataExt;
+    for key_alias in [0, 1, 2, 3] {
+        let f = Fixture::new();
+        let mut request = f.request();
+        let key = f._root.path().join("vault.key");
+        fs::write(&key, b"fixture-only-key").unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = f._root.path().join("config.toml");
+        match key_alias {
+            0 => {
+                fs::write(&config, b"fixture_credentials = 'not-real'\n").unwrap();
+                fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            1 => fs::hard_link(&key, &config).unwrap(),
+            2 => symlink(&key, &config).unwrap(),
+            _ => {}
+        }
+        let key_m = fs::metadata(&key).unwrap();
+        let path = if key_alias == 3 {
+            key.clone()
+        } else {
+            config.clone()
+        };
+        let m = fs::metadata(&path).unwrap();
+        request.excluded_vault_key = Some(ExcludedVaultKey {
+            path: key,
+            identity: (key_m.dev(), key_m.ino()),
+        });
+        request.configs = vec![ApprovedConfig {
+            kind: MemberKind::ProtectedConfig,
+            path,
+            identity: (m.dev(), m.ino()),
+            byte_limit: 4096,
+        }];
+        let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+        let result = backup(&f.store, &request, &filesystem, &CancelToken::new());
+        if key_alias == 0 {
+            let PublicationOutcome::Durable(bundle) = result.unwrap() else {
+                panic!("not durable")
+            };
+            assert_eq!(
+                fs::read(bundle.path().join("config.toml")).unwrap(),
+                b"fixture_credentials = 'not-real'\n"
+            );
+            assert_eq!(
+                fs::metadata(bundle.path().join("config.toml"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600
+            );
+            assert!(!bundle.path().join("vault.key").exists());
+        } else {
+            assert!(result.is_err());
+            assert!(
+                !f.destination
+                    .join(request.operation_id.to_string())
+                    .exists()
+            );
+        }
+    }
+}
+
+struct WriteFault {
+    mode: u8,
+    reached: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for WriteFault {
+    fn write_at(&self, file: &fs::File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        self.reached
+            .store(true, std::sync::atomic::Ordering::Release);
+        match self.mode {
+            0 => file.write_at(&bytes[..bytes.len().min(13)], offset),
+            1 => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            2 => Err(io::Error::from_raw_os_error(libc::EACCES)),
+            _ => Ok(0),
+        }
+    }
+}
+#[test]
+fn short_writes_retry_but_enospc_permission_and_zero_writes_abort_privately() {
+    for mode in 0..4 {
+        let f = Fixture::new();
+        let request = f.request();
+        let hook = Arc::new(WriteFault {
+            mode,
+            reached: Default::default(),
+        });
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: hook.clone(),
+            limits: reconciliation_limits(),
+        };
+        let result = backup(&f.store, &request, &filesystem, &CancelToken::new());
+        assert!(hook.reached.load(std::sync::atomic::Ordering::Acquire));
+        if mode == 0 {
+            assert!(matches!(result, Ok(PublicationOutcome::Durable(_))))
+        } else {
+            assert!(result.is_err());
+            assert!(
+                !f.destination
+                    .join(request.operation_id.to_string())
+                    .exists()
+            );
+        }
+        f.assert_source_usable();
+    }
+}
+struct CancelCopy {
+    cancel: CancelToken,
+    reached: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for CancelCopy {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        if event == RecoveryEvent::Write(Member::VerificationCopy) {
+            self.reached
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.cancel.cancel();
+        }
+        Ok(())
+    }
+}
+#[test]
+fn cancellation_during_actual_verifier_copy_keeps_source_and_old_bundle_usable() {
+    let f = Fixture::new();
+    let old_request = f.request();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let PublicationOutcome::Durable(old) =
+        backup(&f.store, &old_request, &native, &CancelToken::new()).unwrap()
+    else {
+        panic!("old backup")
+    };
+    let old_bytes = fs::read(old.path().join("image.fls")).unwrap();
+    let request = f.request();
+    let cancel = CancelToken::new();
+    let hook = Arc::new(CancelCopy {
+        cancel: cancel.clone(),
+        reached: Default::default(),
+    });
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: hook.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &cancel),
+        Err(fl_store::recovery::RecoveryError::Cancelled { .. })
+    ));
+    assert!(hook.reached.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        !f.destination
+            .join(request.operation_id.to_string())
+            .exists()
+    );
+    assert_eq!(old_bytes, fs::read(old.path().join("image.fls")).unwrap());
+    f.assert_source_usable();
+}
+#[test]
+fn every_catalog_failure_is_unknown_and_repairable_without_changing_old_backup() {
+    for event in [
+        RecoveryEvent::Sync(Directory::StagingParent),
+        RecoveryEvent::Flush(Member::Receipt),
+        RecoveryEvent::CatalogPublish,
+        RecoveryEvent::Sync(Directory::CatalogParent),
+    ] {
+        let f = Fixture::new();
+        let old_request = f.request();
+        let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+        let PublicationOutcome::Durable(old) =
+            backup(&f.store, &old_request, &native, &CancelToken::new()).unwrap()
+        else {
+            panic!("old backup")
+        };
+        let old_bytes = fs::read(old.path().join("image.fls")).unwrap();
+        let request = f.request();
+        let faults = Arc::new(Fault::default());
+        *faults.failure.lock().unwrap() = Some(event);
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(matches!(
+            backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap(),
+            PublicationOutcome::OutcomeUnknown { .. }
+        ));
+        assert!(faults.seen.lock().unwrap().contains(&event));
+        *faults.failure.lock().unwrap() = None;
+        assert!(matches!(
+            reconcile_publication(&request.operation_id.to_string(), &filesystem).unwrap(),
+            PublicationOutcome::Durable(_)
+        ));
+        assert_eq!(old_bytes, fs::read(old.path().join("image.fls")).unwrap());
+        f.assert_source_usable();
+    }
+}
+struct KillAt {
+    event: RecoveryEvent,
+    marker: PathBuf,
+}
+impl RecoveryIo for KillAt {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        if event == self.event {
+            fs::write(&self.marker, b"reached")?;
+            unsafe { libc::raise(libc::SIGKILL) };
+        }
+        Ok(())
+    }
+}
+#[test]
+fn backup_crash_child() {
+    let Some(root) = std::env::var_os("FERRO_RECOVERY_CRASH_ROOT") else {
+        return;
+    };
+    assert!(std::env::var_os("FL_DB").is_none());
+    let root = PathBuf::from(root);
+    assert_eq!(
+        fs::read_to_string(root.join("fixture-authority")).unwrap(),
+        std::env::var("FERRO_RECOVERY_FIXTURE_TOKEN").unwrap()
+    );
+    let source = root.join("source.fls");
+    let destination = root.join("backups");
+    let owner = FerroStore::open(&source).unwrap();
+    let mut request = fixture_request(&root, &source, &destination);
+    request.operation_id =
+        uuid::Uuid::parse_str(&std::env::var("FERRO_RECOVERY_OPERATION").unwrap()).unwrap();
+    let event = match std::env::var("FERRO_RECOVERY_CRASH_POINT")
+        .unwrap()
+        .as_str()
+    {
+        "write" => RecoveryEvent::Write(Member::Image),
+        "rename" => RecoveryEvent::Sync(Directory::PublicationParent),
+        "receipt" => RecoveryEvent::Sync(Directory::CatalogParent),
+        _ => panic!("unknown fixture crash point"),
+    };
+    let filesystem = FaultFs {
+        root: destination,
+        io: Arc::new(KillAt {
+            event,
+            marker: root.join("kill-reached"),
+        }),
+        limits: reconciliation_limits(),
+    };
+    let _ = backup(&owner, &request, &filesystem, &CancelToken::new());
+    panic!("kill boundary was not reached");
+}
+#[test]
+fn forced_termination_reconciles_only_complete_operation_without_source_reads() {
+    use std::os::unix::process::ExitStatusExt;
+    for point in ["write", "rename", "receipt"] {
+        let f = Fixture::new();
+        let request = f.request();
+        let operation = request.operation_id.to_string();
+        let token = uuid::Uuid::now_v7().to_string();
+        fs::write(f._root.path().join("fixture-authority"), &token).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "backup_crash_child", "--nocapture"])
+            .env_clear()
+            .env("FERRO_RECOVERY_CRASH_ROOT", f._root.path())
+            .env("FERRO_RECOVERY_FIXTURE_TOKEN", token)
+            .env("FERRO_RECOVERY_OPERATION", &operation)
+            .env("FERRO_RECOVERY_CRASH_POINT", point)
+            .env_remove("AGENT_PERSONA")
+            .env_remove("AGENT_NAME")
+            .env_remove("FL_HOSTED_ID")
+            .env_remove("AGENT_HYDRATION_GENERATION")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(f._root.path().join("kill-reached")).unwrap(),
+            b"reached"
+        );
+        let hidden = f._root.path().join("source-hidden");
+        fs::rename(&f.source, &hidden).unwrap();
+        let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+        let result = reconcile_publication(&operation, &filesystem);
+        if point == "write" {
+            assert!(result.is_err());
+            assert!(!f.destination.join(&operation).exists());
+        } else {
+            assert!(matches!(result, Ok(PublicationOutcome::Durable(_))))
+        }
+        fs::rename(hidden, &f.source).unwrap();
+        f.assert_source_usable();
+    }
+}
+
+#[test]
+fn reconciliation_resyncs_every_complete_member_before_catalog_attestation() {
+    for event in [
+        RecoveryEvent::Flush(Member::Image),
+        RecoveryEvent::Flush(Member::Manifest),
+        RecoveryEvent::Flush(Member::Validation),
+        RecoveryEvent::Flush(Member::Profile),
+        RecoveryEvent::Flush(Member::Report),
+    ] {
+        let f = Fixture::new();
+        let request = f.request();
+        let faults = Arc::new(Fault::default());
+        *faults.failure.lock().unwrap() = Some(RecoveryEvent::Sync(Directory::PublicationParent));
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: faults.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(matches!(
+            backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap(),
+            PublicationOutcome::OutcomeUnknown { .. }
+        ));
+        faults.seen.lock().unwrap().clear();
+        *faults.failure.lock().unwrap() = Some(event);
+        assert!(matches!(
+            reconcile_publication(&request.operation_id.to_string(), &filesystem).unwrap(),
+            PublicationOutcome::OutcomeUnknown { .. }
+        ));
+        assert!(faults.seen.lock().unwrap().contains(&event));
+        assert!(
+            !f.destination
+                .join(".catalog")
+                .join(format!("{}.json", request.operation_id))
+                .exists()
+        );
+        f.assert_source_usable();
+    }
+}
+#[test]
+fn incomplete_catalog_temp_is_preserved_and_durable_bundle_receipt_is_repaired() {
+    let f = Fixture::new();
+    let request = f.request();
+    let faults = Arc::new(Fault::default());
+    *faults.failure.lock().unwrap() = Some(RecoveryEvent::Sync(Directory::PublicationParent));
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap(),
+        PublicationOutcome::OutcomeUnknown { .. }
+    ));
+    let temp = f
+        .destination
+        .join(".catalog")
+        .join(format!("{}.tmp", request.operation_id));
+    fs::write(&temp, b"{incomplete fixture receipt").unwrap();
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+    *faults.failure.lock().unwrap() = None;
+    assert!(matches!(
+        reconcile_publication(&request.operation_id.to_string(), &filesystem).unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+    assert_eq!(
+        fs::read(
+            f.destination
+                .join(".quarantine")
+                .join(format!("{}-catalog-temp", request.operation_id))
+        )
+        .unwrap(),
+        b"{incomplete fixture receipt"
+    );
+    assert!(
+        f.destination
+            .join(request.operation_id.to_string())
+            .join("image.fls")
+            .is_file()
+    );
+}
+#[test]
+fn mismatched_committed_receipt_quarantines_operation_without_deleting_members() {
+    let f = Fixture::new();
+    let request = f.request();
+    let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+    let receipt = f
+        .destination
+        .join(".catalog")
+        .join(format!("{}.json", request.operation_id));
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    json["image_sha256"] = json!("f".repeat(64));
+    fs::write(&receipt, serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(matches!(
+        reconcile_publication(&request.operation_id.to_string(), &filesystem),
+        Err(fl_store::recovery::RecoveryError::Quarantined { .. })
+    ));
+    assert!(receipt.is_file());
+    assert!(
+        f.destination
+            .join(".quarantine")
+            .join(request.operation_id.to_string())
+            .is_file()
+    );
+    assert!(
+        f.destination
+            .join(request.operation_id.to_string())
+            .join("image.fls")
+            .is_file()
+    );
+}
+
+struct CapacityFault {
+    available: u64,
+    asked: std::sync::atomic::AtomicBool,
+    captured: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for CapacityFault {
+    fn available_bytes(&self, _: &fs::File) -> io::Result<u64> {
+        self.asked.store(true, std::sync::atomic::Ordering::Release);
+        Ok(self.available)
+    }
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        if event == RecoveryEvent::Capture {
+            self.captured
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+}
+#[test]
+fn actual_capacity_and_stated_margin_are_admitted_before_capture() {
+    for (available, margin) in [(0, 0), (4095, 4096), (131072, 8192)] {
+        let f = Fixture::new();
+        let mut request = f.request();
+        request.space_margin_bytes = margin;
+        let hook = Arc::new(CapacityFault {
+            available,
+            asked: Default::default(),
+            captured: Default::default(),
+        });
+        let filesystem = FaultFs {
+            root: f.destination.clone(),
+            io: hook.clone(),
+            limits: reconciliation_limits(),
+        };
+        assert!(matches!(
+            backup(&f.store, &request, &filesystem, &CancelToken::new()),
+            Err(fl_store::recovery::RecoveryError::Quota { .. })
+        ));
+        assert!(hook.asked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!hook.captured.load(std::sync::atomic::Ordering::Acquire));
+        f.assert_source_usable();
+    }
+}
+#[test]
+fn oversized_shared_directory_refuses_unsupported_allocation_geometry() {
+    let f = Fixture::new();
+    let request = f.request();
+    let catalog = f.destination.join(".catalog");
+    fs::create_dir(&catalog).unwrap();
+    fs::set_permissions(&catalog, fs::Permissions::from_mode(0o700)).unwrap();
+    for n in 0..512 {
+        fs::write(catalog.join(format!("fixture-entry-{n:04}")), b"").unwrap();
+    }
+    assert!(fs::metadata(&catalog).unwrap().len() > 4096);
+    let faults = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(fl_store::recovery::RecoveryError::Unsupported { .. })
+    ));
+    assert!(
+        !faults
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Capture)
+    );
+}
+struct ObserveAllocation {
+    root: PathBuf,
+    cap: u64,
+    maximum: std::sync::atomic::AtomicU64,
+    copy_seen: std::sync::atomic::AtomicBool,
+}
+fn allocated_tree(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::symlink_metadata(path).unwrap();
+    let mut bytes = m.blocks() * 512;
+    if m.is_dir() {
+        for item in fs::read_dir(path).unwrap() {
+            bytes += allocated_tree(&item.unwrap().path())
+        }
+    }
+    bytes
+}
+impl RecoveryIo for ObserveAllocation {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        let bytes = allocated_tree(&self.root);
+        assert!(
+            bytes <= self.cap,
+            "allocated {bytes}, admitted {}",
+            self.cap
+        );
+        self.maximum
+            .fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
+        if event == RecoveryEvent::Write(Member::VerificationCopy) {
+            self.copy_seen
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+}
+#[test]
+fn measured_image_ratio_and_allocation_peak_include_both_independent_images() {
+    let f = Fixture::new();
+    let request = f.request();
+    let source = fs::metadata(&f.source).unwrap().len();
+    let hook = Arc::new(ObserveAllocation {
+        root: f.destination.clone(),
+        cap: source * 2,
+        maximum: Default::default(),
+        copy_seen: Default::default(),
+    });
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: hook.clone(),
+        limits: reconciliation_limits(),
+    };
+    let PublicationOutcome::Durable(bundle) =
+        backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap()
+    else {
+        panic!("not durable")
+    };
+    let image = fs::metadata(bundle.path().join("image.fls")).unwrap().len();
+    assert!(hook.copy_seen.load(std::sync::atomic::Ordering::Acquire));
+    for item in fs::read_dir(bundle.path()).unwrap() {
+        assert_eq!(
+            fs::metadata(item.unwrap().path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+    assert_eq!(
+        fs::metadata(bundle.path()).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    println!(
+        "fixture=repeated-update-unknown source_bytes={source} image_bytes={image} image_to_source={:.8} peak_allocated_bytes={} disk_cap={}",
+        image as f64 / source as f64,
+        hook.maximum.load(std::sync::atomic::Ordering::Acquire),
+        source * 2
+    );
+}
+
+struct AdvanceSource {
+    owner: Arc<FerroStore>,
+    advanced: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for AdvanceSource {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        if event == RecoveryEvent::Write(Member::Image)
+            && !self
+                .advanced
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.owner
+                .put_doc("fixture_unknown", "after-cut", &json!({"committed":true}))
+                .unwrap();
+        }
+        Ok(())
+    }
+}
+#[test]
+fn source_commits_continue_while_bundle_remains_at_the_captured_sequence() {
+    let f = Fixture::new();
+    let request = f.request();
+    let source = Arc::new(f.store);
+    let hook = Arc::new(AdvanceSource {
+        owner: source.clone(),
+        advanced: Default::default(),
+    });
+    let filesystem = FaultFs {
+        root: f.destination,
+        io: hook.clone(),
+        limits: reconciliation_limits(),
+    };
+    let PublicationOutcome::Durable(bundle) =
+        backup(&source, &request, &filesystem, &CancelToken::new()).unwrap()
+    else {
+        panic!("not durable")
+    };
+    assert!(hook.advanced.load(std::sync::atomic::Ordering::Acquire));
+    let restored =
+        fl_store::recovery::open_recovery_image_existing(&bundle.path().join("image.fls")).unwrap();
+    assert_eq!(
+        restored.get_doc("fixture_unknown", "after-cut").unwrap(),
+        None
+    );
+    assert_eq!(
+        source.get_doc("fixture_unknown", "after-cut").unwrap(),
+        Some(json!({"committed":true}))
+    );
+    assert_eq!(
+        restored.get_doc("fixture_unknown", "one").unwrap().unwrap()["n"],
+        23
+    );
+}

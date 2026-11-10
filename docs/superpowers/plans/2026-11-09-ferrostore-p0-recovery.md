@@ -108,6 +108,41 @@ Shared types defined with their first producer:
 - [ ] Admit only the allowlisted batch configs. Reject a vault-key pathname or identical file identity, including symlink/hardlink aliases, and never follow arbitrary referenced secret paths. A protected config snapshot may contain credentials under the later Ferris/Jarvis decision; it cannot be published as a public artifact. `vault.enc` remains optional and opaque; vault key never copied. No production copies in this task.
 - [ ] Run tests GREEN, including proof that destination sync failure does not set source `Poison`. Commit `feat(recovery): publish verified bounded backup bundles`; fresh task review.
 
+Task 4 implementation decisions approved by Ferris on 2026-11-10 (FerroWire
+`01a1c381-a9d7-74ae-a9df-3000dff52273`):
+
+- The image ceiling defaults to source physical file length L; callers may only
+  lower it. There is no pre-capture engine estimator. Admission requires twice
+  the ceiling plus bounded metadata, configuration and catalog reserves to fit
+  within 2L, the operation quota and available destination space after an explicit
+  margin. A default ceiling with positive reserves therefore refuses. Streaming
+  overflow reports `ImageExceedsCeiling`; fixture evidence records image/L ratios.
+- Exactly one configured approved backup root is supported. Reject other roots
+  and inventory alias status Unknown or ReviewRequired. Hold a `flock` on the
+  physical inventory identity's lock file under that root's `.locks/` for the
+  operation. No source-file lock, multiple-root/host coordination or P1 ownership
+  claim is introduced. Lock diagnostics contain operation/process IDs only.
+- The immutable manifest retains NotPublished and independent-copy Verified.
+  Only an atomic catalog receipt written after bundle rename and parent sync
+  attests Durable. It binds manifest/image hashes and every member checksum;
+  catalog temporary-file sync, exclusive rename and directory sync are required.
+  Reconciliation checks only the requested operation's complete bundle before
+  repairing an absent receipt. A mismatch is quarantined by operation ID, never
+  deleted or selected for restore. Partial staging cleanup is operation-specific.
+
+Task 4 implementation admission currently accepts only native Linux ext4/XFS
+allocation geometry with a consistent power-of-two 512–65536-byte unit. It
+reserves 26 units inside the caller's metadata limit: six directory growth units,
+sixteen member rounding units, two lock units and two receipt/temp units. Shared
+directories larger than one unit refuse; this deliberately bounds this manual P0
+path, not future retention/catalog scale. Image, verifier-copy, config and JSON
+lengths are charged and fully allocated before writes; observed allocations that
+exceed the reserved rounding geometry refuse. Filesystem journals and unrelated
+filesystem activity are not claimed as operation-owned staging. Native fixture
+evidence is ext4; XFS execution and activation remain acceptance work, as do
+macOS/Windows native private-publication implementations. None of these checks
+turns a reflink into an independent-copy or capacity proof.
+
 ### Task 5: Add dormant owner-side schedules and batch accounting
 
 **Files:** Create `crates/store/src/recovery/{policy.rs,scheduler.rs,control.rs}`; modify `crates/store/src/cli/{serve.rs,args.rs}`, `crates/store/src/ferrostore/{server.rs,auth.rs}`, `crates/cli/src/cmd/recovery.rs`. Black-box tests: new `crates/store/tests/recovery_daemon.rs` and `crates/cli/tests/recovery_batch.rs`.

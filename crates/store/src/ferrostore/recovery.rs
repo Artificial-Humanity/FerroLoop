@@ -312,6 +312,20 @@ fn publication(file: &dyn ContainerIo, c: &Check<'_>) -> Result<Publication, Rec
 }
 
 impl FerroStore {
+    /// Bind a recovery request to this physical owner without refreshing or
+    /// reading source contents. This is not persistent lineage or ownership.
+    pub(crate) fn recovery_source_path(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<&std::path::Path, RecoveryError> {
+        match &self.inner {
+            Inner::Disk(disk) => Ok(&disk.path),
+            _ => Err(RecoveryError::Unsupported {
+                operation_id,
+                reason: "physical owner handle required",
+            }),
+        }
+    }
     /// Capture a refreshed immutable published state. This does not create/open
     /// a fallback store, checkpoint, flush MQ, sync the source, or update its cache.
     pub fn capture_recovery(
