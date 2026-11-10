@@ -19,6 +19,10 @@ impl World {
     fn fl(&self) -> Command {
         let mut cmd = Command::cargo_bin("fl").unwrap();
         cmd.env_clear()
+            .env_remove("AGENT_PERSONA")
+            .env_remove("AGENT_NAME")
+            .env_remove("FL_HOSTED_ID")
+            .env_remove("AGENT_HYDRATION_GENERATION")
             .env("HOME", self.home.path())
             .current_dir(self.home.path())
             .timeout(Duration::from_secs(10));
@@ -115,6 +119,9 @@ fn inventory_never_reads_store_contents_or_connects_to_its_socket() {
     let world = World::new();
     let path = world.stores.join("fl.fls");
     std::fs::write(&path, b"invalid store").unwrap();
+    for name in ["example.fls", "unbound.fls", "fl.code.fls"] {
+        std::fs::write(world.stores.join(name), b"invalid store").unwrap();
+    }
     // A directory-fd path keeps the socket address below SUN_LEN even when
     // the caller selects a long TMPDIR; the socket still lives beside the store.
     let directory = std::fs::File::open(&world.stores).unwrap();
@@ -125,16 +132,21 @@ fn inventory_never_reads_store_contents_or_connects_to_its_socket() {
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
     assert!(fd >= 0);
     let fd = unsafe { std::fs::File::from_raw_fd(fd) };
-    let watched = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    assert!(
-        unsafe {
-            libc::inotify_add_watch(
-                fd.as_raw_fd(),
-                watched.as_ptr(),
-                libc::IN_OPEN | libc::IN_MODIFY,
-            )
-        } >= 0
-    );
+    for entry in std::fs::read_dir(&world.stores).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "fls") {
+            let watched = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(
+                        fd.as_raw_fd(),
+                        watched.as_ptr(),
+                        libc::IN_OPEN | libc::IN_MODIFY,
+                    )
+                } >= 0
+            );
+        }
+    }
     // Give the child a short address to the same fixture, so an accidental
     // connection would reach the listener rather than fail at SUN_LEN first.
     let home_directory = std::fs::File::open(world.home.path()).unwrap();
@@ -394,7 +406,7 @@ fn hub_discovery_is_bounded_and_reports_omitted_bindings() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|b| b["caller"] == "hub"),
+            .any(|b| b["caller"] == "hub" && b["scope"] != "workspace"),
         "a truncated directory must not choose an enumeration-dependent subset"
     );
     assert!(
@@ -402,4 +414,186 @@ fn hub_discovery_is_bounded_and_reports_omitted_bindings() {
         "metadata scan still accounts for unbound candidates"
     );
     assert_eq!(map["complete"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn incomplete_scan_without_artifact_reads_returns_partial_map() {
+    let world = World::new();
+    let hidden = world.stores.join("hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::os::unix::fs::symlink(&hidden, world.stores.join("linked-directory")).unwrap();
+    let map = world.inventory();
+    assert_eq!(map["complete"], false);
+    assert!(
+        map["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("symlinked directory"))
+    );
+}
+
+#[test]
+fn matching_config_and_hub_keep_both_edges_including_workspace() {
+    let world = World::new();
+    std::fs::write(
+        world.home.path().join(".config/fl/config.toml"),
+        format!(
+            "[state]\nstore = {:?}\n[[project]]\nname = \"example\"\nroot = {:?}\nstore = {:?}\n",
+            world.stores.join("fl.redb"),
+            world.home.path().join("Example"),
+            world.stores.join("example.redb")
+        ),
+    )
+    .unwrap();
+    std::fs::write(world.stores.join("example.fls"), b"fixture").unwrap();
+    let map = world.inventory();
+    for scope in ["workspace", "project:example"] {
+        for caller in ["config", "hub"] {
+            let edge = map["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["caller"] == caller && e["scope"] == scope)
+                .unwrap();
+            assert_eq!(edge["mismatch"], false);
+        }
+    }
+}
+
+#[test]
+fn hub_workspace_and_project_fallback_follow_cwd_bound_store() {
+    let world = World::new();
+    let selected = world.stores.join("bound.redb");
+    std::fs::write(
+        world.home.path().join(".config/fl/config.toml"),
+        format!(
+            "[[project]]\nname = \"example\"\nroot = {:?}\nstore = {:?}\n",
+            world.home.path(),
+            selected
+        ),
+    )
+    .unwrap();
+    let map = world.inventory();
+    for scope in ["workspace", "project:example"] {
+        let edge = map["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["caller"] == "hub" && e["scope"] == scope)
+            .unwrap();
+        assert_eq!(
+            edge["effective_path"],
+            selected.with_extension("fls").to_str().unwrap()
+        );
+        assert_eq!(edge["mismatch"], scope == "workspace");
+    }
+}
+
+#[test]
+fn invalid_backend_is_refused_by_inventory() {
+    let world = World::new();
+    world
+        .fl()
+        .env("FL_STORE_BACKEND", "sqlite")
+        .args(["recovery", "inventory", "--root"])
+        .arg(&world.stores)
+        .arg("--json")
+        .assert()
+        .failure();
+    assert!(!world.stores.join("fl.fls").exists());
+}
+
+#[test]
+fn hub_workspace_edge_tracks_explicit_override_and_default() {
+    let world = World::new();
+    let map = world.inventory();
+    let hub = map["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["caller"] == "hub" && e["scope"] == "workspace")
+        .unwrap();
+    assert_eq!(
+        hub["physical_path"],
+        world.stores.join("fl.fls").to_str().unwrap()
+    );
+    for flag in [false, true] {
+        let chosen = world.stores.join(if flag { "flag.fls" } else { "env.fls" });
+        let mut cmd = world.fl();
+        cmd.env("FL_DB", world.stores.join("env.fls"));
+        if flag {
+            cmd.arg("--db").arg(&chosen);
+        }
+        let output = cmd
+            .args(["recovery", "inventory", "--root"])
+            .arg(&world.stores)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let map: Value = serde_json::from_slice(&output).unwrap();
+        let hub = map["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["caller"] == "hub" && e["scope"] == "workspace")
+            .unwrap();
+        assert_eq!(hub["effective_path"], chosen.to_str().unwrap());
+        assert_eq!(hub["mismatch"], true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn incomplete_scan_refuses_hidden_reverse_alias_before_artifact_open() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    for deployment in [false, true] {
+        let world = World::new();
+        let artifact = world.home.path().join(if deployment {
+            "deployment.json"
+        } else {
+            ".config/fl/config.toml"
+        });
+        std::fs::write(&artifact, if deployment { "{}" } else { "# fixture" }).unwrap();
+        let hidden = world.home.path().join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::os::unix::fs::symlink(&artifact, hidden.join("reverse.fls")).unwrap();
+        std::os::unix::fs::symlink(&hidden, world.stores.join("hidden-directory")).unwrap();
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { std::fs::File::from_raw_fd(fd) };
+        let watched = std::ffi::CString::new(artifact.to_str().unwrap()).unwrap();
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(
+                    fd.as_raw_fd(),
+                    watched.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
+            } >= 0
+        );
+        let mut cmd = world.fl();
+        cmd.args(["recovery", "inventory", "--root"])
+            .arg(&world.stores)
+            .arg("--json");
+        if deployment {
+            cmd.arg("--deployment").arg(&artifact);
+        }
+        cmd.assert()
+            .failure()
+            .stderr(predicates::str::contains("preflight incomplete"));
+        let mut bytes = [0u8; 4096];
+        assert_eq!(
+            unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }

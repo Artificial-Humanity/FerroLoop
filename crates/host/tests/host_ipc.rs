@@ -1292,7 +1292,6 @@ fn slow_subscriber_dropped_not_blocking() {
     healthy.wait_until(Duration::from_secs(3), |events| {
         line_bytes(events, "out").iter().any(|line| line == b"HOLD")
     });
-    let started = Instant::now();
     std::fs::write(flood_gate, b"go").unwrap();
     // Bound the healthy peer's pending batch below its queue cap. Its observed
     // progress admits the next batch, while the held peer accumulates all of them.
@@ -1310,7 +1309,20 @@ fn slow_subscriber_dropped_not_blocking() {
             .count()
             == 200
     });
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // The child measures writes + flushes after each gate, excluding the twenty
+    // harness/healthy-reader round trips. Each batch still has the progress
+    // deadline above, so a fanout blocked by the held peer fails independently.
+    let timing = wait_file(&batches.join("producer-ns"), |bytes| bytes.ends_with(b"\n"));
+    let nanos = std::str::from_utf8(&timing)
+        .expect("producer timing UTF-8")
+        .trim()
+        .parse::<u64>()
+        .expect("producer timing nanoseconds");
+    let producer_elapsed = Duration::from_nanos(nanos);
+    assert!(
+        producer_elapsed < Duration::from_secs(3),
+        "producer writes and flushes took {producer_elapsed:?}"
+    );
     let data: Vec<_> = line_bytes(&events, "out")
         .into_iter()
         .filter(|line| line.starts_with(b"L"))

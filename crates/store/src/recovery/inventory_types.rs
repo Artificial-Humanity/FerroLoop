@@ -110,8 +110,20 @@ pub struct Link {
     pub path: PathBuf,
     pub target: PathBuf,
 }
+/// Observed alias safety, never an assertion of persistent store identity.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasStatus {
+    #[default]
+    Unknown,
+    NoAliasObserved,
+    ReviewRequired,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoreIdentity {
+    /// Missing in older inventory output means unknown, never alias-free.
+    #[serde(default)]
+    pub alias_status: AliasStatus,
     /// Catalog identity derived from the canonical path; not an intrinsic store UUID.
     pub catalog_key: String,
     pub given_paths: Vec<PathBuf>,
