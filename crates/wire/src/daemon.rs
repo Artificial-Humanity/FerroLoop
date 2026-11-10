@@ -217,22 +217,60 @@ fn daemon_draining_queue_path(socket_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Record `message_id` for delivery by the daemon listening (or next spawned) at `socket_path`.
-pub fn enqueue_for_daemon(socket_path: &Path, message_id: &MessageId) -> io::Result<()> {
+fn daemon_queue_lock_path(socket_path: &Path) -> PathBuf {
+    let mut os = socket_path.as_os_str().to_os_string();
+    os.push(".queue.lock");
+    PathBuf::from(os)
+}
+
+fn with_daemon_queue_lock<T>(
+    socket_path: &Path,
+    f: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
     if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let path = daemon_queue_path(socket_path);
+    let lock_path = daemon_queue_lock_path(socket_path);
     let mut opts = fs::OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true).write(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts.open(path)?;
-    writeln!(file, "{message_id}")?;
-    file.flush()
+    let lock_file = opts.open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let res = f();
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    res
+}
+
+/// Record `message_id` for delivery by the daemon listening (or next spawned) at `socket_path`.
+pub fn enqueue_for_daemon(socket_path: &Path, message_id: &MessageId) -> io::Result<()> {
+    with_daemon_queue_lock(socket_path, || {
+        let path = daemon_queue_path(socket_path);
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(path)?;
+        writeln!(file, "{message_id}")?;
+        file.flush()
+    })
 }
 
 pub fn resolve_socket_path(
@@ -2550,76 +2588,74 @@ where
         }
         let mut first_holds = Vec::new();
         let _order = lock(&self.enqueue_gate);
-        if queue_path.exists() {
-            if !draining_path.exists() {
-                let _ = fs::rename(&queue_path, &draining_path);
-            } else {
-                if let Ok(extra) = fs::read_to_string(&queue_path)
-                    && let Ok(mut f) = fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&draining_path)
-                {
-                    let _ = f.write_all(extra.as_bytes());
-                    let _ = f.flush();
-                }
-                let _ = fs::remove_file(&queue_path);
-            }
-        }
-        let Ok(raw) = fs::read_to_string(&draining_path) else {
-            return;
-        };
-        let _ = fs::remove_file(&draining_path);
         let mut seen = BTreeSet::new();
-        let now = now_at();
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
-                continue;
+        for _ in 0..2 {
+            if !draining_path.exists() && queue_path.exists() {
+                let _ = with_daemon_queue_lock(&self.config.socket_path, || {
+                    if !draining_path.exists() && queue_path.exists() {
+                        fs::rename(&queue_path, &draining_path)
+                    } else {
+                        Ok(())
+                    }
+                });
             }
-            let Ok(iri) = fl_core::iri::Iri::parse(trimmed) else {
-                continue;
+            let Ok(raw) = fs::read_to_string(&draining_path) else {
+                break;
             };
-            let mid = MessageId(iri);
-            let Ok(Some(msg)) = self.store.get_wire_message(&mid) else {
-                continue;
-            };
-            let Ok(receipts) = self.store.list_wire_receipts(&mid) else {
-                continue;
-            };
-            let pending_receipts: Vec<DeliveryReceipt> = receipts
-                .into_iter()
-                .filter(|r| r.status == DeliveryStatus::Pending && r.attempts == 0)
-                .collect();
-            if pending_receipts.is_empty() {
-                continue;
-            }
-            {
-                let mut queued = lock(&self.queued_for_daemon);
-                for rcpt in &pending_receipts {
-                    let key = normalize_persona(&rcpt.recipient_name)
-                        .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
-                    if !key.is_empty() {
-                        let list = queued.entry(key).or_default();
-                        if !list.contains(&mid) {
-                            list.push(mid.clone());
+            let _ = fs::remove_file(&draining_path);
+            let now = now_at();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                    continue;
+                }
+                let Ok(iri) = fl_core::iri::Iri::parse(trimmed) else {
+                    continue;
+                };
+                let mid = MessageId(iri);
+                let Ok(Some(msg)) = self.store.get_wire_message(&mid) else {
+                    continue;
+                };
+                let Ok(receipts) = self.store.list_wire_receipts(&mid) else {
+                    continue;
+                };
+                let pending_receipts: Vec<DeliveryReceipt> = receipts
+                    .into_iter()
+                    .filter(|r| r.status == DeliveryStatus::Pending && r.attempts == 0)
+                    .collect();
+                if pending_receipts.is_empty() {
+                    continue;
+                }
+                {
+                    let mut queued = lock(&self.queued_for_daemon);
+                    for rcpt in &pending_receipts {
+                        let key = normalize_persona(&rcpt.recipient_name)
+                            .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
+                        if !key.is_empty() {
+                            let list = queued.entry(key).or_default();
+                            if !list.contains(&mid) {
+                                list.push(mid.clone());
+                            }
                         }
                     }
                 }
+                self.admit_pending_receipts(&msg, &pending_receipts);
+                self.notify_subscribers_message(&msg, &pending_receipts);
+                self.broadcast_to_peers(
+                    None,
+                    &PeerFrame::Publish {
+                        message: msg.clone(),
+                        receipts: pending_receipts.clone(),
+                    },
+                );
+                if let Err(message) =
+                    self.schedule_dispatch(&msg, &pending_receipts, now.clone(), &mut first_holds)
+                {
+                    warn(&message);
+                }
             }
-            self.admit_pending_receipts(&msg, &pending_receipts);
-            self.notify_subscribers_message(&msg, &pending_receipts);
-            self.broadcast_to_peers(
-                None,
-                &PeerFrame::Publish {
-                    message: msg.clone(),
-                    receipts: pending_receipts.clone(),
-                },
-            );
-            if let Err(message) =
-                self.schedule_dispatch(&msg, &pending_receipts, now.clone(), &mut first_holds)
-            {
-                warn(&message);
+            if !queue_path.exists() {
+                break;
             }
         }
         drop(_order);

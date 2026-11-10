@@ -132,11 +132,13 @@ impl HostEndpoint {
             let run_user_dir = if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
                 let p = PathBuf::from(raw);
                 (p.is_absolute() && p.is_dir()).then_some(p)
-            } else {
+            } else if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1") {
                 let p = PathBuf::from(format!("/run/user/{uid}"));
                 std::fs::symlink_metadata(&p)
                     .is_ok_and(|m| m.is_dir() && m.uid() == uid)
                     .then_some(p)
+            } else {
+                None
             };
             let path = Self::discover_unix_path_with(
                 std::env::var_os("FL_HOST_SOCK").as_deref(),
