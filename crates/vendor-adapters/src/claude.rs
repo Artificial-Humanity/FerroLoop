@@ -1322,9 +1322,15 @@ mod tests {
     {
         let tmp = TempDir::new().unwrap();
         let adapter = ClaudeHostAdapter::new();
+        let proj_dir = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("ferroloop");
+        fs::create_dir_all(&proj_dir).unwrap();
 
         // 1. Complete JSONL ending with a dangling tool_use + SIGKILL metadata (no Archive record).
-        let dangling_path = tmp.path().join("dangling.jsonl");
+        let dangling_path = proj_dir.join("dangling.jsonl");
         let complete_lines = concat!(
             r#"{"type":"bridge-session","sessionId":"4d9bd978-abdb-432c-9f25-e002b9b3ae61","bridgeSessionId":"cse_01SP4ortBQU3hQGNi4NtM8pN"}"#,
             "\n",
@@ -1343,7 +1349,7 @@ mod tests {
         assert_eq!(fs::read(&dangling_path).unwrap(), complete_lines.as_bytes());
 
         // 2. Complete JSONL without a trailing newline must also remain byte-for-byte untouched.
-        let no_nl_path = tmp.path().join("no_nl.jsonl");
+        let no_nl_path = proj_dir.join("no_nl.jsonl");
         let no_nl = complete_lines.trim_end_matches('\n');
         fs::write(&no_nl_path, no_nl).unwrap();
         assert_eq!(
@@ -1352,9 +1358,9 @@ mod tests {
         );
         assert_eq!(fs::read(&no_nl_path).unwrap(), no_nl.as_bytes());
 
-        // 3. Torn trailing non-JSON fragment (including torn UTF-8 bytes) is truncated back to the
-        //    byte offset immediately after the last valid newline-terminated JSON record.
-        let torn_path = tmp.path().join("torn.jsonl");
+        // 3. Torn trailing non-JSON fragment (including torn UTF-8 bytes) is backed up to
+        //    `<file>.fl-torn-tail-<ts>` (mode 0600) and truncated back to the last valid newline.
+        let torn_path = proj_dir.join("torn.jsonl");
         let mut torn_bytes = complete_lines.as_bytes().to_vec();
         let fragment = b"{\"type\":\"assistant\",\"message\":{\"content\":\"\xe2\x97";
         torn_bytes.extend_from_slice(fragment);
@@ -1364,27 +1370,80 @@ mod tests {
         assert_eq!(removed, fragment.len());
         assert_eq!(fs::read(&torn_path).unwrap(), complete_lines.as_bytes());
 
-        // 4. Transcript with zero valid JSON lines truncates to 0 bytes and returns original_len.
-        let all_bad_path = tmp.path().join("all_bad.jsonl");
+        let backups: Vec<PathBuf> = fs::read_dir(&proj_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("torn.jsonl.fl-torn-tail-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "expected 1 torn-tail backup file");
+        assert_eq!(fs::read(&backups[0]).unwrap(), fragment);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup must be 0600, got {mode:o}");
+        }
+
+        // 4. Transcript with zero valid JSON lines returns Err and is NEVER truncated on disk.
+        let all_bad_path = proj_dir.join("all_bad.jsonl");
         let bad_payload = b"{\"type\":\"user\",\"message\":";
         fs::write(&all_bad_path, bad_payload).unwrap();
-        assert_eq!(
-            adapter
-                .repair_session_transcript_tail(&all_bad_path)
-                .unwrap(),
-            bad_payload.len()
-        );
-        assert!(fs::read(&all_bad_path).unwrap().is_empty());
+        assert!(matches!(
+            adapter.repair_session_transcript_tail(&all_bad_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+        assert_eq!(fs::read(&all_bad_path).unwrap(), bad_payload);
+        assert!(matches!(
+            adapter.estimate_post_compaction_context(&all_bad_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+
+        // 5. Path outside `.claude/projects` or symlinked transcript is refused.
+        let outside_path = tmp.path().join("outside.jsonl");
+        fs::write(&outside_path, complete_lines).unwrap();
+        assert!(matches!(
+            adapter.repair_session_transcript_tail(&outside_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+        assert!(matches!(
+            adapter.estimate_post_compaction_context(&outside_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+
+        #[cfg(unix)]
+        {
+            let symlink_path = proj_dir.join("symlinked.jsonl");
+            std::os::unix::fs::symlink(&outside_path, &symlink_path).unwrap();
+            assert!(matches!(
+                adapter.repair_session_transcript_tail(&symlink_path),
+                Err(VendorAdapterError::Transport { .. })
+            ));
+            assert!(matches!(
+                adapter.estimate_post_compaction_context(&symlink_path),
+                Err(VendorAdapterError::Transport { .. })
+            ));
+        }
     }
 
     #[test]
     fn estimate_post_compaction_context_computes_tokens_bytes_model_and_bridge_session() {
         let tmp = TempDir::new().unwrap();
         let adapter = ClaudeHostAdapter::new();
+        let proj_dir = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("ferroloop");
+        fs::create_dir_all(&proj_dir).unwrap();
 
         // Case 1: Uncompacted SIGKILL transcript with bridge-session, telemetry bloat, sidechains,
         // and a trailing <synthetic> 0-token interrupted-turn recovery record.
-        let uncompacted_path = tmp.path().join("uncompacted.jsonl");
+        let uncompacted_path = proj_dir.join("uncompacted.jsonl");
         let user_line = r#"{"uuid":"u-1","type":"user","isSidechain":false,"message":{"role":"user","content":"Inspect workspace"}}"#;
         let asst_line = r#"{"uuid":"a-1","type":"assistant","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":974,"cache_read_input_tokens":387420,"output_tokens":612},"content":[{"type":"text","text":"Workspace clean."}]}}"#;
         let synth_tool = r#"{"uuid":"u-2","type":"user","isSidechain":false,"toolDenialKind":"interrupted","message":{"role":"user","content":[{"type":"tool_result","is_error":true,"tool_use_id":"toolu_01","content":"[Tool call interrupted]"}]}}"#;
@@ -1424,7 +1483,7 @@ mod tests {
 
         // Case 2: Compacted transcript right after compact_boundary falls back to postTokens and
         // drops pre-compaction bytes/tokens while keeping bridge_session_id and latest_model.
-        let compacted_path = tmp.path().join("compacted.jsonl");
+        let compacted_path = proj_dir.join("compacted.jsonl");
         let compact_summary = r#"{"uuid":"cs-1","type":"user","isCompactSummary":true,"message":{"role":"user","content":"Compacted summary"}}"#;
         let compacted = [
             r#"{"type":"bridge-session","sessionId":"032bc4ff-1451-486f-95ec-69215c9773bc","bridgeSessionId":"cse_compacted_01"}"#,
@@ -1468,6 +1527,29 @@ mod tests {
             ctx_grown.post_compact_conversational_bytes,
             (compact_summary.len() + post_asst.len()) as u64
         );
+
+        // Case 4: Torn trailing line is ignored by estimate without modifying the file, whereas
+        // a corrupt non-trailing line returns Err.
+        let torn_view_path = proj_dir.join("torn_view.jsonl");
+        let with_torn_tail = format!("{compacted_grown}{{\"torn\":");
+        fs::write(&torn_view_path, &with_torn_tail).unwrap();
+        let ctx_torn = adapter
+            .estimate_post_compaction_context(&torn_view_path)
+            .unwrap();
+        assert_eq!(ctx_torn, ctx_grown);
+        assert_eq!(
+            fs::read_to_string(&torn_view_path).unwrap(),
+            with_torn_tail,
+            "estimate_post_compaction_context must not modify transcript on disk"
+        );
+
+        let mid_corrupt_path = proj_dir.join("mid_corrupt.jsonl");
+        let mid_corrupt = format!("{compacted}\n{{\"corrupt_mid\":\n{post_asst}\n");
+        fs::write(&mid_corrupt_path, &mid_corrupt).unwrap();
+        assert!(matches!(
+            adapter.estimate_post_compaction_context(&mid_corrupt_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
     }
 
     #[test]

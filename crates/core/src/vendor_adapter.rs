@@ -624,6 +624,115 @@ pub fn validate_claude_session_id<'a>(
     Ok(trimmed)
 }
 
+/// Maximum Claude `.jsonl` transcript file size (64 MiB) accepted by
+/// [`estimate_claude_post_compaction_context`].
+pub const MAX_CLAUDE_TRANSCRIPT_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum backward tail window (2 MiB) scanned by [`repair_claude_session_transcript_tail`].
+pub const MAX_CLAUDE_TAIL_REPAIR_SCAN_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Validate that `transcript_path` is a regular, non-symlink `.jsonl` file directly inside
+/// `<home>/.claude/projects/<project_slug>/`, with no symlinked `.claude`, `.claude/projects`, or
+/// `<project_slug>` directory along the path, and return its canonical path.
+pub fn validate_claude_transcript_path(
+    transcript_path: &Path,
+) -> Result<PathBuf, VendorAdapterError> {
+    let reject = |reason: String| VendorAdapterError::Transport {
+        vendor: "claude".into(),
+        reason,
+    };
+
+    if transcript_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return Err(reject(format!(
+            "refusing non-JSONL Claude transcript path {}",
+            transcript_path.display()
+        )));
+    }
+
+    let file_meta = fs::symlink_metadata(transcript_path).map_err(|e| {
+        reject(format!(
+            "failed to stat Claude transcript {}: {e}",
+            transcript_path.display()
+        ))
+    })?;
+    if file_meta.file_type().is_symlink() || !file_meta.file_type().is_file() {
+        return Err(reject(format!(
+            "refusing symlink or non-regular Claude transcript {}",
+            transcript_path.display()
+        )));
+    }
+
+    let project_dir = transcript_path.parent().ok_or_else(|| {
+        reject(format!(
+            "Claude transcript path {} has no project directory parent",
+            transcript_path.display()
+        ))
+    })?;
+    let projects_dir = project_dir.parent().ok_or_else(|| {
+        reject(format!(
+            "Claude transcript path {} is not under .claude/projects",
+            transcript_path.display()
+        ))
+    })?;
+    let claude_dir = projects_dir.parent().ok_or_else(|| {
+        reject(format!(
+            "Claude transcript path {} is not under .claude/projects",
+            transcript_path.display()
+        ))
+    })?;
+
+    if projects_dir.file_name().and_then(|n| n.to_str()) != Some("projects")
+        || claude_dir.file_name().and_then(|n| n.to_str()) != Some(".claude")
+    {
+        return Err(reject(format!(
+            "refusing Claude transcript {} outside .claude/projects/<project_slug>",
+            transcript_path.display()
+        )));
+    }
+
+    for dir in [claude_dir, projects_dir, project_dir] {
+        let meta = fs::symlink_metadata(dir).map_err(|e| {
+            reject(format!(
+                "failed to stat Claude transcript ancestor {}: {e}",
+                dir.display()
+            ))
+        })?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(reject(format!(
+                "refusing symlink or non-directory ancestor {} for Claude transcript {}",
+                dir.display(),
+                transcript_path.display()
+            )));
+        }
+    }
+
+    let canonical_projects_dir = fs::canonicalize(projects_dir).map_err(|e| {
+        reject(format!(
+            "failed to canonicalize Claude projects directory {}: {e}",
+            projects_dir.display()
+        ))
+    })?;
+    let canonical_transcript = fs::canonicalize(transcript_path).map_err(|e| {
+        reject(format!(
+            "failed to canonicalize Claude transcript {}: {e}",
+            transcript_path.display()
+        ))
+    })?;
+
+    if !canonical_transcript.starts_with(&canonical_projects_dir)
+        || canonical_transcript.parent().and_then(|p| p.parent())
+            != Some(canonical_projects_dir.as_path())
+    {
+        return Err(reject(format!(
+            "Claude transcript {} does not canonicalize directly under {}",
+            transcript_path.display(),
+            canonical_projects_dir.display()
+        )));
+    }
+
+    Ok(canonical_transcript)
+}
+
 /// Locate `<vendor_session_id>.jsonl` under `<home_dir>/.claude/projects/*/` (and optionally
 /// `<home_dir>/.claude/archived/*/`), sorted deterministically by project directory name.
 pub fn find_claude_session_transcript_path(
@@ -639,6 +748,12 @@ pub fn find_claude_session_transcript_path(
     let session_id = validate_claude_session_id(vendor_session_id, op)?;
     let target_file = format!("{session_id}.jsonl");
     let claude_dir = home_dir.join(".claude");
+    let Ok(claude_meta) = fs::symlink_metadata(&claude_dir) else {
+        return Ok(None);
+    };
+    if claude_meta.file_type().is_symlink() || !claude_meta.file_type().is_dir() {
+        return Ok(None);
+    }
     let buckets: &[&str] = if include_archived {
         &["projects", "archived"]
     } else {
@@ -646,18 +761,31 @@ pub fn find_claude_session_transcript_path(
     };
     for bucket in buckets {
         let root = claude_dir.join(bucket);
+        let Ok(root_meta) = fs::symlink_metadata(&root) else {
+            continue;
+        };
+        if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&root) else {
             continue;
         };
         let mut subdirs: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
+            .filter(|p| {
+                fs::symlink_metadata(p)
+                    .map(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+                    .unwrap_or(false)
+            })
             .collect();
         subdirs.sort();
         for proj_dir in subdirs {
             let candidate = proj_dir.join(&target_file);
-            if candidate.is_file() {
+            if fs::symlink_metadata(&candidate)
+                .map(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+                .unwrap_or(false)
+            {
                 return Ok(Some(candidate));
             }
         }
@@ -673,66 +801,106 @@ pub fn find_claude_active_session_transcript_path(
     find_claude_session_transcript_path(home_dir, vendor_session_id, false)
 }
 
-/// Inspect only the final non-empty line of a Claude `.jsonl` transcript and truncate any torn
-/// trailing non-JSON write back to the last complete valid JSON line.
+fn write_torn_tail_backup(
+    transcript_path: &Path,
+    removed_bytes: &[u8],
+) -> Result<PathBuf, VendorAdapterError> {
+    use std::io::Write;
+    let parent = transcript_path
+        .parent()
+        .ok_or_else(|| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "Claude transcript {} has no parent directory for backup",
+                transcript_path.display()
+            ),
+        })?;
+    let file_name = transcript_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "Claude transcript {} has invalid file name",
+                transcript_path.display()
+            ),
+        })?;
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    for attempt in 0u32..1000 {
+        let backup_name = if attempt == 0 {
+            format!("{file_name}.fl-torn-tail-{ts_ms}")
+        } else {
+            format!("{file_name}.fl-torn-tail-{ts_ms}-{attempt}")
+        };
+        let backup_path = parent.join(backup_name);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&backup_path) {
+            Ok(mut backup_file) => {
+                backup_file.write_all(removed_bytes).map_err(|e| {
+                    VendorAdapterError::Transport {
+                        vendor: "claude".into(),
+                        reason: format!(
+                            "failed to write torn tail backup {}: {e}",
+                            backup_path.display()
+                        ),
+                    }
+                })?;
+                backup_file
+                    .sync_all()
+                    .map_err(|e| VendorAdapterError::Transport {
+                        vendor: "claude".into(),
+                        reason: format!(
+                            "failed to fsync torn tail backup {}: {e}",
+                            backup_path.display()
+                        ),
+                    })?;
+                return Ok(backup_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(VendorAdapterError::Transport {
+                    vendor: "claude".into(),
+                    reason: format!(
+                        "failed to create torn tail backup {}: {e}",
+                        backup_path.display()
+                    ),
+                });
+            }
+        }
+    }
+
+    Err(VendorAdapterError::Transport {
+        vendor: "claude".into(),
+        reason: format!(
+            "exhausted torn tail backup filenames for {}",
+            transcript_path.display()
+        ),
+    })
+}
+
+/// Inspect only a bounded tail window of a Claude `.jsonl` transcript and, when the final
+/// non-empty line is torn after at least one complete valid JSONL line, save the torn tail to
+/// `<transcript>.fl-torn-tail-<ts>` (`0600`) and truncate + `fsync` the transcript back to the
+/// last complete valid JSON line.
 pub fn repair_claude_session_transcript_tail(
     transcript_path: &Path,
 ) -> Result<usize, VendorAdapterError> {
-    let raw = fs::read(transcript_path).map_err(|e| VendorAdapterError::Transport {
-        vendor: "claude".into(),
-        reason: format!(
-            "failed to read Claude transcript {}: {e}",
-            transcript_path.display()
-        ),
-    })?;
-    let original_len = raw.len();
-    if original_len == 0 {
-        return Ok(0);
-    }
+    use std::io::{Read, Seek, SeekFrom};
 
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut pos = 0;
-    while pos < original_len {
-        let next_end = match raw[pos..].iter().position(|&b| b == b'\n') {
-            Some(rel) => pos + rel + 1,
-            None => original_len,
-        };
-        spans.push((pos, next_end));
-        pos = next_end;
-    }
+    validate_claude_transcript_path(transcript_path)?;
 
-    let is_valid_json_span = |start: usize, end: usize| -> Option<bool> {
-        let trimmed = raw[start..end].trim_ascii();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let valid = std::str::from_utf8(trimmed)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .is_some();
-        Some(valid)
-    };
-
-    let Some((last_non_empty_idx, last_is_valid)) = spans
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, &(s, e))| is_valid_json_span(s, e).map(|v| (idx, v)))
-    else {
-        return Ok(0);
-    };
-
-    if last_is_valid {
-        return Ok(0);
-    }
-
-    let truncate_to = spans[..last_non_empty_idx]
-        .iter()
-        .rev()
-        .find_map(|&(s, e)| (is_valid_json_span(s, e) == Some(true)).then_some(e))
-        .unwrap_or(0);
-
-    let file = fs::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(transcript_path)
         .map_err(|e| VendorAdapterError::Transport {
@@ -742,7 +910,113 @@ pub fn repair_claude_session_transcript_tail(
                 transcript_path.display()
             ),
         })?;
-    file.set_len(truncate_to as u64)
+    let file_len = file
+        .metadata()
+        .map_err(|e| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "failed to stat Claude transcript {}: {e}",
+                transcript_path.display()
+            ),
+        })?
+        .len();
+    if file_len == 0 {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: "transcript is empty".into(),
+        });
+    }
+
+    let scan_start = file_len.saturating_sub(MAX_CLAUDE_TAIL_REPAIR_SCAN_BYTES);
+    file.seek(SeekFrom::Start(scan_start))
+        .map_err(|e| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "failed to seek Claude transcript {}: {e}",
+                transcript_path.display()
+            ),
+        })?;
+    let scan_len = (file_len - scan_start) as usize;
+    let mut buf = Vec::with_capacity(scan_len);
+    (&mut file)
+        .take(scan_len as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "failed to read Claude transcript {}: {e}",
+                transcript_path.display()
+            ),
+        })?;
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let next_end = match buf[pos..].iter().position(|&b| b == b'\n') {
+            Some(rel) => pos + rel + 1,
+            None => buf.len(),
+        };
+        spans.push((pos, next_end));
+        pos = next_end;
+    }
+
+    let is_valid_json_span = |start: usize, end: usize| -> Option<bool> {
+        let trimmed = buf[start..end].trim_ascii();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let valid = serde_json::from_slice::<Value>(trimmed).is_ok();
+        Some(valid)
+    };
+
+    let Some((last_non_empty_idx, last_is_valid)) = spans
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, &(s, e))| is_valid_json_span(s, e).map(|v| (idx, v)))
+    else {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: "transcript contains zero valid JSONL lines".into(),
+        });
+    };
+
+    if last_is_valid {
+        return Ok(0);
+    }
+
+    if scan_start > 0 && last_non_empty_idx == 0 {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: "transcript has no valid JSONL lines before torn tail within scan window"
+                .into(),
+        });
+    }
+
+    let min_idx = usize::from(scan_start > 0);
+    let Some(rel_truncate_to) = spans[min_idx..last_non_empty_idx]
+        .iter()
+        .rev()
+        .find_map(|&(s, e)| (is_valid_json_span(s, e) == Some(true)).then_some(e))
+    else {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: "transcript has no valid JSONL lines before torn tail".into(),
+        });
+    };
+
+    let truncate_to = scan_start + (rel_truncate_to as u64);
+    if truncate_to == 0 {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: "transcript has no valid JSONL lines before torn tail".into(),
+        });
+    }
+
+    let removed_bytes = &buf[rel_truncate_to..];
+    write_torn_tail_backup(transcript_path, removed_bytes)?;
+
+    file.set_len(truncate_to)
         .map_err(|e| VendorAdapterError::Transport {
             vendor: "claude".into(),
             reason: format!(
@@ -750,8 +1024,15 @@ pub fn repair_claude_session_transcript_tail(
                 transcript_path.display()
             ),
         })?;
+    file.sync_all().map_err(|e| VendorAdapterError::Transport {
+        vendor: "claude".into(),
+        reason: format!(
+            "failed to fsync repaired Claude transcript {}: {e}",
+            transcript_path.display()
+        ),
+    })?;
 
-    Ok(original_len - truncate_to)
+    Ok(removed_bytes.len())
 }
 
 /// Extract displayable text / tool summary content from a Claude JSONL record.
@@ -888,18 +1169,52 @@ pub fn classify_claude_turn_role(val: &Value) -> Option<String> {
 
 /// Estimate post-compaction active context tokens, conversational byte volume, latest real model
 /// ID, normalized turn count, and persisted Remote Control `bridgeSessionId` from a Claude
-/// `.jsonl` transcript file.
+/// `.jsonl` transcript file without modifying the file on disk.
+///
+/// A torn trailing non-empty line at EOF is ignored for estimation; any non-trailing corrupt line
+/// or a transcript with zero valid JSONL lines returns an error.
 pub fn estimate_claude_post_compaction_context(
     transcript_path: &Path,
 ) -> Result<PostCompactionContext, VendorAdapterError> {
-    let raw = fs::read_to_string(transcript_path).map_err(|e| VendorAdapterError::Transport {
+    use std::io::{BufRead, BufReader, Read};
+
+    validate_claude_transcript_path(transcript_path)?;
+
+    let file = fs::File::open(transcript_path).map_err(|e| VendorAdapterError::Transport {
         vendor: "claude".into(),
         reason: format!(
-            "failed to read Claude transcript {}: {e}",
+            "failed to open Claude transcript {}: {e}",
             transcript_path.display()
         ),
     })?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "failed to stat Claude transcript {}: {e}",
+                transcript_path.display()
+            ),
+        })?
+        .len();
+    if file_len > MAX_CLAUDE_TRANSCRIPT_READ_BYTES {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: format!(
+                "Claude transcript {} exceeds maximum size ({} > {} bytes)",
+                transcript_path.display(),
+                file_len,
+                MAX_CLAUDE_TRANSCRIPT_READ_BYTES
+            ),
+        });
+    }
 
+    let mut reader = BufReader::new(file.take(MAX_CLAUDE_TRANSCRIPT_READ_BYTES + 1));
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut total_read: u64 = 0;
+
+    let mut valid_json_lines: usize = 0;
+    let mut saw_invalid_line: bool = false;
     let mut turn_count: usize = 0;
     let mut latest_model: Option<String> = None;
     let mut bridge_session_id: Option<String> = None;
@@ -907,14 +1222,56 @@ pub fn estimate_claude_post_compaction_context(
     let mut post_compact_assistant_tokens: Option<u64> = None;
     let mut post_compact_conversational_bytes: u64 = 0;
 
-    for line in raw.lines() {
-        let trimmed = line.trim();
+    loop {
+        line_buf.clear();
+        let n =
+            reader
+                .read_until(b'\n', &mut line_buf)
+                .map_err(|e| VendorAdapterError::Transport {
+                    vendor: "claude".into(),
+                    reason: format!(
+                        "failed to read Claude transcript {}: {e}",
+                        transcript_path.display()
+                    ),
+                })?;
+        if n == 0 {
+            break;
+        }
+        total_read = total_read.saturating_add(n as u64);
+        if total_read > MAX_CLAUDE_TRANSCRIPT_READ_BYTES {
+            return Err(VendorAdapterError::Transport {
+                vendor: "claude".into(),
+                reason: format!(
+                    "Claude transcript {} exceeds maximum size ({} bytes)",
+                    transcript_path.display(),
+                    MAX_CLAUDE_TRANSCRIPT_READ_BYTES
+                ),
+            });
+        }
+
+        let no_nl = line_buf.strip_suffix(b"\n").unwrap_or(&line_buf);
+        let no_cr = no_nl.strip_suffix(b"\r").unwrap_or(no_nl);
+        let trimmed = no_cr.trim_ascii();
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+
+        if saw_invalid_line {
+            return Err(VendorAdapterError::Transport {
+                vendor: "claude".into(),
+                reason: format!(
+                    "Claude transcript {} contains corrupt non-trailing JSONL line",
+                    transcript_path.display()
+                ),
+            });
+        }
+
+        let Ok(val) = serde_json::from_slice::<Value>(trimmed) else {
+            saw_invalid_line = true;
             continue;
         };
+
+        valid_json_lines += 1;
 
         if classify_claude_turn_role(&val).is_some()
             && !extract_claude_message_content(&val).is_empty()
@@ -956,7 +1313,7 @@ pub fn estimate_claude_post_compaction_context(
             && !is_claude_skipped_record_type(record_type)
         {
             post_compact_conversational_bytes =
-                post_compact_conversational_bytes.saturating_add(line.len() as u64);
+                post_compact_conversational_bytes.saturating_add(no_cr.len() as u64);
         }
 
         if record_type == "assistant" {
@@ -991,6 +1348,13 @@ pub fn estimate_claude_post_compaction_context(
                 }
             }
         }
+    }
+
+    if valid_json_lines == 0 {
+        return Err(VendorAdapterError::Transport {
+            vendor: "claude".into(),
+            reason: "transcript contains zero valid JSONL lines".into(),
+        });
     }
 
     Ok(PostCompactionContext {

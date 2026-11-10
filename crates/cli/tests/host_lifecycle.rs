@@ -905,16 +905,39 @@ fn hydration_status_delayed_start_remains_unconfirmed_after_initialization() {
 #[test]
 fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacking_foreign_persona()
 {
-    use std::io::Write;
-
     let f = Fixture::new();
+    let fl_bin = env!("CARGO_BIN_EXE_fl");
+    let routes_path = f.root.path().join(".cache/agent-bus/routes.json");
+    let ada_sock = f.root.path().join("42424.sock");
+    let db_path = f.root.path().join("fl.fls");
     std::fs::write(
         f.root.path().join("vendor"),
-        "#!/bin/sh\nroot=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$root/arguments\"\nexec /bin/cat\n",
+        format!(
+            "#!/bin/sh\n\
+             root=$(dirname \"$0\")\n\
+             printf '%s\\n' \"$@\" > \"$root/arguments\"\n\
+             printf 'AGENT_PERSONA=%s\\nAGENT_NAME=%s\\nFL_HOSTED_ID=%s\\nAGENT_HYDRATION_GENERATION=%s\\n' \\\n\
+               \"${{AGENT_PERSONA:-<unset>}}\" \"${{AGENT_NAME:-<unset>}}\" \"${{FL_HOSTED_ID:-<unset>}}\" \"${{AGENT_HYDRATION_GENERATION:-<unset>}}\" \\\n\
+               > \"$root/child_env\"\n\
+             case \" $* \" in\n\
+               *\" --resume \"*)\n\
+                 if [ -f \"$root/hook_payload.json\" ]; then\n\
+                   FL_WIRE_ROUTES=\"{}\" CLAUDE_CODE_MESSAGING_SOCKET=\"{}\" \"{}\" --db \"{}\" wire hook claude < \"$root/hook_payload.json\" > \"$root/hook_stdout\" 2> \"$root/hook_stderr\"\n\
+                   echo $? > \"$root/hook_status\"\n\
+                 fi\n\
+                 ;;\n\
+             esac\n\
+             exec /bin/cat\n",
+            routes_path.display(),
+            ada_sock.display(),
+            fl_bin,
+            db_path.display()
+        ),
     )
     .unwrap();
 
-    // 1. Spin up both `feira` (antigravity, no_spawn) and `ada` (claude, spawned on private fl-host).
+    // 1. Spin up both `feira` (antigravity, no_spawn) and `ada` (claude, spawned on private fl-host
+    //    while parent caller environment is polluted with foreign `feira` identity vars).
     f.json(
         &[
             "agent",
@@ -932,14 +955,68 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
         ],
         true,
     );
-    let spun_ada = f.spin("claude", false);
+    let mut spin_cmd = f.command();
+    spin_cmd
+        .env("AGENT_PERSONA", "feira")
+        .env("AGENT_NAME", "feira")
+        .env("FL_HOSTED_ID", "antigravity:feira")
+        .env(
+            "AGENT_HYDRATION_GENERATION",
+            "01900000-0000-7000-8000-000000000099",
+        )
+        .args([
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+            "--json",
+        ]);
+    let spin_out = spin_cmd.output().unwrap();
+    assert!(
+        spin_out.status.success(),
+        "spin-up failed: {}",
+        String::from_utf8_lossy(&spin_out.stderr)
+    );
+    let spun_ada: Value = serde_json::from_slice(&spin_out.stdout).unwrap();
     assert_eq!(spun_ada["runtime_spawned"], true);
     let ada_gen = spun_ada["hydration_generation"]
         .as_str()
         .expect("ada hydration_generation")
         .to_string();
+    assert_ne!(
+        ada_gen, "01900000-0000-7000-8000-000000000099",
+        "spin_up must mint a fresh hydration_generation for ada"
+    );
 
-    let db_path = f.root.path().join("fl.fls");
+    let child_env_path = f.root.path().join("child_env");
+    let wait_for_file = |path: &std::path::Path| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_for_file(&child_env_path);
+    let spin_child_env = std::fs::read_to_string(&child_env_path).unwrap();
+    assert_eq!(
+        spin_child_env,
+        format!(
+            "AGENT_PERSONA=ada\nAGENT_NAME=<unset>\nFL_HOSTED_ID=claude:ada\nAGENT_HYDRATION_GENERATION={ada_gen}\n"
+        ),
+        "spawned child process on spin_up must receive ada's identity and never polluted parent feira vars"
+    );
+
     let ada_sid = {
         let store = fl_store::open_store(&db_path).unwrap();
         let rec = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
@@ -972,8 +1049,7 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
     )
     .unwrap();
 
-    // Seed `feira`'s route in routes.json before restarting `ada`.
-    let routes_path = f.root.path().join(".cache/agent-bus/routes.json");
+    // Seed `feira`'s route in routes.json and write hook_payload.json before restarting `ada`.
     let feira_route = fl_wire::identity::VendorRoute::Agy {
         conversation_id: "019a0000-0000-7000-8000-000000000111".into(),
         agentapi_exe: None,
@@ -989,8 +1065,22 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
     );
     routes.save(Some(&routes_path)).unwrap();
 
-    // 2. Kill `Ada.claude` on private fl-host and restart `claude:ada` via `restart_hosted_session` ->
-    //    must launch with `--resume <ada_sid>` and preserve `ada_sid` and `ada_gen`.
+    let hook_payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "resume",
+        "session_id": ada_sid,
+        "cwd": f.root.path(),
+    });
+    std::fs::write(
+        f.root.path().join("hook_payload.json"),
+        hook_payload.to_string(),
+    )
+    .unwrap();
+
+    // 2. Kill `Ada.claude` on private fl-host and restart `claude:ada` via `restart_hosted_session`
+    //    while parent caller environment is polluted with `feira` identity vars ->
+    //    must launch with `--resume <ada_sid>`, preserve `ada_sid` and `ada_gen`, and pass clean
+    //    `ada` identity env vars to the spawned child process.
     {
         let mut rpc = f.rpc();
         let stream = rpc
@@ -1013,15 +1103,26 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    let _ = std::fs::remove_file(&child_env_path);
 
     let out = Command::new(std::env::current_exe().unwrap())
         .env_clear()
         .env("HOME", f.root.path())
         .env("PATH", "/usr/bin:/bin")
+        .env("XDG_RUNTIME_DIR", f.root.path())
+        .env("XDG_CONFIG_HOME", f.root.path().join("config"))
+        .env("XDG_DATA_HOME", f.root.path().join("data"))
         .env("FL_HOST_SOCK", f.endpoint.socket_path())
         .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
         .env("FL_WIRE_CLAUDE_BIN", f.root.path().join("vendor"))
         .env("F433_RESTART_CHILD", f.root.path())
+        .env("AGENT_NAME", "feira")
+        .env("AGENT_PERSONA", "feira")
+        .env("FL_HOSTED_ID", "antigravity:feira")
+        .env(
+            "AGENT_HYDRATION_GENERATION",
+            "01900000-0000-7000-8000-000000000099",
+        )
         .args(["--exact", "hub_restart_claude_resume_child", "--nocapture"])
         .output()
         .unwrap();
@@ -1032,6 +1133,25 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(f.running("Ada.claude"));
+
+    let hook_status_path = f.root.path().join("hook_status");
+    wait_for_file(&child_env_path);
+    wait_for_file(&hook_status_path);
+
+    let restart_child_env = std::fs::read_to_string(&child_env_path).unwrap();
+    assert_eq!(
+        restart_child_env,
+        format!(
+            "AGENT_PERSONA=ada\nAGENT_NAME=<unset>\nFL_HOSTED_ID=claude:ada\nAGENT_HYDRATION_GENERATION={ada_gen}\n"
+        ),
+        "spawned child process on restart_hosted_session must receive ada's identity and never polluted parent feira vars"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hook_status_path).unwrap().trim(),
+        "0",
+        "SessionStart:resume hook inside spawned child failed: {}",
+        std::fs::read_to_string(f.root.path().join("hook_stderr")).unwrap_or_default()
+    );
 
     let args_after = std::fs::read_to_string(f.root.path().join("arguments")).unwrap();
     let arg_lines: Vec<&str> = args_after.lines().collect();
@@ -1044,77 +1164,6 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
     assert!(
         !arg_lines.contains(&"--session-id"),
         "--resume spawn must not pass --session-id: {arg_lines:?}"
-    );
-
-    // 3. Filter a polluted parent ambient environment (`AGENT_NAME=feira`, `AGENT_PERSONA=feira`,
-    //    `FL_HOSTED_ID=antigravity:feira`, `AGENT_HYDRATION_GENERATION=<foreign>`) through
-    //    `build_host_spawn_env` for `claude:ada`, then run `fl wire hook claude` (`SessionStart:resume`).
-    let launch_spec = fl_hub::lifecycle::LaunchSpec {
-        env: vec![
-            ("AGENT_PERSONA".into(), "ada".into()),
-            ("AGENT_HYDRATION_GENERATION".into(), ada_gen.clone()),
-        ],
-        argv: vec!["claude".into(), "--resume".into(), ada_sid.clone()],
-    };
-    let (child_map, child_allow) =
-        fl_hub::lifecycle::build_host_spawn_env(Some(&launch_spec), "claude:ada");
-    assert!(!child_allow.contains("AGENT_NAME"));
-
-    let parent_ambient = [
-        ("HOME", f.root.path().to_str().unwrap()),
-        ("PATH", "/usr/bin:/bin"),
-        ("AGENT_NAME", "feira"),
-        ("AGENT_PERSONA", "feira"),
-        ("FL_HOSTED_ID", "antigravity:feira"),
-        (
-            "AGENT_HYDRATION_GENERATION",
-            "019dc759-0000-7000-8000-000000000999",
-        ),
-    ];
-
-    let mut hook_cmd = Command::new(env!("CARGO_BIN_EXE_fl"));
-    hook_cmd.env_clear().current_dir(f.root.path());
-    for (k, v) in parent_ambient {
-        if child_allow.contains(k) {
-            hook_cmd.env(k, v);
-        }
-    }
-    for (k, v) in &child_map {
-        hook_cmd.env(k, v);
-    }
-    let ada_sock = f.root.path().join("42424.sock");
-    hook_cmd
-        .env("XDG_RUNTIME_DIR", f.root.path())
-        .env("XDG_CONFIG_HOME", f.root.path().join("config"))
-        .env("XDG_DATA_HOME", f.root.path().join("data"))
-        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-        .env("FL_WIRE_ROUTES", &routes_path)
-        .env("CLAUDE_CODE_MESSAGING_SOCKET", &ada_sock)
-        .args(["--db"])
-        .arg(&db_path)
-        .args(["wire", "hook", "claude"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = hook_cmd.spawn().unwrap();
-    let hook_payload = serde_json::json!({
-        "hook_event_name": "SessionStart",
-        "source": "resume",
-        "session_id": ada_sid,
-        "cwd": f.root.path(),
-    });
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(hook_payload.to_string().as_bytes())
-        .unwrap();
-    let hook_out = child.wait_with_output().unwrap();
-    assert!(
-        hook_out.status.success(),
-        "hook failed: {}",
-        String::from_utf8_lossy(&hook_out.stderr)
     );
 
     // Prove `routes.json` updated `ada` to `<ada_sid>` and left `feira`'s route untouched!

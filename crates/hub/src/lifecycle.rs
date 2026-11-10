@@ -504,6 +504,10 @@ pub trait SessionRuntime: std::fmt::Debug {
     /// `true` when `unit` runs and is the one `hosted_id` started: for a window unit, a window of
     /// that name carrying the mark `hosted_id`; for a session unit, as [`Self::exists`].
     fn owns(&self, unit: &str, hosted_id: &str) -> bool;
+    /// Root OS PID recorded by the runtime for `unit` (when known).
+    fn recorded_pid(&self, _unit: &str, _hosted_id: &str) -> Option<u32> {
+        None
+    }
     /// The pause between the checks that a launched command's session is still there (see
     /// [`launch_survived`]). Zero for a runtime that answers at once.
     fn settle_delay(&self) -> std::time::Duration {
@@ -571,6 +575,265 @@ fn muse_window_not_ours(env: &LifecycleEnv<'_>, vendor: &str, unit: &str, hosted
 
 /// How many times [`launch_survived`] asks whether the session is there.
 const LAUNCH_SURVIVAL_CHECKS: u32 = 5;
+
+/// Positive survival window for `claude --resume <uuid>` launches (`10s` in production).
+pub const CLAUDE_RESUME_SURVIVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLAUDE_RESUME_SURVIVAL_WINDOW: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `true` when `pid` is a live (non-zombie) OS process.
+pub(crate) fn claude_pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return false;
+        }
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("State:")
+                    && rest.trim_start().starts_with('Z')
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn raw_route_entry_provenance(path: &Path, persona: &str) -> (Option<String>, Option<String>) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None);
+    };
+    let Some(entries) = val.get("entries").and_then(serde_json::Value::as_object) else {
+        return (None, None);
+    };
+    let Some((_, entry_val)) = entries
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(persona))
+    else {
+        return (None, None);
+    };
+    let hosted_id = entry_val
+        .get("hosted_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let generation = entry_val
+        .get("hydration_generation")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (hosted_id, generation)
+}
+
+/// `true` when `persona`'s saved Claude route in `route_table_paths(env.home_override)` confirms
+/// a live `SessionStart:resume` registration for `vendor_session_id` at or after
+/// `launch_started_ms` belonging to `(hosted_id, hydration_generation)`.
+fn claude_resume_route_registered(
+    env: &LifecycleEnv<'_>,
+    persona: &str,
+    hosted_id: &str,
+    vendor_session_id: &str,
+    hydration_generation: &str,
+    launch_started_ms: u64,
+) -> bool {
+    if vendor_session_id.trim().is_empty() {
+        return false;
+    }
+    for path in route_table_paths(env.home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        let Some(entry) = table.get(persona) else {
+            continue;
+        };
+        let VendorRoute::Claude {
+            pid, session_id, ..
+        } = &entry.route
+        else {
+            continue;
+        };
+        if session_id.trim() != vendor_session_id.trim() {
+            continue;
+        }
+        if entry.updated_at.unix_millis() < launch_started_ms {
+            continue;
+        }
+        if *pid == 0 || !claude_pid_is_alive(*pid) {
+            continue;
+        }
+        let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, persona);
+        if let Some(hid) = raw_hid.as_deref()
+            && !hid.eq_ignore_ascii_case(hosted_id)
+        {
+            continue;
+        }
+        if let Some(g) = raw_gen.as_deref()
+            && !hydration_generation.is_empty()
+            && g != hydration_generation
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// `true` when a saved Claude route for `persona` matches `vendor_session_id` and proves
+/// provenance for `(hosted_id, hydration_generation, runtime_pid)` (even if the process later
+/// exited).
+fn claude_route_confirmed_for_session(
+    env: &LifecycleEnv<'_>,
+    persona: &str,
+    hosted_id: &str,
+    vendor_session_id: &str,
+    hydration_generation: Option<&str>,
+    runtime_pid: Option<u32>,
+) -> bool {
+    if vendor_session_id.trim().is_empty() {
+        return false;
+    }
+    for path in route_table_paths(env.home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        let Some(entry) = table.get(persona) else {
+            continue;
+        };
+        let VendorRoute::Claude {
+            pid, session_id, ..
+        } = &entry.route
+        else {
+            continue;
+        };
+        if session_id.trim() != vendor_session_id.trim() {
+            continue;
+        }
+        let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, persona);
+        let raw_meta_mismatch = raw_hid
+            .as_deref()
+            .is_some_and(|h| !h.eq_ignore_ascii_case(hosted_id))
+            || raw_gen
+                .as_deref()
+                .is_some_and(|g| hydration_generation != Some(g));
+        let pid_ok = *pid > 0 && runtime_pid.is_none_or(|rp| rp == *pid);
+        if !raw_meta_mismatch && pid_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Positive survival confirmation for `claude --resume <uuid>` launches, returning
+/// `(survived, hook_confirmed)`.
+///
+/// Unlike [`launch_survived`], which returns `true` on the first `t=0` `owns` check, this polls
+/// across [`CLAUDE_RESUME_SURVIVAL_WINDOW`] (or returns `(true, true)` early once the resumed
+/// session's `SessionStart:resume` hook registers its live Claude route) so a `--resume` process
+/// that exits after `t=0` (e.g. `"No conversation found"` at `t=1s`) is caught and triggers the
+/// fresh-launch fallback.
+fn resume_launch_survived(
+    env: &LifecycleEnv<'_>,
+    unit: &str,
+    hosted_id: &str,
+    persona: &str,
+    vendor_session_id: &str,
+    hydration_generation: &str,
+    launch_started_ms: u64,
+) -> (bool, bool) {
+    if !env.runtime.owns(unit, hosted_id) || env.runtime.presence(unit) == RuntimePresence::Gone {
+        return (false, false);
+    }
+    if claude_resume_route_registered(
+        env,
+        persona,
+        hosted_id,
+        vendor_session_id,
+        hydration_generation,
+        launch_started_ms,
+    ) {
+        return (true, true);
+    }
+
+    let settle = env.runtime.settle_delay();
+    #[cfg(test)]
+    let window = TEST_CLAUDE_RESUME_SURVIVAL_WINDOW
+        .with(|c| c.get())
+        .unwrap_or_else(|| settle.saturating_mul(LAUNCH_SURVIVAL_CHECKS));
+    #[cfg(not(test))]
+    let window = CLAUDE_RESUME_SURVIVAL_WINDOW;
+
+    let poll_step = if settle.is_zero() {
+        window / LAUNCH_SURVIVAL_CHECKS.max(1)
+    } else {
+        settle
+            .min(window / LAUNCH_SURVIVAL_CHECKS.max(1))
+            .max(Duration::from_millis(10))
+    };
+    let deadline = Instant::now() + window;
+    let mut post_checks = 0u32;
+
+    while post_checks < LAUNCH_SURVIVAL_CHECKS || (!window.is_zero() && Instant::now() < deadline) {
+        if !poll_step.is_zero() {
+            let sleep_for = if window.is_zero() {
+                Duration::ZERO
+            } else {
+                poll_step.min(deadline.saturating_duration_since(Instant::now()))
+            };
+            if !sleep_for.is_zero() {
+                std::thread::sleep(sleep_for);
+            }
+        }
+        post_checks = post_checks.saturating_add(1);
+        if !env.runtime.owns(unit, hosted_id) || env.runtime.presence(unit) == RuntimePresence::Gone
+        {
+            return (false, false);
+        }
+        if claude_resume_route_registered(
+            env,
+            persona,
+            hosted_id,
+            vendor_session_id,
+            hydration_generation,
+            launch_started_ms,
+        ) {
+            return (true, true);
+        }
+        if window.is_zero() && post_checks >= LAUNCH_SURVIVAL_CHECKS {
+            break;
+        }
+    }
+
+    if env.runtime.owns(unit, hosted_id) && env.runtime.presence(unit) != RuntimePresence::Gone {
+        (true, false)
+    } else {
+        (false, false)
+    }
+}
 
 /// `true` when the runtime unit of a command just launched in it (`spawn` with a [`LaunchSpec`])
 /// is still there: a command that exits at once (a missing binary) takes its window with it. Asks
@@ -968,19 +1231,28 @@ fn find_active_claude_transcript_path(
         .home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
-    if let Some(host_adapter) = env.host_vendor_adapter("claude") {
+    let found = if let Some(host_adapter) = env.host_vendor_adapter("claude") {
         match host_adapter.find_active_session_transcript_path(&home, vendor_session_id) {
-            Ok(path) => return path,
-            Err(fl_core::VendorAdapterError::Unsupported { .. }) => {}
-            Err(_) => return None,
+            Ok(path) => path,
+            Err(fl_core::VendorAdapterError::Unsupported { .. }) => {
+                env.vendor_adapter("claude").and_then(|adapter| {
+                    adapter
+                        .find_active_session_transcript_path(&home, vendor_session_id)
+                        .ok()
+                        .flatten()
+                })
+            }
+            Err(_) => None,
         }
-    }
-    env.vendor_adapter("claude").and_then(|adapter| {
-        adapter
-            .find_active_session_transcript_path(&home, vendor_session_id)
-            .ok()
-            .flatten()
-    })
+    } else {
+        env.vendor_adapter("claude").and_then(|adapter| {
+            adapter
+                .find_active_session_transcript_path(&home, vendor_session_id)
+                .ok()
+                .flatten()
+        })
+    };
+    found.filter(|p| fl_core::vendor_adapter::validate_claude_transcript_path(p).is_ok())
 }
 
 fn repair_claude_transcript_tail(
@@ -1023,16 +1295,27 @@ fn estimate_claude_post_compaction_context(
     })
 }
 
-/// Sync `record.vendor_session_id` from a live `VendorRoute::Claude` for `record.persona` when an
-/// interactive `/clear` rotated the active Claude session ID and its `.jsonl` transcript exists
-/// under `<home>/.claude/projects/*/`.
-fn sync_claude_vendor_session_id_from_route(
+/// Sync `record.vendor_session_id` from a `VendorRoute::Claude` for `record.persona` when an
+/// interactive `/clear` rotated the active Claude session ID, the hosted runtime unit is dead,
+/// the route's PID is dead (`*pid > 0 && !claude_pid_is_alive(*pid)`), and provenance matches this
+/// hosted session (`(hosted_id, hydration_generation)` on the route JSON or `runtime_pid == pid`).
+fn sync_claude_vendor_session_id_from_route<S: StateStore>(
+    store: &S,
     env: &LifecycleEnv<'_>,
     record: &mut HostedSessionRecord,
 ) -> bool {
     if record.vendor != "claude" {
         return false;
     }
+    let target = record
+        .tmux_target
+        .clone()
+        .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+    let unit = env.runtime.unit(&target);
+    if env.spawn_runtime && env.runtime.exists(unit) {
+        return false;
+    }
+    let resume_state = load_claude_resume_state(store, &record.session_id);
     for path in route_table_paths(env.home_override) {
         if !path.is_file() {
             continue;
@@ -1041,9 +1324,26 @@ fn sync_claude_vendor_session_id_from_route(
         let Some(entry) = table.get(&record.persona) else {
             continue;
         };
-        let VendorRoute::Claude { session_id, .. } = &entry.route else {
+        let VendorRoute::Claude {
+            pid, session_id, ..
+        } = &entry.route
+        else {
             continue;
         };
+        if *pid == 0 || claude_pid_is_alive(*pid) {
+            continue;
+        }
+        let (raw_hid, raw_gen) = raw_route_entry_provenance(&path, &record.persona);
+        let route_meta_matches = raw_hid
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&record.session_id))
+            && raw_gen
+                .as_deref()
+                .is_some_and(|g| record.hydration_generation.as_deref() == Some(g));
+        let pid_matches = resume_state.runtime_pid == Some(*pid);
+        if !route_meta_matches && !pid_matches {
+            continue;
+        }
         let sid = session_id.trim();
         if !is_native_session_id(sid)
             || record
@@ -1102,10 +1402,51 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
     posture: fl_core::permissions::Posture,
     cwd: Option<&str>,
 ) -> Result<ClaudeResumeDecision, LifecycleError> {
+    let mut resume_state = load_claude_resume_state(store, &record.session_id);
+    let unconfirmed_died = resume_state
+        .resume_unconfirmed_session_id
+        .as_deref()
+        .is_some_and(|unconfirmed_sid| {
+            !claude_route_confirmed_for_session(
+                env,
+                &record.persona,
+                &record.session_id,
+                unconfirmed_sid,
+                record.hydration_generation.as_deref(),
+                resume_state.runtime_pid,
+            )
+        });
+    if resume_state.resume_failed || unconfirmed_died {
+        let failed_sid = resume_state
+            .resume_unconfirmed_session_id
+            .take()
+            .or_else(|| record.vendor_session_id.clone())
+            .unwrap_or_default();
+        resume_state.resume_failed = false;
+        save_claude_resume_state(store, &record.session_id, &resume_state, "hub")?;
+        if !failed_sid.is_empty() {
+            push_tombstone(&mut record.tombstone_ids, &failed_sid);
+        }
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "resume_launch_did_not_survive",
+            detail: format!(
+                "previous --resume `{failed_sid}` for `{}` exited before route confirmation",
+                record.persona
+            ),
+        });
+    }
+    if resume_state.resume_unconfirmed_session_id.is_some() {
+        resume_state.resume_unconfirmed_session_id = None;
+        save_claude_resume_state(store, &record.session_id, &resume_state, "hub")?;
+    }
+
     if recast_staged {
         return Ok(ClaudeResumeDecision::FreshLaunch {
             reason_code: "recast_guidance_staged",
-            detail: format!("recast assignment staged for `{}`", record.persona),
+            detail: format!(
+                "recast assignment staged (recast_staged) for `{}`",
+                record.persona
+            ),
         });
     }
     let _ = promote_confirmed_hydration(store, record);
@@ -1142,31 +1483,10 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
         return Ok(ClaudeResumeDecision::FreshLaunch {
             reason_code: "missing_or_archived_transcript",
             detail: format!(
-                "no active transcript found for session `{sid}` under ~/.claude/projects/"
+                "missing_transcript: no active transcript found for session `{sid}` under ~/.claude/projects/"
             ),
         });
     };
-    match repair_claude_transcript_tail(env, &transcript_path) {
-        Ok(truncated_bytes) => {
-            if truncated_bytes > 0 && env.log_hydration_warnings {
-                eprintln!(
-                    "hub: warning ({} / claude:{}): repaired {truncated_bytes} torn trailing byte(s) in `{}`",
-                    record.persona,
-                    record.persona,
-                    transcript_path.display()
-                );
-            }
-        }
-        Err(err) => {
-            return Ok(ClaudeResumeDecision::FreshLaunch {
-                reason_code: "empty_or_unparseable_transcript",
-                detail: format!(
-                    "transcript tail repair failed for `{}`: {err}",
-                    transcript_path.display()
-                ),
-            });
-        }
-    }
     let ctx = match estimate_claude_post_compaction_context(env, &transcript_path) {
         Ok(ctx) if ctx.turn_count > 0 => ctx,
         Ok(_) => {
@@ -1188,11 +1508,41 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
             });
         }
     };
-    let max_ceiling = std::env::var("FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(crate::context_window::MAX_CLAUDE_RESUME_ACTIVE_TOKENS);
+    if let (Some(transcript_model), Some(target_model)) =
+        (ctx.latest_model.as_deref(), effective_model)
+    {
+        let target_window = crate::context_window::claude_session_context_window(
+            effective_context_window,
+            Some(target_model),
+            None,
+        );
+        let transcript_window = crate::context_window::claude_session_context_window(
+            None,
+            None,
+            Some(transcript_model),
+        );
+        if target_window < transcript_window {
+            return Ok(ClaudeResumeDecision::FreshLaunch {
+                reason_code: "model_context_window_shrunk",
+                detail: format!(
+                    "target model `{target_model}` window ({target_window}) is smaller than transcript model `{transcript_model}` window ({transcript_window})"
+                ),
+            });
+        }
+    }
+    let raw_max_ceiling = std::env::var("FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS").ok();
+    let (max_ceiling, max_ceiling_warning) =
+        crate::context_window::parse_claude_max_resume_active_tokens_override(
+            raw_max_ceiling.as_deref(),
+        );
+    if let Some(warn) = max_ceiling_warning
+        && env.log_hydration_warnings
+    {
+        eprintln!(
+            "hub: warning ({} / {}): {warn}",
+            record.persona, record.session_id
+        );
+    }
     let window_tokens = crate::context_window::claude_session_context_window(
         effective_context_window,
         effective_model,
@@ -1204,7 +1554,7 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
             return Ok(ClaudeResumeDecision::FreshLaunch {
                 reason_code: "context_over_cap",
                 detail: format!(
-                    "post-compaction active_context_tokens ({active_tokens}) exceeds cap ({cap}) for window ({window_tokens})"
+                    "active_context_tokens_exceeded: post-compaction active_context_tokens ({active_tokens}) exceeds cap ({cap}) for window ({window_tokens})"
                 ),
             });
         }
@@ -1214,7 +1564,7 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
         return Ok(ClaudeResumeDecision::FreshLaunch {
             reason_code: "context_over_cap",
             detail: format!(
-                "post-compaction conversational bytes ({}) exceeds cap ({})",
+                "active_context_tokens_exceeded: post-compaction conversational bytes ({}) exceeds cap ({})",
                 ctx.post_compact_conversational_bytes,
                 crate::context_window::MAX_CLAUDE_RESUME_POST_COMPACT_CONVERSATIONAL_BYTES
             ),
@@ -1231,6 +1581,27 @@ fn evaluate_claude_resume_eligibility<S: StateStore>(
         &sid,
         Some(&existing_gen),
     )?;
+    match repair_claude_transcript_tail(env, &transcript_path) {
+        Ok(truncated_bytes) => {
+            if truncated_bytes > 0 && env.log_hydration_warnings {
+                eprintln!(
+                    "hub: warning ({} / claude:{}): repaired {truncated_bytes} torn trailing byte(s) in `{}`",
+                    record.persona,
+                    record.persona,
+                    transcript_path.display()
+                );
+            }
+        }
+        Err(err) => {
+            return Ok(ClaudeResumeDecision::FreshLaunch {
+                reason_code: "empty_or_unparseable_transcript",
+                detail: format!(
+                    "transcript tail repair failed for `{}`: {err}",
+                    transcript_path.display()
+                ),
+            });
+        }
+    }
     Ok(ClaudeResumeDecision::ResumeExisting {
         vendor_session_id: sid,
         hydration_generation: existing_gen,
@@ -1722,6 +2093,23 @@ impl SessionRuntime for HostRuntime {
             })
     }
 
+    fn recorded_pid(&self, unit: &str, hosted_id: &str) -> Option<u32> {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.recorded_pid(unit, hosted_id);
+        }
+        let wanted = exact_host_unit(unit, hosted_id)?;
+        let mut client = connect_host_client()?;
+        let sessions = client.list_sessions().ok()?;
+        sessions
+            .into_iter()
+            .find(|s| s.stream.session == wanted)
+            .and_then(|s| match s.state {
+                fl_host_proto::ChildState::Running(r)
+                | fl_host_proto::ChildState::LeaderExited(r)
+                | fl_host_proto::ChildState::CleanupComplete(r) => (r.pid > 0).then_some(r.pid),
+            })
+    }
+
     fn settle_delay(&self) -> std::time::Duration {
         std::time::Duration::from_millis(50)
     }
@@ -1771,6 +2159,15 @@ impl SessionRuntime for TmuxRuntime {
         tmux_unit_owned(unit, hosted_id)
     }
 
+    fn recorded_pid(&self, unit: &str, _hosted_id: &str) -> Option<u32> {
+        let out = tmux_stdout(&["list-panes", "-t", unit, "-F", "#{pane_pid}"])?;
+        out.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .and_then(|l| l.parse::<u32>().ok())
+            .filter(|&pid| pid > 0)
+    }
+
     fn settle_delay(&self) -> std::time::Duration {
         std::time::Duration::from_millis(100)
     }
@@ -1804,6 +2201,12 @@ pub(crate) struct FakeRuntime {
     pub(crate) vanish_windows: std::cell::RefCell<Vec<String>>,
     /// Windows whose runtime is gone right after its next single spawn (then cleared).
     pub(crate) vanish_once_windows: std::cell::RefCell<Vec<String>>,
+    /// Per-unit `owns` check count after which a spawned unit exits (e.g., `1` means alive on
+    /// `t=0` check #1 and gone on check #2). Consumed on trigger so a fresh fallback spawn stays up.
+    pub(crate) vanish_after_owns_checks: std::cell::RefCell<BTreeMap<String, u32>>,
+    pub(crate) unit_owns_since_spawn: std::cell::RefCell<BTreeMap<String, u32>>,
+    /// Scripted PID returned by [`SessionRuntime::recorded_pid`] for a unit.
+    pub(crate) unit_pids: std::cell::RefCell<BTreeMap<String, u32>>,
     /// How many times `exists` was asked.
     pub(crate) exists_calls: std::cell::Cell<u32>,
     /// How many times `owns` was asked (the survival check of a launched command).
@@ -1822,6 +2225,16 @@ impl FakeRuntime {
             .borrow_mut()
             .extend(sessions.iter().map(ToString::to_string));
         fake
+    }
+
+    pub(crate) fn vanish_unit_after_owns_checks(&self, unit: &str, checks: u32) {
+        self.vanish_after_owns_checks
+            .borrow_mut()
+            .insert(unit.to_string(), checks);
+    }
+
+    pub(crate) fn set_unit_pid(&self, unit: &str, pid: u32) {
+        self.unit_pids.borrow_mut().insert(unit.to_string(), pid);
     }
 
     pub(crate) fn env<'a>(&'a self, home: &'a Path) -> LifecycleEnv<'a> {
@@ -2004,6 +2417,12 @@ impl SessionRuntime for FakeRuntime {
             self.live.borrow_mut().insert(session.to_string())
         };
         if started {
+            self.unit_owns_since_spawn
+                .borrow_mut()
+                .insert(unit.clone(), 0);
+            self.unit_owns_since_spawn
+                .borrow_mut()
+                .insert(session.to_string(), 0);
             self.launches
                 .borrow_mut()
                 .push((unit.clone(), launch.cloned()));
@@ -2055,7 +2474,7 @@ impl SessionRuntime for FakeRuntime {
             return false;
         }
         if is_muse_window_target(unit) {
-            // One window of the name, mark or not. A second window of the same name
+            // One window of the name, mark or not. A second window of the name
             // cannot be represented here; the tmux path refuses that case.
             if self.windows.borrow().contains(unit) {
                 self.close_window(unit);
@@ -2095,12 +2514,49 @@ impl SessionRuntime for FakeRuntime {
 
     fn owns(&self, unit: &str, hosted_id: &str) -> bool {
         self.owns_calls.set(self.owns_calls.get() + 1);
+        let check_num = {
+            let mut counts = self.unit_owns_since_spawn.borrow_mut();
+            let entry = counts.entry(unit.to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        let triggered_key = {
+            let vanish_map = self.vanish_after_owns_checks.borrow();
+            let direct = vanish_map
+                .get(unit)
+                .is_some_and(|&limit| check_num > limit)
+                .then(|| unit.to_string());
+            direct.or_else(|| {
+                unit.split_once(':').and_then(|(sess, _)| {
+                    vanish_map
+                        .get(sess)
+                        .is_some_and(|&limit| check_num > limit)
+                        .then(|| sess.to_string())
+                })
+            })
+        };
+        if let Some(key) = triggered_key {
+            self.vanish_after_owns_checks.borrow_mut().remove(&key);
+            if unit.contains(':') {
+                self.close_window(unit);
+            } else {
+                self.live.borrow_mut().remove(unit);
+            }
+            return false;
+        }
         if !unit.contains(':') {
             return self.is_live(unit);
         }
         !hosted_id.is_empty()
             && self.is_live(unit)
             && self.marks.borrow().get(unit).map(String::as_str) == Some(hosted_id)
+    }
+
+    fn recorded_pid(&self, unit: &str, _hosted_id: &str) -> Option<u32> {
+        let pids = self.unit_pids.borrow();
+        pids.get(unit)
+            .copied()
+            .or_else(|| unit.split_once(':').and_then(|(s, _)| pids.get(s).copied()))
     }
 }
 
@@ -2628,6 +3084,84 @@ pub struct HydrationReceipt {
     pub accepted_at_ms: u64,
 }
 
+/// Prefix of disjoint runtime entries that record per-session Claude resume survival/PID state.
+pub const CLAUDE_RESUME_STATE_SLUG_PREFIX: &str = "claude-resume-state-";
+
+/// Slug of the disjoint runtime entry for a hosted Claude session's resume state.
+pub fn claude_resume_state_slug(session_id: &str) -> String {
+    format!(
+        "{CLAUDE_RESUME_STATE_SLUG_PREFIX}{}",
+        session_id.replace(':', "-")
+    )
+}
+
+/// Disjoint runtime state for a hosted Claude session's `--resume` survival and PID tracking.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeResumeState {
+    /// Set when a `--resume` launch exited before positive confirmation so the next restart
+    /// goes straight to a fresh launch with `resume_launch_did_not_survive`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume_failed: bool,
+    /// Session ID of a `--resume` launch that survived the initial launch window without yet
+    /// registering its `SessionStart:resume` route; if the unit exits before route confirmation,
+    /// `reconcile_dead_hosted_sessions` / restart marks `resume_failed = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_unconfirmed_session_id: Option<String>,
+    /// PID of the Claude process spawned or confirmed for this hosted session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_pid: Option<u32>,
+}
+
+pub fn load_claude_resume_state<S: StateStore>(store: &S, session_id: &str) -> ClaudeResumeState {
+    let slug = claude_resume_state_slug(session_id);
+    store
+        .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
+        .ok()
+        .flatten()
+        .and_then(|entry| match entry.payload {
+            StatePayload::Runtime(rt) => serde_json::from_value::<ClaudeResumeState>(rt.value).ok(),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+pub fn save_claude_resume_state<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    state: &ClaudeResumeState,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    let slug = claude_resume_state_slug(session_id);
+    if !state.resume_failed
+        && state.resume_unconfirmed_session_id.is_none()
+        && state.runtime_pid.is_none()
+    {
+        let _ = store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug);
+        return Ok(());
+    }
+    let value = serde_json::to_value(state).map_err(|e| LifecycleError::Store(e.to_string()))?;
+    store.upsert_state(UpsertStateArgs {
+        scope: StateScope::Workspace,
+        slug,
+        sensitivity: SensitivityPatch::Inherit,
+        payload: StatePayload::Runtime(RuntimeEntry {
+            value,
+            merge_mode: MergeMode::LastWriter,
+        }),
+        at: stamp::now(),
+        by: by.to_string(),
+    })?;
+    Ok(())
+}
+
+pub fn delete_claude_resume_state<S: StateStore>(store: &S, session_id: &str) {
+    let _ = store.delete_state_by_key(
+        &StateScope::Workspace,
+        StateConcern::Runtime,
+        &claude_resume_state_slug(session_id),
+    );
+}
+
 static LAST_HYDRATION_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2869,6 +3403,21 @@ pub fn record_hydration_ack<S: StateStore>(
             .map(|r| r.session_id)
             .unwrap_or_default()
     };
+    let claude_socket_pid = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET")
+        .and_then(|raw| {
+            Path::new(&raw)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .filter(|&p| p > 0);
+    if session_id.starts_with("claude:")
+        && let Some(pid) = claude_socket_pid
+    {
+        let mut rstate = load_claude_resume_state(store, &session_id);
+        rstate.runtime_pid = Some(pid);
+        let _ = save_claude_resume_state(store, &session_id, &rstate, &persona_lower);
+    }
     let receipt = HydrationReceipt {
         session_id,
         persona: persona_lower.clone(),
@@ -4651,7 +5200,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             .filter(|r| !is_decommissioned(r) && r.vendor == "claude")
     {
         env.runtime.preflight_spawn(&session_id)?;
-        let _ = sync_claude_vendor_session_id_from_route(env, prev);
+        let _ = sync_claude_vendor_session_id_from_route(store, env, prev);
         let recast_staged = recast_staged_in_store
             || !prev.project.eq_ignore_ascii_case(&v.project)
             || !prev.role.eq_ignore_ascii_case(&v.role);
@@ -4824,6 +5373,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
+    let resume_launch_started_ms = now_ms();
     let mut raw_spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
@@ -4838,14 +5388,45 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
         apply_startup_prompt_rules(env.runtime, &v.vendor, target);
     }
     let mut launched = raw_spawned && launch.is_some();
-    let mut survived = !launched || launch_survived(env, &unit, &session_id);
+    let survived;
     let mut resumed_existing = false;
     if is_claude_resume {
-        if raw_spawned && survived {
+        let resumed_sid = vendor_session_id.clone().unwrap_or_default();
+        let (survived_resume, hook_confirmed) = if raw_spawned {
+            if launch.is_some() {
+                resume_launch_survived(
+                    env,
+                    &unit,
+                    &session_id,
+                    &v.persona,
+                    &resumed_sid,
+                    &hydration_generation,
+                    resume_launch_started_ms,
+                )
+            } else {
+                (true, true)
+            }
+        } else {
+            (false, false)
+        };
+        if raw_spawned && survived_resume {
+            survived = true;
             resumed_existing = true;
+            let mut rstate = load_claude_resume_state(store, &session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = if hook_confirmed {
+                None
+            } else {
+                Some(resumed_sid)
+            };
+            if let Some(pid) = env.runtime.recorded_pid(&unit, &session_id) {
+                rstate.runtime_pid = Some(pid);
+            }
+            save_claude_resume_state(store, &session_id, &rstate, by)?;
         } else {
             let _ = env.runtime.kill(&unit, &session_id);
-            let failed_sid = vendor_session_id.unwrap_or_default();
+            let failed_sid = resumed_sid;
+            push_tombstone(&mut record.tombstone_ids, &failed_sid);
             push_claude_resume_fallback_notice(
                 env,
                 &v.persona,
@@ -4903,17 +5484,38 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             }
             launched = raw_spawned && launch.is_some();
             survived = !launched || launch_survived(env, &unit, &session_id);
+            let mut rstate = load_claude_resume_state(store, &session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = None;
+            rstate.runtime_pid = if raw_spawned && survived {
+                env.runtime.recorded_pid(&unit, &session_id)
+            } else {
+                None
+            };
+            save_claude_resume_state(store, &session_id, &rstate, by)?;
         }
-    } else if will_spawn
-        && !raw_spawned
-        && let Some(prev_g) = existing_gen.as_ref()
-    {
-        record.hydration_generation = Some(prev_g.clone());
-        let _ = store.delete_state_by_key(
-            &StateScope::Workspace,
-            StateConcern::Runtime,
-            &hydration_ack_slug(prev_g),
-        );
+    } else {
+        survived = !launched || launch_survived(env, &unit, &session_id);
+        if v.vendor == "claude" {
+            let mut rstate = load_claude_resume_state(store, &session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = None;
+            if raw_spawned && survived {
+                rstate.runtime_pid = env.runtime.recorded_pid(&unit, &session_id);
+            }
+            save_claude_resume_state(store, &session_id, &rstate, by)?;
+        }
+        if will_spawn
+            && !raw_spawned
+            && let Some(prev_g) = existing_gen.as_ref()
+        {
+            record.hydration_generation = Some(prev_g.clone());
+            let _ = store.delete_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hydration_ack_slug(prev_g),
+            );
+        }
     }
     // Argv handed the prompt to the vendor, but survival does not prove acceptance.
     // A command that exited at once took its session with it: nothing to deliver to.
@@ -5846,9 +6448,21 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
             continue;
         }
         if vendor_route_present(env.home_override, &record.persona, &record.vendor) {
-            if sync_claude_vendor_session_id_from_route(env, &mut record) {
-                record.updated_at_ms = now_ms();
-                persist_hosted_session(store, &record, by)?;
+            if record.vendor == "claude" {
+                let mut rstate = load_claude_resume_state(store, &record.session_id);
+                if let Some(ref unconfirmed_sid) = rstate.resume_unconfirmed_session_id
+                    && claude_route_confirmed_for_session(
+                        env,
+                        &record.persona,
+                        &record.session_id,
+                        unconfirmed_sid,
+                        record.hydration_generation.as_deref(),
+                        rstate.runtime_pid,
+                    )
+                {
+                    rstate.resume_unconfirmed_session_id = None;
+                    let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
+                }
             }
             with_dead_streaks(|streaks| {
                 streaks.remove(&record.session_id);
@@ -5876,7 +6490,27 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                     *streak
                 });
                 if streak >= 2 {
-                    let _ = sync_claude_vendor_session_id_from_route(env, &mut record);
+                    if record.vendor == "claude" {
+                        let mut rstate = load_claude_resume_state(store, &record.session_id);
+                        if let Some(unconfirmed_sid) = rstate.resume_unconfirmed_session_id.clone()
+                            && !claude_route_confirmed_for_session(
+                                env,
+                                &record.persona,
+                                &record.session_id,
+                                &unconfirmed_sid,
+                                record.hydration_generation.as_deref(),
+                                rstate.runtime_pid,
+                            )
+                        {
+                            rstate.resume_failed = true;
+                            rstate.resume_unconfirmed_session_id = None;
+                            let _ =
+                                save_claude_resume_state(store, &record.session_id, &rstate, by);
+                        } else {
+                            let _ =
+                                sync_claude_vendor_session_id_from_route(store, env, &mut record);
+                        }
+                    }
                     record.status = STATUS_STOPPED.to_string();
                     record.updated_at_ms = now_ms();
                     persist_hosted_session(store, &record, by)?;
@@ -6157,6 +6791,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     record.tombstone_ids = tombstone_ids;
     record.updated_at_ms = updated_ms;
     persist_hosted_session(store, &record, by)?;
+    delete_claude_resume_state(store, &record.session_id);
     for mut sib in same_vendor_siblings {
         if !is_decommissioned(&sib) {
             sib.status = STATUS_DECOMMISSIONED.to_string();
@@ -6168,6 +6803,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             sib.updated_at_ms = updated_ms;
             persist_hosted_session(store, &sib, by)?;
         }
+        delete_claude_resume_state(store, &sib.session_id);
     }
     // The native conversation id is tombstoned above. Conversation files stay.
     refresh_decommission_tombstones(store, env.home_override);
@@ -6267,7 +6903,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = env.runtime.unit(&want_target).to_string();
-    let _ = sync_claude_vendor_session_id_from_route(env, &mut record);
+    let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
     // A stale `<Display>:muse` record whose old session still runs: that one Muse is the agent.
     // No second Muse is opened beside it; the prompt goes to it by delivery and the ownership
     // flag stays as recorded.
@@ -6468,6 +7104,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     let mut launched_with_prompt = false;
     let mut launch_died = false;
     let mut resumed_existing = false;
+    let resume_launch_started_ms = now_ms();
     let raw_spawned = record.hosted
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
@@ -6480,14 +7117,42 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             &record.session_id,
         );
     if is_claude_resume {
-        let survived =
-            raw_spawned && (launch.is_none() || launch_survived(env, &unit, &record.session_id));
-        if survived {
+        let resumed_sid = record.vendor_session_id.clone().unwrap_or_default();
+        let (survived_resume, hook_confirmed) = if raw_spawned {
+            if launch.is_some() {
+                resume_launch_survived(
+                    env,
+                    &unit,
+                    &record.session_id,
+                    &record.persona,
+                    &resumed_sid,
+                    &hydration_generation,
+                    resume_launch_started_ms,
+                )
+            } else {
+                (true, true)
+            }
+        } else {
+            (false, false)
+        };
+        if raw_spawned && survived_resume {
             record.runtime_spawned = true;
             resumed_existing = true;
+            let mut rstate = load_claude_resume_state(store, &record.session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = if hook_confirmed {
+                None
+            } else {
+                Some(resumed_sid)
+            };
+            if let Some(pid) = env.runtime.recorded_pid(&unit, &record.session_id) {
+                rstate.runtime_pid = Some(pid);
+            }
+            save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         } else {
             let _ = env.runtime.kill(&unit, &record.session_id);
-            let failed_sid = record.vendor_session_id.clone().unwrap_or_default();
+            let failed_sid = resumed_sid;
+            push_tombstone(&mut record.tombstone_ids, &failed_sid);
             push_claude_resume_fallback_notice(
                 env,
                 &record.persona,
@@ -6551,6 +7216,15 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
                 launch_died = true;
                 record.runtime_spawned = false;
             }
+            let mut rstate = load_claude_resume_state(store, &record.session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = None;
+            rstate.runtime_pid = if record.runtime_spawned {
+                env.runtime.recorded_pid(&unit, &record.session_id)
+            } else {
+                None
+            };
+            save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         }
     } else if raw_spawned {
         if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
@@ -6561,6 +7235,15 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
             record.runtime_spawned = true;
             // Argv already handed off the prompt; acceptance remains unconfirmed.
             launched_with_prompt = launch.is_some();
+        }
+        if record.vendor == "claude" {
+            let mut rstate = load_claude_resume_state(store, &record.session_id);
+            rstate.resume_failed = false;
+            rstate.resume_unconfirmed_session_id = None;
+            if record.runtime_spawned {
+                rstate.runtime_pid = env.runtime.recorded_pid(&unit, &record.session_id);
+            }
+            save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         }
     } else if will_spawn && let Some(prev_g) = existing_gen.as_ref() {
         record.hydration_generation = Some(prev_g.clone());
@@ -13996,6 +14679,22 @@ mod tests {
             inbox[0].message.body
         );
 
+        // Simulate SessionStart:resume hook registering the route for the resumed session before
+        // it stops again in part 2.
+        let routes_path = home.path().join(".cache/agent-bus/routes.json");
+        let mut table = RouteTable::default();
+        table.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: std::process::id(),
+                session_id: sid.clone(),
+                socket_path: home.path().join("claude.sock"),
+                key_path: None,
+            },
+            stamp::now(),
+        );
+        table.save(Some(&routes_path)).unwrap();
+
         // 2. Mark session stopped and re-run spin_up -> also resumes `<sid>` and preserves G1.
         fake.clear();
         fake.launches.borrow_mut().clear();
@@ -14180,6 +14879,17 @@ mod tests {
                 "expected missing_or_tombstoned_session_id (is_tombstoned={is_tombstoned}) notice in {:?}",
                 restarted.warnings
             );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned on missing_or_tombstoned_session_id fallback"
+            );
             if is_tombstoned {
                 // Re-spinning a non-decommissioned record must also preserve tombstone_ids.
                 let respun = spin_up(
@@ -14238,6 +14948,17 @@ mod tests {
                 "expected missing_or_archived_transcript notice in {:?}",
                 restarted.warnings
             );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned on missing_or_archived_transcript fallback"
+            );
         }
 
         // 3. empty_or_unparseable_transcript (0 turns)
@@ -14279,6 +15000,17 @@ mod tests {
                 "expected empty_or_unparseable_transcript notice in {:?}",
                 restarted.warnings
             );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned on empty_or_unparseable_transcript fallback"
+            );
         }
 
         // 4. context_over_cap (model-relative: 388,396 fails on claude-opus-4-1 200k window,
@@ -14317,6 +15049,17 @@ mod tests {
                     .any(|w| w.contains("context_over_cap")),
                 "expected context_over_cap notice for {model} at {tokens} tokens in {:?}",
                 restarted.warnings
+            );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned on context_over_cap fallback"
             );
         }
 
@@ -14359,6 +15102,17 @@ mod tests {
                     .any(|w| w.contains("recast_guidance_staged")),
                 "expected recast_guidance_staged notice in {:?}",
                 restarted.warnings
+            );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned on recast_guidance_staged fallback"
             );
         }
 
@@ -14439,10 +15193,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_clear_route_sync_updates_vendor_session_id_and_ignores_tombstoned_ids() {
+    fn claude_clear_route_sync_updates_vendor_session_id_and_ignores_tombstoned_and_foreign_routes()
+    {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let fake = FakeRuntime::default();
+        fake.set_unit_pid("Ada", 999_999_991);
         let env = fake.env(home.path());
 
         let spun = spin_up(
@@ -14460,32 +15216,29 @@ mod tests {
             .vendor_session_id
             .unwrap();
         record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+        write_claude_transcript(
+            home.path(),
+            false,
+            &old_sid,
+            "claude-opus-5-5",
+            10_000,
+            false,
+        );
 
         let new_sid = uuid::Uuid::now_v7().to_string();
+        let foreign_sid = uuid::Uuid::now_v7().to_string();
+        let live_sid = uuid::Uuid::now_v7().to_string();
         let tombstoned_sid = uuid::Uuid::now_v7().to_string();
-        write_claude_transcript(
-            home.path(),
-            false,
-            &new_sid,
-            "claude-opus-5-5",
-            12_000,
-            false,
-        );
-        write_claude_transcript(
-            home.path(),
-            false,
-            &tombstoned_sid,
-            "claude-opus-5-5",
-            12_000,
-            false,
-        );
+        for sid in [&new_sid, &foreign_sid, &live_sid, &tombstoned_sid] {
+            write_claude_transcript(home.path(), false, sid, "claude-opus-5-5", 12_000, false);
+        }
 
         let routes_path = home.path().join(".cache/agent-bus/routes.json");
         let mut table = RouteTable::default();
         table.upsert(
             "ada",
             VendorRoute::Claude {
-                pid: std::process::id(),
+                pid: 999_999_991,
                 session_id: tombstoned_sid.clone(),
                 socket_path: home.path().join("claude.sock"),
                 key_path: None,
@@ -14500,7 +15253,7 @@ mod tests {
         rec.tombstone_ids.push(tombstoned_sid);
         persist_hosted_session(&store, &rec, "owner").unwrap();
 
-        // Tombstoned route session_id is ignored.
+        // 1. Tombstoned route session_id is ignored.
         reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
         assert_eq!(
             find_hosted_session(&store, &["claude:ada"])
@@ -14511,12 +15264,83 @@ mod tests {
             Some(old_sid.as_str())
         );
 
-        // Active non-tombstoned `/clear` session_id with `.jsonl` updates record.vendor_session_id
-        // and is targeted by `--resume` on subsequent restart.
+        // 2. I2: A LIVE Claude process (`pid = std::process::id()`) registered under `ada` is
+        //    never adopted even if `runtime_pid` matches.
+        fake.clear();
+        fake.launches.borrow_mut().clear();
         table.upsert(
             "ada",
             VendorRoute::Claude {
                 pid: std::process::id(),
+                session_id: live_sid.clone(),
+                socket_path: home.path().join("claude.sock"),
+                key_path: None,
+            },
+            At::from_unix_millis(15),
+        );
+        table.save(Some(&routes_path)).unwrap();
+        save_claude_resume_state(
+            &store,
+            "claude:ada",
+            &ClaudeResumeState {
+                runtime_pid: Some(std::process::id()),
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+        let mut probe_rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert!(
+            !sync_claude_vendor_session_id_from_route(&store, &env, &mut probe_rec),
+            "I2: live process route must never be adopted"
+        );
+        assert_eq!(
+            probe_rec.vendor_session_id.as_deref(),
+            Some(old_sid.as_str())
+        );
+
+        // 3. I2: A DEAD Claude process (`pid = 999_999_992`) with a different PID than
+        //    `runtime_pid = 999_999_991` and no matching `(hosted_id, hydration_generation)` is
+        //    never adopted.
+        save_claude_resume_state(
+            &store,
+            "claude:ada",
+            &ClaudeResumeState {
+                runtime_pid: Some(999_999_991),
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+        table.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: 999_999_992,
+                session_id: foreign_sid.clone(),
+                socket_path: home.path().join("claude.sock"),
+                key_path: None,
+            },
+            At::from_unix_millis(18),
+        );
+        table.save(Some(&routes_path)).unwrap();
+        assert!(
+            !sync_claude_vendor_session_id_from_route(&store, &env, &mut probe_rec),
+            "I2: dead foreign route with mismatched PID and no provenance must never be adopted"
+        );
+        assert_eq!(
+            probe_rec.vendor_session_id.as_deref(),
+            Some(old_sid.as_str())
+        );
+
+        // 4. Dead route from this session's own process (`pid == runtime_pid == 999_999_991`)
+        //    with non-tombstoned `/clear` session_id updates `record.vendor_session_id` and is
+        //    targeted by `--resume` on subsequent restart.
+        table.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: 999_999_991,
                 session_id: new_sid.clone(),
                 socket_path: home.path().join("claude.sock"),
                 key_path: None,
@@ -14539,6 +15363,499 @@ mod tests {
             argv.windows(2).any(|w| w == ["--resume", &new_sid]),
             "expected --resume {new_sid} after /clear sync, got {argv:?}"
         );
+    }
+
+    #[test]
+    fn claude_resume_launch_survived_detects_post_t0_exit_and_unconfirmed_route_death() {
+        // 1. Unit exists at t=0 (owns check #1) and exits at t=1s (owns check #2) for both
+        //    `restart_hosted_session` and `spin_up`.
+        for use_spin_up in [false, true] {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+
+            fake.clear();
+            fake.launches.borrow_mut().clear();
+            // Alive at t=0 (check #1), dead at t=1s (check #2).
+            fake.vanish_unit_after_owns_checks("Ada", 1);
+
+            if use_spin_up {
+                let mut stopped = find_hosted_session(&store, &["claude:ada"])
+                    .unwrap()
+                    .unwrap();
+                stopped.status = STATUS_STOPPED.to_string();
+                persist_hosted_session(&store, &stopped, "owner").unwrap();
+                let respun = spin_up(
+                    &store,
+                    &env,
+                    &req("ada", "assistant", "claude"),
+                    "owner",
+                    Caller::Owner,
+                )
+                .unwrap();
+                assert!(respun.runtime_spawned);
+                assert_eq!(respun.hydration_status, HydrationStatus::Unconfirmed);
+                assert_ne!(respun.hydration_generation.as_deref(), Some(g1.as_str()));
+                assert!(
+                    respun
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("resume_launch_did_not_survive")),
+                    "spin_up must emit resume_launch_did_not_survive when unit exits at check #2: {:?}",
+                    respun.warnings
+                );
+            } else {
+                let restarted =
+                    restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+                assert!(restarted.record.runtime_spawned);
+                assert_eq!(
+                    restarted.record.hydration_status,
+                    HydrationStatus::Unconfirmed
+                );
+                assert_ne!(
+                    restarted.record.hydration_generation.as_deref(),
+                    Some(g1.as_str())
+                );
+                assert!(
+                    restarted
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("resume_launch_did_not_survive")),
+                    "restart must emit resume_launch_did_not_survive when unit exits at check #2: {:?}",
+                    restarted.warnings
+                );
+            }
+
+            let rec_after = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                rec_after.vendor_session_id.as_deref(),
+                Some(sid1.as_str()),
+                "fresh vendor_session_id must be minted after post-t=0 resume exit"
+            );
+            assert!(
+                rec_after.tombstone_ids.contains(&sid1),
+                "old session ID `{sid1}` must be tombstoned after resume failure, got {:?}",
+                rec_after.tombstone_ids
+            );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned after post-t=0 resume exit"
+            );
+            let launches = fake.launches.borrow().clone();
+            assert_eq!(
+                launches.len(),
+                2,
+                "expected 1st spawn (--resume) + 2nd spawn (fresh --session-id)"
+            );
+            assert!(
+                launches[0]
+                    .1
+                    .as_ref()
+                    .unwrap()
+                    .argv
+                    .windows(2)
+                    .any(|w| w == ["--resume", &sid1])
+            );
+            assert!(
+                !launches[1]
+                    .1
+                    .as_ref()
+                    .unwrap()
+                    .argv
+                    .iter()
+                    .any(|a| a == "--resume")
+            );
+        }
+
+        // 2. Resumed unit survives the initial window without `SessionStart:resume` hook
+        //    confirmation (`resume_unconfirmed_session_id = Some(sid)`), then exits before
+        //    confirmation: `reconcile_dead_hosted_sessions` marks `resume_failed = true` and the
+        //    next `restart_hosted_session` goes straight to a fresh launch with
+        //    `resume_launch_did_not_survive`.
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g1 = spun.hydration_generation.unwrap();
+        let sid1 = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap()
+            .vendor_session_id
+            .unwrap();
+        record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+        write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+
+        fake.clear();
+        fake.launches.borrow_mut().clear();
+        let resumed = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            resumed.record.vendor_session_id.as_deref(),
+            Some(sid1.as_str())
+        );
+        let rstate_after_resume = load_claude_resume_state(&store, "claude:ada");
+        assert_eq!(
+            rstate_after_resume.resume_unconfirmed_session_id.as_deref(),
+            Some(sid1.as_str()),
+            "survival without SessionStart:resume route must record resume_unconfirmed_session_id"
+        );
+
+        // Now the resumed unit dies before registering its route.
+        fake.clear();
+        fake.presence_of
+            .borrow_mut()
+            .insert("Ada:claude".to_string(), RuntimePresence::Gone);
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+
+        let rstate_after_death = load_claude_resume_state(&store, "claude:ada");
+        assert!(
+            rstate_after_death.resume_failed,
+            "reconcile_dead_hosted_sessions must set resume_failed = true when unconfirmed resumed unit dies"
+        );
+        assert!(rstate_after_death.resume_unconfirmed_session_id.is_none());
+
+        fake.presence_of.borrow_mut().clear();
+        fake.launches.borrow_mut().clear();
+        let fresh_after_death =
+            restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+        assert_ne!(
+            fresh_after_death.record.vendor_session_id.as_deref(),
+            Some(sid1.as_str()),
+            "next restart after unconfirmed resume death must go straight to a fresh session"
+        );
+        assert!(
+            fresh_after_death.record.tombstone_ids.contains(&sid1),
+            "failed resumed session ID must be tombstoned"
+        );
+        assert!(
+            fresh_after_death
+                .warnings
+                .iter()
+                .any(|w| w.contains("resume_launch_did_not_survive")),
+            "expected resume_launch_did_not_survive warning on next restart, got {:?}",
+            fresh_after_death.warnings
+        );
+        let launches = fake.launches.borrow().clone();
+        assert_eq!(
+            launches.len(),
+            1,
+            "must go straight to fresh launch without trying --resume again"
+        );
+        assert!(
+            !launches[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .argv
+                .iter()
+                .any(|a| a == "--resume")
+        );
+    }
+
+    #[test]
+    fn claude_resume_tail_repair_runs_only_after_eligibility_and_backs_up_torn_tail() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. Over-cap transcript with a torn trailing line is rejected by
+        //    `evaluate_claude_resume_eligibility` (`context_over_cap`) and the transcript file on
+        //    disk is NOT modified (and no `.fl-torn-tail-*` backup is created).
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let mut request = req("ada", "assistant", "claude");
+            request.model = Some("claude-opus-4-1".into());
+            let spun = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            let path = write_claude_transcript(
+                home.path(),
+                false,
+                &sid1,
+                "claude-opus-4-1",
+                388_396,
+                true,
+            );
+            let original_bytes = std::fs::read(&path).unwrap();
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("context_over_cap")),
+                "expected context_over_cap in {:?}",
+                restarted.warnings
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original_bytes,
+                "I3: ineligible over-cap transcript must not be truncated on disk"
+            );
+            let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".fl-torn-tail-"))
+                .collect();
+            assert!(
+                backups.is_empty(),
+                "I3: no .fl-torn-tail-* backup may be created when resume is rejected"
+            );
+        }
+
+        // 2. Eligible transcript with a torn trailing line after valid lines creates
+        //    `<sid>.jsonl.fl-torn-tail-<ts>` with mode `0600` containing the exact removed tail
+        //    bytes, and truncates the transcript.
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            let path =
+                write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, true);
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_eq!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str())
+            );
+            let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".fl-torn-tail-"))
+                .collect();
+            assert_eq!(backups.len(), 1, "expected 1 .fl-torn-tail-* backup file");
+            let backup_path = backups[0].path();
+            assert_eq!(
+                std::fs::read_to_string(&backup_path).unwrap(),
+                "{\"type\":\"assistant\",\"message\":"
+            );
+            #[cfg(unix)]
+            {
+                let mode = std::fs::metadata(&backup_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "backup file must have 0600 permissions");
+            }
+        }
+
+        // 3. File with zero valid lines (single torn line) is never truncated on disk and causes
+        //    fallback with `empty_or_unparseable_transcript`.
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            let proj_dir = home.path().join(".claude/projects/ferroloop");
+            std::fs::create_dir_all(&proj_dir).unwrap();
+            let path = proj_dir.join(format!("{sid1}.jsonl"));
+            let single_torn = b"{\"type\":\"user\",\"mess";
+            std::fs::write(&path, single_torn).unwrap();
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("empty_or_unparseable_transcript")),
+                "expected empty_or_unparseable_transcript in {:?}",
+                restarted.warnings
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                single_torn,
+                "I3: file with 0 valid lines must not be truncated to 0 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_spin_up_stopped_fallback_ladder_and_model_context_window_shrunk() {
+        // Minor 5: spin_up fallback ladder tests beyond tombstone:
+        // (a) missing_transcript, (b) empty_or_unparseable_transcript,
+        // (c) active_context_tokens_exceeded, (d) recast_staged,
+        // plus Minor 8: (e) model_context_window_shrunk.
+        enum Case {
+            MissingTranscript,
+            EmptyTranscript,
+            OverCap,
+            RecastStaged,
+            WindowShrunk,
+        }
+        for (case, expected_tag) in [
+            (Case::MissingTranscript, "missing_transcript"),
+            (Case::EmptyTranscript, "empty_or_unparseable_transcript"),
+            (Case::OverCap, "active_context_tokens_exceeded"),
+            (Case::RecastStaged, "recast_staged"),
+            (Case::WindowShrunk, "model_context_window_shrunk"),
+        ] {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let mut initial_req = req("ada", "assistant", "claude");
+            initial_req.model = Some("claude-opus-4-6[1m]".into());
+            let spun = spin_up(&store, &env, &initial_req, "owner", Caller::Owner).unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+
+            let mut next_req = initial_req.clone();
+            match case {
+                Case::MissingTranscript => {}
+                Case::EmptyTranscript => {
+                    let proj_dir = home.path().join(".claude/projects/ferroloop");
+                    std::fs::create_dir_all(&proj_dir).unwrap();
+                    std::fs::write(proj_dir.join(format!("{sid1}.jsonl")), "").unwrap();
+                }
+                Case::OverCap => {
+                    write_claude_transcript(
+                        home.path(),
+                        false,
+                        &sid1,
+                        "claude-opus-4-6[1m]",
+                        895_176,
+                        false,
+                    );
+                }
+                Case::RecastStaged => {
+                    write_claude_transcript(
+                        home.path(),
+                        false,
+                        &sid1,
+                        "claude-opus-4-6[1m]",
+                        10_000,
+                        false,
+                    );
+                    let agent = store.agent_by_name("ada").unwrap().unwrap();
+                    stage_recast_guidance(&store, &agent, &agent.project, &agent.role, "owner")
+                        .unwrap();
+                }
+                Case::WindowShrunk => {
+                    write_claude_transcript(
+                        home.path(),
+                        false,
+                        &sid1,
+                        "claude-opus-4-6[1m]",
+                        50_000,
+                        false,
+                    );
+                    next_req.model = Some("claude-sonnet-4-5".into());
+                }
+            }
+
+            fake.clear();
+            fake.launches.borrow_mut().clear();
+            let mut stopped = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            stopped.status = STATUS_STOPPED.to_string();
+            persist_hosted_session(&store, &stopped, "owner").unwrap();
+
+            let respun = spin_up(&store, &env, &next_req, "owner", Caller::Owner).unwrap();
+            assert_eq!(respun.hydration_status, HydrationStatus::Unconfirmed);
+            assert_ne!(respun.hydration_generation.as_deref(), Some(g1.as_str()));
+            let after = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_ne!(after.vendor_session_id.as_deref(), Some(sid1.as_str()));
+            assert!(
+                respun.warnings.iter().any(|w| w.contains(expected_tag)),
+                "expected `{expected_tag}` in spin_up warnings: {:?}",
+                respun.warnings
+            );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned on spin_up fallback ({expected_tag})"
+            );
+        }
     }
 
     #[test]

@@ -1731,4 +1731,105 @@ fn service_resume_notice_skips_duplicate_when_unread_notice_exists_and_skips_ret
         .unwrap()
     );
     assert_eq!(inbox(&state, "jarvis").len(), 1);
+
+    // 1. An unread plain `"Host restarted"` notice is replaced (old receipt acked, new notice
+    //    unread) when `AGENTS.md` changes before the agent reads its inbox.
+    let ws = tempfile::TempDir::new().unwrap();
+    let baseline_ms = stamp::now().unix_millis();
+    std::thread::sleep(Duration::from_millis(5));
+    std::fs::write(ws.path().join("AGENTS.md"), "# updated agents\n").unwrap();
+    assert!(
+        send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            Some(ws.path()),
+            Some("assistant"),
+            Some(baseline_ms),
+        )
+        .unwrap(),
+        "unread plain notice must be replaced when AGENTS.md changes"
+    );
+    {
+        let store = state.open_store().unwrap();
+        let unread_freya = store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("freya".into()),
+                unread_only: true,
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            unread_freya.len(),
+            1,
+            "only the replacement notice should remain unread"
+        );
+        assert!(
+            unread_freya[0].message.body.contains("`AGENTS.md`"),
+            "replacement notice should list `AGENTS.md`: {}",
+            unread_freya[0].message.body
+        );
+    }
+
+    // 2. An unread `"Host restarted"` notice listing `` `AGENTS.md` `` is replaced with a merged
+    //    notice listing `` `AGENTS.md`, `WORKFLOW.md` `` when `WORKFLOW.md` also changes before the
+    //    first notice is read (even if the new check uses a baseline after `AGENTS.md`'s mtime).
+    let post_agents_baseline_ms = stamp::now().unix_millis();
+    std::thread::sleep(Duration::from_millis(5));
+    std::fs::write(ws.path().join("WORKFLOW.md"), "# updated workflow\n").unwrap();
+    assert!(
+        send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            Some(ws.path()),
+            Some("assistant"),
+            Some(post_agents_baseline_ms),
+        )
+        .unwrap(),
+        "unread notice with `AGENTS.md` must be replaced with merged `AGENTS.md`, `WORKFLOW.md` notice"
+    );
+    {
+        let store = state.open_store().unwrap();
+        let unread_freya = store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("freya".into()),
+                unread_only: true,
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            unread_freya.len(),
+            1,
+            "only the merged notice should remain unread"
+        );
+        assert!(
+            unread_freya[0]
+                .message
+                .body
+                .contains("`AGENTS.md`, `WORKFLOW.md`"),
+            "merged notice must list both files in canonical order: {}",
+            unread_freya[0].message.body
+        );
+        drop(store);
+        let all_freya = inbox(&state, "freya");
+        assert_eq!(
+            all_freya.len(),
+            3,
+            "two superseded notices + one active merged notice"
+        );
+    }
+
+    // Repeating with no additional changed files is a no-op.
+    assert!(
+        !send_service_resume_notice_if_unnotified(
+            &state,
+            &host("boot-a"),
+            "freya",
+            Some(ws.path()),
+            Some("assistant"),
+            Some(post_agents_baseline_ms),
+        )
+        .unwrap()
+    );
 }

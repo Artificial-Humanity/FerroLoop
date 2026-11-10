@@ -7,6 +7,7 @@ pub use crate::host_runtime::HostRuntimePort;
 pub use fl_core::vendor_adapter::{
     PostCompactionContext, estimate_claude_post_compaction_context,
     find_claude_active_session_transcript_path, repair_claude_session_transcript_tail,
+    validate_claude_transcript_path,
 };
 
 use std::collections::BTreeMap;

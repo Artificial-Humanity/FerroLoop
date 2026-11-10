@@ -179,8 +179,32 @@ fn classify_claude_major(raw_model: &str) -> Option<ClaudeMajor> {
 
 /// Default active-token ceiling for `claude --resume` (`75%` of the 1M window).
 pub(crate) const MAX_CLAUDE_RESUME_ACTIVE_TOKENS: u64 = 750_000;
+/// Upper bound accepted for `FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS` overrides (`2,000,000` tokens).
+pub const MAX_ALLOWED_CLAUDE_RESUME_ACTIVE_TOKENS_OVERRIDE: u64 = 2_000_000;
 /// Fallback post-compaction conversational byte ceiling when `active_context_tokens` is absent.
 pub(crate) const MAX_CLAUDE_RESUME_POST_COMPACT_CONVERSATIONAL_BYTES: u64 = 3_600_000;
+
+/// Parse and validate an optional `FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS` environment override,
+/// returning `(effective_ceiling, warning)`.
+pub fn parse_claude_max_resume_active_tokens_override(raw: Option<&str>) -> (u64, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (MAX_CLAUDE_RESUME_ACTIVE_TOKENS, None);
+    };
+    let Some(raw_val) = raw else {
+        return (MAX_CLAUDE_RESUME_ACTIVE_TOKENS, None);
+    };
+    match trimmed.parse::<u64>() {
+        Ok(parsed) if (1..=MAX_ALLOWED_CLAUDE_RESUME_ACTIVE_TOKENS_OVERRIDE).contains(&parsed) => {
+            (parsed, None)
+        }
+        _ => (
+            MAX_CLAUDE_RESUME_ACTIVE_TOKENS,
+            Some(format!(
+                "ignoring invalid FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS={raw_val:?}; using default {MAX_CLAUDE_RESUME_ACTIVE_TOKENS}"
+            )),
+        ),
+    }
+}
 
 /// Resolve the effective context window (in tokens) for a Claude session from existing catalog
 /// and session metadata sources:
@@ -520,5 +544,40 @@ mod tests {
             claude_session_context_window(Some(0), Some("claude-opus-5-5"), None),
             1_000_000
         );
+    }
+
+    #[test]
+    fn parse_claude_max_resume_active_tokens_override_validates_range_and_warns_on_invalid() {
+        assert_eq!(
+            parse_claude_max_resume_active_tokens_override(None),
+            (MAX_CLAUDE_RESUME_ACTIVE_TOKENS, None)
+        );
+        assert_eq!(
+            parse_claude_max_resume_active_tokens_override(Some("   ")),
+            (MAX_CLAUDE_RESUME_ACTIVE_TOKENS, None)
+        );
+        assert_eq!(
+            parse_claude_max_resume_active_tokens_override(Some("1")),
+            (1, None)
+        );
+        assert_eq!(
+            parse_claude_max_resume_active_tokens_override(Some(" 500000 ")),
+            (500_000, None)
+        );
+        assert_eq!(
+            parse_claude_max_resume_active_tokens_override(Some("2000000")),
+            (MAX_ALLOWED_CLAUDE_RESUME_ACTIVE_TOKENS_OVERRIDE, None)
+        );
+
+        for invalid in ["0", "-100", "abc", "2000001", "999999999999"] {
+            let (cap, warn) = parse_claude_max_resume_active_tokens_override(Some(invalid));
+            assert_eq!(cap, MAX_CLAUDE_RESUME_ACTIVE_TOKENS, "{invalid:?}");
+            let warn = warn.unwrap_or_else(|| panic!("expected warning for {invalid:?}"));
+            assert!(
+                warn.contains("ignoring invalid FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS"),
+                "{warn}"
+            );
+            assert!(warn.contains(invalid), "{warn}");
+        }
     }
 }

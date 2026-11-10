@@ -372,6 +372,59 @@ fn regular_file_canonical_and_mtime_ms(path: &Path) -> Option<(PathBuf, u64)> {
     Some((canonical, millis(dur)))
 }
 
+const MODIFIED_NOTICE_PREFIX: &str = "The host restarted. Re-read instruction files modified since your hydration before continuing: ";
+const MODIFIED_NOTICE_SUFFIX: &str = ". Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.";
+
+fn format_modified_instruction_notice(modified: &[String]) -> String {
+    if modified.is_empty() {
+        NOTICE_BODY.to_string()
+    } else {
+        format!(
+            "{MODIFIED_NOTICE_PREFIX}{}{MODIFIED_NOTICE_SUFFIX}",
+            modified.join(", ")
+        )
+    }
+}
+
+fn extract_modified_instruction_files(body: &str) -> Vec<String> {
+    let Some(rest) = body.strip_prefix(MODIFIED_NOTICE_PREFIX) else {
+        return Vec::new();
+    };
+    let Some(list_part) = rest.strip_suffix(MODIFIED_NOTICE_SUFFIX) else {
+        return Vec::new();
+    };
+    list_part
+        .split(", ")
+        .map(str::trim)
+        .filter(|s| s.starts_with('`') && s.ends_with('`') && s.len() > 2)
+        .map(str::to_string)
+        .collect()
+}
+
+fn merge_modified_instruction_files(existing: &[Vec<String>], candidate: &[String]) -> Vec<String> {
+    const CANONICAL_PREFIX: [&str; 3] = ["`AGENTS.md`", "`WORKFLOW.md`", "`PERSONA.md`"];
+    let mut union: Vec<String> = Vec::new();
+    for list in existing.iter().map(Vec::as_slice).chain([candidate]) {
+        for item in list {
+            if !union.contains(item) {
+                union.push(item.clone());
+            }
+        }
+    }
+    let mut ordered: Vec<String> = Vec::with_capacity(union.len());
+    for fixed in CANONICAL_PREFIX {
+        if union.iter().any(|s| s == fixed) {
+            ordered.push(fixed.to_string());
+        }
+    }
+    for item in union {
+        if !ordered.contains(&item) {
+            ordered.push(item);
+        }
+    }
+    ordered
+}
+
 /// Format the `"Host restarted"` instruction-refresh notice body, listing any candidate
 /// instruction files (`AGENTS.md`, `WORKFLOW.md`, `PERSONA.md`, `docs/roles/<role>.md`,
 /// `.agents/roles/<role>.md`, `../.agents/roles/<role>.md`) whose `mtime_ms > baseline_ms`, or
@@ -408,14 +461,7 @@ pub(crate) fn format_host_restarted_notice(
             modified.push(format!("`{rel}`"));
         }
     }
-    if modified.is_empty() {
-        NOTICE_BODY.to_string()
-    } else {
-        format!(
-            "The host restarted. Re-read instruction files modified since your hydration before continuing: {}. Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.",
-            modified.join(", ")
-        )
-    }
+    format_modified_instruction_notice(&modified)
 }
 
 /// Resolve the hydration baseline timestamp (`hydration-ack-<gen>.accepted_at_ms`, falling back to
@@ -559,6 +605,7 @@ pub(crate) fn send_service_resume_notice_if_unnotified_in_store<
         return Ok(false);
     }
 
+    let candidate_body = format_host_restarted_notice(cwd, role_label, baseline_ms);
     let unread = store
         .list_wire_inbox(&WireFilter {
             recipient: Some(persona.clone()),
@@ -566,16 +613,45 @@ pub(crate) fn send_service_resume_notice_if_unnotified_in_store<
             ..WireFilter::default()
         })
         .map_err(|e| e.to_string())?;
-    let has_unread_notice = unread.iter().any(|item| {
-        item.message.sender_name == NOTICE_SENDER && item.message.subject == NOTICE_SUBJECT
-    });
-    if has_unread_notice {
+    let unread_notices: Vec<_> = unread
+        .into_iter()
+        .filter(|item| {
+            item.message.sender_name == NOTICE_SENDER && item.message.subject == NOTICE_SUBJECT
+        })
+        .collect();
+    if !unread_notices.is_empty() {
+        let existing_file_lists: Vec<Vec<String>> = unread_notices
+            .iter()
+            .map(|item| extract_modified_instruction_files(&item.message.body))
+            .collect();
+        let latest_files = existing_file_lists.last().cloned().unwrap_or_default();
+        let candidate_files = extract_modified_instruction_files(&candidate_body);
+        let merged_files = merge_modified_instruction_files(&existing_file_lists, &candidate_files);
+
+        if merged_files.is_empty() || merged_files == latest_files {
+            record_epoch_notified_best_effort(store, host, &persona);
+            return Ok(false);
+        }
+
+        let merged_body = format_modified_instruction_notice(&merged_files);
+        let now_at = stamp::now();
+        for item in &unread_notices {
+            store
+                .update_wire_receipt(
+                    &item.message.id,
+                    &persona,
+                    fl_core::ferrowire::DeliveryStatus::Acked,
+                    false,
+                    now_at.clone(),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        send_notice_with_body(store, &persona, &merged_body)?;
         record_epoch_notified_best_effort(store, host, &persona);
-        return Ok(false);
+        return Ok(true);
     }
 
-    let body = format_host_restarted_notice(cwd, role_label, baseline_ms);
-    send_notice_with_body(store, &persona, &body)?;
+    send_notice_with_body(store, &persona, &candidate_body)?;
     record_epoch_notified_best_effort(store, host, &persona);
     Ok(true)
 }
