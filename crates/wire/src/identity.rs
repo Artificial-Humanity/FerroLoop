@@ -102,34 +102,36 @@ pub struct RouteEntry {
 }
 
 impl RouteEntry {
-    /// Nonzero identity-evidence timestamp, or `None` when unknown (`None` or epoch `0`).
+    /// Nonzero source identity-evidence timestamp, or `None` when unknown (`None` or epoch `0`).
     pub fn identity_evidence_at(&self) -> Option<&At> {
         self.identity_at.as_ref().filter(|at| at.unix_millis() > 0)
     }
+}
 
-    /// Timestamp used when competing across routes or sessions.
-    ///
-    /// Passive routes strictly require known [`Self::identity_evidence_at`] and never fall back
-    /// to `updated_at` (which advances on scans and endpoint repairs). Explicit registrations
-    /// preserve legacy entries lacking `identity_at` by falling back to nonzero `updated_at`.
-    pub(crate) fn effective_identity_at(&self) -> Option<&At> {
-        if self.explicit {
-            self.identity_evidence_at()
-                .or_else(|| (self.updated_at.unix_millis() > 0).then_some(&self.updated_at))
-        } else {
-            self.identity_evidence_at()
-        }
-    }
+fn passive_identity_beats(challenger: &RouteEntry, incumbent: &RouteEntry) -> bool {
+    challenger.identity_evidence_at() > incumbent.identity_evidence_at()
+}
 
-    /// Pin a legacy explicit entry's fallback `updated_at` into `identity_at` before advancing
-    /// `updated_at` on an endpoint/executable repair or metadata restamp.
-    fn pin_legacy_explicit_identity(&mut self) {
-        if self.explicit
-            && self.identity_evidence_at().is_none()
-            && self.updated_at.unix_millis() > 0
-        {
-            self.identity_at = Some(self.updated_at.clone());
-        }
+fn incoming_beats_incumbent(
+    challenger: &RouteEntry,
+    incumbent: &RouteEntry,
+    same_persona: bool,
+) -> bool {
+    if challenger.explicit || incumbent.explicit {
+        challenger.updated_at.unix_millis() > incumbent.updated_at.unix_millis()
+    } else if same_persona
+        && challenger.route.session_identity().is_some()
+        && challenger.route.session_identity() == incumbent.route.session_identity()
+    {
+        (
+            challenger.identity_evidence_at().is_some(),
+            challenger.updated_at.unix_millis(),
+        ) > (
+            incumbent.identity_evidence_at().is_some(),
+            incumbent.updated_at.unix_millis(),
+        )
+    } else {
+        passive_identity_beats(challenger, incumbent)
     }
 }
 
@@ -143,57 +145,27 @@ thread_local! {
     pub(crate) static DISCOVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-fn same_passive_agy_claim(a: &RouteEntry, b: &RouteEntry) -> bool {
-    a.persona == b.persona
-        && a.explicit == b.explicit
-        && a.route == b.route
-        && a.updated_at == b.updated_at
-}
-
-/// In-memory result for the latest rejected claim remembered for one persona. A later scan
-/// can confirm the same source, and that confirmation clears only this exact rejection.
+/// In-memory result for the latest passive Agy source check remembered for one persona.
+/// `None` rejects the exact `entry`; `Some(file_at)` records its validated transcript age
+/// so snapshot merges normalize pre-revalidation copies without clobbering newer reloads.
 #[derive(Debug, Clone)]
 struct PassiveAgyRevalidation {
     entry: RouteEntry,
-    source_validated: bool,
+    validated_identity_at: Option<At>,
     /// Orders only in-process validation results, never competing route identities.
     observed_at: Instant,
 }
 
 impl PassiveAgyRevalidation {
-    fn rejects(&self, entry: &RouteEntry) -> bool {
-        !self.source_validated && same_passive_agy_claim(&self.entry, entry)
-    }
-}
-
-type PassiveAgyClaimSet = BTreeSet<(At, Option<At>)>;
-type PassiveAgyClaimSnapshot = BTreeMap<(String, String), PassiveAgyClaimSet>;
-
-#[derive(Debug, Clone)]
-struct PassiveAgyIdentityValidation {
-    identity_at: At,
-    observed_at: Instant,
-    revalidated_claims: PassiveAgyClaimSet,
-}
-
-fn apply_passive_agy_validation(
-    entry: &mut RouteEntry,
-    val: &PassiveAgyIdentityValidation,
-    self_prev: Option<&(At, Instant)>,
-    other_prev: Option<&(At, Instant)>,
-    entry_prev: Option<&(At, Instant)>,
-) {
-    let both_in_memory_superseded = self_prev.is_some()
-        && other_prev.is_some()
-        && entry_prev.is_some_and(|(prev_id, prev_obs)| {
-            *prev_obs < val.observed_at && entry.identity_at.as_ref() == Some(prev_id)
-        });
-    let claim_key = (entry.updated_at.clone(), entry.identity_at.clone());
-    if entry.identity_at.is_none()
-        || val.revalidated_claims.contains(&claim_key)
-        || both_in_memory_superseded
-    {
-        entry.identity_at = Some(val.identity_at.clone());
+    fn normalize_or_reject(&self, entry: &mut RouteEntry) -> bool {
+        if self.entry != *entry {
+            return true;
+        }
+        let Some(file_at) = &self.validated_identity_at else {
+            return false;
+        };
+        entry.identity_at = Some(file_at.clone());
+        true
     }
 }
 
@@ -204,16 +176,10 @@ pub struct RouteTable {
     /// memory only (never in the routes file), so a fresh process starts due for a scan.
     #[serde(skip)]
     last_discovery: Option<Instant>,
-    /// Latest exact passive Agy claim rejected per persona. Kept only in memory so a scan's
-    /// invalidation survives snapshot reconciliation, including a same-persona replacement.
-    /// This is not route freshness metadata or a history of rejected conversations.
+    /// Latest exact passive Agy revalidation result per persona. Kept only in memory so a scan's
+    /// invalidation or identity-age normalization survives snapshot reconciliation.
     #[serde(skip)]
     passive_agy_revalidation: BTreeMap<String, PassiveAgyRevalidation>,
-    /// Revalidated transcript timestamps for passive Agy `(persona, conversation_id)` claims
-    /// seen during scans in this process, paired with pre-scan `(updated_at, identity_at)` claims
-    /// superseded by revalidation so stale snapshots downgrade without clobbering newer reloads.
-    #[serde(skip)]
-    passive_agy_identity_at: BTreeMap<(String, String), PassiveAgyIdentityValidation>,
 }
 
 /// Sidecar next to the route table. Rebuilt from hosted records that are still
@@ -825,105 +791,35 @@ impl RouteTable {
     }
 
     pub fn merge_newer(&mut self, other: Self) {
-        // Apply source invalidation before freshness comparisons. Matching the whole rejected
-        // entry preserves a concurrent registration or a changed, valid route. Keep one exact
-        // rejection per persona so replaying that stale snapshot cannot resurrect the claim.
+        // Apply source revalidation before freshness comparisons. Matching the whole pre-scan
+        // entry preserves concurrent registrations, changed valid routes, and newer disk reloads.
         for (key, result) in other.passive_agy_revalidation {
             let current = self.passive_agy_revalidation.get(&key);
             // Keep confirmations even when this receiver missed the rejection, so replaying
             // that older rejection cannot revoke the successfully revalidated claim.
             if current.is_none_or(|old| result.observed_at > old.observed_at)
-                && (!result.source_validated
-                    || current.is_none_or(|old| same_passive_agy_claim(&old.entry, &result.entry)))
+                && (result.validated_identity_at.is_none()
+                    || current.is_none_or(|old| {
+                        old.entry == result.entry
+                            || old.validated_identity_at.is_some()
+                            || self.entries.get(&key) == Some(&result.entry)
+                    }))
             {
                 self.passive_agy_revalidation.insert(key, result);
             }
         }
-        let self_prev_agy_obs: BTreeMap<(String, String), (At, Instant)> = self
-            .passive_agy_identity_at
-            .iter()
-            .map(|(k, v)| (k.clone(), (v.identity_at.clone(), v.observed_at)))
-            .collect();
-        let other_prev_agy_obs: BTreeMap<(String, String), (At, Instant)> = other
-            .passive_agy_identity_at
-            .iter()
-            .map(|(k, v)| (k.clone(), (v.identity_at.clone(), v.observed_at)))
-            .collect();
-        for (key, other_val) in other.passive_agy_identity_at {
-            match self.passive_agy_identity_at.get_mut(&key) {
-                Some(self_val) => {
-                    self_val
-                        .revalidated_claims
-                        .extend(other_val.revalidated_claims);
-                    if other_val.observed_at > self_val.observed_at {
-                        self_val.identity_at = other_val.identity_at;
-                        self_val.observed_at = other_val.observed_at;
-                    }
-                    let current_id = self_val.identity_at.clone();
-                    self_val
-                        .revalidated_claims
-                        .retain(|(_, id_at)| id_at.as_ref() != Some(&current_id));
-                }
-                None => {
-                    self.passive_agy_identity_at.insert(key, other_val);
-                }
-            }
-        }
-        self.passive_agy_identity_at
-            .retain(|(persona, conv_id), val| {
-                !self
-                    .passive_agy_revalidation
-                    .get(persona)
-                    .is_some_and(|rej| {
-                        !rej.source_validated
-                            && rej.observed_at >= val.observed_at
-                            && matches!(
-                                &rej.entry.route,
-                                VendorRoute::Agy {
-                                    conversation_id, ..
-                                } if conversation_id == conv_id
-                            )
-                    })
-            });
         self.entries.retain(|key, entry| {
-            !self
-                .passive_agy_revalidation
+            self.passive_agy_revalidation
                 .get(key)
-                .is_some_and(|result| result.rejects(entry))
+                .is_none_or(|result| result.normalize_or_reject(entry))
         });
-        for (key, entry) in &mut self.entries {
-            if !entry.explicit
-                && let VendorRoute::Agy {
-                    conversation_id, ..
-                } = &entry.route
-            {
-                let lookup_key = (key.clone(), conversation_id.clone());
-                if let Some(val) = self.passive_agy_identity_at.get(&lookup_key) {
-                    let self_prev = self_prev_agy_obs.get(&lookup_key);
-                    let other_prev = other_prev_agy_obs.get(&lookup_key);
-                    apply_passive_agy_validation(entry, val, self_prev, other_prev, self_prev);
-                }
-            }
-        }
         for (k, mut v) in other.entries {
             if self
                 .passive_agy_revalidation
                 .get(&k)
-                .is_some_and(|result| result.rejects(&v))
+                .is_some_and(|result| !result.normalize_or_reject(&mut v))
             {
                 continue;
-            }
-            if !v.explicit
-                && let VendorRoute::Agy {
-                    conversation_id, ..
-                } = &v.route
-            {
-                let lookup_key = (k.clone(), conversation_id.clone());
-                if let Some(val) = self.passive_agy_identity_at.get(&lookup_key) {
-                    let self_prev = self_prev_agy_obs.get(&lookup_key);
-                    let other_prev = other_prev_agy_obs.get(&lookup_key);
-                    apply_passive_agy_validation(&mut v, val, self_prev, other_prev, other_prev);
-                }
             }
             if !v.explicit
                 && v.route.session_identity().is_some_and(|identity| {
@@ -936,97 +832,57 @@ impl RouteTable {
             {
                 continue;
             }
-            let inherit_explicit = if let Some(existing) = self.entries.get(&k)
+            if let Some(existing) = self.entries.get(&k)
                 && existing.explicit
                 && !v.explicit
             {
                 if std::mem::discriminant(&existing.route) != std::mem::discriminant(&v.route) {
                     continue;
                 }
-                true
-            } else {
-                false
-            };
+                v.explicit = true;
+                v.identity_at = None;
+            }
             if let Some((target_kind, target_id)) = v
                 .route
                 .session_identity()
                 .map(|(kind, id)| (kind, id.to_string()))
             {
                 let target_sid = (target_kind, target_id.as_str());
-                let mut beaten_by_other_persona_sid = false;
+                let mut beaten_by_same_sid = false;
                 for (name, existing) in &mut self.entries {
-                    if name != &k
-                        && existing.route.session_identity() == Some(target_sid)
-                        && (!v.explicit || existing.explicit)
-                        && v.effective_identity_at() <= existing.effective_identity_at()
+                    if existing.route.session_identity() == Some(target_sid)
+                        && !incoming_beats_incumbent(&v, existing, name == &k)
                     {
                         preserve_muse_tmux_fields(&mut existing.route, &v.route);
-                        beaten_by_other_persona_sid = true;
+                        if name == &k && !existing.explicit && !v.explicit {
+                            existing.identity_at = existing
+                                .identity_evidence_at()
+                                .max(v.identity_evidence_at())
+                                .cloned();
+                            restamp_if_newer(&mut existing.updated_at, &v.updated_at);
+                        }
+                        beaten_by_same_sid = true;
                     }
                 }
-                if beaten_by_other_persona_sid {
+                if beaten_by_same_sid {
                     continue;
                 }
-                if self
-                    .entries
-                    .get(&k)
-                    .is_some_and(|existing| existing.route.session_identity() == Some(target_sid))
-                {
-                    // Same persona and same session: propagate endpoint/executable repairs and
-                    // preserve explicitness and the newest validated identity evidence without
-                    // promoting identity_at to updated_at.
-                    let existing = self.entries.get(&k).expect("checked Some");
-                    let v_rank = (v.effective_identity_at().is_some(), &v.updated_at);
-                    let existing_rank = (
-                        existing.effective_identity_at().is_some(),
-                        &existing.updated_at,
-                    );
-                    let merged_explicit = existing.explicit || v.explicit || inherit_explicit;
-                    let merged_identity = existing
-                        .effective_identity_at()
-                        .max(v.effective_identity_at())
-                        .cloned();
-                    let merged_updated = existing.updated_at.clone().max(v.updated_at.clone());
-                    if v_rank <= existing_rank {
-                        let existing = self.entries.get_mut(&k).expect("checked Some");
+                if let Some(existing) = self.entries.get_mut(&k) {
+                    if !incoming_beats_incumbent(&v, existing, true) {
                         preserve_muse_tmux_fields(&mut existing.route, &v.route);
-                        existing.explicit = merged_explicit;
-                        existing.identity_at = merged_identity;
-                        existing.updated_at = merged_updated;
-                        let mut existing_route = existing.route.clone();
-                        self.entries.retain(|existing_k, old| {
-                            if existing_k != &k && old.route.session_identity() == Some(target_sid)
-                            {
-                                preserve_muse_tmux_fields(&mut existing_route, &old.route);
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        if let Some(existing) = self.entries.get_mut(&k) {
-                            existing.route = existing_route;
-                        }
                         continue;
                     }
-                    self.entries.retain(|existing_k, old| {
-                        if old.route.session_identity() == Some(target_sid) {
-                            preserve_muse_tmux_fields(&mut v.route, &old.route);
-                            existing_k == &k
-                        } else {
-                            true
-                        }
-                    });
-                    v.explicit = merged_explicit;
-                    v.identity_at = merged_identity;
-                    v.updated_at = merged_updated;
-                    self.entries.insert(k, v);
-                    continue;
-                }
-                if let Some(existing) = self.entries.get_mut(&k)
-                    && v.effective_identity_at() <= existing.effective_identity_at()
-                {
-                    preserve_muse_tmux_fields(&mut existing.route, &v.route);
-                    continue;
+                    preserve_muse_tmux_fields(&mut v.route, &existing.route);
+                    if !existing.explicit
+                        && !v.explicit
+                        && existing.route.session_identity() == Some(target_sid)
+                    {
+                        v.identity_at = existing
+                            .identity_evidence_at()
+                            .max(v.identity_evidence_at())
+                            .cloned();
+                        restamp_if_newer(&mut v.updated_at, &existing.updated_at);
+                    }
                 }
                 self.entries.retain(|existing_k, old| {
                     if old.route.session_identity() == Some(target_sid) {
@@ -1036,38 +892,25 @@ impl RouteTable {
                         true
                     }
                 });
-            }
-            match self.entries.get_mut(&k) {
-                Some(existing)
-                    if existing.route == v.route
-                        && v.effective_identity_at() == existing.effective_identity_at() =>
-                {
-                    preserve_muse_tmux_fields(&mut existing.route, &v.route);
-                    existing.pin_legacy_explicit_identity();
-                    v.pin_legacy_explicit_identity();
-                    if existing.identity_evidence_at().is_none() {
-                        existing.identity_at = v.identity_evidence_at().cloned();
+                self.entries.insert(k, v);
+            } else {
+                match self.entries.get_mut(&k) {
+                    Some(existing) if !incoming_beats_incumbent(&v, existing, true) => {
+                        preserve_muse_tmux_fields(&mut existing.route, &v.route);
+                        if !existing.explicit && !v.explicit && existing.route == v.route {
+                            if existing.identity_evidence_at().is_none() {
+                                existing.identity_at = v.identity_evidence_at().cloned();
+                            }
+                            restamp_if_newer(&mut existing.updated_at, &v.updated_at);
+                        }
                     }
-                    restamp_if_newer(&mut existing.updated_at, &v.updated_at);
-                    if v.explicit || inherit_explicit {
-                        existing.explicit = true;
+                    Some(existing) => {
+                        preserve_muse_tmux_fields(&mut v.route, &existing.route);
+                        self.entries.insert(k, v);
                     }
-                }
-                Some(existing) if v.effective_identity_at() <= existing.effective_identity_at() => {
-                    preserve_muse_tmux_fields(&mut existing.route, &v.route);
-                }
-                Some(existing) => {
-                    preserve_muse_tmux_fields(&mut v.route, &existing.route);
-                    if inherit_explicit {
-                        v.explicit = true;
+                    None => {
+                        self.entries.insert(k, v);
                     }
-                    self.entries.insert(k, v);
-                }
-                None => {
-                    if inherit_explicit {
-                        v.explicit = true;
-                    }
-                    self.entries.insert(k, v);
                 }
             }
         }
@@ -1133,7 +976,6 @@ impl RouteTable {
                 entries,
                 last_discovery: None,
                 passive_agy_revalidation: BTreeMap::new(),
-                passive_agy_identity_at: BTreeMap::new(),
             });
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
@@ -1150,23 +992,14 @@ impl RouteTable {
                         .and_then(|v| v.as_str())
                         .and_then(parse_flexible_at)
                         .unwrap_or_else(|| At::from_unix_millis(0));
-                    let identity_at = item
-                        .get("identity_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_flexible_at)
-                        .filter(|at| at.unix_millis() > 0);
-                    let explicit = item
-                        .get("explicit")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
                     entries.insert(
                         norm.clone(),
                         RouteEntry {
                             persona: norm,
                             route,
                             updated_at,
-                            identity_at,
-                            explicit,
+                            identity_at: None,
+                            explicit: false,
                         },
                     );
                 }
@@ -1176,7 +1009,6 @@ impl RouteTable {
                     entries,
                     last_discovery: None,
                     passive_agy_revalidation: BTreeMap::new(),
-                    passive_agy_identity_at: BTreeMap::new(),
                 });
             }
         }
@@ -1229,8 +1061,7 @@ impl RouteTable {
 
     /// Register a route selected by the caller rather than discovered by a passive scan.
     pub fn upsert_explicit(&mut self, persona: &str, route: VendorRoute, at: At) {
-        let identity_at = (at.unix_millis() > 0).then(|| at.clone());
-        self.upsert_inner(persona, route, at, identity_at, true);
+        self.upsert_inner(persona, route, at, None, true);
     }
 
     fn upsert_passive(&mut self, persona: &str, route: VendorRoute, at: At) {
@@ -1290,7 +1121,11 @@ impl RouteTable {
                     }
                 });
             }
-            let identity_at = identity_at.filter(|stamp| stamp.unix_millis() > 0);
+            let identity_at = if explicit {
+                None
+            } else {
+                identity_at.filter(|stamp| stamp.unix_millis() > 0)
+            };
             self.entries.insert(
                 norm.clone(),
                 RouteEntry {
@@ -1306,10 +1141,10 @@ impl RouteTable {
 
     /// Record a file-discovered route at its own mtime.
     ///
-    /// Competing sessions compare [`RouteEntry::effective_identity_at`]: newer known evidence
+    /// Passive sessions compete by [`RouteEntry::identity_evidence_at`]: newer known evidence
     /// wins, incumbent wins ties, and known evidence outranks unknown (`None`). `updated_ms == 0`
-    /// stays unknown (`identity_at: None`) and is never promoted to scan time `now`.
-    fn upsert_discovered(&mut self, persona: &str, route: VendorRoute, updated_ms: u64, _now: &At) {
+    /// stays unknown (`identity_at: None`) and is never promoted to scan time.
+    fn upsert_discovered(&mut self, persona: &str, route: VendorRoute, updated_ms: u64) {
         let Some(norm) = normalize_persona(persona) else {
             return;
         };
@@ -1323,21 +1158,25 @@ impl RouteTable {
                 name != &norm
                     && existing.route.session_identity() == Some(target_sid)
                     && (existing.explicit
-                        || cand_identity.as_ref() <= existing.effective_identity_at())
+                        || cand_identity.as_ref() <= existing.identity_evidence_at())
             })
         {
             return;
         }
         if let Some(existing) = self.entries.get(&norm) {
-            if existing.explicit
-                && std::mem::discriminant(&existing.route) != std::mem::discriminant(&route)
-            {
+            if existing.explicit {
+                if matches!(existing.route, VendorRoute::Agy { .. })
+                    || std::mem::discriminant(&existing.route) != std::mem::discriminant(&route)
+                    || updated_ms == 0
+                    || existing.updated_at.unix_millis() > updated_ms
+                {
+                    return;
+                }
+                self.upsert_inner(&norm, route, cand_updated, None, true);
                 return;
             }
-            let same_session =
-                target_sid.is_some() && existing.route.session_identity() == target_sid;
-            if same_session {
-                if cand_identity.as_ref() < existing.effective_identity_at() {
+            if target_sid.is_some() && existing.route.session_identity() == target_sid {
+                if cand_identity.as_ref() < existing.identity_evidence_at() {
                     return;
                 }
                 let updated_at = existing.updated_at.clone().max(cand_updated);
@@ -1345,7 +1184,7 @@ impl RouteTable {
                 self.upsert_inner(&norm, route, updated_at, identity_at, false);
                 return;
             }
-            if cand_identity.as_ref() <= existing.effective_identity_at() {
+            if cand_identity.as_ref() <= existing.identity_evidence_at() {
                 return;
             }
         }
@@ -1357,27 +1196,15 @@ impl RouteTable {
         self.entries.get(&norm)
     }
 
-    /// `true` when `other` holds the same personas with the same routes, explicitness, and
-    /// identity evidence, ignoring `updated_at` and wall-clock PID restamps on live Claude /
-    /// active Grok routes.
+    /// `true` when `other` holds the same personas with the same routes, ignoring `updated_at`
+    /// and `identity_at` (discovery restamps every live Claude route and refreshes active
+    /// transcript mtimes in memory on each scan).
     pub fn same_routes(&self, other: &Self) -> bool {
         self.entries.len() == other.entries.len()
-            && self.entries.iter().all(|(k, e)| {
-                other.entries.get(k).is_some_and(|o| {
-                    o.route == e.route
-                        && o.explicit == e.explicit
-                        && match &e.route {
-                            VendorRoute::Claude { .. } | VendorRoute::Grok { .. } => {
-                                e.identity_at.is_some() == o.identity_at.is_some()
-                            }
-                            VendorRoute::Agy { .. }
-                            | VendorRoute::Codex { .. }
-                            | VendorRoute::Muse { .. }
-                            | VendorRoute::HostCli { .. }
-                            | VendorRoute::Webhook { .. } => e.identity_at == o.identity_at,
-                        }
-                })
-            })
+            && self
+                .entries
+                .iter()
+                .all(|(k, e)| other.entries.get(k).is_some_and(|o| o.route == e.route))
     }
 
     /// Rescan the host's session files and report whether the route held for `persona` changed
@@ -1399,37 +1226,6 @@ impl RouteTable {
     #[cfg(test)]
     pub(crate) fn set_last_discovery(&mut self, at: Option<Instant>) {
         self.last_discovery = at;
-    }
-
-    fn snapshot_passive_agy_claims(&self) -> PassiveAgyClaimSnapshot {
-        let mut claims = PassiveAgyClaimSnapshot::new();
-        for (persona, entry) in &self.entries {
-            if !entry.explicit
-                && let VendorRoute::Agy {
-                    conversation_id, ..
-                } = &entry.route
-            {
-                claims
-                    .entry((persona.clone(), conversation_id.clone()))
-                    .or_default()
-                    .insert((entry.updated_at.clone(), entry.identity_at.clone()));
-            }
-        }
-        claims
-    }
-
-    fn has_unvalidated_passive_agy_entries(&self) -> bool {
-        self.entries.iter().any(|(persona, entry)| {
-            !entry.explicit
-                && matches!(
-                    &entry.route,
-                    VendorRoute::Agy {
-                        conversation_id, ..
-                    } if !self
-                        .passive_agy_identity_at
-                        .contains_key(&(persona.clone(), conversation_id.clone()))
-                )
-        })
     }
 
     /// Passively discover Claude, Antigravity, Codex, Meta Muse, and xAI Grok routes from vendor session files.
@@ -1456,16 +1252,16 @@ impl RouteTable {
         };
         let check_proc = home_override.is_none()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1");
-        let pre_scan_agy = self.snapshot_passive_agy_claims();
         self.drop_decommissioned_routes(home_override);
         let pre_existing: BTreeSet<String> = self
             .entries
             .keys()
             .map(|k| k.to_ascii_lowercase())
             .collect();
+        let agy_candidates = self.revalidate_passive_agy_entries(&home);
         self.discover_claude_routes(&home, check_proc, &at);
-        self.discover_agy_routes_with_claims(&home, check_proc, &at, Some(&pre_scan_agy));
-        self.discover_codex_routes(&home, &at);
+        self.discover_agy_routes_with_candidates(&home, check_proc, &at, agy_candidates);
+        self.discover_codex_routes(&home);
         self.discover_muse_routes(&home, home_override.is_some(), &at);
         self.discover_grok_routes(&home, check_proc, &at);
         self.discover_scanner_routes(&home, &at);
@@ -1562,7 +1358,7 @@ impl RouteTable {
                         existing.route.session_identity() == Some(target_sid)
                             && (existing_name != &name
                                 || existing.explicit
-                                || existing.effective_identity_at().is_some()
+                                || existing.identity_evidence_at().is_some()
                                 || existing.updated_at > *at)
                     })
                 {
@@ -1652,20 +1448,7 @@ impl RouteTable {
         }
     }
 
-    fn revalidate_passive_agy_entries(
-        &mut self,
-        home: &Path,
-        extra_claims: Option<&PassiveAgyClaimSnapshot>,
-    ) -> Vec<(u64, String, String)> {
-        let mut pre_scan_claims = self.snapshot_passive_agy_claims();
-        if let Some(extra) = extra_claims {
-            for (key, claims) in extra {
-                pre_scan_claims
-                    .entry(key.clone())
-                    .or_default()
-                    .extend(claims.iter().cloned());
-            }
-        }
+    fn revalidate_passive_agy_entries(&mut self, home: &Path) -> Vec<(u64, String, String)> {
         let brain_dir = home.join(".gemini").join("antigravity-cli").join("brain");
         // Revalidate passive identity claims before endpoint repair or any early return.
         // A cached conversation ID is not evidence by itself: its bounded transcript head
@@ -1708,52 +1491,16 @@ impl RouteTable {
         // A later bounded scan can validate a previously rejected conversation again. Do not
         // let old in-memory rejection evidence suppress that now-valid identity.
         for (persona, result) in &mut self.passive_agy_revalidation {
-            result.source_validated = matches!(
-                &result.entry.route,
+            result.validated_identity_at = match &result.entry.route {
                 VendorRoute::Agy {
                     conversation_id, ..
-                } if validated.get(conversation_id.as_str()).map(|(_, p)| *p) == Some(persona.as_str())
-            );
+                } => validated
+                    .get(conversation_id.as_str())
+                    .filter(|&&(_, p)| p == persona.as_str())
+                    .map(|&(file_ms, _)| At::from_unix_millis(file_ms)),
+                _ => None,
+            };
             result.observed_at = validation_at;
-        }
-        self.passive_agy_identity_at
-            .retain(|(persona, conv_id), _| {
-                validated
-                    .get(conv_id.as_str())
-                    .is_some_and(|&(_, valid_persona)| valid_persona == persona.as_str())
-            });
-        for (file_ms, conv_id, persona) in &candidates {
-            let file_at = At::from_unix_millis(*file_ms);
-            let key = (persona.clone(), conv_id.clone());
-            let mut revalidated_claims: BTreeSet<(At, Option<At>)> = pre_scan_claims
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .filter(|(_, id_at)| id_at.as_ref() != Some(&file_at))
-                .cloned()
-                .collect();
-            match self.passive_agy_identity_at.get_mut(&key) {
-                Some(existing_val) => {
-                    existing_val.identity_at = file_at.clone();
-                    existing_val.observed_at = validation_at;
-                    existing_val
-                        .revalidated_claims
-                        .append(&mut revalidated_claims);
-                    existing_val
-                        .revalidated_claims
-                        .retain(|(_, id_at)| id_at.as_ref() != Some(&file_at));
-                }
-                None => {
-                    self.passive_agy_identity_at.insert(
-                        key,
-                        PassiveAgyIdentityValidation {
-                            identity_at: file_at,
-                            observed_at: validation_at,
-                            revalidated_claims,
-                        },
-                    );
-                }
-            }
         }
         self.entries.retain(|persona, entry| {
             let keep = if entry.explicit {
@@ -1767,7 +1514,18 @@ impl RouteTable {
                             validated.get(conversation_id.as_str())
                             && valid_persona == persona.as_str()
                         {
-                            entry.identity_at = Some(At::from_unix_millis(file_ms));
+                            let file_at = At::from_unix_millis(file_ms);
+                            if entry.identity_at.as_ref() != Some(&file_at) {
+                                self.passive_agy_revalidation.insert(
+                                    persona.clone(),
+                                    PassiveAgyRevalidation {
+                                        entry: entry.clone(),
+                                        validated_identity_at: Some(file_at.clone()),
+                                        observed_at: validation_at,
+                                    },
+                                );
+                                entry.identity_at = Some(file_at);
+                            }
                             true
                         } else {
                             false
@@ -1796,7 +1554,7 @@ impl RouteTable {
                     persona.clone(),
                     PassiveAgyRevalidation {
                         entry: entry.clone(),
-                        source_validated: false,
+                        validated_identity_at: None,
                         observed_at: validation_at,
                     },
                 );
@@ -1808,19 +1566,19 @@ impl RouteTable {
 
     #[cfg(test)]
     fn discover_agy_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
-        self.discover_agy_routes_with_claims(home, check_proc, at, None);
+        let candidates = self.revalidate_passive_agy_entries(home);
+        self.discover_agy_routes_with_candidates(home, check_proc, at, candidates);
     }
 
-    fn discover_agy_routes_with_claims(
+    fn discover_agy_routes_with_candidates(
         &mut self,
         home: &Path,
         check_proc: bool,
         at: &At,
-        extra_claims: Option<&PassiveAgyClaimSnapshot>,
+        mut candidates: Vec<(u64, String, String)>,
     ) {
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         let brain_dir = agy_dir.join("brain");
-        let mut candidates = self.revalidate_passive_agy_entries(home, extra_claims);
         if !brain_dir.is_dir() {
             // No transcript to scan. Still replace a missing or `.old` exe with
             // `$HOME/.local/bin/agy` when that file exists, otherwise `agy`.
@@ -1835,7 +1593,6 @@ impl RouteTable {
                     let replaced = agentapi_exe.is_some();
                     *agentapi_exe = Some(fallback.clone());
                     if replaced {
-                        entry.pin_legacy_explicit_identity();
                         restamp_if_newer(&mut entry.updated_at, at);
                     }
                 }
@@ -2031,7 +1788,6 @@ impl RouteTable {
             // to a legacy copy still holding the stale pre-reboot endpoint. Nothing changed, no
             // restamp, so a steady-state scan stays a no-op for the callers that save on change.
             if changed {
-                entry.pin_legacy_explicit_identity();
                 restamp_if_newer(&mut entry.updated_at, at);
             }
         }
@@ -2058,9 +1814,13 @@ impl RouteTable {
                             csrf_token,
                             agentapi_exe,
                         } if !is_native_session_id(conversation_id) => {
-                            let placeholder_ms = entry
-                                .effective_identity_at()
-                                .map_or(entry.updated_at.unix_millis(), At::unix_millis);
+                            let placeholder_ms = if entry.explicit {
+                                entry.updated_at.unix_millis()
+                            } else {
+                                entry
+                                    .identity_evidence_at()
+                                    .map_or(entry.updated_at.unix_millis(), At::unix_millis)
+                            };
                             if file_ms < placeholder_ms {
                                 continue;
                             }
@@ -2073,6 +1833,7 @@ impl RouteTable {
                                 entry.explicit,
                             ))
                         }
+                        _ if entry.explicit => continue,
                         _ => None,
                     },
                     None => None,
@@ -2089,7 +1850,7 @@ impl RouteTable {
                     let accepts_shared =
                         agy_route_accepts_shared_endpoint(existing_pid, shared_ls_pid, check_proc);
                     let route = VendorRoute::Agy {
-                        conversation_id: conv_id.clone(),
+                        conversation_id: conv_id,
                         ls_pid: existing_pid,
                         ls_address: existing_addr
                             .or_else(|| accepts_shared.then(|| shared_ls_addr.clone()).flatten()),
@@ -2110,22 +1871,19 @@ impl RouteTable {
                     let accepts_shared =
                         agy_route_accepts_shared_endpoint(None, shared_ls_pid, check_proc);
                     let route = VendorRoute::Agy {
-                        conversation_id: conv_id.clone(),
+                        conversation_id: conv_id,
                         ls_pid: None,
                         ls_address: accepts_shared.then(|| shared_ls_addr.clone()).flatten(),
                         csrf_token: accepts_shared.then(|| shared_csrf.clone()).flatten(),
                         agentapi_exe: Some(resolved_shared.clone()),
                     };
-                    self.upsert_discovered(&persona, route, file_ms, at);
+                    self.upsert_discovered(&persona, route, file_ms);
                 }
             }
         }
     }
 
-    fn discover_codex_routes(&mut self, home: &Path, at: &At) {
-        if self.has_unvalidated_passive_agy_entries() {
-            let _ = self.revalidate_passive_agy_entries(home, None);
-        }
+    fn discover_codex_routes(&mut self, home: &Path) {
         let codex_dir = home.join(".codex");
         let mut rollout_files = Vec::new();
         collect_codex_rollout_files(&codex_dir.join("sessions"), 0, &mut rollout_files);
@@ -2193,7 +1951,7 @@ impl RouteTable {
                     .map(|stamp| stamp.unix_millis())
                     .filter(|ms| *ms > 0);
                 // Prefer the matching rollout mtime. Fall back to the line's `updated_at`,
-                // then the index mtime. Zero means `upsert_discovered` may use `at`.
+                // then the index mtime. Zero stays unknown and is never promoted to scan time.
                 let updated_ms = rollout_mtime_by_thread
                     .get(thread_id)
                     .copied()
@@ -2207,7 +1965,6 @@ impl RouteTable {
                         cwd,
                     },
                     updated_ms,
-                    at,
                 );
             }
         }
@@ -2230,19 +1987,11 @@ impl RouteTable {
         }
         candidates.sort_by_key(|c| c.0);
         for (updated_ms, persona, thread_id, cwd) in candidates {
-            self.upsert_discovered(
-                &persona,
-                VendorRoute::Codex { thread_id, cwd },
-                updated_ms,
-                at,
-            );
+            self.upsert_discovered(&persona, VendorRoute::Codex { thread_id, cwd }, updated_ms);
         }
     }
 
     fn discover_muse_routes(&mut self, home: &Path, has_home_override: bool, at: &At) {
-        if self.has_unvalidated_passive_agy_entries() {
-            let _ = self.revalidate_passive_agy_entries(home, None);
-        }
         let mut dirs = vec![
             home.join(".local")
                 .join("share")
@@ -2325,16 +2074,14 @@ impl RouteTable {
                 };
                 if explicit_placeholder {
                     let updated = mtime_ms(path);
-                    let cand_identity = (updated > 0).then(|| At::from_unix_millis(updated));
-                    let file_at = cand_identity.clone().unwrap_or_else(|| at.clone());
-                    let preserved_identity = cand_identity.or_else(|| {
-                        self.entries
-                            .get(&persona)
-                            .and_then(|existing| existing.identity_at.clone())
-                    });
-                    self.upsert_inner(&persona, route, file_at, preserved_identity, false);
+                    let file_at = if updated > 0 {
+                        At::from_unix_millis(updated)
+                    } else {
+                        at.clone()
+                    };
+                    self.upsert_passive(&persona, route, file_at);
                 } else {
-                    self.upsert_discovered(&persona, route, mtime_ms(path), at);
+                    self.upsert_discovered(&persona, route, mtime_ms(path));
                 }
             }
         }
@@ -2426,9 +2173,6 @@ impl RouteTable {
     }
 
     fn discover_grok_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
-        if self.has_unvalidated_passive_agy_entries() {
-            let _ = self.revalidate_passive_agy_entries(home, None);
-        }
         let grok_dir = home.join(".grok");
         let sessions_dir = grok_dir.join("sessions");
 
@@ -2529,7 +2273,6 @@ impl RouteTable {
                         tmux_pane: existing_pane,
                     },
                     mtime_ms(&path),
-                    at,
                 );
             }
         }
@@ -2629,7 +2372,7 @@ impl RouteTable {
             if cand.is_active {
                 self.upsert_passive(&cand.persona, route, at.clone());
             } else {
-                self.upsert_discovered(&cand.persona, route, cand.updated_ms, at);
+                self.upsert_discovered(&cand.persona, route, cand.updated_ms);
             }
         }
 
@@ -4293,7 +4036,6 @@ fn resolve_persona_traced(
                 .max_by_key(|entry| {
                     (
                         registered_active.contains(&entry.persona.to_ascii_lowercase()),
-                        entry.effective_identity_at(),
                         entry.updated_at.unix_millis(),
                     )
                 })
@@ -5112,7 +4854,6 @@ mod tests {
                 cwd: None,
             },
             2,
-            &At::from_unix_millis(2),
         );
         let entry = table.get("ada").unwrap();
         assert!(entry.explicit);
@@ -5986,7 +5727,8 @@ mod tests {
         let home = tmp.path();
         let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
         let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
-        agy_registration_fixture(home, "conv-wesley", "Wesley", live_at.unix_millis());
+        let agy_transcript =
+            agy_registration_fixture(home, "conv-wesley", "Wesley", live_at.unix_millis());
 
         let day = home
             .join(".codex")
@@ -6059,7 +5801,7 @@ mod tests {
                 csrf_token: None,
                 agentapi_exe: None,
             },
-            live_at,
+            live_at.clone(),
         );
         table.discover_routes(Some(home), At::parse("2026-10-29T04:00:00.000Z").unwrap());
 
@@ -6070,6 +5812,16 @@ mod tests {
             ),
             "stale codex, muse, and grok files must not replace the newer route"
         );
+
+        // An explicit Agy registration at `live_at` also survives even if its transcript mtime is 100.
+        set_mtime(&agy_transcript, 100);
+        let mut explicit_table = RouteTable::default();
+        explicit_table.upsert_explicit("wesley", agy_route("conv-wesley"), live_at);
+        explicit_table.discover_routes(Some(home), At::parse("2026-10-29T04:00:00.000Z").unwrap());
+        assert!(matches!(
+            explicit_table.get("wesley").map(|e| &e.route),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-wesley"
+        ));
     }
 
     #[test]
@@ -6078,7 +5830,8 @@ mod tests {
         let home = tmp.path();
         let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
         let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
-        agy_registration_fixture(home, "conv-wesley", "Wesley", live_at.unix_millis());
+        let agy_transcript =
+            agy_registration_fixture(home, "conv-wesley", "Wesley", live_at.unix_millis());
         let summary_ms = At::parse("2026-10-29T05:00:00.000Z").unwrap().unix_millis();
 
         let grok = home
@@ -6136,6 +5889,15 @@ mod tests {
             "inactive grok chat mtime must not lose to summary.json updated_at"
         );
         assert_eq!(entry.updated_at, live_at);
+
+        set_mtime(&agy_transcript, 100);
+        let mut explicit_table = RouteTable::default();
+        explicit_table.upsert_explicit("wesley", agy_route("conv-wesley"), live_at);
+        explicit_table.discover_routes(Some(home), At::parse("2026-10-29T06:00:00.000Z").unwrap());
+        assert!(matches!(
+            explicit_table.get("wesley").map(|e| &e.route),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-wesley"
+        ));
     }
 
     #[test]
@@ -6144,7 +5906,8 @@ mod tests {
         let home = tmp.path();
         let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
         let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
-        agy_registration_fixture(home, "conv-wesley", "Wesley", live_at.unix_millis());
+        let agy_transcript =
+            agy_registration_fixture(home, "conv-wesley", "Wesley", live_at.unix_millis());
         let thread_id = "01a0a9ce-1111-7222-8333-ea40058ed587";
 
         let day = home
@@ -6222,6 +5985,15 @@ mod tests {
             "index updated_at newer than the route must not beat an older rollout mtime"
         );
         assert_eq!(entry.updated_at, live_at);
+
+        set_mtime(&agy_transcript, 100);
+        let mut explicit_table = RouteTable::default();
+        explicit_table.upsert_explicit("wesley", agy_route("conv-wesley"), live_at);
+        explicit_table.discover_routes(Some(home), At::parse("2026-10-29T06:00:00.000Z").unwrap());
+        assert!(matches!(
+            explicit_table.get("wesley").map(|e| &e.route),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-wesley"
+        ));
     }
 
     #[test]
@@ -8168,7 +7940,7 @@ mod tests {
         };
         let mut table = RouteTable::default();
         table.upsert_explicit("ada", route.clone(), At::from_unix_millis(1));
-        table.upsert_discovered("old-alias", route.clone(), 2, &At::from_unix_millis(2));
+        table.upsert_discovered("old-alias", route.clone(), 2);
         assert_eq!(table.get("ada").map(|entry| &entry.route), Some(&route));
         assert!(table.get("old-alias").is_none());
 
@@ -9951,7 +9723,7 @@ mod tests {
 
         // 2. Reversed discovery order (Codex -> Agy) at scan time 9000.
         let mut reversed = RouteTable::default();
-        reversed.discover_codex_routes(home, &At::from_unix_millis(9000));
+        reversed.discover_codex_routes(home);
         reversed.discover_agy_routes(home, false, &At::from_unix_millis(9000));
         let rev_entry = reversed.get("kayla").expect("kayla route reversed");
         assert!(
@@ -9989,7 +9761,7 @@ mod tests {
         assert_eq!(std_winner.identity_at, Some(At::from_unix_millis(300)));
 
         let mut agy_newer_rev = RouteTable::default();
-        agy_newer_rev.discover_codex_routes(home, &At::from_unix_millis(11000));
+        agy_newer_rev.discover_codex_routes(home);
         agy_newer_rev.discover_agy_routes(home, false, &At::from_unix_millis(11000));
         let rev_winner = agy_newer_rev.get("kayla").expect("rev winner");
         assert!(
@@ -10319,41 +10091,46 @@ mod tests {
         // 1. Equal known evidence (100 vs 100 across different sessions): incumbent wins ties in
         // both upsert_discovered and merge_newer (same-vendor, cross-vendor, and cross-persona).
         let mut up_tie = RouteTable::default();
-        up_tie.upsert_discovered(
-            "kayla",
-            agy_route("conv-incumbent-100"),
-            100,
-            &At::from_unix_millis(9000),
-        );
-        up_tie.upsert_discovered(
-            "kayla",
-            codex_route("codex-challenger-100"),
-            100,
-            &At::from_unix_millis(9000),
-        );
+        up_tie.upsert_discovered("kayla", agy_route("conv-incumbent-100"), 100);
+        up_tie.upsert_discovered("kayla", codex_route("codex-challenger-100"), 100);
         assert_eq!(
             up_tie.get("kayla").unwrap().route,
             agy_route("conv-incumbent-100")
         );
-        up_tie.upsert_discovered(
-            "alias-kayla",
-            agy_route("conv-incumbent-100"),
-            100,
-            &At::from_unix_millis(9000),
-        );
+        up_tie.upsert_discovered("alias-kayla", agy_route("conv-incumbent-100"), 100);
         assert!(up_tie.get("alias-kayla").is_none());
 
         let mut merge_incumbent = RouteTable::default();
-        merge_incumbent.upsert(
-            "kayla",
-            agy_route("conv-incumbent-100"),
-            At::from_unix_millis(100),
+        merge_incumbent.entries.insert(
+            "kayla".into(),
+            RouteEntry {
+                persona: "kayla".into(),
+                route: agy_route("conv-incumbent-100"),
+                updated_at: At::from_unix_millis(9000),
+                identity_at: Some(At::from_unix_millis(100)),
+                explicit: false,
+            },
+        );
+        merge_incumbent.entries.insert(
+            "bystander".into(),
+            RouteEntry {
+                persona: "bystander".into(),
+                route: codex_route("codex-challenger-100"),
+                updated_at: At::from_unix_millis(50),
+                identity_at: Some(At::from_unix_millis(50)),
+                explicit: false,
+            },
         );
         let mut merge_challenger = RouteTable::default();
-        merge_challenger.upsert(
-            "kayla",
-            codex_route("codex-challenger-100"),
-            At::from_unix_millis(100),
+        merge_challenger.entries.insert(
+            "kayla".into(),
+            RouteEntry {
+                persona: "kayla".into(),
+                route: codex_route("codex-challenger-100"),
+                updated_at: At::from_unix_millis(9500),
+                identity_at: Some(At::from_unix_millis(100)),
+                explicit: false,
+            },
         );
         merge_challenger.upsert(
             "alias-kayla",
@@ -10363,34 +10140,68 @@ mod tests {
         merge_incumbent.merge_newer(merge_challenger);
         assert_eq!(
             merge_incumbent.get("kayla").unwrap().route,
-            agy_route("conv-incumbent-100")
+            agy_route("conv-incumbent-100"),
+            "same-persona passive tie must keep incumbent even when challenger has higher updated_at"
+        );
+        assert_eq!(
+            merge_incumbent.get("bystander").unwrap().route,
+            codex_route("codex-challenger-100"),
+            "losing same-persona challenger must not evict bystander owning challenger's session"
         );
         assert!(merge_incumbent.get("alias-kayla").is_none());
+
+        // Same-persona tie for `session_identity() == None` routes (e.g. Webhook).
+        for hook_identity in [None, Some(At::from_unix_millis(100))] {
+            let mut hook_a = RouteTable::default();
+            hook_a.entries.insert(
+                "kayla".into(),
+                RouteEntry {
+                    persona: "kayla".into(),
+                    route: VendorRoute::Webhook {
+                        socket_path: PathBuf::from("/tmp/hook-a.sock"),
+                    },
+                    updated_at: At::from_unix_millis(9000),
+                    identity_at: hook_identity.clone(),
+                    explicit: false,
+                },
+            );
+            let mut hook_b = RouteTable::default();
+            hook_b.entries.insert(
+                "kayla".into(),
+                RouteEntry {
+                    persona: "kayla".into(),
+                    route: VendorRoute::Webhook {
+                        socket_path: PathBuf::from("/tmp/hook-b.sock"),
+                    },
+                    updated_at: At::from_unix_millis(9500),
+                    identity_at: hook_identity.clone(),
+                    explicit: false,
+                },
+            );
+            hook_a.merge_newer(hook_b);
+            assert_eq!(
+                hook_a.get("kayla").unwrap().route,
+                VendorRoute::Webhook {
+                    socket_path: PathBuf::from("/tmp/hook-a.sock"),
+                },
+                "hook_identity={hook_identity:?}"
+            );
+        }
 
         // 2. Unknown (0 mtime) is NEVER promoted to "now", and known (Some(100)) outranks unknown
         // (None / 0 mtime) in BOTH directions across upsert_discovered and merge_newer.
         let mut zero_first = RouteTable::default();
-        zero_first.upsert_discovered(
-            "kayla",
-            codex_route("codex-zero"),
-            0,
-            &At::from_unix_millis(9000),
-        );
+        zero_first.upsert_discovered("kayla", codex_route("codex-zero"), 0);
         let zero_entry = zero_first.get("kayla").expect("zero-mtime route");
         assert_eq!(zero_entry.identity_at, None);
-        assert_eq!(zero_entry.effective_identity_at(), None);
+        assert_eq!(zero_entry.identity_evidence_at(), None);
         assert_eq!(
             zero_entry.updated_at,
             At::from_unix_millis(0),
-            "zero mtime must never be promoted to scan time 9000"
+            "zero mtime must never be promoted to scan time"
         );
         // Known challenger (100) beats unknown incumbent (None).
-        zero_first.upsert_discovered(
-            "kayla",
-            codex_route("codex-known-100"),
-            100,
-            &At::from_unix_millis(9000),
-        );
+        zero_first.upsert_discovered("kayla", codex_route("codex-known-100"), 100);
         assert_eq!(
             zero_first.get("kayla").unwrap().route,
             codex_route("codex-known-100")
@@ -10399,13 +10210,8 @@ mod tests {
             zero_first.get("kayla").unwrap().identity_at,
             Some(At::from_unix_millis(100))
         );
-        // Unknown challenger (0 mtime) loses to known incumbent (100) even at a huge scan time.
-        zero_first.upsert_discovered(
-            "kayla",
-            codex_route("codex-zero-again"),
-            0,
-            &At::from_unix_millis(99_000),
-        );
+        // Unknown challenger (0 mtime) loses to known incumbent (100).
+        zero_first.upsert_discovered("kayla", codex_route("codex-zero-again"), 0);
         assert_eq!(
             zero_first.get("kayla").unwrap().route,
             codex_route("codex-known-100")
@@ -10444,18 +10250,8 @@ mod tests {
         // 3. Equal unknown (None vs None across different sessions): incumbent wins ties in both
         // upsert_discovered and merge_newer.
         let mut unknown_tie = RouteTable::default();
-        unknown_tie.upsert_discovered(
-            "kayla",
-            codex_route("unknown-first"),
-            0,
-            &At::from_unix_millis(5000),
-        );
-        unknown_tie.upsert_discovered(
-            "kayla",
-            codex_route("unknown-second"),
-            0,
-            &At::from_unix_millis(9000),
-        );
+        unknown_tie.upsert_discovered("kayla", codex_route("unknown-first"), 0);
+        unknown_tie.upsert_discovered("kayla", codex_route("unknown-second"), 0);
         assert_eq!(
             unknown_tie.get("kayla").unwrap().route,
             codex_route("unknown-first")
@@ -10484,23 +10280,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cross_vendor_alias_and_same_vendor_refresh_policies_remain_intact() {
+    fn explicit_routes_are_never_replaced_by_passive_agy_discovery_or_aliases() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         agy_registration_fixture(home, "conv-passive-500", "Ada", 500);
 
-        // 1. Legacy explicit cross-vendor route (identity_at: None, updated_at: 100) is protected
-        // against newer passive cross-vendor discovery and merge_newer.
+        // 1. Explicit cross-vendor route (updated_at: 100) is protected against newer passive
+        // cross-vendor discovery and merge_newer.
         let mut cross = RouteTable::default();
-        cross.entries.insert(
-            "ada".into(),
-            RouteEntry {
-                persona: "ada".into(),
-                route: codex_route("explicit-codex"),
-                updated_at: At::from_unix_millis(100),
-                identity_at: None,
-                explicit: true,
-            },
+        cross.upsert_explicit(
+            "ada",
+            codex_route("explicit-codex"),
+            At::from_unix_millis(100),
         );
         cross.discover_routes(Some(home), At::from_unix_millis(9000));
         assert_eq!(
@@ -10521,158 +10312,114 @@ mod tests {
             codex_route("explicit-codex")
         );
 
-        // 2. Explicit same-vendor route refreshes only on newer known identity evidence, never on
-        // older passive evidence or unvalidated legacy passive entries (identity_at: None).
+        // 2. Explicit Agy route is NEVER replaced or re-pointed by passive Agy discovery, even
+        // when another Agy transcript for the same persona has a newer mtime than registration.
         let mut same = RouteTable::default();
         same.upsert_explicit(
             "ada",
             agy_route("explicit-agy-200"),
             At::from_unix_millis(200),
         );
-        same.upsert_discovered(
-            "ada",
-            agy_route("passive-agy-100"),
-            100,
-            &At::from_unix_millis(9000),
-        );
+        same.upsert_discovered("ada", agy_route("conv-passive-500"), 500);
         assert_eq!(
             same.get("ada").unwrap().route,
             agy_route("explicit-agy-200")
         );
-
-        let mut unvalidated_same = RouteTable::default();
-        unvalidated_same.entries.insert(
-            "ada".into(),
-            RouteEntry {
-                persona: "ada".into(),
-                route: agy_route("unvalidated-passive-agy"),
-                updated_at: At::from_unix_millis(9000),
-                identity_at: None,
-                explicit: false,
-            },
-        );
-        same.merge_newer(unvalidated_same);
-        assert_eq!(
-            same.get("ada").unwrap().route,
-            agy_route("explicit-agy-200")
-        );
-        assert!(same.get("ada").unwrap().explicit);
-
-        // Newer validated passive same-vendor route refreshes and preserves explicit = true.
         same.discover_routes(Some(home), At::from_unix_millis(9000));
         assert!(
             matches!(
                 &same.get("ada").unwrap().route,
-                VendorRoute::Agy { conversation_id, .. } if conversation_id == "conv-passive-500"
+                VendorRoute::Agy { conversation_id, .. } if conversation_id == "explicit-agy-200"
             ),
-            "got {:?}",
+            "passive Agy discovery must never replace an explicit Agy route: got {:?}",
             same.get("ada")
         );
         assert!(same.get("ada").unwrap().explicit);
-        assert_eq!(
-            same.get("ada").unwrap().identity_at,
-            Some(At::from_unix_millis(500))
+        assert_eq!(same.get("ada").unwrap().identity_at, None);
+
+        // 3. Hosted reproduction: `upsert_explicit("feira", conv-hosted, 1000)` with `conv-hosted`
+        // transcript at mtime 5000 and another `feira` Agy chat at mtime 3000 stays on `conv-hosted`.
+        let hosted_tmp = TempDir::new().unwrap();
+        let hosted_home = hosted_tmp.path();
+        agy_registration_fixture(hosted_home, "conv-hosted", "Feira", 5000);
+        agy_registration_fixture(hosted_home, "conv-other-chat", "Feira", 3000);
+        let mut hosted = RouteTable::default();
+        hosted.upsert_explicit(
+            "feira",
+            agy_route("conv-hosted"),
+            At::from_unix_millis(1000),
+        );
+        hosted.discover_routes(Some(hosted_home), At::from_unix_millis(9000));
+        let feira = hosted.get("feira").expect("feira explicit route");
+        assert!(feira.explicit);
+        assert!(
+            matches!(
+                &feira.route,
+                VendorRoute::Agy { conversation_id, .. } if conversation_id == "conv-hosted"
+            ),
+            "got {feira:?}"
         );
 
-        // 3. Explicit alias protection: passive discovery or merge for another persona with the
+        // 4. Explicit alias protection: passive discovery or merge for another persona with the
         // same session ID never evicts the explicit owner.
-        same.upsert_discovered(
-            "alias-ada",
-            agy_route("conv-passive-500"),
-            900,
-            &At::from_unix_millis(9000),
-        );
-        assert!(same.get("alias-ada").is_none());
+        hosted.upsert_discovered("alias-feira", agy_route("conv-hosted"), 9000);
+        assert!(hosted.get("alias-feira").is_none());
         let mut alias_table = RouteTable::default();
         alias_table.upsert(
-            "alias-ada",
-            agy_route("conv-passive-500"),
-            At::from_unix_millis(900),
+            "alias-feira",
+            agy_route("conv-hosted"),
+            At::from_unix_millis(9000),
         );
-        same.merge_newer(alias_table);
-        assert!(same.get("alias-ada").is_none());
-        assert!(same.get("ada").unwrap().explicit);
+        hosted.merge_newer(alias_table);
+        assert!(hosted.get("alias-feira").is_none());
+        assert!(hosted.get("feira").unwrap().explicit);
     }
 
     #[test]
-    fn same_routes_compares_explicit_and_identity_evidence_without_live_pid_restamp_churn() {
-        let entry_with =
-            |route: VendorRoute, updated_ms: u64, identity_ms: Option<u64>, explicit: bool| {
-                let mut t = RouteTable::default();
-                t.entries.insert(
-                    "kayla".into(),
-                    RouteEntry {
-                        persona: "kayla".into(),
-                        route,
-                        updated_at: At::from_unix_millis(updated_ms),
-                        identity_at: identity_ms.map(At::from_unix_millis),
-                        explicit,
-                    },
-                );
-                t
-            };
+    fn same_routes_ignores_same_session_identity_and_endpoint_timestamp_refreshes() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_transcript = agy_registration_fixture(home, "conv-kayla", "Kayla", 100);
+        let codex_tid = "01900000-0000-7000-8000-000000000301";
+        let codex_rollout = codex_rollout_fixture(home, codex_tid, "Ferris", 100);
 
-        // Agy / Codex / Muse / HostCli / Webhook require exact `identity_at` and `explicit`
-        // equality while ignoring `updated_at`.
-        let non_pid_routes = [
-            agy_route("conv-kayla-100"),
-            codex_route("codex-kayla-100"),
-            VendorRoute::Muse {
-                session_id: "muse-kayla-100".into(),
-                cwd: None,
-                tmux_target: None,
-                tmux_pane: None,
-            },
-            VendorRoute::HostCli {
-                vendor: "custom".into(),
-                session_id: "host-kayla-100".into(),
-                cwd: None,
-                tmux_target: None,
-                tmux_pane: None,
-            },
-            VendorRoute::Webhook {
-                socket_path: PathBuf::from("/tmp/kayla-test.sock"),
-            },
-        ];
-        for route in non_pid_routes {
-            let legacy_none = entry_with(route.clone(), 9000, None, false);
-            let scan_9000 = entry_with(route.clone(), 9000, Some(9000), false);
-            let revalidated_100 = entry_with(route.clone(), 9000, Some(100), false);
-            let steady_100 = entry_with(route.clone(), 9500, Some(100), false);
-            let explicit_100 = entry_with(route.clone(), 9000, Some(100), true);
+        let mut base = RouteTable::default();
+        base.discover_routes(Some(home), At::from_unix_millis(1000));
+        assert_eq!(
+            base.get("kayla").unwrap().identity_at,
+            Some(At::from_unix_millis(100))
+        );
+        assert_eq!(
+            base.get("ferris").unwrap().identity_at,
+            Some(At::from_unix_millis(100))
+        );
 
-            assert!(!revalidated_100.same_routes(&legacy_none), "{route:?}");
-            assert!(!revalidated_100.same_routes(&scan_9000), "{route:?}");
-            assert!(revalidated_100.same_routes(&steady_100), "{route:?}");
-            assert!(!revalidated_100.same_routes(&explicit_100), "{route:?}");
+        // Advancing active transcript mtimes on the same winning sessions refreshes `identity_at`
+        // in memory while `same_routes` stays `true` (zero persistence churn).
+        let mut working = base.clone();
+        for (i, mtime) in [200_u64, 300, 400, 500, 600].into_iter().enumerate() {
+            set_mtime(&agy_transcript, mtime);
+            set_mtime(&codex_rollout, mtime);
+            working.discover_routes(Some(home), At::from_unix_millis(2000 + i as u64 * 100));
+            assert_eq!(
+                working.get("kayla").unwrap().identity_at,
+                Some(At::from_unix_millis(mtime))
+            );
+            assert_eq!(
+                working.get("ferris").unwrap().identity_at,
+                Some(At::from_unix_millis(mtime))
+            );
+            assert!(
+                working.same_routes(&base),
+                "same-session mtime={mtime} refresh must not look like a route change"
+            );
         }
 
-        // Live Claude and active Grok restamp `identity_at` on each scan: `None` -> `Some` is a
-        // change, while `Some(t1)` -> `Some(t2)` with identical route and explicitness is steady-state.
-        let pid_routes = [
-            VendorRoute::Claude {
-                pid: 4242,
-                session_id: "claude-sid".into(),
-                socket_path: PathBuf::from("/tmp/claude-4242.sock"),
-                key_path: None,
-            },
-            VendorRoute::Grok {
-                session_id: "grok-sid".into(),
-                cwd: None,
-                tmux_target: None,
-                tmux_pane: None,
-            },
-        ];
-        for route in pid_routes {
-            let none = entry_with(route.clone(), 9000, None, false);
-            let stamp_9000 = entry_with(route.clone(), 9000, Some(9000), false);
-            let stamp_9500 = entry_with(route.clone(), 9500, Some(9500), false);
-            let explicit_9500 = entry_with(route.clone(), 9500, Some(9500), true);
-
-            assert!(!stamp_9000.same_routes(&none), "{route:?}");
-            assert!(stamp_9500.same_routes(&stamp_9000), "{route:?}");
-            assert!(!explicit_9500.same_routes(&stamp_9000), "{route:?}");
-        }
+        // Changing the winning session for `kayla` (newer Codex rollout at 700 > 600) IS a route change.
+        let kayla_codex = "01900000-0000-7000-8000-000000000302";
+        codex_rollout_fixture(home, kayla_codex, "Kayla", 700);
+        working.discover_routes(Some(home), At::from_unix_millis(3000));
+        assert!(!working.same_routes(&base));
     }
 
     #[test]
@@ -10722,7 +10469,7 @@ mod tests {
                 );
 
                 // Later on disk, `conv-kayla` advances to mtime = 500 and is persisted to routes.json.
-                // `table2` is loaded from disk, so `table2.passive_agy_identity_at` is empty.
+                // `table2` is loaded from disk, so `table2.passive_agy_revalidation` is empty.
                 set_mtime(&transcript, 500);
                 let mut writer = RouteTable::default();
                 writer.discover_routes(Some(&home), At::from_unix_millis(9600));
@@ -10768,10 +10515,9 @@ mod tests {
      {
         for initial_identity in [None, Some(9000_u64)] {
             for merge_mode in ["direct", "dispatch", "daemon"] {
-                // 1. Claude-first during `discover_routes` (`8500 < 9000`): `discover_claude_routes`
-                // replaces `working.entries["kayla"]` before `discover_agy_routes` runs, yet
-                // `live` reconciliation still downgrades `live`'s scan-stamped 9000 Agy to 100 so
-                // Claude(8500) wins.
+                // 1. Claude-first during `discover_routes` (`8500 < 9000`): top-of-scan revalidation
+                // normalizes `kayla` before `discover_claude_routes` replaces it, so `live`
+                // reconciliation also downgrades `live`'s scan-stamped 9000 Agy to 100 and Claude(8500) wins.
                 {
                     let tmp = TempDir::new().unwrap();
                     let home = tmp.path();
@@ -10832,9 +10578,8 @@ mod tests {
                     ));
                 }
 
-                // 2. Reversed Codex -> Agy (`200 < 9000`): even when `discover_codex_routes` runs
-                // before `discover_agy_routes` on a working snapshot seeded with scan-stamped 9000
-                // passive Agy, Codex(200) beats Agy(100) in both `working` and `live`.
+                // 2. Reversed Codex -> Agy (`200 < 9000`) after the single top-of-scan revalidation
+                // pass: Codex(200) beats Agy(100) in both `working` and `live`.
                 {
                     let tmp = TempDir::new().unwrap();
                     let home = tmp.path();
@@ -10854,8 +10599,14 @@ mod tests {
                         },
                     );
                     let mut working = base.clone();
-                    working.discover_codex_routes(home, &At::from_unix_millis(8500));
-                    working.discover_agy_routes(home, false, &At::from_unix_millis(8500));
+                    let agy_candidates = working.revalidate_passive_agy_entries(home);
+                    working.discover_codex_routes(home);
+                    working.discover_agy_routes_with_candidates(
+                        home,
+                        false,
+                        &At::from_unix_millis(8500),
+                        agy_candidates,
+                    );
                     assert!(
                         matches!(
                             working.get("kayla").map(|e| &e.route),
@@ -10893,7 +10644,7 @@ mod tests {
     }
 
     #[test]
-    fn same_session_merge_preserves_repaired_endpoint_explicitness_and_newest_identity_in_both_directions()
+    fn same_session_passive_merge_preserves_repaired_endpoint_and_newest_identity_in_both_directions()
      {
         let repaired_route = VendorRoute::Agy {
             conversation_id: "conv-kayla".into(),
@@ -10902,7 +10653,7 @@ mod tests {
             csrf_token: Some("fresh-csrf".into()),
             agentapi_exe: Some(PathBuf::from("/tmp/agy")),
         };
-        let explicit_route = VendorRoute::Agy {
+        let stale_route = VendorRoute::Agy {
             conversation_id: "conv-kayla".into(),
             ls_pid: None,
             ls_address: Some("127.0.0.1:1".into()),
@@ -10921,101 +10672,37 @@ mod tests {
                 explicit: false,
             },
         );
-        let mut explicit_reg = RouteTable::default();
-        explicit_reg.upsert_explicit("kayla", explicit_route, At::from_unix_millis(9200));
+        let mut newer_transcript = RouteTable::default();
+        newer_transcript.entries.insert(
+            "kayla".into(),
+            RouteEntry {
+                persona: "kayla".into(),
+                route: stale_route,
+                updated_at: At::from_unix_millis(500),
+                identity_at: Some(At::from_unix_millis(500)),
+                explicit: false,
+            },
+        );
 
-        let mut repaired_then_explicit = passive_repaired.clone();
-        repaired_then_explicit.merge_newer(explicit_reg.clone());
-        let a = repaired_then_explicit.get("kayla").expect("kayla merged a");
+        let mut repaired_then_transcript = passive_repaired.clone();
+        repaired_then_transcript.merge_newer(newer_transcript.clone());
+        let a = repaired_then_transcript.get("kayla").expect("kayla a");
         assert_eq!(a.route, repaired_route);
-        assert!(a.explicit);
+        assert!(!a.explicit);
         assert_eq!(a.updated_at, At::from_unix_millis(9500));
-        assert_eq!(a.identity_at, Some(At::from_unix_millis(9200)));
+        assert_eq!(a.identity_at, Some(At::from_unix_millis(500)));
 
-        let mut explicit_then_repaired = explicit_reg;
-        explicit_then_repaired.merge_newer(passive_repaired);
-        let b = explicit_then_repaired.get("kayla").expect("kayla merged b");
+        let mut transcript_then_repaired = newer_transcript;
+        transcript_then_repaired.merge_newer(passive_repaired);
+        let b = transcript_then_repaired.get("kayla").expect("kayla b");
         assert_eq!(b.route, repaired_route);
-        assert!(b.explicit);
+        assert!(!b.explicit);
         assert_eq!(b.updated_at, At::from_unix_millis(9500));
-        assert_eq!(b.identity_at, Some(At::from_unix_millis(9200)));
+        assert_eq!(b.identity_at, Some(At::from_unix_millis(500)));
     }
 
     #[test]
-    fn legacy_explicit_agy_repair_pins_identity_age_and_allows_newer_same_vendor_refresh() {
-        // 1. No-brain `.old` exe repair path (`1654`) and same-route `merge_newer` restamp (`965`)
-        // pin `identity_at = Some(200)` before advancing `updated_at` to `9000`.
-        {
-            let tmp = TempDir::new().unwrap();
-            let home = tmp.path();
-            let bin_dir = home.join(".local/bin");
-            fs::create_dir_all(&bin_dir).unwrap();
-            let local_agy = bin_dir.join("agy");
-            fs::write(&local_agy, b"#!/bin/sh\n").unwrap();
-            let old_agy = bin_dir.join("agy.12.old");
-            fs::write(&old_agy, b"#!/bin/sh\n").unwrap();
-
-            let mut no_brain = RouteTable::default();
-            no_brain.entries.insert(
-                "ada".into(),
-                RouteEntry {
-                    persona: "ada".into(),
-                    route: VendorRoute::Agy {
-                        conversation_id: "conv-old".into(),
-                        ls_pid: None,
-                        ls_address: None,
-                        csrf_token: None,
-                        agentapi_exe: Some(old_agy),
-                    },
-                    updated_at: At::from_unix_millis(200),
-                    identity_at: None,
-                    explicit: true,
-                },
-            );
-            no_brain.discover_routes(Some(home), At::from_unix_millis(9000));
-            let pinned = no_brain.get("ada").expect("ada after no-brain exe repair");
-            assert!(pinned.explicit);
-            assert_eq!(pinned.updated_at, At::from_unix_millis(9000));
-            assert_eq!(pinned.identity_at, Some(At::from_unix_millis(200)));
-
-            let hook = VendorRoute::Webhook {
-                socket_path: home.join("ada.sock"),
-            };
-            let mut legacy_hook = RouteTable::default();
-            legacy_hook.entries.insert(
-                "ada".into(),
-                RouteEntry {
-                    persona: "ada".into(),
-                    route: hook.clone(),
-                    updated_at: At::from_unix_millis(200),
-                    identity_at: None,
-                    explicit: true,
-                },
-            );
-            let mut restamped_hook = RouteTable::default();
-            restamped_hook.entries.insert(
-                "ada".into(),
-                RouteEntry {
-                    persona: "ada".into(),
-                    route: hook,
-                    updated_at: At::from_unix_millis(9000),
-                    identity_at: Some(At::from_unix_millis(200)),
-                    explicit: false,
-                },
-            );
-            legacy_hook.merge_newer(restamped_hook);
-            let merged_hook = legacy_hook.get("ada").expect("ada webhook");
-            assert!(merged_hook.explicit);
-            assert_eq!(merged_hook.updated_at, At::from_unix_millis(9000));
-            assert_eq!(merged_hook.identity_at, Some(At::from_unix_millis(200)));
-        }
-
-        // 2. Endpoint repair with `brain_dir` (`1849`):
-        // - When `conv-old` remains the only session, `identity_at` pins to `Some(200)` while
-        //   `updated_at` advances to `9000`.
-        // - When a newer Agy transcript (`file_ms = 500 > 200`) is also present during the same
-        //   scan at `9000`, endpoint repair does not inflate `effective_identity_at` to `9000`,
-        //   so `conv-new` refreshes the explicit route to `identity_at = Some(500)`.
+    fn explicit_agy_endpoint_repair_never_repoints_to_another_agy_conversation() {
         for with_newer_transcript in [false, true] {
             let tmp = TempDir::new().unwrap();
             let home = tmp.path();
@@ -11061,6 +10748,8 @@ mod tests {
             table.discover_routes(Some(home), At::from_unix_millis(9000));
             let ada = table.get("ada").expect("ada route");
             assert!(ada.explicit);
+            assert_eq!(ada.updated_at, At::from_unix_millis(9000));
+            assert_eq!(ada.identity_at, None);
             match &ada.route {
                 VendorRoute::Agy {
                     conversation_id,
@@ -11068,16 +10757,12 @@ mod tests {
                     agentapi_exe,
                     ..
                 } => {
+                    assert_eq!(
+                        conversation_id, "conv-old",
+                        "explicit Agy route must stay on conv-old (with_newer={with_newer_transcript})"
+                    );
                     assert_eq!(ls_address.as_deref(), Some(live_addr.as_str()));
                     assert_eq!(agentapi_exe.as_deref(), Some(local_agy.as_path()));
-                    if with_newer_transcript {
-                        assert_eq!(conversation_id, "conv-new");
-                        assert_eq!(ada.identity_at, Some(At::from_unix_millis(500)));
-                    } else {
-                        assert_eq!(conversation_id, "conv-old");
-                        assert_eq!(ada.updated_at, At::from_unix_millis(9000));
-                        assert_eq!(ada.identity_at, Some(At::from_unix_millis(200)));
-                    }
                 }
                 other => panic!("expected Agy route, got {other:?}"),
             }
@@ -11085,7 +10770,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_persona_scanner_tie_and_explicit_merge_override_behave_symmetrically() {
+    fn discover_scanner_routes_keeps_cross_persona_incumbent_on_tie() {
         struct HomeScopedScanner {
             expected_home: PathBuf,
             route: VendorRoute,
@@ -11103,8 +10788,6 @@ mod tests {
             }
         }
 
-        // 1. `discover_scanner_routes`: an incumbent cross-persona owner of `target_sid` keeps it
-        // on a tie (`identity_at: None` and equal `updated_at == *at`).
         let tmp = TempDir::new().unwrap();
         let shared_host_route = VendorRoute::HostCli {
             vendor: "custom".into(),
@@ -11139,38 +10822,5 @@ mod tests {
             scan_table.get("scanner-challenger").is_none(),
             "scanner must not steal a session already owned by another persona on a tie"
         );
-
-        // 2. `merge_newer`: a passive cross-persona alias cannot block an incoming `explicit: true`
-        // registration even when the passive alias has a newer timestamp (matching `upsert_explicit`),
-        // whereas an incumbent `explicit: true` owner with newer evidence still wins.
-        let mut live_with_passive_alias = RouteTable::default();
-        live_with_passive_alias.upsert(
-            "alias-ada",
-            agy_route("conv-shared-445"),
-            At::from_unix_millis(500),
-        );
-        let mut incoming_explicit = RouteTable::default();
-        incoming_explicit.upsert_explicit(
-            "ada",
-            agy_route("conv-shared-445"),
-            At::from_unix_millis(200),
-        );
-        live_with_passive_alias.merge_newer(incoming_explicit.clone());
-        let ada = live_with_passive_alias
-            .get("ada")
-            .expect("explicit registration must evict passive cross-persona alias");
-        assert!(ada.explicit);
-        assert_eq!(ada.route, agy_route("conv-shared-445"));
-        assert!(live_with_passive_alias.get("alias-ada").is_none());
-
-        let mut live_with_explicit_owner = RouteTable::default();
-        live_with_explicit_owner.upsert_explicit(
-            "owner-ada",
-            agy_route("conv-shared-445"),
-            At::from_unix_millis(500),
-        );
-        live_with_explicit_owner.merge_newer(incoming_explicit);
-        assert!(live_with_explicit_owner.get("owner-ada").is_some());
-        assert!(live_with_explicit_owner.get("ada").is_none());
     }
 }
