@@ -5808,30 +5808,28 @@ mod tests {
     }
 
     /// Audit D-1: the dispatch ran vendor CLIs while holding the route-table lock, so one slow
-    /// `codex` froze `Status` and `RegisterRoute` for as long as it ran.
+    /// vendor delivery froze `Status` and `RegisterRoute` for as long as it ran. Hold the fake
+    /// vendor binary open behind a filesystem gate and verify `Send`, `Status`, `RegisterRoute`,
+    /// and delivery to another recipient all complete while the gate remains closed.
     #[test]
     fn status_and_route_registration_do_not_wait_behind_a_slow_vendor_delivery() {
         use std::os::unix::fs::PermissionsExt;
-        let _codex_lock = crate::dispatcher::CODEX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
-        let slow = tmp.path().join("slow-codex.sh");
+        let slow = tmp.path().join("slow-vendor.sh");
         let started_file = tmp.path().join("started");
+        let gate_file = tmp.path().join("gate");
         let done_file = tmp.path().join("done");
         fs::write(
             &slow,
             format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 2\nprintf done > '{}'\n",
+                "#!/bin/sh\nprintf started > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nprintf done > '{}'\n",
                 started_file.display(),
+                gate_file.display(),
                 done_file.display()
             ),
         )
         .unwrap();
         fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
-        // SAFETY: serialised by CODEX_ENV_LOCK; restored below.
-        let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
-        unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &slow) };
 
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
         let cfg = test_config(tmp.path(), "slow");
@@ -5841,11 +5839,14 @@ mod tests {
         let mut reg = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         reg.request(&LocalRequest::register(
             "synthetic-recipient",
-            VendorRoute::Codex {
-                thread_id: "t1".into(),
-                cwd: None,
+            VendorRoute::Agy {
+                conversation_id: "t1".into(),
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(slow.clone()),
+                ls_pid: None,
             },
-            false,
+            true,
         ))
         .unwrap();
 
@@ -5860,14 +5861,27 @@ mod tests {
                 .map(|_| ());
             let _ = sent_tx.send(result);
         });
-        let sent_promptly = sent_rx.recv_timeout(Duration::from_millis(400));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let sent_promptly = sent_rx.recv_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(sent_promptly, Ok(Ok(()))),
+            "send waited for vendor delivery: {sent_promptly:?}"
+        );
+        assert!(
+            !done_file.exists(),
+            "vendor delivery finished before gate was released"
+        );
+        sender.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !started_file.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(started_file.exists(), "slow delivery did not start");
+        assert!(
+            !done_file.exists(),
+            "slow delivery finished while gate was still closed"
+        );
 
-        let started = Instant::now();
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         probe
             .request(&LocalRequest::Status {
@@ -5888,13 +5902,13 @@ mod tests {
                 false,
             ))
             .unwrap();
-        let mut other = LocalClient::connect(&sock, Duration::from_secs(1)).unwrap();
+        let mut other = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         other
             .request(&LocalRequest::Send {
                 args: mail("other", "fast one"),
             })
             .unwrap();
-        let other_deadline = Instant::now() + Duration::from_millis(800);
+        let other_deadline = Instant::now() + Duration::from_secs(10);
         let mut delivered_other = false;
         while Instant::now() < other_deadline {
             if other_listener.accept().is_ok() {
@@ -5905,30 +5919,19 @@ mod tests {
         }
         assert!(
             delivered_other,
-            "other recipient did not receive while slow recipient ran"
+            "other recipient did not receive while slow recipient was gate-held"
         );
-        let waited = started.elapsed();
+        assert!(
+            !done_file.exists(),
+            "slow delivery finished before gate was released"
+        );
 
-        sender.join().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        fs::write(&gate_file, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !done_file.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(done_file.exists(), "slow delivery did not finish");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("FL_WIRE_CODEX_BIN", v),
-                None => std::env::remove_var("FL_WIRE_CODEX_BIN"),
-            }
-        }
-        assert!(
-            matches!(sent_promptly, Ok(Ok(()))),
-            "send waited for vendor delivery"
-        );
-        assert!(
-            waited < Duration::from_millis(1200),
-            "Status/RegisterRoute waited {waited:?} behind a vendor delivery"
-        );
     }
 
     #[test]
