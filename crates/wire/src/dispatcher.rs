@@ -2562,6 +2562,23 @@ fn clear_unconfirmed_wire_deliveries(route_keys: &[String]) {
     ledger.retain(|(k, _)| !route_keys.iter().any(|rk| rk == k));
 }
 
+fn remove_unconfirmed_wire_delivery(route_keys: &[String], wire_id: &str) {
+    if route_keys.is_empty() || wire_id.is_empty() {
+        return;
+    }
+    let mut ledger = UNCONFIRMED_WIRE_DELIVERIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ledger.retain_mut(|(k, entries)| {
+        if route_keys.iter().any(|rk| rk == k) {
+            entries.retain(|entry| entry.wire_id != wire_id);
+            !entries.is_empty()
+        } else {
+            true
+        }
+    });
+}
+
 #[cfg(test)]
 fn route_has_unconfirmed_wire_deliveries(route_keys: &[String]) -> bool {
     let ledger = UNCONFIRMED_WIRE_DELIVERIES
@@ -2876,7 +2893,7 @@ fn execute_verified_paste_delivery(
     if let Some(id) = wire_id
         && transcript.already_accepted_wire_id(id)
     {
-        clear_unconfirmed_wire_deliveries(&spec.route_keys);
+        remove_unconfirmed_wire_delivery(&spec.route_keys, id);
         return Ok(());
     }
 
@@ -2891,7 +2908,9 @@ fn execute_verified_paste_delivery(
         )?;
         match prep {
             PrePasteOutcome::AlreadySubmittedTarget => {
-                clear_unconfirmed_wire_deliveries(&spec.route_keys);
+                if let Some(id) = wire_id {
+                    remove_unconfirmed_wire_delivery(&spec.route_keys, id);
+                }
                 return Ok(());
             }
             PrePasteOutcome::FlushedEarlierProceedToPaste => {
@@ -2918,7 +2937,6 @@ fn execute_verified_paste_delivery(
         return Err(err);
     }
     if !spec.verify_submission || trimmed.is_empty() {
-        clear_unconfirmed_wire_deliveries(&spec.route_keys);
         return Ok(());
     }
     match confirm_paste_submission_with_raw(
@@ -2929,8 +2947,14 @@ fn execute_verified_paste_delivery(
         || transcript.confirmed(trimmed),
         &mut send_enter,
     ) {
-        Ok(()) => {
+        Ok(PostPasteOutcome::ObservedEmptyRenderedComposer) => {
             clear_unconfirmed_wire_deliveries(&spec.route_keys);
+            Ok(())
+        }
+        Ok(PostPasteOutcome::ConfirmedWithoutEmptyRenderedComposer) => {
+            if let Some(id) = wire_id {
+                remove_unconfirmed_wire_delivery(&spec.route_keys, id);
+            }
             Ok(())
         }
         Err(err) => {
@@ -3631,6 +3655,7 @@ fn prepare_clean_composer_before_paste_for_route(
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if !composer_has_unsubmitted_content(&contents1, cursor1) {
+        clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
 
@@ -3656,6 +3681,7 @@ fn prepare_clean_composer_before_paste_for_route(
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if !composer_has_unsubmitted_content(&contents2, cursor2) {
+        clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
     if !composer_equals_recorded_wire_deliveries(&contents2, route_keys) {
@@ -3698,6 +3724,7 @@ fn prepare_clean_composer_before_paste_for_route(
                     exhausted_detail: "composer still holds earlier unsubmitted content",
                 };
             }
+            clear_unconfirmed_wire_deliveries(route_keys);
             RetryPollDecision::ConfirmedNow
         },
         send_enter,
@@ -3711,6 +3738,12 @@ fn prepare_clean_composer_before_paste_for_route(
     } else {
         Ok(PrePasteOutcome::FlushedEarlierProceedToPaste)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostPasteOutcome {
+    ObservedEmptyRenderedComposer,
+    ConfirmedWithoutEmptyRenderedComposer,
 }
 
 /// Bounded confirmation and Enter retry loop after a paste and initial Enter.
@@ -3735,6 +3768,7 @@ fn confirm_paste_submission(
         transcript_confirmed,
         send_enter,
     )
+    .map(|_| ())
 }
 
 fn confirm_paste_submission_with_raw(
@@ -3742,19 +3776,28 @@ fn confirm_paste_submission_with_raw(
     raw_text: Option<&str>,
     wait: impl FnMut(Duration),
     mut capture_screen: impl FnMut() -> Option<ScreenCapture>,
-    transcript_confirmed: impl FnMut() -> bool,
+    mut transcript_confirmed: impl FnMut() -> bool,
     send_enter: impl FnMut() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<PostPasteOutcome, String> {
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(PostPasteOutcome::ConfirmedWithoutEmptyRenderedComposer);
     }
     let d_target = build_delivery_descriptor("", trimmed, raw_text);
+    let confirmed_by_transcript = std::cell::Cell::new(false);
+    let last_poll_rendered_empty = std::cell::Cell::new(false);
     run_bounded_enter_retry_loop(
         false,
         "composer still held payload before capture became unavailable",
         wait,
-        transcript_confirmed,
         || {
+            let ok = transcript_confirmed();
+            if ok {
+                confirmed_by_transcript.set(true);
+            }
+            ok
+        },
+        || {
+            last_poll_rendered_empty.set(false);
             let Some(capture) = capture_screen() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
@@ -3790,6 +3833,7 @@ fn confirm_paste_submission_with_raw(
                             composer_occupied_by_non_wire_input_error(),
                         );
                     }
+                    last_poll_rendered_empty.set(true);
                     if composer_visibly_submitted_with_cursor_and_raw(
                         &contents, cursor, trimmed, raw_text,
                     ) {
@@ -3827,7 +3871,12 @@ fn confirm_paste_submission_with_raw(
             }
         },
         send_enter,
-    )
+    )?;
+    if !confirmed_by_transcript.get() && last_poll_rendered_empty.get() {
+        Ok(PostPasteOutcome::ObservedEmptyRenderedComposer)
+    } else {
+        Ok(PostPasteOutcome::ConfirmedWithoutEmptyRenderedComposer)
+    }
 }
 
 fn compact_contains_exact_wire_id(compact: &str, wire_id: &str) -> bool {
@@ -16696,5 +16745,287 @@ exit 1"#,
 
         let _ = stop_tx.send(());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn transcript_dedup_evicts_only_confirmed_wire_id_preserving_unsubmitted_composer_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+
+        let store = MemStore::default();
+        let mut d1 = mail_to(&store, "melisandre");
+        d1.sender_name = "cassandra".into();
+        d1.subject = "D1 late self-submit".into();
+        d1.body = "D1 landed in session.jsonl right before D2 pasted.".into();
+        let fmt_d1 = format_push_message(&d1);
+
+        let mut d2 = mail_to(&store, "melisandre");
+        d2.sender_name = "cassandra".into();
+        d2.subject = "D2 stalled in composer".into();
+        d2.body = "D2 is still unsubmitted in the live rendered composer.".into();
+        let fmt_d2 = format_push_message(&d2);
+
+        let mut d3 = mail_to(&store, "melisandre");
+        d3.sender_name = "ferris".into();
+        d3.subject = "D3 followup".into();
+        d3.body = "D3 must recognize and flush D2, then paste and submit D3.".into();
+        let fmt_d3 = format_push_message(&d3);
+
+        let muse_sid = "01a1c218-44dc-7000-8000-bea1904c0f99";
+        let tdir = home.join(".local/share/muse/sessions").join(muse_sid);
+        fs::create_dir_all(&tdir).unwrap();
+        let tpath = tdir.join("session.jsonl");
+        let d1_accepted_line = serde_json::json!({
+            "payload_type": "runtime.user_intent.accepted",
+            "payload": {
+                "text": fmt_d1,
+            }
+        })
+        .to_string();
+        fs::write(&tpath, format!("{d1_accepted_line}\n")).unwrap();
+
+        let route_keys = vec![
+            "host:muse.melisandre.r3".to_string(),
+            "target:muse:melisandre.r3".to_string(),
+        ];
+        clear_unconfirmed_wire_deliveries(&route_keys);
+        record_unconfirmed_wire_delivery(&route_keys, d1.id.as_str(), &fmt_d1);
+        record_unconfirmed_wire_delivery(&route_keys, d2.id.as_str(), &fmt_d2);
+
+        let ledger_ids_for = |key: &str| -> Vec<String> {
+            let ledger = UNCONFIRMED_WIRE_DELIVERIES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ledger
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, entries)| entries.iter().map(|e| e.wire_id.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            ledger_ids_for("host:muse.melisandre.r3"),
+            vec![d1.id.as_str().to_string(), d2.id.as_str().to_string()]
+        );
+
+        let rule = "─".repeat(120);
+        let d2_composer_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ {}\n{rule}\n  muse-wonder-full-1.0",
+            fmt_d2.replace('\n', "\n  ")
+        );
+        let rendered_state = std::cell::RefCell::new(d2_composer_screen.clone());
+
+        let spec = VerifiedDeliverySpec {
+            route_keys: route_keys.clone(),
+            transcript_target: "muse:melisandre.r3",
+            session_id: Some(muse_sid),
+            is_muse_route: true,
+            verify_submission: true,
+            raw_text: None,
+        };
+
+        // 1. Retrying D1 hits `transcript.already_accepted_wire_id(id1)`:
+        //    returns `Ok(())` with 0 pastes / 0 Enters, evicts D1, and preserves D2!
+        let mut d1_pastes = 0u32;
+        let mut d1_enters = 0u32;
+        execute_verified_paste_delivery(
+            &spec,
+            &fmt_d1,
+            |_| {},
+            || {
+                Some((
+                    rendered_state.borrow().clone(),
+                    Some(CursorState::with_dims(5, 20, 40, 120)),
+                ))
+            },
+            || {
+                Some(ScreenCapture::Rendered {
+                    contents: rendered_state.borrow().clone(),
+                    cursor: Some(CursorState::with_dims(5, 20, 40, 120)),
+                })
+            },
+            || {
+                d1_pastes += 1;
+                Ok(())
+            },
+            || {
+                d1_enters += 1;
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect("D1 retry must succeed via transcript dedup");
+        assert_eq!(d1_pastes, 0, "D1 retry must perform 0 pastes");
+        assert_eq!(d1_enters, 0, "D1 retry must perform 0 Enters");
+        for rk in &route_keys {
+            assert_eq!(
+                ledger_ids_for(rk),
+                vec![d2.id.as_str().to_string()],
+                "D1 must be evicted while D2 remains in UNCONFIRMED_WIRE_DELIVERIES for {rk}"
+            );
+        }
+
+        // 1b. Also verify pre-Enter `transcript_confirmed()` (`AlreadySubmittedTarget` at :3645)
+        //     and unverified/empty writes (:2921) preserve D2 in the ledger!
+        fs::write(&tpath, "").unwrap();
+        record_unconfirmed_wire_delivery(&route_keys, d1.id.as_str(), &fmt_d1);
+        assert_eq!(
+            ledger_ids_for("host:muse.melisandre.r3"),
+            vec![d2.id.as_str().to_string(), d1.id.as_str().to_string()]
+        );
+        let mut d1_settle_pastes = 0u32;
+        let mut d1_settle_enters = 0u32;
+        execute_verified_paste_delivery(
+            &spec,
+            &fmt_d1,
+            |_| {
+                // D1 lands in `session.jsonl` during pre-Enter settle wait while D2 is still in composer!
+                fs::write(&tpath, format!("{d1_accepted_line}\n")).unwrap();
+            },
+            || {
+                Some((
+                    rendered_state.borrow().clone(),
+                    Some(CursorState::with_dims(5, 20, 40, 120)),
+                ))
+            },
+            || None,
+            || {
+                d1_settle_pastes += 1;
+                Ok(())
+            },
+            || {
+                d1_settle_enters += 1;
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect("D1 pre-Enter transcript confirmation must succeed");
+        assert_eq!(d1_settle_pastes, 0);
+        assert_eq!(d1_settle_enters, 0);
+        for rk in &route_keys {
+            assert_eq!(
+                ledger_ids_for(rk),
+                vec![d2.id.as_str().to_string()],
+                "pre-Enter AlreadySubmittedTarget must evict only D1 and preserve D2 for {rk}"
+            );
+        }
+
+        // Empty write (`trimmed.is_empty()`) and post-paste confirmation without rendered capture
+        // (`capture_screen` unavailable) must not wipe D2 either:
+        let mut bare_enters = 0u32;
+        execute_verified_paste_delivery(
+            &spec,
+            "",
+            |_| {},
+            || None,
+            || None,
+            || Ok(()),
+            || {
+                bare_enters += 1;
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect("bare Enter must succeed");
+        assert_eq!(bare_enters, 1);
+        assert_eq!(
+            ledger_ids_for("host:muse.melisandre.r3"),
+            vec![d2.id.as_str().to_string()]
+        );
+
+        fs::write(&tpath, "").unwrap();
+        record_unconfirmed_wire_delivery(&route_keys, d1.id.as_str(), &fmt_d1);
+        execute_verified_paste_delivery(
+            &spec,
+            &fmt_d1,
+            |_| {},
+            || None,
+            || None,
+            || Ok(()),
+            || Ok(()),
+            || {},
+            |_| {},
+        )
+        .expect("post-paste confirmation with capture unavailable must evict only D1");
+        assert_eq!(
+            ledger_ids_for("host:muse.melisandre.r3"),
+            vec![d2.id.as_str().to_string()]
+        );
+
+        // 2. Subsequent `execute_verified_paste_delivery` for D3 recognizes D2 in the composer,
+        //    flushes D2, and pastes/submits D3 instead of failing with `composer_occupied_by_non_wire_input:`!
+        let active_in_composer = std::cell::RefCell::new(Some(fmt_d2.clone()));
+        let submitted_log = std::cell::RefCell::new(Vec::<String>::new());
+        let mut d3_pastes = 0u32;
+        let mut d3_enters = 0u32;
+
+        execute_verified_paste_delivery(
+            &spec,
+            &fmt_d3,
+            |_| {},
+            || {
+                Some((
+                    rendered_state.borrow().clone(),
+                    Some(CursorState::with_dims(5, 20, 40, 120)),
+                ))
+            },
+            || {
+                Some(ScreenCapture::Rendered {
+                    contents: rendered_state.borrow().clone(),
+                    cursor: Some(CursorState::with_dims(3, 2, 40, 120)),
+                })
+            },
+            || {
+                assert!(
+                    active_in_composer.borrow().is_none(),
+                    "D2 must be flushed from composer before D3 is pasted"
+                );
+                d3_pastes += 1;
+                *active_in_composer.borrow_mut() = Some(fmt_d3.clone());
+                *rendered_state.borrow_mut() = format!(
+                    "◆ Ready.\n\n{rule}\n❯ {}\n{rule}\n  muse-wonder-full-1.0",
+                    fmt_d3.replace('\n', "\n  ")
+                );
+                Ok(())
+            },
+            || {
+                d3_enters += 1;
+                if let Some(submitted) = active_in_composer.borrow_mut().take() {
+                    *rendered_state.borrow_mut() = format!(
+                        "◆ Submitted.\n❯ {}\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0",
+                        submitted.lines().next().unwrap_or("")
+                    );
+                    submitted_log.borrow_mut().push(submitted);
+                }
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect("D3 must flush preserved D2 and paste/submit D3 without composer_occupied failure");
+
+        assert_eq!(d3_pastes, 1, "D3 must paste exactly once");
+        assert_eq!(
+            d3_enters, 2,
+            "expected 1 pre-paste flush Enter for D2 + 1 post-paste submit Enter for D3"
+        );
+        assert_eq!(
+            submitted_log.borrow().clone(),
+            vec![fmt_d2, fmt_d3],
+            "D2 must be flushed first, followed by D3 submission"
+        );
+        assert!(
+            !route_has_unconfirmed_wire_deliveries(&route_keys),
+            "route ledger must be completely cleared once rendered composer is observed empty"
+        );
     }
 }
