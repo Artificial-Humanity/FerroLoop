@@ -4338,6 +4338,71 @@ pub(crate) fn find_muse_transcript_path(
     None
 }
 
+/// Resolve a Muse session from the filesystem by exact `session_id` without consulting
+/// `FL_HOSTED_ID` or any persona environment variable (which a child Claude session launched inside
+/// a Muse terminal inherits).
+///
+/// Returns `Some(path)` when `session_id` matches a Muse transcript (`<id>/session.jsonl` or flat
+/// `<id>.jsonl`) or an existing Muse session directory (`~/.local/share/muse/sessions/.../<id>`) on
+/// disk; returns `None` otherwise. When `session.jsonl` exists inside the matched session
+/// directory, its path is returned so callers can also populate `transcript_path`.
+pub fn resolve_muse_session_from_fs(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let sid = session_id.trim();
+    if sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.starts_with('.') {
+        return None;
+    }
+    if let Some(transcript) = find_muse_transcript_path(home, Some(sid), None) {
+        return Some(transcript);
+    }
+    let mut dirs = vec![
+        home.join(".local")
+            .join("share")
+            .join("muse")
+            .join("sessions"),
+    ];
+    if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == home)
+        && let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+    {
+        let xdg_dir = PathBuf::from(xdg).join("muse").join("sessions");
+        if !dirs.contains(&xdg_dir) {
+            dirs.push(xdg_dir);
+        }
+    }
+    for root in dirs {
+        let mut stack = vec![(root, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(read_dir) = fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut entries: Vec<_> = read_dir.flatten().collect();
+            entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+            let mut subdirs = Vec::new();
+            for entry in entries {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if !kind.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || name.to_ascii_lowercase().contains("subagent") {
+                    continue;
+                }
+                let path = entry.path();
+                if name == sid {
+                    let candidate = path.join("session.jsonl");
+                    return Some(if candidate.is_file() { candidate } else { path });
+                }
+                if depth + 1 < MUSE_MAX_DEPTH {
+                    subdirs.push((path, depth + 1));
+                }
+            }
+            stack.extend(subdirs.into_iter().rev());
+        }
+    }
+    None
+}
+
 /// Muse transcripts under `sessions_dir`, newest names first: the flat `<id>.jsonl` form and the
 /// nested `YYYY/MM/DD/<id>/session.jsonl` form. Symlinks are not followed, dot-directories
 /// (`.msp-view-*`) and anything below a `subagent` directory are skipped, and the scan is bounded
@@ -5375,12 +5440,16 @@ pub fn resolve_persona_with_source(
 }
 
 fn persona_from_hosted_id(raw: &str) -> Option<String> {
+    if let Ok((_, persona)) = parse_hosted_identity(raw) {
+        return Some(persona);
+    }
     let (vendor, persona) = raw.trim().split_once(':')?;
     let vendor = vendor.trim();
     if vendor.is_empty()
         || !vendor
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !is_known_hosted_vendor(&vendor.to_ascii_lowercase())
     {
         return None;
     }
@@ -13428,6 +13497,9 @@ mod tests {
             libc::kill(-(pane_pid as i32), libc::SIGKILL);
         }
         let _ = pane_shell.wait();
+    }
+
+    #[test]
     fn resolve_persona_traced_resolves_fl_hosted_id_before_transcript_and_after_agent_persona() {
         assert_eq!(
             persona_from_hosted_id("muse:Melisandre"),
@@ -13441,6 +13513,16 @@ mod tests {
         assert_eq!(persona_from_hosted_id(":melisandre"), None);
         assert_eq!(persona_from_hosted_id("muse:"), None);
         assert_eq!(persona_from_hosted_id("muse:a:b"), None);
+        assert_eq!(persona_from_hosted_id("unknownvendor:kacey"), None);
+        assert_eq!(
+            persona_from_hosted_id("agy:Kacey"),
+            Some("kacey".to_string()),
+            "agy alias must keep resolving via the canonical vendor check"
+        );
+        assert_eq!(
+            persona_from_hosted_id("antigravity:Kacey"),
+            Some("kacey".to_string())
+        );
 
         let tmp = TempDir::new().unwrap();
         let cwd = tmp.path();
@@ -13567,5 +13649,36 @@ mod tests {
             scan_transcript_for_persona(&head_session, 50).as_deref(),
             Some("kacey")
         );
+    }
+
+    #[test]
+    fn resolve_muse_session_from_fs_matches_session_dir_and_transcript_only() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let muse_sid = "20261110_140000_00000000-0000-0000-0000-000000000471";
+        let claude_sid = "11111111-2222-3333-4444-555555555555";
+        let session_dir = home
+            .join(".local/share/muse/sessions/2026/11/10")
+            .join(muse_sid);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // Directory exists before `session.jsonl` is flushed -> returns the directory path.
+        assert_eq!(
+            resolve_muse_session_from_fs(home, muse_sid),
+            Some(session_dir.clone())
+        );
+
+        // Once `session.jsonl` exists -> returns the transcript file path.
+        let transcript = session_dir.join("session.jsonl");
+        fs::write(&transcript, "{\"type\":\"session.started\"}\n").unwrap();
+        assert_eq!(
+            resolve_muse_session_from_fs(home, muse_sid),
+            Some(transcript)
+        );
+
+        // Unrelated Claude session_id returns None.
+        assert_eq!(resolve_muse_session_from_fs(home, claude_sid), None);
+        assert_eq!(resolve_muse_session_from_fs(home, ""), None);
+        assert_eq!(resolve_muse_session_from_fs(home, "../escape"), None);
     }
 }

@@ -1060,12 +1060,26 @@ fn log_first_holds(rows: Vec<FenceDiagnostic>) {
 #[cfg(test)]
 type RegistrationProbeHook = Box<dyn FnMut(&mut RouteTable) + Send>;
 
+#[cfg(test)]
+type ComposerProbeHook = Box<dyn FnMut(&str, &VendorRoute) -> Option<bool> + Send>;
+
 const MAX_AWAITING_DAEMON_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const AWAITING_DAEMON_POLL_INTERVAL: Duration = if cfg!(test) {
     Duration::from_millis(50)
 } else {
     Duration::from_secs(2)
 };
+
+pub const COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF: Duration = Duration::from_secs(10);
+pub const COMPOSER_OCCUPIED_REPROBE_MAX_BACKOFF: Duration = Duration::from_secs(120);
+pub const COMPOSER_OCCUPIED_MAX_REPROBES: u32 = 16;
+
+#[derive(Debug, Clone)]
+struct ComposerOccupiedReprobeEntry {
+    next_probe_at: At,
+    backoff: Duration,
+    probes_run: u32,
+}
 
 #[derive(Default)]
 struct AwaitingDaemonEntry {
@@ -1093,6 +1107,9 @@ struct DaemonInner<S> {
     dispatch_diagnostics: Mutex<DiagnosticsState>,
     pending_by_recipient: Mutex<BTreeMap<String, BTreeMap<MessageId, At>>>,
     awaiting_daemon_state: Mutex<BTreeMap<MessageId, AwaitingDaemonEntry>>,
+    composer_occupied_reprobes: Mutex<BTreeMap<String, ComposerOccupiedReprobeEntry>>,
+    #[cfg(test)]
+    composer_probe_hook: Mutex<Option<ComposerProbeHook>>,
     #[cfg(test)]
     no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
@@ -1669,6 +1686,9 @@ where
             let mut evicted_no_route = false;
             let mut parked_no_route = false;
             let mut unresolved = false;
+            let is_composer_occupied_hold =
+                evidence.first_reason == FenceReason::ComposerOccupiedByNonWireInput;
+            let job_at = job.1.clone();
             let mut queues = lock(&self.dispatch_queues);
             if let Some(queue) = queues.get_mut(&recipient) {
                 queue.in_flight = None;
@@ -1713,12 +1733,18 @@ where
                 queues.remove(&recipient);
             }
             drop(queues);
+            if matches!(outcome, DispatchOutcome::Resolved) {
+                lock(&self.composer_occupied_reprobes).remove(&recipient);
+            }
             log_first_holds(first_hold.into_iter().collect());
             if evicted_no_route || parked_no_route {
                 self.wake_capacity_waiters();
                 return;
             }
             if unresolved {
+                if is_composer_occupied_hold {
+                    self.schedule_composer_occupied_reprobe(&recipient, &job_at);
+                }
                 warn(&format!(
                     "delivery unresolved for message {}; later messages for {} remain pending",
                     job.0,
@@ -1847,20 +1873,174 @@ where
         if let Some(queue) = lock(&self.dispatch_queues).get_mut(&name) {
             queue.overflowed = false;
         }
+        let mut has_pending = false;
         for item in &unread {
-            if item.receipt.status == DeliveryStatus::Pending
-                && let Err(message) = self.schedule_dispatch(
+            if item.receipt.status == DeliveryStatus::Pending {
+                has_pending = true;
+                if let Err(message) = self.schedule_dispatch(
                     &item.message,
                     std::slice::from_ref(&item.receipt),
                     now.clone(),
                     &mut first_holds,
-                )
-            {
-                warn(&message);
+                ) {
+                    warn(&message);
+                }
             }
+        }
+        if !has_pending {
+            lock(&self.composer_occupied_reprobes).remove(&name);
         }
         drop(_order);
         log_first_holds(first_holds);
+    }
+
+    fn recipient_has_zero_attempt_pending_only(&self, recipient: &str) -> bool {
+        let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
+            recipient: Some(recipient.to_string()),
+            unread_only: true,
+            ..Default::default()
+        }) else {
+            return false;
+        };
+        let mut any_pending = false;
+        for item in unread {
+            if item.receipt.status == DeliveryStatus::Pending {
+                if item.receipt.attempts > 0 {
+                    return false;
+                }
+                any_pending = true;
+            }
+        }
+        any_pending
+    }
+
+    fn schedule_composer_occupied_reprobe(&self, recipient: &str, observed_at: &At) {
+        if !self.recipient_has_zero_attempt_pending_only(recipient) {
+            lock(&self.composer_occupied_reprobes).remove(recipient);
+            return;
+        }
+        let now_ms = observed_at.unix_millis();
+        let mut reprobes = lock(&self.composer_occupied_reprobes);
+        reprobes
+            .entry(recipient.to_string())
+            .and_modify(|entry| {
+                if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                    // A fresh hold for an exhausted recipient must get a fresh budget,
+                    // otherwise the retained entry would never re-arm.
+                    let backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
+                    *entry = ComposerOccupiedReprobeEntry {
+                        next_probe_at: At::from_unix_millis(
+                            now_ms.saturating_add(backoff.as_millis() as u64),
+                        ),
+                        backoff,
+                        probes_run: 0,
+                    };
+                } else {
+                    entry.next_probe_at = At::from_unix_millis(
+                        now_ms.saturating_add(entry.backoff.as_millis() as u64),
+                    );
+                }
+            })
+            .or_insert_with(|| {
+                let backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
+                ComposerOccupiedReprobeEntry {
+                    next_probe_at: At::from_unix_millis(
+                        now_ms.saturating_add(backoff.as_millis() as u64),
+                    ),
+                    backoff,
+                    probes_run: 0,
+                }
+            });
+    }
+
+    /// Re-probe recipients held by a zero-key `ComposerOccupiedByNonWireInput` fence on a bounded
+    /// exponential backoff schedule (`10s -> 20s -> 40s -> 80s -> 120s`, up to
+    /// [`COMPOSER_OCCUPIED_MAX_REPROBES`]). Unconfirmed pastes (`attempts > 0`) are never
+    /// auto-retried here and continue to wait for an explicit `fl wire ack` / `fl wire read --ack`.
+    pub(crate) fn poll_composer_occupied_holds(self: &Arc<Self>, now: At) {
+        let now_ms = now.unix_millis();
+        let due: Vec<String> = lock(&self.composer_occupied_reprobes)
+            .iter()
+            .filter(|(_, entry)| {
+                entry.probes_run < COMPOSER_OCCUPIED_MAX_REPROBES
+                    && now_ms >= entry.next_probe_at.unix_millis()
+            })
+            .map(|(recipient, _)| recipient.clone())
+            .collect();
+        for recipient in due {
+            if !lock(&self.overflow_recipients).contains(&recipient) {
+                lock(&self.composer_occupied_reprobes).remove(&recipient);
+                continue;
+            }
+            if !self.recipient_has_zero_attempt_pending_only(&recipient) {
+                lock(&self.composer_occupied_reprobes).remove(&recipient);
+                continue;
+            }
+            let route = lock(&self.routes).get(&recipient).map(|e| e.route.clone());
+            let Some(route) = route else {
+                // A missing route still consumes probe budget and is logged, so polling
+                // stays bounded instead of retrying silently forever.
+                let counted = {
+                    let mut reprobes = lock(&self.composer_occupied_reprobes);
+                    reprobes.get_mut(&recipient).map(|entry| {
+                        entry.probes_run = entry.probes_run.saturating_add(1);
+                        entry.backoff =
+                            (entry.backoff * 2).min(COMPOSER_OCCUPIED_REPROBE_MAX_BACKOFF);
+                        entry.next_probe_at = At::from_unix_millis(
+                            now_ms.saturating_add(entry.backoff.as_millis() as u64),
+                        );
+                        (entry.probes_run, entry.backoff)
+                    })
+                };
+                if let Some((probes_run, backoff)) = counted {
+                    warn(&format!(
+                        "composer-occupied reprobe {probes_run}/{COMPOSER_OCCUPIED_MAX_REPROBES} for {recipient}: ready=None (no route), next backoff {backoff:?}"
+                    ));
+                }
+                continue;
+            };
+            let ready = {
+                #[cfg(test)]
+                {
+                    let mut hook = lock(&self.composer_probe_hook);
+                    if let Some(ref mut f) = *hook {
+                        f(&recipient, &route)
+                    } else if tests::has_test_transport() {
+                        None
+                    } else {
+                        crate::dispatcher::probe_route_composer_ready(&route)
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    crate::dispatcher::probe_route_composer_ready(&route)
+                }
+            };
+            let (probes_run, backoff) = {
+                let mut reprobes = lock(&self.composer_occupied_reprobes);
+                if let Some(entry) = reprobes.get_mut(&recipient) {
+                    entry.probes_run = entry.probes_run.saturating_add(1);
+                    entry.backoff = (entry.backoff * 2).min(COMPOSER_OCCUPIED_REPROBE_MAX_BACKOFF);
+                    entry.next_probe_at = At::from_unix_millis(
+                        now_ms.saturating_add(entry.backoff.as_millis() as u64),
+                    );
+                    (entry.probes_run, entry.backoff)
+                } else {
+                    continue;
+                }
+            };
+            warn(&format!(
+                "composer-occupied reprobe {probes_run}/{COMPOSER_OCCUPIED_MAX_REPROBES} for {recipient}: ready={ready:?}, next backoff {backoff:?}"
+            ));
+            // Fail closed: only a probe that positively observed a clean composer (or one
+            // exactly matching recorded deliveries) may resume dispatch. `Some(false)` means
+            // the composer still holds non-wire input or a dialog, and `None` means the probe
+            // could not observe the composer at all; both keep the fence and never send keys.
+            if ready != Some(true) {
+                continue;
+            }
+            self.maybe_unfence_and_resume(&recipient, now.clone());
+        }
     }
 
     #[cfg(test)]
@@ -2946,6 +3126,9 @@ where
         dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
         pending_by_recipient: Mutex::new(initial_pending),
         awaiting_daemon_state: Mutex::new(BTreeMap::new()),
+        composer_occupied_reprobes: Mutex::new(BTreeMap::new()),
+        #[cfg(test)]
+        composer_probe_hook: Mutex::new(None),
         #[cfg(test)]
         no_route_hook: Mutex::new(None),
         #[cfg(test)]
@@ -3003,6 +3186,7 @@ where
                 if last_poll.elapsed() >= AWAITING_DAEMON_POLL_INTERVAL {
                     last_poll = Instant::now();
                     inner_poll.drain_awaiting_daemon_messages(false);
+                    inner_poll.poll_composer_occupied_holds(now_at());
                 } else {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -3195,6 +3379,8 @@ mod tests {
             dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
             pending_by_recipient: Mutex::new(BTreeMap::new()),
             awaiting_daemon_state: Mutex::new(BTreeMap::new()),
+            composer_occupied_reprobes: Mutex::new(BTreeMap::new()),
+            composer_probe_hook: Mutex::new(None),
             no_route_hook: Mutex::new(None),
             empty_exit_hook: Mutex::new(None),
             fail_next_worker_spawn: AtomicBool::new(false),
@@ -3438,6 +3624,10 @@ mod tests {
         msg.id
     }
 
+    pub(super) fn has_test_transport() -> bool {
+        TRANSPORT_RESULT.with(|cell| cell.borrow().is_some())
+    }
+
     pub(super) fn dispatch_with_test_transport<S: MessageStore>(
         store: &S,
         routes: &mut RouteTable,
@@ -3473,11 +3663,12 @@ mod tests {
         }
     }
 
-    fn with_transport(outcome: Result<(), String>, f: impl FnOnce()) {
+    fn with_transport<T>(outcome: Result<(), String>, f: impl FnOnce() -> T) -> T {
         TRANSPORT_RESULT.with(|cell| *cell.borrow_mut() = Some(outcome));
         TRANSPORT_CALLS.with(|n| n.set(0));
-        f();
+        let out = f();
         TRANSPORT_RESULT.with(|cell| *cell.borrow_mut() = None);
+        out
     }
 
     fn check_fault(
@@ -8444,6 +8635,262 @@ mod tests {
             calls_on_second_poll.is_empty(),
             "periodic poll should skip get/receipts reads for unrouted markers when routes did not change, got {calls_on_second_poll:?}"
         );
+    }
+
+    #[test]
+    fn composer_occupied_zero_key_hold_auto_retries_with_backoff_and_delivers_when_cleared() {
+        let (tmp, inner) = fault_rig();
+        let webhook_sock = tmp.path().join("held-webhook.sock");
+        let webhook_listener = std::os::unix::net::UnixListener::bind(&webhook_sock).unwrap();
+        webhook_listener.set_nonblocking(true).unwrap();
+        lock(&inner.routes).upsert_explicit(
+            "held",
+            VendorRoute::Webhook {
+                socket_path: webhook_sock,
+            },
+            now_at(),
+        );
+        let occupied_err =
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
+                .to_string();
+
+        let id = with_transport(Err(occupied_err), || run_fault_job(&inner, "held"));
+
+        // 1. Pre-paste occupied composer leaves receipt `Pending` with `attempts == 0` and fences `held`.
+        let rcpts = inner.store.list_wire_receipts(&id).unwrap();
+        assert_eq!(rcpts.len(), 1);
+        assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(
+            rcpts[0].attempts, 0,
+            "zero-key pre-paste occupied hold must leave attempts at 0"
+        );
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+        {
+            let reprobes = lock(&inner.composer_occupied_reprobes);
+            let entry = reprobes
+                .get("held")
+                .expect("zero-key occupied hold must schedule background reprobe");
+            assert_eq!(entry.backoff, Duration::from_secs(10));
+            assert_eq!(entry.next_probe_at.unix_millis(), 1 + 10_000);
+            assert_eq!(entry.probes_run, 0);
+        }
+
+        // 2. While composer remains occupied (`Some(false)`), polls advance exponential backoff
+        //    `10s -> 20s -> 40s -> 80s -> 120s` (capped at 2m) and send zero keys.
+        let ready_flag = Arc::new(AtomicBool::new(false));
+        let ready_for_hook = Arc::clone(&ready_flag);
+        *lock(&inner.composer_probe_hook) = Some(Box::new(move |_, _| {
+            Some(ready_for_hook.load(Ordering::SeqCst))
+        }));
+
+        // Before initial 10s backoff expires -> no probe run.
+        inner.poll_composer_occupied_holds(At::from_unix_millis(10_000));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].probes_run,
+            0
+        );
+        assert!(webhook_listener.accept().is_err());
+
+        // Expected schedule starting at t = 1:
+        // Probe 1 at 10_001 -> backoff becomes 20s, next_probe_at = 30_001
+        // Probe 2 at 30_001 -> backoff becomes 40s, next_probe_at = 70_001
+        // Probe 3 at 70_001 -> backoff becomes 80s, next_probe_at = 150_001
+        // Probe 4 at 150_001 -> backoff becomes 120s (capped), next_probe_at = 270_001
+        let expected = [
+            (10_001u64, 1u32, Duration::from_secs(20), 30_001u64),
+            (30_001u64, 2u32, Duration::from_secs(40), 70_001u64),
+            (70_001u64, 3u32, Duration::from_secs(80), 150_001u64),
+            (150_001u64, 4u32, Duration::from_secs(120), 270_001u64),
+        ];
+        for (poll_ms, exp_probes, exp_backoff, exp_next_ms) in expected {
+            inner.poll_composer_occupied_holds(At::from_unix_millis(poll_ms));
+            let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+            assert_eq!(entry.probes_run, exp_probes);
+            assert_eq!(entry.backoff, exp_backoff);
+            assert_eq!(entry.next_probe_at.unix_millis(), exp_next_ms);
+            assert!(
+                webhook_listener.accept().is_err(),
+                "occupied composer probe must send zero keys"
+            );
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+        }
+
+        // 3. Human clears draft / submits their turn (`ready_flag = true`). Next due poll at
+        //    270_001 unfences `held` and delivers the held message cleanly with `attempts == 1`.
+        ready_flag.store(true, Ordering::SeqCst);
+        inner.poll_composer_occupied_holds(At::from_unix_millis(270_001));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let rcpts = inner.store.list_wire_receipts(&id).unwrap();
+            if rcpts[0].status == DeliveryStatus::Acked {
+                assert_eq!(
+                    rcpts[0].attempts, 1,
+                    "auto-retried delivery after zero-key hold must complete with attempts == 1"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for auto-retried delivery of {id}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            webhook_listener.accept().is_ok(),
+            "expected exactly one delivery after composer became ready"
+        );
+        assert!(
+            !lock(&inner.overflow_recipients).contains("held"),
+            "recipient must be unfenced after auto-retry succeeds"
+        );
+        assert!(
+            !lock(&inner.composer_occupied_reprobes).contains_key("held"),
+            "reprobe state must be cleared once delivery resolves"
+        );
+    }
+
+    #[test]
+    fn composer_occupied_unobservable_probe_none_fails_closed_and_sends_no_keys() {
+        let (_tmp, inner) = fault_rig();
+        let occupied_err =
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
+                .to_string();
+        let id = with_transport(Err(occupied_err), || run_fault_job(&inner, "held"));
+        let rcpts = inner.store.list_wire_receipts(&id).unwrap();
+        assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(rcpts[0].attempts, 0);
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+
+        // Probe cannot observe the composer (`None`): fence must stay, no dispatch, no keys.
+        *lock(&inner.composer_probe_hook) = Some(Box::new(|_, _| None));
+        with_transport(Ok(()), || {
+            inner.poll_composer_occupied_holds(At::from_unix_millis(60_000));
+            assert_eq!(
+                TRANSPORT_CALLS.with(|n| n.get()),
+                0,
+                "unobservable composer probe (None) must not re-dispatch or send keys"
+            );
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+        });
+        let rcpts = inner.store.list_wire_receipts(&id).unwrap();
+        assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(rcpts[0].attempts, 0);
+    }
+
+    #[test]
+    fn composer_occupied_route_missing_probe_counts_toward_max_and_logs() {
+        let (_tmp, inner) = fault_rig();
+        let occupied_err =
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
+                .to_string();
+        let _id = with_transport(Err(occupied_err), || run_fault_job(&inner, "held"));
+        assert!(lock(&inner.composer_occupied_reprobes).contains_key("held"));
+        // Route disappears before the first reprobe is due.
+        lock(&inner.routes).entries.remove("held");
+        let _ = take_warnings();
+
+        inner.poll_composer_occupied_holds(At::from_unix_millis(10_001));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].probes_run,
+            1,
+            "route-missing probe must count toward COMPOSER_OCCUPIED_MAX_REPROBES"
+        );
+        let warnings = take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("composer-occupied reprobe 1/")
+                    && w.contains("held")
+                    && w.contains("no route")),
+            "route-missing probe must be logged via warn, got {warnings:?}"
+        );
+
+        // Drive the entry to exhaustion following its own schedule; further polls do nothing.
+        loop {
+            let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+            if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                break;
+            }
+            inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+        }
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].probes_run,
+            COMPOSER_OCCUPIED_MAX_REPROBES
+        );
+        let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+        inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].probes_run,
+            COMPOSER_OCCUPIED_MAX_REPROBES,
+            "exhausted route-missing entry must not probe further"
+        );
+    }
+
+    #[test]
+    fn composer_occupied_fresh_hold_rearms_exhausted_reprobe_entry() {
+        let (_tmp, inner) = fault_rig();
+        let occupied_err =
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
+                .to_string();
+        let _id = with_transport(Err(occupied_err), || run_fault_job(&inner, "held"));
+        {
+            let mut reprobes = lock(&inner.composer_occupied_reprobes);
+            let entry = reprobes.get_mut("held").expect("reprobe entry");
+            entry.probes_run = COMPOSER_OCCUPIED_MAX_REPROBES;
+            entry.backoff = COMPOSER_OCCUPIED_REPROBE_MAX_BACKOFF;
+            entry.next_probe_at = At::from_unix_millis(999_999);
+        }
+        // A fresh zero-key hold for the same recipient resets the exhausted entry.
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+        assert_eq!(entry.probes_run, 0, "fresh hold must reset exhausted entry");
+        assert_eq!(entry.backoff, COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF);
+        assert_eq!(entry.next_probe_at.unix_millis(), 510_000);
+
+        // A non-exhausted entry is only rescheduled, not reset.
+        {
+            let mut reprobes = lock(&inner.composer_occupied_reprobes);
+            reprobes.get_mut("held").unwrap().probes_run = 3;
+        }
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(600_000));
+        let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+        assert_eq!(entry.probes_run, 3, "live entry must keep its probe count");
+    }
+
+    #[test]
+    fn composer_occupied_with_nonzero_attempts_never_auto_retries_without_explicit_ack() {
+        let (_tmp, inner) = fault_rig();
+        let post_paste_occupied_err =
+            "composer_occupied_by_non_wire_input: composer holds non-wire input after paste; aborting Enter retries"
+                .to_string();
+
+        let id = with_transport(Err(post_paste_occupied_err), || {
+            run_fault_job(&inner, "held")
+        });
+
+        let rcpts = inner.store.list_wire_receipts(&id).unwrap();
+        assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
+        assert_eq!(
+            rcpts[0].attempts, 1,
+            "post-paste occupied error must record attempts == 1 because keys were sent"
+        );
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+        assert!(
+            !lock(&inner.composer_occupied_reprobes).contains_key("held"),
+            "unconfirmed paste (attempts > 0) must never schedule background auto-retry"
+        );
+
+        *lock(&inner.composer_probe_hook) = Some(Box::new(|_, _| Some(true)));
+        with_transport(Ok(()), || {
+            inner.poll_composer_occupied_holds(At::from_unix_millis(60_000));
+            assert_eq!(
+                TRANSPORT_CALLS.with(|n| n.get()),
+                0,
+                "unconfirmed paste (attempts > 0) must not be re-dispatched by background poll"
+            );
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+        });
     }
 }
 

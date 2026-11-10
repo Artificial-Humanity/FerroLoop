@@ -2528,9 +2528,19 @@ fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
 }
 
+pub(crate) fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
+    is_composer_occupied_error(err) && err.contains("without sending keys")
+}
+
 fn composer_occupied_by_non_wire_input_error() -> String {
     format!(
         "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input or active dialog; holding delivery without sending keys"
+    )
+}
+
+fn composer_occupied_after_paste_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input after paste; aborting Enter retries"
     )
 }
 
@@ -2818,22 +2828,24 @@ fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
         .copied()
         .filter(|l| !l.trim().is_empty())
         .collect();
-    if !non_empty_tail
-        .iter()
-        .rev()
-        .take(3)
-        .any(|l| l.contains("[Pasted Content"))
-    {
+    let recent = &non_empty_tail[non_empty_tail.len().saturating_sub(3)..];
+    let slice = if let Some(prompt_pos) = recent.iter().rposition(|l| line_starts_with_prompt(l)) {
+        &recent[prompt_pos..]
+    } else if recent.iter().any(|l| l.contains("[Pasted Content")) {
+        if let Some(prompt_pos) = non_empty_tail
+            .iter()
+            .rposition(|l| line_starts_with_prompt(l))
+        {
+            &non_empty_tail[prompt_pos..]
+        } else {
+            recent
+        }
+    } else {
+        return None;
+    };
+    if lines_have_dialog_or_menu_markers(slice) {
         return None;
     }
-    let slice = if let Some(prompt_pos) = non_empty_tail
-        .iter()
-        .rposition(|l| line_starts_with_prompt(l))
-    {
-        &non_empty_tail[prompt_pos..]
-    } else {
-        &non_empty_tail[non_empty_tail.len().saturating_sub(3)..]
-    };
     build_compact_from_composer_slice(slice, false)
 }
 
@@ -4011,9 +4023,7 @@ fn confirm_paste_submission_with_raw(
                         };
                     }
                     if composer_has_unsubmitted_content(&contents, cursor) {
-                        return RetryPollDecision::Abort(
-                            composer_occupied_by_non_wire_input_error(),
-                        );
+                        return RetryPollDecision::Abort(composer_occupied_after_paste_error());
                     }
                     last_poll_rendered_empty.set(true);
                     if composer_visibly_submitted_with_cursor_and_raw(
@@ -4434,6 +4444,39 @@ fn is_known_static_ghost_placeholder(ghost_text: &str) -> bool {
     ) || ghost_text.starts_with("Try \"")
         || ghost_text.starts_with("Press ")
         || ghost_text.starts_with("? for shortcuts")
+        || is_muse_placeholder_hint(ghost_text)
+}
+
+/// Muse rotates grey hint texts in an empty composer (for example
+/// `/resume reopens a past session (--last for the latest)`). The rendered capture does not
+/// always carry ghost styling for them, so recognise the maintained hint list and the
+/// leading-slash hint pattern: a `/command` followed by a descriptive sentence. This is only
+/// consulted inside the ghost gate in `composer_has_unsubmitted_content`, where the cursor
+/// sits immediately after the prompt prefix — real typed input has the cursor past the text.
+fn is_muse_placeholder_hint(ghost_text: &str) -> bool {
+    const MUSE_HINTS: &[&str] = &[
+        "/resume reopens a past session (--last for the latest)",
+        "/help lists available commands",
+        "/model switches the model",
+        "/clear clears the conversation",
+    ];
+    if MUSE_HINTS.contains(&ghost_text) {
+        return true;
+    }
+    let mut words = ghost_text.split_whitespace();
+    let Some(command) = words.next() else {
+        return false;
+    };
+    if !command.starts_with('/')
+        || command.len() < 2
+        || !command[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return false;
+    }
+    // `/command` plus at least two descriptive words reads as a hint sentence, not input.
+    words.count() >= 2
 }
 
 /// `true` when `raw_ansi` applies ANSI dim/faint/gray SGR styling (`\x1b[2m`, `\x1b[90m`,
@@ -5572,6 +5615,75 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     })
 }
 
+/// Passively inspect `route`'s terminal composer without sending any keys.
+///
+/// Returns `Some(true)` when a rendered capture shows no dialog/menu markers and either an empty
+/// composer or only recorded unconfirmed FerroWire deliveries for `route`; `Some(false)` when the
+/// composer still holds non-wire input or an active dialog/menu; and `None` when the route does not
+/// use terminal composer verification or its rendered screen cannot be captured right now.
+pub(crate) fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
+    let target = match route {
+        VendorRoute::Muse {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::HostCli {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        } => tmux_pane
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| tmux_target.as_deref().filter(|s| !s.trim().is_empty()))
+            .unwrap_or(session_id.as_str())
+            .to_string(),
+        VendorRoute::Claude { .. } => claude_route_live_pane(route)?,
+        VendorRoute::Codex { .. } | VendorRoute::Agy { .. } | VendorRoute::Webhook { .. } => {
+            return None;
+        }
+    };
+    if target.trim().is_empty() {
+        return None;
+    }
+    let (contents, cursor, route_keys) = if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+        && let Some((mut client, stream, true)) = resolve_live_host_session_with_mode(&target)
+    {
+        let (contents, cursor) = capture_host_rendered_screen(&mut client, &stream)?.into_parts();
+        let route_keys = vec![
+            format!("host:{}", stream.session.as_str()),
+            format!("target:{target}"),
+        ];
+        (contents, cursor, route_keys)
+    } else {
+        let exact = tmux_exact_target(&target);
+        if !tmux_target_alive_passive(&exact) {
+            return None;
+        }
+        let (contents, cursor) = capture_tmux_rendered_screen(&tmux_bin(), &exact)?.into_parts();
+        let route_keys = vec![format!("tmux:{exact}"), format!("target:{target}")];
+        (contents, cursor, route_keys)
+    };
+    if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, &route_keys) {
+        return Some(false);
+    }
+    if !composer_has_unsubmitted_content(&contents, cursor)
+        || composer_equals_recorded_wire_deliveries(&contents, &route_keys)
+    {
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -5993,15 +6105,18 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                 }
             }
         }
-        let target_status = match pushed {
-            Ok(status) => status,
-            Err(_) => DeliveryStatus::Pending,
+        let (target_status, increment_attempts) = match pushed {
+            Ok(status) => (status, true),
+            Err(ref err) => (
+                DeliveryStatus::Pending,
+                !is_composer_occupied_zero_keys_error(err.as_str()),
+            ),
         };
         match store.update_wire_receipt(
             &msg.id,
             &rcpt.recipient_name,
             target_status,
-            true,
+            increment_attempts,
             now.clone(),
         ) {
             Ok(Some(new_rcpt)) => updated.push(new_rcpt),
@@ -13212,6 +13327,26 @@ exit 1"#,
             Some(CursorState::new(2, 2))
         ));
 
+        // Muse rotating placeholder hint in an empty composer (exact live line, Melisandre
+        // 2026-11-10): grey hint text, no ghost styling in the capture, cursor after `❯ ` ->
+        // empty (`false`). The same text with the cursor past it is real input (`true`).
+        let mut muse_hint_rows: Vec<String> = (0..36).map(|i| format!("row {i}")).collect();
+        muse_hint_rows[35] = "⏺ Done.".to_string();
+        muse_hint_rows.push(claude_titled_top.clone());
+        muse_hint_rows
+            .push("❯\u{a0}/resume reopens a past session (--last for the latest)".to_string());
+        muse_hint_rows.push(rule.clone());
+        muse_hint_rows.push("  claude-opus-4-6 · bypass permissions".to_string());
+        let muse_hint_screen = muse_hint_rows.join("\n");
+        assert!(
+            !composer_has_unsubmitted_content(&muse_hint_screen, Some(CursorState::new(37, 2))),
+            "Muse placeholder hint must not read as composer input"
+        );
+        assert!(composer_has_unsubmitted_content(
+            &muse_hint_screen,
+            Some(CursorState::new(37, 33))
+        ));
+
         // End-to-end mock-host delivery to `Hector.claude` displaying ANSI-dim ghost suggestion at
         // `(37, 2)` before paste and again after submit: 0 pre-paste Enters and 0 post-paste retry Enters!
         let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -17802,6 +17937,111 @@ exit 1"#,
             crate::dispatch_diagnostics::take_last_paste_settle_ms(),
             Some(50),
             "long placeholder must break on settle poll 1 (50ms)"
+        );
+    }
+
+    #[test]
+    fn ruleless_extract_composer_compact_handles_short_inline_prompt_and_fails_closed_on_output() {
+        let short_payload = "[fl-wire mail/normal] from felix (id: urn:uuid:019d8b30-4400-7000-8000-000000000471): ping\n\nok";
+        let d_short = UnconfirmedWireDelivery::from_payload(short_payload);
+
+        // Ruleless screen with short (< 150 char) inline prompt text in the last 3 non-empty lines.
+        let ruleless_short_prompt = "◆ Ready.\n\n❯ [fl-wire mail/normal] from felix (id: urn:uuid:019d8b30-4400-7000-8000-000000000471): ping\n  ok";
+        assert_eq!(
+            composer_equals_single_target(ruleless_short_prompt, &d_short),
+            (true, false),
+            "ruleless screen with inline short prompt must extract composer compact"
+        );
+
+        // Ruleless screen with model output only and no prompt or placeholder must fail closed (`None`).
+        let ruleless_output_only =
+            "◆ Thinking...\n  line 1 of model output\n  line 2 of model output";
+        let out_lines: Vec<&str> = ruleless_output_only.lines().collect();
+        assert_eq!(extract_composer_compact(&out_lines), None);
+
+        // Ruleless screen with an interactive menu (`❯ 1. Allow once`) must fail closed (`None`).
+        let ruleless_menu = "◆ Tool approval needed\n❯ 1. Allow once\n  2. Deny";
+        let menu_lines: Vec<&str> = ruleless_menu.lines().collect();
+        assert_eq!(extract_composer_compact(&menu_lines), None);
+    }
+
+    #[test]
+    fn zero_key_composer_occupied_leaves_receipt_attempts_at_zero_while_post_paste_increments() {
+        let store = MemStore::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let routes_path = tmp.path().join("routes.json");
+        let mut routes = RouteTable::load(Some(&routes_path));
+        routes.upsert_explicit(
+            "kacey",
+            VendorRoute::Muse {
+                session_id: "sid-471".into(),
+                cwd: None,
+                tmux_target: Some("muse:kacey".into()),
+                tmux_pane: Some("%47".into()),
+            },
+            At::from_unix_millis(10),
+        );
+
+        let (msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kacey".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "zero-key occupied".into(),
+                body: "hold without burning attempt".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(20),
+            })
+            .unwrap();
+
+        // 1. Pre-paste occupied composer error (0 keys sent) must keep `attempts == 0`.
+        let mut report = DispatchReport::default();
+        let (updated, attempted) = dispatch_message_for_recipient_with_test_dispatch(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(30),
+            "kacey",
+            &mut report,
+            |_, _| Err(composer_occupied_by_non_wire_input_error()),
+        );
+        assert_eq!(attempted, Some(true));
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].status, DeliveryStatus::Pending);
+        assert_eq!(
+            updated[0].attempts, 0,
+            "pre-paste zero-key composer_occupied hold must not increment receipt attempts"
+        );
+        assert_eq!(
+            report.failure_stages,
+            vec![FailureStage::ComposerOccupiedByNonWireInput]
+        );
+
+        // 2. Post-paste occupied composer error (after `write_payload` sent keys) MUST increment `attempts` to 1.
+        let mut post_report = DispatchReport::default();
+        let (updated_post, _) = dispatch_message_for_recipient_with_test_dispatch(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(40),
+            "kacey",
+            &mut post_report,
+            |_, _| Err(composer_occupied_after_paste_error()),
+        );
+        assert_eq!(updated_post.len(), 1);
+        assert_eq!(updated_post[0].status, DeliveryStatus::Pending);
+        assert_eq!(
+            updated_post[0].attempts, 1,
+            "post-paste composer_occupied abort must increment receipt attempts because keys were sent"
         );
     }
 }

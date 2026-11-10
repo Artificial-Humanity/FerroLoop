@@ -1993,7 +1993,7 @@ fn vendor_hook_response(
         .and_then(Value::as_str)
         .or(env_grok_event.as_deref())
         .unwrap_or("Stop");
-    let transcript_path = payload
+    let mut transcript_path = payload
         .get("transcript_path")
         .and_then(Value::as_str)
         .map(PathBuf::from);
@@ -2024,15 +2024,40 @@ fn vendor_hook_response(
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let is_muse = vendor_str == Some("muse")
-        || tp_str.contains(".muse")
-        || tp_str.contains("/muse/")
-        || payload.get("event").is_some();
     let is_grok = vendor_str == Some("grok")
         || tp_str.contains(".grok")
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || payload.get("hookEventName").is_some();
     let is_codex = vendor_str == Some("codex") || tp_str.contains(".codex");
+    // Muse's `.claude-plugin` (`agent-bus-claude-hook`) invokes `fl wire hook claude` with a
+    // Claude-shaped payload (`hook_event_name`, `session_id`, `cwd`) and no `vendor`, `event`, or
+    // `transcript_path`. That subcommand sets `explicit_vendor=Some("claude")`, so the FS match
+    // must run for `None` and for `"claude"` alike (never for grok/codex). Classify by matching
+    // `session_id` against `~/.local/share/muse/sessions` (never `FL_HOSTED_ID`) so a Muse
+    // session gets its `session.jsonl` and `muse` vendor while a child Claude session inside a
+    // Muse terminal stays `claude`.
+    let muse_fs_match = if (vendor_str.is_none() || vendor_str == Some("claude"))
+        && !is_grok
+        && !is_codex
+        && !session_id.is_empty()
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|home| fl_wire::identity::resolve_muse_session_from_fs(&home, &session_id))
+    } else {
+        None
+    };
+    if transcript_path.is_none()
+        && let Some(ref path) = muse_fs_match
+        && path.is_file()
+    {
+        transcript_path = Some(path.clone());
+    }
+    let is_muse = vendor_str == Some("muse")
+        || tp_str.contains(".muse")
+        || tp_str.contains("/muse/")
+        || payload.get("event").is_some()
+        || muse_fs_match.is_some();
 
     // `grok -p` is a one-shot command, not an agent. It fires the same hooks as an interactive
     // session but must never touch the route table or read the inbox. Its summary may not
@@ -6565,6 +6590,7 @@ pub(crate) mod tests {
             std::env::remove_var("FL_WIRE_ROUTES");
         }
     }
+    #[test]
     fn muse_hook_resolves_persona_past_50_lines_and_via_fl_hosted_id() {
         let rig = HookRig::new(None);
         let session_dir = rig
@@ -6655,5 +6681,163 @@ pub(crate) mod tests {
             rig.route_of("melisandre"),
             Some(VendorRoute::Muse { ref session_id, .. }) if session_id == "muse-hosted-sid"
         ));
+    }
+
+    #[test]
+    fn claude_shaped_muse_plugin_hook_resolves_session_dir_and_preserves_foreign_claude_guard() {
+        use std::io::Write;
+
+        let _guard = hook_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("store.redb");
+        let routes = tmp.path().join("routes.json");
+        let fake_home = tmp.path().join("home");
+        let muse_sid = "20261110_141200_00000000-0000-0000-0000-000000000471";
+        let muse_session_dir = fake_home
+            .join(".local/share/muse/sessions/2026/11/10")
+            .join(muse_sid);
+        std::fs::create_dir_all(&muse_session_dir).unwrap();
+        let muse_tp = muse_session_dir.join("session.jsonl");
+        {
+            let mut f = std::fs::File::create(&muse_tp).unwrap();
+            for idx in 0..80 {
+                writeln!(
+                    f,
+                    r#"{{"payload_type":"session.event","payload":{{"seq":{idx}}}}}"#
+                )
+                .unwrap();
+            }
+            writeln!(
+                f,
+                r#"{{"payload_type":"runtime.user_intent.accepted","payload":{{"model_messages":[{{"role":"user","content":"You are Kacey, the Muse agent."}}]}}}}"#
+            )
+            .unwrap();
+        }
+
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::set_var("FL_WIRE_ROUTES", &routes);
+            std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+            std::env::set_var("FL_HOSTED_ID", "muse:kacey");
+            std::env::remove_var("AGENT_PERSONA");
+            std::env::remove_var("AGENT_NAME");
+        }
+
+        let cfg = Config::default();
+        let env = StateEnv {
+            explicit_db: Some(&db),
+            default_store: tmp.path(),
+            cfg: &cfg,
+            cwd: tmp.path(),
+        };
+
+        // 1. Muse's `.claude-plugin` (`agent-bus-claude-hook`) invokes `run_claude_hook` ->
+        // `vendor_hook_response(&env, None, ...)` with a Claude-shaped payload lacking `vendor`,
+        // `event`, and `transcript_path`. Because `session_id` matches `~/.local/share/muse/sessions`,
+        // it classifies as `muse`, locates `session.jsonl`, and registers `VendorRoute::Muse`.
+        let muse_payload = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": muse_sid,
+            "cwd": tmp.path().to_string_lossy(),
+        });
+        vendor_hook_response(&env, None, &muse_payload.to_string()).unwrap();
+
+        let table = RouteTable::load(Some(&routes));
+        let entry = table
+            .get("kacey")
+            .expect("Muse .claude-plugin hook must register kacey");
+        assert!(
+            matches!(
+                &entry.route,
+                VendorRoute::Muse { session_id, .. } if session_id == muse_sid
+            ),
+            "expected Muse route for {muse_sid}, got {:?}",
+            entry.route
+        );
+
+        // 2. When `FL_HOSTED_ID` is unset, the same Claude-shaped payload still locates
+        // `session.jsonl` on disk and resolves `kacey` from line 81 via the bounded tail scan.
+        unsafe {
+            std::env::remove_var("FL_HOSTED_ID");
+        }
+        let routes_tail = tmp.path().join("routes-tail.json");
+        unsafe {
+            std::env::set_var("FL_WIRE_ROUTES", &routes_tail);
+        }
+        vendor_hook_response(&env, None, &muse_payload.to_string()).unwrap();
+        let tail_table = RouteTable::load(Some(&routes_tail));
+        assert!(
+            matches!(
+                tail_table.get("kacey").map(|e| &e.route),
+                Some(VendorRoute::Muse { session_id, .. }) if session_id == muse_sid
+            ),
+            "Claude-shaped Muse hook must locate session.jsonl and scan tail past line 50"
+        );
+
+        // 3. A child Claude session launched inside the Muse terminal (`FL_HOSTED_ID=muse:kacey`)
+        // whose `session_id` has no matching Muse session directory stays `claude` and is refused
+        // by the foreign-hosted-env guard without clobbering the Muse route.
+        unsafe {
+            std::env::set_var("FL_WIRE_ROUTES", &routes);
+            std::env::set_var("FL_HOSTED_ID", "muse:kacey");
+        }
+        let child_claude_payload = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "99999999-8888-7777-6666-555555555555",
+            "cwd": tmp.path().to_string_lossy(),
+        });
+        vendor_hook_response(&env, None, &child_claude_payload.to_string()).unwrap();
+        let after_child = RouteTable::load(Some(&routes));
+        assert!(
+            matches!(
+                after_child.get("kacey").map(|e| &e.route),
+                Some(VendorRoute::Muse { session_id, .. }) if session_id == muse_sid
+            ),
+            "child Claude session with no Muse session dir must stay claude and be blocked by ForeignHostedEnv"
+        );
+
+        // 4. The real `.claude-plugin` entry point is `fl wire hook claude`, i.e.
+        // `vendor_hook_response(&env, Some("claude"), ...)`. The Muse session-dir FS match
+        // must still run for that explicit vendor and register the Muse route.
+        let routes_explicit = tmp.path().join("routes-explicit.json");
+        unsafe {
+            std::env::set_var("FL_WIRE_ROUTES", &routes_explicit);
+            std::env::set_var("FL_HOSTED_ID", "muse:kacey");
+        }
+        vendor_hook_response(&env, Some("claude"), &muse_payload.to_string()).unwrap();
+        let explicit_table = RouteTable::load(Some(&routes_explicit));
+        assert!(
+            matches!(
+                explicit_table.get("kacey").map(|e| &e.route),
+                Some(VendorRoute::Muse { session_id, .. }) if session_id == muse_sid
+            ),
+            "explicit `fl wire hook claude` invocation must still match the Muse session dir, got {:?}",
+            explicit_table.get("kacey").map(|e| &e.route)
+        );
+
+        // 5. A child Claude session invoked the same way (`Some("claude")`) whose
+        // `session_id` has no Muse session directory must stay `claude` and not clobber
+        // the Muse route registered in step 4.
+        vendor_hook_response(&env, Some("claude"), &child_claude_payload.to_string()).unwrap();
+        let after_explicit_child = RouteTable::load(Some(&routes_explicit));
+        assert!(
+            matches!(
+                after_explicit_child.get("kacey").map(|e| &e.route),
+                Some(VendorRoute::Muse { session_id, .. }) if session_id == muse_sid
+            ),
+            "child Claude session via Some(\"claude\") with no Muse dir must stay claude"
+        );
+
+        unsafe {
+            if let Some(h) = prev_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            std::env::remove_var("FL_WIRE_ROUTES");
+            std::env::remove_var("FL_WIRE_DISABLE_HOST_DISCOVERY");
+            std::env::remove_var("FL_HOSTED_ID");
+        }
     }
 }
