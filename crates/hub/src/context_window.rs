@@ -177,6 +177,11 @@ fn classify_claude_major(raw_model: &str) -> Option<ClaudeMajor> {
     }
 }
 
+/// Default active-token ceiling for `claude --resume` (`75%` of the 1M window).
+pub(crate) const MAX_CLAUDE_RESUME_ACTIVE_TOKENS: u64 = 750_000;
+/// Fallback post-compaction conversational byte ceiling when `active_context_tokens` is absent.
+pub(crate) const MAX_CLAUDE_RESUME_POST_COMPACT_CONVERSATIONAL_BYTES: u64 = 3_600_000;
+
 /// Resolve the effective context window (in tokens) for a Claude session from existing catalog
 /// and session metadata sources:
 /// 1. Explicit positive `record_window` on the hosted session record.
@@ -187,7 +192,6 @@ fn classify_claude_major(raw_model: &str) -> Option<ClaudeMajor> {
 ///    `anthropic-api` default window (`200_000`).
 /// 4. Otherwise (Claude 5.x+ models, unversioned CLI aliases `opus`/`sonnet`/`haiku`, or `None`)
 ///    -> [`crate::discovery::ASSUMED_LARGE_CONTEXT_WINDOW`] (`1_000_000`).
-#[allow(dead_code)]
 pub(crate) fn claude_session_context_window(
     record_window: Option<u64>,
     record_model: Option<&str>,
@@ -224,7 +228,6 @@ pub(crate) fn claude_session_context_window(
 }
 
 /// Model-relative active-token ceiling for `claude --resume`: `min(ceiling, 75% of window_tokens)`.
-#[allow(dead_code)]
 pub(crate) fn claude_resume_active_token_cap(window_tokens: u64, ceiling: u64) -> u64 {
     ceiling.min(window_tokens.saturating_mul(3) / 4)
 }

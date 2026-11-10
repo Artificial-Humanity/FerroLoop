@@ -622,7 +622,7 @@ pub fn preserve_on_replace(
     (role, extras)
 }
 
-pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
+pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageStore>(
     store: &S,
     cmd: AgentCmd,
 ) -> Result<(), (i32, String)> {

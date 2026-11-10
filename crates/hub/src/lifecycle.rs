@@ -19,7 +19,7 @@ use fl_core::state::{
     HandoffEntry, MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload,
     StateScope, UpsertStateArgs, validate_slug,
 };
-use fl_core::store::{AgentRegistry, Catalog, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, Catalog, MessageStore, StateStore, StoreError};
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
 use fl_exec::stamp;
 use fl_wire::dispatcher::{
@@ -871,11 +871,421 @@ fn launch_spec_for_with_session(
     Ok(Some(spec))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resume_spec_for_with_session(
+    env: &LifecycleEnv<'_>,
+    vendor: &str,
+    persona: &str,
+    model: Option<&str>,
+    thinking_level: Option<&str>,
+    posture: fl_core::permissions::Posture,
+    cwd: Option<&str>,
+    vendor_session_id: &str,
+    hydration_generation: Option<&str>,
+) -> Result<Option<LaunchSpec>, LifecycleError> {
+    let home = env
+        .home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let options = env.vendor_launch_options_for_vendor(vendor, posture);
+    if let Some(host_adapter) = env.host_vendor_adapter(vendor) {
+        let binding = fl_core::AdapterIdentityBinding::new(
+            format!("{vendor}:{persona}"),
+            1,
+            hosted_tmux_target(vendor, persona),
+            None,
+        )
+        .with_vendor_session_id(vendor_session_id);
+        let req = fl_core::AttachOrResumeRequest {
+            binding,
+            vendor_session_id: vendor_session_id.to_string(),
+            control_endpoint: None,
+            cwd: cwd.map(PathBuf::from),
+            home_dir: home.clone(),
+            persona: Some(persona.to_string()),
+            model: model.map(str::to_string),
+            thinking_effort: thinking_level.map(str::to_string),
+            remote_control: options.remote_control,
+            posture,
+            auto_approval: options.auto_approval,
+        };
+        match host_adapter.prepare_resume(&req) {
+            Ok(plan) => {
+                let mut spec = LaunchSpec {
+                    env: plan.env,
+                    argv: plan.argv,
+                };
+                apply_vendor_launch_env(
+                    &mut spec.env,
+                    vendor,
+                    persona,
+                    home.as_deref(),
+                    hydration_generation,
+                );
+                return Ok(Some(spec));
+            }
+            Err(fl_core::VendorAdapterError::PermissionRefused { reason, .. }) => {
+                let detail = reason
+                    .strip_prefix("posture:")
+                    .map(str::trim_start)
+                    .unwrap_or(&reason);
+                return Err(invalid_field("posture", detail));
+            }
+            Err(fl_core::VendorAdapterError::Unsupported { .. }) => {}
+            Err(host_err) => {
+                return Err(LifecycleError::Invalid(host_err.to_string()));
+            }
+        }
+    }
+    let Some(adapter) = env.vendor_adapter(vendor) else {
+        return Ok(None);
+    };
+    let mut spec = adapter
+        .build_resume_spec_with_options(
+            persona,
+            vendor_session_id,
+            model,
+            thinking_level,
+            home.as_deref(),
+            options,
+        )
+        .map_err(|why| invalid_field("posture", &why))?;
+    apply_vendor_launch_env(
+        &mut spec.env,
+        vendor,
+        persona,
+        home.as_deref(),
+        hydration_generation,
+    );
+    Ok(Some(spec))
+}
+
+fn find_active_claude_transcript_path(
+    env: &LifecycleEnv<'_>,
+    vendor_session_id: &str,
+) -> Option<PathBuf> {
+    let home = env
+        .home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
+    if let Some(host_adapter) = env.host_vendor_adapter("claude") {
+        match host_adapter.find_active_session_transcript_path(&home, vendor_session_id) {
+            Ok(path) => return path,
+            Err(fl_core::VendorAdapterError::Unsupported { .. }) => {}
+            Err(_) => return None,
+        }
+    }
+    env.vendor_adapter("claude").and_then(|adapter| {
+        adapter
+            .find_active_session_transcript_path(&home, vendor_session_id)
+            .ok()
+            .flatten()
+    })
+}
+
+fn repair_claude_transcript_tail(
+    env: &LifecycleEnv<'_>,
+    transcript_path: &Path,
+) -> Result<usize, fl_core::VendorAdapterError> {
+    if let Some(host_adapter) = env.host_vendor_adapter("claude") {
+        match host_adapter.repair_session_transcript_tail(transcript_path) {
+            Err(fl_core::VendorAdapterError::Unsupported { .. }) => {}
+            res => return res,
+        }
+    }
+    if let Some(adapter) = env.vendor_adapter("claude") {
+        return adapter.repair_session_transcript_tail(transcript_path);
+    }
+    Err(fl_core::VendorAdapterError::Unsupported {
+        vendor: "claude".to_string(),
+        operation: "repair_session_transcript_tail".to_string(),
+        reason: "no Claude adapter registered".to_string(),
+    })
+}
+
+fn estimate_claude_post_compaction_context(
+    env: &LifecycleEnv<'_>,
+    transcript_path: &Path,
+) -> Result<fl_core::PostCompactionContext, fl_core::VendorAdapterError> {
+    if let Some(host_adapter) = env.host_vendor_adapter("claude") {
+        match host_adapter.estimate_post_compaction_context(transcript_path) {
+            Err(fl_core::VendorAdapterError::Unsupported { .. }) => {}
+            res => return res,
+        }
+    }
+    if let Some(adapter) = env.vendor_adapter("claude") {
+        return adapter.estimate_post_compaction_context(transcript_path);
+    }
+    Err(fl_core::VendorAdapterError::Unsupported {
+        vendor: "claude".to_string(),
+        operation: "estimate_post_compaction_context".to_string(),
+        reason: "no Claude adapter registered".to_string(),
+    })
+}
+
+/// Sync `record.vendor_session_id` from a live `VendorRoute::Claude` for `record.persona` when an
+/// interactive `/clear` rotated the active Claude session ID and its `.jsonl` transcript exists
+/// under `<home>/.claude/projects/*/`.
+fn sync_claude_vendor_session_id_from_route(
+    env: &LifecycleEnv<'_>,
+    record: &mut HostedSessionRecord,
+) -> bool {
+    if record.vendor != "claude" {
+        return false;
+    }
+    for path in route_table_paths(env.home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        let Some(entry) = table.get(&record.persona) else {
+            continue;
+        };
+        let VendorRoute::Claude { session_id, .. } = &entry.route else {
+            continue;
+        };
+        let sid = session_id.trim();
+        if !is_native_session_id(sid)
+            || record
+                .tombstone_ids
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(sid))
+            || record.vendor_session_id.as_deref() == Some(sid)
+        {
+            continue;
+        }
+        if find_active_claude_transcript_path(env, sid).is_some() {
+            record.vendor_session_id = Some(sid.to_string());
+            return true;
+        }
+    }
+    false
+}
+
+enum ClaudeResumeDecision {
+    ResumeExisting {
+        vendor_session_id: String,
+        hydration_generation: String,
+        launch: Option<LaunchSpec>,
+    },
+    FreshLaunch {
+        reason_code: &'static str,
+        detail: String,
+    },
+}
+
+fn push_claude_resume_fallback_notice(
+    env: &LifecycleEnv<'_>,
+    persona: &str,
+    warnings: &mut Vec<String>,
+    reason_code: &str,
+    detail: &str,
+) {
+    let notice = format!(
+        "claude:{persona} resume fallback ({reason_code}): {detail}; launching fresh session"
+    );
+    if env.log_hydration_warnings {
+        eprintln!("hub: warning ({persona} / claude:{persona}): {notice}");
+    }
+    warnings.push(notice);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_claude_resume_eligibility<S: StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    record: &mut HostedSessionRecord,
+    recast_staged: bool,
+    effective_model: Option<&str>,
+    effective_thinking_level: Option<&str>,
+    effective_context_window: Option<u64>,
+    posture: fl_core::permissions::Posture,
+    cwd: Option<&str>,
+) -> Result<ClaudeResumeDecision, LifecycleError> {
+    if recast_staged {
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "recast_guidance_staged",
+            detail: format!("recast assignment staged for `{}`", record.persona),
+        });
+    }
+    let _ = promote_confirmed_hydration(store, record);
+    let Some(existing_gen) = record
+        .hydration_generation
+        .clone()
+        .filter(|g| is_valid_hydration_generation(g))
+        .filter(|_| record.hydration_status == HydrationStatus::Confirmed)
+    else {
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "unconfirmed_hydration",
+            detail: format!("hydration status is `{}`", record.hydration_status),
+        });
+    };
+    let Some(sid) = record
+        .vendor_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| {
+            is_native_session_id(s)
+                && !record
+                    .tombstone_ids
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(s))
+        })
+        .map(str::to_string)
+    else {
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "missing_or_tombstoned_session_id",
+            detail: "vendor_session_id is missing, invalid, or tombstoned".to_string(),
+        });
+    };
+    let Some(transcript_path) = find_active_claude_transcript_path(env, &sid) else {
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "missing_or_archived_transcript",
+            detail: format!(
+                "no active transcript found for session `{sid}` under ~/.claude/projects/"
+            ),
+        });
+    };
+    match repair_claude_transcript_tail(env, &transcript_path) {
+        Ok(truncated_bytes) => {
+            if truncated_bytes > 0 && env.log_hydration_warnings {
+                eprintln!(
+                    "hub: warning ({} / claude:{}): repaired {truncated_bytes} torn trailing byte(s) in `{}`",
+                    record.persona,
+                    record.persona,
+                    transcript_path.display()
+                );
+            }
+        }
+        Err(err) => {
+            return Ok(ClaudeResumeDecision::FreshLaunch {
+                reason_code: "empty_or_unparseable_transcript",
+                detail: format!(
+                    "transcript tail repair failed for `{}`: {err}",
+                    transcript_path.display()
+                ),
+            });
+        }
+    }
+    let ctx = match estimate_claude_post_compaction_context(env, &transcript_path) {
+        Ok(ctx) if ctx.turn_count > 0 => ctx,
+        Ok(_) => {
+            return Ok(ClaudeResumeDecision::FreshLaunch {
+                reason_code: "empty_or_unparseable_transcript",
+                detail: format!(
+                    "transcript `{}` has 0 normalized turns",
+                    transcript_path.display()
+                ),
+            });
+        }
+        Err(err) => {
+            return Ok(ClaudeResumeDecision::FreshLaunch {
+                reason_code: "empty_or_unparseable_transcript",
+                detail: format!(
+                    "transcript parse failed for `{}`: {err}",
+                    transcript_path.display()
+                ),
+            });
+        }
+    };
+    let max_ceiling = std::env::var("FL_CLAUDE_MAX_RESUME_ACTIVE_TOKENS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(crate::context_window::MAX_CLAUDE_RESUME_ACTIVE_TOKENS);
+    let window_tokens = crate::context_window::claude_session_context_window(
+        effective_context_window,
+        effective_model,
+        ctx.latest_model.as_deref(),
+    );
+    let cap = crate::context_window::claude_resume_active_token_cap(window_tokens, max_ceiling);
+    if let Some(active_tokens) = ctx.active_context_tokens {
+        if active_tokens > cap {
+            return Ok(ClaudeResumeDecision::FreshLaunch {
+                reason_code: "context_over_cap",
+                detail: format!(
+                    "post-compaction active_context_tokens ({active_tokens}) exceeds cap ({cap}) for window ({window_tokens})"
+                ),
+            });
+        }
+    } else if ctx.post_compact_conversational_bytes
+        > crate::context_window::MAX_CLAUDE_RESUME_POST_COMPACT_CONVERSATIONAL_BYTES
+    {
+        return Ok(ClaudeResumeDecision::FreshLaunch {
+            reason_code: "context_over_cap",
+            detail: format!(
+                "post-compaction conversational bytes ({}) exceeds cap ({})",
+                ctx.post_compact_conversational_bytes,
+                crate::context_window::MAX_CLAUDE_RESUME_POST_COMPACT_CONVERSATIONAL_BYTES
+            ),
+        });
+    }
+    let launch = resume_spec_for_with_session(
+        env,
+        "claude",
+        &record.persona,
+        effective_model,
+        effective_thinking_level,
+        posture,
+        cwd,
+        &sid,
+        Some(&existing_gen),
+    )?;
+    Ok(ClaudeResumeDecision::ResumeExisting {
+        vendor_session_id: sid,
+        hydration_generation: existing_gen,
+        launch,
+    })
+}
+
 #[cfg(test)]
 fn resolve_muse_bin(configured: Option<std::ffi::OsString>, home: Option<&Path>) -> String {
     resolve_vendor_bin(configured, home, "muse")
 }
 
+/// Build the `(env, env_allow)` pair passed to `fl-host` when spawning a hosted session.
+///
+/// Any agent-identity variable (`AGENT_NAME`, `AGENT_PERSONA`, `AGENT_HYDRATION_GENERATION`,
+/// `FL_HOSTED_ID`) not explicitly populated in `env` is removed from `env_allow` so `fl-host`
+/// never inherits ambient parent identity variables into a child session.
+pub fn build_host_spawn_env(
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
+) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    let mut env_map = BTreeMap::new();
+    let mut env_allow: BTreeSet<String> = fl_core::child_env::BASELINE_EXACT
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Some(spec) = launch {
+        for (k, v) in &spec.env {
+            env_allow.insert(k.clone());
+            env_map.insert(k.clone(), v.clone());
+        }
+    }
+    // Interactive CLIs pick their color depth from these; a launch spec's own value wins.
+    for (key, default) in [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")] {
+        env_allow.insert(key.to_string());
+        env_map
+            .entry(key.to_string())
+            .or_insert_with(|| default.to_string());
+    }
+    if !hosted_id.is_empty() {
+        env_allow.insert("FL_HOSTED_ID".to_string());
+        env_map.insert("FL_HOSTED_ID".to_string(), hosted_id.to_string());
+    }
+    for key in [
+        "AGENT_NAME",
+        "AGENT_PERSONA",
+        "AGENT_HYDRATION_GENERATION",
+        "FL_HOSTED_ID",
+    ] {
+        if !env_map.contains_key(key) {
+            env_allow.remove(key);
+        }
+    }
+    (env_map, env_allow)
+}
 /// The native runtime: `fl-host`, falling back to `TmuxRuntime` only when `FL_WIRE_TMUX_BIN` is
 /// explicitly configured and `fl-host` is not reachable.
 #[derive(Debug, Clone, Copy)]
@@ -1124,31 +1534,7 @@ impl SessionRuntime for HostRuntime {
             .filter(|d| Path::new(d).is_dir())
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
-        let mut env_map = BTreeMap::new();
-        let mut env_allow: BTreeSet<String> = fl_core::child_env::BASELINE_EXACT
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        if let Some(spec) = launch {
-            for (k, v) in &spec.env {
-                env_allow.insert(k.clone());
-                env_map.insert(k.clone(), v.clone());
-            }
-        }
-        if !env_map.contains_key("AGENT_HYDRATION_GENERATION") {
-            env_allow.remove("AGENT_HYDRATION_GENERATION");
-        }
-        // Interactive CLIs pick their color depth from these; a launch spec's own value wins.
-        for (key, default) in [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")] {
-            env_allow.insert(key.to_string());
-            env_map
-                .entry(key.to_string())
-                .or_insert_with(|| default.to_string());
-        }
-        if !hosted_id.is_empty() {
-            env_allow.insert("FL_HOSTED_ID".to_string());
-            env_map.insert("FL_HOSTED_ID".to_string(), hosted_id.to_string());
-        }
+        let (mut env_map, mut env_allow) = build_host_spawn_env(launch, hosted_id);
         let use_pty_mode = cfg!(unix)
             && std::env::var_os("FL_HOST_DISABLE_PTY_MODE")
                 .is_none_or(|v| v != "1" && !v.eq_ignore_ascii_case("true"));
@@ -1416,6 +1802,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) spawn_cwds: std::cell::RefCell<Vec<Option<String>>>,
     /// Windows whose runtime is gone right after its spawn (a launched command that exits).
     pub(crate) vanish_windows: std::cell::RefCell<Vec<String>>,
+    /// Windows whose runtime is gone right after its next single spawn (then cleared).
+    pub(crate) vanish_once_windows: std::cell::RefCell<Vec<String>>,
     /// How many times `exists` was asked.
     pub(crate) exists_calls: std::cell::Cell<u32>,
     /// How many times `owns` was asked (the survival check of a launched command).
@@ -1619,7 +2007,16 @@ impl SessionRuntime for FakeRuntime {
             self.launches
                 .borrow_mut()
                 .push((unit.clone(), launch.cloned()));
-            if self.vanish_windows.borrow().iter().any(|w| w == window) {
+            let vanish_once = {
+                let mut once = self.vanish_once_windows.borrow_mut();
+                if let Some(pos) = once.iter().position(|w| w == window) {
+                    once.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            };
+            if vanish_once || self.vanish_windows.borrow().iter().any(|w| w == window) {
                 if session == MUSE_SESSION {
                     self.close_window(&unit);
                 } else {
@@ -3058,8 +3455,20 @@ fn tmux_bin() -> PathBuf {
     std::env::var_os("FL_WIRE_TMUX_BIN").map_or_else(|| PathBuf::from("tmux"), PathBuf::from)
 }
 
+fn scrub_parent_identity_env(cmd: &mut Command) {
+    for key in [
+        "AGENT_NAME",
+        "AGENT_PERSONA",
+        "AGENT_HYDRATION_GENERATION",
+        "FL_HOSTED_ID",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 fn tmux_ok(args: &[&str]) -> bool {
     let mut cmd = Command::new(tmux_bin());
+    scrub_parent_identity_env(&mut cmd);
     cmd.args(args);
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
 }
@@ -3098,7 +3507,9 @@ pub(crate) fn tmux_stdout(args: &[&str]) -> Option<String> {
 pub(crate) fn tmux_stdout_of(bin: &Path, args: &[&str]) -> Option<String> {
     use std::io::Read;
 
-    let mut child = Command::new(bin)
+    let mut cmd = Command::new(bin);
+    scrub_parent_identity_env(&mut cmd);
+    let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -4145,7 +4556,7 @@ fn resolve_project_cwd<S: Catalog>(
 /// session (none, or a decommissioned one left from an earlier teardown) becomes hosted by the
 /// spin-up, after which a peer's teardown would be allowed, so only the owner may do it. A peer
 /// may still spin up a new or retired persona, or re-spin a session whose hosted record is live.
-pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
+pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     req: &SpinUpRequest,
@@ -4160,7 +4571,9 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     )
     .map_err(|msg| LifecycleError::Invalid(format!("posture: {msg}")))?
     .receipts;
-    if let Some(agent) = current_recast_assignment(store, &v.persona)? {
+    let recast_assignment = current_recast_assignment(store, &v.persona)?;
+    let recast_staged_in_store = recast_assignment.is_some();
+    if let Some(agent) = recast_assignment {
         v.project = agent.project;
         v.role = role_label_of(&agent.role);
     }
@@ -4190,7 +4603,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     check_slug_free(store, &session_id)?;
     // The unfiltered record carries `created_at_ms`, `restart_count` and `runtime_spawned` over;
     // the gate below looks only at whether it is LIVE.
-    let previous =
+    let mut previous =
         find_hosted_session(store, &[&session_id])?.filter(|r| r.session_id == session_id);
     // Order: this gate runs first, before the Lead and project/role Conflict checks in
     // `register_spun_up_agent`, because a refusal here reveals nothing about the agent's
@@ -4214,16 +4627,56 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         .filter(|r| !is_decommissioned(r))
         .and_then(|r| r.hydration_generation.clone())
         .filter(|g| is_valid_hydration_generation(g));
+    let should_check_unit = has_runtime
+        && v.hosted
+        && env.spawn_runtime
+        && (existing_gen.is_some()
+            || previous
+                .as_ref()
+                .is_some_and(|r| !is_decommissioned(r) && r.vendor == "claude"));
+    let unit_not_running = unit.is_empty() || (should_check_unit && !env.runtime.exists(&unit));
     let will_spawn = has_runtime
         && v.hosted
         && env.spawn_runtime
-        && (existing_gen.is_none() || unit.is_empty() || !env.runtime.exists(&unit));
-    let hydration_generation = if will_spawn {
-        next_hydration_generation()
-    } else {
-        existing_gen
+        && (existing_gen.is_none() || unit_not_running);
+
+    let mut resume_decision: Option<ClaudeResumeDecision> = None;
+    if v.vendor == "claude"
+        && has_runtime
+        && v.hosted
+        && env.spawn_runtime
+        && unit_not_running
+        && let Some(prev) = previous
+            .as_mut()
+            .filter(|r| !is_decommissioned(r) && r.vendor == "claude")
+    {
+        env.runtime.preflight_spawn(&session_id)?;
+        let _ = sync_claude_vendor_session_id_from_route(env, prev);
+        let recast_staged = recast_staged_in_store
+            || !prev.project.eq_ignore_ascii_case(&v.project)
+            || !prev.role.eq_ignore_ascii_case(&v.role);
+        resume_decision = Some(evaluate_claude_resume_eligibility(
+            store,
+            env,
+            prev,
+            recast_staged,
+            v.model.as_deref(),
+            v.thinking_level.as_deref(),
+            v.context_window,
+            v.posture,
+            v.cwd.as_deref(),
+        )?);
+    }
+
+    let mut hydration_generation = match &resume_decision {
+        Some(ClaudeResumeDecision::ResumeExisting {
+            hydration_generation: g,
+            ..
+        }) => g.clone(),
+        _ if will_spawn => next_hydration_generation(),
+        _ => existing_gen
             .clone()
-            .unwrap_or_else(next_hydration_generation)
+            .unwrap_or_else(next_hydration_generation),
     };
     let guidance = registered_role_prompt_with_generation(
         store,
@@ -4237,25 +4690,73 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
     }
-    let prompt = guidance.text;
+    let mut warnings = guidance.warnings;
+    let mut prompt = guidance.text;
 
-    let vendor_session_id = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
-    let mut launch = if has_runtime && v.hosted && env.spawn_runtime {
-        env.runtime.preflight_spawn(&session_id)?;
-        launch_spec_for_with_session(
-            env,
-            &v.vendor,
-            &v.persona,
-            v.model.as_deref(),
-            v.thinking_level.as_deref(),
-            v.posture,
-            &prompt,
-            v.cwd.as_deref(),
-            vendor_session_id.as_deref(),
-            Some(&hydration_generation),
-        )?
-    } else {
-        None
+    let mut is_claude_resume = false;
+    let (mut vendor_session_id, mut launch) = match resume_decision.take() {
+        Some(ClaudeResumeDecision::ResumeExisting {
+            vendor_session_id: sid,
+            launch: resume_launch,
+            ..
+        }) => {
+            is_claude_resume = true;
+            (Some(sid), resume_launch)
+        }
+        Some(ClaudeResumeDecision::FreshLaunch {
+            reason_code,
+            detail,
+        }) => {
+            push_claude_resume_fallback_notice(
+                env,
+                &v.persona,
+                &mut warnings,
+                reason_code,
+                &detail,
+            );
+            if let Some(prev_g) = existing_gen.as_ref() {
+                let _ = store.delete_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hydration_ack_slug(prev_g),
+                );
+            }
+            let fresh_sid = Some(uuid::Uuid::now_v7().to_string());
+            let spec = launch_spec_for_with_session(
+                env,
+                &v.vendor,
+                &v.persona,
+                v.model.as_deref(),
+                v.thinking_level.as_deref(),
+                v.posture,
+                &prompt,
+                v.cwd.as_deref(),
+                fresh_sid.as_deref(),
+                Some(&hydration_generation),
+            )?;
+            (fresh_sid, spec)
+        }
+        None => {
+            let sid = (v.vendor == "claude").then(|| uuid::Uuid::now_v7().to_string());
+            let spec = if has_runtime && v.hosted && env.spawn_runtime {
+                env.runtime.preflight_spawn(&session_id)?;
+                launch_spec_for_with_session(
+                    env,
+                    &v.vendor,
+                    &v.persona,
+                    v.model.as_deref(),
+                    v.thinking_level.as_deref(),
+                    v.posture,
+                    &prompt,
+                    v.cwd.as_deref(),
+                    sid.as_deref(),
+                    Some(&hydration_generation),
+                )?
+            } else {
+                None
+            };
+            (sid, spec)
+        }
     };
     pin_launch_config(&mut launch, config_home.as_deref());
     register_spun_up_agent(store, &v, by)?;
@@ -4279,11 +4780,15 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         cwd: v.cwd.clone(),
         context_window: v.context_window,
         posture: v.posture,
-        hydration_dispatched: false,
-        hydration_status: crate::lifecycle::HydrationStatus::Unconfirmed,
+        hydration_dispatched: is_claude_resume,
+        hydration_status: if is_claude_resume {
+            crate::lifecycle::HydrationStatus::Confirmed
+        } else {
+            crate::lifecycle::HydrationStatus::Unconfirmed
+        },
         hydration_generation: Some(hydration_generation.clone()),
         tombstone_ids: Vec::new(),
-        vendor_session_id,
+        vendor_session_id: vendor_session_id.clone(),
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
         // Only when the record named this same target: a runtime under another name (an older
@@ -4299,7 +4804,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
     };
-    if !will_spawn && existing_gen.is_some() {
+    if !will_spawn && !is_claude_resume && existing_gen.is_some() {
         let _ = store.delete_state_by_key(
             &StateScope::Workspace,
             StateConcern::Runtime,
@@ -4315,7 +4820,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
-    let raw_spawned = has_runtime
+    let mut raw_spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
         && env.runtime.spawn(
@@ -4325,7 +4830,77 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             launch.as_ref(),
             &session_id,
         );
-    if will_spawn
+    if raw_spawned && let Some(target) = tmux_target.as_deref() {
+        apply_startup_prompt_rules(env.runtime, &v.vendor, target);
+    }
+    let mut launched = raw_spawned && launch.is_some();
+    let mut survived = !launched || launch_survived(env, &unit, &session_id);
+    let mut resumed_existing = false;
+    if is_claude_resume {
+        if raw_spawned && survived {
+            resumed_existing = true;
+        } else {
+            let _ = env.runtime.kill(&unit, &session_id);
+            let failed_sid = vendor_session_id.unwrap_or_default();
+            push_claude_resume_fallback_notice(
+                env,
+                &v.persona,
+                &mut warnings,
+                "resume_launch_did_not_survive",
+                &format!("--resume `{failed_sid}` did not survive startup"),
+            );
+            let _ = store.delete_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hydration_ack_slug(&hydration_generation),
+            );
+            hydration_generation = next_hydration_generation();
+            let fresh_sid = uuid::Uuid::now_v7().to_string();
+            vendor_session_id = Some(fresh_sid.clone());
+            let fresh_guidance = registered_role_prompt_with_generation(
+                store,
+                env,
+                v.cwd.as_deref().map(Path::new),
+                &display,
+                &v.project,
+                &agent_role_from_label(&v.role),
+                Some(&hydration_generation),
+            )?;
+            prompt = fresh_guidance.text;
+            launch = launch_spec_for_with_session(
+                env,
+                &v.vendor,
+                &v.persona,
+                v.model.as_deref(),
+                v.thinking_level.as_deref(),
+                v.posture,
+                &prompt,
+                v.cwd.as_deref(),
+                vendor_session_id.as_deref(),
+                Some(&hydration_generation),
+            )?;
+            pin_launch_config(&mut launch, config_home.as_deref());
+            record.vendor_session_id = vendor_session_id;
+            record.hydration_generation = Some(hydration_generation.clone());
+            record.hydration_status = HydrationStatus::Unconfirmed;
+            record.hydration_dispatched = false;
+            record.runtime_spawned = false;
+            record.updated_at_ms = now_ms();
+            persist_hosted_session(store, &record, by)?;
+            raw_spawned = env.runtime.spawn(
+                &rt_session,
+                &rt_window,
+                v.cwd.as_deref(),
+                launch.as_ref(),
+                &session_id,
+            );
+            if raw_spawned && let Some(target) = tmux_target.as_deref() {
+                apply_startup_prompt_rules(env.runtime, &v.vendor, target);
+            }
+            launched = raw_spawned && launch.is_some();
+            survived = !launched || launch_survived(env, &unit, &session_id);
+        }
+    } else if will_spawn
         && !raw_spawned
         && let Some(prev_g) = existing_gen.as_ref()
     {
@@ -4336,15 +4911,15 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             &hydration_ack_slug(prev_g),
         );
     }
-    if raw_spawned && let Some(target) = tmux_target.as_deref() {
-        apply_startup_prompt_rules(env.runtime, &v.vendor, target);
-    }
     // Argv handed the prompt to the vendor, but survival does not prove acceptance.
     // A command that exited at once took its session with it: nothing to deliver to.
-    let launched = raw_spawned && launch.is_some();
-    let survived = !launched || launch_survived(env, &unit, &session_id);
     let spawned = raw_spawned && survived;
-    let hydration = if launched {
+    let hydration = if resumed_existing {
+        HydrationOutcome {
+            dispatched: true,
+            status: HydrationStatus::Confirmed,
+        }
+    } else if launched {
         HydrationOutcome::from_launch(survived)
     } else {
         deliver_prompt(env, &v.persona, &session_id, by, &prompt)
@@ -4364,9 +4939,24 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         }
         return Err(e);
     }
+    if resumed_existing {
+        let baseline_ms = crate::boot_reconcile::hydration_baseline_ms(store, &record);
+        if let Err(err) = crate::boot_reconcile::send_service_resume_notice_in_store(
+            store,
+            &record.persona,
+            record.cwd.as_deref().map(Path::new),
+            Some(&record.role),
+            baseline_ms,
+        ) {
+            eprintln!(
+                "hub: warning ({} / {}): failed to enqueue Host restarted notice on resume: {err}",
+                record.persona, record.session_id
+            );
+        }
+    }
 
     Ok(SpinUpResponse {
-        warnings: guidance.warnings,
+        warnings,
         runtime_spawned: spawned,
         session_id,
         persona: v.persona,
@@ -5252,6 +5842,10 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
             continue;
         }
         if vendor_route_present(env.home_override, &record.persona, &record.vendor) {
+            if sync_claude_vendor_session_id_from_route(env, &mut record) {
+                record.updated_at_ms = now_ms();
+                persist_hosted_session(store, &record, by)?;
+            }
             with_dead_streaks(|streaks| {
                 streaks.remove(&record.session_id);
             });
@@ -5278,6 +5872,7 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                     *streak
                 });
                 if streak >= 2 {
+                    let _ = sync_claude_vendor_session_id_from_route(env, &mut record);
                     record.status = STATUS_STOPPED.to_string();
                     record.updated_at_ms = now_ms();
                     persist_hosted_session(store, &record, by)?;
@@ -5637,7 +6232,7 @@ pub struct RestartResponse {
 
 /// Count a restart: reopen a missing tmux session, redeliver the reforge prompt, mark running.
 /// A `decommissioned` session is refused (409); spin it up again instead.
-pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
+pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     id: &str,
@@ -5649,7 +6244,9 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
         // Its agent is retired; restarting would mark it running with no agent behind it.
         return Err(decommissioned_conflict(&record.session_id));
     }
-    if let Some(agent) = current_recast_assignment(store, &record.persona)? {
+    let recast_assignment = current_recast_assignment(store, &record.persona)?;
+    let recast_staged = recast_assignment.is_some();
+    if let Some(agent) = recast_assignment {
         record.project = agent.project;
         record.role = role_label_of(&agent.role);
     }
@@ -5666,6 +6263,7 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = env.runtime.unit(&want_target).to_string();
+    let _ = sync_claude_vendor_session_id_from_route(env, &mut record);
     if record.vendor == "claude"
         && record
             .vendor_session_id
@@ -5712,17 +6310,53 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
         .hydration_generation
         .clone()
         .filter(|g| is_valid_hydration_generation(g));
+    let should_check_unit = record.hosted
+        && !adopted_old_session
+        && vendor_has_runtime(&record.vendor)
+        && env.spawn_runtime
+        && (existing_gen.is_some() || record.vendor == "claude");
+    let unit_not_running = should_check_unit && !env.runtime.exists(&unit);
     let will_spawn = record.hosted
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
-        && (existing_gen.is_none() || !env.runtime.exists(&unit));
-    let hydration_generation = if will_spawn {
-        next_hydration_generation()
-    } else {
-        existing_gen
+        && (existing_gen.is_none() || unit_not_running);
+
+    let mut resume_decision: Option<ClaudeResumeDecision> = None;
+    if record.vendor == "claude"
+        && record.hosted
+        && !adopted_old_session
+        && vendor_has_runtime(&record.vendor)
+        && env.spawn_runtime
+        && unit_not_running
+    {
+        let model = record.model.clone();
+        let thinking = record.thinking_level.clone();
+        let ctx_win = record.context_window;
+        let posture = record.posture;
+        let cwd = record.cwd.clone();
+        resume_decision = Some(evaluate_claude_resume_eligibility(
+            store,
+            env,
+            &mut record,
+            recast_staged,
+            model.as_deref(),
+            thinking.as_deref(),
+            ctx_win,
+            posture,
+            cwd.as_deref(),
+        )?);
+    }
+
+    let mut hydration_generation = match &resume_decision {
+        Some(ClaudeResumeDecision::ResumeExisting {
+            hydration_generation: g,
+            ..
+        }) => g.clone(),
+        _ if will_spawn => next_hydration_generation(),
+        _ => existing_gen
             .clone()
-            .unwrap_or_else(next_hydration_generation)
+            .unwrap_or_else(next_hydration_generation),
     };
     let display = capitalize(&record.persona);
     let guidance = registered_role_prompt_with_generation(
@@ -5737,29 +6371,77 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
     }
-    let prompt = guidance.text;
-    let mut launch = if record.hosted
-        && !adopted_old_session
-        && vendor_has_runtime(&record.vendor)
-        && env.spawn_runtime
-    {
-        launch_spec_for_with_session(
-            env,
-            &record.vendor,
-            &record.persona,
-            record.model.as_deref(),
-            record.thinking_level.as_deref(),
-            record.posture,
-            &prompt,
-            record.cwd.as_deref(),
-            record.vendor_session_id.as_deref(),
-            Some(&hydration_generation),
-        )?
-    } else {
-        None
+    let mut warnings = guidance.warnings;
+    let mut prompt = guidance.text;
+
+    let mut is_claude_resume = false;
+    let mut launch = match resume_decision.take() {
+        Some(ClaudeResumeDecision::ResumeExisting {
+            vendor_session_id: sid,
+            launch: resume_launch,
+            ..
+        }) => {
+            is_claude_resume = true;
+            record.vendor_session_id = Some(sid);
+            resume_launch
+        }
+        Some(ClaudeResumeDecision::FreshLaunch {
+            reason_code,
+            detail,
+        }) => {
+            push_claude_resume_fallback_notice(
+                env,
+                &record.persona,
+                &mut warnings,
+                reason_code,
+                &detail,
+            );
+            if let Some(prev_g) = existing_gen.as_ref() {
+                let _ = store.delete_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hydration_ack_slug(prev_g),
+                );
+            }
+            record.vendor_session_id = Some(uuid::Uuid::now_v7().to_string());
+            launch_spec_for_with_session(
+                env,
+                &record.vendor,
+                &record.persona,
+                record.model.as_deref(),
+                record.thinking_level.as_deref(),
+                record.posture,
+                &prompt,
+                record.cwd.as_deref(),
+                record.vendor_session_id.as_deref(),
+                Some(&hydration_generation),
+            )?
+        }
+        None => {
+            if record.hosted
+                && !adopted_old_session
+                && vendor_has_runtime(&record.vendor)
+                && env.spawn_runtime
+            {
+                launch_spec_for_with_session(
+                    env,
+                    &record.vendor,
+                    &record.persona,
+                    record.model.as_deref(),
+                    record.thinking_level.as_deref(),
+                    record.posture,
+                    &prompt,
+                    record.cwd.as_deref(),
+                    record.vendor_session_id.as_deref(),
+                    Some(&hydration_generation),
+                )?
+            } else {
+                None
+            }
+        }
     };
     pin_launch_config(&mut launch, config_home.as_deref());
-    if !will_spawn && existing_gen.is_some() {
+    if !will_spawn && !is_claude_resume && existing_gen.is_some() {
         let _ = store.delete_state_by_key(
             &StateScope::Workspace,
             StateConcern::Runtime,
@@ -5768,12 +6450,20 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     }
     record.status = STATUS_RUNNING.to_string();
     record.decommission_prepared_at_ms = None;
-    record.hydration_status = HydrationStatus::Unconfirmed;
+    record.hydration_status = if is_claude_resume {
+        HydrationStatus::Confirmed
+    } else {
+        HydrationStatus::Unconfirmed
+    };
+    if is_claude_resume {
+        record.hydration_dispatched = true;
+    }
     record.hydration_generation = Some(hydration_generation.clone());
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
     let mut launched_with_prompt = false;
     let mut launch_died = false;
+    let mut resumed_existing = false;
     let raw_spawned = record.hosted
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
@@ -5785,7 +6475,80 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
             launch.as_ref(),
             &record.session_id,
         );
-    if raw_spawned {
+    if is_claude_resume {
+        let survived =
+            raw_spawned && (launch.is_none() || launch_survived(env, &unit, &record.session_id));
+        if survived {
+            record.runtime_spawned = true;
+            resumed_existing = true;
+        } else {
+            let _ = env.runtime.kill(&unit, &record.session_id);
+            let failed_sid = record.vendor_session_id.clone().unwrap_or_default();
+            push_claude_resume_fallback_notice(
+                env,
+                &record.persona,
+                &mut warnings,
+                "resume_launch_did_not_survive",
+                &format!("--resume `{failed_sid}` did not survive startup"),
+            );
+            let _ = store.delete_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hydration_ack_slug(&hydration_generation),
+            );
+            hydration_generation = next_hydration_generation();
+            let fresh_sid = uuid::Uuid::now_v7().to_string();
+            record.vendor_session_id = Some(fresh_sid);
+            record.hydration_generation = Some(hydration_generation.clone());
+            record.hydration_status = HydrationStatus::Unconfirmed;
+            record.hydration_dispatched = false;
+            record.runtime_spawned = false;
+            record.updated_at_ms = now_ms();
+            let fresh_guidance = registered_role_prompt_with_generation(
+                store,
+                env,
+                record.cwd.as_deref().map(Path::new),
+                &display,
+                &record.project,
+                &agent_role_from_label(&record.role),
+                Some(&hydration_generation),
+            )?;
+            prompt = fresh_guidance.text;
+            launch = launch_spec_for_with_session(
+                env,
+                &record.vendor,
+                &record.persona,
+                record.model.as_deref(),
+                record.thinking_level.as_deref(),
+                record.posture,
+                &prompt,
+                record.cwd.as_deref(),
+                record.vendor_session_id.as_deref(),
+                Some(&hydration_generation),
+            )?;
+            pin_launch_config(&mut launch, config_home.as_deref());
+            persist_hosted_session(store, &record, by)?;
+            let retry_raw = env.runtime.spawn(
+                &rt_session,
+                &rt_window,
+                record.cwd.as_deref(),
+                launch.as_ref(),
+                &record.session_id,
+            );
+            if retry_raw {
+                if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
+                    launch_died = true;
+                    record.runtime_spawned = false;
+                } else {
+                    record.runtime_spawned = true;
+                    launched_with_prompt = launch.is_some();
+                }
+            } else {
+                launch_died = true;
+                record.runtime_spawned = false;
+            }
+        }
+    } else if raw_spawned {
         if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
             // The command exited at once and took its session with it: nothing to deliver to.
             launch_died = true;
@@ -5803,7 +6566,12 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
             &hydration_ack_slug(prev_g),
         );
     }
-    let hydration = if launch_died || launched_with_prompt {
+    let hydration = if resumed_existing {
+        HydrationOutcome {
+            dispatched: true,
+            status: HydrationStatus::Confirmed,
+        }
+    } else if launch_died || launched_with_prompt {
         HydrationOutcome::from_launch(!launch_died)
     } else {
         deliver_prompt(env, &record.persona, &record.session_id, by, &prompt)
@@ -5818,10 +6586,25 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog>(
     record.decommission_prepared_at_ms = None;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
+    if resumed_existing {
+        let baseline_ms = crate::boot_reconcile::hydration_baseline_ms(store, &record);
+        if let Err(err) = crate::boot_reconcile::send_service_resume_notice_in_store(
+            store,
+            &record.persona,
+            record.cwd.as_deref().map(Path::new),
+            Some(&record.role),
+            baseline_ms,
+        ) {
+            eprintln!(
+                "hub: warning ({} / {}): failed to enqueue Host restarted notice on resume: {err}",
+                record.persona, record.session_id
+            );
+        }
+    }
     Ok(RestartResponse {
         record,
         prompt,
-        warnings: guidance.warnings,
+        warnings,
     })
 }
 
@@ -6385,7 +7168,7 @@ type SpinUpFn<'f, S> = dyn FnMut(
 /// handler holds its `HubStoreGuard` (one process-wide store lock) from target resolution to
 /// the end of the call. `fl agent remodel` is a separate process and is not serialized with the
 /// hub, as `fl agent spin-up` and `decommission` are not.
-pub fn remodel_session<S: AgentRegistry + StateStore + Catalog>(
+pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -6424,7 +7207,7 @@ thread_local! {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn remodel_with<S: AgentRegistry + StateStore + Catalog>(
+fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -11353,6 +12136,31 @@ mod tests {
                     startup_rules: Vec::<VendorStartupPromptRule>::new(),
                 })
             }
+            fn prepare_resume(
+                &self,
+                req: &AttachOrResumeRequest,
+            ) -> Result<VendorLaunchPlan, VendorAdapterError> {
+                let persona = req.persona.clone().unwrap_or_else(|| "kayla".into());
+                let display = capitalize(&persona);
+                let argv = vec![
+                    "claude".to_string(),
+                    "--remote-control".to_string(),
+                    "--enable-auto-mode".to_string(),
+                    "--resume".to_string(),
+                    req.vendor_session_id.clone(),
+                    "--name".to_string(),
+                    display,
+                ];
+                Ok(VendorLaunchPlan {
+                    vendor_id: "claude".into(),
+                    binary: "claude".into(),
+                    argv,
+                    env: vec![("AGENT_PERSONA".into(), persona)],
+                    cwd: req.cwd.clone(),
+                    remote_control: req.remote_control,
+                    startup_rules: Vec::<VendorStartupPromptRule>::new(),
+                })
+            }
             fn validate_config(
                 &self,
                 model: Option<&str>,
@@ -11470,7 +12278,25 @@ mod tests {
             ]
         );
 
-        // Restart reuses the existing vendor_session_id.
+        // Restart reuses the existing vendor_session_id when hydration is confirmed and active transcript exists.
+        record_hydration_ack(
+            &store,
+            "kayla",
+            true,
+            rec.hydration_generation.as_deref(),
+            Some("claude:kayla"),
+        )
+        .unwrap();
+        let proj_dir = home.path().join(".claude/projects/test");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            proj_dir.join(format!("{sid}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"uuid\":\"u1\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{sid}\",\"uuid\":\"a1\",\"message\":{{\"model\":\"claude-opus-5-5\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":10,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100}},\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
         fake.clear();
         let restarted = restart_hosted_session(&store, &env, "claude:kayla", "owner").unwrap();
         assert_eq!(
@@ -13024,5 +13850,683 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn write_claude_transcript(
+        home: &Path,
+        archived: bool,
+        sid: &str,
+        model: &str,
+        active_tokens: u64,
+        include_bridge_and_torn_tail: bool,
+    ) -> PathBuf {
+        let sub = if archived { "archived" } else { "projects" };
+        let dir = home.join(".claude").join(sub).join("ferroloop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{sid}.jsonl"));
+        let mut content = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"uuid\":\"u-1\",\"message\":{{\"role\":\"user\",\"content\":\"hydrate\"}}}}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"{sid}\",\"uuid\":\"a-1\",\"message\":{{\"model\":\"{model}\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":2,\"cache_creation_input_tokens\":94,\"cache_read_input_tokens\":{}}},\"content\":[{{\"type\":\"text\",\"text\":\"ready\"}}]}}}}\n",
+            active_tokens.saturating_sub(96)
+        );
+        if include_bridge_and_torn_tail {
+            content.push_str(&format!(
+                "{{\"type\":\"bridge-session\",\"sessionId\":\"{sid}\",\"bridgeSessionId\":\"cse_01SP4ortBQU3hQGNi4NtM8pN\"}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{sid}\",\"uuid\":\"a-2\",\"message\":{{\"model\":\"{model}\",\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"usage\":{{\"input_tokens\":2,\"cache_creation_input_tokens\":94,\"cache_read_input_tokens\":{}}},\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_01CSgTocp6F5DXW47yNSYL82\",\"name\":\"Bash\",\"input\":{{\"command\":\"sleep 25\"}}}}]}}}}\n\
+                 {{\"type\":\"assistant\",\"message\":",
+                active_tokens.saturating_sub(96)
+            ));
+        }
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn claude_resume_happy_path_on_restart_and_stopped_spin_up_preserves_identity_and_sends_notice()
+    {
+        use fl_core::ferrowire::WireFilter;
+        use fl_core::store::MessageStore;
+
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let cwd_dir = home.path().join("worktree");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        std::fs::write(cwd_dir.join("AGENTS.md"), "initial agents\n").unwrap();
+        std::fs::write(cwd_dir.join("WORKFLOW.md"), "initial workflow\n").unwrap();
+
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut request = req("ada", "assistant", "claude");
+        request.cwd = Some(cwd_dir.to_string_lossy().into_owned());
+
+        let spun = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+        assert!(spun.runtime_spawned);
+        let g1 = spun.hydration_generation.clone().unwrap();
+        let rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        let sid = rec.vendor_session_id.clone().unwrap();
+
+        assert!(
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap(),
+            "hydration ack must record for G1"
+        );
+        write_claude_transcript(home.path(), false, &sid, "claude-opus-5-5", 388_396, false);
+
+        // Touch WORKFLOW.md so its mtime strictly exceeds hydration-ack-<G1>.accepted_at_ms.
+        std::thread::sleep(Duration::from_millis(15));
+        std::fs::write(cwd_dir.join("WORKFLOW.md"), "updated workflow rules\n").unwrap();
+
+        // 1. Stop runtime and run restart_hosted_session -> resumes with `--resume <sid>`.
+        fake.clear();
+        fake.launches.borrow_mut().clear();
+        let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+        assert!(restarted.record.runtime_spawned);
+        assert_eq!(
+            restarted.record.vendor_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            restarted.record.hydration_generation.as_deref(),
+            Some(g1.as_str())
+        );
+        assert_eq!(
+            restarted.record.hydration_status,
+            HydrationStatus::Confirmed
+        );
+        assert!(restarted.record.hydration_dispatched);
+        assert!(
+            store
+                .get_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hydration_ack_slug(&g1),
+                )
+                .unwrap()
+                .is_some(),
+            "hydration-ack-<G1> must stay intact on --resume"
+        );
+
+        let launches = fake.launches.borrow().clone();
+        assert_eq!(launches.len(), 1);
+        let resume_spec = launches[0].1.as_ref().expect("resume launch spec");
+        assert!(
+            resume_spec.argv.windows(2).any(|w| w == ["--resume", &sid]),
+            "expected --resume {sid} in {:?}",
+            resume_spec.argv
+        );
+        assert!(
+            resume_spec.argv.contains(&"--remote-control".to_string()),
+            "expected --remote-control in {:?}",
+            resume_spec.argv
+        );
+        assert!(
+            resume_spec.argv.windows(2).any(|w| w == ["--name", "Ada"]),
+            "expected --name Ada in {:?}",
+            resume_spec.argv
+        );
+        assert!(
+            !resume_spec.argv.iter().any(|a| a == "--session-id"),
+            "--resume argv must not contain --session-id: {:?}",
+            resume_spec.argv
+        );
+        assert_eq!(
+            resume_spec.argv.last().map(String::as_str),
+            Some("Ada"),
+            "--resume argv must have no trailing positional hydration prompt: {:?}",
+            resume_spec.argv
+        );
+
+        let inbox = store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("ada".into()),
+                unread_only: true,
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(inbox.len(), 1, "expected 1 Host restarted notice in inbox");
+        assert_eq!(inbox[0].message.subject, "Host restarted");
+        assert!(
+            inbox[0].message.body.contains("`WORKFLOW.md`"),
+            "expected modified `WORKFLOW.md` in notice body, got: {}",
+            inbox[0].message.body
+        );
+
+        // 2. Mark session stopped and re-run spin_up -> also resumes `<sid>` and preserves G1.
+        fake.clear();
+        fake.launches.borrow_mut().clear();
+        let mut stopped = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        stopped.status = STATUS_STOPPED.to_string();
+        persist_hosted_session(&store, &stopped, "owner").unwrap();
+
+        let respun = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+        assert!(respun.runtime_spawned);
+        assert_eq!(respun.hydration_status, HydrationStatus::Confirmed);
+        assert_eq!(respun.hydration_generation.as_deref(), Some(g1.as_str()));
+        let after_respun = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_respun.vendor_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+        let launches = fake.launches.borrow().clone();
+        assert_eq!(launches.len(), 1);
+        let respun_spec = launches[0].1.as_ref().unwrap();
+        assert!(
+            respun_spec.argv.windows(2).any(|w| w == ["--resume", &sid]),
+            "spin_up on stopped confirmed record must resume {sid}: {:?}",
+            respun_spec.argv
+        );
+    }
+
+    #[test]
+    fn claude_resume_sigkill_mid_tool_call_repairs_only_torn_tail_and_preserves_bridge_session() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g1 = spun.hydration_generation.unwrap();
+        let sid = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap()
+            .vendor_session_id
+            .unwrap();
+        record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+
+        let path =
+            write_claude_transcript(home.path(), false, &sid, "claude-opus-5-5", 94_671, true);
+
+        fake.clear();
+        fake.launches.borrow_mut().clear();
+        let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            restarted.record.vendor_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            restarted.record.hydration_status,
+            HydrationStatus::Confirmed
+        );
+
+        let repaired_text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            repaired_text.contains("\"bridgeSessionId\":\"cse_01SP4ortBQU3hQGNi4NtM8pN\""),
+            "bridge-session line must remain intact: {repaired_text}"
+        );
+        assert!(
+            repaired_text.contains("\"id\":\"toolu_01CSgTocp6F5DXW47yNSYL82\""),
+            "dangling tool_use line must remain intact for Claude Code recovery: {repaired_text}"
+        );
+        assert!(
+            !repaired_text.ends_with("{\"type\":\"assistant\",\"message\":"),
+            "torn trailing fragment must be truncated: {repaired_text}"
+        );
+        let ctx = estimate_claude_post_compaction_context(&env, &path).unwrap();
+        assert!(ctx.has_persisted_bridge_session());
+        assert_eq!(
+            ctx.bridge_session_id.as_deref(),
+            Some("cse_01SP4ortBQU3hQGNi4NtM8pN")
+        );
+    }
+
+    #[test]
+    fn claude_resume_fallback_ladder_covers_all_reasons_and_emits_lifecycle_notices() {
+        // 1. unconfirmed_hydration
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_ne!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str())
+            );
+            assert_ne!(
+                restarted.record.hydration_generation.as_deref(),
+                Some(g1.as_str())
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("unconfirmed_hydration")),
+                "expected unconfirmed_hydration notice in {:?}",
+                restarted.warnings
+            );
+        }
+
+        // 2. missing_or_archived_transcript (transcript only in .claude/archived/)
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            write_claude_transcript(home.path(), true, &sid1, "claude-opus-5-5", 10_000, false);
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_ne!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str())
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("missing_or_archived_transcript")),
+                "expected missing_or_archived_transcript notice in {:?}",
+                restarted.warnings
+            );
+        }
+
+        // 3. empty_or_unparseable_transcript (0 turns)
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            let proj_dir = home.path().join(".claude/projects/ferroloop");
+            std::fs::create_dir_all(&proj_dir).unwrap();
+            std::fs::write(proj_dir.join(format!("{sid1}.jsonl")), "").unwrap();
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_ne!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str())
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("empty_or_unparseable_transcript")),
+                "expected empty_or_unparseable_transcript notice in {:?}",
+                restarted.warnings
+            );
+        }
+
+        // 4. context_over_cap (model-relative: 388,396 fails on claude-opus-4-1 200k window,
+        //    895,176 fails on claude-opus-5-5 1M window)
+        for (model, tokens) in [
+            ("claude-opus-4-1", 388_396u64),
+            ("claude-opus-5-5", 895_176u64),
+        ] {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let mut request = req("ada", "assistant", "claude");
+            request.model = Some(model.to_string());
+            let spun = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            write_claude_transcript(home.path(), false, &sid1, model, tokens, false);
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_ne!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str()),
+                "{model} at {tokens} tokens must refuse resume"
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("context_over_cap")),
+                "expected context_over_cap notice for {model} at {tokens} tokens in {:?}",
+                restarted.warnings
+            );
+        }
+
+        // 5. recast_guidance_staged
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+
+            let agent = store.agent_by_name("ada").unwrap().unwrap();
+            stage_recast_guidance(&store, &agent, &agent.project, &agent.role, "owner").unwrap();
+
+            fake.clear();
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert_ne!(
+                restarted.record.vendor_session_id.as_deref(),
+                Some(sid1.as_str())
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("recast_guidance_staged")),
+                "expected recast_guidance_staged notice in {:?}",
+                restarted.warnings
+            );
+        }
+
+        // 6. resume_launch_did_not_survive (--resume exits immediately, retries once with fresh UUIDv7 + G2)
+        {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let g1 = spun.hydration_generation.unwrap();
+            let sid1 = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .unwrap();
+            record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+            write_claude_transcript(home.path(), false, &sid1, "claude-opus-5-5", 10_000, false);
+
+            fake.clear();
+            fake.launches.borrow_mut().clear();
+            fake.vanish_once_windows.borrow_mut().push("claude".into());
+
+            let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+            assert!(
+                restarted.record.runtime_spawned,
+                "fallback fresh launch must survive"
+            );
+            let sid2 = restarted.record.vendor_session_id.clone().unwrap();
+            let g2 = restarted.record.hydration_generation.clone().unwrap();
+            assert_ne!(sid2, sid1, "fallback must mint fresh vendor_session_id");
+            assert_ne!(g2, g1, "fallback must mint fresh hydration_generation");
+            assert_eq!(
+                restarted.record.hydration_status,
+                HydrationStatus::Unconfirmed
+            );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        StateConcern::Runtime,
+                        &hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "hydration-ack-<G1> must be pruned when --resume fails launch_survived"
+            );
+            assert!(
+                restarted
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("resume_launch_did_not_survive")),
+                "expected resume_launch_did_not_survive notice in {:?}",
+                restarted.warnings
+            );
+            let launches = fake.launches.borrow().clone();
+            assert_eq!(
+                launches.len(),
+                2,
+                "expected 1st spawn (--resume) + 2nd spawn (fresh --session-id)"
+            );
+            let first_argv = &launches[0].1.as_ref().unwrap().argv;
+            let second_argv = &launches[1].1.as_ref().unwrap().argv;
+            assert!(first_argv.windows(2).any(|w| w == ["--resume", &sid1]));
+            assert!(!second_argv.iter().any(|a| a == "--resume"));
+            assert!(
+                second_argv.last().is_some_and(|p| p.contains(&g2)),
+                "retry fresh launch must pass hydration prompt with new generation {g2}: {second_argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_clear_route_sync_updates_vendor_session_id_and_ignores_tombstoned_ids() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+
+        let spun = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let g1 = spun.hydration_generation.unwrap();
+        let old_sid = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap()
+            .vendor_session_id
+            .unwrap();
+        record_hydration_ack(&store, "ada", true, Some(&g1), Some("claude:ada")).unwrap();
+
+        let new_sid = uuid::Uuid::now_v7().to_string();
+        let tombstoned_sid = uuid::Uuid::now_v7().to_string();
+        write_claude_transcript(
+            home.path(),
+            false,
+            &new_sid,
+            "claude-opus-5-5",
+            12_000,
+            false,
+        );
+        write_claude_transcript(
+            home.path(),
+            false,
+            &tombstoned_sid,
+            "claude-opus-5-5",
+            12_000,
+            false,
+        );
+
+        let routes_path = home.path().join(".cache/agent-bus/routes.json");
+        let mut table = RouteTable::default();
+        table.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: std::process::id(),
+                session_id: tombstoned_sid.clone(),
+                socket_path: home.path().join("claude.sock"),
+                key_path: None,
+            },
+            At::from_unix_millis(10),
+        );
+        table.save(Some(&routes_path)).unwrap();
+
+        let mut rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        rec.tombstone_ids.push(tombstoned_sid);
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+
+        // Tombstoned route session_id is ignored.
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(
+            find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .vendor_session_id
+                .as_deref(),
+            Some(old_sid.as_str())
+        );
+
+        // Active non-tombstoned `/clear` session_id with `.jsonl` updates record.vendor_session_id
+        // and is targeted by `--resume` on subsequent restart.
+        table.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: std::process::id(),
+                session_id: new_sid.clone(),
+                socket_path: home.path().join("claude.sock"),
+                key_path: None,
+            },
+            At::from_unix_millis(20),
+        );
+        table.save(Some(&routes_path)).unwrap();
+
+        fake.clear();
+        fake.launches.borrow_mut().clear();
+        let restarted = restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            restarted.record.vendor_session_id.as_deref(),
+            Some(new_sid.as_str())
+        );
+        let launches = fake.launches.borrow().clone();
+        assert_eq!(launches.len(), 1);
+        let argv = &launches[0].1.as_ref().unwrap().argv;
+        assert!(
+            argv.windows(2).any(|w| w == ["--resume", &new_sid]),
+            "expected --resume {new_sid} after /clear sync, got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_host_spawn_env_isolates_child_identity_from_ambient_parent_env() {
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let g_ada = next_hydration_generation();
+        let sid_ada = uuid::Uuid::now_v7().to_string();
+
+        let spec = resume_spec_for_with_session(
+            &env,
+            "claude",
+            "ada",
+            Some("claude-opus-5-5"),
+            None,
+            fl_core::permissions::Posture::Auto,
+            None,
+            &sid_ada,
+            Some(&g_ada),
+        )
+        .unwrap()
+        .expect("claude resume spec");
+
+        let (env_map, env_allow) = build_host_spawn_env(Some(&spec), "claude:ada");
+        assert_eq!(
+            env_map.get("AGENT_PERSONA").map(String::as_str),
+            Some("ada")
+        );
+        assert_eq!(
+            env_map
+                .get("AGENT_HYDRATION_GENERATION")
+                .map(String::as_str),
+            Some(g_ada.as_str())
+        );
+        assert_eq!(
+            env_map.get("FL_HOSTED_ID").map(String::as_str),
+            Some("claude:ada")
+        );
+        assert!(
+            !env_map.contains_key("AGENT_NAME"),
+            "AGENT_NAME must not be injected into env_map"
+        );
+        assert!(
+            !env_allow.contains("AGENT_NAME"),
+            "AGENT_NAME must be scrubbed from env_allow so ambient parent AGENT_NAME cannot leak"
+        );
+
+        // Blank launch with no persona or generation scrubs all four identity keys unless set.
+        let (blank_map, blank_allow) = build_host_spawn_env(None, "");
+        for key in [
+            "AGENT_NAME",
+            "AGENT_PERSONA",
+            "AGENT_HYDRATION_GENERATION",
+            "FL_HOSTED_ID",
+        ] {
+            assert!(
+                !blank_map.contains_key(key),
+                "{key} must not be in blank_map"
+            );
+            assert!(
+                !blank_allow.contains(key),
+                "{key} must not be in blank_allow"
+            );
+        }
     }
 }

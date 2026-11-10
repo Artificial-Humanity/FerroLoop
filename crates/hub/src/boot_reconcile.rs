@@ -517,7 +517,6 @@ fn record_epoch_notified_best_effort<S: StateStore>(store: &S, host: &Host, pers
 /// `store`, deduplicating against any unread `"Host restarted"` mail already in `persona`'s inbox
 /// and marking `EpochRecord.notified` for `host.boot_id` when present so a subsequent
 /// [`reconcile_pass_with`] in the same boot does not send a duplicate.
-#[allow(dead_code)]
 pub(crate) fn send_service_resume_notice_if_unnotified_in_store<
     S: MessageStore + AgentRegistry + StateStore,
 >(
@@ -583,7 +582,6 @@ pub(crate) fn send_service_resume_notice_if_unnotified_in_store<
 
 /// Convenience wrapper around [`send_service_resume_notice_if_unnotified_in_store`] using
 /// [`Host::current`].
-#[allow(dead_code)]
 pub(crate) fn send_service_resume_notice_in_store<S: MessageStore + AgentRegistry + StateStore>(
     store: &S,
     persona: &str,

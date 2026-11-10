@@ -901,3 +901,250 @@ fn hydration_status_live_dialog_is_unconfirmed_without_a_second_handoff() {
 fn hydration_status_delayed_start_remains_unconfirmed_after_initialization() {
     hydration_waiting_child_stays_unconfirmed(false);
 }
+
+#[test]
+fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacking_foreign_persona()
+{
+    use std::io::Write;
+
+    let f = Fixture::new();
+    std::fs::write(
+        f.root.path().join("vendor"),
+        "#!/bin/sh\nroot=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$root/arguments\"\nexec /bin/cat\n",
+    )
+    .unwrap();
+
+    // 1. Spin up both `feira` (antigravity, no_spawn) and `ada` (claude, spawned on private fl-host).
+    f.json(
+        &[
+            "agent",
+            "spin-up",
+            "feira",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "lead",
+            "--vendor",
+            "antigravity",
+            "--by",
+            "owner",
+            "--json",
+        ],
+        true,
+    );
+    let spun_ada = f.spin("claude", false);
+    assert_eq!(spun_ada["runtime_spawned"], true);
+    let ada_gen = spun_ada["hydration_generation"]
+        .as_str()
+        .expect("ada hydration_generation")
+        .to_string();
+
+    let db_path = f.root.path().join("fl.fls");
+    let ada_sid = {
+        let store = fl_store::open_store(&db_path).unwrap();
+        let rec = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        let sid = rec.vendor_session_id.clone().unwrap();
+        assert!(
+            fl_hub::lifecycle::record_hydration_ack(
+                &store,
+                "ada",
+                true,
+                Some(&ada_gen),
+                Some("claude:ada"),
+            )
+            .unwrap()
+        );
+        sid
+    };
+
+    // Write active transcript `<ada_sid>.jsonl` under `<home>/.claude/projects/ferroloop/`.
+    let proj_dir = f.root.path().join(".claude/projects/ferroloop");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::write(
+        proj_dir.join(format!("{ada_sid}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{ada_sid}\",\"uuid\":\"u1\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"{ada_sid}\",\"uuid\":\"a1\",\"message\":{{\"model\":\"claude-opus-5-5\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":100}},\"content\":[{{\"type\":\"text\",\"text\":\"ready\"}}]}}}}\n\
+             {{\"type\":\"bridge-session\",\"sessionId\":\"{ada_sid}\",\"bridgeSessionId\":\"cse_01SP4ortBQU3hQGNi4NtM8pN\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    // Seed `feira`'s route in routes.json before restarting `ada`.
+    let routes_path = f.root.path().join(".cache/agent-bus/routes.json");
+    let feira_route = fl_wire::identity::VendorRoute::Agy {
+        conversation_id: "019a0000-0000-7000-8000-000000000111".into(),
+        agentapi_exe: None,
+        ls_pid: None,
+        ls_address: Some("127.0.0.1:42100".into()),
+        csrf_token: Some("tok".into()),
+    };
+    let mut routes = fl_wire::identity::RouteTable::default();
+    routes.upsert(
+        "feira",
+        feira_route.clone(),
+        fl_core::At::from_unix_millis(100),
+    );
+    routes.save(Some(&routes_path)).unwrap();
+
+    // 2. Kill `Ada.claude` on private fl-host and restart `claude:ada` via `restart_hosted_session` ->
+    //    must launch with `--resume <ada_sid>` and preserve `ada_sid` and `ada_gen`.
+    {
+        let mut rpc = f.rpc();
+        let stream = rpc
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.stream.session.as_str() == "Ada.claude")
+            .unwrap()
+            .stream;
+        let grant = rpc.claim_controller(stream.clone()).unwrap();
+        rpc.kill_session(stream.clone(), grant.lease).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rpc
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|s| s.stream == stream && !matches!(s.state, ChildState::CleanupComplete(_)))
+        {
+            assert!(Instant::now() < deadline, "cleanup deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let out = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("HOME", f.root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("FL_HOST_SOCK", f.endpoint.socket_path())
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env("FL_WIRE_CLAUDE_BIN", f.root.path().join("vendor"))
+        .env("F433_RESTART_CHILD", f.root.path())
+        .args(["--exact", "hub_restart_claude_resume_child", "--nocapture"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(f.running("Ada.claude"));
+
+    let args_after = std::fs::read_to_string(f.root.path().join("arguments")).unwrap();
+    let arg_lines: Vec<&str> = args_after.lines().collect();
+    assert!(
+        arg_lines
+            .windows(2)
+            .any(|w| w == ["--resume", ada_sid.as_str()]),
+        "expected --resume {ada_sid} in spawned arguments: {arg_lines:?}"
+    );
+    assert!(
+        !arg_lines.contains(&"--session-id"),
+        "--resume spawn must not pass --session-id: {arg_lines:?}"
+    );
+
+    // 3. Filter a polluted parent ambient environment (`AGENT_NAME=feira`, `AGENT_PERSONA=feira`,
+    //    `FL_HOSTED_ID=antigravity:feira`, `AGENT_HYDRATION_GENERATION=<foreign>`) through
+    //    `build_host_spawn_env` for `claude:ada`, then run `fl wire hook claude` (`SessionStart:resume`).
+    let launch_spec = fl_hub::lifecycle::LaunchSpec {
+        env: vec![
+            ("AGENT_PERSONA".into(), "ada".into()),
+            ("AGENT_HYDRATION_GENERATION".into(), ada_gen.clone()),
+        ],
+        argv: vec!["claude".into(), "--resume".into(), ada_sid.clone()],
+    };
+    let (child_map, child_allow) =
+        fl_hub::lifecycle::build_host_spawn_env(Some(&launch_spec), "claude:ada");
+    assert!(!child_allow.contains("AGENT_NAME"));
+
+    let parent_ambient = [
+        ("HOME", f.root.path().to_str().unwrap()),
+        ("PATH", "/usr/bin:/bin"),
+        ("AGENT_NAME", "feira"),
+        ("AGENT_PERSONA", "feira"),
+        ("FL_HOSTED_ID", "antigravity:feira"),
+        (
+            "AGENT_HYDRATION_GENERATION",
+            "019dc759-0000-7000-8000-000000000999",
+        ),
+    ];
+
+    let mut hook_cmd = Command::new(env!("CARGO_BIN_EXE_fl"));
+    hook_cmd.env_clear().current_dir(f.root.path());
+    for (k, v) in parent_ambient {
+        if child_allow.contains(k) {
+            hook_cmd.env(k, v);
+        }
+    }
+    for (k, v) in &child_map {
+        hook_cmd.env(k, v);
+    }
+    let ada_sock = f.root.path().join("42424.sock");
+    hook_cmd
+        .env("XDG_RUNTIME_DIR", f.root.path())
+        .env("XDG_CONFIG_HOME", f.root.path().join("config"))
+        .env("XDG_DATA_HOME", f.root.path().join("data"))
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env("FL_WIRE_ROUTES", &routes_path)
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", &ada_sock)
+        .args(["--db"])
+        .arg(&db_path)
+        .args(["wire", "hook", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = hook_cmd.spawn().unwrap();
+    let hook_payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "resume",
+        "session_id": ada_sid,
+        "cwd": f.root.path(),
+    });
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(hook_payload.to_string().as_bytes())
+        .unwrap();
+    let hook_out = child.wait_with_output().unwrap();
+    assert!(
+        hook_out.status.success(),
+        "hook failed: {}",
+        String::from_utf8_lossy(&hook_out.stderr)
+    );
+
+    // Prove `routes.json` updated `ada` to `<ada_sid>` and left `feira`'s route untouched!
+    let after_routes = fl_wire::identity::RouteTable::load(Some(&routes_path));
+    assert_eq!(
+        after_routes.get("feira").map(|e| &e.route),
+        Some(&feira_route),
+        "feira's route must never be hijacked by ada's resumed session hook"
+    );
+    match after_routes.get("ada").map(|e| &e.route) {
+        Some(fl_wire::identity::VendorRoute::Claude { session_id, .. }) => {
+            assert_eq!(session_id, &ada_sid);
+        }
+        other => panic!("expected Claude route for ada with {ada_sid}, got {other:?}"),
+    }
+}
+
+#[test]
+fn hub_restart_claude_resume_child() {
+    use fl_hub::lifecycle;
+    let Some(root) = std::env::var_os("F433_RESTART_CHILD").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let store = fl_store::open_store(&root.join("fl.fls")).unwrap();
+    let mut env = lifecycle::LifecycleEnv::new(Some(&root));
+    env.spawn_runtime = true;
+    let restarted = lifecycle::restart_hosted_session(&store, &env, "claude:ada", "owner").unwrap();
+    assert!(restarted.record.runtime_spawned);
+    assert_eq!(
+        restarted.record.hydration_status,
+        lifecycle::HydrationStatus::Confirmed
+    );
+}
