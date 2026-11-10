@@ -18,7 +18,7 @@
 - Every successful image is self-consistent and recoverable at one published sequence **S**, observed under the existing commit barrier and current-file lock. S is the store commit sequence, not a WAL offset or superblock epoch, and includes all commits acknowledged before the capture cut. Before P1 single ownership, external failed-sync publications may be included with unknown outcomes; capture does not claim to exclude them. Capture, logical expectations and query expectations use the same immutable pin; never sample live collections separately.
 - One concurrent backup per physical store. Enforce operation deadlines, cancellation and memory/disk quotas; destination failures must not poison a healthy source.
 - Recurring capture runs in-process in the serving daemon, with the socket listener kept up. Hourly/6-hour schedules remain **off until pinned capture is proven on fixtures**. A service-local mutex alone does not exclude legacy embedded writers.
-- At most **1 s writer delay per store**; temporary disk at most **2x store size**, including image, independent verification copy, metadata and scratch. **Backup staging** is `/data/fl-backups/.staging`. **Restore staging** is a private sibling directory beside the destination on its filesystem, because publication from the backup NVMe to the live-store NVMe cannot use atomic rename. Neither uses `/tmp`. Task 6 fixes restore admission/accounting explicitly; insufficient budget means refusal, not a relaxed quota or omitted independent copy.
+- At most **1 s writer delay per store**; backup temporary disk at most **2L + R**, with two images bounded by source size L and a separately capped metadata/configuration/directory reserve R. Restore retains its Task 6 bound. **Backup staging** is `/data/fl-backups/.staging`. **Restore staging** is a private sibling directory beside the destination on its filesystem, because publication from the backup NVMe to the live-store NVMe cannot use atomic rename. Neither uses `/tmp`. Task 6 fixes restore admission/accounting explicitly; insufficient budget means refusal, not a relaxed quota or omitted independent copy.
 - Destination `/data/fl-backups` is the second physical NVMe (`nvme0n1`, xfs), separate from source `nvme1n1`. Jarvis provisions mode **0700**, owner `lmcfarlin`, datashare setgid cleared. It covers disk loss, **not host loss**. Off-host/cloud copy requires an owner decision.
 - `fl.fls` and `ferroloop.fls`: hourly, one batch ID. Other served projects and Council: every **6 h**. An unserved store cannot participate in recurring daemon capture: report its unmet schedule explicitly; only an announced, separately authorized one-off quiescence is available until an owner serves it.
 - Retain **24 hourly + 7 daily + 4 weekly** generations; never delete the last verified generation. Maintain capacity reserve **2x the bundle set**. One failed run alerts Jarvis/Ferris; two consecutive failures page the owner.
@@ -33,7 +33,7 @@
 
 1. A binding resolves differently in config and hub, or is a hardlink/symlink alias: inventory exposes both edges; backup/restore refuses ambiguous identity (Task 1).
 2. A concurrent external opener commits or compacts between preparation and capture: image and expectations remain at exactly published S, including all commits acknowledged before the capture cut, with bounded capture retry and no long writer barrier. An external failed-sync publication may be included; typed metadata says exclusion proof is unavailable before single ownership (Task 2; engine hazard #456).
-3. Small or incompressible sources leave no room for two images plus metadata inside 2x: admission refuses before capture; source and prior backups remain usable (Task 4).
+3. Small or incompressible sources exceed the operation quota or available space after adding the bounded reserve: admission refuses before capture; source and prior backups remain usable (Task 4).
 4. A crash loses the rename's directory entry after apparent publication/replacement: reconciliation proves the surviving image and keeps admission closed until durability is established (Tasks 4 and 6).
 5. Restored receipts lag real vendor effects, or references require another store's sequence: readiness remains blocked for affected operations and nothing blindly replays (Task 6).
 
@@ -100,13 +100,59 @@ Shared types defined with their first producer:
 
 **Interfaces:** `backup(owner: &FerroStore, request: &BackupRequest, fs: &dyn RecoveryFs, cancel: &CancelToken) -> Result<PublicationOutcome, RecoveryError>`; `reconcile_publication(operation_id: &str, fs: &dyn RecoveryFs) -> Result<PublicationOutcome, RecoveryError>`. `BackupRequest` binds store identity/map digest, operation/batch ID, destination, capture/operation limits, validation profile and approved configuration-member descriptors. `VerifiedBundle` is constructed only after independent verification and durable publication.
 
-- [ ] Add RED tests for source/destination identity alias, no-follow escapes, concurrent backup, inadequate space, arithmetic overflow and the small/incompressible-source 2x limit. Assert failure before capture if the bounded output estimate cannot accommodate two full images plus metadata; streaming quota checks also stop growth before the limit. A reflink is not proof of independent validation or free future space.
+- [ ] Add RED tests for source/destination identity alias, no-follow escapes, concurrent backup, inadequate space, arithmetic overflow and the small/incompressible-source operation and 2L+R limits. Assert failure before capture if the bounded output estimate cannot accommodate two full images plus metadata; streaming quota checks also stop growth before the limit. A reflink is not proof of independent validation or free future space.
 - [ ] Add crash/fault cases for every image/manifest/report flush and directory sync, short write, ENOSPC, cancellation, kill, permission denial and collision. Assert old backups survive, source writes continue, final names never contain partial bundles, and rename-before-dirsync yields outcome-unknown rather than success.
 - [ ] Run `cargo test -p fl-store recovery::backup` and `cargo test -p fl-store --test recovery_backup`; keep RED evidence.
-- [ ] Implement admit → capture → private write → independent verify → atomic publish. Create directories 0700/files0600 exclusively, validate same publication filesystem and ownership, reject symlink/hardlink substitutions using handles/file identity. Use Task 3's `copy_and_verify(candidate, verification_copy, expected, profile, limits)` for backup verification, with both paths explicitly inside the admitted staging allocation. Account image, verifier copy, manifests/configs and all staging against the same 2x-store quota; delete the verifier copy only after its durable report is bound to the candidate. Keep time/memory limits explicit and abort cleanly.
+- [ ] Implement admit → capture → private write → independent verify → atomic publish. Create directories 0700/files0600 exclusively, validate same publication filesystem and ownership, reject symlink/hardlink substitutions using handles/file identity. Use Task 3's `copy_and_verify(candidate, verification_copy, expected, profile, limits)` for backup verification, with both paths explicitly inside the admitted staging allocation. Account image, verifier copy, manifests/configs and all staging against the same 2L+R and operation quotas; delete the verifier copy only after its durable report is bound to the candidate. Keep time/memory limits explicit and abort cleanly.
 - [ ] Flush all final members and staging directory before rename; use a unique immutable final name, then sync the parent before catalog success. Recover uncertain names by operation ID plus complete-member checksums; never broadly sweep staging or select uncertain bundles for restore. Catalog writes are themselves atomic and recoverable; reconcile a durable bundle missing its catalog entry.
 - [ ] Admit only the allowlisted batch configs. Reject a vault-key pathname or identical file identity, including symlink/hardlink aliases, and never follow arbitrary referenced secret paths. A protected config snapshot may contain credentials under the later Ferris/Jarvis decision; it cannot be published as a public artifact. `vault.enc` remains optional and opaque; vault key never copied. No production copies in this task.
 - [ ] Run tests GREEN, including proof that destination sync failure does not set source `Poison`. Commit `feat(recovery): publish verified bounded backup bundles`; fresh task review.
+
+Task 4 implementation decisions approved by Ferris on 2026-11-10 (FerroWire
+`01a1c381-a9d7-74ae-a9df-3000dff52273`):
+
+- The image ceiling defaults to source physical file length L; callers may only
+  lower it. There is no pre-capture engine estimator. Admission requires twice
+  the ceiling plus R to fit min(2L + R, operation quota, available space minus
+  an explicit margin). R adds the caller's bounded metadata/config/catalog
+  payload budget to the observed-unit directory/rounding margin, capped in total
+  at512MiB. Default L is admitted when quota and free space cover the reserve.
+  This corrects the earlier 2L ruling (Ferris PR467 review, 2026-11-10). Streaming
+  overflow reports `ImageExceedsCeiling`; fixture evidence records image/L ratios.
+- Exactly one configured approved backup root is supported. Reject other roots
+  and inventory alias status Unknown or ReviewRequired. Hold a `flock` on the
+  physical inventory identity's lock file under that root's `.locks/` for the
+  operation. No source-file lock, multiple-root/host coordination or P1 ownership
+  claim is introduced. Lock diagnostics contain operation ID, pid and start time; they are not exclusion evidence. Identity-checked operation lock names are unlinked while held, with stale-inode contenders rejected.
+- The immutable manifest retains NotPublished and independent-copy Verified.
+  Only an atomic catalog receipt written after bundle rename and parent sync
+  attests Durable. It binds manifest/image hashes and every member checksum;
+  catalog temporary-file sync, exclusive rename and directory sync are required.
+  Reconciliation checks only the requested operation's complete bundle before
+  repairing an absent receipt. A mismatch is quarantined by operation ID, never
+  deleted or selected for restore. Partial staging cleanup is operation-specific.
+
+Task 4 implementation admission currently accepts only native Linux ext4/XFS
+allocation geometry with a consistent power-of-two 512–65536-byte unit. It
+derives R from32 prospective directory entries times129 units per entry (two
+index-path blocks per64 levels plus a root),26 file/lock rounding units, and the
+caller's metadata/config/catalog payload budget. R is capped at512MiB, not set
+to that cap. At4KiB the directory/rounding part is17,014,784 bytes. This is an
+approved conservative P0 safety margin, not a universal ext4/XFS allocation proof.
+There is no historical directory-size or operation-count admission limit.
+Clean ENOSPC/EDQUOT refusal is required at every directory entry, write and
+allocation step, including failed quarantine. Earlier backups/receipts and the
+source remain unchanged; final names contain only complete bundles. Post-rename
+uncertainty stays OutcomeUnknown. Task7 must compare actual native ext4 directory
+block growth across1000 mixed operations against the charged reserve and report
+the ratio; any excess is a bug that blocks rollout. XFS evidence is still pending.
+All file payloads are charged and allocated before writes; reflinks provide no
+admission credit. Quarantine withdraws an existing receipt by exclusive rename to
+.quarantine/<operation>/receipt.json and syncs both directories. Transient resource
+errors do not quarantine. Read-only library status reports requested payload,
+derived R, and bounded complete quarantine count/allocated-byte totals; a failed
+scan returns an error. FL_RECOVERY_TEST_DIR explicitly selects native ext4/XFS
+fixture storage; unsupported temporary filesystems fail clearly, never skip.
 
 ### Task 5: Add dormant owner-side schedules and batch accounting
 
