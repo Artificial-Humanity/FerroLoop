@@ -24,27 +24,14 @@ use fl_core::vendor_adapter::{
     ConfigEffectiveScope, NormalizedSessionTurn, RuntimePort, TeardownOutcome, TeardownTarget,
     TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError,
     VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule,
+    VendorStartupPromptRule, classify_claude_turn_role, estimate_claude_post_compaction_context,
+    extract_claude_message_content, find_claude_active_session_transcript_path,
+    find_claude_session_transcript_path, repair_claude_session_transcript_tail,
+    validate_claude_session_id,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Post-compaction transcript inspection summary for `--resume` eligibility and diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ClaudePostCompactionContext {
-    pub turn_count: usize,
-    pub latest_model: Option<String>,
-    pub active_context_tokens: Option<u64>,
-    pub post_compact_conversational_bytes: u64,
-    pub bridge_session_id: Option<String>,
-}
-
-impl ClaudePostCompactionContext {
-    /// Returns `true` when the transcript contains a persisted Remote Control `bridgeSessionId`.
-    pub fn has_persisted_bridge_session(&self) -> bool {
-        self.bridge_session_id.is_some()
-    }
-}
+pub use fl_core::PostCompactionContext as ClaudePostCompactionContext;
 
 /// First-launch modal printed by Claude Code when auto mode asks for environment setup.
 pub const CLAUDE_AUTO_MODE_PROMPT: &str = "Teach auto mode about your environment";
@@ -117,28 +104,7 @@ impl ClaudeHostAdapter {
         home_dir: &Path,
         vendor_session_id: &str,
     ) -> Result<Option<PathBuf>, VendorAdapterError> {
-        let session_id = validate_required_session_id(vendor_session_id, "find_transcript")?;
-        let target_file = format!("{session_id}.jsonl");
-        let claude_dir = home_dir.join(".claude");
-        for bucket in ["projects", "archived"] {
-            let root = claude_dir.join(bucket);
-            let Ok(entries) = fs::read_dir(&root) else {
-                continue;
-            };
-            let mut subdirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            subdirs.sort();
-            for proj_dir in subdirs {
-                let candidate = proj_dir.join(&target_file);
-                if candidate.is_file() {
-                    return Ok(Some(candidate));
-                }
-            }
-        }
-        Ok(None)
+        find_claude_session_transcript_path(home_dir, vendor_session_id, true)
     }
 
     /// Locate the active `<session-uuid>.jsonl` transcript file strictly under
@@ -149,25 +115,7 @@ impl ClaudeHostAdapter {
         home_dir: &Path,
         vendor_session_id: &str,
     ) -> Result<Option<PathBuf>, VendorAdapterError> {
-        let session_id = validate_required_session_id(vendor_session_id, "find_active_transcript")?;
-        let target_file = format!("{session_id}.jsonl");
-        let root = home_dir.join(".claude").join("projects");
-        let Ok(entries) = fs::read_dir(&root) else {
-            return Ok(None);
-        };
-        let mut subdirs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        subdirs.sort();
-        for proj_dir in subdirs {
-            let candidate = proj_dir.join(&target_file);
-            if candidate.is_file() {
-                return Ok(Some(candidate));
-            }
-        }
-        Ok(None)
+        find_claude_active_session_transcript_path(home_dir, vendor_session_id)
     }
 
     /// Inspect only the final non-empty line of `<session-uuid>.jsonl` and truncate any torn
@@ -179,80 +127,7 @@ impl ClaudeHostAdapter {
         &self,
         transcript_path: &Path,
     ) -> Result<usize, VendorAdapterError> {
-        let raw = fs::read(transcript_path).map_err(|e| VendorAdapterError::Transport {
-            vendor: "claude".into(),
-            reason: format!(
-                "failed to read Claude transcript {}: {e}",
-                transcript_path.display()
-            ),
-        })?;
-        let original_len = raw.len();
-        if original_len == 0 {
-            return Ok(0);
-        }
-
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        let mut pos = 0;
-        while pos < original_len {
-            let next_end = match raw[pos..].iter().position(|&b| b == b'\n') {
-                Some(rel) => pos + rel + 1,
-                None => original_len,
-            };
-            spans.push((pos, next_end));
-            pos = next_end;
-        }
-
-        let is_valid_json_span = |start: usize, end: usize| -> Option<bool> {
-            let trimmed = raw[start..end].trim_ascii();
-            if trimmed.is_empty() {
-                return None;
-            }
-            let valid = std::str::from_utf8(trimmed)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .is_some();
-            Some(valid)
-        };
-
-        let Some((last_non_empty_idx, last_is_valid)) = spans
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, &(s, e))| is_valid_json_span(s, e).map(|v| (idx, v)))
-        else {
-            return Ok(0);
-        };
-
-        if last_is_valid {
-            return Ok(0);
-        }
-
-        let truncate_to = spans[..last_non_empty_idx]
-            .iter()
-            .rev()
-            .find_map(|&(s, e)| (is_valid_json_span(s, e) == Some(true)).then_some(e))
-            .unwrap_or(0);
-
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(transcript_path)
-            .map_err(|e| VendorAdapterError::Transport {
-                vendor: "claude".into(),
-                reason: format!(
-                    "failed to open Claude transcript {} for tail repair: {e}",
-                    transcript_path.display()
-                ),
-            })?;
-        file.set_len(truncate_to as u64)
-            .map_err(|e| VendorAdapterError::Transport {
-                vendor: "claude".into(),
-                reason: format!(
-                    "failed to truncate torn Claude transcript {}: {e}",
-                    transcript_path.display()
-                ),
-            })?;
-
-        Ok(original_len - truncate_to)
+        repair_claude_session_transcript_tail(transcript_path)
     }
 
     /// Estimate post-compaction active context tokens, conversational byte volume, latest real
@@ -261,115 +136,7 @@ impl ClaudeHostAdapter {
         &self,
         transcript_path: &Path,
     ) -> Result<ClaudePostCompactionContext, VendorAdapterError> {
-        let raw =
-            fs::read_to_string(transcript_path).map_err(|e| VendorAdapterError::Transport {
-                vendor: "claude".into(),
-                reason: format!(
-                    "failed to read Claude transcript {}: {e}",
-                    transcript_path.display()
-                ),
-            })?;
-
-        let mut turn_count: usize = 0;
-        let mut latest_model: Option<String> = None;
-        let mut bridge_session_id: Option<String> = None;
-        let mut last_compact_post_tokens: Option<u64> = None;
-        let mut post_compact_assistant_tokens: Option<u64> = None;
-        let mut post_compact_conversational_bytes: u64 = 0;
-
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
-                continue;
-            };
-
-            if classify_claude_turn_role(&val).is_some()
-                && !extract_claude_message_content(&val).is_empty()
-            {
-                turn_count += 1;
-            }
-
-            if val.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-
-            let record_type = val.get("type").and_then(Value::as_str).unwrap_or("");
-
-            if record_type == "bridge-session" {
-                if let Some(bsid) = val
-                    .get("bridgeSessionId")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    bridge_session_id = Some(bsid.to_string());
-                }
-                continue;
-            }
-
-            if record_type == "system"
-                && val.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-            {
-                last_compact_post_tokens = val
-                    .pointer("/compactMetadata/postTokens")
-                    .and_then(Value::as_u64)
-                    .filter(|&n| n > 0);
-                post_compact_assistant_tokens = None;
-                post_compact_conversational_bytes = 0;
-                continue;
-            }
-
-            if matches!(record_type, "user" | "assistant")
-                && !is_claude_skipped_record_type(record_type)
-            {
-                post_compact_conversational_bytes =
-                    post_compact_conversational_bytes.saturating_add(line.len() as u64);
-            }
-
-            if record_type == "assistant" {
-                let model_opt = val
-                    .pointer("/message/model")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                if model_opt != Some("<synthetic>") {
-                    if let Some(m) = model_opt {
-                        latest_model = Some(m.to_string());
-                    }
-                    if let Some(usage) = val.pointer("/message/usage") {
-                        let input = usage
-                            .get("input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let cache_creation = usage
-                            .get("cache_creation_input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let cache_read = usage
-                            .get("cache_read_input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let total = input
-                            .saturating_add(cache_creation)
-                            .saturating_add(cache_read);
-                        if total > 0 {
-                            post_compact_assistant_tokens = Some(total);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(ClaudePostCompactionContext {
-            turn_count,
-            latest_model,
-            active_context_tokens: post_compact_assistant_tokens.or(last_compact_post_tokens),
-            post_compact_conversational_bytes,
-            bridge_session_id,
-        })
+        estimate_claude_post_compaction_context(transcript_path)
     }
 
     /// Read and normalize an exact-session `.jsonl` transcript file from disk, advancing
@@ -449,38 +216,11 @@ pub fn safe_positional_prompt(prompt: &str) -> String {
     }
 }
 
-/// Validate that a session ID is non-empty and safe to use as a CLI argument and filename stem
-/// (no path separators, traversal, whitespace, control characters, or leading dash).
-fn is_valid_claude_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
 fn validate_required_session_id<'a>(
     raw: &'a str,
     operation: &str,
 ) -> Result<&'a str, VendorAdapterError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(VendorAdapterError::MissingSessionIdentity {
-            vendor: "claude".into(),
-            reason: format!(
-                "Claude `{operation}` requires an explicit vendor_session_id; \
-                 --continue and newest-by-mtime fallback are forbidden"
-            ),
-        });
-    }
-    if !is_valid_claude_session_id(trimmed) {
-        return Err(VendorAdapterError::InvalidConfig {
-            vendor: "claude".into(),
-            reason: format!("invalid Claude vendor_session_id `{trimmed}` for `{operation}`"),
-        });
-    }
-    Ok(trimmed)
+    validate_claude_session_id(raw, operation)
 }
 
 /// Convert a persona identifier (`"ferris"`, `"kayla"`) into a capitalized display name
@@ -556,134 +296,6 @@ fn parse_cursor_line(after_cursor: Option<&str>) -> Result<usize, VendorAdapterE
             vendor: "claude".into(),
             reason: format!("invalid transcript cursor `{raw}`"),
         })
-}
-
-fn extract_claude_message_content(val: &Value) -> String {
-    let Some(content) = val
-        .get("content")
-        .or_else(|| val.pointer("/message/content"))
-    else {
-        if let Some(s) = val
-            .get("result")
-            .or_else(|| val.get("text"))
-            .and_then(Value::as_str)
-        {
-            return s.trim().to_string();
-        }
-        return String::new();
-    };
-    match content {
-        Value::String(s) => s.trim().to_string(),
-        Value::Array(blocks) => {
-            let mut parts = Vec::new();
-            for block in blocks {
-                let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
-                match btype {
-                    "text" => {
-                        if let Some(t) = block.get("text").and_then(Value::as_str)
-                            && !t.trim().is_empty()
-                        {
-                            parts.push(t.trim().to_string());
-                        }
-                    }
-                    "tool_result" => {
-                        if let Some(c) = block.get("content") {
-                            match c {
-                                Value::String(s) if !s.trim().is_empty() => {
-                                    parts.push(s.trim().to_string());
-                                }
-                                Value::Array(arr) => {
-                                    for item in arr {
-                                        if let Some(t) = item.get("text").and_then(Value::as_str)
-                                            && !t.trim().is_empty()
-                                        {
-                                            parts.push(t.trim().to_string());
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "tool_use" => {
-                        if let Some(name) = block.get("name").and_then(Value::as_str)
-                            && !name.trim().is_empty()
-                        {
-                            parts.push(format!("[tool_use:{name}]"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            parts.join("\n")
-        }
-        _ => String::new(),
-    }
-}
-
-fn is_claude_skipped_record_type(record_type: &str) -> bool {
-    record_type.starts_with("api-request")
-        || record_type.starts_with("file-history-")
-        || matches!(
-            record_type,
-            "attachment"
-                | "queue-operation"
-                | "last-prompt"
-                | "file-history-snapshot"
-                | "mode"
-                | "permission-mode"
-                | "atis-latch"
-                | "bridge-session"
-                | "cost-state"
-                | "ai-title"
-                | "tools-used"
-                | "summary"
-        )
-}
-
-fn classify_claude_turn_role(val: &Value) -> Option<String> {
-    let obj = val.as_object()?;
-    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    if let Some(t) = obj.get("type").and_then(Value::as_str)
-        && is_claude_skipped_record_type(t)
-    {
-        return None;
-    }
-    let raw_role = obj
-        .get("role")
-        .and_then(Value::as_str)
-        .or_else(|| val.pointer("/message/role").and_then(Value::as_str))
-        .or_else(|| obj.get("type").and_then(Value::as_str))?;
-
-    let mut role = match raw_role.trim().to_ascii_lowercase().as_str() {
-        "user" | "human" => "user".to_string(),
-        "assistant" | "model" | "result" | "reasoning" => "assistant".to_string(),
-        "tool" | "tool_result" => "tool".to_string(),
-        "system" => "system".to_string(),
-        _ => return None,
-    };
-
-    if role == "user" {
-        if obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-            || obj.get("synthetic_reason").is_some()
-        {
-            role = "system".to_string();
-        } else if let Some(arr) = obj
-            .get("content")
-            .or_else(|| val.pointer("/message/content"))
-            .and_then(Value::as_array)
-            && !arr.is_empty()
-            && arr
-                .iter()
-                .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
-        {
-            role = "tool".to_string();
-        }
-    }
-
-    Some(role)
 }
 
 impl VendorHostAdapter for ClaudeHostAdapter {
@@ -1125,6 +737,28 @@ impl VendorHostAdapter for ClaudeHostAdapter {
             turns,
             next_cursor: last_cursor,
         })
+    }
+
+    fn find_active_session_transcript_path(
+        &self,
+        home_dir: &Path,
+        vendor_session_id: &str,
+    ) -> Result<Option<PathBuf>, VendorAdapterError> {
+        Self::find_active_session_transcript_path(self, home_dir, vendor_session_id)
+    }
+
+    fn repair_session_transcript_tail(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<usize, VendorAdapterError> {
+        Self::repair_session_transcript_tail(self, transcript_path)
+    }
+
+    fn estimate_post_compaction_context(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<ClaudePostCompactionContext, VendorAdapterError> {
+        Self::estimate_post_compaction_context(self, transcript_path)
     }
 
     fn stop(&self, target: &TeardownTarget) -> Result<TeardownOutcome, VendorAdapterError> {
@@ -1834,5 +1468,41 @@ mod tests {
             ctx_grown.post_compact_conversational_bytes,
             (compact_summary.len() + post_asst.len()) as u64
         );
+    }
+
+    #[test]
+    fn vendor_host_adapter_trait_object_exposes_transcript_preflight_repair_and_estimation() {
+        let tmp = TempDir::new().unwrap();
+        let registry = crate::default_vendor_host_adapter_registry();
+        let adapter: Arc<dyn VendorHostAdapter> =
+            registry.lookup("claude").expect("claude host adapter");
+
+        let uuid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+        let proj_dir = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("ferroloop");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let tx_path = proj_dir.join(format!("{uuid}.jsonl"));
+        let valid_line = r#"{"uuid":"a-1","type":"assistant","message":{"model":"claude-sonnet-4@20250514","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000},"content":[{"type":"text","text":"Ready"}]}}"#;
+        fs::write(&tx_path, format!("{valid_line}\n{{\"torn\":")).unwrap();
+
+        let located = adapter
+            .find_active_session_transcript_path(tmp.path(), uuid)
+            .unwrap()
+            .expect("active transcript path via VendorHostAdapter");
+        assert_eq!(located, tx_path);
+
+        let removed = adapter.repair_session_transcript_tail(&located).unwrap();
+        assert_eq!(removed, b"{\"torn\":".len());
+
+        let ctx = adapter.estimate_post_compaction_context(&located).unwrap();
+        assert_eq!(ctx.turn_count, 1);
+        assert_eq!(
+            ctx.latest_model.as_deref(),
+            Some("claude-sonnet-4@20250514")
+        );
+        assert_eq!(ctx.active_context_tokens, Some(1010));
     }
 }

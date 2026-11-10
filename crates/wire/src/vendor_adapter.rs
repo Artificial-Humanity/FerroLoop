@@ -4,12 +4,17 @@
 //! `claude`, `codex`, `antigravity`, `grok`, `muse`, `lemonade`, and `ollama`.
 
 pub use crate::host_runtime::HostRuntimePort;
+pub use fl_core::vendor_adapter::{
+    PostCompactionContext, estimate_claude_post_compaction_context,
+    find_claude_active_session_transcript_path, repair_claude_session_transcript_tail,
+};
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use fl_core::VendorAdapterError;
 use fl_core::permissions::{
     AutoApproval, Effect, EvidenceClass, Origin, Posture, ReceiptClass, ReceiptLine,
     ReceiptSubject, Transport, Vendor, VendorFacts, compile_posture,
@@ -231,6 +236,117 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String>;
+
+    /// Build the full `LaunchSpec` (`env` + `argv`) with an optional explicit `vendor_session_id`
+    /// and [`VendorLaunchOptions`].
+    #[allow(clippy::too_many_arguments)]
+    fn build_launch_spec_with_session_options(
+        &self,
+        persona: &str,
+        vendor_session_id: Option<&str>,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        prompt: &str,
+        home: Option<&Path>,
+        options: VendorLaunchOptions,
+    ) -> Result<LaunchSpec, String> {
+        let _ = vendor_session_id;
+        self.build_launch_spec_with_options(persona, model, thinking_level, prompt, home, options)
+    }
+
+    /// Build the `LaunchSpec` (`env` + `argv`) for resuming an existing vendor session
+    /// identified by `vendor_session_id` with default [`VendorLaunchOptions`].
+    fn build_resume_spec(
+        &self,
+        persona: &str,
+        vendor_session_id: &str,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        home: Option<&Path>,
+    ) -> Result<LaunchSpec, String> {
+        self.build_resume_spec_with_options(
+            persona,
+            vendor_session_id,
+            model,
+            thinking_level,
+            home,
+            VendorLaunchOptions::default(),
+        )
+    }
+
+    /// Build the `LaunchSpec` (`env` + `argv`) for resuming an existing vendor session
+    /// identified by `vendor_session_id` with explicit [`VendorLaunchOptions`].
+    fn build_resume_spec_with_options(
+        &self,
+        persona: &str,
+        vendor_session_id: &str,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        home: Option<&Path>,
+        options: VendorLaunchOptions,
+    ) -> Result<LaunchSpec, String> {
+        let _ = (
+            persona,
+            vendor_session_id,
+            model,
+            thinking_level,
+            home,
+            options,
+        );
+        Err(format!(
+            "vendor `{}` does not support CLI resume launch specs",
+            self.vendor_id()
+        ))
+    }
+
+    /// Locate the active session transcript file for `vendor_session_id` under `home_dir`
+    /// (excluding archived transcripts; never scanning by newest `mtime`).
+    fn find_active_session_transcript_path(
+        &self,
+        _home_dir: &Path,
+        _vendor_session_id: &str,
+    ) -> Result<Option<PathBuf>, VendorAdapterError> {
+        Err(VendorAdapterError::Unsupported {
+            vendor: self.vendor_id().to_string(),
+            operation: "find_active_session_transcript_path".to_string(),
+            reason: format!(
+                "vendor `{}` does not support active session transcript lookup",
+                self.vendor_id()
+            ),
+        })
+    }
+
+    /// Inspect the final non-empty line of a session transcript file and truncate any torn
+    /// trailing write back to the last complete valid record (`0` when already valid or empty).
+    fn repair_session_transcript_tail(
+        &self,
+        _transcript_path: &Path,
+    ) -> Result<usize, VendorAdapterError> {
+        Err(VendorAdapterError::Unsupported {
+            vendor: self.vendor_id().to_string(),
+            operation: "repair_session_transcript_tail".to_string(),
+            reason: format!(
+                "vendor `{}` does not support session transcript tail repair",
+                self.vendor_id()
+            ),
+        })
+    }
+
+    /// Estimate post-compaction active context tokens, conversational byte volume, latest
+    /// model ID, normalized turn count, and persisted bridge session identity from a transcript.
+    fn estimate_post_compaction_context(
+        &self,
+        _transcript_path: &Path,
+    ) -> Result<PostCompactionContext, VendorAdapterError> {
+        Err(VendorAdapterError::Unsupported {
+            vendor: self.vendor_id().to_string(),
+            operation: "estimate_post_compaction_context".to_string(),
+            reason: format!(
+                "vendor `{}` does not support post-compaction context estimation",
+                self.vendor_id()
+            ),
+        })
+    }
 
     /// Whether a launch with `thinking_level` (already a plain token) can honour it. The default
     /// refuses: a vendor with no launch option for it must not report a level it never applied.
@@ -530,6 +646,36 @@ pub fn resolve_vendor_bin(
 // 7 Built-in Vendor CLI Adapters
 // ---------------------------------------------------------------------------
 
+fn claude_display_name_for_persona(persona: &str) -> Option<String> {
+    let trimmed = persona.trim();
+    if trimmed.is_empty() || !is_plain_model_id(trimmed) {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    let mut out = String::with_capacity(trimmed.len());
+    out.push(first.to_ascii_uppercase());
+    out.push_str(chars.as_str());
+    Some(out)
+}
+
+fn normalize_claude_resume_effort(level: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = level.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.len() > 32 || !is_plain_model_id(raw) {
+        return Err(format!(
+            "thinking_effort `{raw}` is not a valid plain token"
+        ));
+    }
+    let lower = raw.to_ascii_lowercase();
+    if ["low", "medium", "high", "xhigh", "max"].contains(&lower.as_str()) {
+        Ok(Some(lower))
+    } else {
+        Ok(Some(raw.to_string()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeCliAdapter;
 
@@ -573,6 +719,27 @@ impl VendorCliAdapter for ClaudeCliAdapter {
         home: Option<&Path>,
         options: VendorLaunchOptions,
     ) -> Result<LaunchSpec, String> {
+        self.build_launch_spec_with_session_options(
+            persona,
+            None,
+            model,
+            thinking_level,
+            prompt,
+            home,
+            options,
+        )
+    }
+
+    fn build_launch_spec_with_session_options(
+        &self,
+        persona: &str,
+        vendor_session_id: Option<&str>,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        prompt: &str,
+        home: Option<&Path>,
+        options: VendorLaunchOptions,
+    ) -> Result<LaunchSpec, String> {
         // Place `--remote-control` before `--permission-mode <mode>` so `--remote-control [name]`
         // (which accepts an optional name in Commander.js) is always followed by a `--` flag
         // and never consumes the trailing positional `<prompt>` when `model` and
@@ -584,6 +751,15 @@ impl VendorCliAdapter for ClaudeCliAdapter {
             argv.extend(self.remote_control_args(persona));
         }
         argv.extend(perms.args);
+        if let Some(raw_sid) = vendor_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let sid =
+                fl_core::vendor_adapter::validate_claude_session_id(raw_sid, "prepare_launch")
+                    .map_err(|e| e.to_string())?;
+            argv.extend(["--session-id".to_string(), sid.to_string()]);
+            if let Some(display_name) = claude_display_name_for_persona(persona) {
+                argv.extend(["--name".to_string(), display_name]);
+            }
+        }
         if let Some(m) = self.normalize_model(model) {
             argv.extend(["--model".to_string(), m]);
         }
@@ -595,6 +771,76 @@ impl VendorCliAdapter for ClaudeCliAdapter {
             env: launch_env_for_vendor(self.vendor_id(), persona, home),
             argv,
         })
+    }
+
+    fn build_resume_spec_with_options(
+        &self,
+        persona: &str,
+        vendor_session_id: &str,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        home: Option<&Path>,
+        options: VendorLaunchOptions,
+    ) -> Result<LaunchSpec, String> {
+        let perms =
+            self.check_posture_with_auto_approval(options.posture, options.auto_approval)?;
+        let session_id = fl_core::vendor_adapter::validate_claude_session_id(
+            vendor_session_id,
+            "prepare_resume",
+        )
+        .map_err(|e| e.to_string())?;
+        let normalized_model = match model.map(str::trim).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(raw) => Some(normalize_plain_model(Some(raw)).ok_or_else(|| {
+                format!(
+                    "model `{raw}` is not a valid plain Claude model ID \
+                     (expected plain model ID with optional [1m] or [200k] window tag)"
+                )
+            })?),
+        };
+        let normalized_effort = normalize_claude_resume_effort(thinking_level)?;
+
+        let mut argv = vec![self.resolve_binary(home)];
+        if options.remote_control {
+            argv.extend(self.remote_control_args(persona));
+        }
+        argv.extend(perms.args);
+        argv.extend(["--resume".to_string(), session_id.to_string()]);
+        if let Some(display_name) = claude_display_name_for_persona(persona) {
+            argv.extend(["--name".to_string(), display_name]);
+        }
+        if let Some(m) = normalized_model {
+            argv.extend(["--model".to_string(), m]);
+        }
+        if let Some(effort) = normalized_effort {
+            argv.extend(["--effort".to_string(), effort]);
+        }
+        Ok(LaunchSpec {
+            env: launch_env_for_vendor(self.vendor_id(), persona, home),
+            argv,
+        })
+    }
+
+    fn find_active_session_transcript_path(
+        &self,
+        home_dir: &Path,
+        vendor_session_id: &str,
+    ) -> Result<Option<PathBuf>, VendorAdapterError> {
+        find_claude_active_session_transcript_path(home_dir, vendor_session_id)
+    }
+
+    fn repair_session_transcript_tail(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<usize, VendorAdapterError> {
+        repair_claude_session_transcript_tail(transcript_path)
+    }
+
+    fn estimate_post_compaction_context(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<PostCompactionContext, VendorAdapterError> {
+        estimate_claude_post_compaction_context(transcript_path)
     }
 
     fn startup_prompt_rules(&self) -> &[StartupPromptRule] {
@@ -1917,5 +2163,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn claude_cli_adapter_exposes_resume_spec_and_transcript_preflight_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = lookup_vendor_cli_adapter("claude").expect("claude cli adapter");
+
+        // Rejects empty and flag-like session IDs on resume.
+        assert!(
+            claude
+                .build_resume_spec_with_options(
+                    "ferris",
+                    "   ",
+                    None,
+                    None,
+                    Some(tmp.path()),
+                    VendorLaunchOptions::default(),
+                )
+                .is_err()
+        );
+        assert!(
+            claude
+                .build_resume_spec_with_options(
+                    "ferris",
+                    "--continue",
+                    None,
+                    None,
+                    Some(tmp.path()),
+                    VendorLaunchOptions::default(),
+                )
+                .is_err()
+        );
+
+        let uuid = "019d8f34-89cd-7e43-8a66-31f3b49788b7";
+        let resume_spec = claude
+            .build_resume_spec_with_options(
+                "kayla",
+                uuid,
+                Some("claude-sonnet-4-5[200k]"),
+                Some("MAX"),
+                Some(tmp.path()),
+                VendorLaunchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            &resume_spec.argv[1..],
+            &[
+                "--remote-control",
+                "--permission-mode",
+                "auto",
+                "--resume",
+                uuid,
+                "--name",
+                "Kayla",
+                "--model",
+                "claude-sonnet-4-5[200k]",
+                "--effort",
+                "max",
+            ]
+        );
+
+        let bound_launch = claude
+            .build_launch_spec_with_session_options(
+                "ferris",
+                Some(uuid),
+                Some("opus[1m]"),
+                Some("high"),
+                "Hydrate",
+                Some(tmp.path()),
+                VendorLaunchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            &bound_launch.argv[1..],
+            &[
+                "--remote-control",
+                "--permission-mode",
+                "auto",
+                "--session-id",
+                uuid,
+                "--name",
+                "Ferris",
+                "--model",
+                "opus[1m]",
+                "--effort",
+                "high",
+                "Hydrate",
+            ]
+        );
+
+        // Archived-only transcript is ignored by active lookup.
+        let archived_dir = tmp.path().join(".claude/archived/ferroloop");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        std::fs::write(
+            archived_dir.join(format!("{uuid}.jsonl")),
+            r#"{"uuid":"1","type":"user","content":"archived"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            None
+        );
+
+        // Active transcript lookup, tail repair, and post-compaction estimation work via VendorCliAdapter.
+        let proj_dir = tmp.path().join(".claude/projects/ferroloop");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let active_path = proj_dir.join(format!("{uuid}.jsonl"));
+        let line = r#"{"uuid":"a-1","type":"assistant","message":{"model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":5,"cache_creation_input_tokens":10,"cache_read_input_tokens":100},"content":[{"type":"text","text":"ok"}]}}"#;
+        std::fs::write(&active_path, format!("{line}\n{{\"partial\":")).unwrap();
+
+        let found = claude
+            .find_active_session_transcript_path(tmp.path(), uuid)
+            .unwrap()
+            .expect("active transcript");
+        assert_eq!(found, active_path);
+        assert_eq!(
+            claude.repair_session_transcript_tail(&found).unwrap(),
+            b"{\"partial\":".len()
+        );
+        let ctx = claude.estimate_post_compaction_context(&found).unwrap();
+        assert_eq!(ctx.turn_count, 1);
+        assert_eq!(ctx.latest_model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(ctx.active_context_tokens, Some(115));
+
+        // Non-Claude CLI adapters report Unsupported for resume & transcript preflight.
+        let grok = lookup_vendor_cli_adapter("grok").expect("grok cli adapter");
+        assert!(
+            grok.build_resume_spec_with_options(
+                "ferris",
+                uuid,
+                None,
+                None,
+                Some(tmp.path()),
+                VendorLaunchOptions::default(),
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            grok.find_active_session_transcript_path(tmp.path(), uuid),
+            Err(VendorAdapterError::Unsupported { .. })
+        ));
     }
 }

@@ -150,31 +150,43 @@ pub(crate) fn parse_window_tag_tokens(tag: &str) -> Option<u64> {
     count.checked_mul(mult)
 }
 
-fn is_pre_5_claude_model_id(raw_model: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeMajor {
+    Pre5,
+    V5Plus,
+}
+
+fn classify_claude_major(raw_model: &str) -> Option<ClaudeMajor> {
     let trimmed = raw_model.trim();
     let base = fl_wire::vendor_adapter::split_window_tag(trimmed).map_or(trimmed, |(b, _)| b);
     let base = base.split_once('[').map_or(base, |(b, _)| b);
     let lower = base.trim().to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("claude-") else {
-        return false;
-    };
-    let Some(ver_seg) = rest
+    let rest = lower.strip_prefix("claude-")?;
+    let ver_seg = rest
         .split('-')
-        .find(|seg| seg.bytes().next().is_some_and(|b| b.is_ascii_digit()))
-    else {
-        return false;
-    };
-    matches!(ver_seg, "3" | "4") || ver_seg.starts_with("3.") || ver_seg.starts_with("4.")
+        .find(|seg| seg.bytes().next().is_some_and(|b| b.is_ascii_digit()))?;
+    let digits_len = ver_seg.bytes().take_while(u8::is_ascii_digit).count();
+    let major = ver_seg[..digits_len]
+        .parse::<u32>()
+        .ok()
+        .filter(|&n| n < 100)?;
+    match major {
+        3 | 4 => Some(ClaudeMajor::Pre5),
+        5.. => Some(ClaudeMajor::V5Plus),
+        _ => None,
+    }
 }
 
 /// Resolve the effective context window (in tokens) for a Claude session from existing catalog
 /// and session metadata sources:
 /// 1. Explicit positive `record_window` on the hosted session record.
 /// 2. Explicit `[Nk]` / `[Nm]` window tag on `record_model`, then `transcript_model`.
-/// 3. Pre-5.x Claude 3 / 4 model IDs on `record_model` (or `transcript_model` when `record_model`
-///    is absent) -> `anthropic-api` default window (`200_000`).
-/// 4. Otherwise (Claude 5.x models, CLI aliases `opus`/`sonnet`/`haiku`, or `None`) ->
-///    [`crate::discovery::ASSUMED_LARGE_CONTEXT_WINDOW`] (`1_000_000`).
+/// 3. First versioned Claude major across `[record_model, transcript_model]`: pre-5.x (Claude
+///    3 / 4, including Vertex/Bedrock forms like `claude-sonnet-4@20250514` and unversioned
+///    `record_model` CLI aliases falling through to a versioned `transcript_model`) ->
+///    `anthropic-api` default window (`200_000`).
+/// 4. Otherwise (Claude 5.x+ models, unversioned CLI aliases `opus`/`sonnet`/`haiku`, or `None`)
+///    -> [`crate::discovery::ASSUMED_LARGE_CONTEXT_WINDOW`] (`1_000_000`).
 #[allow(dead_code)]
 pub(crate) fn claude_session_context_window(
     record_window: Option<u64>,
@@ -196,8 +208,11 @@ pub(crate) fn claude_session_context_window(
         }
     }
 
-    if let Some(model) = record_model.or(transcript_model)
-        && is_pre_5_claude_model_id(model)
+    if [record_model, transcript_model]
+        .into_iter()
+        .flatten()
+        .find_map(classify_claude_major)
+        == Some(ClaudeMajor::Pre5)
     {
         return fl_core::lookup_vendor("anthropic-api")
             .map(|d| d.default_context_window)
@@ -426,6 +441,8 @@ mod tests {
         for model in [
             "claude-opus-4-1",
             "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4@20250514",
             "claude-haiku-4-5",
             "claude-opus-4-0",
             "claude-opus-4",
@@ -451,6 +468,25 @@ mod tests {
                 "120,000 tokens must pass on 200k model {model}"
             );
         }
+
+        // Unversioned CLI aliases on `record_model` fall through to versioned `transcript_model`,
+        // while an explicit versioned 5.x `record_model` takes precedence over a pre-5.x transcript.
+        assert_eq!(
+            claude_session_context_window(None, Some("sonnet"), Some("claude-sonnet-4-5-20250929")),
+            200_000
+        );
+        assert_eq!(
+            claude_session_context_window(None, Some("opus"), Some("claude-sonnet-4@20250514")),
+            200_000
+        );
+        assert_eq!(
+            claude_session_context_window(
+                None,
+                Some("claude-opus-5-5"),
+                Some("claude-sonnet-4-5-20250929")
+            ),
+            1_000_000
+        );
 
         // Window tags override model-family defaults; explicit record_window overrides all.
         let tagged_200k = claude_session_context_window(None, Some("claude-opus-5-5[200k]"), None);

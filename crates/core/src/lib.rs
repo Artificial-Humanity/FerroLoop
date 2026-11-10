@@ -222,10 +222,10 @@ pub use vendor::{
 };
 pub use vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
-    ConfigEffectiveScope, NormalizedSessionTurn, RuntimePort, TeardownOutcome, TeardownTarget,
-    TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError,
-    VendorConfigSpec, VendorHostAdapter, VendorHostAdapterRegistry, VendorLaunchPlan,
-    VendorLaunchRequest, VendorStartupPromptRule,
+    ConfigEffectiveScope, NormalizedSessionTurn, PostCompactionContext, RuntimePort,
+    TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
+    TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorHostAdapter,
+    VendorHostAdapterRegistry, VendorLaunchPlan, VendorLaunchRequest, VendorStartupPromptRule,
 };
 pub use verdict::{FailReason, Population, Verdict};
 pub use workflow::{
