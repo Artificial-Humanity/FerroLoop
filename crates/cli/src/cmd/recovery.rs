@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use fl_core::state::StateScope;
 use fl_store::recovery::inventory::{
     BindingInput, ConsumerEdge, DeploymentMetadata, InventoryInputs, collect_inventory,
-    metadata_digest, preflight_candidates, read_metadata_artifact,
+    metadata_digest, read_metadata_artifact, scan_candidates,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -104,8 +104,7 @@ fn consumers(scope: &str) -> Vec<ConsumerEdge> {
             caller: caller.into(),
             binding_callers: match caller {
                 "CLI" | "MCP" => vec!["config", "CLI root", "CLI override"],
-                "hub" if scope == "workspace" => vec!["config"],
-                "hub" => vec!["hub"],
+                "hub" | "governor" => vec!["hub"],
                 "code index" => vec!["code index"],
                 "store maintenance" => vec!["config", "CLI root", "CLI override", "hub"],
                 _ => vec!["config"],
@@ -128,10 +127,23 @@ pub fn inventory_inputs(
     config: &config::Config,
     config_path: &Path,
     roots: &[PathBuf],
+    explicit_db: Option<&Path>,
 ) -> Result<InventoryInputs> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let default = crate::default_state_store_path()?;
     let workspace = config.workspace_state_store(&default);
+    let cwd = std::env::current_dir()?;
+    let hub_workspace = super::hub::resolve_hub_store_path(&super::state::StateEnv {
+        explicit_db,
+        default_store: &default,
+        cfg: config,
+        cwd: &cwd,
+    });
+    let hub_workspace = if hub_workspace.is_absolute() {
+        hub_workspace
+    } else {
+        cwd.join(hub_workspace)
+    };
     let env = std::env::var(fl_store::BACKEND_ENV).ok();
     let mut inputs = InventoryInputs {
         roots: roots.to_vec(),
@@ -148,6 +160,16 @@ pub fn inventory_inputs(
     );
     workspace_edge.precedence = "[state].store > XDG_DATA_HOME > HOME".into();
     inputs.bindings.push(workspace_edge);
+    inputs.bindings.push(BindingInput {
+        caller: "hub".into(),
+        scope: "workspace".into(),
+        logical_path: hub_workspace.clone(),
+        backend_env: env.clone(),
+        source: "crates/cli/src/cmd/hub.rs::resolve_hub_store_path; source-derived invocation/config/cwd selection, not observed daemon binding".into(),
+        precedence: "--db > FL_DB > [state].store > cwd-bound project > workspace default".into(),
+        declared_mode: "unspecified_legacy_auto".into(),
+        ..Default::default()
+    });
     inputs.consumers.extend(consumers("workspace"));
     // Root-based CLI/MCP resolution must retain every entry, even when no
     // valid slug exists or multiple roots have the same basename.
@@ -249,7 +271,21 @@ pub fn inventory_inputs(
         }
         inputs.bindings.push(binding);
         if let Some(home) = &home {
-            inputs.bindings.push(BindingInput {caller:"hub".into(),scope:label.clone(),logical_path:home.join(".local/share/fl").join(format!("{slug}.redb")),backend_env:env.clone(),source:"crates/hub/src/records.rs::{normalize_project,project_redb_with}; HOME slug lookup".into(),precedence:"plain project file > hub workspace fallback; unmigrated redb refused".into(),fallback_target:Some(fl_store::physical_path(&workspace,fl_store::choose_backend(&workspace,env.as_deref())?)),hub_slug:Some(slug),declared_mode:"unspecified_legacy_auto".into(),..Default::default()});
+            inputs.bindings.push(BindingInput {
+                caller: "hub".into(),
+                scope: label.clone(),
+                logical_path: home.join(".local/share/fl").join(format!("{slug}.redb")),
+                backend_env: env.clone(),
+                source: "crates/hub/src/records.rs::{normalize_project,project_redb_with}; HOME slug lookup".into(),
+                precedence: "plain project file > hub workspace fallback; unmigrated redb refused".into(),
+                fallback_target: Some(fl_store::physical_path(
+                    &hub_workspace,
+                    fl_store::choose_backend(&hub_workspace, env.as_deref())?,
+                )),
+                hub_slug: Some(slug),
+                declared_mode: "unspecified_legacy_auto".into(),
+                ..Default::default()
+            });
         }
         inputs.consumers.extend(consumers(&label));
     }
@@ -265,9 +301,16 @@ pub fn run(cmd: Cmd, explicit_db: Option<PathBuf>) -> Result<i32> {
         .config
         .or_else(config::path)
         .context("inventory needs a config path or HOME/XDG_CONFIG_HOME")?;
-    let mut candidates = preflight_candidates(&args.roots)?;
+    let scan = scan_candidates(&args.roots)?;
+    if args.deployment.is_some() {
+        scan.require_complete()?;
+    }
+    let mut candidates = scan.paths.clone();
     let config_bytes = match std::fs::symlink_metadata(&config_path) {
-        Ok(_) => Some(read_metadata_artifact(&config_path, &candidates)?),
+        Ok(_) => {
+            scan.require_complete()?;
+            Some(read_metadata_artifact(&config_path, &candidates)?)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => bail!(
             "inventory config metadata unavailable: {}",
@@ -282,13 +325,20 @@ pub fn run(cmd: Cmd, explicit_db: Option<PathBuf>) -> Result<i32> {
         .map_err(|_| anyhow::anyhow!("inventory config is invalid: {}", config_path.display()))?,
         None => config::Config::default(),
     };
-    let mut inputs = inventory_inputs(&config, &config_path, &args.roots)?;
+    let source = if explicit_db
+        .as_ref()
+        .is_some_and(|p| !p.as_os_str().is_empty())
+    {
+        "--db"
+    } else {
+        "FL_DB"
+    };
+    let override_path = crate::explicit_db(explicit_db);
+    let mut inputs =
+        inventory_inputs(&config, &config_path, &args.roots, override_path.as_deref())?;
+    inputs.warnings.extend(scan.warnings);
     inputs.config_digest = config_bytes.as_deref().map(metadata_digest);
     inputs.host_identifier = args.host_id;
-    let (override_path, source) = match explicit_db {
-        Some(path) => (Some(path), "--db"),
-        None => (std::env::var_os("FL_DB").map(PathBuf::from), "FL_DB"),
-    };
     if let Some(path) = override_path {
         let path = if path.is_absolute() {
             path
