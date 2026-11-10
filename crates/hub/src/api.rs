@@ -11428,6 +11428,7 @@ mod council_guidance_tests {
                             agentapi_exe: Some(PathBuf::from("/secret/agentapi")),
                         },
                         updated_at: ts_for_status.clone(),
+                        identity_at: None,
                         explicit: true,
                     },
                     RouteEntry {
@@ -11439,6 +11440,7 @@ mod council_guidance_tests {
                             key_path: Some(PathBuf::from("/secret/key_path")),
                         },
                         updated_at: ts_for_status.clone(),
+                        identity_at: None,
                         explicit: false,
                     },
                 ],

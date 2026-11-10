@@ -379,6 +379,7 @@ mod tests {
             persona: "ROUTE_PERSONA_SECRET".into(),
             route,
             updated_at: At::from_unix_millis(123),
+            identity_at: None,
             explicit: true,
         }
     }
