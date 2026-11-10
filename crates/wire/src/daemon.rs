@@ -34,6 +34,10 @@ use fl_core::ids::MessageId;
 use fl_core::store::{AgentRegistry, MessageStore};
 use serde::{Deserialize, Serialize};
 
+pub use crate::codex_control::{
+    CODEX_QUEUE_INSPECT_TIMEOUT, CODEX_QUEUE_LIST_LIMIT, CodexQueueInspection,
+    CodexRouteQueueStatus, VERIFIED_CODEX_QUEUE_RPC_VERSION, parse_uuid_v7_unix_ms,
+};
 use crate::dispatch_diagnostics::{
     DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
     FenceDiagnostic, FenceReason, SuppressionPhase,
@@ -256,7 +260,10 @@ pub enum LocalRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<MessageId>,
     },
-    Status,
+    Status {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_codex_queues: bool,
+    },
     Shutdown,
 }
 
@@ -305,6 +312,120 @@ pub struct DaemonStatus {
     pub dispatch_diagnostics: Option<DispatchDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_recipients: Vec<RecipientPendingSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_queues: Vec<CodexRouteQueueStatus>,
+}
+
+/// Inspect Codex app-server queue depth/age for all registered Codex routes in `routes`.
+///
+/// Must be called outside any daemon state lock: performs read-only WebSocket RPC over the
+/// Codex control socket, reusing a single handshake when multiple Codex routes share the socket.
+pub fn collect_codex_route_queues(
+    routes: &[RouteEntry],
+    registry: Option<&dyn AgentRegistry>,
+    home_override: Option<&Path>,
+    now_ms: u64,
+) -> Vec<CodexRouteQueueStatus> {
+    struct RouteSnapshot {
+        persona: String,
+        project: Option<String>,
+        thread_id: Option<String>,
+    }
+
+    let mut items = Vec::new();
+    for entry in routes {
+        let VendorRoute::Codex { thread_id, .. } = &entry.route else {
+            continue;
+        };
+        let trimmed_tid = thread_id.trim();
+        let project = registry
+            .and_then(|reg| reg.agent_by_name(&entry.persona).ok().flatten())
+            .map(|agent| agent.project)
+            .filter(|p| !p.trim().is_empty());
+        items.push(RouteSnapshot {
+            persona: entry.persona.clone(),
+            project,
+            thread_id: (!trimmed_tid.is_empty()).then(|| trimmed_tid.to_string()),
+        });
+    }
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let resolved_sock = if let Some(home) = home_override {
+        crate::codex_control::resolve_control_socket(None, None, None, Some(home.as_os_str()))
+    } else {
+        crate::codex_control::resolve_control_socket(
+            std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+            std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+            std::env::var_os("CODEX_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
+    };
+
+    match resolved_sock {
+        Ok(Some(sock)) => {
+            let thread_refs: Vec<&str> = items
+                .iter()
+                .map(|item| item.thread_id.as_deref().unwrap_or(""))
+                .collect();
+            let inspections = crate::codex_control::inspect_thread_queues(
+                &sock,
+                &thread_refs,
+                now_ms,
+                CODEX_QUEUE_INSPECT_TIMEOUT,
+            );
+            items
+                .into_iter()
+                .zip(inspections)
+                .map(|(item, queue)| CodexRouteQueueStatus {
+                    persona: item.persona,
+                    project: item.project,
+                    thread_id: item.thread_id,
+                    queue,
+                })
+                .collect()
+        }
+        Ok(None) => items
+            .into_iter()
+            .map(|item| {
+                let reason = if item.thread_id.is_none() {
+                    "Codex route has no thread_id"
+                } else {
+                    "Codex control socket disabled while FL_WIRE_CODEX_BIN is set without FL_WIRE_CODEX_CONTROL_SOCK"
+                };
+                CodexRouteQueueStatus {
+                    persona: item.persona,
+                    project: item.project,
+                    thread_id: item.thread_id,
+                    queue: CodexQueueInspection::unknown(reason, None),
+                }
+            })
+            .collect(),
+        Err(err) => {
+            let safe_err = if err.starts_with("CODEX_HOME must be an absolute path") {
+                "CODEX_HOME must be an absolute path".to_string()
+            } else {
+                err
+            };
+            items
+                .into_iter()
+                .map(|item| {
+                    let reason = if item.thread_id.is_none() {
+                        "Codex route has no thread_id".to_string()
+                    } else {
+                        safe_err.clone()
+                    };
+                    CodexRouteQueueStatus {
+                        persona: item.persona,
+                        project: item.project,
+                        thread_id: item.thread_id,
+                        queue: CodexQueueInspection::unknown(reason, None),
+                    }
+                })
+                .collect()
+        }
+    }
 }
 
 pub fn collect_pending_recipient_summaries<S: MessageStore>(
@@ -1641,7 +1762,9 @@ where
                 });
                 (LocalResponse::Subscribed, Some(rx))
             }
-            LocalRequest::Status => {
+            LocalRequest::Status {
+                include_codex_queues,
+            } => {
                 let connected_peers = lock(&self.peers)
                     .values()
                     .map(|(label, _)| label.clone())
@@ -1649,6 +1772,18 @@ where
                 let routes: Vec<RouteEntry> =
                     lock(&self.routes).entries.values().cloned().collect();
                 let pending_recipients = self.pending_recipients_snapshot(&now);
+                let dispatch_diagnostics = Some(self.diagnostics_snapshot());
+                // All daemon state mutexes are dropped before any store lookup or control-socket I/O.
+                let codex_queues = if include_codex_queues {
+                    collect_codex_route_queues(
+                        &routes,
+                        Some(self.store.as_ref() as &dyn AgentRegistry),
+                        self.config.home_override.as_deref(),
+                        now.unix_millis(),
+                    )
+                } else {
+                    Vec::new()
+                };
                 (
                     LocalResponse::Status(DaemonStatus {
                         node_id: self.config.node_id.clone(),
@@ -1657,8 +1792,9 @@ where
                         listen_addr: self.config.listen_addr.clone(),
                         connected_peers,
                         routes,
-                        dispatch_diagnostics: Some(self.diagnostics_snapshot()),
+                        dispatch_diagnostics,
                         pending_recipients,
+                        codex_queues,
                     }),
                     None,
                 )
@@ -3259,7 +3395,9 @@ mod tests {
             routes: Vec<RouteEntry>,
         }
         let (_tmp, inner) = fault_rig();
-        let (response, subscription) = inner.handle_local_request(LocalRequest::Status);
+        let (response, subscription) = inner.handle_local_request(LocalRequest::Status {
+            include_codex_queues: false,
+        });
         assert!(subscription.is_none());
         let LocalResponse::Status(status) = response else {
             panic!("expected Status")
@@ -3331,7 +3469,9 @@ mod tests {
             lock(&inner.store.gets).push_back(Fault::Panic);
             lock(&inner.store.reads).push_back(Fault::Panic);
             for _ in 0..5 {
-                let (response, _) = inner.handle_local_request(LocalRequest::Status);
+                let (response, _) = inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                });
                 // Serialize while explicitly owning the diagnostics lock: Status returned
                 // an owned clone, so serialization needs no daemon guard.
                 let _guard = lock(&inner.dispatch_diagnostics);
@@ -3372,7 +3512,9 @@ mod tests {
         let store_calls = lock(&inner.store.calls).clone();
         for _ in 0..3 {
             let (LocalResponse::Status(status), _) =
-                inner.handle_local_request(LocalRequest::Status)
+                inner.handle_local_request(LocalRequest::Status {
+                    include_codex_queues: false,
+                })
             else {
                 panic!("expected Status");
             };
@@ -4936,7 +5078,9 @@ mod tests {
                 .request(&req)
                 .unwrap()
         };
-        let status_personas = || match request(LocalRequest::Status) {
+        let status_personas = || match request(LocalRequest::Status {
+            include_codex_queues: false,
+        }) {
             LocalResponse::Status(st) => {
                 st.routes.into_iter().map(|r| r.persona).collect::<Vec<_>>()
             }
@@ -5044,7 +5188,11 @@ mod tests {
 
         let started = Instant::now();
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
-        probe.request(&LocalRequest::Status).unwrap();
+        probe
+            .request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .unwrap();
         let other_socket = tmp.path().join("other.sock");
         let other_listener = UnixListener::bind(&other_socket).unwrap();
         other_listener.set_nonblocking(true).unwrap();
@@ -5310,7 +5458,10 @@ mod tests {
 
         let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         assert!(matches!(
-            ok.request(&LocalRequest::Status).unwrap(),
+            ok.request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .unwrap(),
             LocalResponse::Status(_)
         ));
     }
@@ -5338,7 +5489,12 @@ mod tests {
         // A client that connects and hangs up sends nothing; the daemon must shrug it off.
         drop(UnixStream::connect(&sock).unwrap());
         let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
-        assert!(ok.request(&LocalRequest::Status).is_ok());
+        assert!(
+            ok.request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -5529,7 +5685,9 @@ mod tests {
             writer.write_all(reply.as_bytes()).unwrap();
         });
         let mut client = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
-        let resp = client.request(&LocalRequest::Status);
+        let resp = client.request(&LocalRequest::Status {
+            include_codex_queues: false,
+        });
         fake.join().unwrap();
         assert!(
             matches!(resp, Ok(LocalResponse::RouteRegistered)),
@@ -5846,5 +6004,389 @@ mod tests {
             default_socket_path()
         );
         assert_eq!(resolve_socket_path(None, None, None), default_socket_path());
+    }
+
+    #[test]
+    fn status_populates_codex_queues_outside_daemon_state_locks_in_single_session() {
+        use crate::codex_control::fake_server::spawn_at;
+        use fl_core::agent::AgentRole;
+        use serde_json::json;
+
+        let rig = rig();
+        for (name, project) in [("Felix", "ferroloop"), ("Kacey", "ferroloop")] {
+            rig.inner
+                .store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: project.into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: now_at(),
+                    by: name.to_ascii_lowercase(),
+                })
+                .unwrap();
+        }
+
+        for (persona, route) in [
+            (
+                "felix",
+                VendorRoute::Codex {
+                    thread_id: "thread-felix".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "ghost",
+                VendorRoute::Codex {
+                    thread_id: "   ".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "kacey",
+                VendorRoute::Codex {
+                    thread_id: "thread-kacey".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "ada",
+                VendorRoute::Webhook {
+                    socket_path: rig._tmp.path().join("ada.sock"),
+                },
+            ),
+        ] {
+            let (resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: persona.into(),
+                route,
+                explicit: true,
+            });
+            assert!(matches!(resp, LocalResponse::RouteRegistered));
+        }
+
+        let control_sock = rig
+            ._tmp
+            .path()
+            .join(".codex/app-server-control/app-server-control.sock");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let now_ms = now_at().unix_millis();
+        let ts_ms = now_ms.saturating_sub(15_000);
+        let uuid_v7 = format!(
+            "{:08x}-{:04x}-7000-8000-000000000001",
+            (ts_ms >> 16) as u32,
+            (ts_ms & 0xFFFF) as u16
+        );
+
+        let server = spawn_at(&control_sock, move |c| {
+            c.handshake();
+            let init = c.expect_json();
+            assert_eq!(init["method"], "initialize");
+            entered_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            c.send_text(
+                &json!({
+                    "id": 1,
+                    "result": {
+                        "userAgent": format!("ferroloop/{VERIFIED_CODEX_QUEUE_RPC_VERSION} (Linux; x86_64)"),
+                        "codexHome": "/tmp/.codex",
+                        "platformFamily": "unix",
+                        "platformOs": "linux",
+                    }
+                })
+                .to_string(),
+            );
+            assert_eq!(c.expect_json()["method"], "initialized");
+
+            let q1 = c.expect_json();
+            assert_eq!(q1["id"], 2);
+            assert_eq!(q1["params"]["threadId"], "thread-felix");
+            c.send_text(
+                &json!({
+                    "id": 2,
+                    "result": {
+                        "data": [
+                            {"id": uuid_v7, "clientUserMessageId": "c1", "input": []},
+                            {"id": "msg-2", "clientUserMessageId": "c2", "input": []},
+                        ],
+                        "nextCursor": "100",
+                    }
+                })
+                .to_string(),
+            );
+
+            let q2 = c.expect_json();
+            assert_eq!(q2["id"], 3);
+            assert_eq!(q2["params"]["threadId"], "thread-kacey");
+            c.send_text(
+                &json!({
+                    "id": 3,
+                    "result": {
+                        "data": [],
+                        "nextCursor": null,
+                    }
+                })
+                .to_string(),
+            );
+            c.drain_until_eof();
+        });
+
+        let inner_for_status = Arc::clone(&rig.inner);
+        let status_thread = std::thread::spawn(move || {
+            inner_for_status.handle_local_request(LocalRequest::Status {
+                include_codex_queues: true,
+            })
+        });
+
+        // Wait until LocalRequest::Status is parked inside codex_control socket I/O.
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("status entered codex_control socket I/O");
+
+        // Prove no daemon state lock is held while Status waits on the control socket:
+        // mutating route table, enqueue_gate, and diagnostics all complete promptly.
+        let (reg_resp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "concurrent".into(),
+            route: VendorRoute::Webhook {
+                socket_path: rig._tmp.path().join("concurrent.sock"),
+            },
+            explicit: true,
+        });
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+        let (unreg_resp, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::UnregisterRoute {
+                persona: "concurrent".into(),
+            });
+        assert!(matches!(unreg_resp, LocalResponse::RouteUnregistered));
+        let _ = rig.inner.diagnostics_snapshot();
+
+        resume_tx.send(()).unwrap();
+        let (LocalResponse::Status(status), _) = status_thread.join().unwrap() else {
+            panic!("expected Status");
+        };
+        let log = server.join().unwrap();
+        // Single WebSocket handshake + 1 initialize + 1 initialized + 2 thread/queue/list frames (+ close).
+        let text_methods: Vec<String> = log
+            .iter()
+            .filter(|f| f.opcode == 0x1)
+            .map(|f| f.json()["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            text_methods,
+            [
+                "initialize",
+                "initialized",
+                "thread/queue/list",
+                "thread/queue/list"
+            ]
+        );
+
+        assert_eq!(status.codex_queues.len(), 3);
+        assert_eq!(status.codex_queues[0].persona, "felix");
+        assert_eq!(status.codex_queues[0].project.as_deref(), Some("ferroloop"));
+        assert_eq!(
+            status.codex_queues[0].thread_id.as_deref(),
+            Some("thread-felix")
+        );
+        match &status.codex_queues[0].queue {
+            CodexQueueInspection::Known {
+                depth,
+                has_more,
+                estimated_oldest_age_secs,
+                verified_codex_version,
+            } => {
+                assert_eq!(*depth, 2);
+                assert!(*has_more);
+                let age = estimated_oldest_age_secs.expect("UUIDv7 oldest age");
+                assert!((14..=17).contains(&age), "unexpected age {age}");
+                assert_eq!(verified_codex_version, VERIFIED_CODEX_QUEUE_RPC_VERSION);
+            }
+            other => panic!("expected Known for felix, got {other:?}"),
+        }
+
+        assert_eq!(status.codex_queues[1].persona, "ghost");
+        assert_eq!(status.codex_queues[1].thread_id, None);
+        assert!(matches!(
+            &status.codex_queues[1].queue,
+            CodexQueueInspection::Unknown { reason, .. } if reason.contains("no thread_id")
+        ));
+
+        assert_eq!(status.codex_queues[2].persona, "kacey");
+        assert_eq!(status.codex_queues[2].project.as_deref(), Some("ferroloop"));
+        assert_eq!(
+            status.codex_queues[2].queue,
+            CodexQueueInspection::Known {
+                depth: 0,
+                has_more: false,
+                estimated_oldest_age_secs: None,
+                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+            }
+        );
+
+        // Older daemon JSON without `codex_queues` still deserializes cleanly to empty Vec.
+        let mut legacy_json = serde_json::to_value(&status).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("codex_queues");
+        let parsed: DaemonStatus = serde_json::from_value(legacy_json).unwrap();
+        assert!(parsed.codex_queues.is_empty());
+
+        // Future daemon JSON with an unrecognized queue `state` and extra unknown fields
+        // deserializes cleanly to `CodexQueueInspection::Unsupported`.
+        let mut future_json = serde_json::to_value(&status).unwrap();
+        future_json["codex_queues"] = json!([
+            {
+                "persona": "felix",
+                "project": "ferroloop",
+                "queue": {
+                    "state": "future_v2",
+                    "extra": 42,
+                    "nested": {"hint": "ignored"}
+                }
+            }
+        ]);
+        let future_parsed: DaemonStatus = serde_json::from_str(&future_json.to_string()).unwrap();
+        assert_eq!(future_parsed.codex_queues.len(), 1);
+        assert_eq!(
+            future_parsed.codex_queues[0].queue,
+            CodexQueueInspection::Unsupported
+        );
+    }
+
+    #[test]
+    fn status_without_opt_in_is_wire_compatible_and_opens_zero_codex_control_connections() {
+        use serde_json::json;
+
+        // 1. Wire-format backward compatibility with older clients and older daemons.
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum OldLocalRequest {
+            Status,
+        }
+
+        let legacy_req: LocalRequest = serde_json::from_str(r#"{"op":"status"}"#).unwrap();
+        assert!(matches!(
+            legacy_req,
+            LocalRequest::Status {
+                include_codex_queues: false
+            }
+        ));
+        let default_serialized = serde_json::to_value(&LocalRequest::Status {
+            include_codex_queues: false,
+        })
+        .unwrap();
+        assert_eq!(default_serialized, json!({"op": "status"}));
+        assert_eq!(
+            serde_json::from_value::<OldLocalRequest>(default_serialized).unwrap(),
+            OldLocalRequest::Status
+        );
+
+        let opt_in_serialized = serde_json::to_value(&LocalRequest::Status {
+            include_codex_queues: true,
+        })
+        .unwrap();
+        assert_eq!(
+            opt_in_serialized,
+            json!({"op": "status", "include_codex_queues": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<OldLocalRequest>(opt_in_serialized.clone()).unwrap(),
+            OldLocalRequest::Status
+        );
+        let opt_in_roundtrip: LocalRequest = serde_json::from_value(opt_in_serialized).unwrap();
+        assert!(matches!(
+            opt_in_roundtrip,
+            LocalRequest::Status {
+                include_codex_queues: true
+            }
+        ));
+
+        // 2. Daemon with registered Codex routes + live mock Codex control socket listener:
+        //    non-opt-in Status (both Rust variant and raw legacy `{"op":"status"}` wire JSON)
+        //    must open ZERO connections on the Codex control socket and return empty `codex_queues`.
+        let tmp = TempDir::new().unwrap();
+        let control_sock = tmp
+            .path()
+            .join(".codex/app-server-control/app-server-control.sock");
+        fs::create_dir_all(control_sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&control_sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let stop_accept = Arc::new(AtomicBool::new(false));
+        let accept_count_bg = Arc::clone(&accept_count);
+        let stop_accept_bg = Arc::clone(&stop_accept);
+        let accept_watcher = std::thread::spawn(move || {
+            while !stop_accept_bg.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        accept_count_bg.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let mut cfg = test_config(tmp.path(), "no-codex-probe");
+        cfg.home_override = Some(tmp.path().to_path_buf());
+        let daemon_sock = cfg.socket_path.clone();
+        let mut daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+
+        let mut reg = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+        let reg_resp = reg
+            .request(&LocalRequest::RegisterRoute {
+                persona: "felix".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "thread-felix".into(),
+                    cwd: None,
+                },
+                explicit: true,
+            })
+            .unwrap();
+        assert!(matches!(reg_resp, LocalResponse::RouteRegistered));
+
+        // Default non-opt-in LocalRequest::Status via LocalClient.
+        let mut c1 = LocalClient::connect(&daemon_sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+        let LocalResponse::Status(st1) = c1
+            .request(&LocalRequest::Status {
+                include_codex_queues: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(st1.routes.len(), 1);
+        assert!(st1.codex_queues.is_empty());
+
+        // Legacy raw `{"op":"status"}` line from an older client.
+        let mut raw = UnixStream::connect(&daemon_sock).unwrap();
+        raw.set_read_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT))
+            .unwrap();
+        raw.write_all(b"{\"op\":\"status\"}\n").unwrap();
+        let mut reply_line = String::new();
+        BufReader::new(&raw).read_line(&mut reply_line).unwrap();
+        let LocalResponse::Status(st2) = serde_json::from_str(&reply_line).unwrap() else {
+            panic!("expected Status from legacy raw JSON, got {reply_line}");
+        };
+        assert_eq!(st2.routes.len(), 1);
+        assert!(st2.codex_queues.is_empty());
+
+        std::thread::sleep(Duration::from_millis(30));
+        stop_accept.store(true, Ordering::SeqCst);
+        accept_watcher.join().unwrap();
+        daemon.stop();
+
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            0,
+            "non-opt-in Status must open zero connections on Codex control socket"
+        );
     }
 }

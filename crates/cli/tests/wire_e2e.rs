@@ -857,7 +857,7 @@ fn scripted_status(env: &TestEnv, diagnostics: Option<Value>, json_output: bool)
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap(),
-            json!({"op":"status"})
+            json!({"op":"status","include_codex_queues":true})
         );
         writeln!(stream, "{response}").unwrap();
     });
@@ -1060,5 +1060,224 @@ fn wire_status_reports_pending_recipients_depth_and_age() {
     assert!(
         text.contains("pending_recipients=fiona:2(oldest_age=45000ms)"),
         "{text}"
+    );
+}
+
+#[test]
+fn wire_status_renders_codex_queues_known_bounded_estimated_age_and_unknown_never_zero() {
+    let env = TestEnv::new();
+    let listener = std::os::unix::net::UnixListener::bind(&env.sock_file).unwrap();
+    let response = json!({
+        "status": "status",
+        "node_id": "fixture-node",
+        "host": "fixture-host",
+        "socket_path": env.sock_file,
+        "listen_addr": null,
+        "connected_peers": [],
+        "routes": [],
+        "dispatch_diagnostics": diagnostic_fixture(false),
+        "codex_queues": [
+            {
+                "persona": "felix",
+                "project": "ferroloop",
+                "thread_id": "thread-felix",
+                "queue": {
+                    "state": "known",
+                    "depth": 100,
+                    "has_more": true,
+                    "estimated_oldest_age_secs": 42,
+                    "verified_codex_version": "0.167.0"
+                }
+            },
+            {
+                "persona": "kacey",
+                "project": "ferroloop",
+                "thread_id": "thread-kacey",
+                "queue": {
+                    "state": "known",
+                    "depth": 0,
+                    "has_more": false,
+                    "verified_codex_version": "0.167.0"
+                }
+            },
+            {
+                "persona": "ghost",
+                "queue": {
+                    "state": "unknown",
+                    "reason": "unverified Codex app-server version 0.168.0 (verified 0.167.0)",
+                    "verified_codex_version": "0.167.0",
+                    "detected_codex_version": "0.168.0"
+                }
+            },
+            {
+                "persona": "future",
+                "queue": {
+                    "state": "future_v2",
+                    "extra": 42
+                }
+            }
+        ]
+    });
+    let resp_json = response.clone();
+    let peer = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["op"], "status");
+            assert_eq!(req["include_codex_queues"], true);
+            writeln!(stream, "{resp_json}").unwrap();
+        }
+    });
+
+    let mut json_cmd = env.fl();
+    json_cmd.args(["wire", "status", "--json"]);
+    let st = run_json(json_cmd);
+    assert_eq!(st["codex_queues"][0]["persona"], "felix");
+    assert_eq!(st["codex_queues"][0]["queue"]["state"], "known");
+    assert_eq!(st["codex_queues"][0]["queue"]["depth"], 100);
+    assert_eq!(st["codex_queues"][0]["queue"]["has_more"], true);
+    assert_eq!(
+        st["codex_queues"][0]["queue"]["estimated_oldest_age_secs"],
+        42
+    );
+    assert_eq!(st["codex_queues"][1]["queue"]["depth"], 0);
+    assert_eq!(st["codex_queues"][2]["queue"]["state"], "unknown");
+    assert!(st["codex_queues"][2]["queue"].get("depth").is_none());
+    assert_eq!(
+        st["codex_queues"][2]["queue"]["detected_codex_version"],
+        "0.168.0"
+    );
+    assert_eq!(st["codex_queues"][3]["persona"], "future");
+    assert_eq!(st["codex_queues"][3]["queue"]["state"], "unsupported");
+    assert!(st["codex_queues"][3]["queue"].get("depth").is_none());
+    assert!(st["codex_queues"][3]["queue"].get("extra").is_none());
+
+    let text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    peer.join().unwrap();
+    std::fs::remove_file(&env.sock_file).unwrap();
+    assert!(text_out.status.success());
+    let text = String::from_utf8(text_out.stdout).unwrap();
+    assert!(
+        text.contains(
+            "codex_queues=felix[ferroloop]: at least 100 queued, oldest ~42s (estimated from queue id); kacey[ferroloop]: 0 queued; ghost: unknown (unverified Codex app-server version 0.168.0 (verified 0.167.0)); future: unknown (unsupported queue state)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("ghost: 0"), "{text}");
+    assert!(!text.contains("future: 0"), "{text}");
+}
+
+#[test]
+fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offline() {
+    let env = TestEnv::new();
+    let reg = env
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Felix",
+            "--project",
+            "ferroloop",
+            "--role",
+            "web-developer",
+        ])
+        .output()
+        .unwrap();
+    assert!(reg.status.success());
+
+    let mut table = fl_wire::identity::RouteTable::default();
+    table.upsert_explicit(
+        "felix",
+        fl_wire::identity::VendorRoute::Codex {
+            thread_id: "thread-e2e".into(),
+            cwd: Some(env.work_dir.clone()),
+        },
+        fl_core::at::At::from_unix_millis(1_762_000_000_000),
+    );
+    table.save(Some(&env.routes_file)).unwrap();
+
+    // 1. Inactive daemon + offline Codex control socket -> Unknown (never 0).
+    let mut inactive_json_cmd = env.fl();
+    inactive_json_cmd
+        .env_remove("CODEX_HOME")
+        .env_remove("FL_WIRE_CODEX_BIN")
+        .env_remove("FL_WIRE_CODEX_CONTROL_SOCK")
+        .args(["wire", "status", "--json"]);
+    let inactive = run_json(inactive_json_cmd);
+    assert_eq!(inactive["daemon"], "inactive");
+    assert_eq!(inactive["codex_queues"][0]["persona"], "felix");
+    assert_eq!(inactive["codex_queues"][0]["project"], "ferroloop");
+    assert_eq!(inactive["codex_queues"][0]["queue"]["state"], "unknown");
+    assert!(inactive["codex_queues"][0]["queue"].get("depth").is_none());
+
+    let inactive_text_out = env
+        .fl()
+        .env_remove("CODEX_HOME")
+        .env_remove("FL_WIRE_CODEX_BIN")
+        .env_remove("FL_WIRE_CODEX_CONTROL_SOCK")
+        .args(["wire", "status"])
+        .output()
+        .unwrap();
+    assert!(inactive_text_out.status.success());
+    let inactive_text = String::from_utf8(inactive_text_out.stdout).unwrap();
+    assert!(
+        inactive_text.contains("codex_queues=felix[ferroloop]: unknown ("),
+        "{inactive_text}"
+    );
+    assert!(
+        !inactive_text.contains("felix[ferroloop]: 0"),
+        "{inactive_text}"
+    );
+
+    // 2. Live daemon + offline Codex control socket -> Unknown (never 0).
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        store,
+        fl_wire::daemon::DaemonConfig {
+            node_id: "fixture-node".into(),
+            host: "fixture-host".into(),
+            socket_path: env.sock_file.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    let mut active_json_cmd = env.fl();
+    active_json_cmd.args(["wire", "status", "--json"]);
+    let active = run_json(active_json_cmd);
+    assert_eq!(active["node_id"], "fixture-node");
+    assert_eq!(active["codex_queues"][0]["persona"], "felix");
+    assert_eq!(active["codex_queues"][0]["project"], "ferroloop");
+    assert_eq!(active["codex_queues"][0]["queue"]["state"], "unknown");
+    assert_eq!(
+        active["codex_queues"][0]["queue"]["verified_codex_version"],
+        "0.167.0"
+    );
+    assert!(active["codex_queues"][0]["queue"].get("depth").is_none());
+
+    let active_text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    daemon.stop();
+    assert!(active_text_out.status.success());
+    let active_text = String::from_utf8(active_text_out.stdout).unwrap();
+    assert!(
+        active_text.contains("daemon=active")
+            && active_text.contains("codex_queues=felix[ferroloop]: unknown ("),
+        "{active_text}"
+    );
+    assert!(
+        !active_text.contains("felix[ferroloop]: 0"),
+        "{active_text}"
     );
 }
