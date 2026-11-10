@@ -2364,9 +2364,10 @@ fn hosted_owner_leader_exit_cleans_up_lingering_descendants() {
         std::fs::write(&gate, b"go").expect("release leader exit gate");
         let exit = session.wait_leader(Duration::from_secs(5)).expect("leader");
         assert_eq!(exit.code, Some(0));
-        if before_leader_exit.elapsed() < HOSTED_LEADER_EXIT_GRACE / 2 {
+        let alive_after_leader = same_process(pid, start);
+        if before_leader_exit.elapsed() < HOSTED_LEADER_EXIT_GRACE {
             assert!(
-                same_process(pid, start),
+                alive_after_leader,
                 "lingering child ({mode}) exited before post-leader-exit grace window"
             );
         }
