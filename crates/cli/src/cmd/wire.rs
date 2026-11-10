@@ -2729,19 +2729,25 @@ fn pending_recipients_summary(pending: &[fl_wire::daemon::RecipientPendingSummar
                 .oldest_pending_age_ms
                 .map(|ms| format!("{ms}ms"))
                 .unwrap_or_else(|| "unknown".into());
-            match row.hold_reason {
-                Some(reason) => {
-                    let reason_str = serde_json::to_value(reason)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "unknown".into());
-                    format!(
-                        "{}:{}(oldest_age={age},hold={reason_str})",
-                        row.recipient, row.pending_count
-                    )
-                }
-                None => format!("{}:{}(oldest_age={age})", row.recipient, row.pending_count),
+            let mut details = format!("oldest_age={age}");
+            if row.awaiting_daemon_count > 0 {
+                let awaiting_age = row
+                    .oldest_awaiting_daemon_age_ms
+                    .map(|ms| format!("{ms}ms"))
+                    .unwrap_or_else(|| "unknown".into());
+                details.push_str(&format!(
+                    ",awaiting_daemon={}(oldest_age={awaiting_age})",
+                    row.awaiting_daemon_count
+                ));
             }
+            if let Some(reason) = row.hold_reason {
+                let reason_str = serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".into());
+                details.push_str(&format!(",hold={reason_str}"));
+            }
+            format!("{}:{}({details})", row.recipient, row.pending_count)
         })
         .collect::<Vec<_>>()
         .join(",");

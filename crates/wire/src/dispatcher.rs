@@ -6065,6 +6065,19 @@ mod tests {
             self.calls.borrow_mut().push("prune");
             self.inner.prune_wire(before)
         }
+        fn send_wire_awaiting_daemon(
+            &self,
+            args: SendWireArgs,
+        ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+            self.calls.borrow_mut().push("send_awaiting_daemon");
+            self.inner.send_wire_awaiting_daemon(args)
+        }
+        fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
+            self.inner.list_wire_awaiting_daemon()
+        }
+        fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError> {
+            self.inner.clear_wire_awaiting_daemon(message_id)
+        }
     }
 
     fn diagnostic_fixture() -> (DiagnosticStore, WireMessage, RouteTable) {

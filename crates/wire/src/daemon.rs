@@ -429,6 +429,10 @@ pub enum PendingHoldReason {
     Unsupported,
 }
 
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecipientPendingSummary {
     pub recipient: String,
@@ -439,6 +443,12 @@ pub struct RecipientPendingSummary {
     pub oldest_pending_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<PendingHoldReason>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub awaiting_daemon_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_at: Option<At>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_age_ms: Option<u64>,
 }
 
 pub fn annotate_dead_explicit_pending_holds(
@@ -597,7 +607,12 @@ pub fn collect_pending_recipient_summaries<S: MessageStore>(
     store: &S,
     now: &At,
 ) -> Vec<RecipientPendingSummary> {
-    summarize_pending_map(&seed_pending_map_from_store(store), now)
+    let awaiting: BTreeMap<MessageId, At> = store
+        .list_wire_awaiting_daemon()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    summarize_pending_map_with_awaiting(&seed_pending_map_from_store(store), &awaiting, now)
 }
 
 fn seed_pending_map_from_store<S: MessageStore>(
@@ -628,8 +643,9 @@ fn seed_pending_map_from_store<S: MessageStore>(
     by_recipient
 }
 
-fn summarize_pending_map(
+fn summarize_pending_map_with_awaiting(
     by_recipient: &BTreeMap<String, BTreeMap<MessageId, At>>,
+    awaiting_by_msg: &BTreeMap<MessageId, At>,
     now: &At,
 ) -> Vec<RecipientPendingSummary> {
     let now_ms = now.unix_millis();
@@ -639,12 +655,24 @@ fn summarize_pending_map(
             continue;
         }
         let oldest_ms = messages.values().map(At::unix_millis).min();
+        let mut awaiting_count = 0usize;
+        let mut oldest_awaiting_ms: Option<u64> = None;
+        for mid in messages.keys() {
+            if let Some(queued_at) = awaiting_by_msg.get(mid) {
+                awaiting_count += 1;
+                let q_ms = queued_at.unix_millis();
+                oldest_awaiting_ms = Some(oldest_awaiting_ms.map_or(q_ms, |prev| prev.min(q_ms)));
+            }
+        }
         out.push(RecipientPendingSummary {
             recipient: recipient.clone(),
             pending_count: messages.len(),
             oldest_pending_at: oldest_ms.map(At::from_unix_millis),
             oldest_pending_age_ms: oldest_ms.map(|ms| now_ms.saturating_sub(ms)),
             hold_reason: None,
+            awaiting_daemon_count: awaiting_count,
+            oldest_awaiting_daemon_at: oldest_awaiting_ms.map(At::from_unix_millis),
+            oldest_awaiting_daemon_age_ms: oldest_awaiting_ms.map(|ms| now_ms.saturating_sub(ms)),
         });
     }
     out
@@ -959,9 +987,12 @@ const AWAITING_DAEMON_POLL_INTERVAL: Duration = if cfg!(test) {
 
 #[derive(Default)]
 struct AwaitingDaemonEntry {
+    queued_at: Option<At>,
     notified: bool,
+    waiting_for_route: bool,
     scheduled_routed: BTreeSet<String>,
     tried_unrouted: BTreeSet<String>,
+    unscheduled_recipients: BTreeSet<String>,
 }
 
 struct DaemonInner<S> {
@@ -1204,11 +1235,37 @@ where
                 pending.remove(&key);
             }
         }
+        drop(pending);
+        let should_clear_marker = {
+            let mut state = lock(&self.awaiting_daemon_state);
+            if let Some(entry) = state.get_mut(msg_id) {
+                entry.unscheduled_recipients.remove(&key);
+                if entry.unscheduled_recipients.is_empty() {
+                    state.remove(msg_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_clear_marker {
+            let _ = self.store.clear_wire_awaiting_daemon(msg_id);
+        }
     }
 
     fn pending_recipients_snapshot(&self, now: &At) -> Vec<RecipientPendingSummary> {
         let merged = lock(&self.pending_by_recipient).clone();
-        summarize_pending_map(&merged, now)
+        let awaiting_by_msg: BTreeMap<MessageId, At> = lock(&self.awaiting_daemon_state)
+            .iter()
+            .filter_map(|(mid, entry)| {
+                (!entry.unscheduled_recipients.is_empty())
+                    .then(|| entry.queued_at.as_ref().map(|at| (mid.clone(), at.clone())))
+                    .flatten()
+            })
+            .collect();
+        summarize_pending_map_with_awaiting(&merged, &awaiting_by_msg, now)
     }
 
     /// Start one queued worker, or retain it until an active slot becomes available.
@@ -2064,15 +2121,11 @@ where
                             &mut first_holds,
                         );
                     }
-                    if let Ok(awaiting) = self.store.list_wire_awaiting_daemon()
-                        && !awaiting.is_empty()
-                    {
-                        self.drain_awaiting_daemon_locked(&awaiting, &now, &mut first_holds);
-                    }
                     drop(_order);
                     break;
                 }
                 log_first_holds(first_holds);
+                self.drain_awaiting_daemon_messages(true);
                 (LocalResponse::RouteRegistered, None)
             }
             LocalRequest::RecordRegistrationDiagnostic { diagnostic } => {
@@ -2511,29 +2564,43 @@ where
         }
     }
 
-    fn drain_awaiting_daemon_messages(self: &Arc<Self>) {
+    fn drain_awaiting_daemon_messages(self: &Arc<Self>, recheck_unrouted: bool) {
         let Ok(awaiting) = self.store.list_wire_awaiting_daemon() else {
             return;
         };
         if awaiting.is_empty() {
+            lock(&self.awaiting_daemon_state).clear();
             return;
         }
-        let mut first_holds = Vec::new();
-        let _order = lock(&self.enqueue_gate);
-        self.drain_awaiting_daemon_locked(&awaiting, &now_at(), &mut first_holds);
-        drop(_order);
-        log_first_holds(first_holds);
-    }
+        let now = now_at();
+        let routed_snapshot: BTreeSet<String> =
+            lock(&self.routes).entries.keys().cloned().collect();
 
-    /// Caller must hold `enqueue_gate`.
-    fn drain_awaiting_daemon_locked(
-        self: &Arc<Self>,
-        awaiting: &[(MessageId, At)],
-        now: &At,
-        first_holds: &mut Vec<FenceDiagnostic>,
-    ) {
-        let routed_keys: BTreeSet<String> = lock(&self.routes).entries.keys().cloned().collect();
-        for (mid, queued_at) in awaiting {
+        for (mid, queued_at) in &awaiting {
+            let expired = now.unix_millis().saturating_sub(queued_at.unix_millis())
+                >= MAX_AWAITING_DAEMON_AGE_MS;
+            if expired {
+                let _ = self.store.clear_wire_awaiting_daemon(mid);
+                lock(&self.awaiting_daemon_state).remove(mid);
+                continue;
+            }
+            if !recheck_unrouted {
+                let skip = lock(&self.awaiting_daemon_state)
+                    .get(mid)
+                    .is_some_and(|entry| {
+                        entry.waiting_for_route
+                            && !entry
+                                .unscheduled_recipients
+                                .iter()
+                                .any(|key| routed_snapshot.contains(key))
+                    });
+                if skip {
+                    continue;
+                }
+            }
+
+            // Store reads happen outside `enqueue_gate` so a slow store never blocks
+            // local accept or client sends.
             let msg = match self.store.get_wire_message(mid) {
                 Ok(Some(msg)) => msg,
                 Ok(None) => {
@@ -2555,68 +2622,102 @@ where
                 lock(&self.awaiting_daemon_state).remove(mid);
                 continue;
             }
-            self.admit_pending_receipts(&msg, &pending_receipts);
-            let mut state = lock(&self.awaiting_daemon_state);
-            let entry = state.entry(mid.clone()).or_default();
-            let should_notify = !entry.notified;
-            entry.notified = true;
-            let mut to_schedule = Vec::new();
-            let mut all_routed = true;
-            for rcpt in &pending_receipts {
-                let key = normalize_persona(&rcpt.recipient_name)
-                    .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
-                let is_routed = !key.is_empty() && routed_keys.contains(&key);
-                if is_routed {
-                    if !entry.scheduled_routed.contains(&key) {
-                        to_schedule.push((key, true, rcpt.clone()));
-                    }
-                } else {
-                    all_routed = false;
-                    if !entry.tried_unrouted.contains(&key) {
-                        to_schedule.push((key, false, rcpt.clone()));
-                    }
-                }
-            }
-            drop(state);
 
-            if should_notify {
-                self.notify_subscribers_message(&msg, &pending_receipts);
-                self.broadcast_to_peers(
-                    None,
-                    &PeerFrame::Publish {
-                        message: msg.clone(),
-                        receipts: pending_receipts.clone(),
-                    },
-                );
-            }
-
-            let mut schedule_ok = true;
-            if !to_schedule.is_empty() {
-                let rcpts_to_schedule: Vec<DeliveryReceipt> =
-                    to_schedule.iter().map(|(_, _, r)| r.clone()).collect();
-                match self.schedule_dispatch(&msg, &rcpts_to_schedule, now.clone(), first_holds) {
-                    Ok(()) => {
-                        let mut state = lock(&self.awaiting_daemon_state);
-                        if let Some(entry) = state.get_mut(mid) {
-                            for (key, is_routed, _) in to_schedule {
-                                if is_routed {
-                                    entry.scheduled_routed.insert(key);
-                                } else {
-                                    entry.tried_unrouted.insert(key);
-                                }
-                            }
+            let mut first_holds = Vec::new();
+            let clear_marker = {
+                let _order = lock(&self.enqueue_gate);
+                let routed_keys: BTreeSet<String> =
+                    lock(&self.routes).entries.keys().cloned().collect();
+                self.admit_pending_receipts(&msg, &pending_receipts);
+                let mut state = lock(&self.awaiting_daemon_state);
+                let entry = state.entry(mid.clone()).or_default();
+                entry.queued_at.get_or_insert_with(|| queued_at.clone());
+                let should_notify = !entry.notified;
+                entry.notified = true;
+                let mut to_schedule = Vec::new();
+                let mut all_routed = true;
+                let mut unscheduled = BTreeSet::new();
+                for rcpt in &pending_receipts {
+                    let key = normalize_persona(&rcpt.recipient_name)
+                        .unwrap_or_else(|| rcpt.recipient_name.trim().to_ascii_lowercase());
+                    let is_routed = !key.is_empty() && routed_keys.contains(&key);
+                    if is_routed {
+                        if !entry.scheduled_routed.contains(&key) {
+                            to_schedule.push((key, true, rcpt.clone()));
+                        }
+                    } else {
+                        all_routed = false;
+                        if !key.is_empty() {
+                            unscheduled.insert(key.clone());
+                        }
+                        if !entry.tried_unrouted.contains(&key) {
+                            to_schedule.push((key, false, rcpt.clone()));
                         }
                     }
-                    Err(message) => {
-                        schedule_ok = false;
-                        warn(&message);
+                }
+                entry.unscheduled_recipients = unscheduled;
+                drop(state);
+
+                if should_notify {
+                    self.notify_subscribers_message(&msg, &pending_receipts);
+                    self.broadcast_to_peers(
+                        None,
+                        &PeerFrame::Publish {
+                            message: msg.clone(),
+                            receipts: pending_receipts.clone(),
+                        },
+                    );
+                }
+
+                let mut schedule_ok = true;
+                if !to_schedule.is_empty() {
+                    let rcpts_to_schedule: Vec<DeliveryReceipt> =
+                        to_schedule.iter().map(|(_, _, r)| r.clone()).collect();
+                    match self.schedule_dispatch(
+                        &msg,
+                        &rcpts_to_schedule,
+                        now.clone(),
+                        &mut first_holds,
+                    ) {
+                        Ok(()) => {
+                            let mut state = lock(&self.awaiting_daemon_state);
+                            if let Some(entry) = state.get_mut(mid) {
+                                for (key, is_routed, _) in to_schedule {
+                                    if is_routed {
+                                        entry.scheduled_routed.insert(key);
+                                    } else {
+                                        entry.tried_unrouted.insert(key);
+                                    }
+                                }
+                                entry.waiting_for_route = !all_routed;
+                            }
+                        }
+                        Err(message) => {
+                            schedule_ok = false;
+                            let mut state = lock(&self.awaiting_daemon_state);
+                            if let Some(entry) = state.get_mut(mid) {
+                                entry.waiting_for_route = false;
+                                for (key, _, _) in to_schedule {
+                                    if !key.is_empty() {
+                                        entry.unscheduled_recipients.insert(key);
+                                    }
+                                }
+                            }
+                            warn(&message);
+                        }
+                    }
+                } else {
+                    let mut state = lock(&self.awaiting_daemon_state);
+                    if let Some(entry) = state.get_mut(mid) {
+                        entry.waiting_for_route = !all_routed;
                     }
                 }
-            }
 
-            let expired = now.unix_millis().saturating_sub(queued_at.unix_millis())
-                >= MAX_AWAITING_DAEMON_AGE_MS;
-            if (all_routed && schedule_ok) || expired {
+                all_routed && schedule_ok
+            };
+
+            log_first_holds(first_holds);
+            if clear_marker {
                 let _ = self.store.clear_wire_awaiting_daemon(mid);
                 lock(&self.awaiting_daemon_state).remove(mid);
             }
@@ -2629,6 +2730,7 @@ pub struct DaemonHandle {
     listen_addr: Option<String>,
     shutdown: Arc<AtomicBool>,
     join_handle: Option<std::thread::JoinHandle<()>>,
+    poll_join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DaemonHandle {
@@ -2647,6 +2749,9 @@ impl DaemonHandle {
             let _ = TcpStream::connect(addr);
         }
         if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.poll_join_handle.take() {
             let _ = h.join();
         }
         let _ = fs::remove_file(&self.socket_path);
@@ -2752,7 +2857,7 @@ where
     warn(
         "startup: pre-restart pending messages remain readable in the inbox; delivery may be unconfirmed",
     );
-    inner.drain_awaiting_daemon_messages();
+    inner.drain_awaiting_daemon_messages(true);
 
     // Spawn outbound peer loops
     for peer_url in config.peers.clone() {
@@ -2774,11 +2879,28 @@ where
     }
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_poll = Arc::clone(&shutdown_flag);
+    let inner_poll = Arc::clone(&inner);
+    let poll_join_handle = std::thread::Builder::new()
+        .name("fl-wire-awaiting-poll".into())
+        .spawn(move || {
+            let mut last_poll = Instant::now();
+            while !shutdown_poll.load(Ordering::SeqCst)
+                && !inner_poll.shutdown.load(Ordering::SeqCst)
+            {
+                if last_poll.elapsed() >= AWAITING_DAEMON_POLL_INTERVAL {
+                    last_poll = Instant::now();
+                    inner_poll.drain_awaiting_daemon_messages(false);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        })?;
+
     let shutdown_clone = Arc::clone(&shutdown_flag);
     let inner_main = Arc::clone(&inner);
 
     let join_handle = std::thread::spawn(move || {
-        let mut last_awaiting_poll = Instant::now();
         while !shutdown_clone.load(Ordering::SeqCst) && !inner_main.shutdown.load(Ordering::SeqCst)
         {
             let mut did_work = false;
@@ -2865,11 +2987,6 @@ where
                 });
             }
 
-            if last_awaiting_poll.elapsed() >= AWAITING_DAEMON_POLL_INTERVAL {
-                last_awaiting_poll = Instant::now();
-                inner_main.drain_awaiting_daemon_messages();
-            }
-
             if !did_work {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -2882,6 +2999,7 @@ where
         listen_addr: config.listen_addr,
         shutdown: shutdown_flag,
         join_handle: Some(join_handle),
+        poll_join_handle: Some(poll_join_handle),
     })
 }
 
@@ -7806,5 +7924,93 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         assert!(hook_listener.accept().is_err());
         handle_2.stop();
+    }
+
+    #[test]
+    fn awaiting_daemon_keeps_marker_on_schedule_failure_and_skips_unrouted_polls_and_reports_status()
+     {
+        let (_tmp, inner) = fault_rig();
+        let now_ms = now_at().unix_millis();
+
+        // 1. Keep-on-failure: recipient "held" has an explicit route in `fault_rig()`.
+        // Force `schedule_dispatch` to fail on worker spawn and verify the store marker is retained.
+        let (msg_routed, _) = inner
+            .store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("held".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "routed-fail-spawn".into(),
+                body: "keep marker when schedule_dispatch fails".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(now_ms),
+            })
+            .unwrap();
+        inner.fail_next_worker_spawn.store(true, Ordering::SeqCst);
+        inner.drain_awaiting_daemon_messages(false);
+        assert_eq!(
+            inner.store.list_wire_awaiting_daemon().unwrap(),
+            vec![(msg_routed.id.clone(), At::from_unix_millis(now_ms))],
+            "marker must remain in store when schedule_dispatch fails"
+        );
+        inner
+            .store
+            .clear_wire_awaiting_daemon(&msg_routed.id)
+            .unwrap();
+        lock(&inner.awaiting_daemon_state).remove(&msg_routed.id);
+
+        // 2. Unrouted recipient: first poll reads message + receipts, discovers no route, and
+        // marks the entry waiting_for_route. Subsequent periodic polls (recheck_unrouted = false)
+        // must skip get_wire_message and list_wire_receipts until routes change.
+        let (_msg_unrouted, _) = inner
+            .store
+            .send_wire_awaiting_daemon(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: Some("node-a".into()),
+                to: WireAddress::AgentName("pull-only-persona".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "unrouted".into(),
+                body: "skip store reads on subsequent periodic polls".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(now_ms - 5_000),
+            })
+            .unwrap();
+        inner.drain_awaiting_daemon_messages(false);
+        assert_eq!(
+            inner.store.list_wire_awaiting_daemon().unwrap().len(),
+            1,
+            "unrouted marker stays in store while awaiting a route"
+        );
+
+        // Status snapshot surfaces aged awaiting_daemon count and age for the recipient.
+        let summaries = inner.pending_recipients_snapshot(&now_at());
+        let pull_summary = summaries
+            .iter()
+            .find(|s| s.recipient == "pull-only-persona")
+            .expect("pull-only-persona should appear in pending_recipients_snapshot");
+        assert_eq!(pull_summary.awaiting_daemon_count, 1);
+        assert!(pull_summary.oldest_awaiting_daemon_age_ms.unwrap_or(0) >= 5_000);
+
+        // Clear recorded FaultStore calls and run another periodic poll (`recheck_unrouted = false`).
+        lock(&inner.store.calls).clear();
+        inner.drain_awaiting_daemon_messages(false);
+        let calls_on_second_poll = lock(&inner.store.calls).clone();
+        assert!(
+            calls_on_second_poll.is_empty(),
+            "periodic poll should skip get/receipts reads for unrouted markers when routes did not change, got {calls_on_second_poll:?}"
+        );
     }
 }

@@ -2028,6 +2028,10 @@ pub struct HubRouteDispatchObservation {
     pub outcome: fl_wire::dispatch_diagnostics::DispatchCallOutcome,
 }
 
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
 /// Allowlist projection of [`fl_wire::daemon::RecipientPendingSummary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubRecipientPendingSummary {
@@ -2039,6 +2043,12 @@ pub struct HubRecipientPendingSummary {
     pub oldest_pending_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<fl_wire::daemon::PendingHoldReason>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub awaiting_daemon_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_at: Option<fl_core::at::At>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_age_ms: Option<u64>,
 }
 
 impl HubRecipientPendingSummary {
@@ -2049,6 +2059,9 @@ impl HubRecipientPendingSummary {
             oldest_pending_at,
             oldest_pending_age_ms,
             hold_reason,
+            awaiting_daemon_count,
+            oldest_awaiting_daemon_at,
+            oldest_awaiting_daemon_age_ms,
         } = summary;
         Self {
             recipient,
@@ -2056,6 +2069,9 @@ impl HubRecipientPendingSummary {
             oldest_pending_at,
             oldest_pending_age_ms,
             hold_reason,
+            awaiting_daemon_count,
+            oldest_awaiting_daemon_at,
+            oldest_awaiting_daemon_age_ms,
         }
     }
 }
@@ -11483,6 +11499,9 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(started_at),
                     oldest_pending_age_ms: Some(1500),
                     hold_reason: None,
+                    awaiting_daemon_count: 0,
+                    oldest_awaiting_daemon_at: None,
+                    oldest_awaiting_daemon_age_ms: None,
                 }],
                 codex_queues: vec![],
             });
@@ -11644,6 +11663,9 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(ts_for_status),
                     oldest_pending_age_ms: Some(250),
                     hold_reason: Some(fl_wire::daemon::PendingHoldReason::DeadExplicitRoute),
+                    awaiting_daemon_count: 0,
+                    oldest_awaiting_daemon_at: None,
+                    oldest_awaiting_daemon_age_ms: None,
                 }],
                 codex_queues: vec![
                     fl_wire::daemon::CodexRouteQueueStatus {

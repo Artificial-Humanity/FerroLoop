@@ -137,7 +137,15 @@ impl HostEndpoint {
         #[cfg(target_os = "linux")]
         {
             let uid = unix_euid();
-            let path = if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
+            let path = if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1") {
+                Self::discover_unix_path_with(
+                    std::env::var_os("FL_HOST_SOCK").as_deref(),
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    None,
+                    std::env::var_os("HOME").as_deref(),
+                    uid,
+                )
+            } else if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
                 let candidate = PathBuf::from(raw);
                 Self::discover_unix_path_with(
                     std::env::var_os("FL_HOST_SOCK").as_deref(),

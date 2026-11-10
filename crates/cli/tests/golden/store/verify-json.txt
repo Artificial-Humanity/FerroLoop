@@ -349,6 +349,14 @@ exit: 0
       "clean": true,
       "ferro_hash": "<HASH#3>",
       "ferro_rows": 0,
+      "name": "wire_awaiting_daemon",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
       "name": "workflow_defs",
       "redb_hash": "<HASH#3>",
       "redb_rows": 0
