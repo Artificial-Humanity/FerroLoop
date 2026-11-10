@@ -739,6 +739,7 @@ fn failure_reason(stage: FailureStage) -> FenceReason {
         FailureStage::MessageLookupError => FenceReason::MessageLookupError,
         FailureStage::InitialReceiptReadError => FenceReason::InitialReceiptReadError,
         FailureStage::TransportError => FenceReason::TransportError,
+        FailureStage::ComposerOccupiedByNonWireInput => FenceReason::ComposerOccupiedByNonWireInput,
         FailureStage::ReceiptWriteError => FenceReason::ReceiptWriteError,
         FailureStage::ReceiptWriteMissing => FenceReason::ReceiptWriteMissing,
         FailureStage::FinalReceiptReadError => FenceReason::FinalReceiptReadError,
@@ -1451,17 +1452,21 @@ where
                     && (!matches!(
                         r.first_reason,
                         FenceReason::TransportError
+                            | FenceReason::ComposerOccupiedByNonWireInput
                             | FenceReason::UnresolvedReceiptStatus
                             | FenceReason::QueueOverflow
                     ) || !matches!(
                         r.decisive_reason,
                         FenceReason::TransportError
+                            | FenceReason::ComposerOccupiedByNonWireInput
                             | FenceReason::UnresolvedReceiptStatus
                             | FenceReason::QueueOverflow
                     ) || r.failure_stages.iter().any(|s| {
                         !matches!(
                             s,
-                            FailureStage::TransportError | FailureStage::UnresolvedReceiptStatus
+                            FailureStage::TransportError
+                                | FailureStage::ComposerOccupiedByNonWireInput
+                                | FailureStage::UnresolvedReceiptStatus
                         )
                     }) || r
                         .route_observations
@@ -2937,6 +2942,40 @@ mod tests {
             assert_eq!(
                 row.route_observations[0].outcome,
                 crate::dispatch_diagnostics::DispatchCallOutcome::ReturnedError
+            );
+        });
+    }
+
+    #[test]
+    fn diagnostics_composer_occupied_fences_and_unfences_on_ack() {
+        let (_tmp, inner) = fault_rig();
+        let occupied_err =
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
+                .to_string();
+        with_transport(Err(occupied_err), || {
+            let id = run_fault_job(&inner, "held");
+            let row = &inner.diagnostics_snapshot().records[0];
+            assert_eq!(
+                row.first_reason,
+                FenceReason::ComposerOccupiedByNonWireInput
+            );
+            assert_eq!(row.decisive_reason, FenceReason::UnresolvedReceiptStatus);
+            assert_eq!(
+                row.failure_stages,
+                vec![
+                    FailureStage::ComposerOccupiedByNonWireInput,
+                    FailureStage::UnresolvedReceiptStatus,
+                ]
+            );
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+            let (response, _) = inner.handle_local_request(LocalRequest::Ack {
+                recipient: "held".into(),
+                message_ids: vec![id],
+            });
+            assert!(matches!(response, LocalResponse::Acked { .. }));
+            assert!(
+                !lock(&inner.overflow_recipients).contains("held"),
+                "fl wire read --ack must unfence ComposerOccupiedByNonWireInput once resolved"
             );
         });
     }
