@@ -2,9 +2,13 @@
 use fl_store::ferrostore::{
     ColumnDef, ColumnType, ColumnValue, FerroStore, VectorMetric, VectorStorage,
 };
-use fl_store::recovery::{CancelToken, CaptureBudget};
+use fl_store::recovery::{
+    CancelToken, CaptureBudget, OperationLimits, ProfileKind, ValidationProfile, copy_and_verify,
+    verify_existing_copy,
+};
 use serde_json::json;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -61,9 +65,15 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
                     "--test-threads=1",
                 ])
                 .env("FL_CAPTURE_MEMORY_CHILD", shape)
+                .env_remove("AGENT_PERSONA")
+                .env_remove("AGENT_NAME")
+                .env_remove("FL_HOSTED_ID")
+                .env_remove("AGENT_HYDRATION_GENERATION")
                 .spawn()
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(180);
+            // Aggregate watchdog covers fixture setup plus five separately
+            // bounded phases; each operation retains its 120s/1GiB limits.
+            let deadline = Instant::now() + Duration::from_secs(600);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success(), "isolated {shape} measurement failed");
@@ -72,7 +82,7 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
                 if Instant::now() >= deadline {
                     child.kill().unwrap();
                     child.wait().unwrap();
-                    panic!("isolated measurement exceeded 180 seconds");
+                    panic!("isolated five-phase measurement exceeded 600 seconds");
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -85,6 +95,7 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
         _ => panic!("unknown fixture shape"),
     };
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = tmp.path().join("mixed.fls");
     let store = FerroStore::open(&path).unwrap();
     store
@@ -199,4 +210,70 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
     println!(
         "capture_memory shape={shape} vectors={vectors} dimensions={dimensions} M=4 wal_upserts=8 file_bytes={file_bytes} baseline={baseline} peak_extra={peak} charged={charged} model_safety_factor=2"
     );
+    println!(
+        "retained_memory shape={shape} bytes={}",
+        capture.retained_bytes()
+    );
+    // Each phase receives its own explicit 1 GiB limit. The source cache and
+    // immutable pin remain alive throughout, and are included in each baseline.
+    let limits = || {
+        OperationLimits::new(
+            Instant::now() + Duration::from_secs(120),
+            1 << 30,
+            1 << 30,
+            CancelToken::new(),
+        )
+    };
+    let image = tmp.path().join("image.fls");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&image)
+        .unwrap();
+    let pipeline_baseline = baseline;
+    let mut pipeline_peak = baseline + peak;
+    let mut measured = |phase: &str, f: &mut dyn FnMut(&OperationLimits)| {
+        let l = limits();
+        let baseline = LIVE.load(Ordering::SeqCst);
+        PEAK.store(baseline, Ordering::SeqCst);
+        f(&l);
+        let absolute_peak = PEAK.load(Ordering::SeqCst);
+        pipeline_peak = pipeline_peak.max(absolute_peak);
+        let peak = absolute_peak.saturating_sub(baseline);
+        let charged = l.admitted_memory_bytes();
+        assert!(
+            charged >= 2 * peak as u64,
+            "{phase}: charge {charged} < 2x measured {peak}"
+        );
+        assert!(charged <= 1 << 30);
+        println!(
+            "recovery_memory shape={shape} phase={phase} baseline={baseline} peak_extra={peak} charged={charged} model_safety_factor=2 budget={}",
+            1u64 << 30
+        );
+        assert!(peak <= 1 << 30);
+    };
+    measured("write_image", &mut |l| {
+        capture.write_image(&mut file, l).unwrap();
+    });
+    let profile = ValidationProfile::new(ProfileKind::MixedTablesVectors, "fixture-memory");
+    let mut expected = None;
+    measured("expectations", &mut |l| {
+        expected = Some(capture.expectations(&profile, l).unwrap());
+    });
+    let expected = expected.unwrap();
+    if cfg!(target_os = "linux") {
+        let copy = tmp.path().join("copy.fls");
+        measured("copy_and_verify", &mut |l| {
+            copy_and_verify(&image, &copy, &expected, &profile, l).unwrap();
+        });
+        measured("verify_existing", &mut |l| {
+            verify_existing_copy(&copy, &expected, &profile, l).unwrap();
+        });
+    }
+    println!(
+        "recovery_pipeline shape={shape} fixture_baseline={pipeline_baseline} peak_extra={} absolute_peak={pipeline_peak} source_cache_and_pin_retained=true",
+        pipeline_peak - pipeline_baseline
+    );
+    assert!(pipeline_peak - pipeline_baseline <= 1 << 30);
 }

@@ -129,6 +129,22 @@ fn existing_only_and_one_copy_never_contact_socket_or_live_source() {
     socket.set_nonblocking(true).unwrap();
     let before = fs::read_dir(tmp.path()).unwrap().count();
     let report = copy_and_verify(&image_path, &copy, &expected, &profile(), &limits()).unwrap();
+    let evidence = report.copy_evidence.as_ref().unwrap();
+    let source_meta = fs::metadata(&image_path).unwrap();
+    let copy_meta = fs::metadata(&copy).unwrap();
+    assert_eq!(
+        evidence.creation,
+        fl_store::recovery::manifest::CopyCreation::WrapperCreated
+    );
+    assert_eq!(
+        evidence.source_image_identity,
+        Some((source_meta.dev(), source_meta.ino()))
+    );
+    assert_eq!(
+        evidence.verified_file_identity,
+        (copy_meta.dev(), copy_meta.ino())
+    );
+    assert_eq!(evidence.image_sha256, report.image_sha256);
     assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), before + 1);
     assert_ne!(
         fs::metadata(&copy).unwrap().ino(),
@@ -283,7 +299,13 @@ fn manifest_binds_report_members_and_models_unpublished_status() {
     assert_eq!(manifest.local_status, LocalPublicationStatus::NotPublished);
     assert_eq!(
         manifest.independent_copy_status,
-        IndependentCopyStatus::Verified
+        IndependentCopyStatus::OutcomeUnknown
+    );
+    let fields = serde_json::to_value(&manifest).unwrap();
+    assert!(fields.get("format_version").is_none());
+    assert_eq!(
+        fields["container_version"],
+        expected.descriptor().container_format
     );
     assert!(manifest.published_at_unix_ms.is_none());
     assert_eq!(manifest.image_bytes, fs::metadata(&path).unwrap().len());
@@ -295,6 +317,30 @@ fn manifest_binds_report_members_and_models_unpublished_status() {
     assert_eq!(
         manifest,
         serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.copy_evidence.as_ref().unwrap().creation,
+        CopyCreation::CallerSuppliedExisting
+    );
+    assert!(
+        report
+            .copy_evidence
+            .as_ref()
+            .unwrap()
+            .source_image_identity
+            .is_none()
+    );
+    let mut missing = report.clone();
+    missing.copy_evidence = None;
+    assert!(
+        BundleManifestV1::verified_unpublished(&expected, &p, &missing, context.clone(), &limits())
+            .is_err()
+    );
+    let mut altered = report.clone();
+    altered.image_sha256 = "c".repeat(64);
+    assert!(
+        BundleManifestV1::verified_unpublished(&expected, &p, &altered, context.clone(), &limits())
+            .is_err()
     );
     let mut corrupt = report;
     corrupt.image_sha256 = "bad".into();
@@ -592,4 +638,38 @@ fn r1_query_work_budget_is_cumulative_across_both_verification_opens() {
     let mut two_passes = limits();
     two_passes.query_work_limit = low * 2;
     assert!(verify_existing_copy(&tmp.path().join("copy.fls"), &expected, &p, &two_passes).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_r1_changed_column_at_same_sequence_rejects_logical_content() {
+    let tmp = private_dir();
+    let a = FerroStore::open(tmp.path().join("a.fls")).unwrap();
+    let b = FerroStore::open(tmp.path().join("b.fls")).unwrap();
+    for (store, value) in [(&a, 7), (&b, 8)] {
+        store
+            .create_column_table(
+                "table",
+                &[ColumnDef {
+                    name: "n".into(),
+                    ty: ColumnType::Int64,
+                }],
+            )
+            .unwrap();
+        store
+            .append_column_rows("table", &[vec![ColumnValue::Int64(value)]])
+            .unwrap();
+    }
+    let p = profile();
+    let expected = pin(&a).expectations(&p, &limits()).unwrap();
+    let other = pin(&b).expectations(&p, &limits()).unwrap();
+    assert_eq!(expected.descriptor(), other.descriptor());
+    let path = tmp.path().join("changed.fls");
+    image(&b, &path);
+    // Valid standalone image with the same S and shape passes its own evidence.
+    assert!(verify_existing_copy(&path, &other, &p, &limits()).is_ok());
+    assert!(matches!(
+        verify_existing_copy(&path, &expected, &p, &limits()),
+        Err(fl_store::recovery::RecoveryError::Verification { .. })
+    ));
 }

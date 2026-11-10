@@ -1,7 +1,7 @@
 //! Existing-only verification. No socket routing, migration, adapters or writes
 //! through a decoded reader. Linux privacy is proved using no-follow handles,
 //! ownership/mode/link checks and absence of extended ACLs; other hosts refuse.
-use super::manifest::Readiness;
+use super::manifest::{CopyCreation, CopyEvidence, Readiness};
 use super::{
     OperationLimits, RecoveryError, ValidationExpectations, ValidationProfile, VerificationReport,
 };
@@ -88,6 +88,12 @@ pub fn verify_existing_copy(
     }
     Ok(VerificationReport {
         report_version: 1,
+        copy_evidence: Some(CopyEvidence {
+            verified_file_identity: held.identity(),
+            source_image_identity: None,
+            creation: CopyCreation::CallerSuppliedExisting,
+            image_sha256: before.1.clone(),
+        }),
         operation_id: limits.operation_id.to_string(),
         image_sha256: before.1,
         image_bytes: before.0,
@@ -200,7 +206,14 @@ pub fn copy_and_verify(
         {
             return Err(limits.verification());
         }
-        let report = verify_existing_copy(copy_path, expected, profile, limits)?;
+        let mut report = verify_existing_copy(copy_path, expected, profile, limits)?;
+        bind_created_copy(
+            &mut report,
+            &before,
+            source.identity(),
+            target.identity(),
+            limits,
+        )?;
         source.unchanged(limits)?;
         target.same_name(limits)?;
         if before != hash_file(&source.file, limits)? || before != hash_file(&target.file, limits)?
@@ -212,6 +225,35 @@ pub fn copy_and_verify(
     // Failure leaves a private, explicitly named incomplete artifact. Task 4
     // owns staging/quarantine/cleanup; never unlink a substituted pathname here.
     result
+}
+
+// Bind the independently reopened verifier result to the exact handles copied
+// above. Successful logical reads alone cannot establish this provenance.
+fn bind_created_copy(
+    report: &mut VerificationReport,
+    source_hash: &(u64, String),
+    source: (u64, u64),
+    target: (u64, u64),
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    l.check()?;
+    let evidence = report
+        .copy_evidence
+        .as_mut()
+        .ok_or_else(|| l.verification())?;
+    if report.image_sha256 != source_hash.1
+        || report.image_bytes != source_hash.0
+        || evidence.image_sha256 != source_hash.1
+        || evidence.verified_file_identity != target
+        || source == target
+        || evidence.creation != CopyCreation::CallerSuppliedExisting
+        || evidence.source_image_identity.is_some()
+    {
+        return Err(l.verification());
+    }
+    evidence.source_image_identity = Some(source);
+    evidence.creation = CopyCreation::WrapperCreated;
+    Ok(())
 }
 
 struct PrivateFile {
@@ -553,6 +595,78 @@ mod tests {
             64 << 20,
             crate::recovery::CancelToken::new(),
         )
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_r1_created_copy_binds_report_digest_inode_and_evidence() {
+        use crate::recovery::{CancelToken, CaptureBudget, ProfileKind};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = crate::FerroStore::open(dir.path().join("source.fls")).unwrap();
+        let l = limits();
+        let capture = store
+            .capture_recovery(
+                &CaptureBudget::new(
+                    l.deadline,
+                    64 << 20,
+                    64 << 20,
+                    std::time::Duration::from_secs(1),
+                ),
+                &CancelToken::new(),
+            )
+            .unwrap();
+        let profile = ValidationProfile::new(ProfileKind::SmallEmpty, "fixture");
+        let expected = capture.expectations(&profile, &l).unwrap();
+        let image = PrivateFile::open(&dir.path().join("image.fls"), true, &l).unwrap();
+        capture
+            .write_image(&mut image.file.try_clone().unwrap(), &l)
+            .unwrap();
+        std::fs::copy(&image.path, dir.path().join("copy.fls")).unwrap();
+        let copy = PrivateFile::open(&dir.path().join("copy.fls"), false, &l).unwrap();
+        let report = verify_existing_copy(&copy.path, &expected, &profile, &l).unwrap();
+        let hash = hash_file(&image.file, &l).unwrap();
+        let source = image.identity();
+        let target = copy.identity();
+        for mutation in 0..6 {
+            let mut changed = report.clone();
+            match mutation {
+                0 => changed.image_sha256 = "a".repeat(64),
+                1 => changed.image_bytes += 1,
+                2 => {
+                    changed
+                        .copy_evidence
+                        .as_mut()
+                        .unwrap()
+                        .verified_file_identity = source
+                }
+                3 => changed.copy_evidence.as_mut().unwrap().image_sha256 = "b".repeat(64),
+                4 => changed.copy_evidence = None,
+                5 => {
+                    changed
+                        .copy_evidence
+                        .as_mut()
+                        .unwrap()
+                        .source_image_identity = Some(source)
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                bind_created_copy(&mut changed, &hash, source, target, &l).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        assert!(bind_created_copy(&mut report.clone(), &hash, target, target, &l).is_err());
+        let mut bound = report;
+        bind_created_copy(&mut bound, &hash, source, target, &l).unwrap();
+        assert_eq!(
+            bound.independent_copy_status(&l).unwrap(),
+            super::super::manifest::IndependentCopyStatus::Verified
+        );
+        assert_eq!(
+            bound.copy_evidence.unwrap().source_image_identity,
+            Some(source)
+        );
     }
     #[test]
     fn canonical_types_framing_order_and_absence_are_distinct() {

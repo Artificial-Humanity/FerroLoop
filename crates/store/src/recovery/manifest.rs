@@ -74,7 +74,6 @@ pub struct BundleManifestV1 {
     pub catalog_store_identity: String,
     pub intrinsic_lineage: Availability<String>,
     pub source_map_sha256: String,
-    pub format_version: u32,
     pub container_version: u32,
     pub snapshot_version: u32,
     pub application_schema_version: Availability<u64>,
@@ -115,12 +114,30 @@ pub enum Readiness {
     DependenciesRequireReconciliation,
     UnknownDomainCoverage,
 }
-/// Public diagnostics contain counts, hashes and typed outcomes only. No payload,
+/// Volatile handle evidence from this verification operation, never durable
+/// identity, intrinsic lineage, publication, or a caller provenance attestation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyCreation {
+    WrapperCreated,
+    CallerSuppliedExisting,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopyEvidence {
+    pub verified_file_identity: (u64, u64),
+    pub source_image_identity: Option<(u64, u64)>,
+    pub creation: CopyCreation,
+    pub image_sha256: String,
+}
+
+/// Diagnostics contain counts, hashes, volatile file identities and typed outcomes only. No payload,
 /// collection names, document IDs, catalog identifiers, paths or query text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationReport {
     pub report_version: u32,
+    pub copy_evidence: Option<CopyEvidence>,
     pub operation_id: String,
     pub image_sha256: String,
     pub image_bytes: u64,
@@ -143,6 +160,31 @@ pub struct VerificationReport {
     pub durable_rpc_receipts_claimed: bool,
     pub readiness: Readiness,
     pub verifier_build_identity: BuildIdentity,
+}
+impl VerificationReport {
+    pub(crate) fn independent_copy_status(
+        &self,
+        l: &super::OperationLimits,
+    ) -> Result<IndependentCopyStatus, super::RecoveryError> {
+        let evidence = self
+            .copy_evidence
+            .as_ref()
+            .ok_or_else(|| l.verification())?;
+        if evidence.image_sha256 != self.image_sha256 || !sha256(&evidence.image_sha256) {
+            return Err(l.verification());
+        }
+        match (&evidence.creation, evidence.source_image_identity) {
+            (CopyCreation::WrapperCreated, Some(source))
+                if source != evidence.verified_file_identity =>
+            {
+                Ok(IndependentCopyStatus::Verified)
+            }
+            (CopyCreation::CallerSuppliedExisting, None) => {
+                Ok(IndependentCopyStatus::OutcomeUnknown)
+            }
+            _ => Err(l.verification()),
+        }
+    }
 }
 /// Expectations carry only hashes/results, not copies of sensitive source rows.
 /// Fields are private: the sole producer is an immutable CapturedStore pin.
@@ -219,6 +261,7 @@ impl BundleManifestV1 {
         limits: &super::OperationLimits,
     ) -> Result<Self, super::RecoveryError> {
         limits.check()?;
+        let independent_copy_status = report.independent_copy_status(limits)?;
         let profile_sha = super::verify::profile_digest(profile, limits)?;
         if expected.version != 1
             || profile.version != super::profiles::PROFILE_VERSION
@@ -312,7 +355,6 @@ impl BundleManifestV1 {
                 .clone()
                 .map_or(Availability::Unavailable, Availability::Available),
             source_map_sha256: context.source_map_sha256,
-            format_version: d.container_format,
             container_version: d.container_format,
             snapshot_version: d.snapshot_format,
             application_schema_version: d
@@ -345,7 +387,7 @@ impl BundleManifestV1 {
             ],
             code_index_configuration: context.code_index_configuration,
             local_status: LocalPublicationStatus::NotPublished,
-            independent_copy_status: IndependentCopyStatus::Verified,
+            independent_copy_status,
         })
     }
 }

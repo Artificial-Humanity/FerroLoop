@@ -83,17 +83,7 @@ pub(crate) fn expectations_from_reader(
         cancel: &l.cancel,
         clock: &RealClock,
     };
-    // Covers clones made by typed domain reads, query result sets, JSON
-    // canonicalization and simultaneous expectation/report arrays. Compressed
-    // column expansion has a separate bounded per-group reservation below.
-    let retained = retained_bytes(&state, l.memory_byte_limit / 64, &check)?;
-    l.quota(
-        retained
-            .saturating_mul(32)
-            .saturating_add(profile_bytes.saturating_mul(32)),
-        l.memory_byte_limit / 2,
-        "verification memory",
-    )?;
+    memory::validation(&state, profile, profile_bytes, l, &check)?;
     let mut out = ValidationExpectations {
         version: 1,
         source_file_identity: None,
@@ -719,7 +709,7 @@ fn references(
     used: &mut std::collections::BTreeSet<String>,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
-    l.check()?;
+    l.charge_query_work(1)?;
     if value.is_null() {
         return Ok(());
     }
@@ -729,6 +719,9 @@ fn references(
         }
         return Ok(());
     }
+    // Admit the input before cloning it for the eventual reference digest.
+    let (input_bytes, _) = crate::recovery::verify::serialized_checksum(value, l)?;
+    l.charge_query_work(input_bytes)?;
     let target = match value {
         Value::String(s) => s.clone(),
         Value::Number(n) if n.is_u64() => n.to_string(),
@@ -739,11 +732,20 @@ fn references(
     }
     // Resolve catalog aliases explicitly, with a traversal bound and no cycles.
     let mut alias = target.as_str();
-    for _ in 0..state.docs.in_collection(doc::ALIASES).count() {
-        l.check()?;
+    for _ in 0..1024 {
+        l.charge_query_work(
+            (alias.len() as u64)
+                .checked_add(1)
+                .ok_or_else(|| l.verification())?,
+        )?;
         let Some(next) = state.docs.get(doc::ALIASES, alias).and_then(Value::as_str) else {
             break;
         };
+        l.charge_query_work(
+            (next.len() as u64)
+                .checked_add(1)
+                .ok_or_else(|| l.verification())?,
+        )?;
         if state.docs.get(target_c, next).is_some() {
             return Ok(());
         }
@@ -1220,6 +1222,130 @@ mod tests {
     }
 
     #[test]
+    fn external_r1_aliases_are_bounded_and_preserve_reference_policies() {
+        let mut state = DocState::at_seq(0);
+        for n in 0..1100 {
+            state.docs.insert(
+                doc::ALIASES.into(),
+                format!("a{n}"),
+                Arc::new(json!(format!("a{}", n + 1))),
+            );
+        }
+        state
+            .docs
+            .insert("targets".into(), "a1100".into(), Arc::new(json!(true)));
+        state.docs.insert(
+            doc::ALIASES.into(),
+            "cycle".into(),
+            Arc::new(json!("cycle")),
+        );
+        let p = profile();
+        let call = |target: &str, p: &ValidationProfile, l: &OperationLimits| {
+            references(
+                &state,
+                "refs",
+                "id",
+                "/target",
+                "targets",
+                &json!(target),
+                p,
+                &mut Default::default(),
+                l,
+            )
+        };
+        assert!(matches!(
+            call("a0", &p, &limits()),
+            Err(RecoveryError::Verification { .. })
+        ));
+        assert!(matches!(
+            call("cycle", &p, &limits()),
+            Err(RecoveryError::Verification { .. })
+        ));
+        assert!(call("a1090", &p, &limits()).is_ok());
+        let mut bounded = limits();
+        bounded.query_work_limit = 5000;
+        let mut exhausted = false;
+        for _ in 0..1000 {
+            match call("a1090", &p, &bounded) {
+                Ok(()) => {}
+                Err(RecoveryError::Quota {
+                    resource: "query work",
+                    ..
+                }) => {
+                    exhausted = true;
+                    break;
+                }
+                other => panic!("alias work must fail by quota, not deadline: {other:?}"),
+            }
+        }
+        assert!(exhausted);
+        let digest =
+            reference_digest("refs", "id", "/target", "targets", "missing", &limits()).unwrap();
+        let mut except = p.clone();
+        except
+            .preexisting_exceptions
+            .push(crate::recovery::profiles::ReferenceException {
+                reference_sha256: digest.clone(),
+                reason: "known fixture".into(),
+            });
+        assert!(call("missing", &except, &limits()).is_ok());
+        let mut external = p.clone();
+        external
+            .dependencies
+            .push(crate::recovery::profiles::ReferenceDependency {
+                reference_sha256: digest,
+                catalog_identity: "external-fixture".into(),
+                required_sequence: None,
+                policy: crate::recovery::profiles::DependencyPolicy::ReconcileBeforeAdmission,
+            });
+        assert!(call("missing", &external, &limits()).is_ok());
+        let cancelled = limits();
+        cancelled.cancel.cancel();
+        assert!(matches!(
+            call("a1090", &p, &cancelled),
+            Err(RecoveryError::Cancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn external_r1_alias_hops_consume_shared_work() {
+        let mut state = DocState::at_seq(0);
+        for n in 0..512 {
+            state.docs.insert(
+                doc::ALIASES.into(),
+                format!("alias-{n}"),
+                Arc::new(json!(format!("alias-{}", n + 1))),
+            );
+        }
+        state
+            .docs
+            .insert("targets".into(), "alias-512".into(), Arc::new(json!(true)));
+        let mut l = limits();
+        l.query_work_limit = 100;
+        let result = references(
+            &state,
+            "refs",
+            "id",
+            "/target",
+            "targets",
+            &json!("alias-0"),
+            &profile(),
+            &mut Default::default(),
+            &l,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(RecoveryError::Quota {
+                    resource: "query work",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn r1_work_quota_is_shared_by_clones_and_refuses_before_decode() {
         let mut l = limits();
         l.query_work_limit = 10;
@@ -1528,12 +1654,13 @@ mod tests {
         ));
         let path = dir.path().join("features.fls");
         let file = std::fs::File::create(&path).unwrap();
+        let blob = layout::encode_snapshot(0, &Default::default()).unwrap();
         let sb = Superblock {
             epoch: 1,
             snapshot_offset: HEADER_BYTES,
-            snapshot_length: 0,
+            snapshot_length: blob.len() as u64,
             snapshot_seq: 0,
-            wal_offset: HEADER_BYTES,
+            wal_offset: HEADER_BYTES + blob.len() as u64,
             wal_length: 0,
         };
         file.write_all_at(
@@ -1541,11 +1668,18 @@ mod tests {
             0,
         )
         .unwrap();
-        file.set_len(HEADER_BYTES).unwrap();
+        file.write_all_at(&blob, HEADER_BYTES).unwrap();
+        file.set_len(HEADER_BYTES + blob.len() as u64).unwrap();
         drop(file);
         let before = std::fs::read(&path).unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        assert!(decode_existing(&file, &limits()).is_err());
+        assert!(matches!(
+            decode_existing(&file, &limits()),
+            Err(RecoveryError::Unsupported {
+                reason: "container format unsupported",
+                ..
+            })
+        ));
         assert_eq!(before, std::fs::read(&path).unwrap());
     }
     #[test]

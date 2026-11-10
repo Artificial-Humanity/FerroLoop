@@ -108,11 +108,7 @@ impl CapturedStore {
             clock: &clock,
         };
         check.check()?;
-        // Existing codecs allocate a growing body plus one escaped JSON value,
-        // and vector validation scratch. Escaping <=6x input, Vec growth <=2x;
-        // 32x the conservative owned-state charge covers their simultaneous peak.
-        let working = mul(self.retained, 32, &check, "encoding memory")?;
-        quota(working, limits.memory_byte_limit, &check, "encoding memory")?;
+        memory::encoding(&self.state, self.retained, limits, &check)?;
         let blob =
             layout::encode_snapshot_for_recovery(&self.state, &mut || codec_progress(&check))
                 .map_err(|err| decode_error(err, &check))?;
@@ -814,6 +810,9 @@ fn retained_bytes(state: &DocState, limit: u64, check: &Check<'_>) -> Result<u64
     Ok(a.bytes)
 }
 
+#[path = "recovery_memory.rs"]
+mod memory;
+
 #[path = "recovery_validation.rs"]
 mod validation;
 pub(crate) use validation::expectations_from_reader;
@@ -853,13 +852,17 @@ pub(crate) fn decode_existing(
     {
         return Err(check.verify());
     }
+    // Decode scratch is dropped before domain/query validation starts. Both
+    // phases account their retained reader and may use the full caller ceiling;
+    // an arbitrary half-budget here would reject otherwise bounded images.
     let budget = CaptureBudget::new(
         limits.deadline,
-        limits.memory_byte_limit / 2,
-        limits.memory_byte_limit / 2,
+        limits.memory_byte_limit,
+        limits.memory_byte_limit,
         Duration::from_secs(1),
     );
-    let (state, _) = prepare(file, &published.sb, &budget, &check)?;
+    let (state, preparation) = prepare(file, &published.sb, &budget, &check)?;
+    limits.admit_memory(preparation)?;
     let mut version = [0; 4];
     file.read_exact_at(&mut version, HEADER_BYTES + 8)
         .map_err(|_| check.verify())?;

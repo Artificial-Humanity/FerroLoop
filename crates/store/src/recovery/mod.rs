@@ -107,6 +107,7 @@ pub struct OperationLimits {
     pub query_work_limit: u64,
     // Clones and both verification opens share consumption for this operation.
     query_work_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    memory_admission: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl OperationLimits {
     pub fn new(
@@ -123,6 +124,7 @@ impl OperationLimits {
             operation_id: uuid::Uuid::now_v7(),
             query_work_limit: byte_limit.saturating_mul(64),
             query_work_used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            memory_admission: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -137,21 +139,39 @@ pub use verify::{
 };
 
 impl OperationLimits {
+    /// Largest admitted simultaneous working-memory reservation, including the
+    /// retained reader/pin and model safety factors. Not measured RSS/heap.
+    pub fn admitted_memory_bytes(&self) -> u64 {
+        self.memory_admission
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn admit_memory(&self, bytes: u64) -> Result<(), RecoveryError> {
+        self.quota(bytes, self.memory_byte_limit, "working memory")?;
+        self.memory_admission
+            .fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
     pub(crate) fn charge_query_work(&self, units: u64) -> Result<(), RecoveryError> {
         self.check()?;
-        self.query_work_used
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |used| {
-                    used.checked_add(units)
-                        .filter(|next| *next <= self.query_work_limit)
-                },
-            )
-            .map_err(|_| RecoveryError::Quota {
-                operation_id: self.operation_id,
-                resource: "query work",
-            })?;
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut used = self.query_work_used.load(Acquire);
+        loop {
+            self.check()?;
+            let next = used
+                .checked_add(units)
+                .filter(|next| *next <= self.query_work_limit)
+                .ok_or(RecoveryError::Quota {
+                    operation_id: self.operation_id,
+                    resource: "query work",
+                })?;
+            match self
+                .query_work_used
+                .compare_exchange_weak(used, next, AcqRel, Acquire)
+            {
+                Ok(_) => break,
+                Err(current) => used = current,
+            }
+        }
         Ok(())
     }
     pub(crate) fn check(&self) -> Result<(), RecoveryError> {
