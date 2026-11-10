@@ -303,13 +303,19 @@ impl PrivateFile {
             } else {
                 libc::O_RDONLY
             };
+        if let Some(control) = &l.publication_io {
+            super::fs::event(&*control.io, super::fs::RecoveryEvent::OpenFile, l)?;
+        }
         // SAFETY: valid directory descriptor and NUL-terminated single component.
         let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o600) };
         if fd < 0 {
-            return Err(RecoveryError::RefusedInput {
-                operation_id: l.operation_id,
-                reason: "existing private image or exclusive destination required",
-            });
+            return Err(super::fs::open_error(
+                l,
+                RecoveryError::RefusedInput {
+                    operation_id: l.operation_id,
+                    reason: "existing private image or exclusive destination required",
+                },
+            ));
         }
         // SAFETY: openat returned a new owned descriptor.
         let file = unsafe { File::from_raw_fd(fd) };
@@ -347,7 +353,7 @@ impl PrivateFile {
             )
         };
         if fd < 0 {
-            return Err(l.verification());
+            return Err(super::fs::open_error(l, l.verification()));
         }
         // SAFETY: openat returned a new owned descriptor.
         let now = unsafe { File::from_raw_fd(fd) };
@@ -406,7 +412,8 @@ pub(crate) fn walk_parent(
     if parts.next() != Some(Component::RootDir) {
         return Err(l.verification());
     }
-    let mut directory = File::open("/").map_err(|_| l.verification())?;
+    let mut directory = File::open("/")
+        .map_err(|e| super::fs::transient(&e, l).unwrap_or_else(|| l.verification()))?;
     while let Some(part) = parts.next() {
         l.check()?;
         let Component::Normal(name) = part else {
@@ -428,7 +435,7 @@ pub(crate) fn walk_parent(
             )
         };
         if fd < 0 {
-            return Err(l.verification());
+            return Err(super::fs::open_error(l, l.verification()));
         }
         // SAFETY: returned descriptor is uniquely owned.
         directory = unsafe { File::from_raw_fd(fd) };

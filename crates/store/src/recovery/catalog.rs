@@ -333,16 +333,23 @@ fn mark_quarantine(
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
     let quarantine = root.child(".quarantine", false, l)?;
-    if !quarantine.exists(operation, l)? {
-        fs::write_json(
-            &quarantine,
-            operation,
-            &serde_json::json!({"operation_id":operation,"status":"quarantined"}),
-            Member::Receipt,
-            control,
+    let entry = quarantine.child(operation, false, l)?;
+    let catalog = root.child(".catalog", false, l)?;
+    let name = format!("{operation}.json");
+    if catalog.exists(&name, l)? {
+        let held = PrivateFile::open(&catalog.path.join(&name), false, l)?;
+        catalog.rename_checked(
+            &name,
+            &entry,
+            "receipt.json",
+            &*control.io,
+            RecoveryEvent::CatalogPublish,
             l,
+            || held.unchanged(l),
         )?;
     }
+    entry.sync(&*control.io, Directory::QuarantineParent, l)?;
+    catalog.sync(&*control.io, Directory::CatalogParent, l)?;
     quarantine.sync(&*control.io, Directory::QuarantineParent, l)?;
     root.sync(&*control.io, Directory::PublicationParent, l)
 }
@@ -370,6 +377,7 @@ pub(crate) fn reconcile(
         unit,
     ));
     control.charge(fs::overhead_bytes(unit, &l)?, true, &l)?;
+    l.publication_io = Some(control.clone());
     let locks = root.child(".locks", false, &l)?;
     let _lock = StoreLock::operation(&locks, id, &l)?;
     let staging = root.child(".staging", false, &l)?;

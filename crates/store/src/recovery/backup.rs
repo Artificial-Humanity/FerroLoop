@@ -27,6 +27,8 @@ pub struct BackupRequest {
     pub limits: OperationLimits,
     pub profile: ValidationProfile,
     pub image_byte_limit: Option<u64>,
+    /// Payload budget for manifest/report/config/catalog metadata; derived
+    /// directory growth and rounding are added, with total R capped at512MiB.
     pub metadata_byte_limit: u64,
     pub space_margin_bytes: u64,
     pub configs: Vec<ApprovedConfig>,
@@ -61,7 +63,10 @@ fn admit_bytes(
     available: u64,
     operation: u64,
 ) -> Result<u64, ()> {
-    let twice_source = source.checked_mul(2).ok_or(())?;
+    let twice_source = source
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(metadata))
+        .ok_or(())?;
     let required = image
         .checked_mul(2)
         .and_then(|n| n.checked_add(metadata))
@@ -69,6 +74,7 @@ fn admit_bytes(
     if image == 0
         || image > source
         || metadata == 0
+        || metadata > 512 * 1024 * 1024
         || required > twice_source
         || required > available
         || required > operation
@@ -254,25 +260,17 @@ pub fn backup(
         .checked_sub(request.space_margin_bytes)
         .ok_or_else(|| quota(&l))?;
     let ceiling = request.image_byte_limit.unwrap_or(source_meta.len());
-    let cap = admit_bytes(
-        source_meta.len(),
-        ceiling,
-        request.metadata_byte_limit,
-        available,
-        l.byte_limit,
-    )
-    .map_err(|_| quota(&l))?;
+    let unit = fs::allocation_geometry(&root, &l)?;
+    let reserve = fs::overhead_bytes(unit, &l)?
+        .checked_add(request.metadata_byte_limit)
+        .filter(|n| *n <= 512 * 1024 * 1024)
+        .ok_or_else(|| quota(&l))?;
+    let cap = admit_bytes(source_meta.len(), ceiling, reserve, available, l.byte_limit)
+        .map_err(|_| quota(&l))?;
     l.quota(65536, l.memory_byte_limit, "copy working memory")?;
     let config_sources = configs(request, &l)?;
     verify::profile_digest(&request.profile, &l)?;
-    let unit = fs::allocation_geometry(&root, &l)?;
-    let control = Arc::new(PublicationIo::new(
-        io.clone(),
-        cap,
-        request.metadata_byte_limit,
-        ceiling,
-        unit,
-    ));
+    let control = Arc::new(PublicationIo::new(io.clone(), cap, reserve, ceiling, unit));
     control.charge(fs::overhead_bytes(unit, &l)?, true, &l)?;
     l.publication_io = Some(control.clone());
     let locks = root.child(".locks", false, &l)?;
@@ -474,9 +472,18 @@ mod tests {
     // admits each of these impossible operations.
     #[test]
     fn two_images_and_metadata_must_fit_before_capture() {
-        assert!(admit_bytes(4096, 4096, 1, u64::MAX, u64::MAX).is_err());
-        assert!(admit_bytes(4096, 4095, 3, u64::MAX, u64::MAX).is_err());
-        assert!(admit_bytes(4096, 3000, 2193, u64::MAX, u64::MAX).is_err());
+        assert_eq!(
+            admit_bytes(4096, 4096, 1, u64::MAX, u64::MAX).unwrap(),
+            8193
+        );
+        assert_eq!(
+            admit_bytes(4096, 4095, 3, u64::MAX, u64::MAX).unwrap(),
+            8193
+        );
+        assert_eq!(
+            admit_bytes(4096, 3000, 2193, u64::MAX, u64::MAX).unwrap(),
+            8193
+        );
         assert_eq!(admit_bytes(4096, 3000, 2192, 8192, 8192).unwrap(), 8192);
     }
 
@@ -490,4 +497,79 @@ mod tests {
         assert!(admit_bytes(4096, 0, 1000, 8192, 8192).is_err());
         assert!(admit_bytes(4096, 3000, 0, 8192, 8192).is_err());
     }
+}
+
+/// Read-only metadata status. Errors mean the scan is incomplete; no partial
+/// count is reported as complete. Reserve is specific to the supplied request.
+#[derive(Debug)]
+pub struct PublicationStatus {
+    pub requested_metadata_payload_bytes: u64,
+    pub derived_reserve_bytes: u64,
+    pub directory_and_rounding_reserve_bytes: u64,
+    pub quarantined_count: u64,
+    pub quarantined_allocated_bytes: u64,
+}
+pub fn publication_status(
+    request: &BackupRequest,
+    filesystem: &dyn RecoveryFs,
+) -> Result<PublicationStatus, RecoveryError> {
+    let l = &request.limits;
+    if request.destination != filesystem.root() {
+        return Err(fs::refused(l, "approved root required"));
+    }
+    let root = Dir::open(filesystem.root(), l)?;
+    let unit = fs::allocation_geometry(&root, l)?;
+    let mut result = PublicationStatus {
+        requested_metadata_payload_bytes: request.metadata_byte_limit,
+        derived_reserve_bytes: fs::overhead_bytes(unit, l)?
+            .checked_add(request.metadata_byte_limit)
+            .filter(|n| *n <= 512 * 1024 * 1024)
+            .ok_or_else(|| quota(l))?,
+        directory_and_rounding_reserve_bytes: fs::overhead_bytes(unit, l)?,
+        quarantined_count: 0,
+        quarantined_allocated_bytes: 0,
+    };
+    let quarantine = Dir::open(&root.path.join(".quarantine"), l)?;
+    fn allocated(dir: &Dir, l: &OperationLimits, depth: u32) -> Result<u64, RecoveryError> {
+        if depth > 4 {
+            return Err(l.verification());
+        }
+        l.admit_memory(4096 * (depth as u64 + 1))?;
+        let mut total = dir
+            .file
+            .metadata()
+            .map_err(|_| fs::destination(l))?
+            .blocks()
+            .checked_mul(512)
+            .ok_or_else(|| l.verification())?;
+        dir.visit_names(l, |name| {
+            let m =
+                std::fs::symlink_metadata(dir.path.join(name)).map_err(|_| fs::destination(l))?;
+            let bytes = if m.is_dir() {
+                let child = Dir::open(&dir.path.join(name), l)?;
+                if fs::identity(&child.file, l)? != (m.dev(), m.ino()) {
+                    return Err(l.verification());
+                }
+                allocated(&child, l, depth + 1)?
+            } else if m.is_file() && m.nlink() == 1 && m.uid() == unsafe { libc::geteuid() } {
+                m.blocks()
+                    .checked_mul(512)
+                    .ok_or_else(|| l.verification())?
+            } else {
+                return Err(l.verification());
+            };
+            total = total.checked_add(bytes).ok_or_else(|| l.verification())?;
+            Ok(())
+        })?;
+        Ok(total)
+    }
+    quarantine.visit_names(l, |_| {
+        result.quarantined_count = result
+            .quarantined_count
+            .checked_add(1)
+            .ok_or_else(|| l.verification())?;
+        Ok(())
+    })?;
+    result.quarantined_allocated_bytes = allocated(&quarantine, l, 0)?;
+    Ok(result)
 }

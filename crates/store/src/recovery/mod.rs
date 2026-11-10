@@ -45,6 +45,11 @@ pub enum RecoveryError {
     Cancelled { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: image or captured expectations verification failed")]
     Verification { operation_id: uuid::Uuid },
+    #[error("recovery {operation_id}: transient resource failure ({errno})")]
+    Transient {
+        operation_id: uuid::Uuid,
+        errno: i32,
+    },
     #[error("recovery {operation_id}: destination I/O failed")]
     Destination { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: publication outcome unknown")]

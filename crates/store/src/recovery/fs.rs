@@ -33,6 +33,7 @@ pub enum Member {
     Warrants,
     VaultCiphertext,
     Receipt,
+    LockDiagnostics,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Directory {
@@ -47,6 +48,11 @@ pub enum Directory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryEvent {
     Capture,
+    OpenFile,
+    CreateDirectory,
+    Allocate,
+    LockFile,
+    RenameEntry,
     Create(Member),
     Write(Member),
     Flush(Member),
@@ -112,7 +118,7 @@ impl RecoveryFs for NativeRecoveryFs {
 /// P0 allocation proof is restricted to native ext4/XFS with one consistent
 /// power-of-two allocation unit. Reflinks, sparse-file promises and speculative
 /// future free space are never admission credits. Existing shared directories
-/// must fit one unit; larger catalogs require a separately bounded policy.
+/// are charged per created entry, independently of historical operation count.
 pub(crate) fn allocation_geometry(root: &Dir, l: &OperationLimits) -> Result<u64, RecoveryError> {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     let mut kind = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -143,20 +149,31 @@ pub(crate) fn directory_geometry(
     unit: u64,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
-    let m = dir.file.metadata().map_err(|_| destination(l))?;
-    if m.len() > unit || m.blocks().checked_mul(512).is_none_or(|n| n > unit) {
-        return Err(RecoveryError::Unsupported {
-            operation_id: l.operation_id,
-            reason: "directory exceeds admitted small-directory geometry",
-        });
-    }
+    let _ = (unit, dir.file.metadata().map_err(|_| destination(l))?);
     Ok(())
 }
-/// Six directory growth blocks, sixteen member rounding blocks, two lock
-/// entries/files and two catalog receipt/temp rounding blocks. File payloads
-/// are charged separately. No operation allocates beyond these member counts.
+/// P0 safety margin, not a universal filesystem allocation proof: at most32
+/// inserted names, each reserved129 units (two index-path blocks per64 levels
+/// plus a root), plus26 file/lock rounding units. Clean ENOSPC/EDQUOT handling
+/// remains the safety mechanism. Task7 must compare measured native directory
+/// growth to this charge; an excess is a bug and blocks activation.
 pub(crate) fn overhead_bytes(unit: u64, l: &OperationLimits) -> Result<u64, RecoveryError> {
-    unit.checked_mul(26).ok_or_else(|| destination(l))
+    unit.checked_mul(32 * 129 + 26)
+        .ok_or_else(|| destination(l))
+}
+pub(crate) fn transient(error: &io::Error, l: &OperationLimits) -> Option<RecoveryError> {
+    let errno = error.raw_os_error()?;
+    matches!(
+        errno,
+        libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EINTR | libc::EAGAIN
+    )
+    .then_some(RecoveryError::Transient {
+        operation_id: l.operation_id,
+        errno,
+    })
+}
+pub(crate) fn open_error(l: &OperationLimits, refused: RecoveryError) -> RecoveryError {
+    transient(&io::Error::last_os_error(), l).unwrap_or(refused)
 }
 pub(crate) fn destination(l: &OperationLimits) -> RecoveryError {
     RecoveryError::Destination {
@@ -175,7 +192,8 @@ pub(crate) fn event(
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
     l.check()?;
-    io.before(e).map_err(|_| destination(l))?;
+    io.before(e)
+        .map_err(|error| transient(&error, l).unwrap_or_else(|| destination(l)))?;
     l.check()
 }
 fn component(name: &str, l: &OperationLimits) -> Result<CString, RecoveryError> {
@@ -221,6 +239,9 @@ impl Dir {
     ) -> Result<Self, RecoveryError> {
         self.same_name(l)?;
         let name_c = component(name, l)?;
+        if let Some(control) = &l.publication_io {
+            event(&*control.io, RecoveryEvent::CreateDirectory, l)?;
+        }
         // SAFETY: owned parent fd and one validated component.
         let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), name_c.as_ptr(), 0o700) };
         if result != 0
@@ -297,6 +318,7 @@ impl Dir {
         self.same_name(l)?;
         to.same_name(l)?;
         validate()?;
+        event(io, RecoveryEvent::RenameEntry, l)?;
         #[cfg(target_os = "linux")]
         // SAFETY: live directory descriptors, validated components; exclusive rename.
         let result = unsafe {
@@ -333,6 +355,55 @@ impl Dir {
         }
         Ok(())
     }
+    pub(crate) fn visit_names(
+        &self,
+        l: &OperationLimits,
+        mut visit: impl FnMut(&str) -> Result<(), RecoveryError>,
+    ) -> Result<(), RecoveryError> {
+        self.same_name(l)?;
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(open_error(l, destination(l)));
+        }
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe { libc::close(fd) };
+            return Err(destination(l));
+        }
+        struct Close(*mut libc::DIR);
+        impl Drop for Close {
+            fn drop(&mut self) {
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+        let _close = Close(stream);
+        loop {
+            l.charge_query_work(1)?;
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let e = unsafe { libc::readdir(stream) };
+            if e.is_null() {
+                if unsafe { *libc::__errno_location() } != 0 {
+                    return Err(destination(l));
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*e).d_name.as_ptr()) }
+                .to_str()
+                .map_err(|_| l.verification())?;
+            if name != "." && name != ".." {
+                visit(name)?;
+            }
+        }
+        self.same_name(l)
+    }
     pub fn members(&self, l: &OperationLimits) -> Result<Vec<String>, RecoveryError> {
         self.same_name(l)?;
         // SAFETY: duplicate is handed to fdopendir, which takes ownership on success.
@@ -344,7 +415,7 @@ impl Dir {
             )
         };
         if fd < 0 {
-            return Err(destination(l));
+            return Err(open_error(l, destination(l)));
         }
         // SAFETY: fd is a newly owned directory descriptor.
         let stream = unsafe { libc::fdopendir(fd) };
@@ -403,7 +474,10 @@ pub(crate) fn source_file(path: &Path, l: &OperationLimits) -> Result<File, Reco
         )
     };
     if fd < 0 {
-        return Err(refused(l, "existing unaliased source required"));
+        return Err(open_error(
+            l,
+            refused(l, "existing unaliased source required"),
+        ));
     }
     // SAFETY: openat returned a new owned fd.
     let file = unsafe { File::from_raw_fd(fd) };
@@ -415,6 +489,7 @@ pub(crate) fn source_file(path: &Path, l: &OperationLimits) -> Result<File, Reco
 }
 pub(crate) struct StoreLock {
     _file: File,
+    cleanup: Option<(File, CString)>,
 }
 impl StoreLock {
     pub fn acquire(
@@ -434,6 +509,9 @@ impl StoreLock {
     fn named(dir: &Dir, name: &str, l: &OperationLimits) -> Result<Self, RecoveryError> {
         let name = component(name, l)?;
         dir.same_name(l)?;
+        if let Some(control) = &l.publication_io {
+            event(&*control.io, RecoveryEvent::LockFile, l)?;
+        }
         // SAFETY: held directory, validated single component, no-follow create/open.
         let fd = unsafe {
             libc::openat(
@@ -448,7 +526,7 @@ impl StoreLock {
             )
         };
         if fd < 0 {
-            return Err(destination(l));
+            return Err(open_error(l, destination(l)));
         }
         let file = unsafe { File::from_raw_fd(fd) };
         verify::privacy(&file, false, l)?;
@@ -458,8 +536,79 @@ impl StoreLock {
                 operation_id: l.operation_id,
             });
         }
-        // Lock files contain no paths, payloads or persistent ownership claims.
-        Ok(Self { _file: file })
+        // A contender may have opened the old inode before its owner unlinked
+        // the operation name. Never let that descriptor become a second lock.
+        Self::bound(&dir.file, &name, &file, l)?;
+        let cleanup = if name.to_bytes().starts_with(b"operation-") {
+            Some((dir.file.try_clone().map_err(|_| destination(l))?, name))
+        } else {
+            None
+        };
+        let lock = Self {
+            _file: file,
+            cleanup,
+        };
+        let file = &lock._file;
+        let diagnostics=serde_json::to_vec(&serde_json::json!({"operation_id":l.operation_id.to_string(),"pid":std::process::id(),"started_at_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_|destination(l))?.as_millis()})).map_err(|_|destination(l))?;
+        file.set_len(0).map_err(|_| destination(l))?;
+        if let Some(control) = &l.publication_io {
+            control.write_all(file, &diagnostics, 0, Member::LockDiagnostics, l)?;
+        } else {
+            file.write_all_at(&diagnostics, 0)
+                .map_err(|_| destination(l))?;
+        }
+        Ok(lock)
+    }
+    fn bound(
+        parent: &File,
+        name: &CStr,
+        file: &File,
+        l: &OperationLimits,
+    ) -> Result<(), RecoveryError> {
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(RecoveryError::ConcurrentBackup {
+                operation_id: l.operation_id,
+            });
+        }
+        let current = unsafe { current.assume_init() };
+        if identity(file, l)? != (current.st_dev, current.st_ino) {
+            return Err(RecoveryError::ConcurrentBackup {
+                operation_id: l.operation_id,
+            });
+        }
+        Ok(())
+    }
+}
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        if let Some((parent, name)) = &self.cleanup {
+            let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    current.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                let current = unsafe { current.assume_init() };
+                if let Ok(held) = self._file.metadata()
+                    && (held.dev(), held.ino()) == (current.st_dev, current.st_ino)
+                {
+                    unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+                }
+            }
+        }
     }
 }
 /// Cumulative allocation is deliberately not refunded when the verification copy
@@ -505,14 +654,21 @@ impl PublicationIo {
         l: &OperationLimits,
     ) -> Result<(), RecoveryError> {
         l.check()?;
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                v.checked_add(n).filter(|next| *next <= cap)
-            })
-            .map_err(|_| RecoveryError::Quota {
-                operation_id: l.operation_id,
-                resource: "shared staging bytes",
-            })?;
+        let mut old = counter.load(Ordering::Acquire);
+        loop {
+            l.check()?;
+            let next = old
+                .checked_add(n)
+                .filter(|n| *n <= cap)
+                .ok_or(RecoveryError::Quota {
+                    operation_id: l.operation_id,
+                    resource: "shared staging bytes",
+                })?;
+            match counter.compare_exchange_weak(old, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => old = now,
+            }
+        }
         Ok(())
     }
     pub fn charge(&self, n: u64, metadata: bool, l: &OperationLimits) -> Result<(), RecoveryError> {
@@ -532,6 +688,7 @@ impl PublicationIo {
         if bytes == 0 {
             return Ok(());
         }
+        event(&*self.io, RecoveryEvent::Allocate, l)?;
         let length = libc::off_t::try_from(bytes).map_err(|_| destination(l))?;
         // Reserve the entire prospective file before the first write. Linux
         // fallocate avoids write-triggered speculative preallocation. Its
@@ -754,11 +911,17 @@ pub(crate) fn write_json<T: serde::Serialize>(
         hash: Sha256::new(),
         failure: None,
     };
-    let result = serde_json::to_writer(&mut output, value);
+    l.admit_memory(65536)?;
+    let mut buffered = std::io::BufWriter::with_capacity(65536, &mut output);
+    let result = serde_json::to_writer(&mut buffered, value);
+    let flushed = buffered.flush();
+    // Discard any failed buffered tail without a destructor retrying I/O.
+    drop(buffered.into_parts());
     if let Some(e) = output.failure {
         return Err(e);
     }
     result.map_err(|_| l.verification())?;
+    flushed.map_err(|_| destination(l))?;
     control.sync(&file.file, member, l)?;
     file.same_name(l)?;
     let actual = (output.len, format!("{:x}", output.hash.finalize()));
@@ -792,4 +955,52 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     file.unchanged(l)?;
     l.check()?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    #[test]
+    fn stale_contender_cannot_acquire_unlinked_operation_inode() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        let dir = Dir::open(root.path(), &l).unwrap();
+        let operation = uuid::Uuid::now_v7();
+        let first = StoreLock::operation(&dir, operation, &l).unwrap();
+        let name = CString::new(format!("operation-{operation}.lock")).unwrap();
+        let stale = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.path().join(name.to_str().unwrap()))
+            .unwrap();
+        assert_ne!(
+            unsafe { libc::flock(stale.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(first);
+        let replacement = StoreLock::operation(&dir, operation, &l).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(stale.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(matches!(
+            StoreLock::bound(&dir.file, &name, &stale, &l),
+            Err(RecoveryError::ConcurrentBackup { .. })
+        ));
+        assert!(matches!(
+            StoreLock::operation(&dir, operation, &l),
+            Err(RecoveryError::ConcurrentBackup { .. })
+        ));
+        drop(replacement);
+    }
 }

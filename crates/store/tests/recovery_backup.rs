@@ -1,5 +1,9 @@
 //! Publication exercises only fixture roots; never reads user config or live stores.
+//! Set FL_RECOVERY_TEST_DIR to a writable native ext4/XFS directory. The default
+//! uses the platform temp directory, but unsupported filesystems fail clearly;
+//! they never count as passing a refusal assertion. No test silently skips.
 #![cfg(target_os = "linux")]
+use fl_store::recovery::RecoveryError;
 use fl_store::{
     FerroStore,
     recovery::{
@@ -21,7 +25,7 @@ use std::{
 fn reconciliation_limits() -> OperationLimits {
     OperationLimits::new(
         Instant::now() + Duration::from_secs(30),
-        1 << 20,
+        64 << 20,
         256 << 20,
         CancelToken::new(),
     )
@@ -35,7 +39,21 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let test_root = std::env::var_os("FL_RECOVERY_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = tempfile::tempdir_in(&test_root)
+            .expect("FL_RECOVERY_TEST_DIR must be a writable native ext4/XFS directory");
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let path = std::ffi::CString::new(root.path().as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) }, 0);
+        assert!(
+            matches!(
+                unsafe { stat.assume_init() }.f_type as u64,
+                0xef53 | 0x58465342
+            ),
+            "recovery_backup requires native ext4/XFS: set FL_RECOVERY_TEST_DIR; unsupported filesystem is not a refusal-test pass"
+        );
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let source = root.path().join("source.fls");
         let destination = root.path().join("backups");
@@ -94,7 +112,7 @@ fn fixture_request(root: &Path, source: &Path, destination: &Path) -> BackupRequ
         .identity
         .clone();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut limits = OperationLimits::new(deadline, 1 << 20, 256 << 20, CancelToken::new());
+    let mut limits = OperationLimits::new(deadline, 64 << 20, 256 << 20, CancelToken::new());
     limits.operation_id = uuid::Uuid::now_v7();
     let profile = ValidationProfile::new(ProfileKind::SmallEmpty, identity.catalog_key.clone());
     BackupRequest {
@@ -245,7 +263,10 @@ fn nofollow_destination_escape_refuses_without_capture() {
         io: faults.clone(),
         limits: reconciliation_limits(),
     };
-    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::Verification { .. })
+    ));
     assert!(
         !faults
             .seen
@@ -278,7 +299,10 @@ fn durable_bundle_uses_independent_copy_and_collision_preserves_old_bytes() {
     );
     assert!(!bundle.path().join("verification.fls").exists());
     let old = fs::read(bundle.path().join("image.fls")).unwrap();
-    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::RefusedInput { .. })
+    ));
     assert_eq!(fs::read(bundle.path().join("image.fls")).unwrap(), old);
     f.assert_source_usable();
 }
@@ -286,8 +310,8 @@ fn durable_bundle_uses_independent_copy_and_collision_preserves_old_bytes() {
 // An empty store cannot fit two full images and any metadata within twice its
 // physical size. Capture must never run merely to discover that impossibility.
 #[test]
-fn default_and_oversized_image_ceilings_refuse_before_capture() {
-    for ceiling in [None, Some(u64::MAX)] {
+fn oversized_image_ceiling_refuses_before_capture() {
+    for ceiling in [Some(u64::MAX)] {
         let f = Fixture::new();
         let mut request = f.request();
         request.image_byte_limit = ceiling;
@@ -298,7 +322,10 @@ fn default_and_oversized_image_ceilings_refuse_before_capture() {
             io: faults.clone(),
             limits: reconciliation_limits(),
         };
-        assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+        assert!(matches!(
+            backup(&f.store, &request, &filesystem, &CancelToken::new()),
+            Err(RecoveryError::Quota { .. })
+        ));
         assert!(
             !faults
                 .seen
@@ -323,7 +350,10 @@ fn unknown_or_review_required_alias_and_wrong_configured_root_refuse_before_capt
             io: faults.clone(),
             limits: reconciliation_limits(),
         };
-        assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+        assert!(matches!(
+            backup(&f.store, &request, &filesystem, &CancelToken::new()),
+            Err(RecoveryError::RefusedInput { .. })
+        ));
         assert!(
             !faults
                 .seen
@@ -340,7 +370,10 @@ fn unknown_or_review_required_alias_and_wrong_configured_root_refuse_before_capt
         io: faults.clone(),
         limits: reconciliation_limits(),
     };
-    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::RefusedInput { .. })
+    ));
     assert!(
         !faults
             .seen
@@ -382,13 +415,17 @@ fn small_incompressible_source_refuses_before_capture() {
         .clone();
     request.profile.catalog_identity = request.store.catalog_key.clone();
     request.image_byte_limit = Some(fs::metadata(&compact_path).unwrap().len());
+    request.limits.byte_limit = fs::metadata(&compact_path).unwrap().len() * 2;
     let faults = Arc::new(Fault::default());
     let filesystem = FaultFs {
         root: f.destination.clone(),
         io: faults.clone(),
         limits: reconciliation_limits(),
     };
-    assert!(backup(&small, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(matches!(
+        backup(&small, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::Quota { .. })
+    ));
     assert!(
         !faults
             .seen
@@ -444,7 +481,10 @@ fn corrupted_final_member_is_quarantined_without_deletion() {
     let final_path = f.destination.join(request.operation_id.to_string());
     fs::write(final_path.join("report.json"), b"corrupt fixture report").unwrap();
     *faults.failure.lock().unwrap() = None;
-    assert!(reconcile_publication(&request.operation_id.to_string(), &filesystem).is_err());
+    assert!(matches!(
+        reconcile_publication(&request.operation_id.to_string(), &filesystem),
+        Err(RecoveryError::Quarantined { .. })
+    ));
     assert!(final_path.join("image.fls").is_file());
     assert!(
         f.destination
@@ -472,7 +512,10 @@ fn source_hardlink_or_request_for_a_different_owner_refuses_before_capture() {
         io: faults.clone(),
         limits: reconciliation_limits(),
     };
-    assert!(backup(&other, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(matches!(
+        backup(&other, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::RefusedInput { .. })
+    ));
     assert!(
         !faults
             .seen
@@ -481,7 +524,10 @@ fn source_hardlink_or_request_for_a_different_owner_refuses_before_capture() {
             .contains(&RecoveryEvent::Capture)
     );
     fs::hard_link(&f.source, f.destination.join("alias.fls")).unwrap();
-    assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+    assert!(matches!(
+        backup(&f.store, &request, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::RefusedInput { .. })
+    ));
     assert!(
         !faults
             .seen
@@ -663,7 +709,18 @@ fn substitution_at_publish_boundary_never_occupies_a_final_name() {
             io: hook.clone(),
             limits: reconciliation_limits(),
         };
-        assert!(backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err());
+        let result = backup(&f.store, &request, &filesystem, &CancelToken::new());
+        if directory {
+            assert!(
+                matches!(result, Err(RecoveryError::Verification { .. })),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(RecoveryError::RefusedInput { .. })),
+                "{result:?}"
+            );
+        }
         assert!(hook.done.load(std::sync::atomic::Ordering::Acquire));
         assert!(
             !f.destination
@@ -677,7 +734,7 @@ fn substitution_at_publish_boundary_never_occupies_a_final_name() {
 fn shared_metadata_quota_cannot_borrow_an_unlimited_verification_budget() {
     let f = Fixture::new();
     let mut request = f.request();
-    request.metadata_byte_limit = 65536;
+    request.metadata_byte_limit = 1;
     let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
     assert!(matches!(
         backup(&f.store, &request, &filesystem, &CancelToken::new()),
@@ -750,7 +807,7 @@ fn protected_config_snapshots_allow_only_named_descriptors_and_exclude_key_alias
             );
             assert!(!bundle.path().join("vault.key").exists());
         } else {
-            assert!(result.is_err());
+            assert!(matches!(result, Err(RecoveryError::RefusedInput { .. })));
             assert!(
                 !f.destination
                     .join(request.operation_id.to_string())
@@ -796,7 +853,7 @@ fn short_writes_retry_but_enospc_permission_and_zero_writes_abort_privately() {
         if mode == 0 {
             assert!(matches!(result, Ok(PublicationOutcome::Durable(_))))
         } else {
-            assert!(result.is_err());
+            assert!(matches!(result, Err(RecoveryError::Destination { .. })));
             assert!(
                 !f.destination
                     .join(request.operation_id.to_string())
@@ -982,7 +1039,7 @@ fn forced_termination_reconciles_only_complete_operation_without_source_reads() 
         let filesystem = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
         let result = reconcile_publication(&operation, &filesystem);
         if point == "write" {
-            assert!(result.is_err());
+            assert!(matches!(result, Err(RecoveryError::Quarantined { .. })));
             assert!(!f.destination.join(&operation).exists());
         } else {
             assert!(matches!(result, Ok(PublicationOutcome::Durable(_))))
@@ -1092,12 +1149,19 @@ fn mismatched_committed_receipt_quarantines_operation_without_deleting_members()
         reconcile_publication(&request.operation_id.to_string(), &filesystem),
         Err(fl_store::recovery::RecoveryError::Quarantined { .. })
     ));
-    assert!(receipt.is_file());
+    assert!(!receipt.exists());
     assert!(
         f.destination
             .join(".quarantine")
             .join(request.operation_id.to_string())
+            .join("receipt.json")
             .is_file()
+    );
+    assert!(
+        f.destination
+            .join(".quarantine")
+            .join(request.operation_id.to_string())
+            .is_dir()
     );
     assert!(
         f.destination
@@ -1151,7 +1215,7 @@ fn actual_capacity_and_stated_margin_are_admitted_before_capture() {
     }
 }
 #[test]
-fn oversized_shared_directory_refuses_unsupported_allocation_geometry() {
+fn oversized_shared_directory_still_admits_operations() {
     let f = Fixture::new();
     let request = f.request();
     let catalog = f.destination.join(".catalog");
@@ -1168,11 +1232,11 @@ fn oversized_shared_directory_refuses_unsupported_allocation_geometry() {
         limits: reconciliation_limits(),
     };
     assert!(matches!(
-        backup(&f.store, &request, &filesystem, &CancelToken::new()),
-        Err(fl_store::recovery::RecoveryError::Unsupported { .. })
+        backup(&f.store, &request, &filesystem, &CancelToken::new()).unwrap(),
+        PublicationOutcome::Durable(_)
     ));
     assert!(
-        !faults
+        faults
             .seen
             .lock()
             .unwrap()
@@ -1465,7 +1529,7 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
                     f.destination
                         .join(".quarantine")
                         .join(request.operation_id.to_string())
-                        .is_file()
+                        .is_dir()
                 );
                 assert!(
                     f.destination
@@ -1473,8 +1537,6 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
                         .join("image.fls")
                         .is_file()
                 );
-                if reconciliation != Some(true)
-                    && event != RecoveryEvent::Sync(Directory::CatalogParent)
                 {
                     assert!(
                         !f.destination
@@ -1543,9 +1605,480 @@ fn quarantine_parent_sync_failure_is_unknown_and_preserves_other_backup() {
         f.destination
             .join(".quarantine")
             .join(request.operation_id.to_string())
-            .is_file()
+            .is_dir()
     );
-    assert_eq!(fs::read(&receipt).unwrap(), b"{corrupt receipt");
+    assert!(!receipt.exists());
+    assert_eq!(
+        fs::read(
+            f.destination
+                .join(".quarantine")
+                .join(request.operation_id.to_string())
+                .join("receipt.json")
+        )
+        .unwrap(),
+        b"{corrupt receipt"
+    );
     assert_eq!(old_bytes, fs::read(old.path().join("image.fls")).unwrap());
     f.assert_source_usable();
+}
+
+#[test]
+fn default_ceiling_is_admitted_with_bounded_reserve() {
+    let f = Fixture::new();
+    let mut r = f.request();
+    r.image_byte_limit = None;
+    assert!(matches!(
+        backup(
+            &f.store,
+            &r,
+            &NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits()),
+            &CancelToken::new()
+        )
+        .unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+}
+#[test]
+fn operation_lock_is_reclaimed_and_store_lock_has_diagnostics() {
+    let f = Fixture::new();
+    let r = f.request();
+    backup(
+        &f.store,
+        &r,
+        &NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits()),
+        &CancelToken::new(),
+    )
+    .unwrap();
+    let names: Vec<_> = fs::read_dir(f.destination.join(".locks"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(names.len(), 1);
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(&names[0]).unwrap()).unwrap();
+    assert_eq!(v["operation_id"], r.operation_id.to_string());
+    assert_eq!(v["pid"], std::process::id());
+    assert!(v["started_at_unix_ms"].as_u64().unwrap() > 0);
+}
+
+struct ExhaustedOpen;
+impl RecoveryIo for ExhaustedOpen {
+    fn before(&self, e: RecoveryEvent) -> io::Result<()> {
+        if e == RecoveryEvent::OpenFile {
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        } else {
+            Ok(())
+        }
+    }
+}
+#[test]
+fn emfile_during_reconciliation_is_retryable_without_quarantine() {
+    let f = Fixture::new();
+    let r = f.request();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    backup(&f.store, &r, &native, &CancelToken::new()).unwrap();
+    let receipt = f
+        .destination
+        .join(".catalog")
+        .join(format!("{}.json", r.operation_id));
+    let bytes = fs::read(&receipt).unwrap();
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: Arc::new(ExhaustedOpen),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        reconcile_publication(&r.operation_id.to_string(), &filesystem),
+        Err(RecoveryError::Transient {
+            errno: libc::EMFILE,
+            ..
+        })
+    ));
+    assert!(
+        !f.destination
+            .join(".quarantine")
+            .join(r.operation_id.to_string())
+            .exists()
+    );
+    assert_eq!(fs::read(receipt).unwrap(), bytes);
+    assert!(matches!(
+        reconcile_publication(&r.operation_id.to_string(), &native).unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+}
+#[test]
+fn thousand_operations_do_not_exhaust_shared_directories() {
+    let f = Fixture::new();
+    let mut r = f.request();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let mut good = 0;
+    let mut bad = 0;
+    use std::os::unix::fs::MetadataExt;
+    fn shared_bytes(root: &Path) -> u64 {
+        ["", ".locks", ".staging", ".catalog", ".quarantine"]
+            .iter()
+            .map(|n| {
+                fs::metadata(root.join(n))
+                    .map(|m| m.blocks() * 512)
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+    let mut total_growth = 0u64;
+    let mut maximum_growth = 0u64;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    use std::os::fd::AsRawFd;
+    let held = fs::File::open(&f.destination).unwrap();
+    assert_eq!(
+        unsafe { libc::fstatvfs(held.as_raw_fd(), stat.as_mut_ptr()) },
+        0
+    );
+    let unit = unsafe { stat.assume_init() }.f_frsize;
+    let directory_reserve = 32 * 129 * unit;
+
+    for n in 0..1000 {
+        let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+        let before = shared_bytes(&f.destination);
+        r.operation_id = uuid::Uuid::now_v7();
+        r.limits = reconciliation_limits();
+        r.limits.operation_id = r.operation_id;
+        r.capture.deadline = Instant::now() + Duration::from_secs(30);
+        if n % 3 == 0 {
+            let fault = Arc::new(Fault::default());
+            *fault.failure.lock().unwrap() = Some(RecoveryEvent::Write(Member::Image));
+            let filesystem = FaultFs {
+                root: f.destination.clone(),
+                io: fault,
+                limits: reconciliation_limits(),
+            };
+            assert!(matches!(
+                backup(&f.store, &r, &filesystem, &CancelToken::new()),
+                Err(RecoveryError::Destination { .. })
+            ));
+            bad += 1;
+        } else {
+            assert!(matches!(
+                backup(&f.store, &r, &native, &CancelToken::new()).unwrap(),
+                PublicationOutcome::Durable(_)
+            ));
+            if n % 3 == 1 {
+                fs::write(
+                    f.destination
+                        .join(r.operation_id.to_string())
+                        .join("image.fls"),
+                    b"broken",
+                )
+                .unwrap();
+                assert!(matches!(
+                    reconcile_publication(&r.operation_id.to_string(), &native),
+                    Err(RecoveryError::Quarantined { .. })
+                ));
+                bad += 1;
+            } else {
+                good += 1;
+            }
+        }
+        let operation = r.operation_id.to_string();
+        let private_dirs = [
+            f.destination.join(&operation),
+            f.destination.join(".staging").join(&operation),
+            f.destination.join(".quarantine").join(&operation),
+        ]
+        .iter()
+        .map(|p| fs::metadata(p).map(|m| m.blocks() * 512).unwrap_or(0))
+        .sum::<u64>();
+        let growth = (shared_bytes(&f.destination) + private_dirs).saturating_sub(before);
+        assert!(
+            growth <= directory_reserve,
+            "operation={n} actual_directory_growth={growth} reserve={directory_reserve}"
+        );
+        total_growth += growth;
+        maximum_growth = maximum_growth.max(growth);
+    }
+    println!(
+        "directory_growth_bytes={total_growth} maximum_operation_growth={maximum_growth} directory_reserve_per_operation={directory_reserve} charged_total={} growth_to_charge_ratio={:.8}",
+        1000 * directory_reserve,
+        total_growth as f64 / (1000 * directory_reserve) as f64
+    );
+    assert_eq!(
+        fs::read_dir(f.destination.join(".locks")).unwrap().count(),
+        1
+    );
+    assert!(matches!(
+        backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+    let status = fl_store::recovery::backup::publication_status(&f.request(), &native).unwrap();
+    assert_eq!(status.quarantined_count, 667);
+    let mut insufficient = f.request();
+    insufficient.limits.query_work_limit = 0;
+    assert!(matches!(
+        fl_store::recovery::backup::publication_status(&insufficient, &native),
+        Err(RecoveryError::Quota { .. })
+    ));
+    assert!(status.quarantined_allocated_bytes > 0);
+    assert!(status.derived_reserve_bytes < 512 * 1024 * 1024);
+    println!(
+        "operations=1000 receipts={good} quarantined={bad} physical_bytes={}",
+        allocated_tree(&f.destination)
+    );
+    f.assert_source_usable();
+}
+
+#[test]
+fn default_reserve_exceeding_quota_by_one_unit_refuses_before_capture() {
+    let f = Fixture::new();
+    let mut r = f.request();
+    r.image_byte_limit = None;
+    let root = fs::File::open(&f.destination).unwrap();
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    assert_eq!(
+        unsafe { libc::fstatvfs(root.as_raw_fd(), stat.as_mut_ptr()) },
+        0
+    );
+    let unit = unsafe { stat.assume_init() }.f_frsize;
+    let reserve = (32 * 129 + 26) * unit + r.metadata_byte_limit;
+    r.limits.byte_limit = 2 * fs::metadata(&f.source).unwrap().len() + reserve - unit;
+    let hook = Arc::new(Fault::default());
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: hook.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(matches!(
+        backup(&f.store, &r, &filesystem, &CancelToken::new()),
+        Err(RecoveryError::Quota { .. })
+    ));
+    assert!(!hook.seen.lock().unwrap().contains(&RecoveryEvent::Capture));
+}
+
+fn mutation_event(e: RecoveryEvent) -> bool {
+    matches!(
+        e,
+        RecoveryEvent::CreateDirectory
+            | RecoveryEvent::LockFile
+            | RecoveryEvent::Allocate
+            | RecoveryEvent::Create(_)
+            | RecoveryEvent::Write(_)
+            | RecoveryEvent::RenameEntry
+    )
+}
+struct AllocationFault {
+    target: Option<usize>,
+    errno: i32,
+    seen: Mutex<Vec<RecoveryEvent>>,
+    reached: std::sync::atomic::AtomicBool,
+    prepared: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for AllocationFault {
+    fn before(&self, e: RecoveryEvent) -> io::Result<()> {
+        if matches!(e, RecoveryEvent::Flush(_)) {
+            self.prepared
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if !mutation_event(e) {
+            return Ok(());
+        }
+        let mut seen = self.seen.lock().unwrap();
+        let index = seen.len();
+        seen.push(e);
+        if self.target == Some(index) {
+            self.reached
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::from_raw_os_error(self.errno));
+        }
+        Ok(())
+    }
+}
+fn complete_bundle(path: &Path) {
+    use sha2::{Digest, Sha256};
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    let image = fs::read(path.join("image.fls")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&image)),
+        manifest["image_sha256"].as_str().unwrap()
+    );
+    for member in manifest["retained_members"].as_array().unwrap() {
+        let bytes = fs::read(path.join(member["relative_name"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            member["sha256"].as_str().unwrap()
+        );
+    }
+}
+fn space_failure_case(phase: u8, target: Option<usize>, errno: i32) -> Vec<RecoveryEvent> {
+    let f = Fixture::new();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let old_request = f.request();
+    let PublicationOutcome::Durable(old) =
+        backup(&f.store, &old_request, &native, &CancelToken::new()).unwrap()
+    else {
+        panic!()
+    };
+    let old_image = fs::read(old.path().join("image.fls")).unwrap();
+    let old_receipt = f
+        .destination
+        .join(".catalog")
+        .join(format!("{}.json", old_request.operation_id));
+    let old_receipt_bytes = fs::read(&old_receipt).unwrap();
+    let mut request = f.request();
+    // Include every allowlisted configuration copy in the actual-write trace.
+    if phase == 0 {
+        use fl_store::recovery::{
+            backup::{ApprovedConfig, ExcludedVaultKey},
+            manifest::{Availability, EffectiveCodeIndexConfig, MemberKind},
+        };
+        use std::os::unix::fs::MetadataExt;
+        request.code_index_configuration = Availability::Available(EffectiveCodeIndexConfig {
+            configuration_version: 1,
+            effective_configuration_sha256: "a".repeat(64),
+            source_root_identity: Availability::Unavailable,
+            repository: Availability::Unavailable,
+            source_revision: Availability::Unavailable,
+            scan_rules: vec![],
+            ignore_rules: vec![],
+            languages_and_parser_versions: vec![],
+            embedding_space: "fixture".into(),
+            embedding_dimensions: 1,
+            embedding_configuration: json!({}),
+            ranking_version: "fixture-v1".into(),
+            rebuild_vector_budget: 1,
+            rebuild_time_budget_ms: 1,
+            defaults_build_identity: "fixture-build".into(),
+            recovery_dependencies: vec![],
+        });
+        let key = f._root.path().join("vault.key");
+        fs::write(&key, b"fixture-key").unwrap();
+        let m = fs::metadata(&key).unwrap();
+        request.excluded_vault_key = Some(ExcludedVaultKey {
+            path: key,
+            identity: (m.dev(), m.ino()),
+        });
+        for (name, kind) in [
+            ("config.toml", MemberKind::ProtectedConfig),
+            ("warrants.json", MemberKind::Warrants),
+            ("vault.enc", MemberKind::VaultCiphertext),
+        ] {
+            let path = f._root.path().join(name);
+            fs::write(&path, b"fixture-only").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let m = fs::metadata(&path).unwrap();
+            request.configs.push(ApprovedConfig {
+                kind,
+                path,
+                identity: (m.dev(), m.ino()),
+                byte_limit: 1024,
+            });
+        }
+    } else {
+        backup(&f.store, &request, &native, &CancelToken::new()).unwrap();
+        let receipt = f
+            .destination
+            .join(".catalog")
+            .join(format!("{}.json", request.operation_id));
+        if phase == 1 {
+            fs::write(receipt, b"{corrupt").unwrap();
+        } else {
+            fs::remove_file(receipt).unwrap();
+            if phase == 2 {
+                fs::write(
+                    f.destination
+                        .join(".catalog")
+                        .join(format!("{}.tmp", request.operation_id)),
+                    b"{partial",
+                )
+                .unwrap();
+                fs::set_permissions(
+                    f.destination
+                        .join(".catalog")
+                        .join(format!("{}.tmp", request.operation_id)),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            } else {
+                fs::rename(
+                    f.destination.join(request.operation_id.to_string()),
+                    f.destination
+                        .join(".staging")
+                        .join(request.operation_id.to_string()),
+                )
+                .unwrap();
+            }
+        }
+    }
+    let hook = Arc::new(AllocationFault {
+        target,
+        errno,
+        seen: Mutex::new(vec![]),
+        reached: Default::default(),
+        prepared: Default::default(),
+    });
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: hook.clone(),
+        limits: reconciliation_limits(),
+    };
+    let result = if phase == 0 {
+        backup(&f.store, &request, &filesystem, &CancelToken::new())
+    } else {
+        reconcile_publication(&request.operation_id.to_string(), &filesystem)
+    };
+    if target.is_some() {
+        assert!(
+            hook.reached.load(std::sync::atomic::Ordering::Acquire),
+            "phase={phase} target={target:?}"
+        );
+        if f.destination
+            .join(request.operation_id.to_string())
+            .exists()
+            && (phase == 0 || hook.prepared.load(std::sync::atomic::Ordering::Acquire))
+        {
+            assert!(
+                matches!(result, Ok(PublicationOutcome::OutcomeUnknown { .. })),
+                "phase={phase} target={target:?}: {result:?}"
+            );
+            complete_bundle(&f.destination.join(request.operation_id.to_string()));
+        } else {
+            assert!(
+                matches!(result, Err(RecoveryError::Destination { .. })),
+                "phase={phase} target={target:?}: {result:?}"
+            );
+        }
+    } else if phase == 1 {
+        assert!(matches!(result, Err(RecoveryError::Quarantined { .. })));
+    } else {
+        assert!(matches!(result, Ok(PublicationOutcome::Durable(_))));
+    }
+    assert_eq!(fs::read(old.path().join("image.fls")).unwrap(), old_image);
+    assert_eq!(fs::read(old_receipt).unwrap(), old_receipt_bytes);
+    f.assert_source_usable();
+    assert!(
+        fs::read_dir(f.destination.join(".locks"))
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"operation-")),
+        "operation lock leaked after phase={phase} target={target:?}"
+    );
+    let trace = hook.seen.lock().unwrap().clone();
+    trace
+}
+#[test]
+fn enospc_and_edquot_at_every_actual_entry_write_and_allocation_are_clean() {
+    for phase in 0..4 {
+        let trace = space_failure_case(phase, None, 0);
+        assert!(!trace.is_empty());
+        for errno in [libc::ENOSPC, libc::EDQUOT] {
+            for index in 0..trace.len() {
+                space_failure_case(phase, Some(index), errno);
+            }
+        }
+        println!(
+            "phase={phase} allocation_points={} injected_errors=ENOSPC,EDQUOT",
+            trace.len()
+        );
+    }
 }
