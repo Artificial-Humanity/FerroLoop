@@ -210,6 +210,14 @@ pub enum PushError {
     Failed(String),
 }
 
+impl PushError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::NotConnected(e) | Self::Failed(e) => e.as_str(),
+        }
+    }
+}
+
 impl std::fmt::Display for PushError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2397,10 +2405,19 @@ fn resolve_live_host_session(
     resolve_live_host_session_with_mode(target).map(|(client, stream, _)| (client, stream))
 }
 
-fn tmux_target_alive(target: &str) -> bool {
+const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxProbeOutcome {
+    Alive,
+    Dead,
+    TimedOut,
+}
+
+fn probe_tmux_target(target: &str, timeout: Duration) -> TmuxProbeOutcome {
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && resolve_live_host_session(target).is_some()
     {
-        return true;
+        return TmuxProbeOutcome::Alive;
     }
     let exact = tmux_exact_target(target);
     // `display-message` answers for the current window when an exact `session:window` target
@@ -2412,14 +2429,63 @@ fn tmux_target_alive(target: &str) -> bool {
     } else {
         cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
     }
-    let Ok(out) = cmd
+    let Ok(mut child) = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     else {
-        return false;
+        return TmuxProbeOutcome::Dead;
     };
-    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    let mut stdout = child.stdout.take();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return TmuxProbeOutcome::Dead;
+                }
+                let mut buf = Vec::new();
+                if let Some(ref mut out) = stdout {
+                    let _ = out.read_to_end(&mut buf);
+                }
+                return if String::from_utf8_lossy(&buf).trim().is_empty() {
+                    TmuxProbeOutcome::Dead
+                } else {
+                    TmuxProbeOutcome::Alive
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TmuxProbeOutcome::TimedOut;
+            }
+        }
+    }
+}
+
+pub(crate) fn tmux_target_alive_passive(target: &str) -> bool {
+    match probe_tmux_target(target, TMUX_PROBE_TIMEOUT) {
+        TmuxProbeOutcome::Alive => true,
+        TmuxProbeOutcome::Dead => false,
+        TmuxProbeOutcome::TimedOut => {
+            eprintln!(
+                "fl-wire: warning: tmux liveness probe timed out after {}ms for target `{target}`; treating route as alive",
+                TMUX_PROBE_TIMEOUT.as_millis()
+            );
+            true
+        }
+    }
+}
+
+fn tmux_target_alive(target: &str) -> bool {
+    matches!(
+        probe_tmux_target(target, TMUX_PROBE_TIMEOUT),
+        TmuxProbeOutcome::Alive
+    )
 }
 
 const COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX: &str = "composer_occupied_by_non_wire_input:";
@@ -5554,6 +5620,18 @@ pub fn dispatch_operator_prompt_to_route(
     }
 }
 
+fn dispatch_to_route_with_push_error(
+    route: &VendorRoute,
+    msg: &WireMessage,
+) -> Result<DeliveryStatus, PushError> {
+    match route {
+        VendorRoute::Webhook { socket_path } => {
+            push_webhook_message(socket_path, msg).map(|()| DeliveryStatus::Acked)
+        }
+        _ => dispatch_to_route_with_status(route, msg).map_err(PushError::Failed),
+    }
+}
+
 /// Attempt push delivery for all pending recipients of `msg` on this host,
 /// updating `store` receipts (`Acked` on verified push, `Pending` with `attempts + 1` on failure)
 /// and returning any modified `DeliveryReceipt`s.
@@ -5572,7 +5650,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         now,
         None,
         &mut DispatchReport::default(),
-        dispatch_to_route_with_status,
+        dispatch_to_route_with_push_error,
     )
     .0
 }
@@ -5616,7 +5694,7 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
         now,
         Some(recipient),
         report,
-        dispatch_to_route_with_status,
+        dispatch_to_route_with_push_error,
     )
 }
 
@@ -5666,12 +5744,16 @@ fn dispatch_message_selected<S: MessageStore>(
         now,
         recipient,
         report,
-        |route, msg| dispatch(route, msg).map(|()| DeliveryStatus::Acked),
+        |route, msg| {
+            dispatch(route, msg)
+                .map(|()| DeliveryStatus::Acked)
+                .map_err(PushError::Failed)
+        },
     )
 }
 
 // The private callback keeps fault tests on this same pass without invoking vendor I/O.
-// Production callers always supply dispatch_to_route_with_status.
+// Production callers always supply dispatch_to_route_with_push_error.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_message_selected_with_status<S: MessageStore>(
     store: &S,
@@ -5681,7 +5763,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     now: At,
     recipient: Option<&str>,
     report: &mut DispatchReport,
-    mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<DeliveryStatus, String>,
+    mut dispatch: impl FnMut(&VendorRoute, &WireMessage) -> Result<DeliveryStatus, PushError>,
 ) -> (Vec<DeliveryReceipt>, Option<bool>) {
     let Ok(mut receipts) = store.list_wire_receipts(&msg.id) else {
         report.record_failure(FailureStage::InitialReceiptReadError);
@@ -5712,6 +5794,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     if home_override.is_some() || missing_route || stale_table() {
         routes.discover_routes(home_override, now.clone());
     }
+    let allow_probes = crate::identity::host_probes_allowed(home_override);
     let mut updated = Vec::new();
     let mut attempted = false;
     for rcpt in receipts {
@@ -5733,10 +5816,21 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
             },
         );
         if let Err(ref err) = pushed {
-            if is_composer_occupied_error(err) {
+            if is_composer_occupied_error(err.as_str()) {
                 report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
             } else {
-                report.record_failure(FailureStage::TransportError);
+                let dead_explicit = entry.explicit
+                    && (matches!(err, PushError::NotConnected(_))
+                        || crate::identity::explicit_route_entry_is_dead(
+                            &entry,
+                            Some(&rcpt.recipient_name),
+                            allow_probes,
+                        ));
+                report.record_failure(if dead_explicit {
+                    FailureStage::DeadExplicitRoute
+                } else {
+                    FailureStage::TransportError
+                });
                 // The session may have restarted since this route was learned (a new pid, socket or
                 // pane). Rescan for this persona, and push once more only when its route changed.
                 if routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
@@ -5753,10 +5847,21 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                         },
                     );
                     if let Err(ref retry_err) = pushed {
-                        if is_composer_occupied_error(retry_err) {
+                        if is_composer_occupied_error(retry_err.as_str()) {
                             report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
                         } else {
-                            report.record_failure(FailureStage::TransportError);
+                            let retry_dead_explicit = fresh.explicit
+                                && (matches!(retry_err, PushError::NotConnected(_))
+                                    || crate::identity::explicit_route_entry_is_dead(
+                                        &fresh,
+                                        Some(&rcpt.recipient_name),
+                                        allow_probes,
+                                    ));
+                            report.record_failure(if retry_dead_explicit {
+                                FailureStage::DeadExplicitRoute
+                            } else {
+                                FailureStage::TransportError
+                            });
                         }
                     }
                 }
@@ -10943,6 +11048,11 @@ exit 1"#,
                     persona: "fiona".into(),
                     route: codex_route("thread-daemon"),
                     explicit: true,
+                    replace: false,
+                    hosted_id: None,
+                    hydration_generation: None,
+                    hosted_session_verified: false,
+                    unverified_process: false,
                 })
                 .unwrap();
 

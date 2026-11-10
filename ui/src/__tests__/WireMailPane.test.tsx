@@ -478,4 +478,125 @@ describe("WireMailPane", () => {
       /^pending: unavailable$/,
     );
   });
+
+  it("surfaces dead_explicit_route on active fence diagnostics and inactive pending holds with zero buttons in status strip", () => {
+    const activeDeadRouteStatus: WireStatusResponse = {
+      daemon: "active",
+      dispatch_diagnostics: {
+        schema_version: 1,
+        instance_nonce: "dead-route-nonce",
+        instance_started_at: "2026-11-10T04:00:00.000Z",
+        scope: "daemon_lifetime",
+        records: [
+          {
+            recipient: "kayla",
+            recipient_digest: null,
+            recipient_invalid: false,
+            trigger_message_id: "urn:uuid:01900000-0000-7000-8000-000000000460",
+            trigger_message_id_digest: null,
+            trigger_message_id_omitted: false,
+            hold_observed_at: "2026-11-10T04:05:00.000Z",
+            phase: "retained_fence",
+            first_reason: "dead_explicit_route",
+            decisive_reason: "dead_explicit_route",
+            failure_stages: ["dead_explicit_route"],
+            omitted_failure_stages: 0,
+            omitted_failure_stages_saturated: false,
+            route_observations: [
+              {
+                adapter: "claude",
+                identity_digest: "sha256:deadclaude460",
+                route_updated_at: "2026-11-10T03:00:00.000Z",
+                explicit: true,
+                outcome: "returned_error",
+              },
+            ],
+            omitted_route_observations: 0,
+            omitted_route_observations_saturated: false,
+            route_dispatch_calls: 1,
+            route_dispatch_calls_saturated: false,
+            registration_generation: null,
+          },
+        ],
+        global_capacity_exhausted: false,
+        diagnostics_partial: false,
+        omitted_evidence_total: 0,
+        omitted_evidence_total_saturated: false,
+      },
+      registration_diagnostics: [
+        {
+          at: "2026-11-10T04:02:00.000Z",
+          persona: "kayla",
+          outcome: "refused",
+          reason: "foreign_hosted_env",
+          incumbent_adapter: "agy",
+          challenger_adapter: "claude",
+          incumbent_hosted_id: "antigravity:kayla",
+          challenger_hosted_id: "antigravity:kayla",
+          replace: false,
+        },
+      ],
+      pending_recipients_available: true,
+      pending_recipients: [
+        {
+          recipient: "kayla",
+          pending_count: 1,
+          oldest_pending_at: "2026-11-10T04:05:00.000Z",
+          oldest_pending_age_ms: 18_000_000,
+          hold_reason: "dead_explicit_route",
+        },
+      ],
+    };
+
+    const { rerender } = render(
+      <WireMailPane
+        messages={SAMPLE_MESSAGES}
+        selectedAgentName="kayla"
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        wireStatus={activeDeadRouteStatus}
+      />,
+    );
+
+    const strip = screen.getByTestId("wire-status-strip");
+    expect(within(strip).queryAllByRole("button")).toHaveLength(0);
+
+    const holdRow = screen.getByTestId("wire-hold-row-kayla");
+    expect(holdRow).toHaveTextContent("decisive_reason=dead_explicit_route");
+    expect(holdRow).toHaveTextContent("stages=dead_explicit_route");
+
+    const pendingBadge = screen.getByTestId("wire-pending-recipient-kayla");
+    expect(pendingBadge).toHaveTextContent("kayla: 1 pending (oldest 5h 0m, hold=dead_explicit_route)");
+
+    const regDiagBadge = screen.getByTestId("wire-registration-diagnostics");
+    expect(regDiagBadge).toHaveTextContent("route_guard=1 (latest kayla:refused:foreign_hosted_env)");
+
+    const inactiveDeadRouteStatus: WireStatusResponse = {
+      daemon: "inactive",
+      dispatch_diagnostics: null,
+      pending_recipients_available: true,
+      pending_recipients: [
+        {
+          recipient: "kayla",
+          pending_count: 1,
+          oldest_pending_at: "2026-11-10T04:05:00.000Z",
+          oldest_pending_age_ms: 120_000,
+          hold_reason: "dead_explicit_route",
+        },
+      ],
+    };
+
+    rerender(
+      <WireMailPane
+        messages={SAMPLE_MESSAGES}
+        selectedAgentName="kayla"
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        wireStatus={inactiveDeadRouteStatus}
+      />,
+    );
+
+    expect(within(screen.getByTestId("wire-status-strip")).queryAllByRole("button")).toHaveLength(0);
+    expect(screen.getByTestId("wire-pending-recipient-kayla")).toHaveTextContent(
+      "kayla: 1 pending (oldest 2m 0s, hold=dead_explicit_route)",
+    );
+  });
 });
