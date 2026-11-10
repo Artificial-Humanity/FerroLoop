@@ -2219,6 +2219,112 @@ mod route_lookup {
             }
         }
     }
+
+    #[test]
+    fn hub_save_route_scan_persists_revalidated_passive_agy_identity_once_and_skips_steady_state_write()
+     {
+        use crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS;
+
+        for initial_identity in [None, Some(At::from_unix_millis(9000))] {
+            let home = TempDir::new().unwrap();
+            let path = routes_file(home.path());
+            let bin_dir = home.path().join(".local/bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let local_agy = bin_dir.join("agy");
+            std::fs::write(&local_agy, b"#!/bin/sh\n").unwrap();
+
+            let agy_transcript = home
+                .path()
+                .join(".gemini/antigravity-cli/brain/conv-kayla-100/.system_generated/logs/transcript.jsonl");
+            std::fs::create_dir_all(agy_transcript.parent().unwrap()).unwrap();
+            std::fs::write(
+                &agy_transcript,
+                "{\"type\":\"USER_INPUT\",\"content\":\"fl wire register Kayla\"}\n",
+            )
+            .unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&agy_transcript)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(100))
+                .unwrap();
+
+            let current_route = VendorRoute::Agy {
+                conversation_id: "conv-kayla-100".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(local_agy),
+            };
+            let mut initial = RouteTable::default();
+            initial.entries.insert(
+                "kayla".into(),
+                fl_wire::identity::RouteEntry {
+                    persona: "kayla".into(),
+                    route: current_route.clone(),
+                    updated_at: At::from_unix_millis(9000),
+                    identity_at: initial_identity.clone(),
+                    explicit: false,
+                },
+            );
+            initial.save(Some(&path)).unwrap();
+
+            // First scan: endpoint is already current (`o.route == e.route`) and no competing
+            // Codex route exists, yet `identity_at` revalidates to `Some(100)` so `save_route_scan`
+            // sees `!same_routes` and writes `identity_at: Some(100)` to `routes.json`.
+            let base = RouteTable::load(Some(&path));
+            let mut scanned = base.clone();
+            scanned.discover_routes(Some(home.path()), At::from_unix_millis(9500));
+            assert_eq!(scanned.get("kayla").unwrap().route, current_route);
+            assert!(
+                !scanned.same_routes(&base),
+                "init={initial_identity:?}: revalidated identity_at must trigger persistence"
+            );
+
+            let inv_before_first = ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+            crate::discovery::save_route_scan(Some(home.path()), &base, &scanned, Instant::now());
+            let inv_after_first = ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+            assert_eq!(
+                inv_after_first - inv_before_first,
+                1,
+                "init={initial_identity:?}: first scan must write routes.json"
+            );
+
+            let saved_after_first = RouteTable::load(Some(&path));
+            let persisted = saved_after_first.get("kayla").expect("kayla persisted");
+            assert_eq!(persisted.route, current_route);
+            assert_eq!(
+                persisted.identity_at,
+                Some(At::from_unix_millis(100)),
+                "init={initial_identity:?}"
+            );
+
+            // Second steady-state scan: `same_routes == true`, so `save_route_scan` performs no
+            // redundant disk write.
+            let bytes_before_second = std::fs::read(&path).unwrap();
+            let mut scanned_steady = saved_after_first.clone();
+            scanned_steady.discover_routes(Some(home.path()), At::from_unix_millis(9800));
+            assert!(
+                scanned_steady.same_routes(&saved_after_first),
+                "init={initial_identity:?}: steady-state scan must satisfy same_routes"
+            );
+
+            let inv_before_second = ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+            crate::discovery::save_route_scan(
+                Some(home.path()),
+                &saved_after_first,
+                &scanned_steady,
+                Instant::now(),
+            );
+            let inv_after_second = ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+            assert_eq!(
+                inv_after_second - inv_before_second,
+                0,
+                "init={initial_identity:?}: steady-state scan must skip writing routes.json"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before_second);
+        }
+    }
 }
 
 mod wire_send {
