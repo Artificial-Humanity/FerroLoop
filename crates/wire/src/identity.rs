@@ -12750,6 +12750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn pid_proven_live_and_route_entry_proven_live_enforce_start_time_and_liveness() {
         let self_pid = std::process::id();
         let self_st = proc_start_time_ticks(self_pid).expect("proc_start_time_ticks on linux");
