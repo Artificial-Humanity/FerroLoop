@@ -283,6 +283,7 @@ fn manifest_binds_report_members_and_models_unpublished_status() {
     })
     .collect();
     let context = ManifestContext {
+        shared_config: None,
         batch_id: None,
         source_map_sha256: "a".repeat(64),
         creator_build_identity: BuildIdentity {
@@ -303,6 +304,12 @@ fn manifest_binds_report_members_and_models_unpublished_status() {
     );
     let fields = serde_json::to_value(&manifest).unwrap();
     assert!(fields.get("format_version").is_none());
+    assert!(
+        fields.get("shared_config").is_none(),
+        "old V1 byte encoding must omit the absent additive reference"
+    );
+    let old_reader_roundtrip: BundleManifestV1 = serde_json::from_value(fields.clone()).unwrap();
+    assert_eq!(old_reader_roundtrip, manifest);
     assert_eq!(
         fields["container_version"],
         expected.descriptor().container_format

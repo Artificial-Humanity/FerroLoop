@@ -169,7 +169,11 @@ fixture storage; unsupported temporary filesystems fail clearly, never skip.
 - [ ] Emit one failure event to the configured Jarvis/Ferris sink, and a second-consecutive event to the owner sink; successful scheduled run resets the failure count, polling/status does not. Runtime tests use inert sinks, bounded retries and operation-ID dedupe. No actual messages or live policy installation in fixture testing.
 - [ ] Run both tests GREEN plus authorization/retention unit tests (`cargo test -p fl-store recovery::` and `cargo test -p fl-store tests_auth`). Commit `feat(recovery): add disabled owner-side backup scheduling`; fresh task review. Do not provision Council or change any service unit as part of this task.
 
+- Task 5 follow-up: a separate small CLI/hub PR supplies the reviewed production RecoveryEventSink adapter before Task 7 activation; the store has no wire dependency and recurrence refuses a missing adapter.
+
 ### Task 6: Explicit offline backup and verified restore with durable fences
+
+- [ ] Add explicit purge-by-operation-ID with verified dependency/config reference closure; intentionally deferred from Task 5 (no purge implementation there).
 
 **Files:** Create `crates/store/src/recovery/{restore.rs,readiness.rs,admission.rs}` and `crates/store/src/cli/recovery.rs`; modify `crates/store/src/{any.rs,cli.rs}`, `crates/store/src/ferrostore/{mod.rs,recovery.rs}`, `crates/store/src/cli/{data.rs,serve.rs,args.rs}` and frontends `crates/cli/src/cmd/store.rs`, `crates/store/src/bin/ferrostore.rs`. Black-box tests: new `crates/store/tests/{recovery_restore.rs,recovery_offline_backup.rs}`.
 

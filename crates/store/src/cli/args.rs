@@ -196,6 +196,9 @@ pub struct ServeArgs {
     /// interface (such as tailscale0). Repeat for more than one.
     #[arg(long, value_name = "IFACE")]
     pub allow_plaintext_on: Vec<String>,
+    /// Versioned owner recovery policy; absent means disabled.
+    #[arg(long, value_name = "PATH")]
+    pub recovery_policy: Option<PathBuf>,
     /// Print the ready line as one JSON object instead of text.
     #[arg(long)]
     pub json: bool,
@@ -204,6 +207,7 @@ pub struct ServeArgs {
 impl ServeArgs {
     pub fn options(&self) -> ServeOptions {
         ServeOptions {
+            recovery_policy: self.recovery_policy.clone(),
             socket: self.socket.clone(),
             tcp: self.tcp.clone(),
             psk_file: self.psk_file.clone(),

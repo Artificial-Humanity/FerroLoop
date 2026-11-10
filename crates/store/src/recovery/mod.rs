@@ -151,8 +151,12 @@ impl OperationLimits {
     }
 }
 
+mod capacity;
+pub mod control;
 pub mod manifest;
+pub mod policy;
 pub mod profiles;
+pub mod scheduler;
 pub(crate) mod verify;
 pub use manifest::{BundleManifestV1, ValidationExpectations, VerificationReport};
 pub use profiles::{ProfileKind, ValidationProfile};
