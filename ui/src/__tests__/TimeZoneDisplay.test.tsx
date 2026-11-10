@@ -441,7 +441,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
 
     // 3-tab bar and "<N> Agents" heading
     expect(screen.getByTestId("settings-tab-bar")).toBeInTheDocument();
-    expect(screen.getByTestId("settings-tab-agents")).toHaveTextContent("2 Agents");
+    expect(screen.getByTestId("settings-tab-agents")).toHaveAccessibleName("Agents");
     expect(screen.getByTestId("settings-agents-heading")).toHaveTextContent("2 Agents");
     expect(screen.getByTestId("settings-tab-system")).toHaveTextContent("System");
     expect(screen.getByTestId("settings-tab-auth")).toHaveTextContent("Auth");
@@ -566,8 +566,8 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
       />,
     );
 
-    // Tab and heading display scoped filtered count (2 Agents) instead of total fleet count (3 Agents)
-    expect(screen.getByTestId("settings-tab-agents")).toHaveTextContent("2 Agents");
+    // The heading displays scoped filtered count (2 Agents) instead of total fleet count (3 Agents)
+    expect(screen.getByTestId("settings-tab-agents")).toHaveAccessibleName("Agents");
     expect(screen.getByTestId("settings-agents-heading")).toHaveTextContent("2 Agents");
     // Case-insensitive initialProject="ferroloop" selects "FerroLoop" in dropdown
     expect(

@@ -12,7 +12,13 @@ export function roleLabel(
   value: string,
   roles: readonly RoleRecord[] = [],
 ): string {
+  const custom = /^custom:/i.test(value);
   const slug = value.replace(/^custom:/i, "");
+  if (custom) {
+    const structural = ["lead", "assistant", "lab-manager", "lab_manager"].includes(slug.toLowerCase());
+    const label = roles.find((role) => role.slug === slug && (!structural || !role.builtin))?.label;
+    return label ?? slug.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
   const catalogSlug = slug === "lab_manager" ? "lab-manager" : slug;
   const label = roles.find((role) => role.slug === catalogSlug)?.label;
   if (catalogSlug === "assistant" && (!label || label === "Assisting Engineer")) return "Software Engineer";

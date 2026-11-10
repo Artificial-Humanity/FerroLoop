@@ -1354,6 +1354,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     null,
   );
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const [openCategoryTooltip, setOpenCategoryTooltip] = useState<SettingsTabId | null>(null);
   const [projectSubTab, setProjectSubTab] =
     useState<ProjectSettingsSubTabId>(initialProjectSubTab ?? "overview");
   const [agentsSubTab, setAgentsSubTab] = useState<AgentsSubTabId>(
@@ -1831,6 +1832,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (event.key !== "Escape") return;
       // The New Project, Edit and Delete dialogs handle their own Escape.
       if (newProjectOpen || projectModals.anyOpen) return;
+      if (openCategoryTooltip) {
+        event.preventDefault();
+        setOpenCategoryTooltip(null);
+        return;
+      }
       if (artifactsDirModalTarget) {
         if (!changingArtifactsDir) {
           setArtifactsDirModalTarget(null);
@@ -1859,6 +1865,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     isOpen,
     newProjectOpen,
     projectModals.anyOpen,
+    openCategoryTooltip,
     artifactsDirModalTarget,
     changingArtifactsDir,
     recastModalAgentKey,
@@ -3006,10 +3013,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   aria-selected={activeTab === tab.id}
                   aria-current={activeTab === tab.id ? "page" : undefined}
                   tabIndex={activeTab === tab.id ? 0 : -1}
-                  title={tab.label}
                   data-testid={`settings-tab-${tab.id}`}
                   className={`fd-btn fd-settings-category-icon${activeTab === tab.id ? " fd-btn-active" : ""}`}
                   onClick={() => setActiveTab(tab.id)}
+                  onFocus={() => setOpenCategoryTooltip(tab.id)}
+                  onBlur={(event) => { if (!event.currentTarget.matches(":hover")) setOpenCategoryTooltip(null); }}
+                  onMouseEnter={() => setOpenCategoryTooltip(tab.id)}
+                  onMouseLeave={(event) => { if (document.activeElement !== event.currentTarget) setOpenCategoryTooltip(null); }}
                   onKeyDown={(event) => {
                     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
                     event.preventDefault();
@@ -3022,7 +3032,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   }}
                 >
                   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={tab.path} /></svg>
-                  <span className="fd-settings-category-tooltip" aria-hidden="true">{tab.label}</span>
+                  <span className="fd-settings-category-tooltip" data-testid={`settings-tooltip-${tab.id}`} aria-hidden="true" hidden={openCategoryTooltip !== tab.id}>{tab.label}</span>
                 </button>
               ))}
           </div>
