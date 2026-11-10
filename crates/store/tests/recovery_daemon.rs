@@ -201,6 +201,73 @@ mod owner_fixtures {
             FerroStore::connect_uri(&format!("unix://{}", self.socket().display())).unwrap()
         }
     }
+    #[test]
+    fn invalid_and_gated_configuration_keeps_owner_serving_with_safe_status() {
+        struct NeverSink;
+        impl fl_store::recovery::control::RecoveryEventSink for NeverSink {
+            fn emit(
+                &self,
+                _: &fl_store::recovery::control::RecoveryEventEnvelope,
+                _: &str,
+                _: Instant,
+            ) -> Result<(), fl_store::recovery::RecoveryError> {
+                panic!("inactive recovery must never send events")
+            }
+        }
+        for case in ["invalid", "destination", "gated", "gated_sink"] {
+            let (mut f, owner) = Fixture::new();
+            match case {
+                "invalid" => f.policy.version = 99,
+                "destination" => f.policy.destination = f.root.path().join("missing-secret-root"),
+                _ => {
+                    f.policy.enabled = true;
+                    f.policy.coverage_interval_seconds = 3600;
+                }
+            }
+            let mut server = FerroStoreServer::bind_unix(f.socket(), owner).unwrap();
+            if case == "gated_sink" {
+                server
+                    .configure_recovery_with_sink(f.policy.clone(), Arc::new(NeverSink))
+                    .unwrap();
+            } else {
+                server.configure_recovery(f.policy.clone()).unwrap();
+            }
+            let client = f.client();
+            let request = f.request();
+            assert!(
+                client.recovery_control("recovery_start", &request).is_err(),
+                "{case}"
+            );
+            let report = client
+                .recovery_control("recovery_status", &request)
+                .unwrap();
+            assert!(!report.complete);
+            assert!(report.members.is_empty());
+            let expected = match case {
+                "gated" => vec!["capture_proof_missing", "reviewed_event_adapter_missing"],
+                "gated_sink" => vec!["capture_proof_missing"],
+                _ => vec!["policy_invalid"],
+            };
+            assert_eq!(report.missing_gates, expected, "{case}");
+            let text = serde_json::to_string(&report).unwrap();
+            assert!(!text.contains("secret"));
+            assert!(!text.contains(&f.root.path().display().to_string()));
+            client
+                .put_doc("fixture", "available", &serde_json::json!({"ok":true}))
+                .unwrap();
+            assert_eq!(
+                client.get_doc("fixture", "available").unwrap(),
+                Some(serde_json::json!({"ok":true}))
+            );
+            assert_eq!(
+                std::fs::read_dir(&f.destination).unwrap().count(),
+                0,
+                "{case}: inactive recovery touched destination"
+            );
+            server.shutdown().unwrap();
+        }
+    }
+
     fn finished(
         client: &FerroStore,
         request: &BatchRequest,

@@ -51,6 +51,9 @@ pub struct BatchReport {
     pub overdue: bool,
     pub outbox_full: bool,
     pub missing_gates: Vec<String>,
+    /// Safe code only; never policy contents, paths or underlying I/O errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_reason: Option<String>,
 }
 impl BatchReport {
     pub(crate) fn refresh(&mut self) {

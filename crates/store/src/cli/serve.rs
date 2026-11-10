@@ -148,17 +148,11 @@ pub fn serve(
     ready: impl FnOnce(&Serving) -> Result<()>,
 ) -> Result<(Serving, &'static str)> {
     check(options)?;
+    // Recovery is optional. A bad policy disables recovery, never data serving.
     let recovery = options
         .recovery_policy
         .as_ref()
-        .map(|path| {
-            crate::recovery::policy::RecoveryPolicy::load(path)
-                .map_err(|_| Error::Refused("recovery policy refused".into()))
-        })
-        .transpose()?;
-    if recovery.as_ref().is_some_and(|p| p.enabled) {
-        refuse!("recovery recurrence requires trusted Task 7 capture proof");
-    }
+        .map(|path| crate::recovery::policy::RecoveryPolicy::load(path));
 
     // Before the store or the server starts a thread.
     let signals = Signals::block()?;
@@ -191,8 +185,10 @@ pub fn serve(
             (server, format!("unix://{}", socket.display()), false)
         }
     };
-    if let Some(policy) = recovery {
-        server.configure_recovery(policy)?;
+    match recovery {
+        Some(Ok(policy)) => server.configure_recovery(policy)?,
+        Some(Err(_)) => server.recovery_policy_unavailable(),
+        None => {}
     }
     drop(migration_lock);
     if options.psk_file.is_some() {

@@ -164,9 +164,23 @@ impl RecoveryPolicy {
         Ok(())
     }
     pub fn load(path: &std::path::Path) -> Result<Self, RecoveryError> {
-        use std::io::Read;
-        let mut file =
-            std::fs::File::open(path).map_err(|_| refuse("recovery policy unavailable"))?;
+        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+        // A supplied FIFO/device must not hold data-daemon startup hostage.
+        // Validate the held descriptor, retaining accepted symlink semantics.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| refuse("recovery policy unavailable"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| refuse("recovery policy unreadable"))?;
+        if !metadata.is_file() {
+            return Err(refuse("regular recovery policy file required"));
+        }
+        if metadata.len() > 1_048_576 {
+            return Err(refuse("recovery policy byte limit"));
+        }
         let mut bytes = Vec::new();
         file.by_ref()
             .take(1_048_577)

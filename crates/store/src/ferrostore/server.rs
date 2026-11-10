@@ -57,9 +57,16 @@ struct Handshake {
     tcp: bool,
 }
 
+#[derive(Clone)]
+struct RecoveryInactive {
+    missing_gates: Vec<String>,
+    reason: Option<&'static str>,
+}
+
 struct ServerState {
     store: Arc<FerroStore>,
     recovery: Mutex<Option<crate::recovery::scheduler::RecoveryScheduler>>,
+    recovery_inactive: Mutex<Option<RecoveryInactive>>,
     shutdown: AtomicBool,
     active_conns: Arc<AtomicUsize>,
     conns: Mutex<HashMap<u64, Box<dyn JsonIo>>>,
@@ -180,22 +187,7 @@ impl FerroStoreServer {
         policy: crate::recovery::policy::RecoveryPolicy,
         io: Arc<dyn crate::recovery::fs::RecoveryIo>,
     ) -> Result<(), StoreError> {
-        let mut slot = lock_mutex(&self.state.recovery);
-        if slot.is_some() {
-            return Err(backend("recovery already configured"));
-        }
-        *slot = Some(
-            crate::recovery::scheduler::RecoveryScheduler::start_shared_with_io(
-                Arc::clone(&self.state.store),
-                policy,
-                None,
-                io,
-            )
-            .map_err(|_| {
-                backend("recovery policy refused; trusted capture proof required for recurrence")
-            })?,
-        );
-        Ok(())
+        self.configure_recovery_runtime(policy, io, None)
     }
 
     /// Inject the reviewed upper-layer delivery adapter; policy and proof gates
@@ -205,21 +197,76 @@ impl FerroStoreServer {
         policy: crate::recovery::policy::RecoveryPolicy,
         sink: Arc<dyn crate::recovery::control::RecoveryEventSink>,
     ) -> Result<(), StoreError> {
+        self.configure_recovery_runtime(
+            policy,
+            Arc::new(crate::recovery::fs::NativeRecoveryIo),
+            Some(sink),
+        )
+    }
+
+    fn configure_recovery_runtime(
+        &self,
+        policy: crate::recovery::policy::RecoveryPolicy,
+        io: Arc<dyn crate::recovery::fs::RecoveryIo>,
+        sink: Option<Arc<dyn crate::recovery::control::RecoveryEventSink>>,
+    ) -> Result<(), StoreError> {
+        use crate::recovery::scheduler::RecoveryScheduler;
         let mut slot = lock_mutex(&self.state.recovery);
-        if slot.is_some() {
+        if slot.is_some() || lock_mutex(&self.state.recovery_inactive).is_some() {
             return Err(backend("recovery already configured"));
         }
-        *slot = Some(
-            crate::recovery::scheduler::RecoveryScheduler::start_shared_with_runtime(
-                Arc::clone(&self.state.store),
-                policy,
-                None,
-                Arc::new(crate::recovery::fs::NativeRecoveryIo),
-                Some(sink),
-            )
-            .map_err(|_| backend("recovery activation gates refused"))?,
-        );
+        if policy.validate().is_err() {
+            self.record_recovery_inactive(RecoveryInactive {
+                missing_gates: vec!["policy_invalid".into()],
+                reason: Some("policy_validation_refused"),
+            });
+            return Ok(());
+        }
+        // This production boundary cannot mint capture proof. Gate refusal must
+        // not touch the backup root, create a scheduler, or stop data serving.
+        let gates =
+            RecoveryScheduler::activation_missing_gates(policy.enabled, false, sink.is_some());
+        if policy.enabled && !gates.is_empty() {
+            self.record_recovery_inactive(RecoveryInactive {
+                missing_gates: gates,
+                reason: None,
+            });
+            return Ok(());
+        }
+        match RecoveryScheduler::start_shared_with_runtime(
+            Arc::clone(&self.state.store),
+            policy,
+            None,
+            io,
+            sink,
+        ) {
+            Ok(scheduler) => *slot = Some(scheduler),
+            Err(_) => self.record_recovery_inactive(RecoveryInactive {
+                missing_gates: vec!["policy_invalid".into()],
+                reason: Some("policy_configuration_refused"),
+            }),
+        }
         Ok(())
+    }
+
+    fn record_recovery_inactive(&self, diagnostic: RecoveryInactive) {
+        // Only fixed codes are logged: never include policy contents or paths.
+        eprintln!(
+            "recovery inactive: {}{}",
+            diagnostic.missing_gates.join(","),
+            diagnostic
+                .reason
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        );
+        *lock_mutex(&self.state.recovery_inactive) = Some(diagnostic);
+    }
+
+    pub(crate) fn recovery_policy_unavailable(&self) {
+        self.record_recovery_inactive(RecoveryInactive {
+            missing_gates: vec!["policy_invalid".into()],
+            reason: Some("policy_load_refused"),
+        });
     }
 
     /// Bind a Unix socket and serve `store`.
@@ -435,6 +482,7 @@ fn new_state(store: FerroStore, auth: ServerAuth) -> Arc<ServerState> {
         sessions: Sessions::new(),
         dedup: Dedup::default(),
         recovery: Mutex::new(None),
+        recovery_inactive: Mutex::new(None),
         auth,
         own_uid: auth::own_uid(),
         handshakes: Mutex::new(HashMap::new()),
@@ -1187,9 +1235,24 @@ fn dispatch_recovery(
 ) -> Result<Value, StoreError> {
     let request: crate::recovery::control::BatchRequest =
         serde_json::from_value(params.clone()).map_err(|_| backend("invalid recovery IDs"))?;
-    let scheduler = lock_mutex(&state.recovery)
-        .clone()
-        .ok_or_else(|| backend("recovery policy is absent; scheduling disabled"))?;
+    let scheduler = lock_mutex(&state.recovery).clone();
+    if let Some(diagnostic) = lock_mutex(&state.recovery_inactive).clone() {
+        if method == "recovery_start" {
+            return Err(backend("recovery inactive; inspect recovery_status"));
+        }
+        return serde_json::to_value(crate::recovery::control::BatchReport {
+            batch_id: request.batch_id,
+            members: Vec::new(),
+            complete: false,
+            overdue: true,
+            outbox_full: false,
+            missing_gates: diagnostic.missing_gates,
+            inactive_reason: diagnostic.reason.map(str::to_owned),
+        })
+        .map_err(|_| backend("invalid recovery report"));
+    }
+    let scheduler =
+        scheduler.ok_or_else(|| backend("recovery policy is absent; scheduling disabled"))?;
     let report = if method == "recovery_start" {
         scheduler.request_batch(&request)
     } else {

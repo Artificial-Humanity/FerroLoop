@@ -414,11 +414,37 @@ impl RecoveryScheduler {
             cancel: CancelToken::new(),
             workers: Mutex::new(Vec::new()),
         }));
-        scheduler.resume()?;
-        scheduler.deliver_pending()?;
-        #[cfg(not(test))]
-        scheduler.start_timer()?;
-        Ok(scheduler)
+        let initialized = (|| {
+            scheduler.resume()?;
+            scheduler.deliver_pending()?;
+            #[cfg(not(test))]
+            scheduler.start_timer()?;
+            Ok(())
+        })();
+        scheduler.finish_start(initialized)
+    }
+    fn finish_start(self, initialized: Result<(), RecoveryError>) -> Result<Self, RecoveryError> {
+        if let Err(error) = initialized {
+            // Initialization may already have resumed interrupted work. Do not
+            // let a server report recovery inactive while those workers survive.
+            self.abort_start();
+            return Err(error);
+        }
+        Ok(self)
+    }
+    fn abort_start(&self) {
+        self.0.cancel.cancel();
+        let workers = std::mem::take(
+            &mut *self
+                .0
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        // A panicked worker must not detach later workers during startup abort.
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
     #[cfg(not(test))]
     fn start_timer(&self) -> Result<(), RecoveryError> {
@@ -775,6 +801,7 @@ impl RecoveryScheduler {
                     overdue: true,
                     outbox_full: journal.outbox_full,
                     missing_gates: self.missing_gates(),
+                    inactive_reason: None,
                     members: request
                         .members
                         .iter()
@@ -812,18 +839,21 @@ impl RecoveryScheduler {
             }
         }
     }
-    fn missing_gates(&self) -> Vec<String> {
+    pub(crate) fn activation_missing_gates(enabled: bool, proof: bool, sink: bool) -> Vec<String> {
         let mut gates = Vec::new();
-        if !self.0.policy.enabled {
+        if !enabled {
             gates.push("recurrence_disabled".into());
         }
-        if !self.0.proof {
+        if !proof {
             gates.push("capture_proof_missing".into());
         }
-        if self.0.sink.is_none() {
+        if !sink {
             gates.push("reviewed_event_adapter_missing".into());
         }
         gates
+    }
+    fn missing_gates(&self) -> Vec<String> {
+        Self::activation_missing_gates(self.0.policy.enabled, self.0.proof, self.0.sink.is_some())
     }
     fn accounting_limits(&self, operation: uuid::Uuid) -> Result<OperationLimits, RecoveryError> {
         let l = self
@@ -988,6 +1018,7 @@ impl RecoveryScheduler {
             overdue: !self.0.proof,
             outbox_full,
             missing_gates: self.missing_gates(),
+            inactive_reason: None,
             members: request
                 .members
                 .iter()
@@ -1857,6 +1888,29 @@ impl RecoveryScheduler {
 }
 
 #[cfg(test)]
+fn fixture_directory() -> tempfile::TempDir {
+    let path = std::env::var_os("FL_RECOVERY_TEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = tempfile::tempdir_in(path)
+        .expect("FL_RECOVERY_TEST_DIR must select writable native ext4/XFS fixture storage");
+    #[cfg(target_os = "linux")]
+    {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let path = std::ffi::CString::new(directory.path().as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) }, 0);
+        assert!(
+            matches!(
+                unsafe { stat.assume_init() }.f_type as u64,
+                0xef53 | 0x58465342
+            ),
+            "scheduler fixtures require native ext4/XFS: set FL_RECOVERY_TEST_DIR; tmpfs is not a passing refusal test"
+        );
+    }
+    directory
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     pub(super) fn policy(root: &std::path::Path) -> RecoveryPolicy {
@@ -1921,8 +1975,162 @@ mod tests {
         }
     }
     #[test]
+    fn failed_initialization_cancels_and_joins_already_started_recovery_worker() {
+        let scheduler =
+            RecoveryScheduler::start(FerroStore::in_memory(), RecoveryPolicy::default(), None)
+                .unwrap();
+        let state = scheduler.0.clone();
+        let cancel = state.cancel.clone();
+        let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = joined.clone();
+        let worker = std::thread::spawn(move || {
+            while !cancel.is_cancelled() {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        state
+            .workers
+            .lock()
+            .unwrap()
+            .push(std::thread::spawn(|| panic!("injected first-worker panic")));
+        state.workers.lock().unwrap().push(worker);
+        let result = scheduler.finish_start(Err(refused("injected post-resume startup failure")));
+        let was_cancelled = state.cancel.is_cancelled();
+        let was_joined = joined.load(std::sync::atomic::Ordering::Acquire);
+        let no_workers = state.workers.lock().unwrap().is_empty();
+        // Always release the fixture worker even if a cleanup mutation survives.
+        state.cancel.cancel();
+        for worker in std::mem::take(&mut *state.workers.lock().unwrap()) {
+            let _ = worker.join();
+        }
+        assert!(
+            matches!(result, Err(RecoveryError::Refused(reason)) if reason == "injected post-resume startup failure")
+        );
+        assert!(was_cancelled && was_joined && no_workers);
+    }
+    #[test]
+    fn capture_proof_and_event_adapter_are_independent_activation_gates() {
+        for with_proof in [false, true] {
+            for with_sink in [false, true] {
+                let root = fixture_directory();
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let mut p = policy(root.path());
+                let capture_proof = with_proof.then(|| proof(&p));
+                let sink =
+                    with_sink.then(|| Arc::new(InertSink::default()) as Arc<dyn RecoveryEventSink>);
+                let result = RecoveryScheduler::start_shared_with_runtime(
+                    Arc::new(FerroStore::in_memory()),
+                    p.clone(),
+                    capture_proof,
+                    Arc::new(fs::NativeRecoveryIo),
+                    sink,
+                );
+                if !with_proof {
+                    assert!(
+                        matches!(result, Err(RecoveryError::Refused(ref reason)) if reason.contains("trusted capture proof"))
+                    );
+                } else if !with_sink {
+                    assert!(
+                        matches!(result, Err(RecoveryError::Refused(ref reason)) if reason.contains("event-sink adapter"))
+                    );
+                } else {
+                    let scheduler = result.unwrap();
+                    assert!(
+                        scheduler
+                            .initial_report(
+                                &BatchRequest {
+                                    policy_id: "fixture".into(),
+                                    batch_id: uuid::Uuid::now_v7(),
+                                    members: vec![],
+                                },
+                                false
+                            )
+                            .missing_gates
+                            .is_empty()
+                    );
+                    scheduler.shutdown().unwrap();
+                }
+                let expected_enabled: Vec<String> = [
+                    (!with_proof).then_some("capture_proof_missing"),
+                    (!with_sink).then_some("reviewed_event_adapter_missing"),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+                assert_eq!(
+                    RecoveryScheduler::activation_missing_gates(true, with_proof, with_sink),
+                    expected_enabled
+                );
+                // The same gate combinations are visible in a dormant owner's status.
+                p.enabled = false;
+                let scheduler = RecoveryScheduler::start_shared_with_runtime(
+                    Arc::new(FerroStore::in_memory()),
+                    p.clone(),
+                    with_proof.then(|| proof(&p)),
+                    Arc::new(fs::NativeRecoveryIo),
+                    with_sink.then(|| Arc::new(InertSink::default()) as Arc<dyn RecoveryEventSink>),
+                )
+                .unwrap();
+                let mut expected = vec!["recurrence_disabled"];
+                if !with_proof {
+                    expected.push("capture_proof_missing");
+                }
+                if !with_sink {
+                    expected.push("reviewed_event_adapter_missing");
+                }
+                assert_eq!(
+                    scheduler
+                        .initial_report(
+                            &BatchRequest {
+                                policy_id: "fixture".into(),
+                                batch_id: uuid::Uuid::now_v7(),
+                                members: vec![],
+                            },
+                            false
+                        )
+                        .missing_gates,
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn scheduled_request_cannot_bypass_disabled_policy_even_with_proof_and_sink() {
+        let root = fixture_directory();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut p = policy(root.path());
+        p.enabled = false;
+        let capture_proof = proof(&p);
+        let scheduler = RecoveryScheduler::start_with_sink(
+            FerroStore::in_memory(),
+            p,
+            Some(capture_proof),
+            Arc::new(InertSink::default()),
+        )
+        .unwrap();
+        let before = std::fs::read_dir(root.path()).unwrap().count();
+        let request = BatchRequest {
+            policy_id: "fixture".into(),
+            batch_id: uuid::Uuid::now_v7(),
+            members: vec![MemberRequest {
+                store_id: "unserved_council".into(),
+                operation_id: uuid::Uuid::now_v7(),
+                scheduled_at_unix_seconds: Some(3600),
+                byte_cap: None,
+            }],
+        };
+        assert!(
+            matches!(scheduler.request_batch(&request), Err(RecoveryError::Refused(reason)) if reason == "scheduled request cannot bypass owner activation gates")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), before);
+        assert!(scheduler.0.journal.lock().unwrap().batches.is_empty());
+    }
+    #[test]
     fn no_client_policy_can_mint_proof_and_disabled_tick_has_no_side_effects() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         let p = policy(root.path());
         assert!(RecoveryScheduler::start(FerroStore::in_memory(), p, None).is_err());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
@@ -1936,7 +2144,7 @@ mod tests {
     }
     #[test]
     fn failed_scheduled_runs_emit_inert_events_once_and_poll_does_not_reset() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let p = policy(root.path());
         let proof = proof(&p);
@@ -2033,7 +2241,7 @@ mod capacity_tests {
     #[test]
     fn insufficient_space_and_overflow_fail_before_any_remote_connection() {
         for (space, cap) in [(0, 32 << 20), (u64::MAX, u64::MAX)] {
-            let root = tempfile::tempdir().unwrap();
+            let root = fixture_directory();
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let listener =
                 std::os::unix::net::UnixListener::bind(root.path().join("remote.sock")).unwrap();
@@ -2084,7 +2292,7 @@ mod event_tests {
         }
     }
     fn root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
     }
@@ -2475,7 +2683,7 @@ mod review_regressions {
     }
     #[test]
     fn timer_ticks_complete_two_real_remote_batches_without_status_polling() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, owner, captures) = native_owner(root.path());
         let (endpoint, _fixture) = owner_endpoint(root.path(), owner, false);
@@ -2499,7 +2707,7 @@ mod review_regressions {
     // batch ID differs: accepting its terminal status would free pending space.
     #[test]
     fn wrong_batch_reply_keeps_background_operation_unknown_and_reserved() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, owner, captures) = native_owner(root.path());
         let (endpoint, fixture) = owner_endpoint(root.path(), owner.clone(), false);
@@ -2562,7 +2770,7 @@ mod review_regressions {
 
     #[test]
     fn wrong_batch_reply_keeps_manual_status_running_and_reserved() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, owner, captures) = native_owner(root.path());
         let (endpoint, fixture) = owner_endpoint(root.path(), owner.clone(), false);
@@ -2614,7 +2822,7 @@ mod review_regressions {
 
     #[test]
     fn lost_admitted_reply_and_unavailable_restart_keep_same_operation_reserved() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, owner, captures) = native_owner(root.path());
         let (endpoint, fixture) = owner_endpoint(root.path(), owner, true);
@@ -2662,10 +2870,10 @@ mod review_regressions {
 
     #[test]
     fn mixed_member_restart_releases_creators_whole_reservation_after_subset_reconcile() {
-        let first_root = tempfile::tempdir().unwrap();
+        let first_root = fixture_directory();
         std::fs::set_permissions(first_root.path(), std::fs::Permissions::from_mode(0o700))
             .unwrap();
-        let second_root = tempfile::tempdir().unwrap();
+        let second_root = fixture_directory();
         std::fs::set_permissions(second_root.path(), std::fs::Permissions::from_mode(0o700))
             .unwrap();
         let (p, first_owner, first_captures) = native_owner(first_root.path());
@@ -2742,7 +2950,7 @@ mod review_regressions {
     }
     #[test]
     fn verified_metadata_replacement_cannot_supply_report_or_block_on_fifo() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, s, _) = native_owner(root.path());
         let batch = uuid::Uuid::now_v7();
@@ -2797,7 +3005,7 @@ mod review_regressions {
     }
     #[test]
     fn encoded_history_refuses_safely_preserves_bindings_and_reopens() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let p = super::tests::policy(root.path());
         let s = RecoveryScheduler::start_shared_with_runtime(
@@ -2869,7 +3077,7 @@ mod review_regressions {
     }
     #[test]
     fn unordered_fresh_ids_are_accepted_and_save_failure_stops_further_admission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, s, captures) = native_owner(root.path());
         let request = BatchRequest {
@@ -2917,7 +3125,7 @@ mod review_regressions {
     }
     #[test]
     fn full_history_keeps_completed_operation_and_member_set_binding() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let (p, s, captures) = native_owner(root.path());
         let request = BatchRequest {
@@ -2956,7 +3164,7 @@ mod review_regressions {
     }
     #[test]
     fn refused_slots_bound_all_history_and_preserve_pending_outbox_on_reopen() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture_directory();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let p = super::tests::policy(root.path());
         let s = RecoveryScheduler::start_shared_with_runtime(
