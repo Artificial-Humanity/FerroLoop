@@ -262,7 +262,7 @@ describe("authenticated editable role catalog", () => {
   });
 
   it.each(["fleet", "agent"])(
-    "keeps unknown selected roles on a delayed %s catalog without a Custom prefix",
+    "keeps a custom role distinct from a built-in when the %s catalog arrives",
     async (path) => {
       const read = deferred<Response>();
       const { client } = server({ get: () => read.promise });
@@ -280,6 +280,8 @@ describe("authenticated editable role catalog", () => {
       fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
       const select = screen.getByTestId("recast-role-select-felix");
       expect(select).toHaveValue("custom:lead");
+      expect(within(select).getByRole("option", { name: "Lead", selected: true }))
+        .toHaveValue("custom:lead");
       await act(async () =>
         read.resolve(
           json([
@@ -300,7 +302,7 @@ describe("authenticated editable role catalog", () => {
       ).toHaveValue("custom:reviewer");
       expect(
         within(select).getByRole("option", {
-          name: "Workspace Lead",
+          name: "Lead",
           selected: true,
         }),
       ).toHaveValue("custom:lead");
