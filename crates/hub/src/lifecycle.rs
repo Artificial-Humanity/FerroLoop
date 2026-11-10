@@ -519,6 +519,10 @@ pub trait SessionRuntime: std::fmt::Debug {
     fn recorded_pid(&self, _unit: &str, _hosted_id: &str) -> Option<u32> {
         None
     }
+    /// PID of the runtime leader, which can differ from the vendor CLI PID.
+    fn recorded_leader_pid(&self, _unit: &str, _hosted_id: &str) -> Option<u32> {
+        None
+    }
     /// Exit status code recorded by the runtime for a non-running `unit` (when known and not
     /// terminated by signal). When `expected_pid` is `Some(pid)` (`pid > 0`) and the runtime
     /// records a non-zero child PID that differs from `pid`, returns `None`.
@@ -2184,6 +2188,15 @@ impl SessionRuntime for HostRuntime {
         select_host_recorded_pid(&sessions, &wanted)
     }
 
+    fn recorded_leader_pid(&self, unit: &str, hosted_id: &str) -> Option<u32> {
+        if use_legacy_tmux_fallback() {
+            return TmuxRuntime.recorded_leader_pid(unit, hosted_id);
+        }
+        let wanted = exact_host_unit(unit, hosted_id)?;
+        let sessions = connect_host_client()?.list_sessions().ok()?;
+        select_host_recorded_leader_pid(&sessions, &wanted)
+    }
+
     fn recorded_exit_code(&self, unit: &str, expected_pid: Option<u32>) -> Option<i32> {
         if use_legacy_tmux_fallback() {
             return TmuxRuntime.recorded_exit_code(unit, expected_pid);
@@ -2203,6 +2216,14 @@ fn select_host_recorded_pid(
     sessions: &[fl_host_proto::SessionSummary],
     wanted: &fl_host_proto::SessionId,
 ) -> Option<u32> {
+    select_host_recorded_leader_pid(sessions, wanted)
+        .and_then(fl_wire::identity::resolve_vendor_cli_pid)
+}
+
+fn select_host_recorded_leader_pid(
+    sessions: &[fl_host_proto::SessionSummary],
+    wanted: &fl_host_proto::SessionId,
+) -> Option<u32> {
     sessions
         .iter()
         .filter(|s| &s.stream.session == wanted)
@@ -2217,7 +2238,6 @@ fn select_host_recorded_pid(
             | fl_host_proto::ChildState::LeaderExited(r)
             | fl_host_proto::ChildState::CleanupComplete(r) => (r.pid > 0).then_some(r.pid),
         })
-        .and_then(fl_wire::identity::resolve_vendor_cli_pid)
 }
 
 fn select_host_recorded_exit_code(
@@ -2291,14 +2311,18 @@ impl SessionRuntime for TmuxRuntime {
         tmux_unit_owned(unit, hosted_id)
     }
 
-    fn recorded_pid(&self, unit: &str, _hosted_id: &str) -> Option<u32> {
+    fn recorded_pid(&self, unit: &str, hosted_id: &str) -> Option<u32> {
+        self.recorded_leader_pid(unit, hosted_id)
+            .and_then(fl_wire::identity::resolve_vendor_cli_pid)
+    }
+
+    fn recorded_leader_pid(&self, unit: &str, _hosted_id: &str) -> Option<u32> {
         let out = tmux_stdout(&["list-panes", "-t", unit, "-F", "#{pane_pid}"])?;
         out.lines()
             .map(str::trim)
             .find(|l| !l.is_empty())
             .and_then(|l| l.parse::<u32>().ok())
             .filter(|&pid| pid > 0)
-            .and_then(fl_wire::identity::resolve_vendor_cli_pid)
     }
 
     fn recorded_exit_code(&self, unit: &str, expected_pid: Option<u32>) -> Option<i32> {
@@ -2728,9 +2752,16 @@ impl SessionRuntime for FakeRuntime {
             .and_then(fl_wire::identity::resolve_vendor_cli_pid)
     }
 
+    fn recorded_leader_pid(&self, unit: &str, _hosted_id: &str) -> Option<u32> {
+        let pids = self.unit_pids.borrow();
+        pids.get(unit)
+            .copied()
+            .or_else(|| unit.split_once(':').and_then(|(s, _)| pids.get(s).copied()))
+    }
+
     fn recorded_exit_code(&self, unit: &str, expected_pid: Option<u32>) -> Option<i32> {
         if let Some(epid) = expected_pid.filter(|&p| p > 0)
-            && let Some(actual_pid) = self.recorded_pid(unit, "").filter(|&p| p > 0)
+            && let Some(actual_pid) = self.recorded_leader_pid(unit, "").filter(|&p| p > 0)
             && actual_pid != epid
         {
             return None;
@@ -3231,6 +3262,9 @@ pub struct HostedSessionRecord {
     /// Root OS PID of the spawned vendor CLI process when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Runtime leader PID used to match exit evidence to the launched process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_leader_pid: Option<u32>,
     /// `/proc/<pid>/stat` field-22 start time (clock ticks) for `pid` when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start_time: Option<u64>,
@@ -3668,6 +3702,27 @@ pub fn record_hydration_ack_with_pid<S: StateStore>(
     hosted_id: Option<&str>,
     caller_pid: Option<u32>,
 ) -> Result<bool, LifecycleError> {
+    record_hydration_ack_with_runtime(
+        store,
+        persona,
+        replace,
+        caller_generation,
+        hosted_id,
+        caller_pid,
+        None,
+    )
+}
+
+/// Like `record_hydration_ack_with_pid`, optionally recovering a missing reference from the runtime.
+pub fn record_hydration_ack_with_runtime<S: StateStore>(
+    store: &S,
+    persona: &str,
+    replace: bool,
+    caller_generation: Option<&str>,
+    hosted_id: Option<&str>,
+    caller_pid: Option<u32>,
+    runtime: Option<&dyn SessionRuntime>,
+) -> Result<bool, LifecycleError> {
     if !replace {
         return Ok(false);
     }
@@ -3720,7 +3775,28 @@ pub fn record_hydration_ack_with_pid<S: StateStore>(
         && let Some(mut rec) = find_hosted_session(store, &[&session_id])?
     {
         let mut dirty = false;
-        if let Some(cpid) = caller_pid.filter(|&p| p > 0) {
+        if rec.pid.is_none()
+            && let Some(runtime) = runtime
+        {
+            let target = rec
+                .tmux_target
+                .clone()
+                .unwrap_or_else(|| hosted_tmux_target(&rec.vendor, &rec.persona));
+            let unit = runtime.unit(&target);
+            let leader_pid = runtime
+                .owns(unit, &rec.session_id)
+                .then(|| runtime.recorded_leader_pid(unit, &rec.session_id))
+                .flatten();
+            if let Some(rpid) = leader_pid.and_then(fl_wire::identity::resolve_vendor_cli_pid) {
+                rec.pid = Some(rpid);
+                rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(rpid);
+                rec.runtime_leader_pid = leader_pid;
+                dirty = true;
+            }
+        }
+        if let Some(cpid) = caller_pid.filter(|&p| p > 0)
+            && cfg!(target_os = "linux")
+        {
             let vendor_pid =
                 fl_wire::identity::find_nearest_vendor_cli_ancestor_pid(cpid).unwrap_or(cpid);
             if let Some(rec_pid) = rec.pid.filter(|&p| p > 0) {
@@ -3750,11 +3826,8 @@ pub fn record_hydration_ack_with_pid<S: StateStore>(
                 } else {
                     return Ok(false);
                 }
-            } else {
-                rec.pid = Some(vendor_pid);
-                rec.pid_start_time = fl_wire::identity::proc_start_time_ticks(vendor_pid);
-                dirty = true;
             }
+            // Without an independently recorded runtime PID, the caller cannot establish it.
         }
         if rec.hydration_generation.as_deref() == Some(g_caller)
             && rec.hydration_status != HydrationStatus::Confirmed
@@ -5822,6 +5895,7 @@ where
             .unwrap_or_default(),
         vendor_session_id: vendor_session_id.clone(),
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
@@ -6014,6 +6088,7 @@ where
             record.hydration_dispatched = false;
             record.runtime_spawned = false;
             record.pid = None;
+            record.runtime_leader_pid = None;
             record.pid_start_time = None;
             record.updated_at_ms = now_ms();
             persist_hosted_session(store, &record, by)?;
@@ -6337,6 +6412,7 @@ fn record_for_target<S: AgentRegistry>(
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         created_at_ms: now,
         updated_at_ms: now,
@@ -7159,7 +7235,10 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                                 sync_claude_vendor_session_id_from_route(store, env, &mut record);
                         }
                     }
-                    let clean_exit = env.runtime.recorded_exit_code(&target, record.pid) == Some(0);
+                    let clean_exit = env
+                        .runtime
+                        .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
+                        == Some(0);
                     record.status = STATUS_STOPPED.to_string();
                     record.stop_reason = Some(
                         if clean_exit {
@@ -7826,6 +7905,7 @@ where
     }
     if will_spawn {
         record.pid = None;
+        record.runtime_leader_pid = None;
         record.pid_start_time = None;
     }
     record.hydration_generation = Some(hydration_generation.clone());
@@ -7968,6 +8048,7 @@ where
             record.hydration_dispatched = false;
             record.runtime_spawned = false;
             record.pid = None;
+            record.runtime_leader_pid = None;
             record.pid_start_time = None;
             record.updated_at_ms = now_ms();
             let fresh_guidance = registered_role_prompt_with_generation(
@@ -8480,11 +8561,11 @@ fn refresh_record_runtime_pid(
     if !record.runtime_spawned || unit.is_empty() {
         return;
     }
-    if let Some(new_pid) = env
-        .runtime
-        .recorded_pid(unit, &record.session_id)
-        .filter(|&p| p > 0)
-    {
+    let leader_pid = env.runtime.recorded_leader_pid(unit, &record.session_id);
+    let vendor_pid = leader_pid
+        .and_then(fl_wire::identity::resolve_vendor_cli_pid)
+        .or_else(|| env.runtime.recorded_pid(unit, &record.session_id));
+    if let Some(new_pid) = vendor_pid.filter(|&p| p > 0) {
         if record.pid.is_none()
             || record.pid == Some(new_pid)
             || record
@@ -8494,8 +8575,11 @@ fn refresh_record_runtime_pid(
                 fl_wire::identity::proc_alive_matching_start(p, record.pid_start_time)
             })
         {
-            record.pid = Some(new_pid);
-            record.pid_start_time = fl_wire::identity::proc_start_time_ticks(new_pid);
+            if env.runtime.owns(unit, &record.session_id) {
+                record.runtime_leader_pid = leader_pid;
+                record.pid = Some(new_pid);
+                record.pid_start_time = fl_wire::identity::proc_start_time_ticks(new_pid);
+            }
         } else if record.pid_start_time.is_none()
             && let Some(rec_pid) = record.pid
         {
@@ -8506,7 +8590,7 @@ fn refresh_record_runtime_pid(
 
 /// Backfill or refresh `record.pid` and `record.pid_start_time` for running hosted sessions whose
 /// recorded PID is missing, lacks `pid_start_time`, is a wrapper shell that now has a vendor CLI
-/// child, or is not proven live while the runtime unit or vendor route is live.
+/// child, or is not proven live while the runtime unit is live.
 pub fn reconcile_running_session_pids_with_store<S: StateStore>(
     env: &LifecycleEnv<'_>,
     store: &S,
@@ -8529,60 +8613,30 @@ pub fn reconcile_running_session_pids_with_store<S: StateStore>(
         if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) {
             continue;
         }
-        if fl_wire::identity::pid_proven_live(record.pid, record.pid_start_time)
-            && !record
-                .pid
-                .is_some_and(fl_wire::identity::proc_is_shell_wrapper)
-        {
-            continue;
-        }
         let target = record
             .tmux_target
             .clone()
             .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
         let unit = env.runtime.unit(&target).to_string();
-        let runtime_pid = if env.spawn_runtime
+        let leader_pid = if env.spawn_runtime
             && vendor_has_runtime(&record.vendor)
             && !matches!(env.runtime.presence(&target), RuntimePresence::Gone)
+            && env.runtime.owns(&unit, &record.session_id)
         {
-            env.runtime
-                .recorded_pid(&unit, &record.session_id)
-                .filter(|&p| p > 0)
+            env.runtime.recorded_leader_pid(&unit, &record.session_id)
         } else {
             None
         };
+        let runtime_pid = leader_pid.and_then(fl_wire::identity::resolve_vendor_cli_pid);
         if let Some(rpid) = runtime_pid {
             let start_ticks = fl_wire::identity::proc_start_time_ticks(rpid);
             if record.pid != Some(rpid)
                 || (start_ticks.is_some() && record.pid_start_time != start_ticks)
+                || (leader_pid.is_some() && record.runtime_leader_pid != leader_pid)
             {
+                record.runtime_leader_pid = leader_pid;
                 record.pid = Some(rpid);
                 record.pid_start_time = start_ticks;
-                record.updated_at_ms = now_ms();
-                persist_hosted_session(store, &record, AUTO_RESPAWN_ACTOR)?;
-                updated += 1;
-            }
-        } else {
-            let route_match = route_table_paths(env.home_override)
-                .into_iter()
-                .filter(|path| path.is_file())
-                .find_map(|path| {
-                    let table = RouteTable::load(Some(&path));
-                    let entry = table.get(&record.persona)?;
-                    if !route_is_vendor(&entry.route, &record.vendor) {
-                        return None;
-                    }
-                    let rpid = entry.route.route_pid().filter(|&p| p > 0)?;
-                    let st = entry
-                        .pid_start_time
-                        .or_else(|| fl_wire::identity::proc_start_time_ticks(rpid));
-                    fl_wire::identity::pid_proven_live(Some(rpid), st).then_some((rpid, st))
-                });
-            if let Some((rpid, st)) = route_match
-                && (record.pid != Some(rpid) || record.pid_start_time != st)
-            {
-                record.pid = Some(rpid);
-                record.pid_start_time = st;
                 record.updated_at_ms = now_ms();
                 persist_hosted_session(store, &record, AUTO_RESPAWN_ACTOR)?;
                 updated += 1;
@@ -13283,6 +13337,7 @@ mod tests {
             tombstone_ids: Vec::new(),
             vendor_session_id: None,
             pid: None,
+            runtime_leader_pid: None,
             pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -17721,9 +17776,8 @@ mod tests {
             ack_thread.join().unwrap();
 
             assert_eq!(
-                restarted.record.pid,
-                Some(7777),
-                "PID written by record_hydration_ack_with_pid during watch must survive post-watch write-back"
+                restarted.record.pid, None,
+                "an ack without runtime evidence must not supply a PID during the watch"
             );
             assert_eq!(
                 restarted.record.hydration_status,
@@ -17736,7 +17790,7 @@ mod tests {
             let persisted = find_hosted_session(&*guard, &["claude:ada"])
                 .unwrap()
                 .unwrap();
-            assert_eq!(persisted.pid, Some(7777));
+            assert_eq!(persisted.pid, None);
             assert_eq!(persisted.hydration_status, HydrationStatus::Confirmed);
             delete_claude_resume_state(&*guard, "claude:ada");
         }
@@ -18693,6 +18747,31 @@ mod tests {
             Some(2222)
         );
 
+        // A wrapper leader and its vendor child are distinct but belong to the same launch.
+        let wrapper_store = MemStore::default();
+        let wrapper_home = TempDir::new().unwrap();
+        let wrapper_runtime = FakeRuntime::default();
+        let mut wrapper = hosted_record("claude", "wrapper", STATUS_RUNNING, true);
+        wrapper.pid = Some(1111);
+        wrapper.runtime_leader_pid = Some(2222);
+        persist_hosted_session(&wrapper_store, &wrapper, "owner").unwrap();
+        wrapper_runtime
+            .presence_of
+            .borrow_mut()
+            .insert("Wrapper:claude".into(), RuntimePresence::Gone);
+        wrapper_runtime
+            .exit_codes
+            .borrow_mut()
+            .insert("Wrapper:claude".into(), 0);
+        wrapper_runtime.set_unit_pid("Wrapper:claude", 2222);
+        let wrapper_env = wrapper_runtime.env(wrapper_home.path());
+        reconcile_dead_hosted_sessions(&wrapper_store, &wrapper_env, "owner").unwrap();
+        reconcile_dead_hosted_sessions(&wrapper_store, &wrapper_env, "owner").unwrap();
+        let stopped = get_hosted_session_by_id(&wrapper_store, "claude:wrapper")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.stop_reason.as_deref(), Some(STOP_REASON_CLEAN_EXIT));
+
         // Reconcile-level check (N5): when `recorded_exit_code` sees a PID mismatch on a `Gone`
         // session (`record.pid = Some(1111)`, runtime exit PID = `2222`, exit code = `0`),
         // `reconcile_dead_hosted_sessions` classifies the stop as `runtime_gone`, never `clean_exit`.
@@ -18701,6 +18780,7 @@ mod tests {
         let fake = FakeRuntime::default();
         let mut rec = hosted_record("claude", "pidmis", STATUS_RUNNING, true);
         rec.pid = Some(1111);
+        rec.runtime_leader_pid = Some(1111);
         persist_hosted_session(&store, &rec, "owner").unwrap();
         fake.presence_of
             .borrow_mut()
@@ -18924,8 +19004,7 @@ mod tests {
         assert_eq!(rec1.pid, Some(vendor_pid));
         assert_eq!(rec1.pid_start_time, vendor_st);
 
-        // 2. When `rec.pid` was `None` on a non-Claude session (`grok:ada`), `record_hydration_ack_with_pid`
-        //    called with `hook_sh_pid` resolves `vendor_pid` and populates `rec.pid` + `rec.pid_start_time`.
+        // A caller cannot establish the trusted PID for a pid-less record.
         let mut rec_none = rec1.clone();
         rec_none.pid = None;
         rec_none.pid_start_time = None;
@@ -18938,16 +19017,62 @@ mod tests {
                 true,
                 Some(&g1),
                 Some("grok:ada"),
-                Some(hook_sh_pid),
+                Some(child_sh_pid),
             )
             .unwrap()
         );
         let after_none = get_hosted_session_by_id(&store, "grok:ada")
             .unwrap()
             .unwrap();
-        assert_eq!(after_none.pid, Some(vendor_pid));
-        assert_eq!(after_none.pid_start_time, vendor_st);
+        assert_eq!(after_none.pid, None);
+        assert_eq!(after_none.pid_start_time, None);
         assert_eq!(after_none.hydration_status, HydrationStatus::Confirmed);
+
+        // The runtime's independent PID rejects a child and accepts the hosted caller.
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(&g1),
+        );
+        persist_hosted_session(&store, &rec_none, "owner").unwrap();
+        assert!(
+            !record_hydration_ack_with_runtime(
+                &store,
+                "ada",
+                true,
+                Some(&g1),
+                Some("grok:ada"),
+                Some(child_sh_pid),
+                Some(&fake)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_hosted_session_by_id(&store, "grok:ada")
+                .unwrap()
+                .unwrap()
+                .pid,
+            None
+        );
+        assert!(
+            record_hydration_ack_with_runtime(
+                &store,
+                "ada",
+                true,
+                Some(&g1),
+                Some("grok:ada"),
+                Some(hook_sh_pid),
+                Some(&fake)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            get_hosted_session_by_id(&store, "grok:ada")
+                .unwrap()
+                .unwrap()
+                .pid,
+            Some(vendor_pid)
+        );
 
         // 3. When `rec.pid` was recorded as the wrapper shell (`pane_pid`), a child CLI (`child_cli_pid`
         //    or `child_sh_pid`) is rejected, while the genuine `hook_sh_pid` upgrades `rec.pid` to `vendor_pid`!

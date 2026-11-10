@@ -452,6 +452,12 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
         if !env_matched {
             continue;
         }
+        // Process ancestry and start-time evidence currently require Linux /proc.
+        if !cfg!(target_os = "linux") {
+            out.verified = true;
+            out.unverified_process = true;
+            continue;
+        }
         if let Some(rec_pid) = rec.pid.filter(|p| *p > 0) {
             if let Some(expected_st) = rec.pid_start_time
                 && fl_wire::identity::proc_start_time_ticks(rec_pid) != Some(expected_st)
@@ -671,7 +677,7 @@ fn evaluate_registration_guard<S: fl_core::StateStore>(
                                     ),
                                 ));
                             }
-                            if ver.process_mismatch && !args.replace {
+                            if ver.process_mismatch {
                                 return Err(make_refusal(
                                     RegistrationConflictReason::HostedIdentityMismatch,
                                     Some(format!("{hid_vendor}:{hid_persona}")),
@@ -707,6 +713,33 @@ fn evaluate_registration_guard<S: fl_core::StateStore>(
                 }
             }
         } else {
+            if let (Some(store), Some(target_vendor), Some(generation)) =
+                (args.store, args.challenger_vendor, candidate_gen.as_deref())
+            {
+                let ver = verify_hosted_session_in_store(
+                    store,
+                    target_vendor,
+                    args.persona,
+                    None,
+                    Some(generation),
+                    args.proc_ctx,
+                );
+                if ver.process_mismatch {
+                    return Err(make_refusal(
+                        RegistrationConflictReason::HostedIdentityMismatch,
+                        None,
+                        candidate_gen,
+                        ver.unverified_process,
+                        format!(
+                            "registration refused for `{}`: caller process does not match live hosted `{target_vendor}` session PID",
+                            args.persona
+                        ),
+                    ));
+                }
+                hosted_session_verified = ver.verified;
+                process_proven = ver.process_proven;
+                unverified_process = ver.unverified_process;
+            }
             effective_generation = candidate_gen;
         }
     }
@@ -2558,13 +2591,14 @@ fn execute_register_with_hydration_env(
             let ack_pid = captured_route_pid.or_else(|| {
                 fl_wire::identity::find_nearest_vendor_cli_ancestor_pid(std::process::id())
             });
-            if let Err(e) = fl_hub::lifecycle::record_hydration_ack_with_pid(
+            if let Err(e) = fl_hub::lifecycle::record_hydration_ack_with_runtime(
                 &store,
                 &rec.name_key,
                 replace,
                 verdict.effective_generation.as_deref(),
                 verdict.effective_hosted_id.as_deref(),
                 ack_pid,
+                Some(&fl_hub::lifecycle::HostRuntime),
             ) {
                 eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
             }
@@ -3219,6 +3253,66 @@ pub(crate) mod tests {
             "fl agent register --replace must clear retired_personas in decommission sidecar"
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn hosted_process_without_proc_is_unverified_not_mismatched() {
+        let rig = HookRig::new(Some("feira"));
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        let gen2 = "01b20000-0000-7000-8000-000000000002";
+        let rec = fl_hub::lifecycle::HostedSessionRecord {
+            session_id: "claude:feira".into(),
+            persona: "feira".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            vendor: "claude".into(),
+            model: None,
+            thinking_level: None,
+            node_id: "local".into(),
+            hosted: true,
+            status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+            stop_reason: None,
+            restart_policy: "on-failure".into(),
+            restart_count: 0,
+            tmux_target: Some("Feira:claude".into()),
+            host_session_id: Some("Feira.claude".into()),
+            cwd: None,
+            context_window: None,
+            posture: fl_core::permissions::Posture::Auto,
+            hydration_dispatched: true,
+            hydration_status: fl_hub::lifecycle::HydrationStatus::Confirmed,
+            hydration_generation: Some(gen2.into()),
+            runtime_spawned: true,
+            tombstone_ids: Vec::new(),
+            vendor_session_id: Some("claude-predeploy-sid".into()),
+            pid: Some(12345),
+            runtime_leader_pid: None,
+            pid_start_time: Some(98765),
+            created_at_ms: 2,
+            updated_at_ms: 2,
+            decommission_prepared_at_ms: None,
+        };
+        fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+        let ver = verify_hosted_session_in_store(
+            &store,
+            "claude",
+            "feira",
+            Some("claude:feira"),
+            Some(gen2),
+            CallerProcessContext::Hook {
+                caller_pid: 54321,
+                session_id: "other",
+            },
+        );
+        assert!(ver.verified && ver.unverified_process);
+        assert!(!ver.process_proven && !ver.process_mismatch);
+    }
+
     #[test]
     fn retention_cutoff_saturates_instead_of_wrapping() {
         assert_eq!(super::retention_cutoff_ms(1_000, u64::MAX), 0);
@@ -4123,6 +4217,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: None,
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -4306,6 +4401,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: None,
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -4730,6 +4826,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: Some("claude-parent-sid".into()),
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 10,
                 updated_at_ms: 10,
@@ -5151,6 +5248,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: None,
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -5251,6 +5349,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: None,
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 2,
                 updated_at_ms: 2,
@@ -5587,6 +5686,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: Some(format!("{vendor}-root-sid")),
                 pid: Some(hosted_pid),
+                runtime_leader_pid: None,
                 pid_start_time: hosted_st,
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -5643,6 +5743,30 @@ pub(crate) mod tests {
             );
             assert!(!ver_pos_reg.process_mismatch);
             assert!(!ver_pos_reg.unverified_process);
+            let positive = evaluate_registration_guard(RegistrationGuardArgs {
+                env: &env,
+                store: Some(&store),
+                persona: "feira",
+                challenger_vendor: Some(vendor),
+                challenger_adapter: RouteAdapter::from_vendor_str(vendor),
+                challenger_session_identity: Some((vendor, new_sid.as_str())),
+                challenger_pid: (vendor == "claude").then_some(hosted_pid),
+                raw_hosted_id: Some(&format!("{vendor}:feira")),
+                raw_generation: Some(gen1),
+                env_persona: Some("feira"),
+                has_foreign_agy_env: false,
+                ignore_process_hosted_env: false,
+                replace: true,
+                proc_ctx: CallerProcessContext::Register {
+                    self_pid: hook_sh_pid,
+                    captured_route_pid: (vendor == "claude").then_some(hosted_pid),
+                    session_id: Some(&new_sid),
+                },
+            });
+            assert!(
+                positive.is_ok(),
+                "genuine {vendor} hosted CLI must register with --replace"
+            );
 
             // Negative Hook & Register (`Hosted CLI -> sh -c -> Child CLI -> sh -c -> hook / register`):
             let child_sid = format!("{vendor}-child-sid");
@@ -5726,7 +5850,7 @@ pub(crate) mod tests {
                     env_persona: Some("feira"),
                     has_foreign_agy_env: false,
                     ignore_process_hosted_env: false,
-                    replace: false,
+                    replace: true,
                     proc_ctx: CallerProcessContext::Register {
                         self_pid: child_sh_pid,
                         captured_route_pid: neg_captured_pid,
@@ -5743,6 +5867,30 @@ pub(crate) mod tests {
                     RegistrationConflictReason::HostedIdentityMismatch
                 );
                 assert!(!guard_neg_reg.diagnostic.unverified_process);
+                let generation_only = evaluate_registration_guard(RegistrationGuardArgs {
+                    env: &env,
+                    store: Some(&store),
+                    persona: "feira",
+                    challenger_vendor: Some(vendor),
+                    challenger_adapter: RouteAdapter::from_vendor_str(vendor),
+                    challenger_session_identity: Some((vendor, child_sid.as_str())),
+                    challenger_pid: neg_captured_pid,
+                    raw_hosted_id: None,
+                    raw_generation: Some(gen1),
+                    env_persona: Some("feira"),
+                    has_foreign_agy_env: false,
+                    ignore_process_hosted_env: false,
+                    replace: true,
+                    proc_ctx: CallerProcessContext::Register {
+                        self_pid: child_sh_pid,
+                        captured_route_pid: neg_captured_pid,
+                        session_id: Some(&child_sid),
+                    },
+                });
+                assert!(
+                    generation_only.is_err(),
+                    "a child cannot bypass hosted verification by omitting FL_HOSTED_ID"
+                );
             }
 
             // End-to-end hook execution via `rig.run` when `rec.pid` matches the test process:
@@ -5877,6 +6025,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: Some("claude-predeploy-sid".into()),
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 2,
                 updated_at_ms: 2,
@@ -6009,6 +6158,7 @@ pub(crate) mod tests {
                 tombstone_ids: Vec::new(),
                 vendor_session_id: None,
                 pid: None,
+                runtime_leader_pid: None,
                 pid_start_time: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,

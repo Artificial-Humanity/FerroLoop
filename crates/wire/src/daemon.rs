@@ -357,18 +357,16 @@ fn extract_peer_cred(stream: &UnixStream) -> PeerCred {
 
 fn verify_peer_cred_for_hosted_claim(
     peer_cred: PeerCred,
-    client_claimed_verified: bool,
-    replace: bool,
     challenger_route: &VendorRoute,
     challenger_generation: Option<&str>,
     incumbent: Option<&RouteEntry>,
     incumbent_is_dead: bool,
 ) -> bool {
-    if !client_claimed_verified || replace {
-        return client_claimed_verified;
+    if !cfg!(target_os = "linux") {
+        return true;
     }
     let Some(peer_pid) = peer_cred.pid else {
-        return client_claimed_verified;
+        return true;
     };
     if let Some(challenger_pid) = challenger_route.route_pid()
         && !crate::identity::pid_is_nearest_vendor_ancestor(peer_pid, challenger_pid, None)
@@ -1982,15 +1980,28 @@ where
                             ));
                         }
                     }
-                    let effective_verified = verify_peer_cred_for_hosted_claim(
-                        peer_cred,
-                        hosted_session_verified,
-                        replace,
-                        &route,
-                        hydration_generation.as_deref(),
-                        current_incumbent.as_ref(),
-                        current_dead.unwrap_or(false),
-                    );
+                    let peer_matches =
+                        if explicit && (hosted_id.is_some() || hydration_generation.is_some()) {
+                            verify_peer_cred_for_hosted_claim(
+                                peer_cred,
+                                &route,
+                                hydration_generation.as_deref(),
+                                current_incumbent.as_ref(),
+                                current_dead.unwrap_or(false),
+                            )
+                        } else {
+                            true
+                        };
+                    if !peer_matches {
+                        return (
+                            LocalResponse::Error {
+                                message: "process_mismatch: caller does not match hosted process"
+                                    .into(),
+                            },
+                            None,
+                        );
+                    }
+                    let effective_verified = hosted_session_verified && peer_matches;
 
                     #[cfg(test)]
                     if let Some(ref mut hook) = *lock(&self.registration_probe_hook) {
@@ -7448,10 +7459,32 @@ mod tests {
                     key_path: None,
                 },
                 explicit: true,
-                replace: false,
+                replace: true,
                 hosted_id: Some("claude:feira".into()),
                 hydration_generation: Some("gen-1".into()),
                 hosted_session_verified: true,
+                unverified_process: false,
+            },
+            PeerCred {
+                pid: Some(challenger_pid),
+                ppid: Some(std::process::id()),
+                start_time: crate::identity::proc_start_time_ticks(challenger_pid),
+            },
+        );
+        let (resp3, _) = rig.inner.handle_local_request_with_peer(
+            LocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: VendorRoute::Claude {
+                    session_id: "sid-unverified".into(),
+                    pid: challenger_pid,
+                    socket_path: PathBuf::from(format!("/tmp/claude-{challenger_pid}.sock")),
+                    key_path: None,
+                },
+                explicit: true,
+                replace: true,
+                hosted_id: None,
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: false,
                 unverified_process: false,
             },
             PeerCred {
@@ -7465,6 +7498,10 @@ mod tests {
         let _ = challenger_child.kill();
         let _ = challenger_child.wait();
 
+        assert!(
+            matches!(resp3, LocalResponse::Error { .. }),
+            "a hosted claim cannot avoid the peer check by clearing verified"
+        );
         assert!(
             matches!(resp2, LocalResponse::Error { .. }),
             "daemon must reject spoofed hosted_session_verified when PeerCred PID does not match live incumbent"

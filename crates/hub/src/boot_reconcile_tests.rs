@@ -1281,6 +1281,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             tombstone_ids: vec![native_id.into()],
             vendor_session_id: None,
             pid: None,
+            runtime_leader_pid: None,
             pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -1503,6 +1504,7 @@ fn reconcile_pass_formats_notice_using_hosted_session_hydration_ack_baseline() {
         tombstone_ids: Vec::new(),
         vendor_session_id: Some("019dc759-7b95-7e90-b411-579a0c7f43a5".into()),
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         created_at_ms: 10_000,
         updated_at_ms: 10_000,
@@ -1713,6 +1715,7 @@ fn service_resume_notice_skips_duplicate_when_unread_notice_exists_and_skips_ret
             tombstone_ids: Vec::new(),
             vendor_session_id: None,
             pid: None,
+            runtime_leader_pid: None,
             pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -1845,13 +1848,12 @@ fn service_resume_notice_skips_duplicate_when_unread_notice_exists_and_skips_ret
 
 #[test]
 #[cfg(target_os = "linux")]
-fn reconcile_pass_backfills_pid_and_pid_start_time_for_running_session() {
+fn reconcile_pass_does_not_copy_pid_from_route_without_runtime_evidence() {
     let fx = Fixture::new();
     let state = fx.state();
     fx.agent(&state, "Ada", false);
 
     let self_pid = std::process::id();
-    let self_st = fl_wire::identity::proc_start_time_ticks(self_pid).expect("linux start_time");
     let sock = fx.home().join(format!("{self_pid}.sock"));
     std::fs::write(&sock, "").unwrap();
     let mut table = RouteTable::load(Some(&fx.routes_path()));
@@ -1896,6 +1898,7 @@ fn reconcile_pass_backfills_pid_and_pid_start_time_for_running_session() {
         tombstone_ids: Vec::new(),
         vendor_session_id: Some("019dc759-7b95-7e90-b411-579a0c7f43a5".into()),
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         created_at_ms: 10_000,
         updated_at_ms: 10_000,
@@ -1912,6 +1915,6 @@ fn reconcile_pass_backfills_pid_and_pid_start_time_for_running_session() {
     let updated = crate::lifecycle::get_hosted_session_by_id(&*store, "claude:ada")
         .unwrap()
         .unwrap();
-    assert_eq!(updated.pid, Some(self_pid));
-    assert_eq!(updated.pid_start_time, Some(self_st));
+    assert_eq!(updated.pid, None);
+    assert_eq!(updated.pid_start_time, None);
 }
