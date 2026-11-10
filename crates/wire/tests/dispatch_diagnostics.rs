@@ -7,7 +7,12 @@ use std::process::Command;
 
 use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+use fl_core::ids::{RevisionId, StateId};
 use fl_core::mem::MemStore;
+use fl_core::state::{
+    MemoryLifecycle, StateConcern, StateConflict, StateEntry, StateRevision, StateScope,
+    StateSyncCursor, UpsertStateArgs,
+};
 use fl_core::store::MessageStore;
 use fl_wire::dispatcher::dispatch_message_for_store;
 use fl_wire::identity::{RouteTable, VendorRoute};
@@ -191,6 +196,83 @@ const SECRET_FAULT: &str = "ERROR_SECRET /private/token panic=PRIVATE_PAYLOAD";
 impl FaultStore {
     fn fault(&self, queue: &Mutex<VecDeque<Fault>>) -> Fault {
         lock(queue).pop_front().unwrap_or_default()
+    }
+}
+impl fl_core::store::StateStore for FaultStore {
+    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+        self.inner.upsert_state(args)
+    }
+    fn retire_memory(
+        &self,
+        scope: &StateScope,
+        slug: &str,
+        lifecycle: MemoryLifecycle,
+        superseded_by: Option<StateId>,
+        at: At,
+        by: &str,
+    ) -> Result<StateEntry, StoreError> {
+        self.inner
+            .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
+    }
+    fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError> {
+        self.inner.get_state(id)
+    }
+    fn get_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<Option<StateEntry>, StoreError> {
+        self.inner.get_state_by_key(scope, concern, slug)
+    }
+    fn delete_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner.delete_state_by_key(scope, concern, slug)
+    }
+    fn list_state(
+        &self,
+        scope: Option<&StateScope>,
+        concern: Option<StateConcern>,
+    ) -> Result<Vec<StateEntry>, StoreError> {
+        self.inner.list_state(scope, concern)
+    }
+    fn state_revisions(&self, id: &StateId) -> Result<Vec<StateRevision>, StoreError> {
+        self.inner.state_revisions(id)
+    }
+    fn list_conflicts(&self) -> Result<Vec<StateConflict>, StoreError> {
+        self.inner.list_conflicts()
+    }
+    fn resolve_conflict(
+        &self,
+        id: &StateId,
+        keep: &RevisionId,
+        at: At,
+        by: &str,
+    ) -> Result<StateEntry, StoreError> {
+        self.inner.resolve_conflict(id, keep, at, by)
+    }
+    fn state_revisions_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, StateRevision)>, StoreError> {
+        self.inner.state_revisions_after(after_seq)
+    }
+    fn import_state_revisions(
+        &self,
+        revisions: &[StateRevision],
+        merge_at: At,
+    ) -> Result<(), StoreError> {
+        self.inner.import_state_revisions(revisions, merge_at)
+    }
+    fn sync_cursor(&self, remote: &str) -> Result<Option<StateSyncCursor>, StoreError> {
+        self.inner.sync_cursor(remote)
+    }
+    fn set_sync_cursor(&self, cursor: StateSyncCursor) -> Result<(), StoreError> {
+        self.inner.set_sync_cursor(cursor)
     }
 }
 impl MessageStore for FaultStore {

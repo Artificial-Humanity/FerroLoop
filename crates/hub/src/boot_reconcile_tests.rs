@@ -1281,6 +1281,7 @@ fn reconcile_pass_refreshes_decommission_tombstones_from_the_store_before_scanni
             tombstone_ids: vec![native_id.into()],
             vendor_session_id: None,
             pid: None,
+            runtime_leader_pid: None,
             pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -1503,6 +1504,7 @@ fn reconcile_pass_formats_notice_using_hosted_session_hydration_ack_baseline() {
         tombstone_ids: Vec::new(),
         vendor_session_id: Some("019dc759-7b95-7e90-b411-579a0c7f43a5".into()),
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         created_at_ms: 10_000,
         updated_at_ms: 10_000,
@@ -1713,6 +1715,7 @@ fn service_resume_notice_skips_duplicate_when_unread_notice_exists_and_skips_ret
             tombstone_ids: Vec::new(),
             vendor_session_id: None,
             pid: None,
+            runtime_leader_pid: None,
             pid_start_time: None,
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -1841,4 +1844,77 @@ fn service_resume_notice_skips_duplicate_when_unread_notice_exists_and_skips_ret
         )
         .unwrap()
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn reconcile_pass_does_not_copy_pid_from_route_without_runtime_evidence() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Ada", false);
+
+    let self_pid = std::process::id();
+    let sock = fx.home().join(format!("{self_pid}.sock"));
+    std::fs::write(&sock, "").unwrap();
+    let mut table = RouteTable::load(Some(&fx.routes_path()));
+    table.upsert_explicit_with_meta(
+        "ada",
+        VendorRoute::Claude {
+            pid: self_pid,
+            session_id: "019dc759-7b95-7e90-b411-579a0c7f43a5".into(),
+            socket_path: sock,
+            key_path: None,
+        },
+        stamp::now(),
+        Some("claude:ada".into()),
+        Some("019dc759-7b95-7000-8000-000000000001".into()),
+        false,
+    );
+    table.save(Some(&fx.routes_path())).unwrap();
+
+    let rec = crate::lifecycle::HostedSessionRecord {
+        session_id: "claude:ada".into(),
+        persona: "ada".into(),
+        project: "ferroloop".into(),
+        role: "assistant".into(),
+        vendor: "claude".into(),
+        model: None,
+        thinking_level: None,
+        posture: fl_core::permissions::Posture::Auto,
+        node_id: "local".into(),
+        hosted: true,
+        status: crate::lifecycle::STATUS_RUNNING.into(),
+        stop_reason: None,
+        restart_policy: "on-failure".into(),
+        restart_count: 0,
+        tmux_target: Some("Ada:claude".into()),
+        host_session_id: Some("Ada.claude".into()),
+        cwd: None,
+        context_window: None,
+        hydration_dispatched: true,
+        hydration_status: crate::lifecycle::HydrationStatus::Confirmed,
+        hydration_generation: Some("019dc759-7b95-7000-8000-000000000001".into()),
+        runtime_spawned: true,
+        tombstone_ids: Vec::new(),
+        vendor_session_id: Some("019dc759-7b95-7e90-b411-579a0c7f43a5".into()),
+        pid: None,
+        runtime_leader_pid: None,
+        pid_start_time: None,
+        created_at_ms: 10_000,
+        updated_at_ms: 10_000,
+        decommission_prepared_at_ms: None,
+    };
+    {
+        let store = state.open_store().unwrap();
+        crate::lifecycle::persist_hosted_session(&*store, &rec, "owner").unwrap();
+    }
+
+    reconcile_pass(&state, &host("boot-a"), &no_panes()).unwrap();
+
+    let store = state.open_store().unwrap();
+    let updated = crate::lifecycle::get_hosted_session_by_id(&*store, "claude:ada")
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.pid, None);
+    assert_eq!(updated.pid_start_time, None);
 }

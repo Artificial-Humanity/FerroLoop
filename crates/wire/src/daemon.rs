@@ -31,7 +31,8 @@ use fl_core::ferrowire::{
     WireMessage,
 };
 use fl_core::ids::MessageId;
-use fl_core::store::{AgentRegistry, MessageStore};
+use fl_core::state::{StateConcern, StatePayload, StateScope};
+use fl_core::store::{AgentRegistry, MessageStore, StateStore};
 use serde::{Deserialize, Serialize};
 
 pub use crate::codex_control::{
@@ -355,27 +356,104 @@ fn extract_peer_cred(stream: &UnixStream) -> PeerCred {
     PeerCred::default()
 }
 
+// Read the hosted reference from the daemon's store, never from a route or client claim.
+// Missing, unavailable, or pid-less records retain the existing unverified behavior.
+type HostedReference = (u32, Option<u64>);
+type HostedLookup<S> = fn(&S, &str, &str, Option<&str>, Option<&str>) -> Option<HostedReference>;
+
+fn hosted_reference<S: StateStore>(
+    store: &S,
+    persona: &str,
+    vendor: &str,
+    _hosted_id: Option<&str>,
+    _generation: Option<&str>,
+) -> Option<HostedReference> {
+    if !crate::vendor_adapter::tool_processes_descend_from_cli(vendor) {
+        return None;
+    }
+    let slug = format!("hosted-session-{vendor}-{persona}");
+    let entry = store
+        .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
+        .ok()??;
+    let StatePayload::Runtime(runtime) = entry.payload else {
+        return None;
+    };
+    let value = runtime.value;
+    let session_id = value.get("session_id")?.as_str()?;
+    let pair = crate::identity::parse_hosted_identity(session_id).ok()?;
+    if pair != (vendor.to_owned(), persona.to_owned())
+        || !value
+            .get("persona")?
+            .as_str()?
+            .eq_ignore_ascii_case(persona)
+        || crate::identity::canonical_vendor_id(value.get("vendor")?.as_str()?) != vendor
+        || value
+            .get("status")?
+            .as_str()?
+            .eq_ignore_ascii_case("decommissioned")
+    {
+        return None;
+    }
+    // A claim is untrusted input: even a malformed ID or stale generation must not
+    // suppress checking the independently selected persona/vendor reference PID.
+    let pid = u32::try_from(value.get("pid")?.as_u64()?)
+        .ok()
+        .filter(|p| *p > 0)?;
+    let start = value.get("pid_start_time").and_then(|v| v.as_u64());
+    Some((pid, start))
+}
+
 fn verify_peer_cred_for_hosted_claim(
     peer_cred: PeerCred,
-    client_claimed_verified: bool,
+    trusted_reference: Option<HostedReference>,
     replace: bool,
     challenger_route: &VendorRoute,
     challenger_generation: Option<&str>,
     incumbent: Option<&RouteEntry>,
     incumbent_is_dead: bool,
 ) -> bool {
-    if !client_claimed_verified || replace {
-        return client_claimed_verified;
+    if !cfg!(target_os = "linux") {
+        return true;
     }
     let Some(peer_pid) = peer_cred.pid else {
-        return client_claimed_verified;
+        return true;
     };
+    if let Some((pid, start)) = trusted_reference {
+        if !crate::identity::proc_alive_matching_start(pid, start) {
+            return false;
+        }
+        let effective_pid = if crate::identity::proc_is_shell_wrapper(pid) {
+            crate::identity::resolve_vendor_cli_pid(pid).unwrap_or(pid)
+        } else {
+            pid
+        };
+        let effective_start = if effective_pid == pid {
+            start
+        } else {
+            crate::identity::proc_start_time_ticks(effective_pid)
+        };
+        if !crate::identity::pid_is_nearest_vendor_ancestor(
+            peer_pid,
+            effective_pid,
+            effective_start,
+        ) {
+            return false;
+        }
+    }
     if let Some(challenger_pid) = challenger_route.route_pid()
-        && !crate::identity::pid_is_self_or_ancestor(peer_pid, challenger_pid, None)
+        && !(trusted_reference.is_some() && matches!(challenger_route, VendorRoute::Agy { .. }))
+        && !crate::identity::pid_is_nearest_vendor_ancestor(peer_pid, challenger_pid, None)
     {
         return false;
     }
-    if let Some(inc) = incumbent
+    // A detached tool process cannot prove ancestry against either the hosted CLI or
+    // an incumbent. Explicit replacement still applies, but remains unverified.
+    let detached_tool_replacement = replace
+        && !crate::vendor_adapter::tool_processes_descend_from_cli(
+            challenger_route.canonical_vendor(),
+        );
+    if !(replace && trusted_reference.is_some() || detached_tool_replacement)
+        && let Some(inc) = incumbent
         && inc.explicit
         && !incumbent_is_dead
         && let Some(inc_pid) = inc.route.route_pid()
@@ -389,7 +467,11 @@ fn verify_peer_cred_for_hosted_claim(
             {
                 return false;
             }
-            if !crate::identity::pid_is_self_or_ancestor(peer_pid, inc_pid, inc.pid_start_time) {
+            if !crate::identity::pid_is_nearest_vendor_ancestor(
+                peer_pid,
+                inc_pid,
+                inc.pid_start_time,
+            ) {
                 return false;
             }
         }
@@ -997,6 +1079,7 @@ struct AwaitingDaemonEntry {
 
 struct DaemonInner<S> {
     store: Arc<S>,
+    hosted_lookup: HostedLookup<S>,
     config: DaemonConfig,
     routes: Mutex<RouteTable>,
     /// Serializes only persistence and enqueue, never vendor execution.
@@ -1943,6 +2026,13 @@ where
                         None,
                     );
                 };
+                // This is a property of the adapter, not a trustworthy client claim.
+                let unverified_process = unverified_process
+                    || (explicit
+                        && (hosted_id.is_some() || hydration_generation.is_some())
+                        && !crate::vendor_adapter::tool_processes_descend_from_cli(
+                            route.canonical_vendor(),
+                        ));
                 let evidence = hold_evidence(
                     &norm,
                     None,
@@ -1978,15 +2068,36 @@ where
                             ));
                         }
                     }
-                    let effective_verified = verify_peer_cred_for_hosted_claim(
-                        peer_cred,
-                        hosted_session_verified,
-                        replace,
-                        &route,
-                        hydration_generation.as_deref(),
-                        current_incumbent.as_ref(),
-                        current_dead.unwrap_or(false),
-                    );
+                    let peer_matches =
+                        if explicit && (hosted_id.is_some() || hydration_generation.is_some()) {
+                            verify_peer_cred_for_hosted_claim(
+                                peer_cred,
+                                (self.hosted_lookup)(
+                                    self.store.as_ref(),
+                                    &norm,
+                                    route.canonical_vendor(),
+                                    hosted_id.as_deref(),
+                                    hydration_generation.as_deref(),
+                                ),
+                                replace,
+                                &route,
+                                hydration_generation.as_deref(),
+                                current_incumbent.as_ref(),
+                                current_dead.unwrap_or(false),
+                            )
+                        } else {
+                            true
+                        };
+                    if !peer_matches {
+                        return (
+                            LocalResponse::Error {
+                                message: "process_mismatch: caller does not match hosted process"
+                                    .into(),
+                            },
+                            None,
+                        );
+                    }
+                    let effective_verified = hosted_session_verified && peer_matches;
 
                     #[cfg(test)]
                     if let Some(ref mut hook) = *lock(&self.registration_probe_hook) {
@@ -2766,7 +2877,7 @@ impl Drop for DaemonHandle {
 
 pub fn spawn_daemon<S>(store: Arc<S>, mut config: DaemonConfig) -> io::Result<DaemonHandle>
 where
-    S: MessageStore + AgentRegistry + Send + Sync + 'static,
+    S: MessageStore + AgentRegistry + StateStore + Send + Sync + 'static,
 {
     if config.psk.is_empty() && (config.listen_addr.is_some() || !config.peers.is_empty()) {
         return Err(io::Error::new(
@@ -2825,6 +2936,7 @@ where
     let initial_pending = seed_pending_map_from_store(store.as_ref());
     let inner = Arc::new(DaemonInner {
         store,
+        hosted_lookup: hosted_reference::<S>,
         config: config.clone(),
         routes: Mutex::new(initial_routes),
         enqueue_gate: Mutex::new(()),
@@ -3055,9 +3167,14 @@ mod tests {
         source: RedbStore,
     }
 
-    fn rig_inner<S>(tmp: &TempDir, store: Arc<S>) -> Arc<DaemonInner<S>> {
+    fn rig_inner<S>(
+        tmp: &TempDir,
+        store: Arc<S>,
+        hosted_lookup: HostedLookup<S>,
+    ) -> Arc<DaemonInner<S>> {
         Arc::new(DaemonInner {
             store,
+            hosted_lookup,
             config: DaemonConfig {
                 node_id: "node-b".into(),
                 host: "host-b".into(),
@@ -3097,7 +3214,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
         let source = RedbStore::open(&tmp.path().join("src.redb")).unwrap();
-        let inner = rig_inner(&tmp, store);
+        let inner = rig_inner(&tmp, store, hosted_reference::<RedbStore>);
         let (tx, _unused) = mpsc::channel();
         let sender = inner.register_peer("peer-a".into(), tx);
         let (tx, observed) = mpsc::channel();
@@ -3290,7 +3407,9 @@ mod tests {
             writes: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
         });
-        let inner = rig_inner(&tmp, store);
+        let inner = rig_inner(&tmp, store, |store: &FaultStore, p, v, h, g| {
+            hosted_reference(&store.inner, p, v, h, g)
+        });
         lock(&inner.routes).upsert_explicit(
             "held",
             VendorRoute::Codex {
@@ -7365,7 +7484,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
-        let mut inner = rig_inner(&tmp, store);
+        let mut inner = rig_inner(&tmp, store, hosted_reference::<RedbStore>);
         Arc::get_mut(&mut inner)
             .expect("unique inner")
             .config
@@ -7398,6 +7517,278 @@ mod tests {
             ),
             "Status {{ include_codex_queues: false }} must not TCP-probe explicit Agy ls_address"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn codex_app_server_tool_can_register_with_generation_and_replace() {
+        use fl_core::state::{
+            MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        let rig = rig();
+        let bin = rig._tmp.path().join("codex");
+        std::os::unix::fs::symlink("/bin/sh", &bin).unwrap();
+        let mut tui = std::process::Command::new(&bin)
+            .args(["-c", "sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut server = std::process::Command::new(&bin)
+            .args(["-c", "sh -c 'echo HOOK:$$; sleep 60; :' & wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let hook: u32 = BufReader::new(server.stdout.take().unwrap())
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap()
+            .strip_prefix("HOOK:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        rig.inner.store.upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace, slug: "hosted-session-codex-feira".into(), sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Runtime(RuntimeEntry { value: serde_json::json!({"session_id":"codex:feira", "persona":"feira", "vendor":"codex", "status":"running", "hydration_generation":"gen-1", "pid":tui.id(), "pid_start_time":crate::identity::proc_start_time_ticks(tui.id())}), merge_mode: MergeMode::LastWriter }), at: At::from_unix_millis(1), by: "test".into(),
+        }).unwrap();
+        let request = |replace| LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "thread".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace,
+            hosted_id: None,
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: true,
+            unverified_process: false,
+        };
+        let peer = PeerCred {
+            pid: Some(hook),
+            ppid: None,
+            start_time: crate::identity::proc_start_time_ticks(hook),
+        };
+        let mut outcomes = Vec::new();
+        for vendor in ["claude", "agy"] {
+            let incumbent = if vendor == "claude" {
+                VendorRoute::Claude {
+                    pid: std::process::id(),
+                    session_id: "incumbent".into(),
+                    socket_path: rig._tmp.path().join("incumbent.sock"),
+                    key_path: None,
+                }
+            } else {
+                VendorRoute::Agy {
+                    conversation_id: "incumbent".into(),
+                    ls_pid: Some(std::process::id()),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                }
+            };
+            {
+                let mut routes = lock(&rig.inner.routes);
+                routes.upsert_explicit_with_meta(
+                    "feira",
+                    incumbent,
+                    At::from_unix_millis(1),
+                    None,
+                    None,
+                    true,
+                );
+                let entry = routes.get("feira").unwrap();
+                assert!(!crate::identity::explicit_route_entry_is_dead(
+                    entry,
+                    Some("feira"),
+                    false
+                ));
+            }
+            let (without_replace, _) = rig
+                .inner
+                .handle_local_request_with_peer(request(false), peer);
+            let (response, _) = rig
+                .inner
+                .handle_local_request_with_peer(request(true), peer);
+            let routes = lock(&rig.inner.routes);
+            let codex_route = matches!(
+                routes.get("feira").unwrap().route,
+                VendorRoute::Codex { .. }
+            );
+            let unverified = routes
+                .registration_diagnostics
+                .last()
+                .is_some_and(|d| d.unverified_process);
+            outcomes.push((vendor, without_replace, response, codex_route, unverified));
+        }
+        unsafe {
+            libc::kill(-(server.id() as i32), libc::SIGKILL);
+            libc::kill(-(tui.id() as i32), libc::SIGKILL);
+        }
+        let _ = server.wait();
+        let _ = tui.wait();
+        for (vendor, without_replace, response, codex_route, unverified) in outcomes {
+            assert!(
+                matches!(without_replace, LocalResponse::Error { .. }),
+                "{vendor}: {without_replace:?}"
+            );
+            assert!(
+                matches!(response, LocalResponse::RouteRegistered),
+                "{vendor}: {response:?}"
+            );
+            assert!(codex_route, "{vendor}: Codex route missing");
+            assert!(
+                unverified,
+                "{vendor}: replacement must record the unverified classification"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hosted_muse_and_grok_replace_checks_peer_against_runtime_record() {
+        use fl_core::state::{
+            MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        for vendor in ["muse", "grok"] {
+            let rig = rig();
+            let vendor_bin = rig._tmp.path().join(vendor);
+            std::os::unix::fs::symlink("/bin/sh", &vendor_bin).unwrap();
+            let script = r#"sh -c 'echo HOOK:$$; sleep 60; :' & "$1" -c 'echo CHILD:$$; sleep 60; :' & wait"#;
+            let mut child = std::process::Command::new(&vendor_bin)
+                .args(["-c", script, "_", vendor_bin.to_str().unwrap()])
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let parent_pid = child.id();
+            let output = child.stdout.take().unwrap();
+            let mut hook_pid = None;
+            let mut child_pid = None;
+            for line in BufReader::new(output).lines() {
+                let line = line.unwrap();
+                if let Some(v) = line.strip_prefix("HOOK:") {
+                    hook_pid = v.parse::<u32>().ok();
+                }
+                if let Some(v) = line.strip_prefix("CHILD:") {
+                    child_pid = v.parse::<u32>().ok();
+                }
+                if hook_pid.is_some() && child_pid.is_some() {
+                    break;
+                }
+            }
+            let hook_pid = hook_pid.unwrap();
+            let child_pid = child_pid.unwrap();
+            assert!(crate::identity::proc_is_vendor_cli(child_pid));
+            rig.inner.store.upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace, slug: format!("hosted-session-{vendor}-feira"),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry { value: serde_json::json!({
+                    "session_id": format!("{vendor}:feira"), "persona": "feira", "vendor": vendor,
+                    "status": "running", "hydration_generation": "gen-1", "pid": parent_pid,
+                    "pid_start_time": crate::identity::proc_start_time_ticks(parent_pid)
+                }), merge_mode: MergeMode::LastWriter }), at: At::from_unix_millis(1), by: "test".into(),
+            }).unwrap();
+            let route = match vendor {
+                "muse" => VendorRoute::Muse {
+                    session_id: "sid".into(),
+                    cwd: None,
+                    tmux_target: None,
+                    tmux_pane: None,
+                },
+                _ => VendorRoute::Grok {
+                    session_id: "sid".into(),
+                    cwd: None,
+                    tmux_target: None,
+                    tmux_pane: None,
+                },
+            };
+            let request = |with_hosted_id: bool| LocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: route.clone(),
+                explicit: true,
+                replace: true,
+                hosted_id: with_hosted_id.then(|| format!("{vendor}:feira")),
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: false,
+                unverified_process: false,
+            };
+            let peer = |pid| PeerCred {
+                pid: Some(pid),
+                ppid: None,
+                start_time: crate::identity::proc_start_time_ticks(pid),
+            };
+            let results = [true, false].map(|with_hosted_id| {
+                let (ok, _) = rig
+                    .inner
+                    .handle_local_request_with_peer(request(with_hosted_id), peer(hook_pid));
+                let (bad, _) = rig
+                    .inner
+                    .handle_local_request_with_peer(request(with_hosted_id), peer(child_pid));
+                (ok, bad)
+            });
+            // A caller cannot bypass the trusted runtime PID by changing its claim.
+            // The actual hosted process remains eligible for process verification.
+            let mut altered_results = Vec::new();
+            for (hosted_id, generation) in [
+                (None, Some("stale-gen".to_owned())),
+                (Some("malformed".to_owned()), None),
+                (Some(format!("{vendor}:someone-else")), None),
+            ] {
+                let altered_request = || LocalRequest::RegisterRoute {
+                    persona: "feira".into(),
+                    route: route.clone(),
+                    explicit: true,
+                    replace: true,
+                    hosted_id: hosted_id.clone(),
+                    hydration_generation: generation.clone(),
+                    hosted_session_verified: false,
+                    unverified_process: false,
+                };
+                let (genuine, _) = rig
+                    .inner
+                    .handle_local_request_with_peer(altered_request(), peer(hook_pid));
+                let (child, _) = rig
+                    .inner
+                    .handle_local_request_with_peer(altered_request(), peer(child_pid));
+                altered_results.push((genuine, child));
+            }
+            unsafe {
+                libc::kill(-(parent_pid as i32), libc::SIGKILL);
+            }
+            let _ = child.wait();
+            for (genuine, child) in altered_results {
+                assert!(
+                    matches!(child, LocalResponse::Error { .. }),
+                    "{vendor} altered claim: {child:?}"
+                );
+                // An independently checked genuine peer must never be mistaken for a child.
+                // Other registration fences may still refuse a conflicting claim.
+                if let LocalResponse::Error { message } = genuine {
+                    assert!(
+                        !message.contains("process_mismatch"),
+                        "{vendor} genuine peer: {message}"
+                    );
+                }
+            }
+            for (ok, bad) in results {
+                assert!(
+                    matches!(ok, LocalResponse::RouteRegistered),
+                    "{vendor}: {ok:?}"
+                );
+                assert!(
+                    matches!(bad, LocalResponse::Error { .. }),
+                    "{vendor}: {bad:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7444,10 +7835,32 @@ mod tests {
                     key_path: None,
                 },
                 explicit: true,
-                replace: false,
+                replace: true,
                 hosted_id: Some("claude:feira".into()),
                 hydration_generation: Some("gen-1".into()),
                 hosted_session_verified: true,
+                unverified_process: false,
+            },
+            PeerCred {
+                pid: Some(challenger_pid),
+                ppid: Some(std::process::id()),
+                start_time: crate::identity::proc_start_time_ticks(challenger_pid),
+            },
+        );
+        let (resp3, _) = rig.inner.handle_local_request_with_peer(
+            LocalRequest::RegisterRoute {
+                persona: "feira".into(),
+                route: VendorRoute::Claude {
+                    session_id: "sid-unverified".into(),
+                    pid: challenger_pid,
+                    socket_path: PathBuf::from(format!("/tmp/claude-{challenger_pid}.sock")),
+                    key_path: None,
+                },
+                explicit: true,
+                replace: true,
+                hosted_id: None,
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: false,
                 unverified_process: false,
             },
             PeerCred {
@@ -7461,6 +7874,10 @@ mod tests {
         let _ = challenger_child.kill();
         let _ = challenger_child.wait();
 
+        assert!(
+            matches!(resp3, LocalResponse::Error { .. }),
+            "a hosted claim cannot avoid the peer check by clearing verified"
+        );
         assert!(
             matches!(resp2, LocalResponse::Error { .. }),
             "daemon must reject spoofed hosted_session_verified when PeerCred PID does not match live incumbent"
@@ -8027,5 +8444,113 @@ mod tests {
             calls_on_second_poll.is_empty(),
             "periodic poll should skip get/receipts reads for unrouted markers when routes did not change, got {calls_on_second_poll:?}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod hydration_peer_review_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn verified_replacement_ignores_unrelated_incumbent_but_not_child_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        for vendor in ["claude", "agy"] {
+            let bin = tmp.path().join(vendor);
+            std::os::unix::fs::symlink("/bin/sh", &bin).unwrap();
+            let mut process = Command::new(&bin).args(["-c", "sh -c 'echo HOOK:$$; sleep 60; :' & \"$1\" -c 'echo CHILD:$$; sleep 60; :' & wait", "_", bin.to_str().unwrap()])
+                .stdout(Stdio::piped()).process_group(0).spawn().unwrap();
+            let pid = process.id();
+            let mut hook = None;
+            let mut child = None;
+            for line in BufReader::new(process.stdout.take().unwrap()).lines() {
+                let line = line.unwrap();
+                if let Some(id) = line.strip_prefix("HOOK:") {
+                    hook = id.parse::<u32>().ok();
+                }
+                if let Some(id) = line.strip_prefix("CHILD:") {
+                    child = id.parse::<u32>().ok();
+                }
+                if hook.is_some() && child.is_some() {
+                    break;
+                }
+            }
+            let route = if vendor == "claude" {
+                VendorRoute::Claude {
+                    pid,
+                    session_id: "new".into(),
+                    socket_path: tmp.path().join("new.sock"),
+                    key_path: None,
+                }
+            } else {
+                VendorRoute::Agy {
+                    conversation_id: "new".into(),
+                    ls_pid: Some(std::process::id()),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                }
+            };
+            let mut table = crate::identity::RouteTable::default();
+            table.upsert_explicit_with_meta(
+                "ada",
+                VendorRoute::Claude {
+                    pid: std::process::id(),
+                    session_id: "old".into(),
+                    socket_path: tmp.path().join("old.sock"),
+                    key_path: None,
+                },
+                At::from_unix_millis(1),
+                None,
+                None,
+                false,
+            );
+            let incumbent = table.get("ada");
+            let peer = |pid| PeerCred {
+                pid: Some(pid),
+                ppid: None,
+                start_time: crate::identity::proc_start_time_ticks(pid),
+            };
+            let reference = Some((pid, crate::identity::proc_start_time_ticks(pid)));
+            let genuine = verify_peer_cred_for_hosted_claim(
+                peer(hook.unwrap()),
+                reference,
+                true,
+                &route,
+                Some("gen"),
+                incumbent,
+                false,
+            );
+            let nested = verify_peer_cred_for_hosted_claim(
+                peer(child.unwrap()),
+                reference,
+                true,
+                &route,
+                Some("gen"),
+                incumbent,
+                false,
+            );
+            let untrusted = verify_peer_cred_for_hosted_claim(
+                peer(hook.unwrap()),
+                None,
+                true,
+                &route,
+                Some("gen"),
+                incumbent,
+                false,
+            );
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let _ = process.wait();
+            assert!(genuine, "{vendor} genuine replacement");
+            assert!(!nested, "{vendor} nested child");
+            assert!(
+                !untrusted,
+                "{vendor} incumbent requires independently proven replacement"
+            );
+        }
     }
 }

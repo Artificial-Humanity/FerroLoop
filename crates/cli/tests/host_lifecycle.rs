@@ -1197,3 +1197,152 @@ fn hub_restart_claude_resume_child() {
         lifecycle::HydrationStatus::Confirmed
     );
 }
+
+/// Exercise actual private fl-host launch and a live-shaped hydration command for every adapter.
+/// Codex tools instead run under a separate app-server fixture, just like its remote TUI.
+#[test]
+#[cfg(target_os = "linux")]
+fn real_host_live_vendor_hydration_register_confirms_and_routes() {
+    use fl_wire::identity::RouteTable;
+    use std::os::unix::process::CommandExt;
+
+    for (vendor, bin_name, bin_env, session_env) in [
+        (
+            "claude",
+            "claude",
+            "FL_WIRE_CLAUDE_BIN",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+        ),
+        ("codex", "codex", "FL_WIRE_CODEX_BIN", "CODEX_THREAD_ID"),
+        ("muse", "muse", "FL_WIRE_MUSE_BIN", "MUSE_SESSION_ID"),
+        (
+            "antigravity",
+            "agy",
+            "FL_WIRE_AGY_BIN",
+            "ANTIGRAVITY_CONVERSATION_ID",
+        ),
+        ("grok", "grok", "FL_WIRE_GROK_BIN", "GROK_SESSION_ID"),
+    ] {
+        let f = Fixture::new();
+        let root = f.root.path();
+        let binary = root.join(bin_name);
+        let routes = root.join("routes.json");
+        let db = root.join("fl.fls");
+        let script = format!(
+            r##"#!/bin/sh
+root='{root}'
+if [ '{vendor}' = codex ] && [ "$1" != --fixture-app-server ]; then /bin/cat; exit; fi
+while [ ! -f "$root/go" ]; do sleep 0.05; done
+export HOME="$root" XDG_RUNTIME_DIR="$root" XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data"
+export FL_HOST_SOCK="$root/h.sock" FL_WIRE_ROUTES="$root/routes.json" FL_WIRE_DISABLE_HOST_DISCOVERY=1
+export AGENT_PERSONA=ada AGENT_HYDRATION_GENERATION="$(cat "$root/go")"
+unset FL_HOSTED_ID CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_SESSION_ID CODEX_THREAD_ID MUSE_SESSION_ID GROK_SESSION_ID ANTIGRAVITY_CONVERSATION_ID ANTIGRAVITY_AGENT
+if [ '{vendor}' = claude ]; then export CLAUDE_CODE_MESSAGING_SOCKET="$root/$$.sock"; else export {session_env}=live-session-id; fi
+'{fl}' --db "$root/fl.fls" wire register Ada --project FerroLoop --role assistant --replace >"$root/register.out" 2>"$root/register.err"
+echo "$?" >"$root/register.status"
+exec /bin/cat
+"##,
+            root = root.display(),
+            fl = env!("CARGO_BIN_EXE_fl")
+        );
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if vendor == "codex" {
+            let codex_home = root.join("codex-home");
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::write(
+                codex_home.join("config.toml"),
+                format!(
+                    "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                    root.display()
+                ),
+            )
+            .unwrap();
+        }
+        let mut spin = f.command();
+        spin.env(bin_env, &binary)
+            .env("CODEX_HOME", root.join("codex-home"))
+            .env("FL_WIRE_ROUTES", &routes)
+            .args([
+                "agent",
+                "spin-up",
+                "ada",
+                "--project",
+                "FerroLoop",
+                "--role",
+                "assistant",
+                "--vendor",
+                vendor,
+                "--by",
+                "owner",
+                "--json",
+            ]);
+        let output = spin.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{vendor} spin-up: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let out: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(out["runtime_spawned"], true, "{vendor}");
+        let generation = out["hydration_generation"].as_str().unwrap();
+        let records = f.json(&["state", "list", "--concern", "runtime", "--json"], false);
+        let slug = format!("hosted-session-{vendor}-ada");
+        let record = records
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["slug"] == slug)
+            .unwrap();
+        let pid = record["payload"]["runtime"]["value"]["pid"]
+            .as_u64()
+            .unwrap() as u32;
+        assert!(
+            fl_wire::identity::proc_is_vendor_cli(pid),
+            "{vendor}: recorded PID {pid} is not the launched CLI"
+        );
+        let mut app_server = (vendor == "codex").then(|| {
+            Command::new(&binary)
+                .arg("--fixture-app-server")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        });
+        std::fs::write(root.join("go"), generation).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !root.join("register.status").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{vendor}: hydration register timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = std::fs::read_to_string(root.join("register.status")).unwrap();
+        if let Some(ref mut server) = app_server {
+            unsafe {
+                libc::kill(-(server.id() as i32), libc::SIGKILL);
+            }
+            let _ = server.wait();
+        }
+        assert_eq!(
+            status.trim(),
+            "0",
+            "{vendor}: {}",
+            std::fs::read_to_string(root.join("register.err")).unwrap_or_default()
+        );
+        let store = fl_store::open_store(&db).unwrap();
+        let session = fl_hub::lifecycle::find_hosted_session(&store, &[&format!("{vendor}:ada")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.hydration_status,
+            fl_hub::lifecycle::HydrationStatus::Confirmed,
+            "{vendor}"
+        );
+        let table = RouteTable::load(Some(&routes));
+        assert_eq!(table.get("ada").unwrap().route.canonical_vendor(), vendor);
+    }
+}

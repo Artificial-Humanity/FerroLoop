@@ -573,6 +573,9 @@ fn the_launched_muse_binary_follows_the_environment_setting_and_the_guard_clears
 
 #[test]
 fn built_in_vendors_launch_with_their_prompt() {
+    let _tmux_env = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (vendor, bin, variable, flags) in [
         (
             "claude",
@@ -731,6 +734,9 @@ fn spin_up_and_restart_launch_muse_with_reasoning_effort_and_no_auto_update_env(
 
 #[test]
 fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
+    let _tmux_env = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (vendor, bin, variable, flags) in [
         (
             "claude",
@@ -2168,6 +2174,9 @@ fn non_muse_vendors_keep_a_blank_session_that_teardown_kills_by_name() {
 
 #[test]
 fn spin_up_and_restart_apply_posture_persist_record_and_emit_bypass_only_on_bypass() {
+    let _tmux_env = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     use fl_core::permissions::Posture;
 
     let _bin = MuseBinEnv::cleared();
