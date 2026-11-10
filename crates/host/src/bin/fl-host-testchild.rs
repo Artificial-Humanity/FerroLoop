@@ -178,15 +178,25 @@ fn main() {
             }
             let mut out = io::stdout();
             let batches = std::path::Path::new(rest.get(2).expect("batch gates"));
+            let mut producer_elapsed = std::time::Duration::ZERO;
             for batch in 0..20 {
                 while !batches.join(batch.to_string()).exists() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
+                // Measure the producer only after this batch is admitted. The
+                // parent deliberately gates batches on healthy-peer observation.
+                let started = std::time::Instant::now();
                 for index in batch * 10..(batch + 1) * 10 {
                     writeln!(out, "L{index}").expect("line");
                 }
                 out.flush().expect("batch flush");
+                producer_elapsed += started.elapsed();
             }
+            std::fs::write(
+                batches.join("producer-ns"),
+                format!("{}\n", producer_elapsed.as_nanos()),
+            )
+            .expect("producer timing");
             park();
         }
         "lines" => {
