@@ -1,8 +1,6 @@
 //! Little-endian `.fls` layout: superblocks, copy-on-write snapshots, WAL frames.
 
-use super::columnar::{
-    ColumnDef, ColumnTable, check_new_table, type_from_tag, type_tag, validate_row_group,
-};
+use super::columnar::{ColumnDef, ColumnTable, check_new_table, type_from_tag, type_tag};
 use super::state::{Collection, Docs, Tables, Vectors};
 use super::vector::{
     self, VectorCollection, VectorMetric, VectorRecord, VectorStorage, metric_from_tag, metric_tag,
@@ -460,7 +458,36 @@ pub(super) struct Snapshot {
     pub(super) vectors: Vectors,
 }
 
+/// Recovery alone supplies cancellation/deadline checks; ordinary codecs use
+/// a no-op control and preserve their bytes and validation behavior.
+pub(super) fn encode_snapshot_for_recovery(
+    state: &super::state::DocState,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Vec<u8>, StoreError> {
+    progress()?;
+    if !state.vectors.is_empty() {
+        encode_snapshot_v3_controlled(
+            state.last_seq,
+            &state.docs,
+            &state.tables,
+            &state.vectors,
+            progress,
+        )
+    } else if !state.tables.is_empty() {
+        encode_snapshot_v2_controlled(state.last_seq, &state.docs, &state.tables, progress)
+    } else {
+        encode_snapshot_controlled(state.last_seq, &state.docs, progress)
+    }
+}
+
 pub(super) fn encode_snapshot(seq: u64, docs: &Docs) -> Result<Vec<u8>, StoreError> {
+    encode_snapshot_controlled(seq, docs, &mut || Ok(()))
+}
+fn encode_snapshot_controlled(
+    seq: u64,
+    docs: &Docs,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Vec<u8>, StoreError> {
     let mut body = Vec::new();
     body.extend_from_slice(SNAP_MAGIC);
     body.extend_from_slice(&SNAPSHOT_VERSION_DOCS.to_le_bytes());
@@ -469,6 +496,7 @@ pub(super) fn encode_snapshot(seq: u64, docs: &Docs) -> Result<Vec<u8>, StoreErr
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
     body.extend_from_slice(&count.to_le_bytes());
     for (collection, id, doc) in docs.iter() {
+        progress()?;
         write_lp(&mut body, collection.as_bytes())?;
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
@@ -487,6 +515,14 @@ pub(super) fn encode_snapshot_v2(
     docs: &Docs,
     tables: &Tables,
 ) -> Result<Vec<u8>, StoreError> {
+    encode_snapshot_v2_controlled(seq, docs, tables, &mut || Ok(()))
+}
+fn encode_snapshot_v2_controlled(
+    seq: u64,
+    docs: &Docs,
+    tables: &Tables,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Vec<u8>, StoreError> {
     let mut body = Vec::new();
     body.extend_from_slice(SNAP_MAGIC);
     body.extend_from_slice(&SNAPSHOT_VERSION_COLUMNAR.to_le_bytes());
@@ -495,6 +531,7 @@ pub(super) fn encode_snapshot_v2(
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
     body.extend_from_slice(&count.to_le_bytes());
     for (collection, id, doc) in docs.iter() {
+        progress()?;
         write_lp(&mut body, collection.as_bytes())?;
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
@@ -504,11 +541,13 @@ pub(super) fn encode_snapshot_v2(
         u32::try_from(tables.len()).map_err(|_| backend("snapshot has too many column tables"))?;
     body.extend_from_slice(&table_count.to_le_bytes());
     for (name, table) in tables {
+        progress()?;
         write_lp(&mut body, name.as_bytes())?;
         let col_count =
             u32::try_from(table.columns.len()).map_err(|_| backend("too many columns"))?;
         body.extend_from_slice(&col_count.to_le_bytes());
         for column in &table.columns {
+            progress()?;
             write_lp(&mut body, column.name.as_bytes())?;
             body.push(type_tag(column.ty));
         }
@@ -516,6 +555,7 @@ pub(super) fn encode_snapshot_v2(
             u32::try_from(table.groups.len()).map_err(|_| backend("too many row groups"))?;
         body.extend_from_slice(&group_count.to_le_bytes());
         for group in &table.groups {
+            progress()?;
             write_lp(&mut body, group)?;
         }
     }
@@ -532,10 +572,20 @@ pub(super) fn encode_snapshot_v3(
     tables: &Tables,
     vectors: &Vectors,
 ) -> Result<Vec<u8>, StoreError> {
+    encode_snapshot_v3_controlled(seq, docs, tables, vectors, &mut || Ok(()))
+}
+fn encode_snapshot_v3_controlled(
+    seq: u64,
+    docs: &Docs,
+    tables: &Tables,
+    vectors: &Vectors,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Vec<u8>, StoreError> {
     if vectors.is_empty() {
         return Err(backend("snapshot has no vector collections"));
     }
     for (name, collection) in vectors {
+        progress()?;
         vector::validate_graph_full(name, collection)?;
     }
     let mut body = Vec::new();
@@ -546,6 +596,7 @@ pub(super) fn encode_snapshot_v3(
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
     body.extend_from_slice(&count.to_le_bytes());
     for (collection, id, doc) in docs.iter() {
+        progress()?;
         write_lp(&mut body, collection.as_bytes())?;
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
@@ -555,13 +606,15 @@ pub(super) fn encode_snapshot_v3(
         u32::try_from(tables.len()).map_err(|_| backend("snapshot has too many column tables"))?;
     body.extend_from_slice(&table_count.to_le_bytes());
     for (name, table) in tables {
-        write_column_table(&mut body, name, table)?;
+        progress()?;
+        write_column_table(&mut body, name, table, progress)?;
     }
     let collection_count = u32::try_from(vectors.len())
         .map_err(|_| backend("snapshot has too many vector collections"))?;
     body.extend_from_slice(&collection_count.to_le_bytes());
     for (name, collection) in vectors {
-        write_vector_collection(&mut body, name, collection)?;
+        progress()?;
+        write_vector_collection(&mut body, name, collection, progress)?;
     }
     let crc = crc32(&body);
     body.extend_from_slice(&crc.to_le_bytes());
@@ -572,11 +625,13 @@ fn write_column_table(
     body: &mut Vec<u8>,
     name: &str,
     table: &ColumnTable,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     write_lp(body, name.as_bytes())?;
     let col_count = u32::try_from(table.columns.len()).map_err(|_| backend("too many columns"))?;
     body.extend_from_slice(&col_count.to_le_bytes());
     for column in &table.columns {
+        progress()?;
         write_lp(body, column.name.as_bytes())?;
         body.push(type_tag(column.ty));
     }
@@ -584,6 +639,7 @@ fn write_column_table(
         u32::try_from(table.groups.len()).map_err(|_| backend("too many row groups"))?;
     body.extend_from_slice(&group_count.to_le_bytes());
     for group in &table.groups {
+        progress()?;
         write_lp(body, group)?;
     }
     Ok(())
@@ -593,6 +649,7 @@ fn write_vector_collection(
     body: &mut Vec<u8>,
     name: &str,
     collection: &VectorCollection,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     write_lp(body, name.as_bytes())?;
     body.extend_from_slice(&collection.dim.to_le_bytes());
@@ -605,6 +662,7 @@ fn write_vector_collection(
         .map_err(|_| backend("too many vectors in one collection"))?;
     body.extend_from_slice(&count.to_le_bytes());
     for (id, record) in &collection.vectors {
+        progress()?;
         write_lp(body, id.as_bytes())?;
         write_lp(body, &record.bytes)?;
         write_metadata(body, &record.metadata)?;
@@ -617,8 +675,10 @@ fn write_vector_collection(
         }
     }
     for record in collection.vectors.values() {
+        progress()?;
         body.push(record.level);
         for neighbors in &record.neighbors {
+            progress()?;
             let ncount =
                 u32::try_from(neighbors.len()).map_err(|_| backend("too many vector neighbors"))?;
             body.extend_from_slice(&ncount.to_le_bytes());
@@ -641,6 +701,28 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
 }
 
 fn decode_snapshot_with(buf: &[u8], check_graph: GraphCheck) -> Result<Snapshot, StoreError> {
+    decode_snapshot_bounded(
+        buf,
+        check_graph,
+        &super::columnar::Limits::DEFAULT,
+        &mut || Ok(()),
+    )
+}
+
+pub(super) fn decode_snapshot_for_recovery(
+    buf: &[u8],
+    limits: &super::columnar::Limits,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Snapshot, StoreError> {
+    decode_snapshot_bounded(buf, vector::validate_graph, limits, progress)
+}
+
+fn decode_snapshot_bounded(
+    buf: &[u8],
+    check_graph: GraphCheck,
+    limits: &super::columnar::Limits,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Snapshot, StoreError> {
     if buf.len() < 4 {
         return Err(corrupt("snapshot is shorter than its crc"));
     }
@@ -675,6 +757,7 @@ fn decode_snapshot_with(buf: &[u8], check_graph: GraphCheck) -> Result<Snapshot,
     }
     let mut nested: BTreeMap<String, Collection> = BTreeMap::new();
     for _ in 0..count {
+        progress()?;
         let collection = cur.lp_str()?;
         let id = cur.lp_str()?;
         let raw = cur.lp()?;
@@ -692,11 +775,16 @@ fn decode_snapshot_with(buf: &[u8], check_graph: GraphCheck) -> Result<Snapshot,
     let docs = Docs::from_nested(nested);
     let mut tables = Tables::new();
     if version == SNAPSHOT_VERSION_COLUMNAR || version == SNAPSHOT_VERSION_VECTOR {
-        tables = decode_column_tables(&mut cur, version == SNAPSHOT_VERSION_COLUMNAR)?;
+        tables = decode_column_tables(
+            &mut cur,
+            version == SNAPSHOT_VERSION_COLUMNAR,
+            limits,
+            progress,
+        )?;
     }
     let mut vectors = Vectors::new();
     if version == SNAPSHOT_VERSION_VECTOR {
-        vectors = decode_vector_collections(&mut cur, check_graph)?;
+        vectors = decode_vector_collections(&mut cur, check_graph, progress)?;
     }
     cur.finish()?;
     Ok(Snapshot {
@@ -707,7 +795,12 @@ fn decode_snapshot_with(buf: &[u8], check_graph: GraphCheck) -> Result<Snapshot,
     })
 }
 
-fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tables, StoreError> {
+fn decode_column_tables(
+    cur: &mut Cur<'_>,
+    require_nonempty: bool,
+    limits: &super::columnar::Limits,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<Tables, StoreError> {
     let table_count = cur.u32()?;
     if require_nonempty && table_count == 0 {
         return Err(corrupt("snapshot has no column tables"));
@@ -717,6 +810,7 @@ fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tab
     }
     let mut tables = BTreeMap::new();
     for _ in 0..table_count {
+        progress()?;
         let name = cur.lp_str()?;
         let col_count = cur.u32()?;
         if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
@@ -724,6 +818,7 @@ fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tab
         }
         let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
         for _ in 0..col_count {
+            progress()?;
             let column_name = cur.lp_str()?;
             let ty = type_from_tag(cur.u8()?)?;
             columns.push(ColumnDef {
@@ -737,6 +832,7 @@ fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tab
         }
         let mut groups = Vec::with_capacity(usize::try_from(group_count).unwrap_or(0));
         for _ in 0..group_count {
+            progress()?;
             groups.push(cur.lp()?.to_vec());
         }
         if tables.contains_key(&name) {
@@ -744,7 +840,8 @@ fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tab
         }
         check_new_table(false, &name, &columns)?;
         for group in &groups {
-            validate_row_group(&columns, group)?;
+            progress()?;
+            super::columnar::validate_row_group_with(&columns, group, limits)?;
         }
         tables.insert(name, Arc::new(ColumnTable { columns, groups }));
     }
@@ -754,6 +851,7 @@ fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tab
 fn decode_vector_collections(
     cur: &mut Cur<'_>,
     check_graph: GraphCheck,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
 ) -> Result<Vectors, StoreError> {
     let collection_count = cur.u32()?;
     if collection_count == 0 {
@@ -764,6 +862,7 @@ fn decode_vector_collections(
     }
     let mut collections = BTreeMap::new();
     for _ in 0..collection_count {
+        progress()?;
         let name = cur.lp_str()?;
         let dim = cur.u32()?;
         let storage = storage_from_tag(cur.u8()?)?;
@@ -777,6 +876,7 @@ fn decode_vector_collections(
         }
         let mut vectors = BTreeMap::new();
         for _ in 0..vector_count {
+            progress()?;
             let id = cur.lp_str()?;
             let bytes = cur.lp()?.to_vec();
             let metadata = read_metadata(cur)?;
@@ -802,6 +902,7 @@ fn decode_vector_collections(
             _ => return Err(corrupt(format!("unknown vector entry flag {entry_flag}"))),
         };
         for record in vectors.values_mut() {
+            progress()?;
             let level = cur.u8()?;
             if usize::from(level) > cur.remaining() {
                 return Err(corrupt("snapshot vector level exceeds the blob"));
@@ -871,9 +972,22 @@ pub(super) fn decode_wal(buf: &[u8]) -> Result<WalFrames, StoreError> {
 /// Decoding from a frame boundary decodes the same frames as decoding the
 /// whole buffer, so a tail can be decoded on its own (spec §4.1).
 pub(super) fn decode_wal_prefix(buf: &[u8]) -> Result<(WalFrames, u64), StoreError> {
+    decode_wal_prefix_controlled(buf, &mut || Ok(()))
+}
+pub(super) fn decode_wal_for_recovery(
+    buf: &[u8],
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<(WalFrames, u64), StoreError> {
+    decode_wal_prefix_controlled(buf, progress)
+}
+fn decode_wal_prefix_controlled(
+    buf: &[u8],
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<(WalFrames, u64), StoreError> {
     let mut offset = 0usize;
     let mut frames = Vec::new();
     while offset < buf.len() {
+        progress()?;
         if buf.len() - offset < 8 {
             break;
         }
@@ -902,7 +1016,7 @@ pub(super) fn decode_wal_prefix(buf: &[u8]) -> Result<(WalFrames, u64), StoreErr
                 "wal frame crc does not match and another frame follows",
             ));
         }
-        frames.push(decode_payload(payload)?);
+        frames.push(decode_payload(payload, progress)?);
         offset = payload_end;
     }
     let consumed = u64::try_from(offset).map_err(|_| corrupt("wal length exceeds u64"))?;
@@ -925,7 +1039,10 @@ fn frame_fits(buf: &[u8], offset: usize) -> bool {
     }
 }
 
-fn decode_payload(buf: &[u8]) -> Result<(u64, Vec<Op>), StoreError> {
+fn decode_payload(
+    buf: &[u8],
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<(u64, Vec<Op>), StoreError> {
     let mut cur = Cur::new(buf);
     let seq = cur.u64()?;
     let count = cur.u32()?;
@@ -934,6 +1051,7 @@ fn decode_payload(buf: &[u8]) -> Result<(u64, Vec<Op>), StoreError> {
     }
     let mut ops = Vec::new();
     for _ in 0..count {
+        progress()?;
         let tag = cur.u8()?;
         let op = match tag {
             TAG_PUT => {

@@ -15,6 +15,7 @@ mod manifest_ops;
 mod migrate;
 mod mq_runtime;
 mod mq_tier;
+mod recovery;
 mod remote_txn;
 mod retry;
 mod server;
@@ -111,6 +112,9 @@ pub use mq_runtime::{
 pub use mq_tier::{
     MqDurability, MqResourceProbe, MqResourceSnapshot, MqSystemResourceProbe, MqTierDecision,
     MqTierObservation, MqTierPolicy,
+};
+pub use recovery::{
+    CaptureExclusion, CapturedStore, ExternalPublishStatus, ImageDescriptor, RecoveryImageWriter,
 };
 pub use server::FerroStoreServer;
 pub use state::MqRecord;

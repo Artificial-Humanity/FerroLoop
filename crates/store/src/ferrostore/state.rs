@@ -552,9 +552,36 @@ pub(super) fn apply_frames(
     snapshot_seq: u64,
     frames: &[(u64, Vec<Op>)],
 ) -> Result<(), StoreError> {
+    apply_frames_with_limits(
+        state,
+        snapshot_seq,
+        frames,
+        &super::columnar::Limits::DEFAULT,
+        &mut || Ok(()),
+    )
+}
+
+pub(super) fn apply_frames_for_recovery(
+    state: &mut DocState,
+    snapshot_seq: u64,
+    frames: &[(u64, Vec<Op>)],
+    limits: &super::columnar::Limits,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    apply_frames_with_limits(state, snapshot_seq, frames, limits, progress)
+}
+
+fn apply_frames_with_limits(
+    state: &mut DocState,
+    snapshot_seq: u64,
+    frames: &[(u64, Vec<Op>)],
+    limits: &super::columnar::Limits,
+    progress: &mut dyn FnMut() -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     let mut previous = None;
     let mut expect = snapshot_seq;
     for (seq, _) in frames {
+        progress()?;
         if *seq == 0 {
             return Err(corrupt("wal sequence is zero"));
         }
@@ -583,7 +610,8 @@ pub(super) fn apply_frames(
             continue;
         }
         for op in ops {
-            apply_op(state, op)?;
+            progress()?;
+            apply_op(state, op, limits)?;
         }
         state.last_seq = *seq;
     }
@@ -593,7 +621,11 @@ pub(super) fn apply_frames(
 /// Apply one replayed op in place. Replay owns the state it builds, so nothing
 /// is copied; an error fails the whole load. The checks are those of
 /// [`Overlay::stage`].
-fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
+fn apply_op(
+    state: &mut DocState,
+    op: &Op,
+    limits: &super::columnar::Limits,
+) -> Result<(), StoreError> {
     match op {
         Op::Put {
             collection,
@@ -621,7 +653,7 @@ fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
             let Some(table) = state.tables.get_mut(name) else {
                 return Err(corrupt(format!("append to missing column table `{name}`")));
             };
-            validate_row_group(&table.columns, bytes)?;
+            super::columnar::validate_row_group_with(&table.columns, bytes, limits)?;
             Arc::make_mut(table).groups.push(bytes.clone());
         }
         Op::CreateVectorCollection {
