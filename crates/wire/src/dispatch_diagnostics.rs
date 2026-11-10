@@ -148,6 +148,7 @@ pub enum RegistrationConflictReason {
     VendorMismatch,
     HostedIdentityMismatch,
     HydrationGenerationMismatch,
+    RegistrationContention,
     #[serde(other)]
     Unsupported,
 }

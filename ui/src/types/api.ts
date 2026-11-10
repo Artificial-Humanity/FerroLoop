@@ -1286,6 +1286,7 @@ export type WireRegistrationConflictReason =
   | "vendor_mismatch"
   | "hosted_identity_mismatch"
   | "hydration_generation_mismatch"
+  | "registration_contention"
   | "unsupported"
   | string;
 

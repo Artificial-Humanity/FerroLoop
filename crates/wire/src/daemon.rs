@@ -737,6 +737,8 @@ struct Subscriber {
 const MAX_SUBSCRIBER_BUFFER: usize = 256;
 const MAX_SYNC_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SYNC_BATCH_ITEMS: usize = 256;
+const MAX_REGISTER_ROUTE_ATTEMPTS: usize = 8;
+const REGISTER_ROUTE_DEADLINE: Duration = Duration::from_secs(2);
 
 fn build_sync_batches(
     registry_events: Vec<RegistryEvent>,
@@ -926,6 +928,9 @@ fn log_first_holds(rows: Vec<FenceDiagnostic>) {
     }
 }
 
+#[cfg(test)]
+type RegistrationProbeHook = Box<dyn FnMut(&mut RouteTable) + Send>;
+
 struct DaemonInner<S> {
     store: Arc<S>,
     config: DaemonConfig,
@@ -950,6 +955,8 @@ struct DaemonInner<S> {
     queue_limit_override: AtomicUsize,
     #[cfg(test)]
     registration_locked_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    registration_probe_hook: Mutex<Option<RegistrationProbeHook>>,
     peers: Mutex<BTreeMap<u64, (String, Sender<PeerFrame>)>>,
     peer_sync_cursors: Mutex<BTreeMap<String, (u64, u64, u64)>>,
     subscribers: Mutex<Vec<Subscriber>>,
@@ -1855,7 +1862,8 @@ where
                 let mut first_holds = Vec::new();
                 let allow_probes =
                     crate::identity::host_probes_allowed(self.config.home_override.as_deref());
-                loop {
+                let started_at = Instant::now();
+                for attempt in 0..MAX_REGISTER_ROUTE_ATTEMPTS {
                     let current_incumbent = lock(&self.routes).get(&norm).cloned();
                     let mut current_dead = None;
                     if explicit
@@ -1889,13 +1897,59 @@ where
                         current_dead.unwrap_or(false),
                     );
 
+                    #[cfg(test)]
+                    if let Some(ref mut hook) = *lock(&self.registration_probe_hook) {
+                        let mut routes = lock(&self.routes);
+                        hook(&mut routes);
+                    }
+
                     // Publish a route only while ordered with persistence and backlog enqueue.
                     // Otherwise a concurrent send could overtake older pending messages.
                     let _order = lock(&self.enqueue_gate);
                     {
                         let mut routes = lock(&self.routes);
-                        if explicit && routes.get(&norm) != current_incumbent.as_ref() {
-                            continue;
+                        if explicit
+                            && !crate::identity::same_opt_registration_identity(
+                                routes.get(&norm),
+                                current_incumbent.as_ref(),
+                            )
+                        {
+                            if attempt + 1 < MAX_REGISTER_ROUTE_ATTEMPTS
+                                && started_at.elapsed() < REGISTER_ROUTE_DEADLINE
+                            {
+                                continue;
+                            }
+                            let latest_inc = routes.get(&norm);
+                            let diag = RouteRegistrationDiagnostic {
+                                at: now.clone(),
+                                last_seen_at: None,
+                                count: 1,
+                                persona: norm,
+                                outcome: crate::dispatch_diagnostics::RegistrationDiagnosticOutcome::Refused,
+                                reason: crate::dispatch_diagnostics::RegistrationConflictReason::RegistrationContention,
+                                incumbent_adapter: latest_inc.map(|e| {
+                                    crate::dispatch_diagnostics::RouteAdapter::from_route(&e.route)
+                                }),
+                                challenger_adapter:
+                                    crate::dispatch_diagnostics::RouteAdapter::from_route(&route),
+                                incumbent_hosted_id: latest_inc.and_then(|e| e.hosted_id.clone()),
+                                challenger_hosted_id: hosted_id,
+                                incumbent_generation: latest_inc
+                                    .and_then(|e| e.hydration_generation.clone()),
+                                challenger_generation: hydration_generation,
+                                replace,
+                                unverified_process,
+                            }
+                            .sanitized();
+                            routes.push_registration_diagnostic(diag);
+                            let _ = routes.save(self.config.routes_path.as_deref());
+                            return (
+                                LocalResponse::Error {
+                                    message: "registration_contention: incumbent route changed concurrently; retry registration"
+                                        .into(),
+                                },
+                                None,
+                            );
                         }
                         if !explicit {
                             let conflicts_with_binding = routes.get(&norm).is_some_and(|entry| {
@@ -2533,6 +2587,8 @@ where
         queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
         #[cfg(test)]
         registration_locked_hook: Mutex::new(None),
+        #[cfg(test)]
+        registration_probe_hook: Mutex::new(None),
         peers: Mutex::new(BTreeMap::new()),
         peer_sync_cursors: Mutex::new(BTreeMap::new()),
         subscribers: Mutex::new(Vec::new()),
@@ -2749,6 +2805,7 @@ mod tests {
             fail_next_worker_spawn: AtomicBool::new(false),
             queue_limit_override: AtomicUsize::new(MAX_QUEUED_PER_RECIPIENT),
             registration_locked_hook: Mutex::new(None),
+            registration_probe_hook: Mutex::new(None),
             peers: Mutex::new(BTreeMap::new()),
             peer_sync_cursors: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
@@ -7113,6 +7170,142 @@ mod tests {
         assert!(
             matches!(resp2, LocalResponse::Error { .. }),
             "daemon must reject spoofed hosted_session_verified when PeerCred PID does not match live incumbent"
+        );
+    }
+
+    #[test]
+    fn register_route_ignores_updated_at_restamps_and_bounds_concurrent_incumbent_contention() {
+        use crate::dispatch_diagnostics::{
+            RegistrationConflictReason, RegistrationDiagnosticOutcome,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let rig = rig();
+
+        let (resp1, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "thread-inc-0".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("codex:feira".into()),
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: true,
+            unverified_process: true,
+        });
+        assert!(matches!(resp1, LocalResponse::RouteRegistered));
+
+        // 1. Restamping `updated_at` and `identity_at` between the unlocked probe and lock
+        // acquisition must NOT trigger a retry because route registration identity is unchanged.
+        let restamp_calls = Arc::new(AtomicUsize::new(0));
+        let restamp_calls_hook = Arc::clone(&restamp_calls);
+        *lock(&rig.inner.registration_probe_hook) = Some(Box::new(move |routes| {
+            restamp_calls_hook.fetch_add(1, Ordering::SeqCst);
+            if let Some(entry) = routes.entries.get_mut("feira") {
+                entry.updated_at = At::from_unix_millis(999_999);
+                entry.identity_at = Some(At::from_unix_millis(888_888));
+            }
+        }));
+
+        let (resp_restamp, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Codex {
+                thread_id: "thread-inc-restamp-ok".into(),
+                cwd: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("codex:feira".into()),
+            hydration_generation: Some("gen-1".into()),
+            hosted_session_verified: false,
+            unverified_process: false,
+        });
+        assert!(matches!(resp_restamp, LocalResponse::RouteRegistered));
+        assert_eq!(
+            restamp_calls.load(Ordering::SeqCst),
+            1,
+            "updated_at restamp must not trigger retry passes"
+        );
+
+        // 2. When the incumbent's route identity changes on every attempt between the unlocked
+        // probe and lock acquisition, `RegisterRoute` must return within the deadline with
+        // `RegistrationContention`, apply nothing, and record a `RegistrationContention` diagnostic.
+        let contention_calls = Arc::new(AtomicUsize::new(0));
+        let contention_calls_hook = Arc::clone(&contention_calls);
+        *lock(&rig.inner.registration_probe_hook) = Some(Box::new(move |routes| {
+            let n = contention_calls_hook.fetch_add(1, Ordering::SeqCst) + 1;
+            routes.upsert_explicit_with_meta(
+                "feira",
+                VendorRoute::Agy {
+                    conversation_id: format!("conv-concurrent-{n}"),
+                    ls_pid: Some(std::process::id()),
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                },
+                At::from_unix_millis(1000 + n as u64),
+                Some("antigravity:feira".into()),
+                Some(format!("gen-concurrent-{n}")),
+                false,
+            );
+        }));
+
+        let started = Instant::now();
+        let (resp_contention, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "feira".into(),
+            route: VendorRoute::Claude {
+                pid: std::process::id(),
+                session_id: "claude-challenger".into(),
+                socket_path: PathBuf::from("/tmp/claude-challenger.sock"),
+                key_path: None,
+            },
+            explicit: true,
+            replace: false,
+            hosted_id: Some("claude:feira".into()),
+            hydration_generation: Some("gen-challenger".into()),
+            hosted_session_verified: true,
+            unverified_process: false,
+        });
+        let elapsed = started.elapsed();
+        *lock(&rig.inner.registration_probe_hook) = None;
+
+        assert!(
+            elapsed < REGISTER_ROUTE_DEADLINE,
+            "contention bound must finish within deadline ({elapsed:?})"
+        );
+        assert_eq!(
+            contention_calls.load(Ordering::SeqCst),
+            MAX_REGISTER_ROUTE_ATTEMPTS
+        );
+        let LocalResponse::Error { message } = resp_contention else {
+            panic!("expected contention error, got {resp_contention:?}");
+        };
+        assert!(
+            message.contains("registration_contention"),
+            "unexpected error message: {message}"
+        );
+
+        let routes = lock(&rig.inner.routes);
+        let entry = routes.get("feira").expect("incumbent route preserved");
+        assert!(
+            matches!(
+                &entry.route,
+                VendorRoute::Agy { conversation_id, .. }
+                    if conversation_id == &format!("conv-concurrent-{MAX_REGISTER_ROUTE_ATTEMPTS}")
+            ),
+            "challenger must not overwrite concurrently modified incumbent: {:?}",
+            entry.route
+        );
+        let latest_diag = routes
+            .registration_diagnostics
+            .last()
+            .expect("contention diagnostic recorded");
+        assert_eq!(latest_diag.outcome, RegistrationDiagnosticOutcome::Refused);
+        assert_eq!(
+            latest_diag.reason,
+            RegistrationConflictReason::RegistrationContention
         );
     }
 }

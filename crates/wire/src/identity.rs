@@ -215,6 +215,25 @@ impl RouteEntry {
     pub fn identity_evidence_at(&self) -> Option<&At> {
         self.identity_at.as_ref().filter(|at| at.unix_millis() > 0)
     }
+
+    /// True when two route entries represent the same registration identity
+    /// (`route`, `explicit`, `hosted_id`, `hydration_generation`, `pid_start_time`),
+    /// ignoring timestamp restamps (`updated_at`, `identity_at`).
+    pub fn same_registration_identity(&self, other: &Self) -> bool {
+        self.route == other.route
+            && self.explicit == other.explicit
+            && self.hosted_id == other.hosted_id
+            && self.hydration_generation == other.hydration_generation
+            && self.pid_start_time == other.pid_start_time
+    }
+}
+
+pub fn same_opt_registration_identity(a: Option<&RouteEntry>, b: Option<&RouteEntry>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.same_registration_identity(right),
+        _ => false,
+    }
 }
 
 fn passive_identity_beats(challenger: &RouteEntry, incumbent: &RouteEntry) -> bool {
