@@ -63,7 +63,7 @@ use fl_wire::dispatcher::{
     CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
     PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
     dispatch_operator_prompt_to_route, push_operator_prompt_to_route,
-    push_operator_prompt_with_intent, push_to_route,
+    push_operator_prompt_with_intent, push_to_route_for_recipient,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -2028,6 +2028,10 @@ pub struct HubRouteDispatchObservation {
     pub outcome: fl_wire::dispatch_diagnostics::DispatchCallOutcome,
 }
 
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
 /// Allowlist projection of [`fl_wire::daemon::RecipientPendingSummary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubRecipientPendingSummary {
@@ -2039,6 +2043,12 @@ pub struct HubRecipientPendingSummary {
     pub oldest_pending_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<fl_wire::daemon::PendingHoldReason>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub awaiting_daemon_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_at: Option<fl_core::at::At>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_awaiting_daemon_age_ms: Option<u64>,
 }
 
 impl HubRecipientPendingSummary {
@@ -2049,6 +2059,9 @@ impl HubRecipientPendingSummary {
             oldest_pending_at,
             oldest_pending_age_ms,
             hold_reason,
+            awaiting_daemon_count,
+            oldest_awaiting_daemon_at,
+            oldest_awaiting_daemon_age_ms,
         } = summary;
         Self {
             recipient,
@@ -2056,6 +2069,9 @@ impl HubRecipientPendingSummary {
             oldest_pending_at,
             oldest_pending_age_ms,
             hold_reason,
+            awaiting_daemon_count,
+            oldest_awaiting_daemon_at,
+            oldest_awaiting_daemon_age_ms,
         }
     }
 }
@@ -2453,7 +2469,8 @@ fn handle_post_wire_send(
                 entry = fresh;
             }
         }
-        let mut pushed = push_to_route(&entry.route, &msg);
+        let mut pushed =
+            push_to_route_for_recipient(&entry.route, Some(rcpt.recipient_name.as_str()), &msg);
         if scan_started.is_none() && matches!(pushed, Err(PushError::NotConnected(_))) {
             // The saved route's receiver was never reached, so nothing was delivered: scan once
             // and push on the route the scan found, when it is a different one.
@@ -2462,7 +2479,11 @@ fn handle_post_wire_send(
                 .get(&rcpt.recipient_name)
                 .filter(|fresh| fresh.route != entry.route)
             {
-                pushed = push_to_route(&fresh.route, &msg);
+                pushed = push_to_route_for_recipient(
+                    &fresh.route,
+                    Some(rcpt.recipient_name.as_str()),
+                    &msg,
+                );
             }
         }
         let target_status = match pushed {
@@ -11478,6 +11499,9 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(started_at),
                     oldest_pending_age_ms: Some(1500),
                     hold_reason: None,
+                    awaiting_daemon_count: 0,
+                    oldest_awaiting_daemon_at: None,
+                    oldest_awaiting_daemon_age_ms: None,
                 }],
                 codex_queues: vec![],
             });
@@ -11639,6 +11663,9 @@ mod council_guidance_tests {
                     oldest_pending_at: Some(ts_for_status),
                     oldest_pending_age_ms: Some(250),
                     hold_reason: Some(fl_wire::daemon::PendingHoldReason::DeadExplicitRoute),
+                    awaiting_daemon_count: 0,
+                    oldest_awaiting_daemon_at: None,
+                    oldest_awaiting_daemon_age_ms: None,
                 }],
                 codex_queues: vec![
                     fl_wire::daemon::CodexRouteQueueStatus {

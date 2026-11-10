@@ -910,6 +910,21 @@ pub trait MessageStore {
     /// messages whose age at `before` is at least [`crate::ferrowire::DURABLE_WIRE_RETENTION_MS`].
     /// Returns the count of pruned messages.
     fn prune_wire(&self, before: At) -> Result<usize, StoreError>;
+
+    /// Record a new message, create initial `Pending` receipts for all resolved recipients,
+    /// and record an awaiting-daemon marker in the same store write so the daemon picks up
+    /// the message via an indexed marker read.
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError>;
+
+    /// Return `(message_id, queued_at)` markers for messages queued by a client while the
+    /// daemon socket was unreachable, ordered by `MessageId`.
+    fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError>;
+
+    /// Clear the awaiting-daemon marker for `message_id` after the daemon has scheduled it.
+    fn clear_wire_awaiting_daemon(&self, message_id: &MessageId) -> Result<(), StoreError>;
 }
 
 /// Directed workflow definitions and stateful workflow runs (workflow spec §2.1).

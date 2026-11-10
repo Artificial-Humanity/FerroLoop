@@ -77,6 +77,47 @@ impl HostEndpoint {
         })
     }
 
+    #[cfg(unix)]
+    pub fn discover_unix_path_with(
+        host_sock: Option<&std::ffi::OsStr>,
+        xdg_runtime_dir: Option<&std::ffi::OsStr>,
+        run_user_dir: Option<&Path>,
+        home: Option<&std::ffi::OsStr>,
+        euid: u32,
+    ) -> PathBuf {
+        if let Some(configured) = host_sock.filter(|s| !s.is_empty()) {
+            return PathBuf::from(configured);
+        }
+        if let Some(runtime) = xdg_runtime_dir.filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(runtime);
+            if p.is_absolute() {
+                return p.join("ferroloop/fl-host.sock");
+            }
+        }
+        if let Some(dir) = run_user_dir.and_then(|d| probe_explicit_run_user_dir(d, euid)) {
+            return dir.join("ferroloop/fl-host.sock");
+        }
+        if let Some(home) = home.filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(home);
+            if p.is_absolute() {
+                return p.join(".cache/fl/host.sock");
+            }
+        }
+        PathBuf::from(format!("/tmp/ferroloop-{euid}/fl-host.sock"))
+    }
+
+    #[cfg(unix)]
+    pub fn discover_unix_path_for_root(
+        host_sock: Option<&std::ffi::OsStr>,
+        xdg_runtime_dir: Option<&std::ffi::OsStr>,
+        run_user_root: &Path,
+        home: Option<&std::ffi::OsStr>,
+        euid: u32,
+    ) -> PathBuf {
+        let probed = probe_run_user_dir(run_user_root, euid);
+        Self::discover_unix_path_with(host_sock, xdg_runtime_dir, probed.as_deref(), home, euid)
+    }
+
     pub fn discover() -> Result<Self, HostError> {
         if let Ok(configured) = std::env::var("FL_HOST_SOCK")
             && !configured.is_empty()
@@ -95,15 +136,34 @@ impl HostEndpoint {
         }
         #[cfg(target_os = "linux")]
         {
-            if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
-                && !runtime.is_empty()
-            {
-                return Self::unix(PathBuf::from(runtime).join("ferroloop/fl-host.sock"));
-            }
             let uid = unix_euid();
-            Self::unix(PathBuf::from(format!(
-                "/run/user/{uid}/ferroloop/fl-host.sock"
-            )))
+            let path = if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1") {
+                Self::discover_unix_path_with(
+                    std::env::var_os("FL_HOST_SOCK").as_deref(),
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    None,
+                    std::env::var_os("HOME").as_deref(),
+                    uid,
+                )
+            } else if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
+                let candidate = PathBuf::from(raw);
+                Self::discover_unix_path_with(
+                    std::env::var_os("FL_HOST_SOCK").as_deref(),
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    Some(candidate.as_path()),
+                    std::env::var_os("HOME").as_deref(),
+                    uid,
+                )
+            } else {
+                Self::discover_unix_path_for_root(
+                    std::env::var_os("FL_HOST_SOCK").as_deref(),
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    Path::new("/run/user"),
+                    std::env::var_os("HOME").as_deref(),
+                    uid,
+                )
+            };
+            Self::unix(path)
         }
         #[cfg(target_os = "macos")]
         {
@@ -240,7 +300,180 @@ fn socket_path_fits(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
+pub fn probe_explicit_run_user_dir(candidate: &Path, expected_uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(candidate).ok()?;
+    if !meta.file_type().is_dir() || meta.uid() != expected_uid {
+        return None;
+    }
+    Some(candidate.to_path_buf())
+}
+
+#[cfg(unix)]
+pub fn probe_run_user_dir(run_user_root: &Path, expected_uid: u32) -> Option<PathBuf> {
+    if !run_user_root.is_absolute() {
+        return None;
+    }
+    let candidate = run_user_root.join(expected_uid.to_string());
+    probe_explicit_run_user_dir(&candidate, expected_uid)
+}
+
+#[cfg(unix)]
 pub(crate) fn unix_euid() -> u32 {
     // SAFETY: geteuid has no arguments and cannot fail.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn discover_unix_path_with_falls_back_through_xdg_run_user_home_and_tmp() {
+        let uid = unix_euid();
+        let tmp = tempfile::tempdir().unwrap();
+        let run_user = tmp.path().join("run-user");
+        std::fs::create_dir_all(&run_user).unwrap();
+        let home = tmp.path().join("home");
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                Some(OsStr::new("/custom/host.sock")),
+                Some(OsStr::new("/xdg/runtime")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+                uid,
+            ),
+            PathBuf::from("/custom/host.sock")
+        );
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                Some(OsStr::new("/xdg/runtime")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+                uid,
+            ),
+            PathBuf::from("/xdg/runtime/ferroloop/fl-host.sock")
+        );
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                None,
+                Some(&run_user),
+                Some(home.as_os_str()),
+                uid,
+            ),
+            run_user.join("ferroloop/fl-host.sock")
+        );
+
+        let missing_run_user = tmp.path().join("missing-run-user");
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                None,
+                Some(&missing_run_user),
+                Some(home.as_os_str()),
+                uid,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(None, None, None, None, uid),
+            PathBuf::from(format!("/tmp/ferroloop-{uid}/fl-host.sock"))
+        );
+    }
+
+    #[test]
+    fn discover_unix_path_for_root_checks_ownership_symlink_and_missing_dir() {
+        let uid = unix_euid();
+        let other_uid = uid.wrapping_add(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let run_root = tmp.path().join("run/user");
+        let home = tmp.path().join("home");
+
+        // 1. Missing `/run/user/<uid>` directory -> falls back to HOME/.cache
+        std::fs::create_dir_all(&run_root).unwrap();
+        assert_eq!(
+            HostEndpoint::discover_unix_path_for_root(
+                None,
+                None,
+                &run_root,
+                Some(home.as_os_str()),
+                uid,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+
+        // 2. Real `<root>/<uid>` directory owned by `uid` -> succeeds
+        let my_run_dir = run_root.join(uid.to_string());
+        std::fs::create_dir_all(&my_run_dir).unwrap();
+        assert_eq!(
+            HostEndpoint::discover_unix_path_for_root(
+                None,
+                None,
+                &run_root,
+                Some(home.as_os_str()),
+                uid,
+            ),
+            my_run_dir.join("ferroloop/fl-host.sock")
+        );
+
+        // 3. Wrong owner (`<root>/<other_uid>` owned by `uid` != `other_uid`) -> rejected
+        let wrong_owner_dir = run_root.join(other_uid.to_string());
+        std::fs::create_dir_all(&wrong_owner_dir).unwrap();
+        assert_eq!(
+            HostEndpoint::discover_unix_path_for_root(
+                None,
+                None,
+                &run_root,
+                Some(home.as_os_str()),
+                other_uid,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                None,
+                Some(&wrong_owner_dir),
+                Some(home.as_os_str()),
+                other_uid,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+
+        // 4. Symlinked `<root>/<uid>` directory -> rejected by `symlink_metadata().file_type().is_dir()`
+        std::fs::remove_dir(&my_run_dir).unwrap();
+        let real_target = tmp.path().join("real-target");
+        std::fs::create_dir_all(&real_target).unwrap();
+        std::os::unix::fs::symlink(&real_target, &my_run_dir).unwrap();
+        assert_eq!(
+            HostEndpoint::discover_unix_path_for_root(
+                None,
+                None,
+                &run_root,
+                Some(home.as_os_str()),
+                uid,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+        assert_eq!(
+            HostEndpoint::discover_unix_path_with(
+                None,
+                None,
+                Some(&my_run_dir),
+                Some(home.as_os_str()),
+                uid,
+            ),
+            home.join(".cache/fl/host.sock")
+        );
+    }
 }

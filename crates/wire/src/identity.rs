@@ -559,20 +559,136 @@ pub fn is_native_session_id(id: &str) -> bool {
     !id.is_empty() && !is_persona_derived_id(id)
 }
 
-pub fn default_routes_path() -> PathBuf {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+#[cfg(unix)]
+pub use fl_host_proto::{probe_explicit_run_user_dir, probe_run_user_dir};
+
+#[cfg(unix)]
+pub fn runtime_dir_path_with_uid(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_dir: Option<&Path>,
+    expected_uid: u32,
+) -> Option<PathBuf> {
+    if let Some(rt) = xdg_runtime_dir.filter(|s| !s.is_empty()) {
         let p = PathBuf::from(rt);
         if p.is_absolute() {
-            return p.join("fl-wire-routes.json");
+            return Some(p);
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    run_user_dir.and_then(|dir| probe_explicit_run_user_dir(dir, expected_uid))
+}
+
+#[cfg(unix)]
+pub fn runtime_dir_path_for_root(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_root: &Path,
+    expected_uid: u32,
+) -> Option<PathBuf> {
+    let probed = probe_run_user_dir(run_user_root, expected_uid);
+    runtime_dir_path_with_uid(xdg_runtime_dir, probed.as_deref(), expected_uid)
+}
+
+pub fn runtime_dir_path_with(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        runtime_dir_path_with_uid(xdg_runtime_dir, run_user_dir, uid)
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(rt) = xdg_runtime_dir.filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(rt);
+            if p.is_absolute() {
+                return Some(p);
+            }
+        }
+        if let Some(dir) = run_user_dir
+            && dir.is_absolute()
+            && dir.is_dir()
+        {
+            return Some(dir.to_path_buf());
+        }
+        None
+    }
+}
+
+pub fn runtime_dir_path() -> Option<PathBuf> {
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR")
+        && let Some(p) = runtime_dir_path_with(Some(&rt), None)
+    {
+        return Some(p);
+    }
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        if let Some(raw) = std::env::var_os("FL_TEST_RUN_USER_DIR") {
+            let p = PathBuf::from(raw);
+            return probe_explicit_run_user_dir(&p, uid);
+        } else if !cfg!(test) {
+            return probe_run_user_dir(Path::new("/run/user"), uid);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+pub fn default_routes_path_for_root(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_root: &Path,
+    home: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
+) -> PathBuf {
+    let probed = probe_run_user_dir(run_user_root, expected_uid);
+    default_routes_path_with(xdg_runtime_dir, probed.as_deref(), home)
+}
+
+pub fn default_routes_path_with(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    run_user_dir: Option<&Path>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(rt) = runtime_dir_path_with(xdg_runtime_dir, run_user_dir) {
+        return rt.join("fl-wire-routes.json");
+    }
+    if let Some(home) = home.filter(|s| !s.is_empty()) {
         let p = PathBuf::from(home);
         if p.is_absolute() {
             return p.join(".cache").join("fl").join("wire-routes.json");
         }
     }
     PathBuf::from("/tmp/fl-wire-routes.json")
+}
+
+pub fn default_routes_path() -> PathBuf {
+    if let Some(rt) = runtime_dir_path() {
+        return rt.join("fl-wire-routes.json");
+    }
+    default_routes_path_with(None, None, std::env::var_os("HOME").as_deref())
+}
+
+pub fn resolve_routes_path(
+    explicit_routes: Option<&Path>,
+    env_routes: Option<&std::ffi::OsStr>,
+    explicit_db: Option<&Path>,
+) -> PathBuf {
+    if let Some(p) = explicit_routes.filter(|p| !p.as_os_str().is_empty()) {
+        return p.to_path_buf();
+    }
+    if let Some(raw) = env_routes.filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    if let Some(dir) = explicit_db
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty())
+    {
+        return dir.join("fl-wire-routes.json");
+    }
+    default_routes_path()
 }
 
 pub fn legacy_routes_path() -> Option<PathBuf> {
@@ -1309,10 +1425,13 @@ impl RouteTable {
     pub fn load(custom_path: Option<&Path>) -> Self {
         #[cfg(test)]
         refuse_default_route_path(custom_path, "load");
-        let primary = custom_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(default_routes_path);
-        let legacy = if custom_path.is_none()
+        let primary = resolve_routes_path(
+            custom_path,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        );
+        let legacy = if !cfg!(test)
+            && (custom_path.is_none() || custom_path == Some(default_routes_path().as_path()))
             && !primary.exists()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
         {
@@ -1815,9 +1934,11 @@ impl RouteTable {
     pub fn save(&self, custom_path: Option<&Path>) -> std::io::Result<()> {
         #[cfg(test)]
         refuse_default_route_path(custom_path, "save");
-        let target = custom_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(default_routes_path);
+        let target = resolve_routes_path(
+            custom_path,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        );
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -12497,6 +12618,104 @@ mod tests {
             assert!(!unix_kill0_proc_alive(u32::MAX));
             assert!(unix_kill0_proc_alive(std::process::id()));
             assert!(!unix_kill0_proc_alive(dead_pid));
+        }
+    }
+
+    #[test]
+    fn default_routes_path_with_and_resolve_routes_path_precedence() {
+        use std::ffi::OsStr;
+        let tmp = tempfile::tempdir().unwrap();
+        let run_user = tmp.path().join("run-user-1000");
+        fs::create_dir_all(&run_user).unwrap();
+        let home = tmp.path().join("home");
+
+        assert_eq!(
+            default_routes_path_with(
+                Some(OsStr::new("/xdg/rt")),
+                Some(&run_user),
+                Some(home.as_os_str()),
+            ),
+            PathBuf::from("/xdg/rt/fl-wire-routes.json")
+        );
+        assert_eq!(
+            default_routes_path_with(None, Some(&run_user), Some(home.as_os_str())),
+            run_user.join("fl-wire-routes.json")
+        );
+        assert_eq!(
+            default_routes_path_with(
+                None,
+                Some(&tmp.path().join("nonexistent")),
+                Some(home.as_os_str()),
+            ),
+            home.join(".cache/fl/wire-routes.json")
+        );
+        assert_eq!(
+            default_routes_path_with(None, None, None),
+            PathBuf::from("/tmp/fl-wire-routes.json")
+        );
+
+        let explicit = tmp.path().join("explicit-routes.json");
+        let env_routes = tmp.path().join("env-routes.json");
+        let db_path = tmp.path().join("dbdir").join("store.fls");
+        assert_eq!(
+            resolve_routes_path(
+                Some(&explicit),
+                Some(env_routes.as_os_str()),
+                Some(&db_path),
+            ),
+            explicit
+        );
+        assert_eq!(
+            resolve_routes_path(None, Some(env_routes.as_os_str()), Some(&db_path)),
+            env_routes
+        );
+        assert_eq!(
+            resolve_routes_path(
+                None,
+                Some(OsStr::new("relative/routes.json")),
+                Some(&db_path)
+            ),
+            tmp.path().join("dbdir").join("fl-wire-routes.json")
+        );
+
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::geteuid() };
+            let other_uid = uid.wrapping_add(1);
+            let run_root = tmp.path().join("run/user");
+            fs::create_dir_all(&run_root).unwrap();
+
+            // Missing `<root>/<uid>` falls back to HOME/.cache
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire-routes.json")
+            );
+
+            // Real `<root>/<uid>` owned by `uid` succeeds
+            let my_dir = run_root.join(uid.to_string());
+            fs::create_dir_all(&my_dir).unwrap();
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                my_dir.join("fl-wire-routes.json")
+            );
+
+            // Wrong owner (`<root>/<other_uid>` owned by `uid` != `other_uid`) is rejected
+            let other_dir = run_root.join(other_uid.to_string());
+            fs::create_dir_all(&other_dir).unwrap();
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), other_uid),
+                home.join(".cache/fl/wire-routes.json")
+            );
+
+            // Symlinked `<root>/<uid>` is rejected
+            fs::remove_dir(&my_dir).unwrap();
+            let real_target = tmp.path().join("real-target");
+            fs::create_dir_all(&real_target).unwrap();
+            std::os::unix::fs::symlink(&real_target, &my_dir).unwrap();
+            assert_eq!(
+                default_routes_path_for_root(None, &run_root, Some(home.as_os_str()), uid),
+                home.join(".cache/fl/wire-routes.json")
+            );
         }
     }
 }
