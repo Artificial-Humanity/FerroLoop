@@ -1,10 +1,14 @@
 //! Recovery inventory and explicitly bounded physical capture primitives.
+pub mod admission;
 pub mod backup;
 pub mod catalog;
 pub mod fs;
 pub mod inventory;
 mod inventory_metadata;
 mod inventory_types;
+pub mod purge;
+pub mod readiness;
+pub mod restore;
 pub use inventory::{
     BindingEdge, BindingInput, ConsumerEdge, InventoryInputs, StoreIdentity, StoreMap,
     collect_inventory,
@@ -12,6 +16,21 @@ pub use inventory::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
+    #[error(
+        "restore admission fenced (operation {operation_id:?}); administrative exclusion and reconciliation required"
+    )]
+    RestoreFenced { operation_id: Option<uuid::Uuid> },
+    #[error(
+        "recovery {operation_id}: admission failed; retained metadata requires operator review"
+    )]
+    RestoreAdmissionArtifactsRetained {
+        operation_id: uuid::Uuid,
+        staging: std::path::PathBuf,
+        staging_identity: Option<(u64, u64)>,
+        operation_lock_identity: Option<(u64, u64)>,
+        #[source]
+        source: Box<RecoveryError>,
+    },
     #[error("recovery {operation_id}: image exceeds admitted ceiling")]
     ImageExceedsCeiling { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: another backup holds the physical store lock")]
@@ -129,6 +148,7 @@ pub struct OperationLimits {
     query_work_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(crate) publication_io: Option<std::sync::Arc<fs::PublicationIo>>,
     memory_admission: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    retained_memory_bytes: u64,
 }
 impl OperationLimits {
     pub fn new(
@@ -147,6 +167,7 @@ impl OperationLimits {
             query_work_used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             publication_io: None,
             memory_admission: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            retained_memory_bytes: 0,
         }
     }
 }
@@ -171,7 +192,21 @@ impl OperationLimits {
         self.memory_admission
             .load(std::sync::atomic::Ordering::Acquire)
     }
+    /// A scoped clone charges nested scratch alongside already retained values.
+    /// The caller admits this reservation before allocating those values.
+    pub(crate) fn with_retained_memory(&self, bytes: u64) -> Result<Self, RecoveryError> {
+        let mut scoped = self.clone();
+        scoped.retained_memory_bytes = self
+            .retained_memory_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| self.verification())?;
+        scoped.admit_memory(0)?;
+        Ok(scoped)
+    }
     pub(crate) fn admit_memory(&self, bytes: u64) -> Result<(), RecoveryError> {
+        let bytes = bytes
+            .checked_add(self.retained_memory_bytes)
+            .ok_or_else(|| self.verification())?;
         self.quota(bytes, self.memory_byte_limit, "working memory")?;
         self.memory_admission
             .fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
@@ -235,3 +270,6 @@ impl OperationLimits {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

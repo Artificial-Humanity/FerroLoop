@@ -1873,6 +1873,13 @@ impl FerroStore {
     /// [`StoreError::ContainerFormat`]; a schema version off the ladder is
     /// [`StoreError::FormatVersion`]. A file from before schema versioning
     /// (no version document) opens, and [`Self::format_version`] reads `None`.
+    pub(crate) fn open_existing_for_backup(
+        path: &Path,
+        limits: &crate::recovery::OperationLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_mode(&RealFs, path, false, Some(limits))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with(&RealFs, path.as_ref())
     }
@@ -1887,17 +1894,46 @@ impl FerroStore {
     /// through a symlink compacts in place and the link goes on naming it.
     /// The handle's label stays `path` as given.
     fn open_with(fs: &dyn ContainerFs, given: &Path) -> Result<Self, StoreError> {
-        let created = fs.create_store_file(given)?;
+        Self::open_with_mode(fs, given, true, None)
+    }
+    fn open_with_mode(
+        fs: &dyn ContainerFs,
+        given: &Path,
+        create: bool,
+        limits: Option<&crate::recovery::OperationLimits>,
+    ) -> Result<Self, StoreError> {
+        fs.check_restore_admission(given)?;
+        let created = if create {
+            fs.create_store_file(given)?
+        } else {
+            false
+        };
         let resolved = fs.resolve(given)?;
         let path = resolved.as_path();
+        fs.check_restore_admission(path)?;
         let write = fs
             .open_rw(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, given))?;
+        let initialized = if create {
+            ensure_superblock(&*write).map_err(|err| name_store(err, given))?
+        } else {
+            false
+        };
         let (_, sb) = latest_superblock(&*write).map_err(|err| name_store(err, given))?;
         let mut write = Descriptor::new(write, path)?;
-        let seed = load_full(&*write.file, write.id, sb).map_err(|err| name_store(err, given))?;
-        let state = &seed.state;
+        let seed = match limits {
+            Some(limits) => {
+                let prepared = recovery::bounded_existing_cache(&*write.file, write.id, limits)
+                    .map_err(|e| backend(e.to_string()))?;
+                // The bounded decoder already checked schema. Drop all prepared
+                // state before capture, which owns a separate bounded pin.
+                drop(prepared);
+                None
+            }
+            None => {
+                Some(load_full(&*write.file, write.id, sb).map_err(|err| name_store(err, given))?)
+            }
+        };
         // Also when an earlier open created the file and stopped before its
         // first superblock: the entry is only durable once the directory is.
         // Any other open did not make the name, so its first write syncs the
@@ -1906,8 +1942,10 @@ impl FerroStore {
             fs.sync_dir(&parent_dir(path))?;
             write.name_durable = true;
         }
-        if let Some(found) =
-            doc::schema_version_in(|collection, id| state.docs.get(collection, id).cloned())?
+        if let Some(seed) = &seed
+            && let Some(found) = doc::schema_version_in(|collection, id| {
+                seed.state.docs.get(collection, id).cloned()
+            })?
         {
             crate::check_format(Some(found))?;
         }
@@ -1922,7 +1960,7 @@ impl FerroStore {
                 path: resolved.clone(),
                 write: Mutex::new(write),
                 read: Mutex::new(read),
-                cache: Mutex::new(Some(Arc::new(seed))),
+                cache: Mutex::new(seed.map(Arc::new)),
                 group: group::Group::default(),
                 poison: Poison::new(given),
                 checkpoint_failed_at: AtomicU64::new(0),
@@ -1945,6 +1983,8 @@ impl FerroStore {
     /// A failed handshake is an error that names the socket. `open` errors are still returned.
     pub fn auto(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        crate::recovery::admission::check_restore_admission(path)
+            .map_err(|e| backend(e.to_string()))?;
         let sock = default_socket_path_for_store(path);
         if !socket_path_fits(&sock) {
             return Self::open(path);
@@ -5252,4 +5292,90 @@ fn wait_mutex<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<
 
 fn io_err(err: io::Error) -> StoreError {
     backend(err)
+}
+
+#[cfg(test)]
+mod offline_existing_tests {
+    use super::*;
+    #[test]
+    fn offline_existing_source_bounds_decode_before_allocation() {
+        let root = crate::recovery::test_support::fixture_root();
+        let source = root.path().join("source.fls");
+        let owner = FerroStore::open(&source).unwrap();
+        owner
+            .put_doc(
+                "fixture",
+                "one",
+                &serde_json::json!({"body":"x".repeat(1<<20)}),
+            )
+            .unwrap();
+        drop(owner);
+        let before = std::fs::read(&source).unwrap();
+        let limits = crate::recovery::OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            64 << 20,
+            65536,
+            crate::recovery::CancelToken::new(),
+        );
+        assert!(
+            FerroStore::open_existing_for_backup(&source, &limits).is_err(),
+            "private source decoder ignored preallocation memory admission"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert!(limits.admitted_memory_bytes() <= limits.memory_byte_limit);
+    }
+    #[test]
+    fn offline_existing_source_never_creates_initializes_or_contacts_socket() {
+        let root = crate::recovery::test_support::fixture_root();
+        let source = root.path().join("source.fls");
+        assert!(
+            FerroStore::open_existing_for_backup(
+                &source,
+                &crate::recovery::OperationLimits::new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    64 << 20,
+                    256 << 20,
+                    crate::recovery::CancelToken::new()
+                )
+            )
+            .is_err()
+        );
+        assert!(!source.exists());
+        std::fs::write(&source, []).unwrap();
+        assert!(
+            FerroStore::open_existing_for_backup(
+                &source,
+                &crate::recovery::OperationLimits::new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    64 << 20,
+                    256 << 20,
+                    crate::recovery::CancelToken::new()
+                )
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::metadata(&source).unwrap().len(), 0);
+        std::fs::remove_file(&source).unwrap();
+        drop(FerroStore::open(&source).unwrap());
+        let before = std::fs::read(&source).unwrap();
+        let owner = FerroStore::open_existing_for_backup(
+            &source,
+            &crate::recovery::OperationLimits::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                64 << 20,
+                256 << 20,
+                crate::recovery::CancelToken::new(),
+            ),
+        )
+        .unwrap();
+        let Inner::Disk(disk) = &owner.inner else {
+            panic!("not physical")
+        };
+        assert!(
+            disk.cache.lock().unwrap().is_none(),
+            "offline opener retained an uncharged warm source cache across capture"
+        );
+        drop(owner);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+    }
 }

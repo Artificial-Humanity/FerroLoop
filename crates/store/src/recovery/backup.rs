@@ -310,6 +310,8 @@ pub fn backup_with_shared_config(
     let locks = root.child(".locks", false, &l)?;
     let _lock = StoreLock::acquire(&locks, physical, &l)?;
     let _operation_lock = StoreLock::operation(&locks, request.operation_id, &l)?;
+    let catalog_access =
+        fs::CatalogLock::acquire(&root, fs::CatalogLockMode::Shared, true, io.clone(), &l)?;
     let staging = root.child(".staging", false, &l)?;
     let catalog = root.child(".catalog", false, &l)?;
     let quarantine = root.child(".quarantine", false, &l)?;
@@ -465,7 +467,7 @@ pub fn backup_with_shared_config(
         renamed = true;
         root.sync(&*io, Directory::PublicationParent, &l)?;
         staging.sync(&*io, Directory::StagingParent, &l)?;
-        super::catalog::record(&root, &catalog, checked, &control, &l)
+        super::catalog::record(&root, &catalog, checked, &control, &l, &catalog_access)
     })();
     match result {
         Ok(bundle) => Ok(PublicationOutcome::Durable(bundle)),
@@ -505,6 +507,26 @@ pub fn reconcile_publication(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_verified_handle_does_not_make_unpublished_directory_completed() {
+        let root = crate::recovery::test_support::fixture_root();
+        let operation = uuid::Uuid::now_v7();
+        let path = root.path().join(operation.to_string());
+        std::fs::create_dir(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let limits = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            64 << 20,
+            CancelToken::new(),
+        );
+        let false_handle = VerifiedBundle { path: path.clone() };
+        assert!(crate::recovery::catalog::retention_manifest(&false_handle, &limits).is_err());
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     // Omitting the second full image or metadata from pre-capture admission
     // admits each of these impossible operations.
@@ -658,6 +680,13 @@ pub fn publish_batch_configs(
     control.charge(fs::overhead_bytes(unit, &l)?, true, &l)?;
     let locks = root.child(".locks", false, &l)?;
     let _lock = StoreLock::operation(&locks, batch, &l)?;
+    let _catalog_access = fs::CatalogLock::acquire(
+        &root,
+        fs::CatalogLockMode::Shared,
+        true,
+        control.io.clone(),
+        &l,
+    )?;
     let parent = root.child(".batch-config", false, &l)?;
     let name = batch.to_string();
     let stage_name = format!("{batch}.staging");
@@ -713,4 +742,49 @@ pub fn publish_batch_configs(
         batch_id: batch,
         descriptor_sha256: digest,
     })
+}
+
+/// Explicit administrative offline action. Daemon availability never selects it.
+pub fn backup_offline(
+    request: &BackupRequest,
+    lease: &super::admission::OfflineLease,
+    filesystem: &dyn RecoveryFs,
+    cancel: &CancelToken,
+) -> Result<PublicationOutcome, RecoveryError> {
+    use super::admission::{OfflineAction, OperationOwnership};
+    let mut l = request.limits.clone();
+    l.operation_id = request.operation_id;
+    lease.validate(filesystem, &l)?;
+    let source = request
+        .store
+        .canonical_path
+        .as_deref()
+        .ok_or_else(|| fs::refused(&l, "existing physical source required"))?;
+    if lease.request.action != OfflineAction::Backup
+        || lease.request.operation_id != request.operation_id
+        || lease.request.physical_path != source
+        || lease.request.catalog_identity != request.store.catalog_key
+        || lease.request.profile_sha256 != verify::profile_digest(&request.profile, &l)?
+    {
+        return Err(fs::refused(
+            &l,
+            "offline backup source, action, profile or operation binding mismatch",
+        ));
+    }
+    let _ownership = OperationOwnership::acquire(source, &l)?;
+    let held = fs::source_file(source, &l)?;
+    let identity = fs::identity(&held, &l)?;
+    // This private engine entry never creates, initializes, migrates or routes.
+    let owner = crate::FerroStore::open_existing_for_backup(source, &l).map_err(|_| {
+        RecoveryError::UnhealthySource {
+            operation_id: l.operation_id,
+        }
+    })?;
+    if fs::identity(&fs::source_file(source, &l)?, &l)? != identity {
+        return Err(l.verification());
+    }
+    lease.validate(filesystem, &l)?;
+    let outcome = backup(&owner, request, filesystem, cancel)?;
+    lease.validate(filesystem, &l)?;
+    Ok(outcome)
 }

@@ -143,6 +143,8 @@ pub mod args;
 pub mod bench;
 pub mod data;
 pub mod inspect;
+#[cfg(feature = "cli")]
+pub mod recovery;
 pub mod serve;
 
 pub use bench::{BenchOptions, BenchReport, BenchTarget, Workload, bench};

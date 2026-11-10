@@ -26,9 +26,9 @@ pub struct PublicationReceiptV1 {
     pub published_at_unix_ms: u128,
 }
 pub(crate) struct CheckedBundle {
-    manifest: BundleManifestV1,
-    manifest_sha256: String,
-    bytes: u64,
+    pub(crate) manifest: BundleManifestV1,
+    pub(crate) manifest_sha256: String,
+    pub(crate) bytes: u64,
     metadata_bytes: u64,
     held: Vec<(Member, PrivateFile)>,
     shared_held: Vec<(Member, PrivateFile)>,
@@ -224,7 +224,7 @@ fn receipt_matches(receipt: &PublicationReceiptV1, checked: &CheckedBundle) -> b
 // A receipt is bound to an open handle while its contents are checked. Keep
 // that handle through the final directory sync so a replacement cannot inherit
 // an earlier receipt's attestation, even if its bytes are identical.
-fn checked_receipt(
+pub(crate) fn checked_receipt(
     catalog: &Dir,
     name: &str,
     checked: &CheckedBundle,
@@ -244,12 +244,14 @@ pub(crate) fn record(
     checked: CheckedBundle,
     control: &Arc<PublicationIo>,
     l: &OperationLimits,
+    access: &fs::CatalogLock,
 ) -> Result<VerifiedBundle, RecoveryError> {
+    access.validate(root, l)?;
     let operation = &checked.manifest.operation_id;
     let result = record_checked(root, catalog, &checked, control, l);
     match result {
         Err(RecoveryError::Verification { .. } | RecoveryError::RefusedInput { .. }) => {
-            mark_quarantine(root, operation, control, l)?;
+            mark_quarantine(root, operation, control, l, access)?;
             Err(RecoveryError::Quarantined {
                 operation_id: l.operation_id,
             })
@@ -356,12 +358,14 @@ fn record_checked(
     Ok(VerifiedBundle { path: bundle.path })
 }
 
-fn mark_quarantine(
+pub(crate) fn mark_quarantine(
     root: &Dir,
     operation: &str,
     control: &Arc<PublicationIo>,
     l: &OperationLimits,
+    access: &fs::CatalogLock,
 ) -> Result<(), RecoveryError> {
+    access.validate(root, l)?;
     let quarantine = root.child(".quarantine", false, l)?;
     let entry = quarantine.child(operation, false, l)?;
     let catalog = root.child(".catalog", false, l)?;
@@ -410,6 +414,8 @@ pub(crate) fn reconcile(
     l.publication_io = Some(control.clone());
     let locks = root.child(".locks", false, &l)?;
     let _lock = StoreLock::operation(&locks, id, &l)?;
+    let catalog_access =
+        fs::CatalogLock::acquire(&root, fs::CatalogLockMode::Shared, true, io.clone(), &l)?;
     let staging = root.child(".staging", false, &l)?;
     let catalog = root.child(".catalog", false, &l)?;
     let quarantine = root.child(".quarantine", false, &l)?;
@@ -420,7 +426,7 @@ pub(crate) fn reconcile(
         // A previous attempt can create the quarantine entry before receipt
         // withdrawal or its directory barriers fail. Finish that same bounded
         // operation before reporting quarantine, including an already moved receipt.
-        mark_quarantine(&root, operation, &control, &l)?;
+        mark_quarantine(&root, operation, &control, &l, &catalog_access)?;
         return Err(RecoveryError::Quarantined { operation_id: id });
     }
     let mut published = root.exists(operation, &l)?;
@@ -439,7 +445,7 @@ pub(crate) fn reconcile(
                 error,
                 RecoveryError::Verification { .. } | RecoveryError::RefusedInput { .. }
             ) {
-                mark_quarantine(&root, operation, &control, &l)?;
+                mark_quarantine(&root, operation, &control, &l, &catalog_access)?;
                 return Err(RecoveryError::Quarantined { operation_id: id });
             }
             return Err(error);
@@ -491,7 +497,7 @@ pub(crate) fn reconcile(
         }
         root.sync(&*io, Directory::PublicationParent, &l)?;
         staging.sync(&*io, Directory::StagingParent, &l)?;
-        record(&root, &catalog, checked, &control, &l)
+        record(&root, &catalog, checked, &control, &l, &catalog_access)
     })();
     match result {
         Ok(bundle) => Ok(PublicationOutcome::Durable(bundle)),
@@ -567,6 +573,12 @@ pub(crate) fn retention_manifest(
     bundle: &VerifiedBundle,
     l: &OperationLimits,
 ) -> Result<BundleManifestV1, RecoveryError> {
+    Ok(retention_checked(bundle, l)?.manifest)
+}
+pub(crate) fn retention_checked(
+    bundle: &VerifiedBundle,
+    l: &OperationLimits,
+) -> Result<CheckedBundle, RecoveryError> {
     let dir = Dir::open(bundle.path(), l)?;
     let operation = dir
         .path
@@ -579,5 +591,32 @@ pub(crate) fn retention_manifest(
     let receipt = checked_receipt(&catalog, &format!("{operation}.json"), &checked, l)?;
     checked.validate_at(&dir, l)?;
     receipt.unchanged(l)?;
-    Ok(checked.manifest)
+    Ok(checked)
+}
+
+/// Read-only completed selection. A directory alone is never proof of publication.
+pub fn select_completed_bundle(
+    operation: uuid::Uuid,
+    filesystem: &dyn RecoveryFs,
+    l: &OperationLimits,
+) -> Result<VerifiedBundle, RecoveryError> {
+    if operation.is_nil() {
+        return Err(l.verification());
+    }
+    let root = Dir::open(filesystem.root(), l)?;
+    let quarantine = Dir::open(&root.path.join(".quarantine"), l)?;
+    if quarantine.exists(&operation.to_string(), l)? {
+        return Err(RecoveryError::Quarantined {
+            operation_id: operation,
+        });
+    }
+    let bundle = VerifiedBundle {
+        path: root.path.join(operation.to_string()),
+    };
+    let manifest = retention_manifest(&bundle, l)?;
+    if manifest.operation_id != operation.to_string() {
+        return Err(l.verification());
+    }
+    root.same_name(l)?;
+    Ok(bundle)
 }

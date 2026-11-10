@@ -23,6 +23,7 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Member {
     Image,
+    Original,
     VerificationCopy,
     Validation,
     Report,
@@ -34,6 +35,13 @@ pub enum Member {
     VaultCiphertext,
     Receipt,
     LockDiagnostics,
+    Lease,
+    RestoreGuard,
+    RestoreJournal,
+    RestoreOperationLock,
+    Reconciliation,
+    PurgeAudit,
+    CatalogLock,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Directory {
@@ -44,10 +52,28 @@ pub enum Directory {
     StagingParent,
     CatalogParent,
     QuarantineParent,
+    LeaseParent,
+    RestoreDestinationParent,
+    RestoreStagingParent,
+    RestoreJournalParent,
+    RestoreOperationLockParent,
+    RestoreGuardParent,
+    PurgeParent,
+    CatalogLockParent,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryEvent {
     Capture,
+    CatalogLock,
+    CatalogLockWait,
+    Exchange,
+    RestoreInstall,
+    RestoreRelocate,
+    RestoreReverseExchange,
+    RestoreGuardRemove,
+    RestoreOperationLock,
+    RestoreOperationLockWait,
+    PurgeUnlink,
     OpenFile,
     CreateDirectory,
     Allocate,
@@ -64,6 +90,12 @@ pub enum RecoveryEvent {
 /// Implementations may fail reads or fail or shorten destination writes. Native
 /// operations are the default; successful hooks alone prove nothing.
 pub trait RecoveryIo: Send + Sync {
+    fn unix_ms(&self) -> io::Result<u128> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .map_err(|_| io::Error::other("clock unavailable"))
+    }
     fn before(&self, _: RecoveryEvent) -> io::Result<()> {
         Ok(())
     }
@@ -1123,5 +1155,184 @@ mod read_tests {
             read_exact_at(&file, &mut [0; 1], 0, &l),
             Err(RecoveryError::Verification { .. })
         ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogLockMode {
+    Shared,
+    Exclusive,
+}
+pub(crate) struct CatalogLock {
+    file: File,
+    parent: Dir,
+    root_identity: (u64, u64),
+    mode: CatalogLockMode,
+}
+impl CatalogLock {
+    pub(crate) fn acquire(
+        root: &Dir,
+        mode: CatalogLockMode,
+        create: bool,
+        io: Arc<dyn RecoveryIo>,
+        l: &OperationLimits,
+    ) -> Result<Self, RecoveryError> {
+        root.same_name(l)?;
+        let parent = if create {
+            root.child(".locks", false, l)?
+        } else {
+            Dir::open(&root.path.join(".locks"), l)?
+        };
+        // Empty stable lock payload; its inode/directory allocation is included
+        // in the caller's fixed metadata reserve, never refunded or unlinked.
+        l.quota(65536, l.memory_byte_limit, "catalog lock memory")?;
+        event(&*io, RecoveryEvent::CatalogLock, l)?;
+        let flags = libc::O_RDWR
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC
+            | if create { libc::O_CREAT } else { 0 };
+        let fd = unsafe {
+            libc::openat(
+                parent.file.as_raw_fd(),
+                c"catalog.lock".as_ptr(),
+                flags,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(open_error(
+                l,
+                refused(l, "existing private stable catalog lock required"),
+            ));
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        verify::privacy(&file, false, l)?;
+        if file.metadata().map_err(|_| destination(l))?.len() != 0 {
+            return Err(l.verification());
+        }
+        let lock = Self {
+            file,
+            parent,
+            root_identity: identity(&root.file, l)?,
+            mode,
+        };
+        loop {
+            l.check()?;
+            lock.validate(root, l)?;
+            let operation = if mode == CatalogLockMode::Shared {
+                libc::LOCK_SH
+            } else {
+                libc::LOCK_EX
+            };
+            if unsafe { libc::flock(lock.file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(transient(&error, l).unwrap_or_else(|| destination(l)));
+            }
+            event(&*io, RecoveryEvent::CatalogLockWait, l)?;
+            // Bounded backoff; tests release/cancel via this event, never sleeps.
+            std::thread::park_timeout(std::time::Duration::from_millis(2));
+        }
+        lock.validate(root, l)?;
+        if create {
+            event(&*io, RecoveryEvent::Flush(Member::CatalogLock), l)?;
+            lock.file.sync_all().map_err(|_| destination(l))?;
+            lock.parent.sync(&*io, Directory::CatalogLockParent, l)?;
+            root.sync(&*io, Directory::CatalogLockParent, l)?;
+        }
+        Ok(lock)
+    }
+    pub(crate) fn validate(&self, root: &Dir, l: &OperationLimits) -> Result<(), RecoveryError> {
+        root.same_name(l)?;
+        self.parent.same_name(l)?;
+        if identity(&root.file, l)? != self.root_identity {
+            return Err(l.verification());
+        }
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                self.parent.file.as_raw_fd(),
+                c"catalog.lock".as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(l.verification());
+        }
+        let current = unsafe { current.assume_init() };
+        if (current.st_dev, current.st_ino) != identity(&self.file, l)?
+            || current.st_mode & libc::S_IFMT != libc::S_IFREG
+            || current.st_nlink != 1
+            || current.st_mode & 0o7777 != 0o600
+        {
+            return Err(l.verification());
+        }
+        Ok(())
+    }
+    pub(crate) fn exclusive(&self) -> bool {
+        self.mode == CatalogLockMode::Exclusive
+    }
+}
+#[cfg(test)]
+mod catalog_lock_tests {
+    use super::*;
+    #[test]
+    fn catalog_lock_serializes_purge_and_publication_without_replacing_inode() {
+        let root = crate::recovery::test_support::fixture_root();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            64 << 20,
+            64 << 20,
+            crate::recovery::CancelToken::new(),
+        );
+        let dir = Dir::open(root.path(), &l).unwrap();
+        let shared = CatalogLock::acquire(
+            &dir,
+            CatalogLockMode::Shared,
+            true,
+            Arc::new(NativeRecoveryIo),
+            &l,
+        )
+        .unwrap();
+        let before = std::fs::metadata(root.path().join(".locks/catalog.lock")).unwrap();
+        let cancel = crate::recovery::CancelToken::new();
+        struct CancelWait(crate::recovery::CancelToken);
+        impl RecoveryIo for CancelWait {
+            fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+                if event == RecoveryEvent::CatalogLockWait {
+                    self.0.cancel();
+                }
+                Ok(())
+            }
+        }
+        let mut blocked = l.clone();
+        blocked.cancel = cancel.clone();
+        assert!(matches!(
+            CatalogLock::acquire(
+                &dir,
+                CatalogLockMode::Exclusive,
+                false,
+                Arc::new(CancelWait(cancel)),
+                &blocked
+            ),
+            Err(RecoveryError::Cancelled { .. })
+        ));
+        drop(shared);
+        let exclusive = CatalogLock::acquire(
+            &dir,
+            CatalogLockMode::Exclusive,
+            false,
+            Arc::new(NativeRecoveryIo),
+            &l,
+        )
+        .unwrap();
+        drop(exclusive);
+        let after = std::fs::metadata(root.path().join(".locks/catalog.lock")).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(after.mode() & 0o7777, 0o600);
     }
 }

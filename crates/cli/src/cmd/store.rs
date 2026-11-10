@@ -14,7 +14,9 @@
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_store::cli::args::{BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, ServeArgs, emit};
+use fl_store::cli::args::{
+    BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, RecoveryArgs, ServeArgs, emit,
+};
 use fl_store::cli::{self as store_cli, Create, Scratch, Target, Wording};
 use fl_store::{BACKEND_ENV, BackendKind, choose_backend};
 use std::path::Path;
@@ -27,6 +29,11 @@ const FL: Wording<'static> = Wording {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Explicit offline recovery; never selected by a missing daemon.
+    Recovery {
+        #[command(flatten)]
+        args: RecoveryArgs,
+    },
     /// The engine, files and format version of the bound store.
     Status {
         /// Print one JSON object instead of text.
@@ -165,6 +172,7 @@ fn on_ferro(path: &Path, what: &str) -> Result<()> {
 
 pub fn run(path: &Path, cmd: Cmd) -> Result<i32> {
     match cmd {
+        Cmd::Recovery { args } => printed(args.run(Some(path))?),
         Cmd::Status { json } => {
             let report = store_cli::status(path, engine(path)?);
             if json {
