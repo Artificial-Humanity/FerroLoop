@@ -2026,6 +2026,8 @@ pub struct HubRouteDispatchObservation {
     pub route_updated_at: Option<fl_core::at::At>,
     pub explicit: bool,
     pub outcome: fl_wire::dispatch_diagnostics::DispatchCallOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_settle_ms: Option<u64>,
 }
 
 fn is_zero_usize(n: &usize) -> bool {
@@ -2084,6 +2086,7 @@ impl HubRouteDispatchObservation {
             route_updated_at,
             explicit,
             outcome,
+            paste_settle_ms,
         } = obs;
         Self {
             adapter,
@@ -2091,6 +2094,7 @@ impl HubRouteDispatchObservation {
             route_updated_at,
             explicit,
             outcome,
+            paste_settle_ms,
         }
     }
 }
@@ -11619,6 +11623,7 @@ mod council_guidance_tests {
                                 route_updated_at: Some(ts_for_status.clone()),
                                 explicit: true,
                                 outcome: DispatchCallOutcome::ReturnedOk,
+                                paste_settle_ms: None,
                             },
                             RouteDispatchObservation {
                                 adapter: RouteAdapter::Claude,
@@ -11626,6 +11631,7 @@ mod council_guidance_tests {
                                 route_updated_at: Some(ts_for_status.clone()),
                                 explicit: false,
                                 outcome: DispatchCallOutcome::ReturnedError,
+                                paste_settle_ms: None,
                             },
                         ],
                         omitted_route_observations: 0,
