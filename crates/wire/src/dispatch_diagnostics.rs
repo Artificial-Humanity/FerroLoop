@@ -50,6 +50,7 @@ pub enum FailureStage {
     MessageLookupError,
     InitialReceiptReadError,
     TransportError,
+    ComposerOccupiedByNonWireInput,
     ReceiptWriteError,
     ReceiptWriteMissing,
     FinalReceiptReadError,
@@ -66,6 +67,7 @@ pub enum FenceReason {
     MessageLookupError,
     InitialReceiptReadError,
     TransportError,
+    ComposerOccupiedByNonWireInput,
     ReceiptWriteError,
     ReceiptWriteMissing,
     FinalReceiptReadError,
@@ -791,7 +793,7 @@ mod tests {
     fn diagnostic_maximal_row_fits_byte_bound() {
         let mut report = DispatchReport::default();
         for _ in 0..5 {
-            report.record_failure(FailureStage::InitialReceiptReadError);
+            report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
         }
         for _ in 0..3 {
             report.record_call_started(&codex());
@@ -809,11 +811,19 @@ mod tests {
             Some(&id),
             At::from_unix_millis(u64::MAX),
             SuppressionPhase::RetainedFence,
-            FenceReason::InitialReceiptReadError,
+            FenceReason::ComposerOccupiedByNonWireInput,
             &report,
         );
         assert_eq!(row.trigger_message_id.as_ref().unwrap().len(), 256);
         assert!(serde_json::to_vec(&row).unwrap().len() <= 4096);
+        assert_eq!(
+            serde_json::to_value(FailureStage::ComposerOccupiedByNonWireInput).unwrap(),
+            "composer_occupied_by_non_wire_input"
+        );
+        assert_eq!(
+            serde_json::to_value(FenceReason::ComposerOccupiedByNonWireInput).unwrap(),
+            "composer_occupied_by_non_wire_input"
+        );
         let invalid = FenceDiagnostic::from_report(
             &"f".repeat(65),
             Some(&MessageId(
