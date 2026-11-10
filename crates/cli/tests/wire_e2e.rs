@@ -1565,6 +1565,7 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         tombstone_ids: Vec::new(),
         vendor_session_id: None,
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         created_at_ms: 1,
         updated_at_ms: 1,
