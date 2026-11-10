@@ -31,10 +31,27 @@ pub(crate) struct CheckedBundle {
     bytes: u64,
     metadata_bytes: u64,
     held: Vec<(Member, PrivateFile)>,
+    directory_identity: (u64, u64),
 }
 impl CheckedBundle {
     pub(crate) fn same_manifest(&self, other: &Self) -> bool {
         self.manifest_sha256 == other.manifest_sha256
+    }
+    fn validate_at(&self, dir: &Dir, l: &OperationLimits) -> Result<(), RecoveryError> {
+        if fs::identity(&dir.file, l)? != self.directory_identity {
+            return Err(l.verification());
+        }
+        for (_, file) in &self.held {
+            file.unchanged_in(&dir.path, l)?;
+        }
+        let latest = check_bundle(dir, &self.manifest.operation_id, l)?;
+        if !self.same_manifest(&latest) {
+            return Err(l.verification());
+        }
+        for (_, file) in &self.held {
+            file.unchanged_in(&dir.path, l)?;
+        }
+        dir.same_name(l)
     }
     pub(crate) fn flush(
         &self,
@@ -164,6 +181,7 @@ pub(crate) fn check_bundle(
         bytes,
         metadata_bytes,
         held,
+        directory_identity: fs::identity(&dir.file, l)?,
     })
 }
 fn receipt_matches(receipt: &PublicationReceiptV1, checked: &CheckedBundle) -> bool {
@@ -173,6 +191,23 @@ fn receipt_matches(receipt: &PublicationReceiptV1, checked: &CheckedBundle) -> b
         && receipt.image_sha256 == checked.manifest.image_sha256
         && receipt.members == checked.manifest.retained_members
 }
+// A receipt is bound to an open handle while its contents are checked. Keep
+// that handle through the final directory sync so a replacement cannot inherit
+// an earlier receipt's attestation, even if its bytes are identical.
+fn checked_receipt(
+    catalog: &Dir,
+    name: &str,
+    checked: &CheckedBundle,
+    l: &OperationLimits,
+) -> Result<PrivateFile, RecoveryError> {
+    let held = PrivateFile::open(&catalog.path.join(name), false, l)?;
+    let receipt: PublicationReceiptV1 = fs::read_json(catalog, name, l)?;
+    if !receipt_matches(&receipt, checked) {
+        return Err(l.verification());
+    }
+    held.unchanged(l)?;
+    Ok(held)
+}
 pub(crate) fn record(
     root: &Dir,
     catalog: &Dir,
@@ -181,101 +216,116 @@ pub(crate) fn record(
     l: &OperationLimits,
 ) -> Result<VerifiedBundle, RecoveryError> {
     let operation = &checked.manifest.operation_id;
+    let result = record_checked(root, catalog, &checked, control, l);
+    match result {
+        Err(RecoveryError::Verification { .. } | RecoveryError::RefusedInput { .. }) => {
+            mark_quarantine(root, operation, control, l)?;
+            Err(RecoveryError::Quarantined {
+                operation_id: l.operation_id,
+            })
+        }
+        result => result,
+    }
+}
+fn record_checked(
+    root: &Dir,
+    catalog: &Dir,
+    checked: &CheckedBundle,
+    control: &Arc<PublicationIo>,
+    l: &OperationLimits,
+) -> Result<VerifiedBundle, RecoveryError> {
+    let operation = &checked.manifest.operation_id;
+    let bundle = Dir::open(&root.path.join(operation), l)?;
+    checked.validate_at(&bundle, l)?;
     let name = format!("{operation}.json");
     let temporary = format!("{operation}.tmp");
-    if catalog.exists(&name, l)? {
-        let receipt: PublicationReceiptV1 = match fs::read_json(catalog, &name, l) {
-            Ok(receipt) => receipt,
-            Err(RecoveryError::Verification { .. } | RecoveryError::RefusedInput { .. }) => {
-                mark_quarantine(root, operation, control, l)?;
-                return Err(RecoveryError::Quarantined {
-                    operation_id: l.operation_id,
-                });
+    let receipt = if catalog.exists(&name, l)? {
+        checked_receipt(catalog, &name, checked, l)?
+    } else {
+        let mut prepared = false;
+        if catalog.exists(&temporary, l)? {
+            match fs::read_json::<PublicationReceiptV1>(catalog, &temporary, l) {
+                Ok(receipt) if receipt_matches(&receipt, checked) => {
+                    let held = PrivateFile::open(&catalog.path.join(&temporary), false, l)?;
+                    control.sync(&held.file, Member::Receipt, l)?;
+                    held.unchanged(l)?;
+                    prepared = true;
+                }
+                Err(RecoveryError::Verification { .. }) => {
+                    // Preserve an interrupted temporary receipt under this
+                    // operation's exact name before deriving a fresh one.
+                    let held = PrivateFile::open(&catalog.path.join(&temporary), false, l)?;
+                    let quarantine = root.child(".quarantine", false, l)?;
+                    catalog.rename_checked(
+                        &temporary,
+                        &quarantine,
+                        &format!("{operation}-catalog-temp"),
+                        &*control.io,
+                        RecoveryEvent::CatalogPublish,
+                        l,
+                        || {
+                            checked.validate_at(&bundle, l)?;
+                            held.unchanged(l)
+                        },
+                    )?;
+                    quarantine.sync(&*control.io, Directory::QuarantineParent, l)?;
+                    catalog.sync(&*control.io, Directory::CatalogParent, l)?;
+                }
+                Ok(_) | Err(RecoveryError::RefusedInput { .. }) => return Err(l.verification()),
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        };
-        if !receipt_matches(&receipt, &checked) {
-            mark_quarantine(root, operation, control, l)?;
-            return Err(RecoveryError::Quarantined {
-                operation_id: l.operation_id,
-            });
         }
-        // A previous caller may have failed the catalog's final directory sync.
-        catalog.sync(&*control.io, Directory::CatalogParent, l)?;
-        return Ok(VerifiedBundle {
-            path: root.path.join(operation),
-        });
-    }
-    let mut prepared = false;
-    if catalog.exists(&temporary, l)? {
-        match fs::read_json::<PublicationReceiptV1>(catalog, &temporary, l) {
-            Ok(receipt) if receipt_matches(&receipt, &checked) => {
-                let held = PrivateFile::open(&catalog.path.join(&temporary), false, l)?;
-                control.sync(&held.file, Member::Receipt, l)?;
-                held.same_name(l)?;
-                prepared = true;
-            }
-            Err(RecoveryError::Verification { .. }) => {
-                // An uncommitted, interrupted temporary receipt is not an
-                // attestation. Preserve it under this operation's exact name,
-                // then derive a fresh receipt from the fully checked bundle.
-                let held = PrivateFile::open(&catalog.path.join(&temporary), false, l)?;
-                let quarantine = root.child(".quarantine", false, l)?;
-                catalog.rename_checked(
-                    &temporary,
-                    &quarantine,
-                    &format!("{operation}-catalog-temp"),
-                    &*control.io,
-                    RecoveryEvent::CatalogPublish,
-                    l,
-                    || held.unchanged(l),
-                )?;
-                quarantine.sync(&*control.io, Directory::QuarantineParent, l)?;
-                catalog.sync(&*control.io, Directory::CatalogParent, l)?;
-            }
-            Ok(_) | Err(RecoveryError::RefusedInput { .. }) => {
-                mark_quarantine(root, operation, control, l)?;
-                return Err(RecoveryError::Quarantined {
-                    operation_id: l.operation_id,
-                });
-            }
-            Err(error) => return Err(error),
+        if !prepared {
+            let receipt = PublicationReceiptV1 {
+                receipt_version: 1,
+                operation_id: operation.clone(),
+                manifest_sha256: checked.manifest_sha256.clone(),
+                image_sha256: checked.manifest.image_sha256.clone(),
+                members: checked.manifest.retained_members.clone(),
+                published_at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| l.verification())?
+                    .as_millis(),
+            };
+            fs::write_json(catalog, &temporary, &receipt, Member::Receipt, control, l)?;
         }
-    }
-    if !prepared {
-        let receipt = PublicationReceiptV1 {
-            receipt_version: 1,
-            operation_id: operation.clone(),
-            manifest_sha256: checked.manifest_sha256.clone(),
-            image_sha256: checked.manifest.image_sha256.clone(),
-            members: checked.manifest.retained_members.clone(),
-            published_at_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| l.verification())?
-                .as_millis(),
-        };
-        fs::write_json(catalog, &temporary, &receipt, Member::Receipt, control, l)?;
-    }
-    catalog.rename_checked(
-        &temporary,
-        catalog,
-        &name,
-        &*control.io,
-        RecoveryEvent::CatalogPublish,
-        l,
-        || {
-            let receipt: PublicationReceiptV1 = fs::read_json(catalog, &temporary, l)?;
-            if !receipt_matches(&receipt, &checked) {
-                return Err(l.verification());
-            }
-            Ok(())
-        },
-    )?;
+        let prepared_receipt = checked_receipt(catalog, &temporary, checked, l)?;
+        let prepared_hash = verify::hash_file(&prepared_receipt.file, l)?;
+        catalog.rename_checked(
+            &temporary,
+            catalog,
+            &name,
+            &*control.io,
+            RecoveryEvent::CatalogPublish,
+            l,
+            || {
+                checked.validate_at(&bundle, l)?;
+                prepared_receipt.unchanged(l)
+            },
+        )?;
+        let committed = checked_receipt(catalog, &name, checked, l)?;
+        // Renaming the receipt changes its ctime. Compare its held inode and
+        // complete digest across that rename, then hold the new timestamp bind.
+        if committed.identity() != prepared_receipt.identity()
+            || verify::hash_file(&committed.file, l)? != prepared_hash
+        {
+            return Err(l.verification());
+        }
+        committed
+    };
+    // Also covers an existing receipt whose previous catalog sync failed.
     catalog.sync(&*control.io, Directory::CatalogParent, l)?;
-    Ok(VerifiedBundle {
-        path: root.path.join(operation),
-    })
+    checked.validate_at(&bundle, l)?;
+    receipt.unchanged(l)?;
+    checked_receipt(catalog, &name, checked, l)?;
+    receipt.unchanged(l)?;
+    catalog.same_name(l)?;
+    root.same_name(l)?;
+    // These checks attest this bounded operation, not immunity to later writes
+    // by another process with the same user's access to the backup root.
+    Ok(VerifiedBundle { path: bundle.path })
 }
+
 fn mark_quarantine(
     root: &Dir,
     operation: &str,

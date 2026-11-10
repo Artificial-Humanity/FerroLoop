@@ -329,7 +329,10 @@ impl PrivateFile {
         (self.initial.dev(), self.initial.ino())
     }
     pub(crate) fn same_name(&self, l: &OperationLimits) -> Result<(), RecoveryError> {
-        let (parent, name) = private_parent(&self.path, l)?;
+        self.same_name_at(&self.path, l)
+    }
+    fn same_name_at(&self, path: &Path, l: &OperationLimits) -> Result<(), RecoveryError> {
+        let (parent, name) = private_parent(path, l)?;
         let current = parent.metadata().map_err(|_| l.verification())?;
         let original = self.parent.metadata().map_err(|_| l.verification())?;
         if (current.dev(), current.ino()) != (original.dev(), original.ino()) {
@@ -356,7 +359,20 @@ impl PrivateFile {
         Ok(())
     }
     pub(crate) fn unchanged(&self, l: &OperationLimits) -> Result<(), RecoveryError> {
-        self.same_name(l)?;
+        self.unchanged_at(&self.path, l)
+    }
+    // A containing bundle may be renamed, but its held parent and member inode,
+    // name, length and timestamps must remain the original checked bindings.
+    pub(crate) fn unchanged_in(
+        &self,
+        directory: &Path,
+        l: &OperationLimits,
+    ) -> Result<(), RecoveryError> {
+        let name = self.path.file_name().ok_or_else(|| l.verification())?;
+        self.unchanged_at(&directory.join(name), l)
+    }
+    fn unchanged_at(&self, path: &Path, l: &OperationLimits) -> Result<(), RecoveryError> {
+        self.same_name_at(path, l)?;
         let now = self.file.metadata().map_err(|_| l.verification())?;
         if now.len() != self.initial.len()
             || now.mtime() != self.initial.mtime()

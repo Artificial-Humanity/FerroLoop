@@ -184,6 +184,7 @@ fn parent_sync_failure_is_unknown_and_reconciliation_repairs_catalog() {
 #[test]
 fn prepublication_flush_failures_never_create_final_names_or_poison_source() {
     for event in [
+        RecoveryEvent::Sync(Directory::Initialization),
         RecoveryEvent::Flush(Member::Image),
         RecoveryEvent::Flush(Member::Validation),
         RecoveryEvent::Flush(Member::Profile),
@@ -194,6 +195,13 @@ fn prepublication_flush_failures_never_create_final_names_or_poison_source() {
         RecoveryEvent::Sync(Directory::StagingBeforePublish),
     ] {
         let f = Fixture::new();
+        let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+        let PublicationOutcome::Durable(old) =
+            backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap()
+        else {
+            panic!("old backup")
+        };
+        let old_bytes = fs::read(old.path().join("image.fls")).unwrap();
         let mut request = f.request();
         request.profile.catalog_identity = request.store.catalog_key.clone();
         let faults = Arc::new(Fault::default());
@@ -204,7 +212,9 @@ fn prepublication_flush_failures_never_create_final_names_or_poison_source() {
             limits: reconciliation_limits(),
         };
         assert!(
-            backup(&f.store, &request, &filesystem, &CancelToken::new()).is_err(),
+            matches!(backup(&f.store, &request, &filesystem, &CancelToken::new()),
+                Err(fl_store::recovery::RecoveryError::Destination { operation_id })
+                    if operation_id == request.operation_id),
             "{event:?}"
         );
         assert!(
@@ -217,6 +227,7 @@ fn prepublication_flush_failures_never_create_final_names_or_poison_source() {
             faults.seen.lock().unwrap().contains(&event),
             "fault not reached: {event:?}"
         );
+        assert_eq!(old_bytes, fs::read(old.path().join("image.fls")).unwrap());
         f.assert_source_usable();
     }
 }
@@ -1299,4 +1310,242 @@ fn source_commits_continue_while_bundle_remains_at_the_captured_sequence() {
         restored.get_doc("fixture_unknown", "one").unwrap().unwrap()["n"],
         23
     );
+}
+
+// These mutations catch stale pre-rename verification and unchecked receipt
+// returns. Same-content replacements must also preserve the held inode binding.
+#[derive(Clone, Copy, Debug)]
+enum PublicationMutation {
+    ImageBytes,
+    ImageInode,
+    DirectoryInode,
+    ReceiptMissing,
+    ReceiptBytes,
+    ReceiptInode,
+}
+struct MutatePublication {
+    root: PathBuf,
+    operation: String,
+    event: RecoveryEvent,
+    mutation: PublicationMutation,
+    done: std::sync::atomic::AtomicBool,
+}
+impl RecoveryIo for MutatePublication {
+    fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        if event != self.event || self.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        let bundle = self.root.join(&self.operation);
+        let image = bundle.join("image.fls");
+        let receipt = self
+            .root
+            .join(".catalog")
+            .join(format!("{}.json", self.operation));
+        match self.mutation {
+            PublicationMutation::ImageBytes => fs::write(image, b"changed image")?,
+            PublicationMutation::ImageInode | PublicationMutation::ReceiptInode => {
+                let path = if matches!(self.mutation, PublicationMutation::ImageInode) {
+                    image
+                } else {
+                    receipt
+                };
+                let held = path.with_extension("held");
+                fs::rename(&path, &held)?;
+                fs::copy(&held, &path)?;
+                fs::remove_file(held)?;
+            }
+            PublicationMutation::DirectoryInode => {
+                let held = self.root.join(format!("{}-held", self.operation));
+                fs::rename(&bundle, &held)?;
+                fs::create_dir(&bundle)?;
+                fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700))?;
+                for member in fs::read_dir(&held)? {
+                    let member = member?;
+                    // Move the original members: only the directory inode changes.
+                    fs::rename(member.path(), bundle.join(member.file_name()))?;
+                }
+            }
+            PublicationMutation::ReceiptMissing => fs::remove_file(receipt)?,
+            PublicationMutation::ReceiptBytes => fs::write(receipt, b"{corrupt receipt")?,
+        }
+        Ok(())
+    }
+}
+
+fn publication_mutation_matrix(reconciliation: Option<bool>) {
+    let mut failures = Vec::new();
+    for event in [
+        RecoveryEvent::Sync(Directory::PublicationParent),
+        RecoveryEvent::Sync(Directory::StagingParent),
+        RecoveryEvent::CatalogPublish,
+        RecoveryEvent::Sync(Directory::CatalogParent),
+    ] {
+        for mutation in [
+            PublicationMutation::ImageBytes,
+            PublicationMutation::ImageInode,
+            PublicationMutation::DirectoryInode,
+            PublicationMutation::ReceiptMissing,
+            PublicationMutation::ReceiptBytes,
+            PublicationMutation::ReceiptInode,
+        ] {
+            if (matches!(
+                mutation,
+                PublicationMutation::ReceiptMissing
+                    | PublicationMutation::ReceiptBytes
+                    | PublicationMutation::ReceiptInode
+            ) && event != RecoveryEvent::Sync(Directory::CatalogParent))
+                || (reconciliation == Some(true) && event == RecoveryEvent::CatalogPublish)
+            {
+                continue;
+            }
+            let f = Fixture::new();
+            let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+            let PublicationOutcome::Durable(old) =
+                backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap()
+            else {
+                panic!("old backup")
+            };
+            let old_bytes = fs::read(old.path().join("image.fls")).unwrap();
+            let request = f.request();
+            if let Some(existing_receipt) = reconciliation {
+                if existing_receipt {
+                    assert!(matches!(
+                        backup(&f.store, &request, &native, &CancelToken::new()).unwrap(),
+                        PublicationOutcome::Durable(_)
+                    ));
+                } else {
+                    let fault = Arc::new(Fault::default());
+                    *fault.failure.lock().unwrap() =
+                        Some(RecoveryEvent::Sync(Directory::PublicationParent));
+                    let interrupted = FaultFs {
+                        root: f.destination.clone(),
+                        io: fault,
+                        limits: reconciliation_limits(),
+                    };
+                    assert!(matches!(
+                        backup(&f.store, &request, &interrupted, &CancelToken::new()).unwrap(),
+                        PublicationOutcome::OutcomeUnknown { .. }
+                    ));
+                    // Reconcile a complete staging bundle, exercising its rename too.
+                    fs::rename(
+                        f.destination.join(request.operation_id.to_string()),
+                        f.destination
+                            .join(".staging")
+                            .join(request.operation_id.to_string()),
+                    )
+                    .unwrap();
+                }
+            }
+            let hook = Arc::new(MutatePublication {
+                root: f.destination.clone(),
+                operation: request.operation_id.to_string(),
+                event,
+                mutation,
+                done: Default::default(),
+            });
+            let filesystem = FaultFs {
+                root: f.destination.clone(),
+                io: hook.clone(),
+                limits: reconciliation_limits(),
+            };
+            let result = if reconciliation.is_some() {
+                reconcile_publication(&request.operation_id.to_string(), &filesystem)
+            } else {
+                backup(&f.store, &request, &filesystem, &CancelToken::new())
+            };
+            assert!(
+                hook.done.load(std::sync::atomic::Ordering::Acquire),
+                "unreached: {reconciliation:?} {event:?} {mutation:?}"
+            );
+            if !matches!(result, Err(fl_store::recovery::RecoveryError::Quarantined { operation_id }) if operation_id == request.operation_id)
+            {
+                failures.push(format!("{event:?} {mutation:?}: {result:?}"));
+            } else {
+                assert!(
+                    f.destination
+                        .join(".quarantine")
+                        .join(request.operation_id.to_string())
+                        .is_file()
+                );
+                assert!(
+                    f.destination
+                        .join(request.operation_id.to_string())
+                        .join("image.fls")
+                        .is_file()
+                );
+                if reconciliation != Some(true)
+                    && event != RecoveryEvent::Sync(Directory::CatalogParent)
+                {
+                    assert!(
+                        !f.destination
+                            .join(".catalog")
+                            .join(format!("{}.json", request.operation_id))
+                            .exists(),
+                        "receipt published after invalid final bundle"
+                    );
+                }
+            }
+            assert_eq!(old_bytes, fs::read(old.path().join("image.fls")).unwrap());
+            f.assert_source_usable();
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "stale publication attestations: {failures:#?}"
+    );
+}
+#[test]
+fn backup_revalidates_final_bundle_and_committed_receipt() {
+    publication_mutation_matrix(None);
+}
+#[test]
+fn staging_reconciliation_revalidates_final_bundle_and_committed_receipt() {
+    publication_mutation_matrix(Some(false));
+}
+#[test]
+fn existing_receipt_reconciliation_revalidates_after_catalog_sync() {
+    publication_mutation_matrix(Some(true));
+}
+
+#[test]
+fn quarantine_parent_sync_failure_is_unknown_and_preserves_other_backup() {
+    let f = Fixture::new();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    let PublicationOutcome::Durable(old) =
+        backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap()
+    else {
+        panic!("old backup")
+    };
+    let old_bytes = fs::read(old.path().join("image.fls")).unwrap();
+    let request = f.request();
+    assert!(matches!(
+        backup(&f.store, &request, &native, &CancelToken::new()).unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+    let receipt = f
+        .destination
+        .join(".catalog")
+        .join(format!("{}.json", request.operation_id));
+    fs::write(&receipt, b"{corrupt receipt").unwrap();
+    let faults = Arc::new(Fault::default());
+    let event = RecoveryEvent::Sync(Directory::QuarantineParent);
+    *faults.failure.lock().unwrap() = Some(event);
+    let filesystem = FaultFs {
+        root: f.destination.clone(),
+        io: faults.clone(),
+        limits: reconciliation_limits(),
+    };
+    assert!(
+        matches!(reconcile_publication(&request.operation_id.to_string(), &filesystem).unwrap(), PublicationOutcome::OutcomeUnknown { operation_id } if operation_id == request.operation_id)
+    );
+    assert!(faults.seen.lock().unwrap().contains(&event));
+    assert!(
+        f.destination
+            .join(".quarantine")
+            .join(request.operation_id.to_string())
+            .is_file()
+    );
+    assert_eq!(fs::read(&receipt).unwrap(), b"{corrupt receipt");
+    assert_eq!(old_bytes, fs::read(old.path().join("image.fls")).unwrap());
+    f.assert_source_usable();
 }
