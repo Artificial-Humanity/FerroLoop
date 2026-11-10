@@ -8004,6 +8004,18 @@ mod tests {
         assert_eq!(pull_summary.awaiting_daemon_count, 1);
         assert!(pull_summary.oldest_awaiting_daemon_age_ms.unwrap_or(0) >= 5_000);
 
+        // Wait for the initial unrouted worker thread to finish before measuring the second poll.
+        let worker_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < worker_deadline {
+            let active = lock(&inner.dispatch_queues)
+                .get("pull-only-persona")
+                .is_some_and(|q| q.worker_active);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         // Clear recorded FaultStore calls and run another periodic poll (`recheck_unrouted = false`).
         lock(&inner.store.calls).clear();
         inner.drain_awaiting_daemon_messages(false);
