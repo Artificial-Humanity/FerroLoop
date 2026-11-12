@@ -4,6 +4,7 @@ use fl_watch::usage::{ParserState, UsageBucket, UsageVendor};
 pub enum ParseOutcome {
     Ignore,
     Observation(UsageBucket),
+    IncompleteObservation(UsageBucket),
     Correction { old: UsageBucket, new: UsageBucket },
     Incomplete,
     Malformed,
@@ -125,7 +126,15 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
     match vendor {
         UsageVendor::Antigravity => {
             if state.antigravity_unsafe {
-                return ParseOutcome::Incomplete;
+                match (
+                    v.get("step_index").and_then(Value::as_u64),
+                    state.antigravity_last_step,
+                ) {
+                    (Some(step), Some(previous)) if step > previous => {
+                        state.antigravity_unsafe = false
+                    }
+                    _ => return ParseOutcome::Incomplete,
+                }
             }
             if let Some(step) = v.get("step_index").and_then(Value::as_u64) {
                 if let Some(prev) = state.antigravity_last_step
@@ -216,6 +225,12 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                 "cached_input_tokens",
                 "cache_creation_input_tokens",
             );
+            if state.codex_baseline_only {
+                state.codex_totals = Some(c);
+                state.codex_baseline_only = false;
+                state.codex_unsafe = false;
+                return ParseOutcome::Incomplete;
+            }
             let delta = if let Some(previous) = &state.codex_totals {
                 let Some(delta) = difference(&c, previous) else {
                     state.codex_unsafe = true;
@@ -231,7 +246,7 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
             }
             if state.codex_model_changed {
                 state.codex_model_changed = false;
-                return ParseOutcome::Incomplete;
+                return ParseOutcome::IncompleteObservation(bucket(None, hour, delta, 0));
             }
             ParseOutcome::Observation(bucket(state.model.clone(), hour, delta, 0))
         }
@@ -419,10 +434,14 @@ mod tests {
             br#"{"type":"turn_context","payload":{"model":"model-b"}}"#,
             &mut state,
         );
-        assert_eq!(
-            parse_line(UsageVendor::Codex, next, &mut state),
-            ParseOutcome::Incomplete
-        );
+        let ParseOutcome::IncompleteObservation(bucket) =
+            parse_line(UsageVendor::Codex, next, &mut state)
+        else {
+            panic!("ambiguous model delta must be retained")
+        };
+        assert_eq!(bucket.model, None);
+        assert_eq!(bucket.counts.input, Some(10));
+        assert_eq!(bucket.counts.output, Some(1));
     }
 
     #[test]
@@ -441,14 +460,12 @@ mod tests {
             ),
             ParseOutcome::Incomplete
         );
-        assert_eq!(
-            parse_line(
-                UsageVendor::Antigravity,
-                br#"{"type":"PLANNER_RESPONSE","step_index":11,"input_tokens":3}"#,
-                &mut s
-            ),
-            ParseOutcome::Incomplete
-        );
+        let resumed = observation(parse_line(
+            UsageVendor::Antigravity,
+            br#"{"type":"PLANNER_RESPONSE","step_index":11,"input_tokens":3}"#,
+            &mut s,
+        ));
+        assert_eq!(resumed.counts.input, Some(3));
     }
     #[test]
     fn claude_recent_eviction_does_not_stop_new_messages_or_recount_old() {

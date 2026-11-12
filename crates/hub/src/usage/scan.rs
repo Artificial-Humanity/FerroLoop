@@ -42,6 +42,22 @@ fn identity(metadata: &std::fs::Metadata) -> Option<String> {
         None
     }
 }
+fn unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if identity(before) != identity(after)
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
+            return false;
+        }
+    }
+    true
+}
 fn anchor(file: &mut std::fs::File, offset: u64) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Seek, SeekFrom};
@@ -167,6 +183,15 @@ pub fn scan_source(
     current: Option<&SourceUsageDocument>,
     limits: ScanLimits,
 ) -> Result<SourceUsageDocument, UsageScanError> {
+    scan_source_with_hook(source, current, limits, || {})
+}
+
+fn scan_source_with_hook(
+    source: &UsageSource,
+    current: Option<&SourceUsageDocument>,
+    limits: ScanLimits,
+    after_read: impl FnOnce(),
+) -> Result<SourceUsageDocument, UsageScanError> {
     use super::parsers::{ParseOutcome, parse_line};
     use std::io::{Read, Seek, SeekFrom};
     if limits.max_line_bytes == 0
@@ -203,24 +228,52 @@ pub fn scan_source(
         doc.coverage.unavailable = true;
     }
     if current.is_some()
-        && (doc.coverage.ambiguous_generation
-            || meta.len() < doc.offset
+        && (meta.len() < doc.offset
             || identity(&meta) != doc.file_identity
             || (!doc.anchor.is_empty() && anchor(&mut file, doc.offset)? != doc.anchor))
     {
-        if !doc.coverage.ambiguous_generation {
-            doc.generation = doc.generation.saturating_add(1);
-        }
+        let original = doc.clone();
+        doc.generation = doc.generation.saturating_add(1);
         doc.coverage.incomplete = true;
         doc.coverage.ambiguous_generation = true;
         doc.coverage.pending = false;
+        // Existing content in the replacement may overlap prior counts. Skip it,
+        // including an unfinished trailing record; later appends can be scanned.
+        doc.offset = meta.len();
+        doc.file_identity = identity(&meta);
+        doc.discarding_line = if doc.offset == 0 {
+            false
+        } else {
+            file.seek(SeekFrom::Start(doc.offset - 1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            last[0] != b'\n'
+        };
+        doc.anchor = anchor(&mut file, doc.offset)?;
+        if doc.offset > 4 * 1024 * 1024 {
+            doc.coverage.unverified_prefix = true;
+        }
+        let after = file.metadata()?;
+        let path_meta = std::fs::metadata(&source.path)?;
+        if !unchanged(&meta, &after) || identity(&after) != identity(&path_meta) {
+            let mut retry = original;
+            retry.coverage.incomplete = true;
+            return Ok(retry);
+        }
+        match source.vendor {
+            UsageVendor::Codex => doc.parser.codex_baseline_only = true,
+            UsageVendor::Antigravity => doc.parser.antigravity_unsafe = true,
+            _ => {}
+        }
         return Ok(doc);
     }
+    let original = doc.clone();
     file.seek(SeekFrom::Start(doc.offset))?;
     let mut buffer = Vec::with_capacity(limits.max_batch_bytes.min(1024 * 1024));
     (&mut file)
         .take(limits.max_batch_bytes as u64)
         .read_to_end(&mut buffer)?;
+    after_read();
     let mut at = 0;
     let mut lines = 0;
     while at < buffer.len() && lines < limits.max_lines {
@@ -258,6 +311,12 @@ pub fn scan_source(
                             doc.coverage.malformed_lines =
                                 doc.coverage.malformed_lines.saturating_add(1);
                         }
+                        ParseOutcome::IncompleteObservation(bucket) => {
+                            doc.coverage.incomplete = true;
+                            if !merge(&mut doc, &bucket, false) {
+                                doc.coverage.incomplete = true;
+                            }
+                        }
                         ParseOutcome::Observation(bucket) => {
                             if !merge(&mut doc, &bucket, false) {
                                 doc.coverage.incomplete = true;
@@ -293,7 +352,25 @@ pub fn scan_source(
         doc.coverage.incomplete = true;
         doc.coverage.unverified_prefix = true;
     }
-    doc.anchor = anchor(&mut file, doc.offset)?;
+    // An in-place rewrite or replacement while reading cannot be paired with
+    // the candidate counts. Retry later from the old cursor instead.
+    let new_anchor = match anchor(&mut file, doc.offset) {
+        Ok(anchor) => anchor,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            let mut retry = original;
+            retry.coverage.incomplete = true;
+            return Ok(retry);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let after = file.metadata()?;
+    let path_meta = std::fs::metadata(&source.path)?;
+    if identity(&after) != identity(&path_meta) || !unchanged(&meta, &after) {
+        let mut retry = original;
+        retry.coverage.incomplete = true;
+        return Ok(retry);
+    }
+    doc.anchor = new_anchor;
     Ok(doc)
 }
 
@@ -487,5 +564,64 @@ mod tests {
                 .sum::<u64>(),
             5
         );
+    }
+    #[test]
+    fn rotated_source_can_count_distinct_future_steps() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":10,\"input_tokens\":10}\n")
+            .unwrap();
+        let src = source(f.path());
+        let first = scan_source(&src, None, ScanLimits::default()).unwrap();
+        std::fs::write(f.path(), b"{}\n").unwrap();
+        let rotated = scan_source(&src, Some(&first), ScanLimits::default()).unwrap();
+        assert!(rotated.coverage.ambiguous_generation);
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":11,\"input_tokens\":3}\n")
+            .unwrap();
+        let resumed = scan_source(&src, Some(&rotated), ScanLimits::default()).unwrap();
+        assert_eq!(resumed.buckets[0].counts.input, Some(13));
+        assert!(resumed.coverage.incomplete);
+    }
+    #[test]
+    fn rewrite_during_scan_does_not_commit_mixed_candidate() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"input_tokens\":1}\n")
+            .unwrap();
+        let src = source(f.path());
+        let old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":2,\"input_tokens\":2}\n")
+            .unwrap();
+        let path = f.path().to_owned();
+        let result = scan_source_with_hook(&src, Some(&old), ScanLimits::default(), || {
+            std::fs::write(
+                path,
+                b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":9,\"input_tokens\":9}\n",
+            )
+            .unwrap();
+        })
+        .unwrap();
+        assert_eq!(result.buckets, old.buckets);
+        assert_eq!(result.offset, old.offset);
+        assert!(result.coverage.incomplete);
+    }
+    #[test]
+    fn codex_rotation_establishes_new_baseline_before_counting_deltas() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10}}}}\n").unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        std::fs::write(f.path(), b"{}\n").unwrap();
+        let rotated = scan_source(&src, Some(&old), ScanLimits::default()).unwrap();
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100}}}}\n").unwrap();
+        let baseline = scan_source(&src, Some(&rotated), ScanLimits::default()).unwrap();
+        assert_eq!(baseline.buckets[0].counts.input, Some(10));
+        f.write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":105}}}}\n").unwrap();
+        let next = scan_source(&src, Some(&baseline), ScanLimits::default()).unwrap();
+        assert_eq!(next.buckets[0].counts.input, Some(15));
+        assert!(next.coverage.incomplete);
     }
 }

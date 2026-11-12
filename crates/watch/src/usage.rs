@@ -62,6 +62,8 @@ pub struct ParserState {
     pub codex_totals: Option<TokenCounts>,
     pub codex_unsafe: bool,
     #[serde(default)]
+    pub codex_baseline_only: bool,
+    #[serde(default)]
     pub codex_model_changed: bool,
     #[serde(default)]
     pub antigravity_last_step: Option<u64>,
