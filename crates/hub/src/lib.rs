@@ -36,6 +36,9 @@ pub mod session_actions;
 mod settings;
 pub mod terminal;
 pub mod usage;
+mod usage_api;
+#[cfg(test)]
+mod usage_api_tests;
 mod vault_consumers_api;
 mod version_api;
 mod warrants;
