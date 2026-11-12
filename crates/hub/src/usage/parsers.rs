@@ -129,7 +129,11 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                 && let Some(id) = v
                     .get("content")
                     .and_then(Value::as_str)
-                    .and_then(|content| content.strip_prefix("Message sent to \""))
+                    .and_then(|content| {
+                        content
+                            .split_once("Message sent to \"")
+                            .map(|(_, suffix)| suffix)
+                    })
                     .and_then(|suffix| suffix.split('\"').next())
                     .and_then(|id| uuid::Uuid::parse_str(id).ok())
             {

@@ -37,77 +37,103 @@ pub fn read_identities(store: &AnyStore) -> anyhow::Result<Vec<IdentityMappingDo
     Ok(result)
 }
 
-/// Only the hub calls this writer; each source advances by one atomic document put.
+fn put_identity(store: &AnyStore, identity: &IdentityMappingDocument) -> anyhow::Result<()> {
+    let ferro = store
+        .as_ferro()
+        .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+    let id = key(
+        "identity",
+        &format!("{}\0{}", identity.session_id, identity.provenance),
+    );
+    ferro.put_doc(
+        COLLECTION,
+        &id,
+        &serde_json::json!({"kind":"identity", "document":identity}),
+    )?;
+    Ok(())
+}
+
+fn read_source(
+    store: &AnyStore,
+    source: &UsageSource,
+) -> anyhow::Result<Option<SourceUsageDocument>> {
+    let ferro = store
+        .as_ferro()
+        .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+    ferro
+        .get_doc(COLLECTION, &key("source", &source.source_id))?
+        .map(|v| serde_json::from_value(v["document"].clone()).map_err(Into::into))
+        .transpose()
+}
+
+fn save_candidate(
+    store: &AnyStore,
+    source: &UsageSource,
+    old: Option<&SourceUsageDocument>,
+    candidate: Result<SourceUsageDocument, super::scan::UsageScanError>,
+) -> anyhow::Result<()> {
+    let ferro = store
+        .as_ferro()
+        .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+    let candidate = match candidate {
+        Ok(doc) => doc,
+        Err(super::scan::UsageScanError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(_) => {
+            ferro.put_doc(
+                COLLECTION,
+                &key("source-error", &source.source_id),
+                &serde_json::json!({"kind":"source_error"}),
+            )?;
+            return Ok(());
+        }
+    };
+    let error_id = key("source-error", &source.source_id);
+    if ferro.get_doc(COLLECTION, &error_id)?.is_some() {
+        ferro.delete_doc(COLLECTION, &error_id)?;
+    }
+    if old != Some(&candidate) {
+        ferro.put_doc(
+            COLLECTION,
+            &key("source", &source.source_id),
+            &serde_json::json!({"kind":"source", "document":candidate}),
+        )?;
+    }
+    for parent in &candidate.parser.antigravity_parents {
+        put_identity(
+            store,
+            &IdentityMappingDocument {
+                session_id: candidate.session_id.clone(),
+                persona: None,
+                parent_id: Some(parent.clone()),
+                launch_time_ms: None,
+                provenance: format!("antigravity-parent:{parent}"),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Collect on a standalone store. Hub production uses short store-guard phases below.
 pub fn collect_once(
     store: &AnyStore,
     sources: &[UsageSource],
     identities: &[IdentityMappingDocument],
     limits: ScanLimits,
 ) -> anyhow::Result<()> {
-    let ferro = store
+    let _flight = COLLECTING.lock().unwrap_or_else(|e| e.into_inner());
+    // Validate even when both inputs are empty.
+    store
         .as_ferro()
         .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
-    let _flight = COLLECTING.lock().unwrap_or_else(|e| e.into_inner());
     for identity in identities {
-        let id = key(
-            "identity",
-            &format!("{}\0{}", identity.session_id, identity.provenance),
-        );
-        ferro.put_doc(
-            COLLECTION,
-            &id,
-            &serde_json::json!({"kind":"identity", "document":identity}),
-        )?;
+        put_identity(store, identity)?;
     }
     for source in sources {
-        let id = key("source", &source.source_id);
-        let old: Option<SourceUsageDocument> = ferro
-            .get_doc(COLLECTION, &id)?
-            .map(|v| serde_json::from_value(v["document"].clone()))
-            .transpose()?;
-        let candidate = match scan_source(source, old.as_ref(), limits) {
-            Ok(d) => d,
-            Err(super::scan::UsageScanError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
-            Err(_) => {
-                ferro.put_doc(
-                    COLLECTION,
-                    &key("source-error", &source.source_id),
-                    &serde_json::json!({"kind":"source_error"}),
-                )?;
-                continue;
-            }
-        };
-        let error_id = key("source-error", &source.source_id);
-        if ferro.get_doc(COLLECTION, &error_id)?.is_some() {
-            ferro.delete_doc(COLLECTION, &error_id)?;
-        }
-        if old.as_ref() != Some(&candidate) {
-            ferro.put_doc(
-                COLLECTION,
-                &id,
-                &serde_json::json!({"kind":"source", "document":candidate}),
-            )?;
-        }
-        for parent in &candidate.parser.antigravity_parents {
-            let mapping = IdentityMappingDocument {
-                session_id: candidate.session_id.clone(),
-                persona: None,
-                parent_id: Some(parent.clone()),
-                launch_time_ms: None,
-                provenance: format!("antigravity-parent:{parent}"),
-            };
-            let id = key(
-                "identity",
-                &format!("{}\0{}", mapping.session_id, mapping.provenance),
-            );
-            ferro.put_doc(
-                COLLECTION,
-                &id,
-                &serde_json::json!({"kind":"identity", "document":mapping}),
-            )?;
-        }
+        let old = read_source(store, source)?;
+        let candidate = scan_source(source, old.as_ref(), limits);
+        save_candidate(store, source, old.as_ref(), candidate)?;
     }
     Ok(())
 }
@@ -179,6 +205,11 @@ fn discover_usage_sources(home: &std::path::Path) -> (Vec<UsageSource>, bool) {
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
                     .map(str::to_owned),
+                UsageVendor::Grok
+                    if path.parent() == Some(root.as_path()) && name.ends_with(".jsonl") =>
+                {
+                    path.file_stem().and_then(|n| n.to_str()).map(str::to_owned)
+                }
                 UsageVendor::Grok if name == "chat_history.jsonl" => path
                     .parent()
                     .and_then(|p| p.file_name())
@@ -207,56 +238,83 @@ pub fn collect_hub(
     start: usize,
     prior_pending: bool,
 ) -> anyhow::Result<(usize, bool)> {
+    collect_hub_with_hook(state, start, prior_pending, || {})
+}
+
+fn collect_hub_with_hook(
+    state: &crate::HubState,
+    start: usize,
+    prior_pending: bool,
+    mut hook: impl FnMut(),
+) -> anyhow::Result<(usize, bool)> {
     let home = state
         .config
         .home_override
         .clone()
         .or_else(|| std::env::var_os("HOME").map(Into::into))
         .ok_or_else(|| anyhow::anyhow!("usage source home unavailable"))?;
+    // The flight spans snapshots, scans, and writes, while each store guard is brief.
+    let _flight = COLLECTING.lock().unwrap_or_else(|e| e.into_inner());
     let (sources, enumeration_incomplete) = discover_usage_sources(&home);
-    let store = state.open_store()?;
-    let snap = crate::discovery::snapshot_discovery_store(&store);
-    let routes = crate::discovery::discover_route_sessions_without_model_info(
-        &snap,
-        state.config.home_override.as_deref(),
-    );
-    let mut identities: Vec<_> = routes
-        .into_iter()
-        .filter_map(|r| {
-            let persona = r.persona?;
-            Some(IdentityMappingDocument {
-                session_id: r.id,
+    let (snap, hosted) = {
+        let store = state.open_store()?;
+        store
+            .as_ferro()
+            .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+        (
+            crate::discovery::snapshot_discovery_store(&store),
+            crate::lifecycle::list_hosted_sessions(&*store).unwrap_or_default(),
+        )
+    };
+    let mut identities: Vec<_> =
+        crate::discovery::usage_route_claims(&snap, state.config.home_override.as_deref())
+            .into_iter()
+            .map(|(session_id, persona, vendor)| IdentityMappingDocument {
+                session_id,
                 persona: Some(persona.clone()),
                 parent_id: None,
                 launch_time_ms: None,
-                provenance: format!("route:{}:{persona}", r.source),
+                provenance: format!("route:{vendor}:{persona}"),
             })
-        })
-        .collect();
-    if let Ok(records) = crate::lifecycle::list_hosted_sessions(&*store) {
-        for record in records {
-            let mut native_ids = crate::lifecycle::record_native_ids(&record);
-            if let Some(id) = record.vendor_session_id.as_deref()
-                && uuid::Uuid::parse_str(id).is_ok()
-                && !native_ids.iter().any(|old| old == id)
-            {
-                native_ids.push(id.to_owned());
-            }
-            for id in native_ids {
-                identities.push(IdentityMappingDocument {
-                    session_id: id,
-                    persona: Some(record.persona.clone()),
-                    parent_id: None,
-                    launch_time_ms: None,
-                    provenance: format!("hosted:{}:{}", record.vendor, record.persona),
-                });
-            }
+            .collect();
+    for record in hosted {
+        let mut native_ids = crate::lifecycle::record_native_ids(&record);
+        if let Some(id) = record.vendor_session_id.as_deref()
+            && uuid::Uuid::parse_str(id).is_ok()
+            && !native_ids.iter().any(|old| old == id)
+        {
+            native_ids.push(id.to_owned());
+        }
+        for id in native_ids {
+            identities.push(IdentityMappingDocument {
+                session_id: id,
+                persona: Some(record.persona.clone()),
+                parent_id: None,
+                launch_time_ms: None,
+                provenance: format!("hosted:{}:{}", record.vendor, record.persona),
+            });
+        }
+    }
+    {
+        let store = state.open_store()?;
+        for identity in &identities {
+            put_identity(&store, identity)?;
         }
     }
     let start = if start >= sources.len() { 0 } else { start };
     let end = (start + 8).min(sources.len());
     let selected = &sources[start..end];
-    collect_once(&store, selected, &identities, ScanLimits::default())?;
+    for source in selected {
+        let old = {
+            let store = state.open_store()?;
+            read_source(&store, source)?
+        };
+        hook();
+        let candidate = scan_source(source, old.as_ref(), ScanLimits::default());
+        let store = state.open_store()?;
+        save_candidate(&store, source, old.as_ref(), candidate)?;
+    }
+    let store = state.open_store()?;
     let next = if end >= sources.len() { 0 } else { end };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -351,7 +409,7 @@ mod tests {
         let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         writeln!(
             file,
-            "{{\"type\":\"GENERIC\",\"content\":\"Message sent to \\\"{}\\\".\"}}",
+            "{{\"type\":\"GENERIC\",\"content\":\"Some leading text. Message sent to \\\"{}\\\".\"}}",
             parent
         )
         .unwrap();
@@ -393,6 +451,77 @@ mod tests {
             fl_watch::usage::Attribution::Persona("Felix".into())
         );
         assert_eq!(read_sources(&store).unwrap(), docs);
+    }
+    #[test]
+    fn direct_grok_session_is_discovered_and_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".grok/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("session-id.jsonl"), "").unwrap();
+        let (sources, incomplete) = discover_usage_sources(root.path());
+        assert!(!incomplete);
+        let source = sources
+            .iter()
+            .find(|s| s.session_id == "session-id")
+            .unwrap();
+        let doc = scan_source(source, None, ScanLimits::default()).unwrap();
+        assert!(doc.coverage.unavailable);
+    }
+
+    #[test]
+    fn conflicting_route_claims_remain_ambiguous() {
+        let home = tempfile::tempdir().unwrap();
+        let mut routes = fl_wire::identity::RouteTable::default();
+        for persona in ["alice", "bob"] {
+            let mut one = fl_wire::identity::RouteTable::default();
+            one.upsert_explicit(
+                persona,
+                fl_wire::identity::VendorRoute::Codex {
+                    thread_id: "shared-session".into(),
+                    cwd: None,
+                },
+                fl_core::at::At::from_unix_millis(1),
+            );
+            routes.entries.extend(one.entries);
+        }
+        routes
+            .save(Some(&home.path().join(".cache/agent-bus/routes.json")))
+            .unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        collect_hub(&state, 0, false).unwrap();
+        let store = state.open_store().unwrap();
+        let mappings = read_identities(&store).unwrap();
+        assert_eq!(
+            fl_watch::usage::resolve_persona("shared-session", &mappings),
+            fl_watch::usage::Attribution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn collector_releases_store_guard_before_scanning() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("s.jsonl"), "").unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut scanned = false;
+        collect_hub_with_hook(&state, 0, false, || {
+            scanned = true;
+            assert!(
+                state.store_lock.try_lock().is_ok(),
+                "store lock held while scanning"
+            );
+        })
+        .unwrap();
+        assert!(scanned);
     }
     #[test]
     fn legacy_backend_reports_unsupported() {
