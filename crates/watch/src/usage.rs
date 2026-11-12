@@ -72,6 +72,8 @@ pub struct ParserState {
     #[serde(default)]
     pub antigravity_seen: Vec<u64>,
     #[serde(default)]
+    pub antigravity_parents: Vec<String>,
+    #[serde(default)]
     pub claude_seen: Vec<u64>,
     pub model: Option<String>,
     pub claude_recent: Vec<ClaudeBaseline>,
@@ -111,4 +113,92 @@ pub struct IdentityMappingDocument {
     pub parent_id: Option<String>,
     pub launch_time_ms: Option<u64>,
     pub provenance: String,
+}
+
+/// Identity joins remain independent of the source usage documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attribution {
+    Persona(String),
+    Unattributed,
+    Ambiguous,
+}
+
+pub fn resolve_persona(session: &str, mappings: &[IdentityMappingDocument]) -> Attribution {
+    use std::collections::HashSet;
+    let mut current = session;
+    let mut resolved: Option<String> = None;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.to_owned()) {
+            return Attribution::Ambiguous;
+        }
+        let mut persona = None;
+        let mut parent = None;
+        let mut found = false;
+        for entry in mappings.iter().filter(|m| m.session_id == current) {
+            found = true;
+            if let Some(p) = entry.persona.as_deref() {
+                if persona.is_some_and(|old| old != p) {
+                    return Attribution::Ambiguous;
+                }
+                persona = Some(p);
+            }
+            if let Some(p) = entry.parent_id.as_deref() {
+                if parent.is_some_and(|old| old != p) {
+                    return Attribution::Ambiguous;
+                }
+                parent = Some(p);
+            }
+        }
+        if let Some(p) = persona {
+            if resolved.as_deref().is_some_and(|old| old != p) {
+                return Attribution::Ambiguous;
+            }
+            resolved = Some(p.to_owned());
+        }
+        if !found || parent.is_none() {
+            return resolved.map_or(Attribution::Unattributed, Attribution::Persona);
+        }
+        current = parent.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    fn identity(id: &str, persona: Option<&str>, parent: Option<&str>) -> IdentityMappingDocument {
+        IdentityMappingDocument {
+            session_id: id.into(),
+            persona: persona.map(str::to_owned),
+            parent_id: parent.map(str::to_owned),
+            launch_time_ms: None,
+            provenance: "fixture".into(),
+        }
+    }
+    #[test]
+    fn late_parent_and_persona_resolve_without_rewriting_usage() {
+        let mut mappings = vec![identity("child", None, Some("parent"))];
+        assert_eq!(
+            resolve_persona("child", &mappings),
+            Attribution::Unattributed
+        );
+        mappings.push(identity("parent", Some("Felix"), None));
+        assert_eq!(
+            resolve_persona("child", &mappings),
+            Attribution::Persona("Felix".into())
+        );
+    }
+    #[test]
+    fn cycles_and_conflicting_evidence_are_never_guessed() {
+        let cycle = vec![
+            identity("a", None, Some("b")),
+            identity("b", None, Some("a")),
+        ];
+        assert_eq!(resolve_persona("a", &cycle), Attribution::Ambiguous);
+        let conflict = vec![
+            identity("a", Some("Felix"), None),
+            identity("a", Some("Ferris"), None),
+        ];
+        assert_eq!(resolve_persona("a", &conflict), Attribution::Ambiguous);
+    }
 }

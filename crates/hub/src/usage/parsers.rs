@@ -125,6 +125,22 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
     let kind = v.get("type").and_then(Value::as_str);
     match vendor {
         UsageVendor::Antigravity => {
+            if kind == Some("GENERIC")
+                && let Some(id) = v
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .and_then(|content| content.strip_prefix("Message sent to \""))
+                    .and_then(|suffix| suffix.split('\"').next())
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            {
+                let id = id.to_string();
+                if !state.antigravity_parents.contains(&id) {
+                    if state.antigravity_parents.len() >= 8 {
+                        return ParseOutcome::Incomplete;
+                    }
+                    state.antigravity_parents.push(id);
+                }
+            }
             if state.antigravity_unsafe {
                 match (
                     v.get("step_index").and_then(Value::as_u64),
@@ -494,5 +510,16 @@ mod tests {
                 &mut s,
             ));
         }
+    }
+    #[test]
+    fn parent_link_extracts_only_conversation_identifier() {
+        let mut state = ParserState::default();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let line = format!(
+            r#"{{"type":"GENERIC","content":"Message sent to \"{}\"."}}"#,
+            parent
+        );
+        parse_line(UsageVendor::Antigravity, line.as_bytes(), &mut state);
+        assert_eq!(state.antigravity_parents, vec![parent]);
     }
 }

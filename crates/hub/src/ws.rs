@@ -267,6 +267,29 @@ impl HubServer {
                 }
             });
         }
+        // One hub-owned worker performs scans serially, away from the async accept loop.
+        let usage_state = state.clone();
+        let mut usage_stop = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut next = 0;
+            let mut pending = false;
+            loop {
+                let work = usage_state.clone();
+                if let Ok(Ok((position, accumulated))) = tokio::task::spawn_blocking(move || {
+                    crate::usage::collector::collect_hub(&work, next, pending)
+                })
+                .await
+                {
+                    next = position;
+                    pending = accumulated;
+                }
+                let delay = if next == 0 && !pending { 30 } else { 5 };
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+                    _ = usage_stop.wait_for(|down| *down) => break,
+                }
+            }
+        });
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut hosted_reconcile_tick = tokio::time::interval_at(
