@@ -104,6 +104,83 @@ fn read_report(store: &AnyStore, query: &UsageReportQuery, now: u64) -> HttpResp
 mod tests {
     use super::*;
     #[test]
+    fn persisted_collection_reopens_and_reports_late_parent_without_double_counting() {
+        use crate::usage::collector::{collect_once, read_sources};
+        use crate::usage::scan::{ScanLimits, UsageSource};
+        use fl_watch::usage::{IdentityMappingDocument, UsageVendor};
+
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("transcript.jsonl");
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        std::fs::write(
+            &source_path,
+            format!(
+                "{{\"type\":\"GENERIC\",\"content\":\"Message sent to \\\"{parent}\\\"\"}}\n\
+                 {{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-08T00:30:00Z\",\"input_tokens\":42,\"output_tokens\":7,\"cache_read_tokens\":13,\"content\":\"private fixture text\"}}\n"
+            ),
+        ).unwrap();
+        let source = UsageSource {
+            path: source_path,
+            source_id: "isolated-source".into(),
+            session_id: "child".into(),
+            vendor: UsageVendor::Antigravity,
+        };
+        let opts = fl_store::StoreOptions {
+            backend: Some(fl_store::BackendKind::Ferro),
+            ..Default::default()
+        };
+        let db = root.path().join("test.fls");
+        let query = UsageReportQuery {
+            since_ms: 1_794_096_000_000,
+            by: UsageGroupBy::Persona,
+        };
+        let now = 1_794_099_600_000;
+        {
+            let store = fl_store::open_store_with(&db, &opts).unwrap();
+            collect_once(
+                &store,
+                std::slice::from_ref(&source),
+                &[],
+                ScanLimits::default(),
+            )
+            .unwrap();
+            let initial = aggregate_usage(&store, &query, now).unwrap();
+            assert_eq!(initial.rows[0].key, "unattributed");
+            assert_eq!(initial.rows[0].input, Some(42));
+        }
+        {
+            let store = fl_store::open_store_with(&db, &opts).unwrap();
+            let original = read_sources(&store).unwrap();
+            let identity = IdentityMappingDocument {
+                session_id: parent.into(),
+                persona: Some("Felix".into()),
+                parent_id: None,
+                launch_time_ms: None,
+                provenance: "fixture-route".into(),
+            };
+            collect_once(
+                &store,
+                std::slice::from_ref(&source),
+                &[identity],
+                ScanLimits::default(),
+            )
+            .unwrap();
+            collect_once(&store, &[source], &[], ScanLimits::default()).unwrap();
+            assert_eq!(read_sources(&store).unwrap(), original);
+            let report = aggregate_usage(&store, &query, now).unwrap();
+            assert_eq!(report.rows.len(), 1);
+            assert_eq!(report.rows[0].key, "Felix");
+            assert_eq!(report.rows[0].input, Some(42));
+            assert_eq!(report.rows[0].output, Some(7));
+            let response = read_report(&store, &query, now);
+            assert_eq!(response.status, 200);
+            let body = response.json_value().unwrap();
+            assert_eq!(body["rows"][0]["input"], 42);
+            assert_eq!(body["rows"][0]["key"], "Felix");
+            assert!(!body.to_string().contains("private fixture text"));
+        }
+    }
+    #[test]
     fn same_store_and_clock_produce_identical_json() {
         let store = AnyStore::in_memory();
         let query = UsageReportQuery {
