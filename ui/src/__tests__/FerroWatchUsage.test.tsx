@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { HubApiClient } from "../api/client";
 import { FerroWatchUsage } from "../components/FerroWatchUsage";
@@ -111,6 +111,52 @@ describe("FerroWatch usage", () => {
     sample.requested_start_ms += 12345;
     render(<FerroWatchUsage apiClient={client(vi.fn().mockResolvedValue(sample))} />);
     expect(await screen.findByText(/2026-11-10 00:10:12.345 UTC/)).toBeInTheDocument();
+  });
+
+  it("refreshes rolling usage and marks an old collection stale as time passes", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-11T00:10:00Z"));
+      const getUsage = vi.fn().mockResolvedValueOnce(report()).mockRejectedValue(new Error("offline"));
+      const view = render(<FerroWatchUsage apiClient={client(getUsage)} />);
+      await act(async () => {});
+      expect(screen.getByRole("table", { name: /token usage/i })).toBeInTheDocument();
+      expect(screen.queryByText(/collection data may be stale/i)).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(getUsage).toHaveBeenCalledTimes(2);
+      expect(screen.getByRole("alert")).toHaveTextContent("offline");
+      expect(screen.getByText(/showing previous results/i)).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(300_000); });
+      expect(screen.getByText(/collection data may be stale/i)).toBeInTheDocument();
+      const calls = getUsage.mock.calls.length;
+      view.unmount();
+      await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+      expect(getUsage).toHaveBeenCalledTimes(calls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the latest periodic response when an earlier request resolves late", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-11T00:10:00Z"));
+      let resolveOld!: (value: WatchUsageReport) => void;
+      const oldRequest = new Promise<WatchUsageReport>((resolve) => { resolveOld = resolve; });
+      const newer = report();
+      newer.rows[0].key = "New report";
+      newer.requested_end_ms += 60_000;
+      const getUsage = vi.fn().mockReturnValueOnce(oldRequest).mockResolvedValue(newer);
+      render(<FerroWatchUsage apiClient={client(getUsage)} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(screen.getByText("New report")).toBeInTheDocument();
+      expect(screen.getByText(/requested window:.*00:11 UTC/i)).toBeInTheDocument();
+      await act(async () => { resolveOld(report()); });
+      expect(screen.getByText("New report")).toBeInTheDocument();
+      expect(screen.queryByText("Zoe")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
 });

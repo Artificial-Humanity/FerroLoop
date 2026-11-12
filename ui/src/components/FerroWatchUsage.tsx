@@ -33,7 +33,16 @@ export function FerroWatchUsage({ apiClient }: { apiClient: HubApiClient }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const [sort, setSort] = useState<{ key: Column; ascending: boolean }>({ key: "key", ascending: true });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+      setRefresh((n) => n + 1);
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -91,7 +100,7 @@ export function FerroWatchUsage({ apiClient }: { apiClient: HubApiClient }) {
         {report.coverage.ambiguous_sources > 0 && <p>{report.coverage.ambiguous_sources} source(s) have ambiguous attribution.</p>}
         {report.coverage.pending && <p role="status">Collection in progress.</p>}
         {report.coverage.incomplete && <p role="status">Collection is incomplete; totals may be partial.</p>}
-        {report.coverage.last_success_ms === null ? <p>No completed collection yet.</p> : report.requested_end_ms - report.coverage.last_success_ms > 300_000 && <p>Collection data may be stale. Last collected {utc(report.coverage.last_success_ms)}.</p>}
+        {report.coverage.last_success_ms === null ? <p>No completed collection yet.</p> : now - report.coverage.last_success_ms > 300_000 && <p>Collection data may be stale. Last collected {utc(report.coverage.last_success_ms)}.</p>}
         {report.coverage.unknown_launch_times > 0 && <p>{report.coverage.unknown_launch_times.toLocaleString("en-US")} subagent launch time(s) unknown; subagent counts are partial.</p>}
         {report.coverage.undated_observations > 0 && <p>Undated usage is outside this window: input {cell(report.undated, "input", 0)}, output {cell(report.undated, "output", 0)}, cache read {cell(report.undated, "cache_read", 0)}, cache write {cell(report.undated, "cache_write", 0)}.</p>}
         {sorted.length === 0 ? <p>No usage for this period.</p> : <div data-testid="usage-table-scroll" tabIndex={0} role="region" aria-label="Scroll usage table" style={{ overflowX: "auto", maxWidth: "100%" }}>
