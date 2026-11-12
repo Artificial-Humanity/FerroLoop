@@ -1260,6 +1260,104 @@ impl Catalog for FaultyStore {
     }
 }
 
+impl fl_core::store::MessageStore for FaultyStore {
+    fn send_wire(
+        &self,
+        args: fl_core::ferrowire::SendWireArgs,
+    ) -> Result<
+        (
+            fl_core::ferrowire::WireMessage,
+            Vec<fl_core::ferrowire::DeliveryReceipt>,
+        ),
+        StoreError,
+    > {
+        self.inner.send_wire(args)
+    }
+    fn send_wire_awaiting_daemon(
+        &self,
+        args: fl_core::ferrowire::SendWireArgs,
+    ) -> Result<
+        (
+            fl_core::ferrowire::WireMessage,
+            Vec<fl_core::ferrowire::DeliveryReceipt>,
+        ),
+        StoreError,
+    > {
+        self.inner.send_wire_awaiting_daemon(args)
+    }
+    fn list_wire_awaiting_daemon(
+        &self,
+    ) -> Result<Vec<(fl_core::ids::MessageId, fl_core::At)>, StoreError> {
+        self.inner.list_wire_awaiting_daemon()
+    }
+    fn clear_wire_awaiting_daemon(&self, id: &fl_core::ids::MessageId) -> Result<(), StoreError> {
+        self.inner.clear_wire_awaiting_daemon(id)
+    }
+    fn get_wire_message(
+        &self,
+        id: &fl_core::ids::MessageId,
+    ) -> Result<Option<fl_core::ferrowire::WireMessage>, StoreError> {
+        self.inner.get_wire_message(id)
+    }
+    fn list_wire_inbox(
+        &self,
+        filter: &fl_core::ferrowire::WireFilter,
+    ) -> Result<Vec<fl_core::ferrowire::WireInboxItem>, StoreError> {
+        self.inner.list_wire_inbox(filter)
+    }
+    fn list_wire_thread(
+        &self,
+        thread_id: &fl_core::ferrowire::ThreadId,
+    ) -> Result<Vec<fl_core::ferrowire::WireMessage>, StoreError> {
+        self.inner.list_wire_thread(thread_id)
+    }
+    fn list_wire_replies(
+        &self,
+        correlation_id: &fl_core::ids::MessageId,
+    ) -> Result<Vec<fl_core::ferrowire::WireMessage>, StoreError> {
+        self.inner.list_wire_replies(correlation_id)
+    }
+    fn list_wire_receipts(
+        &self,
+        message_id: &fl_core::ids::MessageId,
+    ) -> Result<Vec<fl_core::ferrowire::DeliveryReceipt>, StoreError> {
+        self.inner.list_wire_receipts(message_id)
+    }
+    fn update_wire_receipt(
+        &self,
+        message_id: &fl_core::ids::MessageId,
+        recipient: &str,
+        status: fl_core::ferrowire::DeliveryStatus,
+        increment_attempts: bool,
+        at: At,
+    ) -> Result<Option<fl_core::ferrowire::DeliveryReceipt>, StoreError> {
+        self.inner
+            .update_wire_receipt(message_id, recipient, status, increment_attempts, at)
+    }
+    fn wire_messages_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, fl_core::ferrowire::WireMessage)>, StoreError> {
+        self.inner.wire_messages_after(after_seq)
+    }
+    fn wire_receipts_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, fl_core::ferrowire::DeliveryReceipt)>, StoreError> {
+        self.inner.wire_receipts_after(after_seq)
+    }
+    fn import_wire_batch(
+        &self,
+        messages: &[fl_core::ferrowire::WireMessage],
+        receipts: &[fl_core::ferrowire::DeliveryReceipt],
+    ) -> Result<fl_core::ferrowire::WireImportReport, StoreError> {
+        self.inner.import_wire_batch(messages, receipts)
+    }
+    fn prune_wire(&self, before: At) -> Result<usize, StoreError> {
+        self.inner.prune_wire(before)
+    }
+}
+
 fn faulty_remodel(
     store: &FaultyStore,
     env: &LifecycleEnv<'_>,
@@ -1658,6 +1756,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_DECOMMISSIONED.into(),
+        stop_reason: None,
         restart_policy: "never".into(),
         restart_count: 0,
         tmux_target: None,
@@ -1670,6 +1769,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         tombstone_ids: vec!["gs-old".into()],
         vendor_session_id: None,
         pid: None,
+        runtime_leader_pid: None,
         pid_start_time: None,
         created_at_ms: 1,
         updated_at_ms: 1,

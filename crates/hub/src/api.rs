@@ -2026,6 +2026,8 @@ pub struct HubRouteDispatchObservation {
     pub route_updated_at: Option<fl_core::at::At>,
     pub explicit: bool,
     pub outcome: fl_wire::dispatch_diagnostics::DispatchCallOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_settle_ms: Option<u64>,
 }
 
 fn is_zero_usize(n: &usize) -> bool {
@@ -2084,6 +2086,7 @@ impl HubRouteDispatchObservation {
             route_updated_at,
             explicit,
             outcome,
+            paste_settle_ms,
         } = obs;
         Self {
             adapter,
@@ -2091,6 +2094,7 @@ impl HubRouteDispatchObservation {
             route_updated_at,
             explicit,
             outcome,
+            paste_settle_ms,
         }
     }
 }
@@ -7666,8 +7670,9 @@ fn handle_post_session_spin_up(
     if payload.context_window.is_none() {
         payload.context_window = default_context_window_for(state, &payload);
     }
-    match lifecycle::spin_up(
-        &*store,
+    match lifecycle::spin_up_with_store(
+        store,
+        || state.open_store().map_err(LifecycleError::from),
         &lifecycle_env(state),
         &payload,
         authority.actor_name(),
@@ -8014,8 +8019,9 @@ fn handle_post_hosted_session_restart(
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    match lifecycle::restart_hosted_session(
-        &*store,
+    match lifecycle::restart_hosted_session_with_store(
+        store,
+        || state.open_store().map_err(LifecycleError::from),
         &lifecycle_env(state),
         id,
         authority.actor_name(),
@@ -11617,6 +11623,7 @@ mod council_guidance_tests {
                                 route_updated_at: Some(ts_for_status.clone()),
                                 explicit: true,
                                 outcome: DispatchCallOutcome::ReturnedOk,
+                                paste_settle_ms: None,
                             },
                             RouteDispatchObservation {
                                 adapter: RouteAdapter::Claude,
@@ -11624,6 +11631,7 @@ mod council_guidance_tests {
                                 route_updated_at: Some(ts_for_status.clone()),
                                 explicit: false,
                                 outcome: DispatchCallOutcome::ReturnedError,
+                                paste_settle_ms: None,
                             },
                         ],
                         omitted_route_observations: 0,

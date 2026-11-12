@@ -42,11 +42,11 @@
 //! pass, so a pane restored late is still found; each orphan is reported once.
 
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use fl_core::agent::AgentStatus;
-use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
 use fl_core::state::{
     MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload, StateScope,
     UpsertStateArgs,
@@ -60,16 +60,18 @@ use serde_json::json;
 
 use crate::HubState;
 use crate::lifecycle::{
-    HostedSessionRecord, MUSE_SESSION, STATUS_DECOMMISSIONING, list_hosted_sessions, remove_routes,
-    route_table_paths, tmux_stdout, tmux_stdout_of, undeliverable,
+    HostedSessionRecord, HydrationReceipt, MUSE_SESSION, STATUS_DECOMMISSIONED,
+    STATUS_DECOMMISSIONING, STATUS_RUNNING, hydration_ack_slug, is_valid_hydration_generation,
+    list_hosted_sessions, remove_routes, route_table_paths, tmux_stdout, tmux_stdout_of,
+    undeliverable,
 };
 
 /// Runtime state entry (workspace scope) that holds the boot the hub last reconciled.
 pub(crate) const EPOCH_SLUG: &str = "host-boot-epoch";
 /// The subject of the notice.
 pub(crate) const NOTICE_SUBJECT: &str = "Host restarted";
-/// The body of the notice.
-pub(crate) const NOTICE_BODY: &str = "The host restarted. Resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.";
+/// The body of the notice when no specific modified instruction files can be enumerated.
+pub(crate) const NOTICE_BODY: &str = "The host restarted. Re-read any instruction files (`AGENTS.md`, `WORKFLOW.md`, `PERSONA.md`, or your role guidance file) modified since your hydration, then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.";
 /// The sender of the notice, as for the hub's other system messages.
 const NOTICE_SENDER: &str = "system";
 /// With no boot record, the host counts as just rebooted while it has been up no longer than this.
@@ -335,7 +337,189 @@ fn decommissioning(records: &[HostedSessionRecord]) -> Vec<String> {
         .collect()
 }
 
-fn send_notice<S: MessageStore + AgentRegistry>(store: &S, persona: &str) -> Result<(), String> {
+fn safe_role_stem(role_label: Option<&str>) -> Option<String> {
+    let raw = role_label?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lowered = raw.to_ascii_lowercase();
+    let stem = lowered.strip_prefix("custom:").unwrap_or(&lowered);
+    if stem.is_empty()
+        || stem == "."
+        || stem.contains("..")
+        || stem.contains('/')
+        || stem.contains('\\')
+        || stem.contains(':')
+        || stem.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut components = Path::new(stem).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Some(stem.to_string()),
+        _ => None,
+    }
+}
+
+fn regular_file_canonical_and_mtime_ms(path: &Path) -> Option<(PathBuf, u64)> {
+    let canonical = path.canonicalize().ok()?;
+    let meta = std::fs::metadata(&canonical).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some((canonical, millis(dur)))
+}
+
+const MODIFIED_NOTICE_PREFIX: &str = "The host restarted. Re-read instruction files modified since your hydration before continuing: ";
+const MODIFIED_NOTICE_SUFFIX: &str = ". Then resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.";
+
+fn format_modified_instruction_notice(modified: &[String]) -> String {
+    if modified.is_empty() {
+        NOTICE_BODY.to_string()
+    } else {
+        format!(
+            "{MODIFIED_NOTICE_PREFIX}{}{MODIFIED_NOTICE_SUFFIX}",
+            modified.join(", ")
+        )
+    }
+}
+
+fn extract_modified_instruction_files(body: &str) -> Vec<String> {
+    let Some(rest) = body.strip_prefix(MODIFIED_NOTICE_PREFIX) else {
+        return Vec::new();
+    };
+    let Some(list_part) = rest.strip_suffix(MODIFIED_NOTICE_SUFFIX) else {
+        return Vec::new();
+    };
+    list_part
+        .split(", ")
+        .map(str::trim)
+        .filter(|s| s.starts_with('`') && s.ends_with('`') && s.len() > 2)
+        .map(str::to_string)
+        .collect()
+}
+
+fn merge_modified_instruction_files(existing: &[Vec<String>], candidate: &[String]) -> Vec<String> {
+    const CANONICAL_PREFIX: [&str; 3] = ["`AGENTS.md`", "`WORKFLOW.md`", "`PERSONA.md`"];
+    let mut union: Vec<String> = Vec::new();
+    for list in existing.iter().map(Vec::as_slice).chain([candidate]) {
+        for item in list {
+            if !union.contains(item) {
+                union.push(item.clone());
+            }
+        }
+    }
+    let mut ordered: Vec<String> = Vec::with_capacity(union.len());
+    for fixed in CANONICAL_PREFIX {
+        if union.iter().any(|s| s == fixed) {
+            ordered.push(fixed.to_string());
+        }
+    }
+    for item in union {
+        if !ordered.contains(&item) {
+            ordered.push(item);
+        }
+    }
+    ordered
+}
+
+/// Format the `"Host restarted"` instruction-refresh notice body, listing any candidate
+/// instruction files (`AGENTS.md`, `WORKFLOW.md`, `PERSONA.md`, `docs/roles/<role>.md`,
+/// `.agents/roles/<role>.md`, `../.agents/roles/<role>.md`) whose `mtime_ms > baseline_ms`, or
+/// returning [`NOTICE_BODY`] when none changed or `cwd` / `baseline_ms` is unknown.
+pub(crate) fn format_host_restarted_notice(
+    cwd: Option<&Path>,
+    role_label: Option<&str>,
+    baseline_ms: Option<u64>,
+) -> String {
+    let (Some(cwd), Some(baseline_ms)) = (cwd, baseline_ms) else {
+        return NOTICE_BODY.to_string();
+    };
+    let mut candidates = vec![
+        "AGENTS.md".to_string(),
+        "WORKFLOW.md".to_string(),
+        "PERSONA.md".to_string(),
+    ];
+    if let Some(role) = safe_role_stem(role_label) {
+        candidates.push(format!("docs/roles/{role}.md"));
+        candidates.push(format!(".agents/roles/{role}.md"));
+        candidates.push(format!("../.agents/roles/{role}.md"));
+    }
+    let mut seen_canonical = BTreeSet::new();
+    let mut modified = Vec::new();
+    for rel in candidates {
+        let candidate = cwd.join(&rel);
+        let Some((canonical, mtime_ms)) = regular_file_canonical_and_mtime_ms(&candidate) else {
+            continue;
+        };
+        if !seen_canonical.insert(canonical) {
+            continue;
+        }
+        if mtime_ms > baseline_ms {
+            modified.push(format!("`{rel}`"));
+        }
+    }
+    format_modified_instruction_notice(&modified)
+}
+
+/// Resolve the hydration baseline timestamp (`hydration-ack-<gen>.accepted_at_ms`, falling back to
+/// `record.created_at_ms` when positive) for comparing instruction file modification times.
+pub(crate) fn hydration_baseline_ms<S: StateStore>(
+    store: &S,
+    record: &HostedSessionRecord,
+) -> Option<u64> {
+    if let Some(generation) = record.hydration_generation.as_deref()
+        && is_valid_hydration_generation(generation)
+        && let Ok(Some(entry)) = store.get_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &hydration_ack_slug(generation),
+        )
+        && let StatePayload::Runtime(rt) = entry.payload
+        && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
+        && receipt.persona.eq_ignore_ascii_case(&record.persona)
+        && (receipt.session_id.is_empty()
+            || receipt.session_id.eq_ignore_ascii_case(&record.session_id))
+        && receipt.accepted_at_ms > 0
+    {
+        return Some(receipt.accepted_at_ms);
+    }
+    (record.created_at_ms > 0).then_some(record.created_at_ms)
+}
+
+fn notice_body_for_persona<S: StateStore>(
+    store: &S,
+    hosted: &[HostedSessionRecord],
+    persona: &str,
+) -> String {
+    let matching = hosted
+        .iter()
+        .filter(|r| {
+            r.persona.eq_ignore_ascii_case(persona)
+                && !r.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONING)
+                && !r.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONED)
+        })
+        .max_by_key(|r| {
+            (
+                r.status.eq_ignore_ascii_case(STATUS_RUNNING),
+                r.updated_at_ms,
+            )
+        });
+    let cwd = matching.and_then(|r| r.cwd.as_deref()).map(Path::new);
+    let role_label = matching
+        .map(|r| r.role.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let baseline_ms = matching.and_then(|r| hydration_baseline_ms(store, r));
+    format_host_restarted_notice(cwd, role_label, baseline_ms)
+}
+
+fn send_notice_with_body<S: MessageStore + AgentRegistry>(
+    store: &S,
+    persona: &str,
+    body: &str,
+) -> Result<(), String> {
     store
         .send_wire(SendWireArgs {
             id: None,
@@ -347,7 +531,7 @@ fn send_notice<S: MessageStore + AgentRegistry>(store: &S, persona: &str) -> Res
             urgency: MessageUrgency::Normal,
             durable: true,
             subject: NOTICE_SUBJECT.into(),
-            body: NOTICE_BODY.into(),
+            body: body.to_string(),
             reply_to: None,
             thread_id: None,
             deadline_at: None,
@@ -355,6 +539,182 @@ fn send_notice<S: MessageStore + AgentRegistry>(store: &S, persona: &str) -> Res
         })
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+fn record_epoch_notified_best_effort<S: StateStore>(store: &S, host: &Host, persona: &str) {
+    if let Some(boot_id) = host.boot_id.as_deref()
+        && let Some(mut epoch) = epoch_state(store)
+        && epoch.boot_id == boot_id
+        && !epoch
+            .notified
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(persona))
+    {
+        epoch.notified.push(persona.to_string());
+        if let Err(e) = save_epoch(store, &epoch) {
+            eprintln!(
+                "hub: failed to record service-resume notice for `{persona}` in boot epoch: {e}"
+            );
+        }
+    }
+}
+
+/// Enqueue a durable `"Host restarted"` system mail for a service-level `--resume` respawn in
+/// `store`, deduplicating against any unread `"Host restarted"` mail already in `persona`'s inbox
+/// and marking `EpochRecord.notified` for `host.boot_id` when present so a subsequent
+/// [`reconcile_pass_with`] in the same boot does not send a duplicate.
+pub(crate) fn send_service_resume_notice_if_unnotified_in_store<
+    S: MessageStore + AgentRegistry + StateStore,
+>(
+    store: &S,
+    host: &Host,
+    persona: &str,
+    cwd: Option<&Path>,
+    role_label: Option<&str>,
+    baseline_ms: Option<u64>,
+) -> Result<bool, String> {
+    let Some(persona) = normalize_persona(persona) else {
+        return Err(format!("invalid persona `{persona}`"));
+    };
+
+    let agents = store.list_agents(None, true).map_err(|e| e.to_string())?;
+    let is_active = agents
+        .iter()
+        .any(|a| a.name_key.eq_ignore_ascii_case(&persona) && a.status == AgentStatus::Active);
+    let is_retired = !is_active
+        && agents
+            .iter()
+            .any(|a| a.name_key.eq_ignore_ascii_case(&persona) && a.status == AgentStatus::Retired);
+    if is_retired {
+        return Ok(false);
+    }
+
+    let hosted = list_hosted_sessions(store).unwrap_or_default();
+    let persona_hosted: Vec<&HostedSessionRecord> = hosted
+        .iter()
+        .filter(|r| r.persona.eq_ignore_ascii_case(&persona))
+        .collect();
+    if persona_hosted
+        .iter()
+        .any(|r| r.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONING))
+        || (!persona_hosted.is_empty()
+            && persona_hosted
+                .iter()
+                .all(|r| r.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONED)))
+    {
+        return Ok(false);
+    }
+
+    let candidate_body = format_host_restarted_notice(cwd, role_label, baseline_ms);
+    let unread = store
+        .list_wire_inbox(&WireFilter {
+            recipient: Some(persona.clone()),
+            unread_only: true,
+            ..WireFilter::default()
+        })
+        .map_err(|e| e.to_string())?;
+    let unread_notices: Vec<_> = unread
+        .into_iter()
+        .filter(|item| {
+            item.message.sender_name == NOTICE_SENDER && item.message.subject == NOTICE_SUBJECT
+        })
+        .collect();
+    if !unread_notices.is_empty() {
+        let existing_file_lists: Vec<Vec<String>> = unread_notices
+            .iter()
+            .map(|item| extract_modified_instruction_files(&item.message.body))
+            .collect();
+        let latest_files = existing_file_lists.last().cloned().unwrap_or_default();
+        let candidate_files = extract_modified_instruction_files(&candidate_body);
+        let merged_files = merge_modified_instruction_files(&existing_file_lists, &candidate_files);
+
+        if merged_files.is_empty() || merged_files == latest_files {
+            record_epoch_notified_best_effort(store, host, &persona);
+            return Ok(false);
+        }
+
+        let merged_body = format_modified_instruction_notice(&merged_files);
+        let now_at = stamp::now();
+        for item in &unread_notices {
+            store
+                .update_wire_receipt(
+                    &item.message.id,
+                    &persona,
+                    fl_core::ferrowire::DeliveryStatus::Acked,
+                    false,
+                    now_at.clone(),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        send_notice_with_body(store, &persona, &merged_body)?;
+        record_epoch_notified_best_effort(store, host, &persona);
+        return Ok(true);
+    }
+
+    send_notice_with_body(store, &persona, &candidate_body)?;
+    record_epoch_notified_best_effort(store, host, &persona);
+    Ok(true)
+}
+
+/// Convenience wrapper around [`send_service_resume_notice_if_unnotified_in_store`] using
+/// [`Host::current`].
+pub(crate) fn send_service_resume_notice_in_store<S: MessageStore + AgentRegistry + StateStore>(
+    store: &S,
+    persona: &str,
+    cwd: Option<&Path>,
+    role_label: Option<&str>,
+    baseline_ms: Option<u64>,
+) -> Result<bool, String> {
+    send_service_resume_notice_if_unnotified_in_store(
+        store,
+        &Host::current(),
+        persona,
+        cwd,
+        role_label,
+        baseline_ms,
+    )
+}
+
+/// Enqueue a durable `"Host restarted"` system mail for a service-level `--resume` respawn via
+/// `state`, deduplicating against unread inbox notices and updating `EpochRecord.notified` for
+/// `host.boot_id` when present.
+#[allow(dead_code)]
+pub(crate) fn send_service_resume_notice_if_unnotified(
+    state: &HubState,
+    host: &Host,
+    persona: &str,
+    cwd: Option<&Path>,
+    role_label: Option<&str>,
+    baseline_ms: Option<u64>,
+) -> Result<bool, String> {
+    let store = state.open_store().map_err(|e| e.to_string())?;
+    send_service_resume_notice_if_unnotified_in_store(
+        &*store,
+        host,
+        persona,
+        cwd,
+        role_label,
+        baseline_ms,
+    )
+}
+
+/// Convenience wrapper around [`send_service_resume_notice_if_unnotified`] using [`Host::current`].
+#[allow(dead_code)]
+pub(crate) fn send_service_resume_notice(
+    state: &HubState,
+    persona: &str,
+    cwd: Option<&Path>,
+    role_label: Option<&str>,
+    baseline_ms: Option<u64>,
+) -> Result<bool, String> {
+    send_service_resume_notice_if_unnotified(
+        state,
+        &Host::current(),
+        persona,
+        cwd,
+        role_label,
+        baseline_ms,
+    )
 }
 
 impl Memory {
@@ -634,9 +994,10 @@ pub(crate) fn reconcile_pass_with(
             let sent = if memory.take_send_failure() {
                 Err("injected send failure".to_string())
             } else {
-                memory
-                    .open_for_send(state)
-                    .and_then(|store| send_notice(&*store, &name))
+                memory.open_for_send(state).and_then(|store| {
+                    let body = notice_body_for_persona(&*store, &hosted, &name);
+                    send_notice_with_body(&*store, &name, &body)
+                })
             };
             match sent {
                 Ok(()) => {
@@ -661,6 +1022,8 @@ pub(crate) fn reconcile_pass_with(
     {
         eprintln!("hub: the boot record was not saved: {e}");
     }
+    let _ = crate::lifecycle::reconcile_and_respawn_hosted_sessions_in_hub(state);
+    let _ = crate::lifecycle::reconcile_running_session_pids_in_hub(state);
     Ok(report)
 }
 

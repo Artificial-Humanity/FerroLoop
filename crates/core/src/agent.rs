@@ -540,7 +540,7 @@ pub fn builtin_role_records() -> Vec<RoleRecord> {
         ),
         (
             "assistant",
-            "Assisting Engineer",
+            "Software Engineer",
             "Executes delegated engineering tasks with local subagent pre-review.",
             RoleReviewPolicy::LeadReview,
             "Read .agents/roles/assistant.md and execute delegated implementation tasks.",

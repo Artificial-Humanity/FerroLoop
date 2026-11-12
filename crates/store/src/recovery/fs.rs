@@ -39,6 +39,8 @@ pub enum Member {
     RestoreGuard,
     RestoreJournal,
     RestoreOperationLock,
+    RestorePin,
+    RestoreProbe,
     Reconciliation,
     PurgeAudit,
     CatalogLock,
@@ -58,6 +60,7 @@ pub enum Directory {
     RestoreJournalParent,
     RestoreOperationLockParent,
     RestoreGuardParent,
+    RestorePinParent,
     PurgeParent,
     CatalogLockParent,
 }
@@ -68,9 +71,11 @@ pub enum RecoveryEvent {
     CatalogLockWait,
     Exchange,
     RestoreInstall,
+    RestoreExchangeProbe,
     RestoreRelocate,
     RestoreReverseExchange,
     RestoreGuardRemove,
+    RestorePinRemove,
     RestoreOperationLock,
     RestoreOperationLockWait,
     PurgeUnlink,
@@ -381,14 +386,29 @@ impl Dir {
         expected: (u64, u64),
         l: &OperationLimits,
     ) -> Result<(), RecoveryError> {
+        self.remove_file_checked(name, expected, l, |_| Ok(()))
+    }
+    /// Bind deletion authority after the last injectable descriptor open. The
+    /// validator must finish injected reads before its final authority checks;
+    /// only noninjectable held/name checks remain before unlinkat.
+    pub(crate) fn remove_file_checked(
+        &self,
+        name: &str,
+        expected: (u64, u64),
+        l: &OperationLimits,
+        validate: impl FnOnce(&PrivateFile) -> Result<(), RecoveryError>,
+    ) -> Result<(), RecoveryError> {
         self.same_name(l)?;
+        let component = component(name, l)?;
         let held = PrivateFile::open(&self.path.join(name), false, l)?;
         if held.identity() != expected {
             return Err(l.verification());
         }
-        let name = component(name, l)?;
+        validate(&held)?;
+        held.unchanged(l)?;
+        self.same_name(l)?;
         // SAFETY: validated single component relative to held private directory.
-        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), component.as_ptr(), 0) } != 0 {
             return Err(destination(l));
         }
         Ok(())
@@ -995,12 +1015,24 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     name: &str,
     l: &OperationLimits,
 ) -> Result<T, RecoveryError> {
+    Ok(read_json_retained(dir, name, &mut l.clone())?.0)
+}
+
+/// Decode one held JSON member with the existing 32x bound, then retain that
+/// model reservation in the caller's scope. Decode scratch is charged once;
+/// subsequent reads/hashes add their buffers alongside the surviving model.
+pub(crate) fn read_json_retained<T: serde::de::DeserializeOwned>(
+    dir: &Dir,
+    name: &str,
+    l: &mut OperationLimits,
+) -> Result<(T, u64), RecoveryError> {
     let file = PrivateFile::open(&dir.path.join(name), false, l)?;
     let len = file.file.metadata().map_err(|_| destination(l))?.len();
     l.quota(len, l.byte_limit, "metadata bytes")?;
+    let model_bytes = len.checked_mul(32).ok_or_else(|| l.verification())?;
     l.admit_memory(
-        len.checked_mul(32)
-            .and_then(|n| n.checked_add(65536))
+        model_bytes
+            .checked_add(65536)
             .ok_or_else(|| l.verification())?,
     )?;
     let n = usize::try_from(len).map_err(|_| l.verification())?;
@@ -1012,7 +1044,8 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     let value = serde_json::from_slice(&bytes).map_err(|_| l.verification())?;
     file.unchanged(l)?;
     l.check()?;
-    Ok(value)
+    *l = l.with_retained_memory(model_bytes)?;
+    Ok((value, model_bytes))
 }
 
 #[cfg(test)]
@@ -1141,6 +1174,85 @@ mod lock_tests {
 #[cfg(test)]
 mod read_tests {
     use super::*;
+
+    #[test]
+    fn oversized_parsed_json_still_refuses_before_owned_decode() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&"x".repeat(32768)).unwrap();
+        std::fs::write(root.path().join("parsed.json"), &bytes).unwrap();
+        std::fs::set_permissions(
+            root.path().join("parsed.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        let dir = Dir::open(root.path(), &l).unwrap();
+        assert!(matches!(
+            read_json::<String>(&dir, "parsed.json", &l),
+            Err(RecoveryError::Quota {
+                resource: "working memory",
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("parsed.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn retained_json_models_coexist_across_sequential_reads() {
+        let root = crate::recovery::test_support::fixture_root();
+        let bytes = serde_json::to_vec(&"x".repeat(32768)).unwrap();
+        for name in ["first.json", "second.json"] {
+            std::fs::write(root.path().join(name), &bytes).unwrap();
+            std::fs::set_permissions(
+                root.path().join(name),
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let mut l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            2 << 20,
+            super::super::CancelToken::new(),
+        );
+        let model = bytes.len() as u64 * 32;
+        assert!(model + 65536 <= l.memory_byte_limit);
+        assert!(2 * model + 65536 > l.memory_byte_limit);
+        let dir = Dir::open(root.path(), &l).unwrap();
+        // Each decode fits in isolation, including its fixed read buffer.
+        let mut isolated = l.clone();
+        let (second, _) = read_json_retained::<String>(&dir, "second.json", &mut isolated).unwrap();
+        assert_eq!(second.len(), 32768);
+        drop(second);
+        let (first, _) = read_json_retained::<String>(&dir, "first.json", &mut l).unwrap();
+        assert!(
+            matches!(
+                read_json_retained::<String>(&dir, "second.json", &mut l),
+                Err(RecoveryError::Quota {
+                    resource: "working memory",
+                    ..
+                })
+            ),
+            "second decode must account for the still-live first owned JSON model"
+        );
+        assert_eq!(first, "x".repeat(32768));
+        for name in ["first.json", "second.json"] {
+            assert_eq!(std::fs::read(root.path().join(name)).unwrap(), bytes);
+        }
+    }
 
     #[test]
     fn exact_read_eof_remains_verification_failure() {
@@ -1335,4 +1447,24 @@ mod catalog_lock_tests {
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         assert_eq!(after.mode() & 0o7777, 0o600);
     }
+}
+
+pub(crate) fn writable_existing(
+    path: &Path,
+    held: &super::verify::PrivateFile,
+    l: &OperationLimits,
+) -> Result<std::fs::File, RecoveryError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    held.unchanged(l)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| destination(l))?;
+    super::verify::privacy(&file, false, l)?;
+    if identity(&file, l)? != held.identity() {
+        return Err(l.verification());
+    }
+    Ok(file)
 }

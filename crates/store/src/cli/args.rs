@@ -369,6 +369,8 @@ pub enum RecoveryCommand {
     Restore,
     Resume,
     Rollback,
+    /// Abandon an untouched pre-exchange restore, retaining its artifacts.
+    Abandon,
     /// Explicit typed client/dependency/effect reconciliation before admission.
     Finalize,
     /// Finalize the journal-proven original verified generation using rollback reserve.

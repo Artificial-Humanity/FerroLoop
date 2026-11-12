@@ -49,6 +49,7 @@ pub struct OfflineRestoreRequestV1 {
     pub bundle_operation: uuid::Uuid,
     pub metadata_byte_limit: u64,
     pub space_margin_bytes: u64,
+    pub original_profile: ValidationProfile,
     pub available_dependencies: Vec<readiness::DependencyResolution>,
 }
 #[derive(Debug, Deserialize, Serialize)]
@@ -250,6 +251,7 @@ pub fn run(args: &super::args::RecoveryArgs, selected: Option<&Path>) -> Result<
                 limits: l,
                 metadata_byte_limit: r.metadata_byte_limit,
                 space_margin_bytes: r.space_margin_bytes,
+                original_profile: r.original_profile,
                 available_dependencies: r.available_dependencies,
             };
             serde_json::to_value(
@@ -257,7 +259,10 @@ pub fn run(args: &super::args::RecoveryArgs, selected: Option<&Path>) -> Result<
             )
             .map_err(Error::Json)
         }
-        RecoveryCommand::Resume | RecoveryCommand::Rollback | RecoveryCommand::Status => {
+        RecoveryCommand::Resume
+        | RecoveryCommand::Rollback
+        | RecoveryCommand::Abandon
+        | RecoveryCommand::Status => {
             let r: RestoreContinuationRequestV1 = private_request(request_path()?, &l)?;
             continuation(&r, &lease, selected)?;
             if matches!(args.action, RecoveryCommand::Status) {
@@ -270,6 +275,8 @@ pub fn run(args: &super::args::RecoveryArgs, selected: Option<&Path>) -> Result<
                 restore::load_restore_journal(&r.journal, &lease, &filesystem).map_err(error)?;
             let result = if matches!(args.action, RecoveryCommand::Resume) {
                 restore::resume_restore(&journal, &lease, &filesystem)
+            } else if matches!(args.action, RecoveryCommand::Abandon) {
+                restore::abandon_restore(&journal, &lease, &filesystem)
             } else {
                 restore::rollback_restore(&journal, &lease, &filesystem)
             };

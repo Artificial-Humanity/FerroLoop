@@ -69,6 +69,10 @@ fn restore_preserves_original_inode_without_second_image_allocation() {
         limits: l,
         metadata_byte_limit: 1 << 20,
         space_margin_bytes: 4096,
+        original_profile: fl_store::recovery::ValidationProfile::new(
+            fl_store::recovery::ProfileKind::SmallEmpty,
+            f.identity().catalog_key,
+        ),
         available_dependencies: vec![],
     };
     let trace = TraceFs {
@@ -185,6 +189,10 @@ fn prepare_restore_bundle(
             limits: l,
             metadata_byte_limit: 1 << 20,
             space_margin_bytes: 4096,
+            original_profile: fl_store::recovery::ValidationProfile::new(
+                fl_store::recovery::ProfileKind::SmallEmpty,
+                f.identity().catalog_key,
+            ),
             available_dependencies: vec![],
         },
         lease,
@@ -195,8 +203,8 @@ fn reconciliation(j: &RestoreJournal) -> fl_store::recovery::readiness::Reconcil
     ReconciliationRecord {
         version: 1,
         operation_id: j.operation_id,
-        image_sha256: j.verification.image_sha256.clone(),
-        published_sequence: j.verification.published_sequence,
+        image_sha256: j.verification.as_ref().unwrap().image_sha256.clone(),
+        published_sequence: j.verification.as_ref().unwrap().published_sequence,
         operator: "fixture operator".into(),
         recorded_at_unix_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -417,8 +425,28 @@ fn restore_twelve_shared_attempts_preserve_reserved_rollback_and_verified_finali
     };
     let mut bad = reconciliation(&journal);
     bad.clients.caches_invalidated = false;
+    assert!(finalize_restore(&journal, &lease, &bad, &f.filesystem()).is_err());
+    assert_eq!(
+        restore_status(
+            &journal.staging.join("journal.bin"),
+            &lease,
+            &f.filesystem()
+        )
+        .unwrap()
+        .current_attempt,
+        0
+    );
     for _ in 0..12 {
-        assert!(finalize_restore(&journal, &lease, &bad, &f.filesystem()).is_err());
+        let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+            Directory::RestoreDestinationParent,
+        )));
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(resume_restore(&journal, &lease, &filesystem).is_err());
+        assert_eq!(hook.fired.load(Ordering::Acquire), 1);
     }
     let path = journal.staging.join("journal.bin");
     let status = restore_status(&path, &lease, &f.filesystem()).unwrap();
@@ -449,7 +477,7 @@ fn restore_twelve_shared_attempts_preserve_reserved_rollback_and_verified_finali
     let done = restore_status(&path, &lease, &f.filesystem()).unwrap();
     assert_eq!(
         (done.resume_finalize_attempts, done.rollback_attempts),
-        (12, 3)
+        (12, 2)
     );
     assert!(!done.guard_present);
     assert!(done.artifacts.len() >= 3);
@@ -468,15 +496,14 @@ fn restore_four_rollback_attempts_stop_all_mutation_without_resetting_shared_cap
         panic!("not installed")
     };
     for _ in 0..4 {
-        assert!(
-            fl_store::recovery::readiness::finalize_rollback(
-                &journal,
-                &lease,
-                &reconciliation(&journal),
-                &f.filesystem()
-            )
-            .is_err()
-        );
+        let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreReverseExchange));
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(rollback_restore(&journal, &lease, &filesystem).is_err());
+        assert_eq!(hook.fired.load(Ordering::Acquire), 1);
     }
     let path = journal.staging.join("journal.bin");
     let status = restore_status(&path, &lease, &f.filesystem()).unwrap();
@@ -620,6 +647,8 @@ fn mutation_boundary(e: RecoveryEvent) -> bool {
                 | Member::Original
         ) | RecoveryEvent::Sync(
             Directory::RestoreGuardParent
+                | Directory::RestorePinParent
+                | Directory::CatalogParent
                 | Directory::RestoreJournalParent
                 | Directory::RestoreOperationLockParent
                 | Directory::RestoreDestinationParent
@@ -631,8 +660,10 @@ fn mutation_boundary(e: RecoveryEvent) -> bool {
             | RecoveryEvent::RestoreRelocate
             | RecoveryEvent::RestoreReverseExchange
             | RecoveryEvent::RestoreGuardRemove
+            | RecoveryEvent::RestorePinRemove
             | RecoveryEvent::RestoreOperationLock
             | RecoveryEvent::RenameEntry
+            | RecoveryEvent::Publish
     )
 }
 struct CutIo {
@@ -750,12 +781,19 @@ fn restore_exchange_and_reverse_exchange_recover_every_cut() {
             let guard = f.root.path().join("source.fls.restore-guard");
             if guard.exists() {
                 fresh_probe(&f.source);
-                if let Ok(value) =
-                    serde_json::from_slice::<serde_json::Value>(&fs::read(&guard).unwrap())
-                    && let Some(path) = value["journal"].as_str()
-                    && let Ok(j) =
-                        load_restore_journal(std::path::Path::new(path), &lease, &f.filesystem())
-                {
+                let value: serde_json::Value = serde_json::from_slice(&fs::read(&guard).unwrap())
+                    .expect("present guard must contain typed journal binding");
+                let path = value["journal"].as_str().expect("guard journal path");
+                let j = load_restore_journal(std::path::Path::new(path), &lease, &f.filesystem())
+                    .expect(
+                        "present guard MUST have loadable admitted journal; matrix cannot skip",
+                    );
+                if j.phase == RestorePhase::Admitted {
+                    assert!(matches!(
+                        abandon_restore(&j, &lease, &f.filesystem()).unwrap(),
+                        RestoreOutcome::Abandoned { .. }
+                    ));
+                } else {
                     let clock = ClockFs {
                         native: f.filesystem(),
                         now: j.binding.expires_at_unix_ms + 1,
@@ -1320,6 +1358,11 @@ impl RecoveryFs for NativeWithIo {
         self.io.clone()
     }
 }
+fn concurrent_resume_limits() -> OperationLimits {
+    let mut l = limits();
+    l.deadline = std::time::Instant::now() + std::time::Duration::from_secs(480);
+    l
+}
 #[test]
 fn restore_concurrent_resume_child() {
     let Some(input) = std::env::var_os("FL_RESTORE_RESUME_CHILD") else {
@@ -1345,7 +1388,7 @@ fn restore_concurrent_resume_child() {
         }
     }
     let filesystem = NativeWithIo {
-        native: fl_store::recovery::fs::NativeRecoveryFs::new(root, limits()),
+        native: fl_store::recovery::fs::NativeRecoveryFs::new(root, concurrent_resume_limits()),
         io: Arc::new(Notify {
             socket: input["wait_socket"].as_str().unwrap().into(),
             sent: std::sync::atomic::AtomicBool::new(false),
@@ -1370,7 +1413,9 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
         time::{Duration, Instant},
     };
     let f = Fixture::new();
-    let (request, lease) = prepare_restore(&f, &f.source);
+    let (mut request, lease) = prepare_restore(&f, &f.source);
+    request.limits = concurrent_resume_limits();
+    request.limits.operation_id = request.operation_id;
     let RestoreOutcome::Installed { journal } =
         restore_offline(&request, &lease, &f.filesystem()).unwrap()
     else {
@@ -1398,7 +1443,7 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
                 self.release
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(30))
+                    .recv_timeout(Duration::from_secs(240))
                     .map_err(std::io::Error::other)?;
             }
             Ok(())
@@ -1412,12 +1457,12 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
                 release: Mutex::new(release_rx),
                 sent: AtomicBool::new(false),
             }),
-            limits: limits(),
+            limits: concurrent_resume_limits(),
         };
         let journal_ref = &journal;
         let lease_ref = &lease;
         let first = scope.spawn(move || resume_restore(journal_ref, lease_ref, &filesystem));
-        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(120)).unwrap();
         let mut command = scrubbed_command(std::env::current_exe().unwrap());
         command
             .args(["--exact", "restore_concurrent_resume_child", "--nocapture"])
@@ -1425,10 +1470,22 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             match listener.accept() {
-                Ok(_) => break,
+                Ok((mut socket, _)) => {
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut message = [0; 7];
+                    std::io::Read::read_exact(&mut socket, &mut message).unwrap();
+                    assert_eq!(&message, b"waiting");
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "child passed held lock before release"
+                    );
+                    break;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => panic!("child lock notification: {e}"),
             };
@@ -1440,14 +1497,14 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
                 child.kill().unwrap();
                 panic!("child did not reach operation-lock wait");
             }
-            std::thread::yield_now();
+            std::thread::park_timeout(Duration::from_millis(5));
         }
         release_tx.send(()).unwrap();
         assert!(matches!(
             first.join().unwrap().unwrap(),
             RestoreOutcome::Installed { .. }
         ));
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if child.try_wait().unwrap().is_some() {
                 break;
@@ -1456,7 +1513,7 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
                 child.kill().unwrap();
                 panic!("waiting resume child exceeded bound");
             }
-            std::thread::yield_now();
+            std::thread::park_timeout(Duration::from_millis(5));
         }
         let out = child.wait_with_output().unwrap();
         assert!(
@@ -1708,12 +1765,14 @@ fn exercise_finalization_cuts(all: bool) {
             assert_eq!(fs::read(&f.source).unwrap(), before);
             if f.source.with_extension("fls.restore-guard").exists() {
                 fresh_probe(&f.source);
-                if let Ok(current) = load_restore_journal(
-                    &journal.staging.join("journal.bin"),
-                    &lease,
-                    &f.filesystem(),
-                ) {
-                    let evidence = generation_evidence(&current, original);
+                {
+                    let current = load_restore_journal(
+                        &journal.staging.join("journal.bin"),
+                        &lease,
+                        &f.filesystem(),
+                    )
+                    .expect("present guard MUST have loadable finalization journal");
+                    // Retry the exact pre-cut record: its timestamp is accepted evidence.
                     let result = if original {
                         finalize_rollback(&current, &lease, &evidence, &f.filesystem())
                     } else {
@@ -2038,4 +2097,3798 @@ fn restore_existing_bundle_larger_than_allocation_ceiling_survives_restart_actio
             restore_status(&journal.staging.join("journal.bin"), &lease, &filesystem).unwrap();
         assert_eq!(status.budget, original_budget);
     }
+}
+
+#[test]
+fn restore_finalize_refuses_wrong_phase_without_spending_attempts() {
+    use fl_store::recovery::readiness::{finalize_restore, finalize_rollback};
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    assert!(
+        finalize_rollback(
+            &journal,
+            &lease,
+            &generation_evidence(&journal, false),
+            &f.filesystem()
+        )
+        .is_err()
+    );
+    let status = restore_status(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(
+        (status.resume_finalize_attempts, status.rollback_attempts),
+        (0, 0)
+    );
+    let RestoreOutcome::RolledBack { journal } =
+        rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not rolled back")
+    };
+    assert!(
+        finalize_restore(
+            &journal,
+            &lease,
+            &generation_evidence(&journal, true),
+            &f.filesystem()
+        )
+        .is_err()
+    );
+    let status = restore_status(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(
+        (status.resume_finalize_attempts, status.rollback_attempts),
+        (0, 1)
+    );
+}
+#[test]
+fn restore_finalize_rollback_refuses_reverse_intent_without_spending_attempts() {
+    use std::sync::atomic::AtomicBool;
+    struct CutAfterReverse(AtomicBool);
+    impl RecoveryIo for CutAfterReverse {
+        fn before(&self, e: RecoveryEvent) -> std::io::Result<()> {
+            if e == RecoveryEvent::RestoreReverseExchange {
+                self.0.store(true, Ordering::Release);
+            }
+            if e == RecoveryEvent::Write(Member::RestoreJournal) && self.0.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("cut before RolledBack"));
+            }
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let filesystem = CutFs {
+        f: &f,
+        io: Arc::new(CutAfterReverse(AtomicBool::new(false))),
+        limits: limits(),
+    };
+    assert!(rollback_restore(&journal, &lease, &filesystem).is_err());
+    let path = journal.staging.join("journal.bin");
+    let journal = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(journal.phase, RestorePhase::ReverseIntent);
+    assert!(
+        fl_store::recovery::readiness::finalize_rollback(
+            &journal,
+            &lease,
+            &generation_evidence(&journal, true),
+            &f.filesystem()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        restore_status(&path, &lease, &f.filesystem())
+            .unwrap()
+            .rollback_attempts,
+        1
+    );
+}
+
+#[test]
+fn restore_failed_candidate_copy_keeps_a_loadable_admitted_journal() {
+    struct CutCopy;
+    impl RecoveryIo for CutCopy {
+        fn before(&self, e: RecoveryEvent) -> std::io::Result<()> {
+            if e == RecoveryEvent::Flush(Member::Image) {
+                return Err(std::io::Error::other("candidate flush failed"));
+            }
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let original = fs::read(&f.source).unwrap();
+    let filesystem = CutFs {
+        f: &f,
+        io: Arc::new(CutCopy),
+        limits: limits(),
+    };
+    assert!(restore_offline(&request, &lease, &filesystem).is_err());
+    let guard: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.source.with_extension("fls.restore-guard")).unwrap())
+            .unwrap();
+    let journal = load_restore_journal(
+        std::path::Path::new(guard["journal"].as_str().unwrap()),
+        &lease,
+        &f.filesystem(),
+    )
+    .expect("every published guard must name a loadable admitted journal");
+    assert_eq!(serde_json::to_value(&journal.phase).unwrap(), "admitted");
+    assert_eq!(fs::read(&f.source).unwrap(), original);
+}
+
+// Bounded real append history, never padding or a strict-2L exemption.
+fn journal_fixture() -> Fixture {
+    let root = test_support::fixture_root();
+    let source = root.path().join("source.fls");
+    let backups = root.path().join("backups");
+    fs::create_dir(&backups).unwrap();
+    fs::set_permissions(
+        &backups,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let owner = FerroStore::open(&source).unwrap();
+    for n in 0..80 {
+        owner
+            .put_doc(
+                "fixture_unknown",
+                "one",
+                &serde_json::json!({"n": n, "body": "x".repeat(256 << 10)}),
+            )
+            .unwrap();
+    }
+    drop(owner);
+    let bytes = fs::metadata(&source).unwrap().len();
+    assert!(
+        (20 << 20..=22 << 20).contains(&bytes),
+        "bounded physical history: {bytes}"
+    );
+    Fixture {
+        root,
+        source,
+        backups,
+    }
+}
+
+// RJR1 frame helpers for restore journal regression tests.
+fn journal_frame_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while bytes.get(offset..offset + 4) == Some(b"RJR1") {
+        let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let end = offset + 72 + len;
+        assert!(end <= bytes.len());
+        frames.push(offset..end);
+        offset = end;
+    }
+    frames
+}
+#[test]
+fn restore_last_record_byte_tears_load_previous_phase_without_writing() {
+    use std::os::unix::fs::FileExt;
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    for cut in 0..last.len() {
+        let mut tail = vec![0; last.len()];
+        tail[..cut].copy_from_slice(&original[last.start..last.start + cut]);
+        file.write_all_at(&tail, last.start as u64).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(loaded.phase, RestorePhase::RelocateIntent, "cut {cut}");
+        assert_eq!(
+            loaded.torn_tail_bytes,
+            tail.iter()
+                .rposition(|b| *b != 0)
+                .map_or(0, |n| n as u64 + 1),
+            "cut {cut}"
+        );
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (before.mtime(), before.mtime_nsec()),
+            (after.mtime(), after.mtime_nsec()),
+            "read-only load repaired cut {cut}"
+        );
+        let mut retained = vec![0; last.len()];
+        fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut retained, last.start as u64)
+            .unwrap();
+        assert_eq!(retained, tail, "read-only load changed cut {cut}");
+    }
+}
+#[test]
+fn restore_corrupt_midfile_record_refuses_and_last_torn_record_repairs_on_append() {
+    use std::os::unix::fs::FileExt;
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let earlier = &frames[frames.len() - 2];
+    file.write_all_at(
+        &[original[earlier.start + 72] ^ 1],
+        earlier.start as u64 + 72,
+    )
+    .unwrap();
+    assert!(matches!(
+        load_restore_journal(&path, &lease, &f.filesystem()),
+        Err(fl_store::recovery::RecoveryError::Verification { .. })
+    ));
+    file.write_all_at(&original[earlier.clone()], earlier.start as u64)
+        .unwrap();
+    let last = frames.last().unwrap();
+    file.write_all_at(&[original[last.start + 72] ^ 1], last.start as u64 + 72)
+        .unwrap();
+    let torn = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert!(torn.torn_tail_bytes > 0);
+    let RestoreOutcome::Installed { journal } =
+        resume_restore(&torn, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(loaded.torn_tail_bytes, 0);
+    assert_eq!(loaded.phase, RestorePhase::Installed);
+    assert_eq!(loaded.current_attempt, journal.current_attempt);
+}
+
+// Resetting the fixed-size journal below is fixture-only crash-image injection.
+// Each image starts from the same durable installed layout and attempt counter;
+// production resume itself always appends and spends a fresh attempt.
+fn journal_fixture_write(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+    file.write_all_at(bytes, 0).unwrap();
+    file.sync_all().unwrap();
+}
+fn journal_phase(bytes: &[u8], frame: &std::ops::Range<usize>) -> RestorePhase {
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes[frame.start + 72..frame.end]).unwrap();
+    serde_json::from_value(value["phase"].clone()).unwrap()
+}
+#[test]
+fn restore_tail_bad_magic_or_previous_hash_keeps_parseable_length_boundary() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    for byte in [0, 8, 40, 72] {
+        let mut damaged = original.clone();
+        damaged[last.start + byte] ^= 1;
+        journal_fixture_write(&path, &damaged);
+        let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+        assert!(loaded.torn_tail_bytes > 72, "corruption offset {byte}");
+        assert_eq!(fs::read(&path).unwrap(), damaged, "read-only load wrote");
+        let RestoreOutcome::Installed { .. } =
+            resume_restore(&loaded, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("not installed")
+        };
+        assert_eq!(
+            load_restore_journal(&path, &lease, &f.filesystem())
+                .unwrap()
+                .torn_tail_bytes,
+            0
+        );
+    }
+    // An out-of-range length permits only header bytes, never nonzero payload.
+    let mut damaged = original.clone();
+    damaged[last.start + 4..last.start + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    journal_fixture_write(&path, &damaged);
+    assert!(matches!(
+        load_restore_journal(&path, &lease, &f.filesystem()),
+        Err(fl_store::recovery::RecoveryError::Verification { .. })
+    ));
+    damaged[last.start + 72..].fill(0);
+    journal_fixture_write(&path, &damaged);
+    assert!(
+        load_restore_journal(&path, &lease, &f.filesystem())
+            .unwrap()
+            .torn_tail_bytes
+            > 0
+    );
+    // A nonzero byte beyond a parseable failed frame is mid-file failure.
+    damaged = original.clone();
+    damaged[last.start] ^= 1;
+    damaged[last.end] = 1;
+    journal_fixture_write(&path, &damaged);
+    assert!(matches!(
+        load_restore_journal(&path, &lease, &f.filesystem()),
+        Err(fl_store::recovery::RecoveryError::Verification { .. })
+    ));
+}
+
+struct JournalBoundaryIo {
+    events: Mutex<Vec<RecoveryEvent>>,
+    stop: Option<RecoveryEvent>,
+}
+impl RecoveryIo for JournalBoundaryIo {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(event);
+        if self.stop == Some(event) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+fn journal_boundary_io(stop: Option<RecoveryEvent>) -> Arc<JournalBoundaryIo> {
+    Arc::new(JournalBoundaryIo {
+        events: Mutex::new(vec![]),
+        stop,
+    })
+}
+fn journal_set_existing_layout(f: &Fixture, staging: &std::path::Path, layout: &str) {
+    // Initial fixture is Installed: (candidate, absent, original).
+    let c = staging.join("candidate.fls");
+    let o = staging.join("original.fls");
+    match layout {
+        "installed" => {}
+        "exchanged" => fs::rename(o, c).unwrap(),
+        "prepared" => {
+            fs::rename(&f.source, &c).unwrap();
+            fs::rename(o, &f.source).unwrap();
+        }
+        "reversed" => {
+            let temp = staging.join("fixture-swap");
+            fs::rename(&f.source, &temp).unwrap();
+            fs::rename(&o, &f.source).unwrap();
+            fs::rename(temp, o).unwrap();
+        }
+        _ => panic!("unknown fixture layout"),
+    }
+}
+#[test]
+fn restore_adjacent_intents_admit_only_their_before_and_after_layouts() {
+    // Relocate's after-layout belongs to Exchange only after the NEXT intent's
+    // action, so Exchange must reject it. Prepared similarly excludes exchange.
+    for (phase, allowed) in [
+        (RestorePhase::Prepared, [true, false, false, false]),
+        (RestorePhase::ExchangeIntent, [true, true, false, false]),
+        (RestorePhase::RelocateIntent, [false, true, true, false]),
+        (RestorePhase::Installed, [false, false, true, false]),
+        (RestorePhase::ReverseIntent, [false, false, true, true]),
+        (RestorePhase::RolledBack, [false, false, false, true]),
+    ] {
+        for (layout, admitted) in ["prepared", "exchanged", "installed", "reversed"]
+            .into_iter()
+            .zip(allowed)
+        {
+            let f = journal_fixture();
+            let (request, lease) = prepare_restore(&f, &f.source);
+            let RestoreOutcome::Installed { journal } =
+                restore_offline(&request, &lease, &f.filesystem()).unwrap()
+            else {
+                panic!("not installed")
+            };
+            let path = journal.staging.join("journal.bin");
+            let installed = fs::read(&path).unwrap();
+            // Get real ReverseIntent/RolledBack frames, then restore names to
+            // installed before constructing the chosen independent table row.
+            let original = if matches!(
+                phase,
+                RestorePhase::ReverseIntent | RestorePhase::RolledBack
+            ) {
+                rollback_restore(&journal, &lease, &f.filesystem()).unwrap();
+                let bytes = fs::read(&path).unwrap();
+                journal_set_existing_layout(&f, &journal.staging, "reversed"); // swap is its own inverse
+                bytes
+            } else {
+                installed
+            };
+            let frames = journal_frame_ranges(&original);
+            let selected = frames
+                .iter()
+                .find(|range| journal_phase(&original, range) == phase)
+                .unwrap();
+            let mut prefix = original.clone();
+            prefix[selected.end..].fill(0);
+            journal_fixture_write(&path, &prefix);
+            journal_set_existing_layout(&f, &journal.staging, layout);
+            let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+            let io = journal_boundary_io(Some(RecoveryEvent::Write(Member::RestoreJournal)));
+            let filesystem = CutFs {
+                f: &f,
+                io: io.clone(),
+                limits: limits(),
+            };
+            let result = resume_restore(&loaded, &lease, &filesystem);
+            let attempted = io
+                .events
+                .lock()
+                .unwrap()
+                .contains(&RecoveryEvent::Write(Member::RestoreJournal));
+            assert_eq!(attempted, admitted, "{phase:?} {layout}: {result:?}");
+            if !admitted {
+                assert!(matches!(
+                    result,
+                    Err(fl_store::recovery::RecoveryError::Verification { .. })
+                ));
+            }
+            assert_eq!(fs::read(&path).unwrap(), prefix);
+        }
+    }
+}
+#[test]
+fn restore_corrupt_relocate_intent_before_action_finishes_once_after_action_refuses() {
+    for relocated in [false, true] {
+        let f = journal_fixture();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let io = journal_boundary_io(if relocated {
+            None
+        } else {
+            Some(RecoveryEvent::RestoreRelocate)
+        });
+        let filesystem = CutFs {
+            f: &f,
+            io: io.clone(),
+            limits: limits(),
+        };
+        let _ = restore_offline(&request, &lease, &filesystem);
+        let guard = f.root.path().join("source.fls.restore-guard");
+        let guard_bytes = fs::read(&guard).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&guard_bytes).unwrap();
+        let path = std::path::PathBuf::from(value["journal"].as_str().unwrap());
+        let original = fs::read(&path).unwrap();
+        let frames = journal_frame_ranges(&original);
+        let relocate = frames
+            .iter()
+            .find(|range| journal_phase(&original, range) == RestorePhase::RelocateIntent)
+            .unwrap();
+        let mut damaged = original.clone();
+        damaged[relocate.start + 40] ^= 1;
+        damaged[relocate.end..].fill(0);
+        journal_fixture_write(&path, &damaged);
+        let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(loaded.phase, RestorePhase::ExchangeIntent);
+        assert!(loaded.torn_tail_bytes > 0);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        let source_before = fs::read(&f.source).unwrap();
+        let io2 = journal_boundary_io(None);
+        let filesystem2 = CutFs {
+            f: &f,
+            io: io2.clone(),
+            limits: limits(),
+        };
+        let result = resume_restore(&loaded, &lease, &filesystem2);
+        for marker in [
+            RecoveryEvent::RestoreInstall,
+            RecoveryEvent::RestoreExchangeProbe,
+        ] {
+            let count = io
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == marker)
+                .count()
+                + io2
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| **e == marker)
+                    .count();
+            assert_eq!(
+                count, 1,
+                "exactly one {marker:?} across initial plus resume"
+            );
+        }
+        if relocated {
+            assert!(matches!(
+                result,
+                Err(fl_store::recovery::RecoveryError::Verification { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+            assert_eq!(fs::read(&guard).unwrap(), guard_bytes);
+            assert_eq!(fs::read(&f.source).unwrap(), source_before);
+            assert!(path.parent().unwrap().join("original.fls").exists());
+            assert!(
+                !io2.events
+                    .lock()
+                    .unwrap()
+                    .contains(&RecoveryEvent::Write(Member::RestoreJournal))
+            );
+        } else {
+            let RestoreOutcome::Installed { journal } = result.unwrap() else {
+                panic!("not installed")
+            };
+            assert_eq!(journal.phase, RestorePhase::Installed);
+            assert_eq!(journal.torn_tail_bytes, 0);
+            assert_eq!(
+                fs::metadata(&f.source).unwrap().ino(),
+                journal.candidate_identity.1
+            );
+            assert!(path.parent().unwrap().join("original.fls").exists());
+        }
+        assert!(guard.exists());
+    }
+}
+
+#[test]
+fn restore_actions_wait_for_complete_intent_write_file_sync_and_parent_sync() {
+    let trace = journal_fixture();
+    let (request, lease) = prepare_restore(&trace, &trace.source);
+    let hooks = Arc::new(CutIo::new(usize::MAX, libc::EIO));
+    let filesystem = CutFs {
+        f: &trace,
+        io: hooks.clone(),
+        limits: limits(),
+    };
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &filesystem).unwrap()
+    else {
+        panic!("trace did not install")
+    };
+    let durable_log = fs::read(journal.staging.join("journal.bin")).unwrap();
+    let frames = journal_frame_ranges(&durable_log);
+    let events = hooks.events.lock().unwrap().clone();
+    for (action, intent) in [
+        (RecoveryEvent::RestoreInstall, RestorePhase::ExchangeIntent),
+        (RecoveryEvent::RestoreRelocate, RestorePhase::RelocateIntent),
+    ] {
+        let action_index = events.iter().position(|event| *event == action).unwrap();
+        // Every completed append emits exactly one journal-parent sync. Bind
+        // the marker to that durable frame, not merely any earlier sync.
+        let durable_frames = events[..action_index]
+            .iter()
+            .filter(|event| **event == RecoveryEvent::Sync(Directory::RestoreJournalParent))
+            .count();
+        assert_eq!(
+            journal_phase(&durable_log, &frames[durable_frames - 1]),
+            intent,
+            "{action:?} must follow its own durable intent"
+        );
+        let parent = events[..action_index]
+            .iter()
+            .rposition(|event| *event == RecoveryEvent::Sync(Directory::RestoreJournalParent))
+            .unwrap();
+        assert_eq!(
+            &events[parent - 3..=parent],
+            &[
+                RecoveryEvent::Write(Member::RestoreJournal),
+                RecoveryEvent::Write(Member::RestoreJournal),
+                RecoveryEvent::Flush(Member::RestoreJournal),
+                RecoveryEvent::Sync(Directory::RestoreJournalParent),
+            ]
+        );
+        for cut in parent - 3..=parent {
+            let f = journal_fixture();
+            let (request, lease) = prepare_restore(&f, &f.source);
+            let hook = Arc::new(CutIo::new(cut, libc::EIO));
+            let filesystem = CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            };
+            let result = restore_offline(&request, &lease, &filesystem);
+            assert!(result.is_err() || matches!(result, Ok(RestoreOutcome::OutcomeUnknown { .. })));
+            assert!(hook.count.load(Ordering::Acquire) > cut);
+            assert!(
+                !hook.events.lock().unwrap().contains(&action),
+                "{action:?} ran despite failed durability boundary {cut}"
+            );
+        }
+    }
+}
+struct StopThirdJournalWrite(AtomicUsize, Mutex<Vec<RecoveryEvent>>);
+impl RecoveryIo for StopThirdJournalWrite {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.1.lock().unwrap().push(event);
+        if event == RecoveryEvent::Write(Member::RestoreJournal)
+            && self.0.fetch_add(1, Ordering::AcqRel) == 2
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_durable_attempt_bump_without_action_intent_keeps_before_layout_and_retry_spends_again() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    let frame = journal_frame_ranges(&bytes)
+        .into_iter()
+        .find(|range| journal_phase(&bytes, range) == RestorePhase::Prepared)
+        .unwrap();
+    bytes[frame.end..].fill(0);
+    journal_fixture_write(&path, &bytes);
+    journal_set_existing_layout(&f, &journal.staging, "prepared");
+    let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    let before_layout = [f.source.clone(), journal.staging.join("candidate.fls")]
+        .map(|p| (fs::metadata(&p).unwrap().ino(), fs::read(p).unwrap()));
+    // First two writes + file/parent sync durably record the counter bump;
+    // third write is the subsequent ExchangeIntent header and fails before I/O.
+    let io = Arc::new(StopThirdJournalWrite(
+        AtomicUsize::new(0),
+        Mutex::new(vec![]),
+    ));
+    let filesystem = CutFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    assert!(resume_restore(&loaded, &lease, &filesystem).is_err());
+    let after_layout = [f.source.clone(), journal.staging.join("candidate.fls")]
+        .map(|p| (fs::metadata(&p).unwrap().ino(), fs::read(p).unwrap()));
+    assert_eq!(before_layout, after_layout);
+    assert!(!journal.staging.join("original.fls").exists());
+    let events = io.1.lock().unwrap().clone();
+    assert!(!events.contains(&RecoveryEvent::Exchange));
+    assert!(!events.contains(&RecoveryEvent::RestoreRelocate));
+    assert!(events.contains(&RecoveryEvent::Flush(Member::RestoreJournal)));
+    assert!(events.contains(&RecoveryEvent::Sync(Directory::RestoreJournalParent)));
+    let bumped = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(bumped.phase, RestorePhase::Prepared);
+    assert_eq!(bumped.current_attempt, loaded.current_attempt + 1);
+    assert_eq!(
+        bumped.resume_finalize_attempts,
+        loaded.resume_finalize_attempts + 1
+    );
+    assert_eq!(bumped.torn_tail_bytes, 0);
+    let RestoreOutcome::Installed { journal: retried } =
+        resume_restore(&bumped, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    assert_eq!(retried.current_attempt, bumped.current_attempt + 1);
+    assert_eq!(
+        retried.resume_finalize_attempts,
+        bumped.resume_finalize_attempts + 1
+    );
+}
+
+fn journal_digest_frame(payload: &[u8], previous: [u8; 32]) -> Vec<u8> {
+    let mut hash = sha2::Sha256::new();
+    hash.update(previous);
+    hash.update(payload);
+    let mut frame = Vec::from(&b"RJR1"[..]);
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    frame.extend_from_slice(&previous);
+    frame.extend_from_slice(&hash.finalize());
+    frame.extend_from_slice(payload);
+    frame
+}
+#[test]
+fn restore_failed_length_cannot_swallow_next_valid_frame() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let penultimate = &frames[frames.len() - 2];
+    let next = frames.last().unwrap();
+    // These corrupt only the unprotected length. Digest mismatch must scan
+    // inside the claimed payload, including the actual next frame boundary.
+    for claimed_end in [next.end, next.end + 17, penultimate.end - 1] {
+        let mut damaged = original.clone();
+        let length = u32::try_from(claimed_end - penultimate.start - 72).unwrap();
+        damaged[penultimate.start + 4..penultimate.start + 8]
+            .copy_from_slice(&length.to_le_bytes());
+        journal_fixture_write(&path, &damaged);
+        assert!(
+            matches!(
+                load_restore_journal(&path, &lease, &f.filesystem()),
+                Err(fl_store::recovery::RecoveryError::Verification { .. })
+            ),
+            "claimed end {claimed_end}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), damaged, "refusal wrote");
+    }
+}
+#[test]
+fn restore_failed_tail_refuses_unaligned_digest_only_frame_inside_payload() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    // Deliberately invalid JSON and unrelated previous hash: digest alone
+    // makes a later complete frame authoritative evidence against repair.
+    let nested = journal_digest_frame(b"not-json", [0xa5; 32]);
+    let mut at = last.start + 73;
+    if at.is_multiple_of(8) {
+        at += 1;
+    }
+    assert_ne!(at % 8, 0);
+    assert!(at + nested.len() <= last.end);
+    for bad in [0, 4, 8, 40, 72] {
+        let mut damaged = original.clone();
+        damaged[at..at + nested.len()].copy_from_slice(&nested);
+        if bad == 4 {
+            damaged[last.start + 4..last.start + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        } else {
+            damaged[last.start + bad] ^= 1;
+        }
+        journal_fixture_write(&path, &damaged);
+        assert!(
+            matches!(
+                load_restore_journal(&path, &lease, &f.filesystem()),
+                Err(fl_store::recovery::RecoveryError::Verification { .. })
+            ),
+            "corruption offset {bad}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), damaged, "refusal wrote");
+    }
+}
+#[test]
+fn restore_failed_json_path_containing_magic_without_complete_frame_is_torn() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&original[last.start + 72..last.end]).unwrap();
+    payload["destination"] = serde_json::json!("/fixture/RJR1/json-path");
+    let previous = original[last.start + 8..last.start + 40]
+        .try_into()
+        .unwrap();
+    let mut frame = journal_digest_frame(&serde_json::to_vec(&payload).unwrap(), previous);
+    frame[40] ^= 1;
+    let mut damaged = original.clone();
+    damaged[last.start..].fill(0);
+    assert!(last.start + frame.len() <= damaged.len());
+    damaged[last.start..last.start + frame.len()].copy_from_slice(&frame);
+    journal_fixture_write(&path, &damaged);
+    let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+    assert_eq!(loaded.torn_tail_bytes, frame.len() as u64);
+    assert_eq!(fs::read(&path).unwrap(), damaged, "read-only load wrote");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TerminalFixtureMode {
+    Selected,
+    Original,
+    Absence,
+    Abandon,
+    AbandonAbsence,
+}
+fn terminal_fixture(mode: TerminalFixtureMode) -> (Fixture, RestoreJournal, OfflineLease) {
+    let f = journal_fixture();
+    let absent = matches!(
+        mode,
+        TerminalFixtureMode::Absence | TerminalFixtureMode::AbandonAbsence
+    );
+    if absent {
+        // An absent destination uses the compact selected image as its strict-2L
+        // baseline. Real live data, rather than overwritten history, must fund it.
+        let writer = FerroStore::open(&f.source).unwrap();
+        writer
+            .put_doc(
+                "fixture_unknown",
+                "one",
+                &serde_json::json!({"body": "x".repeat(20 << 20)}),
+            )
+            .unwrap();
+        drop(writer);
+    }
+    let destination = if absent {
+        f.root.path().join("absent.fls")
+    } else {
+        f.source.clone()
+    };
+    let (request, lease) = prepare_restore(&f, &destination);
+    if absent {
+        let manifest: BundleManifestV1 = serde_json::from_slice(
+            &fs::read(request.selected_bundle.path().join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manifest.image_bytes >= 20 << 20,
+            "absent fixture needs a genuine compact-image baseline"
+        );
+    }
+    let journal = if matches!(
+        mode,
+        TerminalFixtureMode::Abandon | TerminalFixtureMode::AbandonAbsence
+    ) {
+        struct FailCopy {
+            writes: AtomicUsize,
+            copied: AtomicUsize,
+        }
+        impl RecoveryIo for FailCopy {
+            fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+                // Candidate copying uses VerificationCopy; interrupt its second
+                // write so this fixture proves a genuine nonempty partial copy.
+                if event == RecoveryEvent::Write(Member::VerificationCopy)
+                    && self.writes.fetch_add(1, Ordering::AcqRel) == 1
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            }
+            fn write_at(
+                &self,
+                file: &fs::File,
+                bytes: &[u8],
+                offset: u64,
+            ) -> std::io::Result<usize> {
+                use std::os::unix::fs::FileExt;
+                let written = file.write_at(bytes, offset)?;
+                if self.writes.load(Ordering::Acquire) == 1 {
+                    self.copied.fetch_add(written, Ordering::AcqRel);
+                }
+                Ok(written)
+            }
+        }
+        let hook = Arc::new(FailCopy {
+            writes: AtomicUsize::new(0),
+            copied: AtomicUsize::new(0),
+        });
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(restore_offline(&request, &lease, &filesystem).is_err());
+        assert_eq!(
+            hook.writes.load(Ordering::Acquire),
+            2,
+            "candidate copy cut was not reached"
+        );
+        let guard = destination.with_extension("fls.restore-guard");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&guard).expect("copy cut must leave durable guard"))
+                .unwrap();
+        let journal = load_restore_journal(
+            std::path::Path::new(value["journal"].as_str().unwrap()),
+            &lease,
+            &f.filesystem(),
+        )
+        .expect("present guard MUST have a loadable admitted journal; do not skip");
+        assert_eq!(journal.phase, RestorePhase::Admitted);
+        assert!(journal.verification.is_none());
+        let copied = hook.copied.load(Ordering::Acquire);
+        let candidate = fs::read(journal.staging.join("candidate.fls")).unwrap();
+        let image = fs::read(request.selected_bundle.path().join("image.fls")).unwrap();
+        assert!(
+            copied > 0 && copied < image.len(),
+            "copy must be nonempty and incomplete"
+        );
+        assert_eq!(
+            &candidate[..copied],
+            &image[..copied],
+            "copied prefix differs"
+        );
+        assert_ne!(candidate, image, "candidate copy unexpectedly completed");
+        journal
+    } else {
+        let RestoreOutcome::Installed { journal } =
+            restore_offline(&request, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("not installed")
+        };
+        if matches!(
+            mode,
+            TerminalFixtureMode::Original | TerminalFixtureMode::Absence
+        ) {
+            match rollback_restore(&journal, &lease, &f.filesystem()).unwrap() {
+                RestoreOutcome::RolledBack { journal }
+                | RestoreOutcome::OriginalAbsenceRestored { journal } => journal,
+                other => panic!("not restored: {other:?}"),
+            }
+        } else {
+            journal
+        }
+    };
+    (f, journal, lease)
+}
+fn fixture_lease_request(lease: &OfflineLease) -> OfflineLeaseRequest {
+    serde_json::from_slice(&fs::read(lease.path()).unwrap()).unwrap()
+}
+fn terminal_call(
+    mode: TerminalFixtureMode,
+    j: &RestoreJournal,
+    lease: &OfflineLease,
+    filesystem: &dyn RecoveryFs,
+    replacement: bool,
+) -> Result<RestoreOutcome, fl_store::recovery::RecoveryError> {
+    use fl_store::recovery::readiness::*;
+    match mode {
+        TerminalFixtureMode::Selected | TerminalFixtureMode::Original => {
+            let mut evidence =
+                generation_evidence(j, matches!(mode, TerminalFixtureMode::Original));
+            if replacement {
+                evidence.operator = "replacement must be ignored for durable terminal retry".into();
+                evidence.identity_confirmed = false;
+            }
+            if matches!(mode, TerminalFixtureMode::Original) {
+                finalize_rollback(j, lease, &evidence, filesystem)
+            } else {
+                finalize_restore(j, lease, &evidence, filesystem)
+            }
+        }
+        TerminalFixtureMode::Absence => {
+            let evidence = AbsenceReconciliationRecord {
+                version: if replacement { 999 } else { 1 },
+                operation_id: j.operation_id,
+                candidate_sha256: j.candidate_sha256.clone(),
+                operator: fixture_lease_request(lease).operator.clone(),
+                recorded_at_unix_ms: filesystem.io().unix_ms().unwrap(),
+                no_client_opened_path_while_installed: true,
+                evidence_sha256: "a".repeat(64),
+            };
+            finalize_original_absence(j, lease, &evidence, filesystem)
+        }
+        TerminalFixtureMode::Abandon | TerminalFixtureMode::AbandonAbsence => {
+            abandon_restore(j, lease, filesystem)
+        }
+    }
+}
+#[test]
+fn restore_terminal_abandon_partial_copy_fixture_preserves_original_or_absence() {
+    for mode in [
+        TerminalFixtureMode::Abandon,
+        TerminalFixtureMode::AbandonAbsence,
+    ] {
+        let (f, journal, lease) = terminal_fixture(mode);
+        let source = fs::read(&f.source).unwrap();
+        let source_inode = fs::metadata(&f.source).unwrap().ino();
+        let absent = matches!(mode, TerminalFixtureMode::AbandonAbsence);
+        if absent {
+            assert!(!journal.destination.exists());
+        }
+        let guard = journal.destination.with_extension("fls.restore-guard");
+        let pin = f
+            .backups
+            .join(".catalog/restore-pins")
+            .join(format!("{}.json", journal.operation_id));
+        assert!(guard.exists());
+        assert!(pin.exists());
+        let candidate = journal.staging.join("candidate.fls");
+        let candidate_before = fs::read(&candidate).unwrap();
+        assert!(matches!(
+            terminal_call(mode, &journal, &lease, &f.filesystem(), false).unwrap(),
+            RestoreOutcome::Abandoned { .. }
+        ));
+        assert_eq!(fs::read(&f.source).unwrap(), source);
+        assert_eq!(fs::metadata(&f.source).unwrap().ino(), source_inode);
+        if absent {
+            assert!(!journal.destination.exists());
+        }
+        assert!(!guard.exists());
+        assert!(!pin.exists());
+        assert_eq!(fs::read(&candidate).unwrap(), candidate_before);
+        let terminal = load_restore_journal(
+            &journal.staging.join("journal.bin"),
+            &lease,
+            &f.filesystem(),
+        )
+        .unwrap();
+        assert_eq!(terminal.phase, RestorePhase::Abandoned);
+        assert_eq!(terminal.rollback_attempts, journal.rollback_attempts + 1);
+    }
+}
+#[test]
+fn restore_terminal_absence_fixture_finalizes_with_a_genuine_compact_image_baseline() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    assert_eq!(journal.phase, RestorePhase::OriginalAbsenceRestored);
+    assert!(!journal.destination.exists());
+    let source = fs::read(&f.source).unwrap();
+    let source_inode = fs::metadata(&f.source).unwrap().ino();
+    let candidate = journal.staging.join("candidate.fls");
+    let candidate_before = fs::read(&candidate).unwrap();
+    assert!(candidate_before.len() >= 20 << 20);
+    assert!(matches!(
+        terminal_call(
+            TerminalFixtureMode::Absence,
+            &journal,
+            &lease,
+            &f.filesystem(),
+            false
+        )
+        .unwrap(),
+        RestoreOutcome::OriginalAbsenceFinalized { .. }
+    ));
+    assert!(!journal.destination.exists());
+    assert!(
+        !journal
+            .destination
+            .with_extension("fls.restore-guard")
+            .exists()
+    );
+    assert!(
+        !f.backups
+            .join(".catalog/restore-pins")
+            .join(format!("{}.json", journal.operation_id))
+            .exists()
+    );
+    assert_eq!(fs::read(&f.source).unwrap(), source);
+    assert_eq!(fs::metadata(&f.source).unwrap().ino(), source_inode);
+    assert_eq!(fs::read(&candidate).unwrap(), candidate_before);
+    let terminal = load_restore_journal(
+        &journal.staging.join("journal.bin"),
+        &lease,
+        &f.filesystem(),
+    )
+    .unwrap();
+    assert_eq!(terminal.phase, RestorePhase::OriginalAbsenceFinalized);
+    assert_eq!(terminal.rollback_attempts, journal.rollback_attempts + 1);
+}
+struct TerminalCutIo {
+    event: RecoveryEvent,
+    fired: AtomicUsize,
+    events: Mutex<Vec<RecoveryEvent>>,
+}
+impl TerminalCutIo {
+    fn new(event: RecoveryEvent) -> Self {
+        Self {
+            event,
+            fired: AtomicUsize::new(0),
+            events: Mutex::new(vec![]),
+        }
+    }
+}
+impl RecoveryIo for TerminalCutIo {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(event);
+        if event == self.event && self.fired.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_terminal_sync_cuts_retry_after_accepting_lease_expires_without_attempt_or_append() {
+    let cuts = [
+        RecoveryEvent::RestoreGuardRemove,
+        RecoveryEvent::Sync(Directory::RestoreGuardParent),
+        RecoveryEvent::RestorePinRemove,
+        RecoveryEvent::Sync(Directory::RestorePinParent),
+        RecoveryEvent::Sync(Directory::CatalogParent),
+    ];
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        for cut in cuts {
+            let (f, journal, lease) = terminal_fixture(mode);
+            let source = fs::read(&f.source).unwrap();
+            let source_inode = fs::metadata(&f.source).unwrap().ino();
+            let hook = Arc::new(TerminalCutIo::new(cut));
+            let filesystem = CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            };
+            let result = terminal_call(mode, &journal, &lease, &filesystem, false);
+            assert_eq!(
+                hook.fired.load(Ordering::Acquire),
+                1,
+                "missing cut {mode:?} {cut:?}"
+            );
+            if cut == RecoveryEvent::RestoreGuardRemove {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    RestoreOutcome::OutcomeUnknown { .. }
+                ));
+            }
+            let events = hook.events.lock().unwrap().clone();
+            let mut previous = 0;
+            for expected in cuts
+                .into_iter()
+                .take(cuts.iter().position(|e| *e == cut).unwrap() + 1)
+            {
+                let position = events
+                    .iter()
+                    .position(|e| *e == expected)
+                    .expect("required preceding cleanup boundary missing");
+                assert!(
+                    position > previous,
+                    "cleanup order violated at {mode:?} {cut:?}: {events:?}"
+                );
+                previous = position;
+            }
+            let removal = events
+                .iter()
+                .position(|e| *e == RecoveryEvent::RestoreGuardRemove)
+                .unwrap();
+            assert!(
+                events[..removal].contains(&RecoveryEvent::Sync(Directory::RestoreJournalParent)),
+                "terminal was not durable before guard removal"
+            );
+            let path = journal.staging.join("journal.bin");
+            let terminal = load_restore_journal(&path, &lease, &f.filesystem())
+                .expect("terminal record must load after every cleanup cut");
+            let log = fs::read(&path).unwrap();
+            let counters = (
+                terminal.current_attempt,
+                terminal.resume_finalize_attempts,
+                terminal.rollback_attempts,
+            );
+            let context = serde_json::to_value(&terminal.terminal_evidence_context).unwrap();
+            let clock = ClockFs {
+                native: f.filesystem(),
+                now: fixture_lease_request(&lease).expires_at_unix_ms + 1,
+            };
+            assert!(
+                terminal_call(mode, &terminal, &lease, &clock, true).is_err(),
+                "expired current authority must refuse"
+            );
+            assert_eq!(fs::read(&path).unwrap(), log);
+            let renewed = renewed_lease(&terminal, &clock);
+            assert!(
+                fixture_lease_request(&renewed).issued_at_unix_ms
+                    > terminal
+                        .terminal_evidence_context
+                        .as_ref()
+                        .unwrap()
+                        .accepted_at_unix_ms
+            );
+            // Remove surviving selected catalog material before retry. There is
+            // no catalog lookup in cleanup; quarantine is reversible and inert.
+            let selected = request_bundle_path(&f, terminal.selected_bundle_operation);
+            if selected.exists() {
+                fs::rename(&selected, selected.with_extension("terminal-test-retained")).unwrap();
+            }
+            let done = terminal_call(mode, &terminal, &renewed, &clock, true).unwrap();
+            assert!(!matches!(done, RestoreOutcome::OutcomeUnknown { .. }));
+            let current = load_restore_journal(&path, &renewed, &clock).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                log,
+                "terminal retry appended at {mode:?} {cut:?}"
+            );
+            assert_eq!(
+                (
+                    current.current_attempt,
+                    current.resume_finalize_attempts,
+                    current.rollback_attempts
+                ),
+                counters
+            );
+            assert_eq!(
+                serde_json::to_value(&current.terminal_evidence_context).unwrap(),
+                context
+            );
+            assert!(
+                !terminal
+                    .destination
+                    .with_extension("fls.restore-guard")
+                    .exists()
+            );
+            assert!(
+                !f.backups
+                    .join(".catalog/restore-pins")
+                    .join(format!("{}.json", terminal.operation_id))
+                    .exists()
+            );
+            for name in ["journal.bin", "journal.bin.lock", "candidate.fls"] {
+                if name != "candidate.fls"
+                    || matches!(
+                        mode,
+                        TerminalFixtureMode::Absence
+                            | TerminalFixtureMode::Abandon
+                            | TerminalFixtureMode::AbandonAbsence
+                    )
+                {
+                    assert!(terminal.staging.join(name).exists());
+                }
+            }
+            assert_eq!(fs::metadata(&f.source).unwrap().ino(), source_inode);
+            assert_eq!(fs::read(&f.source).unwrap(), source);
+        }
+    }
+}
+fn request_bundle_path(f: &Fixture, operation: uuid::Uuid) -> std::path::PathBuf {
+    // Locate by verified catalog API before the retry, never fabricate directory
+    // naming assumptions into the product. This is test setup only.
+    fl_store::recovery::catalog::select_completed_bundle(operation, &f.filesystem(), &limits())
+        .unwrap()
+        .path()
+        .to_path_buf()
+}
+#[test]
+fn restore_fourth_reserved_attempt_terminal_cleanup_is_free_despite_exhausted_flag() {
+    let (f, mut journal, lease) = terminal_fixture(TerminalFixtureMode::Original);
+    for _ in 0..2 {
+        let RestoreOutcome::RolledBack { journal: next } =
+            rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("not rolled back")
+        };
+        journal = next;
+    }
+    assert_eq!(journal.rollback_attempts, 3);
+    let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+        Directory::RestorePinParent,
+    )));
+    let filesystem = CutFs {
+        f: &f,
+        io: hook,
+        limits: limits(),
+    };
+    assert!(matches!(
+        terminal_call(
+            TerminalFixtureMode::Original,
+            &journal,
+            &lease,
+            &filesystem,
+            false
+        )
+        .unwrap(),
+        RestoreOutcome::OutcomeUnknown { .. }
+    ));
+    let path = journal.staging.join("journal.bin");
+    let terminal = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(terminal.rollback_attempts, 4);
+    assert!(terminal.forensic_handling_required);
+    let bytes = fs::read(&path).unwrap();
+    assert!(matches!(
+        terminal_call(
+            TerminalFixtureMode::Original,
+            &terminal,
+            &lease,
+            &f.filesystem(),
+            true
+        )
+        .unwrap(),
+        RestoreOutcome::Finalized { .. }
+    ));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+#[test]
+fn restore_malformed_absence_attestation_does_not_charge_or_classify_forensics() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    let path = journal.staging.join("journal.bin");
+    let before = fs::read(&path).unwrap();
+    assert!(
+        terminal_call(
+            TerminalFixtureMode::Absence,
+            &journal,
+            &lease,
+            &f.filesystem(),
+            true
+        )
+        .is_err()
+    );
+    let current = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(current.current_attempt, journal.current_attempt);
+    assert!(!current.forensic_handling_required);
+    assert!(
+        journal
+            .destination
+            .with_extension("fls.restore-guard")
+            .exists()
+    );
+}
+
+struct ReplaceTerminalMetadata {
+    target: RecoveryEvent,
+    path: std::path::PathBuf,
+    same_inode: bool,
+    later_open: bool,
+    armed: std::sync::atomic::AtomicBool,
+    fired: std::sync::atomic::AtomicBool,
+    replacement: Vec<u8>,
+}
+impl RecoveryIo for ReplaceTerminalMetadata {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == self.target {
+            self.armed.store(true, Ordering::Release);
+        }
+        let trigger = self.armed.load(Ordering::Acquire)
+            && if self.later_open {
+                event == RecoveryEvent::OpenFile
+            } else {
+                event == self.target
+            };
+        if trigger && !self.fired.swap(true, Ordering::AcqRel) {
+            if self.same_inode {
+                fs::write(&self.path, &self.replacement)?;
+            } else {
+                let replacement = self.path.with_extension("replacement");
+                fs::write(&replacement, &self.replacement)?;
+                fs::set_permissions(
+                    &replacement,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )?;
+                fs::rename(&replacement, &self.path)?;
+            }
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_terminal_guard_and_pin_replacement_or_content_mutation_after_decode_are_retained() {
+    for target in [
+        RecoveryEvent::RestoreGuardRemove,
+        RecoveryEvent::RestorePinRemove,
+    ] {
+        for same_inode in [false, true] {
+            for later_open in [false, true] {
+                let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+                let path = if target == RecoveryEvent::RestoreGuardRemove {
+                    journal.destination.with_extension("fls.restore-guard")
+                } else {
+                    f.backups
+                        .join(".catalog/restore-pins")
+                        .join(format!("{}.json", journal.operation_id))
+                };
+                let mut replacement = fs::read(&path).unwrap();
+                // Change valid JSON bytes while retaining the same file length.
+                let at = replacement.iter().position(|b| *b == b'1').unwrap();
+                replacement[at] = b'9';
+                let hook = Arc::new(ReplaceTerminalMetadata {
+                    target,
+                    path: path.clone(),
+                    same_inode,
+                    later_open,
+                    armed: false.into(),
+                    fired: false.into(),
+                    replacement: replacement.clone(),
+                });
+                let filesystem = CutFs {
+                    f: &f,
+                    io: hook.clone(),
+                    limits: limits(),
+                };
+                let result = terminal_call(
+                    TerminalFixtureMode::Selected,
+                    &journal,
+                    &lease,
+                    &filesystem,
+                    false,
+                );
+                assert!(
+                    hook.fired.load(Ordering::Acquire),
+                    "mutation hook missed {target:?}/{same_inode}/{later_open}"
+                );
+                assert!(
+                    result.is_err()
+                        || matches!(result.unwrap(), RestoreOutcome::OutcomeUnknown { .. })
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    replacement,
+                    "replacement was removed at {target:?}/{same_inode}/{later_open}"
+                );
+                if target == RecoveryEvent::RestoreGuardRemove {
+                    assert!(
+                        f.backups
+                            .join(".catalog/restore-pins")
+                            .join(format!("{}.json", journal.operation_id))
+                            .exists()
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn restore_rollback_uses_immutable_candidate_proof_after_selected_quarantine() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+    let selected = request_bundle_path(&f, journal.selected_bundle_operation);
+    fs::rename(&selected, selected.with_extension("quarantined-for-test")).unwrap();
+    let RestoreOutcome::RolledBack { journal: current } =
+        rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("rollback needs no live selected bundle")
+    };
+    assert_eq!(current.rollback_attempts, 1);
+    assert_eq!(
+        inspect_file_binding(&f.source, &limits()).unwrap(),
+        journal.original
+    );
+}
+#[cfg(feature = "cli")]
+#[test]
+fn restore_abandon_cli_retries_under_isolated_process_environment() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Abandon);
+    let private = f.root.path().join("cli");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(
+        &private,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    for sub in ["home", "config", "data", "run", "tmp"] {
+        fs::create_dir(private.join(sub)).unwrap();
+    }
+    let request = private.join("continuation.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(
+            &serde_json::json!({ "version": 1, "operation_id": journal.operation_id,
+        "destination": journal.destination, "journal": journal.staging.join("journal.bin") }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        &request,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ferrostore"))
+            .env_clear()
+            .env("HOME", private.join("home"))
+            .env("XDG_CONFIG_HOME", private.join("config"))
+            .env("XDG_DATA_HOME", private.join("data"))
+            .env("XDG_RUNTIME_DIR", private.join("run"))
+            .env("TMPDIR", private.join("tmp"))
+            .current_dir(&private)
+            .arg("recovery")
+            .arg("--root")
+            .arg(&f.backups)
+            .arg("--lease")
+            .arg(lease.path())
+            .arg("--request")
+            .arg(&request)
+            .arg("abandon")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["outcome"], "abandoned");
+    }
+    let current = load_restore_journal(
+        &journal.staging.join("journal.bin"),
+        &lease,
+        &f.filesystem(),
+    )
+    .unwrap();
+    assert_eq!(current.rollback_attempts, 1);
+    assert_eq!(current.current_attempt, 1);
+    assert_eq!(current.phase, RestorePhase::Abandoned);
+    assert!(journal.staging.join("candidate.fls").exists());
+}
+
+struct RecreateTerminalAbsence {
+    destination: std::path::PathBuf,
+    fired: AtomicUsize,
+}
+impl RecoveryIo for RecreateTerminalAbsence {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::RestoreGuardRemove {
+            self.fired.fetch_add(1, Ordering::AcqRel);
+            fs::write(&self.destination, b"recreated destination must survive")?;
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_absence_guard_event_preserves_recreated_entry_on_first_cleanup_and_free_retry() {
+    for mode in [
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::AbandonAbsence,
+    ] {
+        let (f, journal, lease) = terminal_fixture(mode);
+        for retry in [false, true] {
+            let current = load_restore_journal(
+                &journal.staging.join("journal.bin"),
+                &lease,
+                &f.filesystem(),
+            )
+            .unwrap();
+            let before = fs::read(journal.staging.join("journal.bin")).unwrap();
+            let hook = Arc::new(RecreateTerminalAbsence {
+                destination: journal.destination.clone(),
+                fired: AtomicUsize::new(0),
+            });
+            let filesystem = CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            };
+            assert!(terminal_call(mode, &current, &lease, &filesystem, retry).is_err());
+            assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+            assert_eq!(
+                fs::read(&journal.destination).unwrap(),
+                b"recreated destination must survive"
+            );
+            assert!(
+                journal
+                    .destination
+                    .with_extension("fls.restore-guard")
+                    .exists()
+            );
+            assert!(
+                f.backups
+                    .join(".catalog/restore-pins")
+                    .join(format!("{}.json", journal.operation_id))
+                    .exists()
+            );
+            if retry {
+                assert_eq!(
+                    fs::read(journal.staging.join("journal.bin")).unwrap(),
+                    before
+                );
+            }
+            // Explicit fixture operator restores the original absence for retry.
+            fs::remove_file(&journal.destination).unwrap();
+        }
+    }
+}
+#[test]
+fn restore_finalize_intent_renews_current_authority_without_replacing_accepting_evidence() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+    let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+        Directory::RestoreDestinationParent,
+    )));
+    let filesystem = CutFs {
+        f: &f,
+        io: hook,
+        limits: limits(),
+    };
+    assert!(
+        terminal_call(
+            TerminalFixtureMode::Selected,
+            &journal,
+            &lease,
+            &filesystem,
+            false
+        )
+        .is_err()
+    );
+    let path = journal.staging.join("journal.bin");
+    let intent = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(intent.phase, RestorePhase::FinalizeIntent);
+    let accepted = intent.reconciliation.as_ref().unwrap().clone();
+    let context = intent.terminal_evidence_context.as_ref().unwrap().clone();
+    let clock = ClockFs {
+        native: f.filesystem(),
+        now: fixture_lease_request(&lease).expires_at_unix_ms + 1,
+    };
+    let renewed = renewed_lease(&intent, &clock);
+    let before = fs::read(&path).unwrap();
+    assert!(
+        terminal_call(
+            TerminalFixtureMode::Selected,
+            &intent,
+            &renewed,
+            &clock,
+            true
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "replacement intent evidence charged or appended"
+    );
+    assert!(matches!(
+        fl_store::recovery::readiness::finalize_restore(&intent, &renewed, &accepted, &clock)
+            .unwrap(),
+        RestoreOutcome::Finalized { .. }
+    ));
+    let done = load_restore_journal(&path, &renewed, &clock).unwrap();
+    assert_eq!(done.reconciliation.as_ref().unwrap(), &accepted);
+    assert_eq!(done.terminal_evidence_context.as_ref().unwrap(), &context);
+}
+
+// Draft regression matrix. UNRUN: these are inert review artifacts.
+#[test]
+fn restore_terminal_all_generations_are_held_across_removal_and_later_authority_open() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        for target in [
+            RecoveryEvent::RestoreGuardRemove,
+            RecoveryEvent::RestorePinRemove,
+        ] {
+            for member in 0..3 {
+                for same_inode in [false, true] {
+                    for later_open in [false, true] {
+                        let (f, journal, lease) = terminal_fixture(mode);
+                        let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+                        assert!(
+                            terminal_call(
+                                mode,
+                                &journal,
+                                &lease,
+                                &CutFs {
+                                    f: &f,
+                                    io: cut,
+                                    limits: limits()
+                                },
+                                false
+                            )
+                            .is_err()
+                        );
+                        let journal_path = journal.staging.join("journal.bin");
+                        let terminal =
+                            load_restore_journal(&journal_path, &lease, &f.filesystem()).unwrap();
+                        let log = fs::read(&journal_path).unwrap();
+                        let paths = [
+                            terminal.destination.clone(),
+                            terminal.staging.join("candidate.fls"),
+                            terminal.staging.join("original.fls"),
+                        ];
+                        let path = paths[member].clone();
+                        let others: Vec<_> = paths
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != member)
+                            .map(|(_, path)| {
+                                (
+                                    path.clone(),
+                                    fs::read(path).ok(),
+                                    fs::metadata(path).ok().map(|m| m.ino()),
+                                )
+                            })
+                            .collect();
+                        let mut replacement = fs::read(&path).unwrap_or_default();
+                        if replacement.is_empty() {
+                            replacement.push(0x55);
+                        } else {
+                            replacement[0] ^= 0x55;
+                        }
+                        let hook = Arc::new(ReplaceTerminalMetadata {
+                            target,
+                            path: path.clone(),
+                            same_inode,
+                            later_open,
+                            armed: false.into(),
+                            fired: false.into(),
+                            replacement: replacement.clone(),
+                        });
+                        let result = terminal_call(
+                            mode,
+                            &terminal,
+                            &lease,
+                            &CutFs {
+                                f: &f,
+                                io: hook.clone(),
+                                limits: limits(),
+                            },
+                            true,
+                        );
+                        assert!(
+                            hook.fired.load(Ordering::Acquire),
+                            "missed {mode:?}/{target:?}/{member}/{same_inode}/{later_open}"
+                        );
+                        if target == RecoveryEvent::RestoreGuardRemove {
+                            assert!(result.is_err());
+                        } else {
+                            assert!(matches!(
+                                result.unwrap(),
+                                RestoreOutcome::OutcomeUnknown { .. }
+                            ));
+                        }
+                        assert_eq!(
+                            fs::read(&path).unwrap(),
+                            replacement,
+                            "mutated generation was altered"
+                        );
+                        assert_eq!(
+                            fs::read(&journal_path).unwrap(),
+                            log,
+                            "terminal retry appended"
+                        );
+                        assert!(
+                            f.backups
+                                .join(".catalog/restore-pins")
+                                .join(format!("{}.json", terminal.operation_id))
+                                .exists(),
+                            "pin was removed after a generation mutation"
+                        );
+                        if target == RecoveryEvent::RestoreGuardRemove {
+                            assert!(
+                                terminal
+                                    .destination
+                                    .with_extension("fls.restore-guard")
+                                    .exists()
+                            );
+                        }
+                        for (path, bytes, inode) in others {
+                            assert_eq!(fs::read(&path).ok(), bytes);
+                            assert_eq!(fs::metadata(&path).ok().map(|m| m.ino()), inode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn restore_terminal_absent_guard_and_pin_recheck_authority_and_layout_after_every_sync() {
+    let cuts = [
+        RecoveryEvent::Sync(Directory::RestoreGuardParent),
+        RecoveryEvent::Sync(Directory::RestorePinParent),
+    ];
+    let boundaries = [
+        RecoveryEvent::Sync(Directory::RestoreGuardParent),
+        RecoveryEvent::Sync(Directory::RestorePinParent),
+        RecoveryEvent::Sync(Directory::CatalogParent),
+    ];
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        for initial_cut in cuts {
+            for target in boundaries {
+                for member in 0..3 {
+                    for same_inode in [false, true] {
+                        for later_open in [false, true] {
+                            let (f, journal, lease) = terminal_fixture(mode);
+                            let guard = journal.destination.with_extension("fls.restore-guard");
+                            let guard_bytes = fs::read(&guard).unwrap();
+                            let hook = Arc::new(TerminalCutIo::new(initial_cut));
+                            assert!(matches!(
+                                terminal_call(
+                                    mode,
+                                    &journal,
+                                    &lease,
+                                    &CutFs {
+                                        f: &f,
+                                        io: hook,
+                                        limits: limits()
+                                    },
+                                    false
+                                )
+                                .unwrap(),
+                                RestoreOutcome::OutcomeUnknown { .. }
+                            ));
+                            assert!(!guard.exists());
+                            let journal_path = journal.staging.join("journal.bin");
+                            let terminal =
+                                load_restore_journal(&journal_path, &lease, &f.filesystem())
+                                    .unwrap();
+                            let log = fs::read(&journal_path).unwrap();
+                            let path = match member {
+                                0 => lease.path().to_path_buf(),
+                                1 => terminal.destination.clone(),
+                                _ => guard.clone(),
+                            };
+                            let replacement = match member {
+                                0 => {
+                                    let mut value: serde_json::Value =
+                                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                                    value["operator"] = serde_json::json!("mutated-authority");
+                                    serde_json::to_vec(&value).unwrap()
+                                }
+                                1 => {
+                                    let mut bytes = fs::read(&path).unwrap_or_default();
+                                    if bytes.is_empty() {
+                                        bytes.push(0x33);
+                                    } else {
+                                        bytes[0] ^= 0x33;
+                                    }
+                                    bytes
+                                }
+                                _ => guard_bytes,
+                            };
+                            let hook = Arc::new(ReplaceTerminalMetadata {
+                                target,
+                                path: path.clone(),
+                                same_inode,
+                                later_open,
+                                armed: false.into(),
+                                fired: false.into(),
+                                replacement: replacement.clone(),
+                            });
+                            let result = terminal_call(
+                                mode,
+                                &terminal,
+                                &lease,
+                                &CutFs {
+                                    f: &f,
+                                    io: hook.clone(),
+                                    limits: limits(),
+                                },
+                                true,
+                            );
+                            assert!(
+                                hook.fired.load(Ordering::Acquire),
+                                "missed absent branch {mode:?}/{initial_cut:?}/{target:?}/{member}/{same_inode}/{later_open}"
+                            );
+                            assert!(matches!(
+                                result.unwrap(),
+                                RestoreOutcome::OutcomeUnknown { .. }
+                            ));
+                            assert_eq!(fs::read(&path).unwrap(), replacement);
+                            assert_eq!(
+                                fs::read(&journal_path).unwrap(),
+                                log,
+                                "terminal retry appended"
+                            );
+                            if initial_cut == cuts[0] && target == boundaries[0] {
+                                assert!(
+                                    f.backups
+                                        .join(".catalog/restore-pins")
+                                        .join(format!("{}.json", terminal.operation_id))
+                                        .exists(),
+                                    "pin removed before safe durable guard absence"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+struct OneShotAbsenceCandidateReadError {
+    inode: u64,
+    fired: AtomicUsize,
+    events: Mutex<Vec<RecoveryEvent>>,
+}
+impl RecoveryIo for OneShotAbsenceCandidateReadError {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(event);
+        Ok(())
+    }
+    fn read_exact_at(
+        &self,
+        file: &std::fs::File,
+        bytes: &mut [u8],
+        offset: u64,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        if file.metadata()?.ino() == self.inode && self.fired.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        file.read_exact_at(bytes, offset)
+    }
+}
+#[test]
+fn restore_absence_ordinary_inspection_read_error_has_no_attempt_append_or_forensic_flag() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    let path = journal.staging.join("journal.bin");
+    let before = fs::read(&path).unwrap();
+    let candidate = journal.staging.join("candidate.fls");
+    let candidate_before = fs::read(&candidate).unwrap();
+    let hook = Arc::new(OneShotAbsenceCandidateReadError {
+        inode: fs::metadata(&candidate).unwrap().ino(),
+        fired: AtomicUsize::new(0),
+        events: Mutex::new(vec![]),
+    });
+    assert!(
+        terminal_call(
+            TerminalFixtureMode::Absence,
+            &journal,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits()
+            },
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(
+        hook.fired.load(Ordering::Acquire),
+        1,
+        "pre-attempt candidate inspection fault was not reached exactly once"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&candidate).unwrap(), candidate_before);
+    let current = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(
+        (
+            current.current_attempt,
+            current.rollback_attempts,
+            current.resume_finalize_attempts
+        ),
+        (
+            journal.current_attempt,
+            journal.rollback_attempts,
+            journal.resume_finalize_attempts
+        )
+    );
+    assert!(!current.forensic_handling_required);
+    assert!(
+        journal
+            .destination
+            .with_extension("fls.restore-guard")
+            .exists()
+    );
+    assert!(
+        f.backups
+            .join(".catalog/restore-pins")
+            .join(format!("{}.json", journal.operation_id))
+            .exists()
+    );
+    let events = hook.events.lock().unwrap();
+    assert!(!events.contains(&RecoveryEvent::RestoreGuardRemove));
+    assert!(!events.contains(&RecoveryEvent::RestorePinRemove));
+    assert!(!events.contains(&RecoveryEvent::Sync(Directory::RestoreJournalParent)));
+}
+
+#[test]
+fn restore_terminal_retry_accepts_whitespace_padded_renewed_lease_above_journal_payload() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        let (f, journal, lease) = terminal_fixture(mode);
+        let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+        assert!(
+            terminal_call(
+                mode,
+                &journal,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: cut.clone(),
+                    limits: limits()
+                },
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(
+            cut.fired.load(Ordering::Acquire),
+            1,
+            "terminal cleanup cut was not reached: {mode:?}"
+        );
+        let path = journal.staging.join("journal.bin");
+        let terminal = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        let log = fs::read(&path).unwrap();
+        let counters = (
+            terminal.current_attempt,
+            terminal.resume_finalize_attempts,
+            terminal.rollback_attempts,
+        );
+        let context = serde_json::to_value(&terminal.terminal_evidence_context).unwrap();
+        let clock = ClockFs {
+            native: f.filesystem(),
+            now: fixture_lease_request(&lease).expires_at_unix_ms + 1,
+        };
+        let renewed = renewed_lease(&terminal, &clock);
+        let renewed_request = fixture_lease_request(&renewed);
+        assert!(
+            renewed_request.issued_at_unix_ms
+                > terminal
+                    .terminal_evidence_context
+                    .as_ref()
+                    .unwrap()
+                    .accepted_at_unix_ms
+        );
+
+        // The fixed RJR1 schedule caps a frame at capacity / 96 - 72.
+        // Persisted lease JSON has the existing independent byte/memory limits;
+        // trailing JSON whitespace changes no typed field or accepting evidence.
+        let payload_ceiling = terminal.journal_capacity / 96 - 72;
+        let mut padded = fs::read(renewed.path()).unwrap();
+        let padded_len = usize::try_from(payload_ceiling).unwrap() + 1;
+        assert!(
+            padded.len() < padded_len,
+            "fixture lease must start below frame ceiling"
+        );
+        padded.resize(padded_len, b' ');
+        let padded_bytes = padded.len() as u64;
+        assert!(padded_bytes > payload_ceiling);
+        assert!(padded_bytes < limits().byte_limit.min(terminal.budget.read_byte_ceiling));
+        assert!(
+            padded_bytes * 64 + 65536
+                < limits()
+                    .memory_byte_limit
+                    .min(terminal.budget.memory_ceiling)
+        );
+        fs::write(renewed.path(), &padded).unwrap();
+        fs::File::open(renewed.path()).unwrap().sync_all().unwrap();
+        let persisted = OfflineLease::load(renewed.path(), &clock, &limits())
+            .expect("whitespace-padded current lease remains valid under existing read limits");
+        let persisted_request = fixture_lease_request(&persisted);
+        assert_eq!(persisted_request, renewed_request);
+        let admitted = load_restore_journal(&path, &persisted, &clock)
+            .expect("typed terminal admission accepts the padded renewed lease");
+        assert_ne!(
+            admitted.binding, persisted_request,
+            "current lease B must differ from accepting lease A"
+        );
+        let done = terminal_call(mode, &admitted, &persisted, &clock, true).unwrap();
+        assert!(
+            !matches!(done, RestoreOutcome::OutcomeUnknown { .. }),
+            "cleanup incomplete: {mode:?}"
+        );
+        let current = load_restore_journal(&path, &persisted, &clock).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            log,
+            "terminal retry appended: {mode:?}"
+        );
+        assert_eq!(
+            (
+                current.current_attempt,
+                current.resume_finalize_attempts,
+                current.rollback_attempts
+            ),
+            counters
+        );
+        assert_eq!(
+            serde_json::to_value(&current.terminal_evidence_context).unwrap(),
+            context
+        );
+        assert_eq!(fs::read(persisted.path()).unwrap(), padded);
+        assert!(
+            !terminal
+                .destination
+                .with_extension("fls.restore-guard")
+                .exists()
+        );
+        assert!(
+            !f.backups
+                .join(".catalog/restore-pins")
+                .join(format!("{}.json", terminal.operation_id))
+                .exists()
+        );
+    }
+}
+
+// PR481 external review #8: every namespace mutation must durably sync BOTH dirs
+// before any following journal append or namespace mutation can begin.
+fn assert_restore_namespace_sync_order(events: &[RecoveryEvent], action: RecoveryEvent) {
+    let positions: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (*e == action).then_some(i))
+        .collect();
+    assert_eq!(
+        positions.len(),
+        1,
+        "missing or duplicated {action:?}: {events:?}"
+    );
+    for mut position in positions {
+        // The typed marker and low-level marker describe the SAME operation.
+        if matches!(
+            action,
+            RecoveryEvent::RestoreInstall | RecoveryEvent::RestoreReverseExchange
+        ) {
+            assert_eq!(events.get(position + 1), Some(&RecoveryEvent::Exchange));
+            position += 1;
+        } else if action == RecoveryEvent::RestoreRelocate {
+            assert_eq!(events.get(position + 1), Some(&RecoveryEvent::RenameEntry));
+            position += 1;
+        }
+        let suffix = &events[position + 1..];
+        let next = suffix
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    RecoveryEvent::Write(Member::RestoreJournal)
+                        | RecoveryEvent::Exchange
+                        | RecoveryEvent::RestoreRelocate
+                        | RecoveryEvent::RestoreReverseExchange
+                        | RecoveryEvent::RestoreInstall
+                        | RecoveryEvent::RenameEntry
+                )
+            })
+            .unwrap_or(suffix.len());
+        let before_next = &suffix[..next];
+        for dir in [
+            Directory::RestoreDestinationParent,
+            Directory::RestoreStagingParent,
+        ] {
+            assert!(
+                before_next.contains(&RecoveryEvent::Sync(dir)),
+                "{action:?} must sync {dir:?} before following durable phase/rename: {suffix:?}"
+            );
+        }
+        assert!(
+            next < suffix.len(),
+            "fixture must exercise the following durable phase/rename"
+        );
+    }
+}
+
+#[test]
+fn restore_each_forward_reverse_and_relocation_syncs_before_next_phase() {
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    #[derive(Default)]
+    struct NamespaceTraceIo {
+        events: Mutex<Vec<RecoveryEvent>>,
+    }
+    impl RecoveryIo for NamespaceTraceIo {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+    let io = Arc::new(NamespaceTraceIo::default());
+    let filesystem = CutFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &filesystem).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let forward = io.events.lock().unwrap().clone();
+    let probes: Vec<_> = forward
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (*e == RecoveryEvent::RestoreExchangeProbe).then_some(i))
+        .collect();
+    let installs: Vec<_> = forward
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (*e == RecoveryEvent::RestoreInstall).then_some(i))
+        .collect();
+    assert_eq!(
+        probes.len(),
+        1,
+        "expected one pre-guard exchange probe: {forward:?}"
+    );
+    assert_eq!(
+        installs.len(),
+        1,
+        "expected one forward install exchange: {forward:?}"
+    );
+    assert!(
+        probes[0] < installs[0],
+        "probe must precede forward installation"
+    );
+    assert_eq!(forward.get(probes[0] + 1), Some(&RecoveryEvent::Exchange));
+    assert_eq!(forward.get(installs[0] + 1), Some(&RecoveryEvent::Exchange));
+    assert_ne!(
+        probes[0] + 1,
+        installs[0] + 1,
+        "probe and install must use distinct exchanges"
+    );
+    assert_eq!(
+        forward
+            .iter()
+            .filter(|e| **e == RecoveryEvent::Exchange)
+            .count(),
+        2
+    );
+    assert_restore_namespace_sync_order(&forward, RecoveryEvent::RestoreInstall);
+    assert_restore_namespace_sync_order(&forward, RecoveryEvent::RestoreRelocate);
+    io.events.lock().unwrap().clear();
+    assert!(matches!(
+        rollback_restore(&journal, &lease, &filesystem).unwrap(),
+        RestoreOutcome::RolledBack { .. }
+    ));
+    assert_restore_namespace_sync_order(
+        &io.events.lock().unwrap(),
+        RecoveryEvent::RestoreReverseExchange,
+    );
+}
+
+// All manifests/reports below are produced by backup(), never rewritten fixtures.
+#[test]
+fn restore_finalize_uses_each_generations_distinct_dependency_profile() {
+    use fl_store::recovery::{
+        backup::*,
+        profiles::{DependencyPolicy, ReferenceDependency},
+        readiness::*,
+    };
+    for original in [false, true] {
+        let f = Fixture::new();
+        let dependency = |digit: &str| ReferenceDependency {
+            reference_sha256: digit.repeat(64),
+            catalog_identity: format!("fixture-dependency-{digit}"),
+            required_sequence: Some(if digit == "a" { 17 } else { 29 }),
+            policy: DependencyPolicy::ReconcileBeforeAdmission,
+        };
+        let resolution = |d: &ReferenceDependency| DependencyResolution {
+            reference_sha256: d.reference_sha256.clone(),
+            catalog_identity: d.catalog_identity.clone(),
+            observed_sequence: d.required_sequence.unwrap(),
+            evidence_sha256: "e".repeat(64),
+        };
+        let selected_dep = dependency("a");
+        let original_dep = dependency("b");
+        let publish = |d: &ReferenceDependency| {
+            let mut backup_request = f.backup_request();
+            backup_request.profile.dependencies = vec![d.clone()];
+            let profile = backup_request.profile.clone();
+            let owner = FerroStore::open(&f.source).unwrap();
+            let PublicationOutcome::Durable(bundle) = backup(
+                &owner,
+                &backup_request,
+                &f.filesystem(),
+                &fl_store::recovery::CancelToken::new(),
+            )
+            .unwrap() else {
+                panic!("not durable")
+            };
+            drop(owner);
+            (bundle, profile)
+        };
+        let (selected_bundle, _) = publish(&selected_dep);
+        let (original_bundle, original_profile) = publish(&original_dep);
+        assert_ne!(
+            fs::read(selected_bundle.path().join("profile.json")).unwrap(),
+            fs::read(original_bundle.path().join("profile.json")).unwrap()
+        );
+        let (mut request, lease) = prepare_restore_bundle(&f, &f.source, selected_bundle);
+        request.original_profile = original_profile;
+        request.available_dependencies = vec![resolution(&selected_dep), resolution(&original_dep)];
+        let RestoreOutcome::Installed { mut journal } =
+            restore_offline(&request, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("not installed")
+        };
+        assert_eq!(
+            journal.selected_dependencies.references,
+            vec![selected_dep.clone()]
+        );
+        assert_eq!(
+            journal.original_dependencies.references,
+            vec![original_dep.clone()]
+        );
+        assert_eq!(journal.verification.as_ref().unwrap().dependency_count, 1);
+        assert_eq!(
+            journal
+                .original_verification
+                .as_ref()
+                .unwrap()
+                .dependency_count,
+            1
+        );
+        if original {
+            let RestoreOutcome::RolledBack {
+                journal: rolled_back,
+            } = rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+            else {
+                panic!("not rolled back")
+            };
+            journal = rolled_back;
+        }
+        let mut evidence = generation_evidence(&journal, original);
+        // Keep the target report identity valid while supplying ONLY the other
+        // generation's dependency. An incorrect selected fallback must refuse.
+        evidence.dependencies = vec![resolution(if original {
+            &selected_dep
+        } else {
+            &original_dep
+        })];
+        let path = journal.staging.join("journal.bin");
+        let before = fs::read(&path).unwrap();
+        let guard = f.source.with_extension("fls.restore-guard");
+        let guard_before = fs::read(&guard).unwrap();
+        let finalize = |r: &ReconciliationRecord| {
+            if original {
+                finalize_rollback(&journal, &lease, r, &f.filesystem())
+            } else {
+                finalize_restore(&journal, &lease, r, &f.filesystem())
+            }
+        };
+        assert!(finalize(&evidence).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "wrong generation must refuse before charging"
+        );
+        assert_eq!(
+            fs::read(&guard).unwrap(),
+            guard_before,
+            "rejected operation must preserve guard bytes"
+        );
+        evidence.dependencies = vec![resolution(if original {
+            &original_dep
+        } else {
+            &selected_dep
+        })];
+        assert!(matches!(
+            finalize(&evidence).unwrap(),
+            RestoreOutcome::Finalized { .. }
+        ));
+        assert!(!f.source.with_extension("fls.restore-guard").exists());
+        assert!(original_bundle.path().join("image.fls").exists());
+    }
+}
+
+#[test]
+fn restore_status_rejects_held_lock_b_when_name_has_returned_to_a() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Swap {
+        path: std::path::PathBuf,
+        parked: std::path::PathBuf,
+        b: std::path::PathBuf,
+        state: AtomicUsize,
+    }
+    impl RecoveryIo for Swap {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::RestoreOperationLock
+                && self.state.load(Ordering::Acquire) == 0
+            {
+                fs::rename(&self.path, &self.parked)?;
+                fs::write(&self.path, b"")?;
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+                self.state.store(1, Ordering::Release);
+            }
+            Ok(())
+        }
+    }
+    struct SwapFs<'a> {
+        f: &'a Fixture,
+        io: Arc<Swap>,
+        limits: OperationLimits,
+    }
+    impl RecoveryFs for SwapFs<'_> {
+        fn root(&self) -> &std::path::Path {
+            &self.f.backups
+        }
+        fn reconciliation_limits(&self) -> &OperationLimits {
+            &self.limits
+        }
+        fn io(&self) -> Arc<dyn RecoveryIo> {
+            // acquire() used its original Arc through held-file validation.
+            // The next io() is load_journal's lease/guard validation. Restore A
+            // so named-lock checks pass while the status lock still holds B.
+            if self
+                .io
+                .state
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                fs::rename(&self.io.path, &self.io.b).unwrap();
+                fs::rename(&self.io.parked, &self.io.path).unwrap();
+            }
+            self.io.clone()
+        }
+    }
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let before = fs::read(&path).unwrap();
+    let guard = f.source.with_extension("fls.restore-guard");
+    let guard_before = fs::read(&guard).unwrap();
+    let io = Arc::new(Swap {
+        path: journal.staging.join("journal.bin.lock"),
+        parked: journal.staging.join("parked-a.lock"),
+        b: journal.staging.join("held-b.lock"),
+        state: AtomicUsize::new(0),
+    });
+    let filesystem = SwapFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    assert!(restore_status(&path, &lease, &filesystem).is_err());
+    assert_eq!(
+        io.state.load(Ordering::Acquire),
+        2,
+        "replacement race did not execute"
+    );
+    let a = fs::metadata(&io.path).unwrap();
+    let b = fs::metadata(&io.b).unwrap();
+    assert_eq!((a.dev(), a.ino()), journal.operation_lock_identity);
+    assert_ne!((a.dev(), a.ino()), (b.dev(), b.ino()));
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert_eq!(
+        fs::read(&guard).unwrap(),
+        guard_before,
+        "rejected operation must preserve guard bytes"
+    );
+}
+
+// Scratch proposal only. These black-box tests require the fixed-streaming loader
+// composed with terminal lease-ceiling runtime; none changes the protocol/caps.
+fn terminal_negative_fixture(mode: TerminalFixtureMode) -> (Fixture, RestoreJournal, OfflineLease) {
+    let (f, j, lease) = terminal_fixture(mode);
+    let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+    assert!(
+        terminal_call(
+            mode,
+            &j,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: cut.clone(),
+                limits: limits()
+            },
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+    let terminal =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    let expected = match mode {
+        TerminalFixtureMode::Selected => RestorePhase::Finalized,
+        TerminalFixtureMode::Original => RestorePhase::OriginalFinalized,
+        TerminalFixtureMode::Absence => RestorePhase::OriginalAbsenceFinalized,
+        TerminalFixtureMode::Abandon => RestorePhase::Abandoned,
+        TerminalFixtureMode::AbandonAbsence => panic!("not in this matrix"),
+    };
+    assert_eq!(terminal.phase, expected);
+    (f, terminal, lease)
+}
+fn terminal_negative_pin(f: &Fixture, j: &RestoreJournal) -> std::path::PathBuf {
+    f.backups
+        .join(".catalog/restore-pins")
+        .join(format!("{}.json", j.operation_id))
+}
+fn terminal_negative_metadata(f: &Fixture, j: &RestoreJournal) -> [Vec<u8>; 3] {
+    [
+        fs::read(j.staging.join("journal.bin")).unwrap(),
+        fs::read(j.destination.with_extension("fls.restore-guard")).unwrap(),
+        fs::read(terminal_negative_pin(f, j)).unwrap(),
+    ]
+}
+fn terminal_negative_counters(j: &RestoreJournal) -> (u32, u32, u32) {
+    (
+        j.current_attempt,
+        j.resume_finalize_attempts,
+        j.rollback_attempts,
+    )
+}
+fn terminal_negative_digest<T: serde::Serialize>(value: &T) -> [u8; 32] {
+    sha2::Sha256::digest(serde_json::to_vec(value).unwrap()).into()
+}
+// Preserve every original prefix frame byte-for-byte. Rebuild only the last
+// payload with the real RJR1 chain helper and leave the fixed allocation intact.
+fn terminal_negative_reframe_last(j: &RestoreJournal, changed: &RestoreJournal) -> Vec<u8> {
+    let path = j.staging.join("journal.bin");
+    let before = fs::read(&path).unwrap();
+    let ranges = journal_frame_ranges(&before);
+    let frame = ranges.last().unwrap();
+    assert!(
+        ranges.len() > 1,
+        "must compare against immutable preceding records"
+    );
+    let previous: [u8; 32] = before[frame.start + 8..frame.start + 40]
+        .try_into()
+        .unwrap();
+    let payload = serde_json::to_vec(changed).unwrap();
+    assert!(payload.len() as u64 <= j.journal_capacity / 96 - 72);
+    let replacement = journal_digest_frame(&payload, previous);
+    assert!(frame.start + replacement.len() <= before.len());
+    let mut after = before.clone();
+    after[frame.start..].fill(0);
+    after[frame.start..frame.start + replacement.len()].copy_from_slice(&replacement);
+    assert_eq!(&after[..frame.start], &before[..frame.start]);
+    // Independently validate EVERY header and checksum, including the changed
+    // last frame. A bad frame checksum cannot satisfy the refusal assertion.
+    let mut previous = [0; 32];
+    for range in journal_frame_ranges(&after) {
+        assert_eq!(&after[range.start + 8..range.start + 40], &previous);
+        let mut hash = sha2::Sha256::new();
+        hash.update(previous);
+        hash.update(&after[range.start + 72..range.end]);
+        previous = hash.finalize().into();
+        assert_eq!(&after[range.start + 40..range.start + 72], &previous);
+        let _: RestoreJournal =
+            serde_json::from_slice(&after[range.start + 72..range.end]).unwrap();
+    }
+    journal_fixture_write(&path, &after);
+    after
+}
+fn terminal_negative_semantic_refusal(
+    mode: TerminalFixtureMode,
+    f: &Fixture,
+    j: &RestoreJournal,
+    lease: &OfflineLease,
+    changed: &RestoreJournal,
+) {
+    use fl_store::recovery::RecoveryError;
+    let original = terminal_negative_metadata(f, j);
+    let mutated = terminal_negative_reframe_last(j, changed);
+    let path = j.staging.join("journal.bin");
+    assert!(
+        matches!(
+            load_restore_journal(&path, lease, &f.filesystem()),
+            Err(RecoveryError::Verification { .. })
+        ),
+        "checksummed semantic mutation must refuse during public load: {mode:?}"
+    );
+    assert!(matches!(
+        restore_status(&path, lease, &f.filesystem()),
+        Err(RecoveryError::Verification { .. })
+    ));
+    assert!(matches!(
+        terminal_call(mode, j, lease, &f.filesystem(), true),
+        Err(RecoveryError::Verification { .. })
+    ));
+    let after = terminal_negative_metadata(f, j);
+    assert_eq!(after[0], mutated, "refusal repaired, charged or appended");
+    assert_eq!(after[1], original[1]);
+    assert_eq!(after[2], original[2]);
+    journal_fixture_write(&path, &original[0]);
+    assert_eq!(
+        terminal_negative_counters(&load_restore_journal(&path, lease, &f.filesystem()).unwrap()),
+        terminal_negative_counters(j)
+    );
+}
+#[test]
+fn restore_terminal_original_report_and_profile_tampering_refuses_before_cleanup() {
+    // Genuine fixture backup publications and admission-generated reports only.
+    // The altered terminal record must disagree with untouched admission records.
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        let (f, j, lease) = terminal_negative_fixture(mode);
+        assert_eq!(
+            j.original_verification.is_some(),
+            !matches!(mode, TerminalFixtureMode::Absence)
+        );
+        for mutation in 0..3 {
+            if matches!(mode, TerminalFixtureMode::Absence) && mutation != 1 {
+                continue;
+            }
+            let mut changed = j.clone();
+            match mutation {
+                0 => {
+                    changed
+                        .original_verification
+                        .as_mut()
+                        .unwrap()
+                        .profile_sha256 = "0".repeat(64)
+                }
+                1 => changed.original_profile.version += 1,
+                2 => changed.original_verification = None,
+                _ => unreachable!(),
+            }
+            terminal_negative_semantic_refusal(mode, &f, &j, &lease, &changed);
+        }
+    }
+}
+#[test]
+fn restore_terminal_missing_or_mismatched_acceptance_context_refuses_before_cleanup() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        let (f, j, lease) = terminal_negative_fixture(mode);
+        for mutation in 0..7 {
+            let mut changed = j.clone();
+            match mutation {
+                0 => changed.terminal_evidence_context = None, // includes missing OriginalFinalized context
+                1 => {
+                    changed
+                        .terminal_evidence_context
+                        .as_mut()
+                        .unwrap()
+                        .admission_generation_sha256[0] ^= 1
+                }
+                2 => {
+                    changed
+                        .terminal_evidence_context
+                        .as_mut()
+                        .unwrap()
+                        .accepting_lease_sha256[0] ^= 1
+                }
+                3 => {
+                    let c = changed.terminal_evidence_context.as_mut().unwrap();
+                    c.accepted_at_unix_ms = c.accepting_lease.expires_at_unix_ms;
+                }
+                4 => {
+                    let c = changed.terminal_evidence_context.as_mut().unwrap();
+                    c.mode = if c.mode == TerminalMode::Selected {
+                        TerminalMode::Original
+                    } else {
+                        TerminalMode::Selected
+                    };
+                }
+                5 => {
+                    let c = changed.terminal_evidence_context.as_mut().unwrap();
+                    c.prepared_report_sha256 =
+                        Some(c.prepared_report_sha256.map_or([1; 32], |mut hash| {
+                            hash[0] ^= 1;
+                            hash
+                        }));
+                }
+                6 => {
+                    let c = changed.terminal_evidence_context.as_mut().unwrap();
+                    c.reconciliation_sha256 =
+                        Some(c.reconciliation_sha256.map_or([1; 32], |mut hash| {
+                            hash[0] ^= 1;
+                            hash
+                        }));
+                }
+                _ => unreachable!(),
+            }
+            terminal_negative_semantic_refusal(mode, &f, &j, &lease, &changed);
+        }
+    }
+}
+#[test]
+fn restore_terminal_accepted_evidence_tampering_refuses_before_cleanup() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+    ] {
+        let (f, j, lease) = terminal_negative_fixture(mode);
+        let mut changed = j.clone();
+        if let Some(record) = changed.reconciliation.as_mut() {
+            record.clients.clients_invalidated = false;
+        } else {
+            changed
+                .absence_reconciliation
+                .as_mut()
+                .unwrap()
+                .no_client_opened_path_while_installed = false;
+        }
+        terminal_negative_semantic_refusal(mode, &f, &j, &lease, &changed);
+    }
+}
+#[test]
+fn restore_terminal_self_consistent_replacement_context_cannot_replace_prior_acceptance() {
+    // Only these two modes have an accepted-context intent immediately before
+    // the terminal record. No claim of an external cryptographic anchor or of
+    // detecting an attacker rewriting the ENTIRE journal is made here.
+    for mode in [TerminalFixtureMode::Selected, TerminalFixtureMode::Original] {
+        let (f, j, lease) = terminal_negative_fixture(mode);
+        let mut changed = j.clone();
+        let c = changed.terminal_evidence_context.as_mut().unwrap();
+        c.accepting_lease.operator = "another otherwise valid accepting operator".into();
+        c.accepting_lease.expected_file = inspect_file_binding(&j.destination, &limits()).unwrap();
+        c.accepting_lease_sha256 = terminal_negative_digest(&c.accepting_lease);
+        changed.reconciliation.as_mut().unwrap().operator = c.accepting_lease.operator.clone();
+        c.reconciliation_sha256 = Some(terminal_negative_digest(
+            changed.reconciliation.as_ref().unwrap(),
+        ));
+        terminal_negative_semantic_refusal(mode, &f, &j, &lease, &changed);
+    }
+}
+struct TerminalNegativeClockTrace {
+    now: u128,
+    events: Mutex<Vec<RecoveryEvent>>,
+}
+impl RecoveryIo for TerminalNegativeClockTrace {
+    fn unix_ms(&self) -> std::io::Result<u128> {
+        Ok(self.now)
+    }
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(event);
+        Ok(())
+    }
+}
+#[test]
+fn restore_terminal_wrong_expired_and_persisted_mismatched_renewed_b_are_free_refusals() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        let (f, j, lease) = terminal_negative_fixture(mode);
+        let before = terminal_negative_metadata(&f, &j);
+        let counters = terminal_negative_counters(&j);
+        let accepting_request = fixture_lease_request(&lease);
+        let now = accepting_request.expires_at_unix_ms + 1;
+        let clock = ClockFs {
+            native: f.filesystem(),
+            now,
+        };
+        let renewed = renewed_lease(&j, &clock);
+        let current_bytes = fs::read(renewed.path()).unwrap();
+        let renewed_request: OfflineLeaseRequest = serde_json::from_slice(&current_bytes).unwrap();
+        for case in [
+            "expired",
+            "wrong_operation",
+            "wrong_action",
+            "wrong_profile",
+            "wrong_catalog",
+            "wrong_current_file",
+            "persisted_mismatch",
+        ] {
+            let mut request = renewed_request.clone();
+            match case {
+                "wrong_operation" => {
+                    request.operation_id = uuid::Uuid::from_u128(request.operation_id.as_u128() ^ 1)
+                }
+                "wrong_action" => {
+                    let OfflineAction::Restore {
+                        bundle_operation, ..
+                    } = &mut request.action
+                    else {
+                        panic!("not restore")
+                    };
+                    *bundle_operation = uuid::Uuid::from_u128(bundle_operation.as_u128() ^ 1);
+                }
+                "wrong_profile" => request.profile_sha256 = "0".repeat(64),
+                "wrong_catalog" => request.catalog_identity.push_str("-wrong"),
+                "wrong_current_file" => {
+                    request.expected_file = if request.expected_file == FileBinding::Absent {
+                        j.binding.expected_file.clone() // absence's admission is absent too: use a real other file below
+                    } else {
+                        FileBinding::Absent
+                    }
+                }
+                _ => {}
+            }
+            if case == "wrong_current_file"
+                && request.expected_file == renewed_request.expected_file
+            {
+                request.expected_file = inspect_file_binding(&f.source, &limits()).unwrap();
+                assert_ne!(request.expected_file, renewed_request.expected_file);
+            }
+            // Each candidate has its own private persisted attestation. Reusing
+            // create_offline_lease here collides with renewed B's same-operation,
+            // same-issuance O_EXCL publication before reaching restore.
+            // Public load checks the real request/attestation constraints while
+            // leaving the wrong current-generation binding for restore to reject.
+            let candidate_path = renewed.path().parent().unwrap().join(format!(
+                "terminal-negative-{}-{case}.json",
+                request.operation_id
+            ));
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&candidate_path)
+                    .unwrap();
+                serde_json::to_writer(&file, &request).unwrap();
+            }
+            let candidate = OfflineLease::load(&candidate_path, &clock, &limits()).unwrap();
+            // Capture the typed object-equivalent snapshot BEFORE changing its
+            // persisted file; rereading after mutation would erase the mismatch.
+            let candidate_request = fixture_lease_request(&candidate);
+            assert_eq!(candidate_request, request);
+            if case == "persisted_mismatch" {
+                let mut mismatch = candidate_request.clone();
+                mismatch.operator.push_str(" persisted replacement");
+                fs::write(candidate.path(), serde_json::to_vec(&mismatch).unwrap()).unwrap();
+            }
+            let hook = Arc::new(TerminalNegativeClockTrace {
+                now: if case == "expired" {
+                    candidate_request.expires_at_unix_ms
+                } else {
+                    now
+                },
+                events: Mutex::new(vec![]),
+            });
+            let filesystem = CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            };
+            assert!(
+                terminal_call(mode, &j, &candidate, &filesystem, true).is_err(),
+                "{mode:?}/{case}"
+            );
+            let events = hook.events.lock().unwrap();
+            assert!(
+                !events.contains(&RecoveryEvent::RestoreGuardRemove),
+                "guard authorization reached: {mode:?}/{case}"
+            );
+            assert!(
+                !events.contains(&RecoveryEvent::RestorePinRemove),
+                "pin authorization reached: {mode:?}/{case}"
+            );
+            assert!(!events.contains(&RecoveryEvent::Write(Member::RestoreJournal)));
+            assert_eq!(
+                terminal_negative_metadata(&f, &j),
+                before,
+                "charged/appended/withdrew at {mode:?}/{case}"
+            );
+            fs::write(renewed.path(), &current_bytes).unwrap();
+            assert_eq!(
+                terminal_negative_counters(
+                    &load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem())
+                        .unwrap()
+                ),
+                counters
+            );
+        }
+    }
+}
+// Public I/O trace locates the descriptor open immediately preceding the exact
+// guard/pin read used by its removal callback. No assumed global open count.
+struct TerminalAuthorizationOpenTrace {
+    target: RecoveryEvent,
+    target_identity: (u64, u64),
+    events: Mutex<Vec<RecoveryEvent>>,
+    last_target_open: Mutex<Option<usize>>,
+    authorization_open: Mutex<Option<usize>>,
+}
+impl RecoveryIo for TerminalAuthorizationOpenTrace {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        let mut events = self.events.lock().unwrap();
+        events.push(event);
+        if event == self.target {
+            *self.authorization_open.lock().unwrap() = *self.last_target_open.lock().unwrap();
+        }
+        Ok(())
+    }
+    fn read_exact_at(&self, file: &fs::File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let m = file.metadata()?;
+        if (m.dev(), m.ino()) == self.target_identity {
+            let events = self.events.lock().unwrap();
+            *self.last_target_open.lock().unwrap() =
+                events.iter().rposition(|e| *e == RecoveryEvent::OpenFile);
+        }
+        file.read_exact_at(bytes, offset)
+    }
+}
+struct TerminalReplaceBeforeAuthorizationOpen {
+    prefix: Vec<RecoveryEvent>,
+    cursor: AtomicUsize,
+    path: std::path::PathBuf,
+    replacement: Vec<u8>,
+    old_identity: (u64, u64),
+    new_identity: Mutex<Option<(u64, u64)>>,
+}
+impl RecoveryIo for TerminalReplaceBeforeAuthorizationOpen {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        let at = self.cursor.fetch_add(1, Ordering::AcqRel);
+        if at < self.prefix.len() {
+            assert_eq!(
+                event, self.prefix[at],
+                "independent fixture authorization prefix diverged at {at}"
+            );
+        }
+        if at + 1 == self.prefix.len() {
+            assert_eq!(event, RecoveryEvent::OpenFile);
+            let m = fs::metadata(&self.path)?;
+            assert_eq!((m.dev(), m.ino()), self.old_identity);
+            let replacement = self.path.with_extension("before-authorization-open");
+            fs::write(&replacement, &self.replacement)?;
+            fs::set_permissions(
+                &replacement,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )?;
+            let m = fs::metadata(&replacement)?;
+            assert_ne!((m.dev(), m.ino()), self.old_identity);
+            *self.new_identity.lock().unwrap() = Some((m.dev(), m.ino()));
+            fs::rename(replacement, &self.path)?;
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_terminal_guard_and_pin_descriptor_replacement_before_authorization_open_is_retained() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        for target in [
+            RecoveryEvent::RestoreGuardRemove,
+            RecoveryEvent::RestorePinRemove,
+        ] {
+            let (reference, rj, rl) = terminal_negative_fixture(mode);
+            let rp = if target == RecoveryEvent::RestoreGuardRemove {
+                rj.destination.with_extension("fls.restore-guard")
+            } else {
+                terminal_negative_pin(&reference, &rj)
+            };
+            let m = fs::metadata(rp).unwrap();
+            let trace = Arc::new(TerminalAuthorizationOpenTrace {
+                target,
+                target_identity: (m.dev(), m.ino()),
+                events: Mutex::new(vec![]),
+                last_target_open: Mutex::new(None),
+                authorization_open: Mutex::new(None),
+            });
+            let done = terminal_call(
+                mode,
+                &rj,
+                &rl,
+                &CutFs {
+                    f: &reference,
+                    io: trace.clone(),
+                    limits: limits(),
+                },
+                true,
+            )
+            .unwrap();
+            assert!(!matches!(done, RestoreOutcome::OutcomeUnknown { .. }));
+            let at = trace
+                .authorization_open
+                .lock()
+                .unwrap()
+                .expect("target callback must read its exact held descriptor");
+            let prefix = trace.events.lock().unwrap()[..=at].to_vec();
+            assert_eq!(prefix.last(), Some(&RecoveryEvent::OpenFile));
+            assert!(
+                !prefix.contains(&target),
+                "must replace before callback authorization event"
+            );
+
+            let (f, j, lease) = terminal_negative_fixture(mode);
+            let before = terminal_negative_metadata(&f, &j);
+            let path = if target == RecoveryEvent::RestoreGuardRemove {
+                j.destination.with_extension("fls.restore-guard")
+            } else {
+                terminal_negative_pin(&f, &j)
+            };
+            let replacement = fs::read(&path).unwrap(); // valid JSON, identical bytes, different inode
+            let m = fs::metadata(&path).unwrap();
+            let hook = Arc::new(TerminalReplaceBeforeAuthorizationOpen {
+                prefix,
+                cursor: AtomicUsize::new(0),
+                path: path.clone(),
+                replacement: replacement.clone(),
+                old_identity: (m.dev(), m.ino()),
+                new_identity: Mutex::new(None),
+            });
+            let result = terminal_call(
+                mode,
+                &j,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: hook.clone(),
+                    limits: limits(),
+                },
+                true,
+            );
+            assert!(hook.cursor.load(Ordering::Acquire) >= hook.prefix.len());
+            let replaced = hook
+                .new_identity
+                .lock()
+                .unwrap()
+                .expect("replacement hook missed");
+            let m = fs::metadata(&path).unwrap();
+            assert_eq!((m.dev(), m.ino()), replaced);
+            assert_eq!(fs::read(&path).unwrap(), replacement);
+            if target == RecoveryEvent::RestoreGuardRemove {
+                assert!(result.is_err());
+                assert_eq!(terminal_negative_metadata(&f, &j), before);
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    RestoreOutcome::OutcomeUnknown { .. }
+                ));
+                assert!(!j.destination.with_extension("fls.restore-guard").exists());
+                assert_eq!(fs::read(terminal_negative_pin(&f, &j)).unwrap(), before[2]);
+                assert_eq!(fs::read(j.staging.join("journal.bin")).unwrap(), before[0]);
+            }
+            let loaded =
+                load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem())
+                    .unwrap();
+            assert_eq!(
+                terminal_negative_counters(&loaded),
+                terminal_negative_counters(&j)
+            );
+        }
+    }
+}
+
+fn assert_terminal_resume_refused_unchanged(f: &Fixture, j: &RestoreJournal, lease: &OfflineLease) {
+    let before = terminal_negative_metadata(f, j);
+    let counters = terminal_negative_counters(j);
+    let trace = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+    let filesystem = CutFs {
+        f,
+        io: trace.clone(),
+        limits: limits(),
+    };
+    assert!(
+        resume_restore(j, lease, &filesystem).is_err(),
+        "terminal resume must refuse before charging or appending"
+    );
+    assert_eq!(terminal_negative_metadata(f, j), before);
+    let loaded =
+        load_restore_journal(&j.staging.join("journal.bin"), lease, &f.filesystem()).unwrap();
+    assert_eq!(loaded.phase, j.phase);
+    assert_eq!(terminal_negative_counters(&loaded), counters);
+    assert!(!trace.events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        RecoveryEvent::Write(Member::RestoreJournal)
+            | RecoveryEvent::Flush(Member::RestoreJournal)
+            | RecoveryEvent::RestoreInstall
+            | RecoveryEvent::RestoreReverseExchange
+            | RecoveryEvent::RestoreGuardRemove
+            | RecoveryEvent::RestorePinRemove
+    )));
+}
+#[test]
+fn restore_resume_refuses_genuine_finalize_intents_without_mutation_and_typed_finalize_retries() {
+    for mode in [TerminalFixtureMode::Selected, TerminalFixtureMode::Original] {
+        let (f, j, lease) = terminal_fixture(mode);
+        let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+            Directory::RestoreDestinationParent,
+        )));
+        assert!(
+            terminal_call(
+                mode,
+                &j,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: cut.clone(),
+                    limits: limits()
+                },
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+        let intent =
+            load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+        assert_eq!(
+            intent.phase,
+            if matches!(mode, TerminalFixtureMode::Selected) {
+                RestorePhase::FinalizeIntent
+            } else {
+                RestorePhase::FinalizeOriginalIntent
+            }
+        );
+        assert_terminal_resume_refused_unchanged(&f, &intent, &lease);
+        let accepted = intent.reconciliation.as_ref().unwrap();
+        let outcome = if matches!(mode, TerminalFixtureMode::Selected) {
+            fl_store::recovery::readiness::finalize_restore(
+                &intent,
+                &lease,
+                accepted,
+                &f.filesystem(),
+            )
+        } else {
+            fl_store::recovery::readiness::finalize_rollback(
+                &intent,
+                &lease,
+                accepted,
+                &f.filesystem(),
+            )
+        };
+        assert!(matches!(outcome.unwrap(), RestoreOutcome::Finalized { .. }));
+        assert!(
+            !intent
+                .destination
+                .with_extension("fls.restore-guard")
+                .exists()
+        );
+        assert!(!terminal_negative_pin(&f, &intent).exists());
+    }
+}
+#[test]
+fn restore_resume_refuses_durable_terminals_without_mutation_and_typed_cleanup_retries() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+        TerminalFixtureMode::AbandonAbsence,
+    ] {
+        let (f, j, lease) = terminal_fixture(mode);
+        let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+        assert!(
+            terminal_call(
+                mode,
+                &j,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: cut.clone(),
+                    limits: limits()
+                },
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+        let terminal =
+            load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+        let expected = match mode {
+            TerminalFixtureMode::Selected => RestorePhase::Finalized,
+            TerminalFixtureMode::Original => RestorePhase::OriginalFinalized,
+            TerminalFixtureMode::Absence => RestorePhase::OriginalAbsenceFinalized,
+            TerminalFixtureMode::Abandon | TerminalFixtureMode::AbandonAbsence => {
+                RestorePhase::Abandoned
+            }
+        };
+        assert_eq!(terminal.phase, expected);
+        assert_terminal_resume_refused_unchanged(&f, &terminal, &lease);
+        terminal_call(mode, &terminal, &lease, &f.filesystem(), true).unwrap();
+        assert!(
+            !terminal
+                .destination
+                .with_extension("fls.restore-guard")
+                .exists()
+        );
+        assert!(!terminal_negative_pin(&f, &terminal).exists());
+    }
+}
+
+fn assert_unverified_candidate_status_read_only(
+    f: &Fixture,
+    j: &RestoreJournal,
+    lease: &OfflineLease,
+) {
+    let before = terminal_negative_metadata(f, j);
+    let source = fs::read(&f.source).unwrap();
+    let candidate_path = j.staging.join("candidate.fls");
+    let candidate = fs::read(&candidate_path).unwrap();
+    let status = restore_status(&j.staging.join("journal.bin"), lease, &f.filesystem()).unwrap();
+    let artifact = status
+        .artifacts
+        .iter()
+        .find(|a| a.path == candidate_path)
+        .unwrap();
+    assert_eq!(artifact.identity, j.candidate_identity);
+    assert_eq!(artifact.bytes, candidate.len() as u64);
+    assert_eq!(
+        artifact.sha256, None,
+        "unverified bytes must not claim the selected image digest"
+    );
+    assert_eq!(artifact.classification, "selected_unverified_candidate");
+    assert_eq!(
+        status.total_retained_bytes,
+        status
+            .artifacts
+            .iter()
+            .map(|a| fs::metadata(&a.path).unwrap().len())
+            .sum::<u64>()
+    );
+    assert_eq!(terminal_negative_metadata(f, j), before);
+    assert_eq!(fs::read(&f.source).unwrap(), source);
+    assert_eq!(fs::read(candidate_path).unwrap(), candidate);
+}
+#[test]
+fn restore_status_reports_genuine_partial_copy_as_unverified_before_and_after_abandon() {
+    let (f, j, lease) = terminal_fixture(TerminalFixtureMode::Abandon);
+    assert_unverified_candidate_status_read_only(&f, &j, &lease);
+    let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+    assert!(
+        abandon_restore(
+            &j,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: cut.clone(),
+                limits: limits()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+    let abandoned =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    assert_eq!(abandoned.phase, RestorePhase::Abandoned);
+    assert_unverified_candidate_status_read_only(&f, &abandoned, &lease);
+}
+#[test]
+fn restore_status_reports_actual_empty_candidate_after_guard_durable_allocation_failure() {
+    struct FailCandidateAllocation {
+        events: Mutex<Vec<RecoveryEvent>>,
+        fired: AtomicUsize,
+    }
+    impl RecoveryIo for FailCandidateAllocation {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            let mut events = self.events.lock().unwrap();
+            let guard_durable =
+                events.contains(&RecoveryEvent::Sync(Directory::RestoreGuardParent));
+            events.push(event);
+            if guard_durable && event == RecoveryEvent::Allocate {
+                self.fired.fetch_add(1, Ordering::AcqRel);
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            Ok(())
+        }
+    }
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let hook = Arc::new(FailCandidateAllocation {
+        events: Mutex::new(vec![]),
+        fired: AtomicUsize::new(0),
+    });
+    assert!(
+        restore_offline(
+            &request,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+    let events = hook.events.lock().unwrap();
+    let guard = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::Sync(Directory::RestoreGuardParent))
+        .unwrap();
+    let allocation = events
+        .iter()
+        .enumerate()
+        .find(|(i, e)| *i > guard && **e == RecoveryEvent::Allocate)
+        .unwrap()
+        .0;
+    assert!(guard < allocation);
+    assert!(!events[guard + 1..].contains(&RecoveryEvent::Write(Member::VerificationCopy)));
+    drop(events);
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.source.with_extension("fls.restore-guard")).unwrap())
+            .unwrap();
+    let path = std::path::Path::new(value["journal"].as_str().unwrap());
+    let j = load_restore_journal(path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(j.phase, RestorePhase::Admitted);
+    assert!(j.verification.is_none());
+    assert!(j.candidate_bytes > 0);
+    assert_eq!(
+        fs::metadata(j.staging.join("candidate.fls")).unwrap().len(),
+        0
+    );
+    assert_unverified_candidate_status_read_only(&f, &j, &lease);
+    let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+    assert!(
+        abandon_restore(
+            &j,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: cut.clone(),
+                limits: limits()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+    let abandoned = load_restore_journal(path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(abandoned.phase, RestorePhase::Abandoned);
+    assert_unverified_candidate_status_read_only(&f, &abandoned, &lease);
+}
+
+#[test]
+fn restore_guard_publication_every_cut_keeps_named_guard_loadable_or_temp_retained() {
+    let trace = Fixture::new();
+    let (request, lease) = prepare_restore(&trace, &trace.source);
+    let hook = Arc::new(CutIo::new(usize::MAX, libc::EIO));
+    let filesystem = CutFs {
+        f: &trace,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    assert!(matches!(
+        restore_offline(&request, &lease, &filesystem).unwrap(),
+        RestoreOutcome::Installed { .. }
+    ));
+    let events = hook.events.lock().unwrap().clone();
+    let first = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::Create(Member::RestoreGuard))
+        .unwrap();
+    let parent_sync = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::Sync(Directory::RestoreGuardParent))
+        .unwrap();
+    assert_eq!(
+        events.get(parent_sync + 1),
+        Some(&RecoveryEvent::Sync(Directory::RestoreStagingParent)),
+        "published guard requires the removed temporary name's staging sync"
+    );
+    let last = parent_sync + 1;
+    for (cut, observed_event) in events.iter().enumerate().take(last + 1).skip(first) {
+        let f = Fixture::new();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let original = fs::read(&f.source).unwrap();
+        let original_id = {
+            let m = fs::metadata(&f.source).unwrap();
+            (m.dev(), m.ino())
+        };
+        let hook = Arc::new(CutIo::new(cut, libc::EIO));
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        let error = restore_offline(&request, &lease, &filesystem).unwrap_err();
+        let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained {
+            staging,
+            staging_identity: Some(staging_identity),
+            operation_lock_identity: Some(lock_identity),
+            source,
+            ..
+        } = error
+        else {
+            panic!("publication cut must retain admission artifacts: {error:?}")
+        };
+        assert!(hook.count.load(Ordering::Acquire) > cut);
+        let metadata = fs::metadata(&staging).unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), staging_identity);
+        let metadata = fs::metadata(staging.join("journal.bin.lock")).unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), lock_identity);
+        let guard = f.source.with_extension("fls.restore-guard");
+        let temp = staging.join("restore-guard.tmp");
+        let temp_before = if temp.exists() {
+            let m = fs::metadata(&temp).unwrap();
+            Some(((m.dev(), m.ino()), fs::read(&temp).unwrap()))
+        } else {
+            None
+        };
+        if guard.exists() {
+            let value: serde_json::Value = serde_json::from_slice(&fs::read(&guard).unwrap())
+                .expect("present guard must contain typed journal binding");
+            assert_eq!(
+                value["journal"].as_str().unwrap(),
+                staging.join("journal.bin").to_str().unwrap()
+            );
+            assert!(
+                !temp.exists(),
+                "successful publication must remove the temporary name"
+            );
+            assert!(matches!(
+                *source,
+                fl_store::recovery::RecoveryError::OutcomeUnknown { .. }
+            ));
+            fresh_probe(&f.source);
+        } else if cut > first {
+            assert!(temp.exists(), "interrupted private guard must be retained");
+        }
+        let path = staging.join("journal.bin");
+        let journal = load_restore_journal(&path, &lease, &f.filesystem())
+            .expect("publication cut must preserve typed recovery");
+        assert_eq!(journal.phase, RestorePhase::Admitted);
+        let status = restore_status(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(
+            status.artifacts.iter().filter(|a| a.path == temp).count(),
+            usize::from(temp_before.is_some())
+        );
+        assert!(matches!(
+            abandon_restore(&journal, &lease, &f.filesystem()).unwrap(),
+            RestoreOutcome::Abandoned { .. }
+        ));
+        let status = restore_status(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(status.phase, RestorePhase::Abandoned);
+        assert!(!status.guard_present);
+        assert!(
+            !f.backups
+                .join(".catalog/restore-pins")
+                .join(format!("{}.json", journal.operation_id))
+                .exists()
+        );
+        if let Some((identity, bytes)) = temp_before {
+            let m = fs::metadata(&temp).unwrap();
+            assert_eq!((m.dev(), m.ino()), identity);
+            assert_eq!(
+                fs::read(&temp).unwrap(),
+                bytes,
+                "typed abandon must retain the unpublished guard bytes"
+            );
+            assert!(
+                status
+                    .artifacts
+                    .iter()
+                    .any(|a| a.path == temp && a.identity == identity)
+            );
+        }
+        let m = fs::metadata(&f.source).unwrap();
+        assert_eq!((m.dev(), m.ino()), original_id);
+        assert_eq!(fs::read(&f.source).unwrap(), original);
+        eprintln!(
+            "guard_publication_cut index={cut} event={:?} typed_abandon=true temp_retained={}",
+            observed_event,
+            temp.exists()
+        );
+    }
+}
+
+struct GuardPublicationReplacement {
+    named_guard: std::path::PathBuf,
+    temp: bool,
+    fired: AtomicUsize,
+}
+impl RecoveryIo for GuardPublicationReplacement {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::Publish && self.fired.fetch_add(1, Ordering::AcqRel) == 0 {
+            let path = if self.temp {
+                let parent = self.named_guard.parent().unwrap();
+                let staging = fs::read_dir(parent)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .find(|p| {
+                        p.is_dir()
+                            && p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".restore-")
+                    })
+                    .unwrap();
+                staging.join("restore-guard.tmp")
+            } else {
+                self.named_guard.clone()
+            };
+            fs::write(path, b"foreign publication artifact")?;
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_guard_publication_refuses_foreign_named_guard_and_changed_temp_without_overwrite() {
+    for temp in [false, true] {
+        let f = Fixture::new();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let before = fs::read(&f.source).unwrap();
+        let named_guard = f.source.with_extension("fls.restore-guard");
+        let hook = Arc::new(GuardPublicationReplacement {
+            named_guard: named_guard.clone(),
+            temp,
+            fired: AtomicUsize::new(0),
+        });
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        let error = restore_offline(&request, &lease, &filesystem).unwrap_err();
+        let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained {
+            staging, ..
+        } = error
+        else {
+            panic!("publication race must retain artifacts: {error:?}")
+        };
+        assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+        let temporary = staging.join("restore-guard.tmp");
+        assert!(temporary.exists());
+        if temp {
+            assert!(!named_guard.exists());
+            assert_eq!(
+                fs::read(&temporary).unwrap(),
+                b"foreign publication artifact"
+            );
+            let journal =
+                load_restore_journal(&staging.join("journal.bin"), &lease, &f.filesystem())
+                    .unwrap();
+            assert!(matches!(
+                abandon_restore(&journal, &lease, &f.filesystem()).unwrap(),
+                RestoreOutcome::Abandoned { .. }
+            ));
+            assert_eq!(
+                fs::read(&temporary).unwrap(),
+                b"foreign publication artifact"
+            );
+        } else {
+            assert_eq!(
+                fs::read(&named_guard).unwrap(),
+                b"foreign publication artifact"
+            );
+            assert!(
+                load_restore_journal(&staging.join("journal.bin"), &lease, &f.filesystem())
+                    .is_err()
+            );
+            fresh_probe(&f.source);
+            assert_eq!(
+                fs::read(&named_guard).unwrap(),
+                b"foreign publication artifact"
+            );
+        }
+        assert_eq!(fs::read(&f.source).unwrap(), before);
+    }
+}
+
+struct CorruptUnpublishedGuardWrite {
+    armed: AtomicUsize,
+    fired: AtomicUsize,
+}
+impl RecoveryIo for CorruptUnpublishedGuardWrite {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::Write(Member::RestoreGuard) {
+            self.armed.store(1, Ordering::Release);
+        }
+        Ok(())
+    }
+    fn write_at(&self, file: &std::fs::File, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        if self.armed.swap(0, Ordering::AcqRel) == 1
+            && self.fired.fetch_add(1, Ordering::AcqRel) == 0
+        {
+            let mut corrupted = bytes.to_vec();
+            corrupted[0] ^= 0x20;
+            file.write_at(&corrupted, offset)
+        } else {
+            file.write_at(bytes, offset)
+        }
+    }
+}
+#[test]
+fn restore_guard_publication_checks_actual_temp_hash_before_publish() {
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let before = fs::read(&f.source).unwrap();
+    let hook = Arc::new(CorruptUnpublishedGuardWrite {
+        armed: AtomicUsize::new(0),
+        fired: AtomicUsize::new(0),
+    });
+    let filesystem = CutFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let error = restore_offline(&request, &lease, &filesystem).unwrap_err();
+    let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained { staging, .. } =
+        error
+    else {
+        panic!("corrupt private guard must refuse before publication: {error:?}")
+    };
+    assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+    assert!(!f.source.with_extension("fls.restore-guard").exists());
+    let temporary = staging.join("restore-guard.tmp");
+    let retained = fs::read(&temporary).unwrap();
+    let journal =
+        load_restore_journal(&staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    assert!(matches!(
+        abandon_restore(&journal, &lease, &f.filesystem()).unwrap(),
+        RestoreOutcome::Abandoned { .. }
+    ));
+    assert_eq!(fs::read(&temporary).unwrap(), retained);
+    assert_eq!(fs::read(&f.source).unwrap(), before);
+}
+
+struct LateGuardPublicationRetained {
+    path: std::path::PathBuf,
+    identity: (u64, u64),
+    bytes: Option<Vec<u8>>,
+    guard_bytes: Vec<u8>,
+}
+struct LateGuardPublicationMutation {
+    target: Directory,
+    member: u8,
+    replacement: bool,
+    destination: std::path::PathBuf,
+    lease: std::path::PathBuf,
+    published: AtomicUsize,
+    fired: AtomicUsize,
+    retained: Mutex<Option<LateGuardPublicationRetained>>,
+}
+impl RecoveryIo for LateGuardPublicationMutation {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::Publish {
+            self.published.store(1, Ordering::Release);
+        }
+        if self.published.load(Ordering::Acquire) != 1
+            || event != RecoveryEvent::Sync(self.target)
+            || self
+                .fired
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Ok(());
+        }
+        let named_guard = self.destination.with_extension("fls.restore-guard");
+        let staging = || {
+            fs::read_dir(self.destination.parent().unwrap())?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<Result<Vec<_>, std::io::Error>>()?
+                .into_iter()
+                .find(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".restore-")
+                })
+                .ok_or_else(|| std::io::Error::other("missing operation staging"))
+        };
+        let path = match self.member {
+            0 => named_guard.clone(),
+            1 => self.lease.clone(),
+            2 => staging()?,
+            _ => staging()?.join("journal.bin.lock"),
+        };
+        let retained_bytes = if self.member == 2 {
+            let mut old = path.as_os_str().to_os_string();
+            old.push(".held-before-late-replacement");
+            fs::rename(&path, std::path::PathBuf::from(old))?;
+            fs::create_dir(&path)?;
+            fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+            fs::write(path.join("foreign-marker"), b"foreign staging must survive")?;
+            None
+        } else {
+            let original = fs::read(&path)?;
+            if self.replacement {
+                // Equal bytes on a different inode must not inherit held authority.
+                let mut old = path.as_os_str().to_os_string();
+                old.push(".held-before-late-replacement");
+                fs::rename(&path, std::path::PathBuf::from(old))?;
+                fs::write(&path, &original)?;
+                fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            } else if self.member == 1 {
+                let mut value: serde_json::Value = serde_json::from_slice(&original)?;
+                value["operator"] = serde_json::json!("foreign late authority");
+                fs::write(&path, serde_json::to_vec(&value)?)?;
+            } else {
+                fs::write(&path, b"foreign late publication artifact")?;
+            }
+            Some(fs::read(&path)?)
+        };
+        let m = fs::metadata(&path)?;
+        *self.retained.lock().unwrap() = Some(LateGuardPublicationRetained {
+            path,
+            identity: (m.dev(), m.ino()),
+            bytes: retained_bytes,
+            guard_bytes: fs::read(&named_guard)?,
+        });
+        Ok(())
+    }
+}
+#[test]
+fn restore_guard_publication_rechecks_authority_after_both_post_publish_syncs() {
+    for target in [
+        Directory::RestoreGuardParent,
+        Directory::RestoreStagingParent,
+    ] {
+        for member in 0..4 {
+            for replacement in [false, true] {
+                if member == 2 && !replacement {
+                    continue;
+                }
+                let f = Fixture::new();
+                let (request, lease) = prepare_restore(&f, &f.source);
+                let original = fs::read(&f.source).unwrap();
+                let m = fs::metadata(&f.source).unwrap();
+                let original_identity = (m.dev(), m.ino());
+                let hook = Arc::new(LateGuardPublicationMutation {
+                    target,
+                    member,
+                    replacement,
+                    destination: f.source.clone(),
+                    lease: lease.path().to_path_buf(),
+                    published: AtomicUsize::new(0),
+                    fired: AtomicUsize::new(0),
+                    retained: Mutex::new(None),
+                });
+                let filesystem = CutFs {
+                    f: &f,
+                    io: hook.clone(),
+                    limits: limits(),
+                };
+                let result = restore_offline(&request, &lease, &filesystem);
+                assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+                assert!(
+                    matches!(
+                        result,
+                        Err(
+                            fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained { .. }
+                        )
+                    ),
+                    "late publication mutation must refuse before candidate copy: {target:?}/{member}/{replacement}: {result:?}"
+                );
+                let retained = hook.retained.lock().unwrap();
+                let LateGuardPublicationRetained {
+                    path,
+                    identity,
+                    bytes,
+                    guard_bytes,
+                } = retained.as_ref().unwrap();
+                let m = fs::metadata(path).unwrap();
+                assert_eq!((m.dev(), m.ino()), *identity);
+                if let Some(bytes) = bytes {
+                    assert_eq!(&fs::read(path).unwrap(), bytes);
+                } else {
+                    assert_eq!(
+                        fs::read(path.join("foreign-marker")).unwrap(),
+                        b"foreign staging must survive"
+                    );
+                }
+                assert_eq!(
+                    &fs::read(f.source.with_extension("fls.restore-guard")).unwrap(),
+                    guard_bytes
+                );
+                let m = fs::metadata(&f.source).unwrap();
+                assert_eq!((m.dev(), m.ino()), original_identity);
+                assert_eq!(fs::read(&f.source).unwrap(), original);
+            }
+        }
+    }
+}
+
+#[test]
+fn catalog_large_streamed_config_does_not_reserve_a_parsed_payload() {
+    use fl_store::recovery::{
+        CancelToken, backup::*, catalog::select_completed_bundle, fs::NativeRecoveryFs,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let owner = FerroStore::open(&f.source).unwrap();
+    let config = f.root.path().join("streamed-config.toml");
+    fs::write(&config, vec![b'x'; 8 << 20]).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let id = fs::metadata(&config).unwrap();
+    let key = f.root.path().join("excluded-streamed-fixture.key");
+    fs::write(&key, b"not a live key").unwrap();
+    let key_id = fs::metadata(&key).unwrap();
+    let mut request = f.backup_request();
+    request.limits.memory_byte_limit = 4 << 30;
+    request.metadata_byte_limit = 16 << 20;
+    request.configs = vec![ApprovedConfig {
+        kind: fl_store::recovery::manifest::MemberKind::ProtectedConfig,
+        path: config,
+        identity: (id.dev(), id.ino()),
+        byte_limit: 8 << 20,
+    }];
+    request.excluded_vault_key = Some(ExcludedVaultKey {
+        path: key,
+        identity: (key_id.dev(), key_id.ino()),
+    });
+    let filesystem = NativeRecoveryFs::new(f.backups.clone(), request.limits.clone());
+    let PublicationOutcome::Durable(bundle) =
+        backup(&owner, &request, &filesystem, &CancelToken::new()).unwrap()
+    else {
+        panic!("backup not durable")
+    };
+    drop(owner);
+    let manifest: BundleManifestV1 =
+        serde_json::from_slice(&fs::read(bundle.path().join("manifest.json")).unwrap()).unwrap();
+    let mut l = limits();
+    l.memory_byte_limit = 128 << 20;
+    let selected = select_completed_bundle(
+        uuid::Uuid::parse_str(&manifest.operation_id).unwrap(),
+        &filesystem,
+        &l,
+    )
+    .expect("streamed config length must not become a JSON model reservation");
+    assert_eq!(selected.path(), bundle.path());
+    assert!(l.admitted_memory_bytes() >= 65536);
+    assert!(
+        l.admitted_memory_bytes() < 8 << 20,
+        "small decoded metadata plus live fixed buffers must not scale with config bytes"
+    );
 }

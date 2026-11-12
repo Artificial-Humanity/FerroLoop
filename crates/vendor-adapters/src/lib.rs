@@ -6,7 +6,7 @@
 pub mod claude;
 pub mod codex;
 
-pub use claude::ClaudeHostAdapter;
+pub use claude::{ClaudeHostAdapter, ClaudePostCompactionContext};
 pub use codex::CodexHostAdapter;
 
 use std::sync::Arc;

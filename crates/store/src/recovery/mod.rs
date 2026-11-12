@@ -9,6 +9,7 @@ mod inventory_types;
 pub mod purge;
 pub mod readiness;
 pub mod restore;
+mod restore_metadata;
 pub use inventory::{
     BindingEdge, BindingInput, ConsumerEdge, InventoryInputs, StoreIdentity, StoreMap,
     collect_inventory,
@@ -17,9 +18,18 @@ pub use inventory::{
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
     #[error(
-        "restore admission fenced (operation {operation_id:?}); administrative exclusion and reconciliation required"
+        "restore admission fenced by {guard_path:?} (operation {operation_id:?}); inspect with `ferrostore recovery --root <ROOT> --lease <LEASE> --request <CONTINUATION.json> status`; administrative exclusion and reconciliation required"
     )]
-    RestoreFenced { operation_id: Option<uuid::Uuid> },
+    RestoreFenced {
+        guard_path: std::path::PathBuf,
+        operation_id: Option<uuid::Uuid>,
+    },
+    #[error("could not resolve physical store path {path:?}: {source}")]
+    PhysicalPathResolution {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
         "recovery {operation_id}: admission failed; retained metadata requires operator review"
     )]
@@ -57,6 +67,27 @@ pub enum RecoveryError {
     Quota {
         operation_id: uuid::Uuid,
         resource: &'static str,
+    },
+    #[error(
+        "recovery {operation_id}: journal {journal:?} frame at offset {offset} declares {declared_bytes} bytes above cap {cap}; no repair or unfence attempted"
+    )]
+    RestoreJournalFrameQuota {
+        operation_id: uuid::Uuid,
+        journal: std::path::PathBuf,
+        offset: u64,
+        declared_bytes: u64,
+        cap: u64,
+    },
+    #[error(
+        "recovery {operation_id}: journal {journal:?} frame {frame_index} at offset {offset} declares {declared_bytes} bytes above frame count cap {cap}; no repair or unfence attempted"
+    )]
+    RestoreJournalFrameCountQuota {
+        operation_id: uuid::Uuid,
+        journal: std::path::PathBuf,
+        offset: u64,
+        frame_index: u64,
+        cap: u64,
+        declared_bytes: u64,
     },
     #[error("recovery {operation_id}: deadline exceeded")]
     Deadline { operation_id: uuid::Uuid },

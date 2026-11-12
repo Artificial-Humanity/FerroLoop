@@ -185,18 +185,21 @@ fn copy_config(
     fs::event(&*control.io, RecoveryEvent::Create(source.io_kind), l)?;
     let target = PrivateFile::open(&stage.path.join(source.name), true, l)?;
     control.allocate(&target.file, source.len, true, l)?;
-    let mut offset = 0;
-    let mut buffer = [0u8; 65536];
-    while offset < source.len {
-        l.check()?;
-        let n = (source.len - offset).min(buffer.len() as u64) as usize;
-        source
-            .held
-            .file
-            .read_exact_at(&mut buffer[..n], offset)
-            .map_err(|_| l.verification())?;
-        control.write_all(&target.file, &buffer[..n], offset, source.io_kind, l)?;
-        offset += n as u64;
+    {
+        l.admit_memory(65536)?;
+        let mut offset = 0;
+        let mut buffer = [0u8; 65536];
+        while offset < source.len {
+            l.check()?;
+            let n = (source.len - offset).min(buffer.len() as u64) as usize;
+            source
+                .held
+                .file
+                .read_exact_at(&mut buffer[..n], offset)
+                .map_err(|_| l.verification())?;
+            control.write_all(&target.file, &buffer[..n], offset, source.io_kind, l)?;
+            offset += n as u64;
+        }
     }
     control.sync(&target.file, source.io_kind, l)?;
     source.held.unchanged(l)?;
@@ -445,7 +448,8 @@ pub fn backup_with_shared_config(
         // Recheck all final members against their held checksums immediately
         // before the exclusive rename, including rejection of unexpected files.
         let checked = super::catalog::check_bundle(&stage, &operation, &l)?;
-        checked.flush(&control, &l)?;
+        let checked_limits = checked.retained_limits(&l)?;
+        checked.flush(&control, &checked_limits)?;
         stage.sync(&*io, Directory::StagingBeforePublish, &l)?;
         staging.rename_checked(
             &operation,
@@ -457,7 +461,7 @@ pub fn backup_with_shared_config(
             || {
                 stage.same_name(&l)?;
                 writer.held.same_name(&l)?;
-                let latest = super::catalog::check_bundle(&stage, &operation, &l)?;
+                let latest = super::catalog::check_bundle(&stage, &operation, &checked_limits)?;
                 if !checked.same_manifest(&latest) {
                     return Err(l.verification());
                 }

@@ -1863,6 +1863,13 @@ impl FerroStore {
         )
     }
 
+    pub(crate) fn open_existing_for_backup(
+        path: &Path,
+        limits: &crate::recovery::OperationLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_mode(&RealFs, path, false, Some(limits))
+    }
+
     /// Open or create a `.fls` file. A second open of the same path succeeds.
     ///
     /// A new file is created mode 0600 from its first byte, in a parent made
@@ -1873,13 +1880,6 @@ impl FerroStore {
     /// [`StoreError::ContainerFormat`]; a schema version off the ladder is
     /// [`StoreError::FormatVersion`]. A file from before schema versioning
     /// (no version document) opens, and [`Self::format_version`] reads `None`.
-    pub(crate) fn open_existing_for_backup(
-        path: &Path,
-        limits: &crate::recovery::OperationLimits,
-    ) -> Result<Self, StoreError> {
-        Self::open_with_mode(&RealFs, path, false, Some(limits))
-    }
-
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with(&RealFs, path.as_ref())
     }

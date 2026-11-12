@@ -425,6 +425,12 @@ pub struct StatusReport {
     /// Why live and dead bytes are unknown for an existing `.fls`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sizes_note: Option<String>,
+    /// Present fences are reported even when their operation ID is unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_guard: Option<crate::recovery::admission::RestoreGuardStatus>,
+    /// Path resolution failed; guard state is unknown and admission is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_admission_note: Option<String>,
 }
 
 /// How every command here opens a store: on the engine `kind` the caller
@@ -445,6 +451,12 @@ pub(crate) fn engine_options(kind: BackendKind) -> StoreOptions {
 /// permissions); it must change and say nothing beyond its report.
 pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
     let physical = physical_path(path, kind);
+    let (restore_guard, restore_admission_note) =
+        match crate::recovery::admission::inspect_restore_guard(&physical) {
+            Ok(guard) => (guard, None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+    let admission_blocked = restore_guard.is_some() || restore_admission_note.is_some();
     let meta = std::fs::metadata(&physical).ok();
     let exists = meta.is_some();
     let mut size = meta.as_ref().map(std::fs::Metadata::len);
@@ -454,6 +466,10 @@ pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
     // FerroStore has no format version to read yet; redb's is read from the
     // file, which is opened only when it exists.
     let (format_version, format_note) = match (kind, exists) {
+        _ if admission_blocked => (
+            FormatVersion::Unknown,
+            Some("not inspected: restore admission refused".into()),
+        ),
         (BackendKind::Ferro, _) => (
             FormatVersion::NotAvailable,
             Some("not available on ferro yet".into()),
@@ -490,6 +506,11 @@ pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
     // and a file that is not a store yet is reported, not turned into one.
     // The size comes from the same read, so the three figures agree.
     let (live_bytes, dead_bytes, sizes_note) = match (kind, exists) {
+        _ if admission_blocked => (
+            None,
+            None,
+            Some("not inspected: restore admission refused".into()),
+        ),
         (BackendKind::Ferro, true) => match ferro_stats_at(&physical) {
             Ok(st) => {
                 size = Some(st.file_bytes);
@@ -512,6 +533,8 @@ pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
         dead_bytes,
         redb_beside_ferro: redb_beside,
         sizes_note,
+        restore_guard,
+        restore_admission_note,
     }
 }
 
@@ -567,6 +590,29 @@ impl StatusReport {
         match &self.format_note {
             Some(note) => line(&mut out, format!("format version: {shown} ({note})")),
             None => line(&mut out, format!("format version: {shown}")),
+        }
+        if let Some(guard) = &self.restore_guard {
+            line(
+                &mut out,
+                format!(
+                    "restore guard:  {} (active; operation {})",
+                    guard.guard_path.display(),
+                    guard
+                        .operation_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ),
+            );
+            line(
+                &mut out,
+                "restore status: ferrostore recovery --root <ROOT> --lease <LEASE> --request <CONTINUATION.json> status",
+            );
+        }
+        if let Some(note) = &self.restore_admission_note {
+            line(
+                &mut out,
+                format!("restore admission: refused; guard state unknown ({note})"),
+            );
         }
         if self.redb_beside_ferro {
             line(
@@ -1312,6 +1358,69 @@ impl VerifyReport {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn status_reports_guard_without_opening_either_engine() {
+        let root = crate::recovery::test_support::fixture_root();
+        for kind in [BackendKind::Ferro, BackendKind::Redb] {
+            let logical = root.path().join("fixture.redb");
+            let physical = physical_path(&logical, kind);
+            std::fs::write(&physical, b"not a database").unwrap();
+            let guard = crate::recovery::admission::guard_path(&physical);
+            std::fs::write(&guard, b"malformed guard").unwrap();
+            let before = std::fs::metadata(&physical).unwrap();
+            let report = status(&logical, kind);
+            assert_eq!(report.restore_guard.as_ref().unwrap().guard_path, guard);
+            assert_eq!(report.restore_guard.as_ref().unwrap().operation_id, None);
+            assert_eq!(
+                report.format_note.as_deref(),
+                Some("not inspected: restore admission refused")
+            );
+            let json = serde_json::to_value(&report).unwrap();
+            assert!(json["restore_guard"]["operation_id"].is_null());
+            assert_eq!(json["restore_guard"]["guard_path"], guard.to_str().unwrap());
+            let text = report.text(&Wording {
+                command: "ferrostore",
+                redb_path_hint: "<path>",
+            });
+            assert!(text.contains("active; operation unknown"));
+            assert!(text.contains(&guard.display().to_string()));
+            assert!(text.contains("ferrostore recovery --root <ROOT> --lease <LEASE> --request <CONTINUATION.json> status"));
+            assert_eq!(std::fs::read(&physical).unwrap(), b"not a database");
+            assert_eq!(std::fs::read(&guard).unwrap(), b"malformed guard");
+            assert_eq!(
+                std::fs::metadata(&physical).unwrap().modified().unwrap(),
+                before.modified().unwrap()
+            );
+            std::fs::remove_file(&guard).unwrap();
+        }
+    }
+
+    #[test]
+    fn status_reports_physical_resolution_failure_without_claiming_a_guard() {
+        let root = crate::recovery::test_support::fixture_root();
+        let path = root.path().join("dangling.redb");
+        std::os::unix::fs::symlink(root.path().join("missing"), &path).unwrap();
+        let report = status(&path, BackendKind::Redb);
+        assert!(report.restore_guard.is_none());
+        assert!(
+            report
+                .restore_admission_note
+                .as_deref()
+                .unwrap()
+                .contains("could not resolve physical store path")
+        );
+        assert_eq!(
+            report.format_note.as_deref(),
+            Some("not inspected: restore admission refused")
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     /// The pid of a child that has exited and been reaped: no live process.
     pub(crate) fn dead_pid() -> u32 {

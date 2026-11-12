@@ -514,6 +514,25 @@ fn purge_every_audit_write_sync_unlink_cut_preserves_other_material() {
     assert!(events.contains(&RecoveryEvent::Sync(Directory::CatalogParent)));
     assert!(events.contains(&RecoveryEvent::Sync(Directory::PurgeParent)));
     assert!(events.contains(&RecoveryEvent::PurgeUnlink));
+    let unlink = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::PurgeUnlink)
+        .unwrap();
+    let write = events[..unlink]
+        .iter()
+        .rposition(|e| *e == RecoveryEvent::Write(Member::PurgeAudit))
+        .unwrap();
+    let flush = events[write + 1..unlink]
+        .iter()
+        .position(|e| *e == RecoveryEvent::Flush(Member::PurgeAudit))
+        .unwrap()
+        + write
+        + 1;
+    assert!(
+        events[flush + 1..unlink].contains(&RecoveryEvent::Sync(Directory::CatalogParent)),
+        "audit write, file flush, and catalog sync must precede every unlink"
+    );
+
     for (cut, event) in events.iter().enumerate() {
         let f = empty_fixture();
         let (op, lease) = quarantined(&f);
@@ -650,4 +669,658 @@ fn purge_large_valid_catalog_accounts_retained_evidence_with_scan_scratch() {
             .unwrap()
             .all(|e| e.unwrap().file_name() == "receipt.json")
     );
+}
+
+#[test]
+fn purge_identical_independent_backups_are_not_references() {
+    let f = Fixture::new();
+    let (op, lease) = quarantined(&f);
+    let other = f.bundle();
+    let original_image = fs::read(f.backups.join(op.to_string()).join("image.fls")).unwrap();
+    assert_eq!(
+        fs::read(other.path().join("image.fls")).unwrap(),
+        original_image
+    );
+    let report = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    assert!(
+        purge_quarantined(&confirmation(&report), &lease, &f.filesystem(), &limits())
+            .unwrap()
+            .complete
+    );
+    assert!(other.path().join("image.fls").exists());
+}
+
+#[test]
+fn purge_refuses_explicit_dependency_from_live_receipt_manifest() {
+    use fl_store::recovery::{
+        backup::*,
+        profiles::{DependencyPolicy, ReferenceDependency},
+    };
+    let f = Fixture::new();
+    let (op, lease) = quarantined(&f);
+    let mut request = f.backup_request();
+    request.profile.dependencies.push(ReferenceDependency {
+        reference_sha256: "e".repeat(64),
+        catalog_identity: op.to_string(),
+        required_sequence: None,
+        policy: DependencyPolicy::ReconcileBeforeAdmission,
+    });
+    let owner = fl_store::FerroStore::open(&f.source).unwrap();
+    assert!(matches!(
+        backup(
+            &owner,
+            &request,
+            &f.filesystem(),
+            &fl_store::recovery::CancelToken::new()
+        )
+        .unwrap(),
+        PublicationOutcome::Durable(_)
+    ));
+    drop(owner);
+    let error = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap_err();
+    assert!(error.to_string().contains("reference closure"), "{error}");
+    assert!(f.backups.join(op.to_string()).join("image.fls").exists());
+}
+
+// New replay tests are black-box recovery operations over private native fixtures.
+// Cut before unlink N: the preceding members already have durable completion rows.
+struct PurgeReplayCut {
+    stop: usize,
+    seen: std::sync::atomic::AtomicUsize,
+}
+impl RecoveryIo for PurgeReplayCut {
+    fn before(&self, e: RecoveryEvent) -> std::io::Result<()> {
+        if e == RecoveryEvent::PurgeUnlink && self.seen.fetch_add(1, Ordering::AcqRel) == self.stop
+        {
+            return Err(std::io::Error::other("fixture replay checkpoint"));
+        }
+        Ok(())
+    }
+}
+fn admitted_purge(f: &Fixture, op: uuid::Uuid, lease: &OfflineLease, stop: usize) -> PurgeReport {
+    let report = purge_quarantined(&inspection(op), lease, &f.filesystem(), &limits()).unwrap();
+    let hook = Arc::new(PurgeReplayCut {
+        stop,
+        seen: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let filesystem = HookFs {
+        f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    assert!(purge_quarantined(&confirmation(&report), lease, &filesystem, &limits()).is_err());
+    assert_eq!(hook.seen.load(Ordering::Acquire), stop + 1);
+    assert!(
+        f.backups
+            .join(".catalog")
+            .join(format!("purge-{op}.intent.json"))
+            .exists()
+    );
+    report
+}
+fn assert_replay_refuses_before_unlink(
+    f: &Fixture,
+    op: uuid::Uuid,
+    lease: &OfflineLease,
+    report: &PurgeReport,
+) {
+    let hooks = Arc::new(PurgeReplayCut {
+        stop: usize::MAX,
+        seen: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let filesystem = HookFs {
+        f,
+        io: hooks.clone(),
+        limits: limits(),
+    };
+    assert!(purge_quarantined(&inspection(op), lease, &filesystem, &limits()).is_err());
+    assert!(purge_quarantined(&confirmation(report), lease, &filesystem, &limits()).is_err());
+    assert_eq!(
+        hooks.seen.load(Ordering::Acquire),
+        0,
+        "invalid replay mutated a member"
+    );
+    assert!(
+        !f.backups
+            .join(".catalog")
+            .join(format!("purge-{op}.complete.json"))
+            .exists()
+    );
+}
+#[test]
+fn purge_replay_refuses_restored_live_receipt_and_conflicting_target_before_unlink() {
+    for restored_receipt in [true, false] {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let report = admitted_purge(&f, op, &lease, 0);
+        if restored_receipt {
+            let receipt = f
+                .backups
+                .join(".quarantine")
+                .join(op.to_string())
+                .join("receipt.json");
+            let live = f.backups.join(".catalog").join(format!("{op}.json"));
+            fs::copy(receipt, &live).unwrap();
+            fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
+        } else {
+            let duplicate = f.backups.join(".staging").join(op.to_string());
+            fs::create_dir(&duplicate).unwrap();
+            fs::set_permissions(duplicate, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let before = fs::read(f.backups.join(op.to_string()).join("image.fls")).unwrap();
+        assert_replay_refuses_before_unlink(&f, op, &lease, &report);
+        assert_eq!(
+            fs::read(f.backups.join(op.to_string()).join("image.fls")).unwrap(),
+            before
+        );
+    }
+}
+#[test]
+fn purge_replay_refuses_unknown_names_changed_survivors_and_missing_geometry() {
+    for change in 0..4 {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let report = admitted_purge(&f, op, &lease, 0);
+        match change {
+            0 | 1 => {
+                let parent = if change == 0 {
+                    f.backups.join(op.to_string())
+                } else {
+                    f.backups.join(".quarantine").join(op.to_string())
+                };
+                let extra = parent.join("unrelated.bin");
+                fs::write(&extra, b"not admitted").unwrap();
+                fs::set_permissions(extra, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            2 => {
+                // Preserve the exact payload while replacing the admitted inode.
+                let image = f.backups.join(op.to_string()).join("image.fls");
+                let saved = f.root.path().join("saved-image");
+                fs::rename(&image, &saved).unwrap();
+                fs::copy(saved, &image).unwrap();
+                fs::set_permissions(image, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            3 => {
+                let intent = f
+                    .backups
+                    .join(".catalog")
+                    .join(format!("purge-{op}.intent.json"));
+                let mut old: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&intent).unwrap()).unwrap();
+                old.as_object_mut().unwrap().remove("geometry");
+                fs::write(intent, serde_json::to_vec(&old).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_replay_refuses_before_unlink(&f, op, &lease, &report);
+    }
+}
+#[test]
+fn purge_replay_refuses_empty_target_and_quarantine_directory_replacement() {
+    for quarantine in [false, true] {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let report =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        assert!(
+            purge_quarantined(&confirmation(&report), &lease, &f.filesystem(), &limits())
+                .unwrap()
+                .complete
+        );
+        let replaced = if quarantine {
+            f.backups.join(".quarantine").join(op.to_string())
+        } else {
+            f.backups.join(op.to_string())
+        };
+        assert!(fs::read_dir(&replaced).unwrap().next().is_none());
+        let held = f.root.path().join("old-directory");
+        fs::rename(&replaced, &held).unwrap();
+        fs::create_dir(&replaced).unwrap();
+        fs::set_permissions(&replaced, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).is_err());
+        assert!(
+            purge_quarantined(&confirmation(&report), &lease, &f.filesystem(), &limits()).is_err()
+        );
+        assert!(held.is_dir() && replaced.is_dir());
+    }
+}
+#[test]
+fn purge_replay_refuses_changed_completion_and_requires_nonmanifest_durability() {
+    // A completion for the wrong member must be detected before touching any survivor.
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    let report = admitted_purge(&f, op, &lease, 1);
+    let completion = f
+        .backups
+        .join(".catalog")
+        .join(format!("purge-{op}.member-0.json"));
+    let mut bad: serde_json::Value =
+        serde_json::from_slice(&fs::read(&completion).unwrap()).unwrap();
+    bad["member_index"] = serde_json::json!(999);
+    fs::write(&completion, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert_replay_refuses_before_unlink(&f, op, &lease, &report);
+
+    // Simulate the final unlink succeeding before its parent sync/completion row.
+    // This is recoverable only after every nonmanifest completion was durable.
+    for remove_predecessor in [false, true] {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let before =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        let report = admitted_purge(&f, op, &lease, before.members.len() - 1);
+        let manifest = f.backups.join(op.to_string()).join("manifest.json");
+        assert!(manifest.is_file());
+        fs::remove_file(&manifest).unwrap();
+        if remove_predecessor {
+            fs::remove_file(
+                f.backups
+                    .join(".catalog")
+                    .join(format!("purge-{op}.member-0.json")),
+            )
+            .unwrap();
+            assert_replay_refuses_before_unlink(&f, op, &lease, &report);
+        } else {
+            let partial =
+                purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+            assert!(!partial.complete);
+            assert_eq!(
+                partial
+                    .members
+                    .iter()
+                    .filter(|m| m.state == PurgeMemberState::OutcomeUnknown)
+                    .count(),
+                1
+            );
+            assert!(
+                purge_quarantined(&confirmation(&partial), &lease, &f.filesystem(), &limits())
+                    .unwrap()
+                    .complete
+            );
+        }
+    }
+}
+#[test]
+fn purge_rechecks_live_receipt_after_unlink_event_before_removing_member() {
+    struct RestoreReceipt {
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+        seen: AtomicBool,
+    }
+    impl RecoveryIo for RestoreReceipt {
+        fn before(&self, e: RecoveryEvent) -> std::io::Result<()> {
+            if e == RecoveryEvent::PurgeUnlink && !self.seen.swap(true, Ordering::AcqRel) {
+                fs::write(&self.path, &self.bytes)?;
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        }
+    }
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    let report = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    let hook = Arc::new(RestoreReceipt {
+        path: f.backups.join(".catalog").join(format!("{op}.json")),
+        bytes: fs::read(
+            f.backups
+                .join(".quarantine")
+                .join(op.to_string())
+                .join("receipt.json"),
+        )
+        .unwrap(),
+        seen: AtomicBool::new(false),
+    });
+    let filesystem = HookFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    assert!(purge_quarantined(&confirmation(&report), &lease, &filesystem, &limits()).is_err());
+    assert!(hook.seen.load(Ordering::Acquire));
+    assert!(
+        report
+            .members
+            .iter()
+            .all(|m| f.backups.join(&m.relative_name).is_file())
+    );
+}
+
+#[test]
+fn purge_replays_the_admitted_staged_location_without_adopting_a_final_directory() {
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    let final_path = f.backups.join(op.to_string());
+    let staged = f.backups.join(".staging").join(op.to_string());
+    fs::rename(&final_path, &staged).unwrap();
+    let report = admitted_purge(&f, op, &lease, 0);
+    let partial = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    assert!(
+        partial
+            .members
+            .iter()
+            .any(|m| m.relative_name == format!(".staging/{op}/image.fls"))
+    );
+    assert!(
+        purge_quarantined(&confirmation(&report), &lease, &f.filesystem(), &limits())
+            .unwrap()
+            .complete
+    );
+    assert!(!final_path.exists() && staged.is_dir());
+}
+#[test]
+fn purge_audit_authorization_reads_the_held_descriptor_and_refuses_replacement_or_mutation() {
+    use std::os::{fd::AsRawFd, unix::fs::FileExt};
+    struct ReplaceAudit {
+        path: std::path::PathBuf,
+        saved: std::path::PathBuf,
+        replacement: Vec<u8>,
+        same_inode: bool,
+        seen: AtomicBool,
+    }
+    impl RecoveryIo for ReplaceAudit {
+        fn read_exact_at(
+            &self,
+            file: &fs::File,
+            bytes: &mut [u8],
+            offset: u64,
+        ) -> std::io::Result<()> {
+            let observed = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+            if observed == self.path && !self.seen.swap(true, Ordering::AcqRel) {
+                if !self.same_inode {
+                    fs::rename(&self.path, &self.saved)?;
+                }
+                fs::write(&self.path, &self.replacement)?;
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+            }
+            file.read_exact_at(bytes, offset)
+        }
+    }
+    for same_inode in [false, true] {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let report = admitted_purge(&f, op, &lease, 0);
+        let path = f
+            .backups
+            .join(".catalog")
+            .join(format!("purge-{op}.intent.json"));
+        let mut replacement: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        replacement["actor"] = serde_json::json!("other-fixture-operator");
+        let replacement = serde_json::to_vec(&replacement).unwrap();
+        let hook = Arc::new(ReplaceAudit {
+            path: path.clone(),
+            saved: f.root.path().join("held-intent"),
+            replacement: replacement.clone(),
+            same_inode,
+            seen: AtomicBool::new(false),
+        });
+        let filesystem = HookFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(purge_quarantined(&confirmation(&report), &lease, &filesystem, &limits()).is_err());
+        assert!(hook.seen.load(Ordering::Acquire));
+        assert_eq!(fs::read(path).unwrap(), replacement);
+        assert!(
+            report
+                .members
+                .iter()
+                .all(|m| f.backups.join(&m.relative_name).is_file())
+        );
+    }
+}
+
+#[test]
+fn purge_refuses_authority_changes_at_the_final_member_open_before_unlink() {
+    // Arm at PurgeUnlink, then mutate at the next descriptor-open boundary.
+    // Older code rechecked authority before this OpenFile and deleted a member
+    // before discovering the restored receipt or changed audit after unlink.
+    struct LateAuthorityChange {
+        live_receipt: std::path::PathBuf,
+        receipt_bytes: Vec<u8>,
+        audit: std::path::PathBuf,
+        saved_audit: std::path::PathBuf,
+        change: u8,
+        armed: AtomicBool,
+        changed: AtomicBool,
+    }
+    impl RecoveryIo for LateAuthorityChange {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::PurgeUnlink {
+                self.armed.store(true, Ordering::Release);
+            }
+            if event == RecoveryEvent::OpenFile
+                && self.armed.load(Ordering::Acquire)
+                && !self.changed.swap(true, Ordering::AcqRel)
+            {
+                match self.change {
+                    0 => {
+                        fs::write(&self.live_receipt, &self.receipt_bytes)?;
+                        fs::set_permissions(&self.live_receipt, fs::Permissions::from_mode(0o600))?;
+                    }
+                    1 | 2 => {
+                        let mut audit: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&self.audit)?)?;
+                        audit["actor"] = serde_json::json!("late-fixture-operator");
+                        if self.change == 2 {
+                            fs::rename(&self.audit, &self.saved_audit)?;
+                        }
+                        fs::write(&self.audit, serde_json::to_vec(&audit)?)?;
+                        fs::set_permissions(&self.audit, fs::Permissions::from_mode(0o600))?;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(())
+        }
+    }
+    for change in 0..3 {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let report =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        let member_bytes: Vec<_> = report
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.relative_name.clone(),
+                    fs::read(f.backups.join(&member.relative_name)).unwrap(),
+                )
+            })
+            .collect();
+        let catalog = f.backups.join(".catalog");
+        let hook = Arc::new(LateAuthorityChange {
+            live_receipt: catalog.join(format!("{op}.json")),
+            receipt_bytes: fs::read(
+                f.backups
+                    .join(".quarantine")
+                    .join(op.to_string())
+                    .join("receipt.json"),
+            )
+            .unwrap(),
+            audit: catalog.join(format!("purge-{op}.intent.json")),
+            saved_audit: f.root.path().join("saved-late-audit"),
+            change,
+            armed: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
+        });
+        let filesystem = HookFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(purge_quarantined(&confirmation(&report), &lease, &filesystem, &limits()).is_err());
+        assert!(
+            hook.changed.load(Ordering::Acquire),
+            "late OpenFile mutation was not exercised"
+        );
+        for (name, bytes) in member_bytes {
+            assert_eq!(
+                fs::read(f.backups.join(&name)).unwrap(),
+                bytes,
+                "member {name} removed before final authority check"
+            );
+        }
+        assert!(!catalog.join(format!("purge-{op}.member-0.json")).exists());
+        assert!(!catalog.join(format!("purge-{op}.complete.json")).exists());
+        if change == 0 {
+            assert_eq!(fs::read(&hook.live_receipt).unwrap(), hook.receipt_bytes);
+        } else {
+            let changed: serde_json::Value =
+                serde_json::from_slice(&fs::read(&hook.audit).unwrap()).unwrap();
+            assert_eq!(changed["actor"], "late-fixture-operator");
+            assert_eq!(hook.saved_audit.exists(), change == 2);
+        }
+    }
+}
+
+#[test]
+fn purge_manifest_final_hash_preserves_predecessor_authority_on_late_changes() {
+    struct LateManifestRead {
+        predecessor: std::path::PathBuf,
+        predecessor_bytes: Vec<u8>,
+        completion: std::path::PathBuf,
+        completion_bytes: Vec<u8>,
+        saved_completion: std::path::PathBuf,
+        manifest_identity: (u64, u64),
+        reads: std::sync::atomic::AtomicUsize,
+        armed: AtomicBool,
+        changed: AtomicBool,
+        change: u8,
+    }
+    impl RecoveryIo for LateManifestRead {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::PurgeUnlink {
+                self.armed.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+        fn read_exact_at(
+            &self,
+            file: &std::fs::File,
+            bytes: &mut [u8],
+            offset: u64,
+        ) -> std::io::Result<()> {
+            use std::os::unix::fs::{FileExt, MetadataExt};
+            let metadata = file.metadata()?;
+            if self.armed.load(Ordering::Acquire)
+                && (metadata.dev(), metadata.ino()) == self.manifest_identity
+                && !self.changed.swap(true, Ordering::AcqRel)
+            {
+                self.reads.fetch_add(1, Ordering::AcqRel);
+                match self.change {
+                    0 => {
+                        fs::write(&self.predecessor, &self.predecessor_bytes)?;
+                        fs::set_permissions(&self.predecessor, fs::Permissions::from_mode(0o600))?;
+                    }
+                    1 => {
+                        // Even a byte-identical replacement cannot be adopted.
+                        fs::rename(&self.completion, &self.saved_completion)?;
+                        fs::write(&self.completion, &self.completion_bytes)?;
+                        fs::set_permissions(&self.completion, fs::Permissions::from_mode(0o600))?;
+                    }
+                    2 => {
+                        // Remains valid JSON, but changes the held inode binding.
+                        let mut changed = self.completion_bytes.clone();
+                        changed.push(b' ');
+                        fs::write(&self.completion, changed)?;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            file.read_exact_at(bytes, offset)
+        }
+    }
+    for change in 0..3 {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let first = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        let manifest_index = first
+            .members
+            .iter()
+            .position(|m| m.relative_name.ends_with("/manifest.json"))
+            .unwrap();
+        assert_eq!(manifest_index + 1, first.members.len());
+        assert!(manifest_index > 0);
+        let predecessor = f.backups.join(&first.members[0].relative_name);
+        let predecessor_bytes = fs::read(&predecessor).unwrap();
+        let report = admitted_purge(&f, op, &lease, manifest_index);
+        let catalog = f.backups.join(".catalog");
+        let audit = catalog.join(format!("purge-{op}.intent.json"));
+        let audit_bytes = fs::read(&audit).unwrap();
+        let completions: Vec<_> = (0..manifest_index)
+            .map(|index| {
+                let path = catalog.join(format!("purge-{op}.member-{index}.json"));
+                let bytes = fs::read(&path).unwrap();
+                assert!(
+                    bytes.len() < 65536,
+                    "fixture completion must require one Read"
+                );
+                (path, bytes)
+            })
+            .collect();
+        let manifest_path = f
+            .backups
+            .join(&report.members[manifest_index].relative_name);
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        let hook = Arc::new(LateManifestRead {
+            predecessor,
+            predecessor_bytes,
+            completion: completions[0].0.clone(),
+            completion_bytes: completions[0].1.clone(),
+            saved_completion: f.root.path().join("saved-late-completion"),
+            // Match the held manifest inode, so the mutation occurs inside
+            // its final hash rather than during a predecessor completion read.
+            manifest_identity: {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = fs::metadata(&manifest_path).unwrap();
+                (metadata.dev(), metadata.ino())
+            },
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
+            change,
+        });
+        let filesystem = HookFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(purge_quarantined(&confirmation(&report), &lease, &filesystem, &limits()).is_err());
+        assert!(
+            hook.changed.load(Ordering::Acquire),
+            "final manifest hash hook must fire"
+        );
+        assert_eq!(hook.reads.load(Ordering::Acquire), 1);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+        assert_eq!(fs::read(&audit).unwrap(), audit_bytes);
+        assert!(
+            !catalog
+                .join(format!("purge-{op}.member-{manifest_index}.json"))
+                .exists()
+        );
+        assert!(!catalog.join(format!("purge-{op}.complete.json")).exists());
+        for (index, (path, bytes)) in completions.iter().enumerate() {
+            let mut expected = bytes.clone();
+            if change == 2 && index == 0 {
+                expected.push(b' ');
+            }
+            assert_eq!(
+                fs::read(path).unwrap(),
+                expected,
+                "existing authority changed"
+            );
+        }
+        assert_eq!(hook.saved_completion.exists(), change == 1);
+        if change == 1 {
+            assert_eq!(
+                fs::read(&hook.saved_completion).unwrap(),
+                hook.completion_bytes
+            );
+        }
+        if change == 0 {
+            assert_eq!(fs::read(&hook.predecessor).unwrap(), hook.predecessor_bytes);
+        }
+    }
 }

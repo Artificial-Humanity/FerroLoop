@@ -254,6 +254,7 @@ impl HubServer {
         } = self;
         let mut acceptor = make_acceptor(listener);
         crate::artifact_dirs::ensure_startup_dirs(&state);
+        let run_hosted_reconcile = boot_reconcile.is_some();
         if let Some(plan) = boot_reconcile {
             // Not awaited: the reconciliation never holds up the accept loop. It ends with
             // `serve`: a shutdown stops the passes between two of them.
@@ -268,6 +269,13 @@ impl HubServer {
         }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut hosted_reconcile_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + crate::boot_reconcile::RETRY_INTERVAL,
+            crate::boot_reconcile::RETRY_INTERVAL,
+        );
+        hosted_reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let hosted_reconcile_in_flight =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.
         let mut attachment_sweep_tick =
             tokio::time::interval(crate::attachments::ATTACHMENT_SWEEP_INTERVAL);
@@ -321,6 +329,32 @@ impl HubServer {
                             drain_ready_session_queues(&state);
                         }).await;
                     }
+                }
+                _ = hosted_reconcile_tick.tick(), if run_hosted_reconcile => {
+                    if hosted_reconcile_in_flight
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    struct ReconcileFlightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for ReconcileFlightGuard {
+                        fn drop(&mut self) {
+                            self.0.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    let flight_guard = ReconcileFlightGuard(hosted_reconcile_in_flight.clone());
+                    // Not awaited: hosted session reconcile and respawn never holds up the accept loop.
+                    let state = state.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        let _flight_guard = flight_guard;
+                        let _ = crate::lifecycle::reconcile_and_respawn_hosted_sessions_in_hub(&state);
+                    }));
                 }
                 _ = attachment_sweep_tick.tick() => {
                     // Not awaited: a sweep never holds up the accept loop.

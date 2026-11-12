@@ -2607,6 +2607,16 @@ fn build_delivery_descriptor(
     }
 }
 
+impl UnconfirmedWireDelivery {
+    fn from_payload(trimmed: &str) -> Self {
+        build_delivery_descriptor("", trimmed, None)
+    }
+
+    fn from_payload_with_raw(trimmed: &str, raw_text: Option<&str>) -> Self {
+        build_delivery_descriptor("", trimmed, raw_text)
+    }
+}
+
 #[cfg(test)]
 fn record_unconfirmed_wire_delivery(route_keys: &[String], wire_id: &str, trimmed: &str) {
     record_unconfirmed_wire_delivery_with_raw(route_keys, wire_id, trimmed, None);
@@ -2919,6 +2929,24 @@ fn composer_equals_single_target(screen: &str, d_target: &UnconfirmedWireDeliver
     composer_equals_single_target_on_lines(&lines, d_target)
 }
 
+fn composer_is_rendering_target_prefix_on_lines(
+    lines: &[&str],
+    d_target: &UnconfirmedWireDelivery,
+) -> bool {
+    let Some((composer_compact, _is_top_zero_scrolled)) = extract_composer_compact(lines) else {
+        return false;
+    };
+    !composer_compact.is_empty()
+        && d_target.compact_full.starts_with(&composer_compact)
+        && composer_compact.len() < d_target.compact_full.len()
+}
+
+fn composer_is_rendering_target_prefix(screen: &str, d_target: &UnconfirmedWireDelivery) -> bool {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    composer_is_rendering_target_prefix_on_lines(&lines, d_target)
+}
+
 fn composer_equals_recorded_wire_deliveries_on_lines(
     lines: &[&str],
     route_keys: &[String],
@@ -2968,9 +2996,12 @@ struct VerifiedDeliverySpec<'a> {
     transcript_target: &'a str,
     session_id: Option<&'a str>,
     is_muse_route: bool,
+    bracketed: bool,
     verify_submission: bool,
     raw_text: Option<&'a str>,
 }
+
+const MAX_UNBRACKETED_PASTE_SETTLE_POLLS: usize = 6;
 
 #[allow(clippy::too_many_arguments)]
 fn execute_verified_paste_delivery(
@@ -3024,7 +3055,34 @@ fn execute_verified_paste_delivery(
 
     write_payload()?;
     if spec.verify_submission {
-        wait(TMUX_PASTE_SETTLE_DELAY);
+        let mut settle_ms = 0u64;
+        if trimmed.is_empty() || spec.bracketed {
+            wait(TMUX_PASTE_SETTLE_DELAY);
+            settle_ms = TMUX_PASTE_SETTLE_DELAY.as_millis() as u64;
+        } else {
+            let d_target = if spec.raw_text.is_some() {
+                UnconfirmedWireDelivery::from_payload_with_raw(trimmed, spec.raw_text)
+            } else {
+                UnconfirmedWireDelivery::from_payload(trimmed)
+            };
+            for _ in 0..MAX_UNBRACKETED_PASTE_SETTLE_POLLS {
+                wait(TMUX_PASTE_SETTLE_DELAY);
+                settle_ms += TMUX_PASTE_SETTLE_DELAY.as_millis() as u64;
+                let Some((contents, cursor)) = capture_rendered() else {
+                    break;
+                };
+                if composer_equals_single_target(&contents, &d_target).0 {
+                    break;
+                }
+                if composer_is_rendering_target_prefix(&contents, &d_target)
+                    || !composer_has_unsubmitted_content(&contents, cursor)
+                {
+                    continue;
+                }
+                break;
+            }
+        }
+        crate::dispatch_diagnostics::record_last_paste_settle_ms(settle_ms);
     }
     if let Err(err) = send_enter() {
         if let Some(id) = wire_id {
@@ -3132,6 +3190,7 @@ pub fn host_write_text_then_enter(
         transcript_target: &session_str,
         session_id: None,
         is_muse_route: false,
+        bracketed: false,
         verify_submission: true,
         raw_text: Some(text),
     };
@@ -3428,6 +3487,7 @@ fn deliver_via_tmux_paste_with_opts(
             transcript_target: raw_target,
             session_id: opts.session_id,
             is_muse_route: opts.is_muse_route,
+            bracketed: opts.bracketed,
             verify_submission: opts.verify_submission,
             raw_text: None,
         };
@@ -3499,6 +3559,7 @@ fn deliver_via_tmux_paste_with_opts(
         transcript_target: raw_target,
         session_id: opts.session_id,
         is_muse_route: opts.is_muse_route,
+        bracketed: opts.bracketed,
         verify_submission: opts.verify_submission,
         raw_text: None,
     };
@@ -3624,6 +3685,9 @@ enum PrePasteOutcome {
 
 enum RetryPollDecision {
     CaptureUnavailable,
+    StillRendering {
+        exhausted_detail: &'static str,
+    },
     StillUnsubmitted {
         is_raw_fallback: bool,
         exhausted_detail: &'static str,
@@ -3642,6 +3706,7 @@ fn run_bounded_enter_retry_loop(
     mut send_enter: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     let mut watch_polls = 0u32;
+    let mut rendering_polls = 0u32;
     let mut enter_retries = 0u32;
     let mut consecutive_unsubmitted_polls = 0u32;
     let mut saw_unsubmitted_composer = initially_saw_rendered_unsubmitted;
@@ -3666,11 +3731,25 @@ fn run_bounded_enter_retry_loop(
                     ));
                 }
             }
+            RetryPollDecision::StillRendering { exhausted_detail } => {
+                watch_polls = 0;
+                saw_unsubmitted_composer = true;
+                saw_rendered_unsubmitted = true;
+                consecutive_unsubmitted_polls = 0;
+                rendering_polls += 1;
+                if rendering_polls >= MAX_WATCH_POLLS {
+                    return Err(format!(
+                        "prompt submission unconfirmed after {enter_retries} Enter retries: \
+                         {exhausted_detail}"
+                    ));
+                }
+            }
             RetryPollDecision::StillUnsubmitted {
                 is_raw_fallback,
                 exhausted_detail,
             } => {
                 watch_polls = 0;
+                rendering_polls = 0;
                 if is_raw_fallback && enter_retries >= 1 {
                     return Ok(());
                 }
@@ -3699,6 +3778,7 @@ fn run_bounded_enter_retry_loop(
                 if saw_unsubmitted_composer {
                     return Ok(());
                 }
+                rendering_polls = 0;
                 consecutive_unsubmitted_polls = 0;
                 watch_polls += 1;
                 if watch_polls >= MAX_WATCH_POLLS {
@@ -3923,6 +4003,11 @@ fn confirm_paste_submission_with_raw(
                         return RetryPollDecision::StillUnsubmitted {
                             is_raw_fallback: false,
                             exhausted_detail,
+                        };
+                    }
+                    if composer_is_rendering_target_prefix(&contents, &d_target) {
+                        return RetryPollDecision::StillRendering {
+                            exhausted_detail: "composer still rendering pasted payload",
                         };
                     }
                     if composer_has_unsubmitted_content(&contents, cursor) {
@@ -16990,6 +17075,7 @@ exit 1"#,
             transcript_target: "muse:melisandre.r3",
             session_id: Some(muse_sid),
             is_muse_route: true,
+            bracketed: false,
             verify_submission: true,
             raw_text: None,
         };
@@ -17379,5 +17465,343 @@ exit 1"#,
             recorded[0].1
         );
         drop(server_thread);
+    }
+
+    #[test]
+    fn muse_short_multiline_progressive_paste_burst_tolerates_prefix_rendering_and_settles_before_enter()
+     {
+        let rule = "─".repeat(120);
+        // ~360-char 5-line `[fl-wire ...]` payload matching the Melisandre check-2a shape from #479.
+        let payload = concat!(
+            "[fl-wire mail/normal] from feira (id: urn:uuid:019d8b30-4400-7000-8000-000000000479, ",
+            "thread: urn:uuid:019d8b30-4400-7000-8000-000000000400): Check 2a verification\n\n",
+            "Line 2: Short multi-line Muse mail under the 1000-char placeholder threshold.\n",
+            "Line 3: Unbracketed paste burst wraps progressively across composer rows.\n",
+            "Line 4: Confirm poll must wait for full target and retry Enter cleanly."
+        );
+        assert!(
+            (320..=420).contains(&payload.chars().count()),
+            "expected ~360-char payload, got {}",
+            payload.chars().count()
+        );
+        assert_eq!(payload.lines().count(), 5);
+
+        let d_target = UnconfirmedWireDelivery::from_payload(payload);
+        let lines: Vec<&str> = payload.lines().collect();
+        let prefix_2_lines = format!(
+            "◆ Ready.\n\n{rule}\n❯ {}\n  {}\n{rule}\n  muse-wonder-full-1.0",
+            lines[0], lines[1]
+        );
+        let prefix_3_lines = format!(
+            "◆ Ready.\n\n{rule}\n❯ {}\n  {}\n  {}\n{rule}\n  muse-wonder-full-1.0",
+            lines[0], lines[1], lines[2]
+        );
+        // Full 5-line payload with a trailing blank composer line from a swallowed `\r`.
+        let full_with_trailing_blank = format!(
+            "◆ Ready.\n\n{rule}\n❯ {}\n  \n{rule}\n  muse-wonder-full-1.0",
+            payload.replace('\n', "\n  ")
+        );
+        let empty_submitted_screen = format!(
+            "◆ Submitted.\n❯ {}\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0",
+            lines[0]
+        );
+
+        assert!(!composer_equals_single_target(&prefix_2_lines, &d_target).0);
+        assert!(composer_is_rendering_target_prefix(
+            &prefix_2_lines,
+            &d_target
+        ));
+        assert!(!composer_equals_single_target(&prefix_3_lines, &d_target).0);
+        assert!(composer_is_rendering_target_prefix(
+            &prefix_3_lines,
+            &d_target
+        ));
+        assert_eq!(
+            composer_equals_single_target(&full_with_trailing_blank, &d_target),
+            (true, false)
+        );
+        assert!(!composer_is_rendering_target_prefix(
+            &full_with_trailing_blank,
+            &d_target
+        ));
+
+        // Case 1: Post-Enter confirmation sees progressive prefix rendering on polls 1-2 (because
+        // first `\r` was swallowed during a slow burst), then full payload + trailing blank line
+        // on polls 3-4, then sends retry Enter and observes empty composer on poll 5.
+        let confirm_screens = std::cell::RefCell::new(VecDeque::from(vec![
+            prefix_2_lines.clone(),
+            prefix_3_lines.clone(),
+            full_with_trailing_blank.clone(),
+            full_with_trailing_blank.clone(),
+            empty_submitted_screen.clone(),
+        ]));
+        let poll_cursor = std::cell::Cell::new(0usize);
+        let enter_at_polls = std::cell::RefCell::new(Vec::<usize>::new());
+        let outcome = confirm_paste_submission_with_raw(
+            payload,
+            None,
+            |_| {},
+            || {
+                let idx = poll_cursor.get() + 1;
+                poll_cursor.set(idx);
+                let contents = confirm_screens
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| empty_submitted_screen.clone());
+                Some(ScreenCapture::Rendered {
+                    contents,
+                    cursor: Some(CursorState::with_dims(6, 2, 40, 120)),
+                })
+            },
+            || false,
+            || {
+                enter_at_polls.borrow_mut().push(poll_cursor.get());
+                Ok(())
+            },
+        )
+        .expect("progressive prefix rendering must not abort as composer_occupied");
+        assert_eq!(outcome, PostPasteOutcome::ObservedEmptyRenderedComposer);
+        assert_eq!(
+            *enter_at_polls.borrow(),
+            vec![4],
+            "retry Enter must not fire during prefix polls 1-2; must fire on poll 4 after 2 full-target polls"
+        );
+
+        // Also verify via `execute_verified_paste_delivery` with ` paste_writes == 1` when settle
+        // bound expires while still rendering prefix and post-Enter finishes rendering + retries Enter.
+        let route_keys = vec!["host:muse.melisandre.479".to_string()];
+        clear_unconfirmed_wire_deliveries(&route_keys);
+        let spec = VerifiedDeliverySpec {
+            route_keys: route_keys.clone(),
+            transcript_target: "muse:melisandre.479",
+            session_id: None,
+            is_muse_route: true,
+            bracketed: false,
+            verify_submission: true,
+            raw_text: None,
+        };
+        let idle_screen = format!("◆ Ready.\n\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0");
+        let pre_and_settle_screens = std::cell::RefCell::new(VecDeque::from(vec![
+            idle_screen.clone(),    // pre-paste clean check
+            prefix_2_lines.clone(), // settle poll 1
+            prefix_2_lines.clone(), // settle poll 2
+            prefix_2_lines.clone(), // settle poll 3
+            prefix_3_lines.clone(), // settle poll 4
+            prefix_3_lines.clone(), // settle poll 5
+            prefix_3_lines.clone(), // settle poll 6
+        ]));
+        let post_screens = std::cell::RefCell::new(VecDeque::from(vec![
+            prefix_3_lines.clone(),           // confirm poll 1 (still rendering prefix)
+            full_with_trailing_blank.clone(), // confirm poll 2 (full target rendered)
+            full_with_trailing_blank.clone(), // confirm poll 3 (2nd consecutive full target -> retry Enter)
+            empty_submitted_screen.clone(),   // confirm poll 4 (empty after retry Enter)
+        ]));
+        let mut paste_writes = 0u32;
+        let mut enter_presses = 0u32;
+        execute_verified_paste_delivery(
+            &spec,
+            payload,
+            |_| {},
+            || {
+                let s = pre_and_settle_screens
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| prefix_3_lines.clone());
+                Some((s, Some(CursorState::with_dims(4, 2, 40, 120))))
+            },
+            || {
+                let s = post_screens
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| empty_submitted_screen.clone());
+                Some(ScreenCapture::Rendered {
+                    contents: s,
+                    cursor: Some(CursorState::with_dims(6, 2, 40, 120)),
+                })
+            },
+            || {
+                paste_writes += 1;
+                Ok(())
+            },
+            || {
+                enter_presses += 1;
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect(
+            "execute_verified_paste_delivery must succeed when first CR is swallowed mid-burst",
+        );
+        assert_eq!(paste_writes, 1, "must write payload once");
+        assert_eq!(
+            enter_presses, 2,
+            "expected initial Enter + 1 retry Enter after full target rendered"
+        );
+        assert_eq!(
+            crate::dispatch_diagnostics::take_last_paste_settle_ms(),
+            Some(300),
+            "6 settle polls * 50ms must record 300ms"
+        );
+
+        // Case 2: Pre-Enter settle waits for progressive unbracketed paste to finish rendering on
+        // settle poll 3 (150ms) before sending the first `\r`, which then submits on the first try!
+        let settle_3_screens = std::cell::RefCell::new(VecDeque::from(vec![
+            idle_screen.clone(),              // pre-paste clean check
+            prefix_2_lines.clone(),           // settle poll 1 (50ms): strict prefix
+            prefix_3_lines.clone(),           // settle poll 2 (100ms): strict prefix
+            full_with_trailing_blank.clone(), // settle poll 3 (150ms): full target rendered -> break!
+        ]));
+        let mut settle3_pastes = 0u32;
+        let mut settle3_enters = 0u32;
+        execute_verified_paste_delivery(
+            &spec,
+            payload,
+            |_| {},
+            || {
+                let s = settle_3_screens
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| full_with_trailing_blank.clone());
+                Some((s, Some(CursorState::with_dims(4, 2, 40, 120))))
+            },
+            || {
+                Some(ScreenCapture::Rendered {
+                    contents: empty_submitted_screen.clone(),
+                    cursor: Some(CursorState::with_dims(4, 2, 40, 120)),
+                })
+            },
+            || {
+                settle3_pastes += 1;
+                Ok(())
+            },
+            || {
+                assert!(
+                    settle_3_screens.borrow().is_empty(),
+                    "first Enter must not be sent before settle poll 3 renders the full target"
+                );
+                settle3_enters += 1;
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect("unbracketed paste settling on poll 3 must submit cleanly on first Enter");
+        assert_eq!(settle3_pastes, 1);
+        assert_eq!(
+            settle3_enters, 1,
+            "first Enter after settle poll 3 must submit without retry"
+        );
+        assert_eq!(
+            crate::dispatch_diagnostics::take_last_paste_settle_ms(),
+            Some(150),
+            "3 settle polls * 50ms must record 150ms"
+        );
+
+        // Case 3: Human text appended after the payload (`"<payload> human typing"`) is NOT a
+        // target prefix and aborts immediately on poll 1 with `composer_occupied_by_non_wire_input:`
+        // and 0 retry Enters.
+        let appended_human_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ {} human typing\n{rule}\n  muse-wonder-full-1.0",
+            payload.replace('\n', "\n  ")
+        );
+        assert!(
+            !composer_equals_single_target(&appended_human_screen, &d_target).0,
+            "payload + human typing must not match single target"
+        );
+        assert!(
+            !composer_is_rendering_target_prefix(&appended_human_screen, &d_target),
+            "payload + human typing must not be treated as rendering prefix"
+        );
+        let mut human_polls = 0u32;
+        let mut human_retry_enters = 0u32;
+        let human_err = confirm_paste_submission_with_raw(
+            payload,
+            None,
+            |_| {},
+            || {
+                human_polls += 1;
+                Some(ScreenCapture::Rendered {
+                    contents: appended_human_screen.clone(),
+                    cursor: Some(CursorState::with_dims(6, 20, 40, 120)),
+                })
+            },
+            || false,
+            || {
+                human_retry_enters += 1;
+                Ok(())
+            },
+        )
+        .expect_err("payload with trailing human typing must abort immediately");
+        assert!(
+            is_composer_occupied_error(&human_err),
+            "expected composer_occupied_by_non_wire_input, got: {human_err}"
+        );
+        assert_eq!(human_polls, 1, "must abort on confirm poll 1");
+        assert_eq!(human_retry_enters, 0, "must send 0 retry Enters");
+
+        // Case 4: Long placeholder (`[Pasted Content N chars]`) behavior is unchanged — matches
+        // `composer_equals_single_target` on settle poll 1 (50ms) and retries/confirms as before.
+        let long_payload = format!(
+            "[fl-wire mail/normal] from feira (id: urn:uuid:019d8b30-4400-7000-8000-000000000480, thread: t): Long\n\n{}",
+            "Long Muse verification line for placeholder threshold check.\n".repeat(20)
+        );
+        let long_trimmed = long_payload.trim();
+        assert!(long_trimmed.chars().count() > 1000);
+        let long_placeholder_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [Pasted Content {} chars]\n{rule}\n  muse-wonder-full-1.0",
+            long_trimmed.chars().count()
+        );
+        let d_long = UnconfirmedWireDelivery::from_payload(long_trimmed);
+        assert_eq!(
+            composer_equals_single_target(&long_placeholder_screen, &d_long),
+            (true, true)
+        );
+        let long_settle_screens = std::cell::RefCell::new(VecDeque::from(vec![
+            idle_screen.clone(),             // pre-paste clean check
+            long_placeholder_screen.clone(), // settle poll 1 (50ms) -> matches placeholder immediately!
+        ]));
+        let long_post_screens = std::cell::RefCell::new(VecDeque::from(vec![
+            long_placeholder_screen.clone(), // confirm poll 1
+            long_placeholder_screen.clone(), // confirm poll 2 -> triggers retry Enter
+            empty_submitted_screen.clone(),  // confirm poll 3 -> empty after retry Enter
+        ]));
+        let mut long_enters = 0u32;
+        execute_verified_paste_delivery(
+            &spec,
+            long_trimmed,
+            |_| {},
+            || {
+                let s = long_settle_screens
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| long_placeholder_screen.clone());
+                Some((s, Some(CursorState::with_dims(4, 2, 40, 120))))
+            },
+            || {
+                let s = long_post_screens
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| empty_submitted_screen.clone());
+                Some(ScreenCapture::Rendered {
+                    contents: s,
+                    cursor: Some(CursorState::with_dims(4, 2, 40, 120)),
+                })
+            },
+            || Ok(()),
+            || {
+                long_enters += 1;
+                Ok(())
+            },
+            || {},
+            |_| {},
+        )
+        .expect("long placeholder paste must settle on poll 1 and confirm after retry Enter");
+        assert_eq!(long_enters, 2, "expected initial Enter + 1 retry Enter");
+        assert_eq!(
+            crate::dispatch_diagnostics::take_last_paste_settle_ms(),
+            Some(50),
+            "long placeholder must break on settle poll 1 (50ms)"
+        );
     }
 }

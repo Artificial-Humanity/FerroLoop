@@ -24,9 +24,14 @@ use fl_core::vendor_adapter::{
     ConfigEffectiveScope, NormalizedSessionTurn, RuntimePort, TeardownOutcome, TeardownTarget,
     TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError,
     VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule,
+    VendorStartupPromptRule, classify_claude_turn_role, estimate_claude_post_compaction_context,
+    extract_claude_message_content, find_claude_active_session_transcript_path,
+    find_claude_session_transcript_path, repair_claude_session_transcript_tail,
+    validate_claude_session_id,
 };
 use serde_json::Value;
+
+pub use fl_core::PostCompactionContext as ClaudePostCompactionContext;
 
 /// First-launch modal printed by Claude Code when auto mode asks for environment setup.
 pub const CLAUDE_AUTO_MODE_PROMPT: &str = "Teach auto mode about your environment";
@@ -99,28 +104,39 @@ impl ClaudeHostAdapter {
         home_dir: &Path,
         vendor_session_id: &str,
     ) -> Result<Option<PathBuf>, VendorAdapterError> {
-        let session_id = validate_required_session_id(vendor_session_id, "find_transcript")?;
-        let target_file = format!("{session_id}.jsonl");
-        let claude_dir = home_dir.join(".claude");
-        for bucket in ["projects", "archived"] {
-            let root = claude_dir.join(bucket);
-            let Ok(entries) = fs::read_dir(&root) else {
-                continue;
-            };
-            let mut subdirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            subdirs.sort();
-            for proj_dir in subdirs {
-                let candidate = proj_dir.join(&target_file);
-                if candidate.is_file() {
-                    return Ok(Some(candidate));
-                }
-            }
-        }
-        Ok(None)
+        find_claude_session_transcript_path(home_dir, vendor_session_id, true)
+    }
+
+    /// Locate the active `<session-uuid>.jsonl` transcript file strictly under
+    /// `<home_dir>/.claude/projects/*/` (deterministic sorted subdirectory order; never searches
+    /// `.claude/archived/` and never scans by newest `mtime`).
+    pub fn find_active_session_transcript_path(
+        &self,
+        home_dir: &Path,
+        vendor_session_id: &str,
+    ) -> Result<Option<PathBuf>, VendorAdapterError> {
+        find_claude_active_session_transcript_path(home_dir, vendor_session_id)
+    }
+
+    /// Inspect only the final non-empty line of `<session-uuid>.jsonl` and truncate any torn
+    /// trailing non-JSON write back to the last complete valid JSON line.
+    ///
+    /// Complete JSONL transcripts—including dangling `tool_use` turns (`stop_reason: "tool_use"`)
+    /// and unarchived `SIGKILL` transcripts—are left 100% untouched (`Ok(0)`).
+    pub fn repair_session_transcript_tail(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<usize, VendorAdapterError> {
+        repair_claude_session_transcript_tail(transcript_path)
+    }
+
+    /// Estimate post-compaction active context tokens, conversational byte volume, latest real
+    /// model ID, normalized turn count, and persisted Remote Control `bridgeSessionId`.
+    pub fn estimate_post_compaction_context(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<ClaudePostCompactionContext, VendorAdapterError> {
+        estimate_claude_post_compaction_context(transcript_path)
     }
 
     /// Read and normalize an exact-session `.jsonl` transcript file from disk, advancing
@@ -200,38 +216,11 @@ pub fn safe_positional_prompt(prompt: &str) -> String {
     }
 }
 
-/// Validate that a session ID is non-empty and safe to use as a CLI argument and filename stem
-/// (no path separators, traversal, whitespace, control characters, or leading dash).
-fn is_valid_claude_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
 fn validate_required_session_id<'a>(
     raw: &'a str,
     operation: &str,
 ) -> Result<&'a str, VendorAdapterError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(VendorAdapterError::MissingSessionIdentity {
-            vendor: "claude".into(),
-            reason: format!(
-                "Claude `{operation}` requires an explicit vendor_session_id; \
-                 --continue and newest-by-mtime fallback are forbidden"
-            ),
-        });
-    }
-    if !is_valid_claude_session_id(trimmed) {
-        return Err(VendorAdapterError::InvalidConfig {
-            vendor: "claude".into(),
-            reason: format!("invalid Claude vendor_session_id `{trimmed}` for `{operation}`"),
-        });
-    }
-    Ok(trimmed)
+    validate_claude_session_id(raw, operation)
 }
 
 /// Convert a persona identifier (`"ferris"`, `"kayla"`) into a capitalized display name
@@ -307,132 +296,6 @@ fn parse_cursor_line(after_cursor: Option<&str>) -> Result<usize, VendorAdapterE
             vendor: "claude".into(),
             reason: format!("invalid transcript cursor `{raw}`"),
         })
-}
-
-fn extract_claude_message_content(val: &Value) -> String {
-    let Some(content) = val
-        .get("content")
-        .or_else(|| val.pointer("/message/content"))
-    else {
-        if let Some(s) = val
-            .get("result")
-            .or_else(|| val.get("text"))
-            .and_then(Value::as_str)
-        {
-            return s.trim().to_string();
-        }
-        return String::new();
-    };
-    match content {
-        Value::String(s) => s.trim().to_string(),
-        Value::Array(blocks) => {
-            let mut parts = Vec::new();
-            for block in blocks {
-                let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
-                match btype {
-                    "text" => {
-                        if let Some(t) = block.get("text").and_then(Value::as_str)
-                            && !t.trim().is_empty()
-                        {
-                            parts.push(t.trim().to_string());
-                        }
-                    }
-                    "tool_result" => {
-                        if let Some(c) = block.get("content") {
-                            match c {
-                                Value::String(s) if !s.trim().is_empty() => {
-                                    parts.push(s.trim().to_string());
-                                }
-                                Value::Array(arr) => {
-                                    for item in arr {
-                                        if let Some(t) = item.get("text").and_then(Value::as_str)
-                                            && !t.trim().is_empty()
-                                        {
-                                            parts.push(t.trim().to_string());
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "tool_use" => {
-                        if let Some(name) = block.get("name").and_then(Value::as_str)
-                            && !name.trim().is_empty()
-                        {
-                            parts.push(format!("[tool_use:{name}]"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            parts.join("\n")
-        }
-        _ => String::new(),
-    }
-}
-
-fn is_claude_skipped_record_type(record_type: &str) -> bool {
-    record_type.starts_with("api-request")
-        || matches!(
-            record_type,
-            "attachment"
-                | "queue-operation"
-                | "last-prompt"
-                | "file-history-snapshot"
-                | "mode"
-                | "permission-mode"
-                | "atis-latch"
-                | "bridge-session"
-                | "ai-title"
-                | "tools-used"
-                | "summary"
-        )
-}
-
-fn classify_claude_turn_role(val: &Value) -> Option<String> {
-    let obj = val.as_object()?;
-    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    if let Some(t) = obj.get("type").and_then(Value::as_str)
-        && is_claude_skipped_record_type(t)
-    {
-        return None;
-    }
-    let raw_role = obj
-        .get("role")
-        .and_then(Value::as_str)
-        .or_else(|| val.pointer("/message/role").and_then(Value::as_str))
-        .or_else(|| obj.get("type").and_then(Value::as_str))?;
-
-    let mut role = match raw_role.trim().to_ascii_lowercase().as_str() {
-        "user" | "human" => "user".to_string(),
-        "assistant" | "model" | "result" | "reasoning" => "assistant".to_string(),
-        "tool" | "tool_result" => "tool".to_string(),
-        "system" => "system".to_string(),
-        _ => return None,
-    };
-
-    if role == "user" {
-        if obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-            || obj.get("synthetic_reason").is_some()
-        {
-            role = "system".to_string();
-        } else if let Some(arr) = obj
-            .get("content")
-            .or_else(|| val.pointer("/message/content"))
-            .and_then(Value::as_array)
-            && !arr.is_empty()
-            && arr
-                .iter()
-                .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
-        {
-            role = "tool".to_string();
-        }
-    }
-
-    Some(role)
 }
 
 impl VendorHostAdapter for ClaudeHostAdapter {
@@ -874,6 +737,28 @@ impl VendorHostAdapter for ClaudeHostAdapter {
             turns,
             next_cursor: last_cursor,
         })
+    }
+
+    fn find_active_session_transcript_path(
+        &self,
+        home_dir: &Path,
+        vendor_session_id: &str,
+    ) -> Result<Option<PathBuf>, VendorAdapterError> {
+        Self::find_active_session_transcript_path(self, home_dir, vendor_session_id)
+    }
+
+    fn repair_session_transcript_tail(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<usize, VendorAdapterError> {
+        Self::repair_session_transcript_tail(self, transcript_path)
+    }
+
+    fn estimate_post_compaction_context(
+        &self,
+        transcript_path: &Path,
+    ) -> Result<ClaudePostCompactionContext, VendorAdapterError> {
+        Self::estimate_post_compaction_context(self, transcript_path)
     }
 
     fn stop(&self, target: &TeardownTarget) -> Result<TeardownOutcome, VendorAdapterError> {
@@ -1358,5 +1243,348 @@ mod tests {
             adapter.delete(&owned_target).unwrap(),
             TeardownOutcome::AlreadyAbsent
         );
+    }
+
+    #[test]
+    fn find_active_session_transcript_path_ignores_archived_and_validates_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = ClaudeHostAdapter::new();
+
+        assert!(matches!(
+            adapter.find_active_session_transcript_path(tmp.path(), "   "),
+            Err(VendorAdapterError::MissingSessionIdentity { .. })
+        ));
+        for bad in ["../escape", "nested/id", "--continue", "-bad"] {
+            assert!(
+                matches!(
+                    adapter.find_active_session_transcript_path(tmp.path(), bad),
+                    Err(VendorAdapterError::InvalidConfig { .. })
+                ),
+                "expected InvalidConfig for {bad:?}"
+            );
+        }
+
+        let uuid = "4d9bd978-abdb-432c-9f25-e002b9b3ae61";
+        assert_eq!(
+            adapter
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            None
+        );
+
+        let archived_dir = tmp
+            .path()
+            .join(".claude")
+            .join("archived")
+            .join("ferroloop");
+        fs::create_dir_all(&archived_dir).unwrap();
+        let archived_file = archived_dir.join(format!("{uuid}.jsonl"));
+        fs::write(
+            &archived_file,
+            r#"{"uuid":"1","type":"user","content":"archived"}"#,
+        )
+        .unwrap();
+
+        // Present only in archived/: active lookup MUST return None while general lookup finds it.
+        assert_eq!(
+            adapter
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            adapter
+                .find_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            Some(archived_file)
+        );
+
+        // Present in projects/: deterministic sorted project directory selection.
+        let proj_b = tmp.path().join(".claude").join("projects").join("z-proj");
+        let proj_a = tmp.path().join(".claude").join("projects").join("a-proj");
+        fs::create_dir_all(&proj_b).unwrap();
+        fs::create_dir_all(&proj_a).unwrap();
+        let file_b = proj_b.join(format!("{uuid}.jsonl"));
+        let file_a = proj_a.join(format!("{uuid}.jsonl"));
+        fs::write(&file_b, r#"{"uuid":"b","type":"user","content":"b"}"#).unwrap();
+        fs::write(&file_a, r#"{"uuid":"a","type":"user","content":"a"}"#).unwrap();
+
+        assert_eq!(
+            adapter
+                .find_active_session_transcript_path(tmp.path(), uuid)
+                .unwrap(),
+            Some(file_a)
+        );
+    }
+
+    #[test]
+    fn repair_session_transcript_tail_preserves_complete_dangling_tool_use_and_sigkill_transcripts()
+    {
+        let tmp = TempDir::new().unwrap();
+        let adapter = ClaudeHostAdapter::new();
+        let proj_dir = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("ferroloop");
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        // 1. Complete JSONL ending with a dangling tool_use + SIGKILL metadata (no Archive record).
+        let dangling_path = proj_dir.join("dangling.jsonl");
+        let complete_lines = concat!(
+            r#"{"type":"bridge-session","sessionId":"4d9bd978-abdb-432c-9f25-e002b9b3ae61","bridgeSessionId":"cse_01SP4ortBQU3hQGNi4NtM8pN"}"#,
+            "\n",
+            r#"{"uuid":"u-1","type":"user","message":{"role":"user","content":"Run sleep"}}"#,
+            "\n",
+            r#"{"uuid":"a-1","type":"assistant","message":{"model":"claude-opus-5-5","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"sleep 25"}}]}}"#,
+            "\n"
+        );
+        fs::write(&dangling_path, complete_lines).unwrap();
+        assert_eq!(
+            adapter
+                .repair_session_transcript_tail(&dangling_path)
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs::read(&dangling_path).unwrap(), complete_lines.as_bytes());
+
+        // 2. Complete JSONL without a trailing newline must also remain byte-for-byte untouched.
+        let no_nl_path = proj_dir.join("no_nl.jsonl");
+        let no_nl = complete_lines.trim_end_matches('\n');
+        fs::write(&no_nl_path, no_nl).unwrap();
+        assert_eq!(
+            adapter.repair_session_transcript_tail(&no_nl_path).unwrap(),
+            0
+        );
+        assert_eq!(fs::read(&no_nl_path).unwrap(), no_nl.as_bytes());
+
+        // 3. Torn trailing non-JSON fragment (including torn UTF-8 bytes) is backed up to
+        //    `<file>.fl-torn-tail-<ts>` (mode 0600) and truncated back to the last valid newline.
+        let torn_path = proj_dir.join("torn.jsonl");
+        let mut torn_bytes = complete_lines.as_bytes().to_vec();
+        let fragment = b"{\"type\":\"assistant\",\"message\":{\"content\":\"\xe2\x97";
+        torn_bytes.extend_from_slice(fragment);
+        fs::write(&torn_path, &torn_bytes).unwrap();
+
+        let removed = adapter.repair_session_transcript_tail(&torn_path).unwrap();
+        assert_eq!(removed, fragment.len());
+        assert_eq!(fs::read(&torn_path).unwrap(), complete_lines.as_bytes());
+
+        let backups: Vec<PathBuf> = fs::read_dir(&proj_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("torn.jsonl.fl-torn-tail-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "expected 1 torn-tail backup file");
+        assert_eq!(fs::read(&backups[0]).unwrap(), fragment);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup must be 0600, got {mode:o}");
+        }
+
+        // 4. Transcript with zero valid JSON lines returns Err and is NEVER truncated on disk.
+        let all_bad_path = proj_dir.join("all_bad.jsonl");
+        let bad_payload = b"{\"type\":\"user\",\"message\":";
+        fs::write(&all_bad_path, bad_payload).unwrap();
+        assert!(matches!(
+            adapter.repair_session_transcript_tail(&all_bad_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+        assert_eq!(fs::read(&all_bad_path).unwrap(), bad_payload);
+        assert!(matches!(
+            adapter.estimate_post_compaction_context(&all_bad_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+
+        // 5. Path outside `.claude/projects` or symlinked transcript is refused.
+        let outside_path = tmp.path().join("outside.jsonl");
+        fs::write(&outside_path, complete_lines).unwrap();
+        assert!(matches!(
+            adapter.repair_session_transcript_tail(&outside_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+        assert!(matches!(
+            adapter.estimate_post_compaction_context(&outside_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+
+        #[cfg(unix)]
+        {
+            let symlink_path = proj_dir.join("symlinked.jsonl");
+            std::os::unix::fs::symlink(&outside_path, &symlink_path).unwrap();
+            assert!(matches!(
+                adapter.repair_session_transcript_tail(&symlink_path),
+                Err(VendorAdapterError::Transport { .. })
+            ));
+            assert!(matches!(
+                adapter.estimate_post_compaction_context(&symlink_path),
+                Err(VendorAdapterError::Transport { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn estimate_post_compaction_context_computes_tokens_bytes_model_and_bridge_session() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = ClaudeHostAdapter::new();
+        let proj_dir = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("ferroloop");
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        // Case 1: Uncompacted SIGKILL transcript with bridge-session, telemetry bloat, sidechains,
+        // and a trailing <synthetic> 0-token interrupted-turn recovery record.
+        let uncompacted_path = proj_dir.join("uncompacted.jsonl");
+        let user_line = r#"{"uuid":"u-1","type":"user","isSidechain":false,"message":{"role":"user","content":"Inspect workspace"}}"#;
+        let asst_line = r#"{"uuid":"a-1","type":"assistant","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":974,"cache_read_input_tokens":387420,"output_tokens":612},"content":[{"type":"text","text":"Workspace clean."}]}}"#;
+        let synth_tool = r#"{"uuid":"u-2","type":"user","isSidechain":false,"toolDenialKind":"interrupted","message":{"role":"user","content":[{"type":"tool_result","is_error":true,"tool_use_id":"toolu_01","content":"[Tool call interrupted]"}]}}"#;
+        let synth_asst = r#"{"uuid":"a-2","type":"assistant","isSidechain":false,"message":{"model":"<synthetic>","role":"assistant","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"No response requested."}]}}"#;
+        let uncompacted = [
+            r#"{"type":"bridge-session","sessionId":"4d9bd978-abdb-432c-9f25-e002b9b3ae61","bridgeSessionId":"cse_01SP4ortBQU3hQGNi4NtM8pN"}"#,
+            r#"{"type":"attachment","blob":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            r#"{"type":"api-request-shape","payload":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}"#,
+            r#"{"type":"api-request","payload":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"}"#,
+            r#"{"type":"queue-operation","timestamp":"2026-11-09T20:00:00Z"}"#,
+            r#"{"type":"cost-state","costUSD":1.25}"#,
+            r#"{"type":"file-history-snapshot","files":[]}"#,
+            user_line,
+            asst_line,
+            r#"{"uuid":"sc-1","type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5","role":"assistant","usage":{"input_tokens":999999,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"sidechain"}]}}"#,
+            synth_tool,
+            synth_asst,
+        ]
+        .join("\n");
+        fs::write(&uncompacted_path, &uncompacted).unwrap();
+
+        let ctx = adapter
+            .estimate_post_compaction_context(&uncompacted_path)
+            .unwrap();
+        assert_eq!(ctx.turn_count, 4);
+        assert_eq!(ctx.latest_model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(ctx.active_context_tokens, Some(388_396));
+        assert_eq!(
+            ctx.post_compact_conversational_bytes,
+            (user_line.len() + asst_line.len() + synth_tool.len() + synth_asst.len()) as u64
+        );
+        assert_eq!(
+            ctx.bridge_session_id.as_deref(),
+            Some("cse_01SP4ortBQU3hQGNi4NtM8pN")
+        );
+        assert!(ctx.has_persisted_bridge_session());
+
+        // Case 2: Compacted transcript right after compact_boundary falls back to postTokens and
+        // drops pre-compaction bytes/tokens while keeping bridge_session_id and latest_model.
+        let compacted_path = proj_dir.join("compacted.jsonl");
+        let compact_summary = r#"{"uuid":"cs-1","type":"user","isCompactSummary":true,"message":{"role":"user","content":"Compacted summary"}}"#;
+        let compacted = [
+            r#"{"type":"bridge-session","sessionId":"032bc4ff-1451-486f-95ec-69215c9773bc","bridgeSessionId":"cse_compacted_01"}"#,
+            r#"{"uuid":"pre-u","type":"user","message":{"role":"user","content":"Huge pre-compact prompt"}}"#,
+            r#"{"uuid":"pre-a","type":"assistant","message":{"model":"claude-sonnet-5-5","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":850000},"content":[{"type":"text","text":"Pre-compact reply"}]}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto","preTokens":851010,"postTokens":21769,"cumulativeDroppedTokens":2818270}}"#,
+            compact_summary,
+        ]
+        .join("\n");
+        fs::write(&compacted_path, &compacted).unwrap();
+
+        let ctx_post_boundary = adapter
+            .estimate_post_compaction_context(&compacted_path)
+            .unwrap();
+        assert_eq!(ctx_post_boundary.turn_count, 3);
+        assert_eq!(
+            ctx_post_boundary.latest_model.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(ctx_post_boundary.active_context_tokens, Some(21_769));
+        assert_eq!(
+            ctx_post_boundary.post_compact_conversational_bytes,
+            compact_summary.len() as u64
+        );
+        assert_eq!(
+            ctx_post_boundary.bridge_session_id.as_deref(),
+            Some("cse_compacted_01")
+        );
+
+        // Case 3: Real assistant turn after compact_boundary supersedes postTokens.
+        let post_asst = r#"{"uuid":"post-a","type":"assistant","message":{"model":"claude-sonnet-5-5","role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":2085,"cache_read_input_tokens":893089},"content":[{"type":"text","text":"Post-compact reply"}]}}"#;
+        let compacted_grown = format!("{compacted}\n{post_asst}\n");
+        fs::write(&compacted_path, &compacted_grown).unwrap();
+
+        let ctx_grown = adapter
+            .estimate_post_compaction_context(&compacted_path)
+            .unwrap();
+        assert_eq!(ctx_grown.turn_count, 4);
+        assert_eq!(ctx_grown.active_context_tokens, Some(895_176));
+        assert_eq!(
+            ctx_grown.post_compact_conversational_bytes,
+            (compact_summary.len() + post_asst.len()) as u64
+        );
+
+        // Case 4: Torn trailing line is ignored by estimate without modifying the file, whereas
+        // a corrupt non-trailing line returns Err.
+        let torn_view_path = proj_dir.join("torn_view.jsonl");
+        let with_torn_tail = format!("{compacted_grown}{{\"torn\":");
+        fs::write(&torn_view_path, &with_torn_tail).unwrap();
+        let ctx_torn = adapter
+            .estimate_post_compaction_context(&torn_view_path)
+            .unwrap();
+        assert_eq!(ctx_torn, ctx_grown);
+        assert_eq!(
+            fs::read_to_string(&torn_view_path).unwrap(),
+            with_torn_tail,
+            "estimate_post_compaction_context must not modify transcript on disk"
+        );
+
+        let mid_corrupt_path = proj_dir.join("mid_corrupt.jsonl");
+        let mid_corrupt = format!("{compacted}\n{{\"corrupt_mid\":\n{post_asst}\n");
+        fs::write(&mid_corrupt_path, &mid_corrupt).unwrap();
+        assert!(matches!(
+            adapter.estimate_post_compaction_context(&mid_corrupt_path),
+            Err(VendorAdapterError::Transport { .. })
+        ));
+    }
+
+    #[test]
+    fn vendor_host_adapter_trait_object_exposes_transcript_preflight_repair_and_estimation() {
+        let tmp = TempDir::new().unwrap();
+        let registry = crate::default_vendor_host_adapter_registry();
+        let adapter: Arc<dyn VendorHostAdapter> =
+            registry.lookup("claude").expect("claude host adapter");
+
+        let uuid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+        let proj_dir = tmp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("ferroloop");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let tx_path = proj_dir.join(format!("{uuid}.jsonl"));
+        let valid_line = r#"{"uuid":"a-1","type":"assistant","message":{"model":"claude-sonnet-4@20250514","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000},"content":[{"type":"text","text":"Ready"}]}}"#;
+        fs::write(&tx_path, format!("{valid_line}\n{{\"torn\":")).unwrap();
+
+        let located = adapter
+            .find_active_session_transcript_path(tmp.path(), uuid)
+            .unwrap()
+            .expect("active transcript path via VendorHostAdapter");
+        assert_eq!(located, tx_path);
+
+        let removed = adapter.repair_session_transcript_tail(&located).unwrap();
+        assert_eq!(removed, b"{\"torn\":".len());
+
+        let ctx = adapter.estimate_post_compaction_context(&located).unwrap();
+        assert_eq!(ctx.turn_count, 1);
+        assert_eq!(
+            ctx.latest_model.as_deref(),
+            Some("claude-sonnet-4@20250514")
+        );
+        assert_eq!(ctx.active_context_tokens, Some(1010));
     }
 }

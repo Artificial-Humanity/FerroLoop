@@ -21,11 +21,15 @@ pub struct RestoreGuardV1 {
 /// Resolve existing symlinks, including an existing parent of an absent target,
 /// without creating any entry or contacting a daemon.
 pub(crate) fn canonical_physical(path: &Path) -> Result<PathBuf, RecoveryError> {
+    let resolution_error = |source| RecoveryError::PhysicalPathResolution {
+        path: path.to_path_buf(),
+        source,
+    };
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|_| RecoveryError::RestoreFenced { operation_id: None })?
+            .map_err(resolution_error)?
             .join(path)
     };
     let mut current = absolute.as_path();
@@ -40,54 +44,84 @@ pub(crate) fn canonical_physical(path: &Path) -> Result<PathBuf, RecoveryError> 
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // A dangling link is ambiguous, not an absent destination.
-                if fs::symlink_metadata(current).is_ok() {
-                    break;
+                match fs::symlink_metadata(current) {
+                    Ok(_) => return Err(resolution_error(e)),
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(other) => return Err(resolution_error(other)),
                 }
                 if let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
                     suffix.push(name.to_os_string());
                     current = parent;
                 } else {
-                    break;
+                    return Err(resolution_error(e));
                 }
             }
-            Err(_) => break,
+            Err(e) => return Err(resolution_error(e)),
         }
     }
-    Err(RecoveryError::RestoreFenced { operation_id: None })
 }
+
 pub(crate) fn guard_path(physical: &Path) -> PathBuf {
     let mut name = physical.as_os_str().to_os_string();
     name.push(".restore-guard");
     PathBuf::from(name)
 }
+/// Read-only observation of a present admission fence. An unknown operation ID
+/// still fences admission; it never makes a malformed or unreadable guard safe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RestoreGuardStatus {
+    pub guard_path: PathBuf,
+    pub operation_id: Option<uuid::Uuid>,
+}
+
+/// Inspect only the sidecar: bounded reads, no symlink following, no store open,
+/// journal reads, repair or daemon contact. A metadata error counts as present.
+pub fn inspect_restore_guard(
+    physical_path: &Path,
+) -> Result<Option<RestoreGuardStatus>, RecoveryError> {
+    let physical = canonical_physical(physical_path)?;
+    let path = guard_path(&physical);
+    let metadata = match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        other => other,
+    };
+    let operation_id = (|| {
+        let meta = metadata.ok()?;
+        if !meta.is_file() || meta.len() > 65536 {
+            return None;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&path).ok()?;
+        let held = file.metadata().ok()?;
+        if !held.is_file() || held.len() > 65536 || file_identity(&held) != file_identity(&meta) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes).ok()?;
+        let guard: RestoreGuardV1 = serde_json::from_slice(&bytes).ok()?;
+        (guard.version == 1 && !guard.operation_id.is_nil()).then_some(guard.operation_id)
+    })();
+    Ok(Some(RestoreGuardStatus {
+        guard_path: path,
+        operation_id,
+    }))
+}
+
 /// Missing permits admission. Every present, unreadable or malformed guard
 /// refuses; diagnostics contain only a validated operation ID, never its bytes.
 pub fn check_restore_admission(physical_path: &Path) -> Result<(), RecoveryError> {
-    let physical = canonical_physical(physical_path)?;
-    let path = guard_path(&physical);
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        metadata => {
-            let operation_id = (|| {
-                let meta = metadata.ok()?;
-                if !meta.is_file() || meta.len() > 65536 {
-                    return None;
-                }
-                let mut options = fs::OpenOptions::new();
-                options.read(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-                }
-                let file = options.open(path).ok()?;
-                let mut bytes = Vec::new();
-                file.take(65537).read_to_end(&mut bytes).ok()?;
-                let guard: RestoreGuardV1 = serde_json::from_slice(&bytes).ok()?;
-                (guard.version == 1 && !guard.operation_id.is_nil()).then_some(guard.operation_id)
-            })();
-            Err(RecoveryError::RestoreFenced { operation_id })
-        }
+    match inspect_restore_guard(physical_path)? {
+        None => Ok(()),
+        Some(guard) => Err(RecoveryError::RestoreFenced {
+            guard_path: guard.guard_path,
+            operation_id: guard.operation_id,
+        }),
     }
 }
 
@@ -470,6 +504,113 @@ mod tests {
             CancelToken::new(),
         )
     }
+    #[test]
+    fn guard_inspection_is_bounded_and_never_admits_present_unknown_guards() {
+        let root = crate::recovery::test_support::fixture_root();
+        let destination = root.path().join("destination.fls");
+        let guard = guard_path(&destination);
+        assert!(inspect_restore_guard(&destination).unwrap().is_none());
+        for bytes in [b"not-json".as_slice(), &[b'x'; 65537]] {
+            fs::write(&guard, bytes).unwrap();
+            let before = fs::read(&guard).unwrap();
+            let status = inspect_restore_guard(&destination).unwrap().unwrap();
+            assert_eq!(status.guard_path, guard);
+            assert_eq!(status.operation_id, None);
+            let error = check_restore_admission(&destination)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&guard.display().to_string()));
+            assert!(error.contains("ferrostore recovery --root <ROOT> --lease <LEASE> --request <CONTINUATION.json> status"));
+            assert_eq!(fs::read(&guard).unwrap(), before);
+            assert!(!destination.exists());
+        }
+        fs::remove_file(&guard).unwrap();
+        fs::create_dir(&guard).unwrap();
+        assert!(check_restore_admission(&destination).is_err());
+        fs::remove_dir(&guard).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing"), &guard).unwrap();
+        assert_eq!(
+            inspect_restore_guard(&destination)
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            None
+        );
+        assert!(check_restore_admission(&destination).is_err());
+        assert!(
+            fs::symlink_metadata(&guard)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn guard_inspection_reports_only_validated_operation_ids() {
+        let root = crate::recovery::test_support::fixture_root();
+        let destination = root.path().join("destination.fls");
+        let mut guard = RestoreGuardV1 {
+            version: 1,
+            operation_id: uuid::Uuid::now_v7(),
+            physical_path: destination.clone(),
+            parent_identity: (1, 1),
+            journal: root.path().join("missing-journal.json"),
+            phase: "admitted".into(),
+        };
+        let path = guard_path(&destination);
+        fs::write(&path, serde_json::to_vec(&guard).unwrap()).unwrap();
+        assert_eq!(
+            inspect_restore_guard(&destination)
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            Some(guard.operation_id)
+        );
+        assert!(
+            matches!(check_restore_admission(&destination), Err(RecoveryError::RestoreFenced { guard_path, operation_id: Some(id) }) if guard_path == path && id == guard.operation_id)
+        );
+        for version in [0, 2] {
+            guard.version = version;
+            fs::write(&path, serde_json::to_vec(&guard).unwrap()).unwrap();
+            assert_eq!(
+                inspect_restore_guard(&destination)
+                    .unwrap()
+                    .unwrap()
+                    .operation_id,
+                None
+            );
+            assert!(check_restore_admission(&destination).is_err());
+        }
+        guard.version = 1;
+        guard.operation_id = uuid::Uuid::nil();
+        fs::write(&path, serde_json::to_vec(&guard).unwrap()).unwrap();
+        assert_eq!(
+            inspect_restore_guard(&destination)
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            None
+        );
+        assert!(check_restore_admission(&destination).is_err());
+    }
+
+    #[test]
+    fn physical_resolution_failure_is_not_a_restore_fence() {
+        let root = crate::recovery::test_support::fixture_root();
+        let path = root.path().join("dangling.fls");
+        std::os::unix::fs::symlink(root.path().join("missing"), &path).unwrap();
+        assert!(matches!(
+            check_restore_admission(&path),
+            Err(RecoveryError::PhysicalPathResolution { .. })
+        ));
+        assert!(
+            !check_restore_admission(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("fenced")
+        );
+    }
+
     #[test]
     fn lease_creation_is_private_bound_and_short_lived() {
         let root = crate::recovery::test_support::fixture_root();

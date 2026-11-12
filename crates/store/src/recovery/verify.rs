@@ -548,7 +548,7 @@ pub(crate) fn privacy(
     Ok(())
 }
 pub(crate) fn hash_file(file: &File, l: &OperationLimits) -> Result<(u64, String), RecoveryError> {
-    l.quota(65536, l.memory_byte_limit, "hash working memory")?;
+    l.admit_memory(65536)?;
     let len = file.metadata().map_err(|_| l.verification())?.len();
     l.quota(len, l.byte_limit, "image bytes")?;
     let mut hash = Sha256::new();
@@ -718,6 +718,26 @@ pub(crate) fn profile_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streamed_hash_admits_its_buffer_alongside_retained_models() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(8 << 20).unwrap();
+        let l = limits();
+        let retained = l.with_retained_memory(123456).unwrap();
+        assert_eq!(hash_file(&file, &retained).unwrap().0, 8 << 20);
+        assert_eq!(l.admitted_memory_bytes(), 123456 + 65536);
+
+        let mut tight = limits();
+        tight.memory_byte_limit = 123456 + 65536 - 1;
+        let retained = tight.with_retained_memory(123456).unwrap();
+        assert!(matches!(
+            hash_file(&file, &retained),
+            Err(RecoveryError::Quota {
+                resource: "working memory",
+                ..
+            })
+        ));
+    }
     fn limits() -> OperationLimits {
         OperationLimits::new(
             std::time::Instant::now() + std::time::Duration::from_secs(10),

@@ -55,6 +55,13 @@ use super::{
 use std::{collections::BTreeSet, os::fd::AsRawFd, path::Path, sync::Arc};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PurgeGeometryV1 {
+    staged: bool,
+    target_identity: (u64, u64),
+    quarantine_identity: (u64, u64),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PurgeAuditV1 {
     version: u32,
     operation_id: uuid::Uuid,
@@ -63,6 +70,10 @@ struct PurgeAuditV1 {
     actor: String,
     at_unix_ms: u128,
     administrative_evidence: ReferenceClosureEvidence,
+    // Old intents without directory evidence cannot safely authorize replay once
+    // their files are gone. Decode them for diagnostics, but refuse replay.
+    #[serde(default)]
+    geometry: Option<PurgeGeometryV1>,
     members: Vec<PurgeMember>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,33 +109,123 @@ fn member(root: &Dir, path: &Path, l: &OperationLimits) -> Result<PurgeMember, R
         state: PurgeMemberState::Present,
     })
 }
+// The same exact-name geometry is used before initial admission and on replay.
+// Keep both descriptors alive through all unlink/completion boundaries.
+struct PurgeTarget {
+    bundle: Dir,
+    quarantine: Dir,
+    staged: bool,
+}
+impl PurgeTarget {
+    fn evidence(&self, l: &OperationLimits) -> Result<PurgeGeometryV1, RecoveryError> {
+        Ok(PurgeGeometryV1 {
+            staged: self.staged,
+            target_identity: fs::identity(&self.bundle.file, l)?,
+            quarantine_identity: fs::identity(&self.quarantine.file, l)?,
+        })
+    }
+    fn validate(
+        &self,
+        root: &Dir,
+        catalog: &Dir,
+        op: uuid::Uuid,
+        l: &OperationLimits,
+    ) -> Result<(), RecoveryError> {
+        root.same_name(l)?;
+        catalog.same_name(l)?;
+        self.bundle.same_name(l)?;
+        self.quarantine.same_name(l)?;
+        let staged = Dir::open(&root.path.join(".staging"), l)?;
+        let text = op.to_string();
+        if root.exists(&text, l)? == self.staged
+            || staged.exists(&text, l)? != self.staged
+            || catalog.exists(&format!("{op}.json"), l)?
+        {
+            return Err(l.verification());
+        }
+        Ok(())
+    }
+}
+fn open_target(
+    root: &Dir,
+    op: uuid::Uuid,
+    expected: Option<&PurgeGeometryV1>,
+    l: &OperationLimits,
+) -> Result<PurgeTarget, RecoveryError> {
+    root.same_name(l)?;
+    let staging = Dir::open(&root.path.join(".staging"), l)?;
+    let text = op.to_string();
+    let staged = match (root.exists(&text, l)?, staging.exists(&text, l)?) {
+        (true, false) => false,
+        (false, true) => true,
+        _ => return Err(l.verification()),
+    };
+    let bundle = Dir::open(
+        &if staged {
+            staging.path.join(&text)
+        } else {
+            root.path.join(&text)
+        },
+        l,
+    )?;
+    let quarantine = Dir::open(&root.path.join(".quarantine").join(&text), l)?;
+    let target = PurgeTarget {
+        bundle,
+        quarantine,
+        staged,
+    };
+    if let Some(binding) = expected {
+        let actual = target.evidence(l)?;
+        if actual.staged != binding.staged
+            || actual.target_identity != binding.target_identity
+            || actual.quarantine_identity != binding.quarantine_identity
+        {
+            return Err(l.verification());
+        }
+    }
+    staging.same_name(l)?;
+    root.same_name(l)?;
+    Ok(target)
+}
+// Unlike fs::read_json, this decodes the descriptor the caller already holds.
+// Retain the decoded-model reservation for all later hashing/geometry scratch.
+fn read_held_json<T: serde::de::DeserializeOwned>(
+    held: &PrivateFile,
+    l: &OperationLimits,
+) -> Result<(T, OperationLimits), RecoveryError> {
+    let len = held.file.metadata().map_err(|_| l.verification())?.len();
+    l.quota(len, l.byte_limit, "metadata bytes")?;
+    let retained = len.checked_mul(32).ok_or_else(|| l.verification())?;
+    let scope = l.with_retained_memory(retained)?;
+    scope.admit_memory(len.checked_add(65536).ok_or_else(|| l.verification())?)?;
+    let mut bytes = vec![0; usize::try_from(len).map_err(|_| l.verification())?];
+    for (index, chunk) in bytes.chunks_mut(65536).enumerate() {
+        scope.check()?;
+        fs::read_exact_at(&held.file, chunk, index as u64 * 65536, &scope)?;
+    }
+    let value = serde_json::from_slice(&bytes).map_err(|_| l.verification())?;
+    held.unchanged(&scope)?;
+    Ok((value, scope))
+}
+struct InspectedTarget {
+    manifest: BundleManifestV1,
+    hash: String,
+    members: Vec<PurgeMember>,
+    pending: bool,
+    geometry: PurgeGeometryV1,
+}
 fn target(
     root: &Dir,
     operation: uuid::Uuid,
     l: &OperationLimits,
-) -> Result<(BundleManifestV1, String, Vec<PurgeMember>, bool), RecoveryError> {
+) -> Result<InspectedTarget, RecoveryError> {
     let op = operation.to_string();
-    let quarantine = Dir::open(&root.path.join(".quarantine").join(&op), l)?;
-    let final_path = root.path.join(&op);
-    let staged_path = root.path.join(".staging").join(&op);
-    let exists = |p: &Path| {
-        std::fs::symlink_metadata(p)
-            .map(|_| true)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(false)
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(|_| l.verification())
-    };
-    let dir = match (exists(&final_path)?, exists(&staged_path)?) {
-        (true, false) => Dir::open(&final_path, l)?,
-        (false, true) => Dir::open(&staged_path, l)?,
-        _ => return Err(l.verification()),
-    };
-    let checked = catalog::check_bundle(&dir, &op, l)?;
+    let target = open_target(root, operation, None, l)?;
+    let dir = &target.bundle;
+    let quarantine = &target.quarantine;
+    let checked = catalog::check_bundle(dir, &op, l)?;
+    let retained = checked.retained_limits(l)?;
+    let l = &retained;
     let catalog = Dir::open(&root.path.join(".catalog"), l)?;
     let receipt_name = format!("{op}.json");
     let pending = catalog.exists(&receipt_name, l)?;
@@ -134,7 +235,7 @@ fn target(
         }
         catalog::checked_receipt(&catalog, &receipt_name, &checked, l)?
     } else {
-        catalog::checked_receipt(&quarantine, "receipt.json", &checked, l)?
+        catalog::checked_receipt(quarantine, "receipt.json", &checked, l)?
     };
     if quarantine.members(l)?
         != if pending {
@@ -168,24 +269,28 @@ fn target(
         )
     });
     receipt.unchanged(l)?;
-    Ok((checked.manifest, checked.manifest_sha256, members, pending))
+    let geometry = target.evidence(l)?;
+    target.bundle.same_name(l)?;
+    target.quarantine.same_name(l)?;
+    Ok(InspectedTarget {
+        manifest: checked.manifest,
+        hash: checked.manifest_sha256,
+        members,
+        pending,
+        geometry,
+    })
 }
-fn reference_hit(manifest: &BundleManifestV1, op: uuid::Uuid, digests: &BTreeSet<String>) -> bool {
+fn reference_hit(manifest: &BundleManifestV1, op: uuid::Uuid) -> bool {
     let name = op.to_string();
     manifest.operation_id == name
         || manifest
             .reference_dependencies
             .iter()
-            .any(|r| r.catalog_identity == name || digests.contains(&r.reference_sha256))
-        || manifest
-            .retained_members
-            .iter()
-            .any(|m| digests.contains(&m.sha256))
-        || digests.contains(&manifest.image_sha256)
+            .any(|r| r.catalog_identity == name)
         || manifest
             .shared_config
             .as_ref()
-            .is_some_and(|r| digests.contains(&r.descriptor_sha256))
+            .is_some_and(|r| r.batch_id == op)
 }
 /// Only known live receipt/manifests and completed recovery-set records are
 /// reference grammar. Journals, scheduler history and arbitrary strings are not.
@@ -226,25 +331,41 @@ impl ClosureEvidence {
         Ok(scoped)
     }
 }
+fn retain_restore_pins(
+    catalog: &Dir,
+    target: uuid::Uuid,
+    evidence: &mut ClosureEvidence,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    super::restore::check_restore_pins(
+        catalog,
+        target,
+        l,
+        evidence,
+        |evidence, additional, limits| evidence.reserve(additional, limits),
+        |evidence, name, held, pin_limits| {
+            // Capacity and iterator scratch were reserved before the pin read;
+            // pin_limits also retains the decoded pin during hashing/string growth.
+            let hash = verify::hash_file(&held.file, pin_limits)?.1;
+            evidence.entries.push((format!("restore-pin/{name}"), hash));
+            Ok(())
+        },
+    )
+}
 fn checked_memory(
     checked: &catalog::CheckedBundle,
     l: &OperationLimits,
 ) -> Result<u64, RecoveryError> {
-    checked
-        .bytes
-        .checked_sub(checked.manifest.image_bytes)
-        .and_then(|n| n.checked_mul(64))
-        .and_then(|n| n.checked_add(65536))
-        .ok_or_else(|| l.verification())
+    checked.memory_bytes(l)
 }
 fn closure(
     root: &Dir,
     op: uuid::Uuid,
     members: &[PurgeMember],
-    manifest_hash: &str,
+    _manifest_hash: &str,
     l: &OperationLimits,
 ) -> Result<String, RecoveryError> {
-    // The input members and digest tree coexist throughout both scans. Charge
+    // The input members coexist throughout both scans. Charge
     // before collect/clone, including a second caller-owned member list.
     let retained = (members.len() as u64)
         .checked_mul(3)
@@ -252,13 +373,15 @@ fn closure(
         .and_then(|n| n.checked_mul(CLOSURE_ENTRY_MEMORY))
         .ok_or_else(|| l.verification())?;
     let l = l.with_retained_memory(retained)?;
-    let mut digests: BTreeSet<String> = members.iter().map(|m| m.sha256.clone()).collect();
-    digests.insert(manifest_hash.to_owned());
     let catalog = Dir::open(&root.path.join(".catalog"), &l)?;
     let mut evidence = ClosureEvidence {
         entries: Vec::new(),
     };
+    retain_restore_pins(&catalog, op, &mut evidence, &l)?;
     catalog.visit_names(&l, |name| {
+        if name == "restore-pins" {
+            return Ok(());
+        }
         if name.starts_with("purge-") {
             validate_audit_name(name, &l)?;
             return Ok(());
@@ -273,10 +396,10 @@ fn closure(
         let checked = catalog::check_bundle(&dir, text, &scan)?;
         let receipt_limits = scan.with_retained_memory(checked_memory(&checked, &scan)?)?;
         let receipt = catalog::checked_receipt(&catalog, name, &checked, &receipt_limits)?;
-        if reference_hit(&checked.manifest, op, &digests) {
+        if reference_hit(&checked.manifest, op) {
             return Err(fs::refused(
                 &scan,
-                "administrative reference closure includes target operation, name or member digest",
+                "administrative reference closure includes target operation or bundle name",
             ));
         }
         evidence.entries.push((
@@ -320,10 +443,7 @@ fn closure(
             member_limits.charge_query_work(1)?;
             if !seen.insert(m.operation_id)
                 || m.operation_id == op
-                || digests.contains(&m.manifest_sha256)
-                || m.shared_config
-                    .as_ref()
-                    .is_some_and(|r| digests.contains(&r.descriptor_sha256))
+                || m.shared_config.as_ref().is_some_and(|r| r.batch_id == op)
             {
                 return Err(fs::refused(
                     &member_limits,
@@ -345,7 +465,7 @@ fn closure(
                 || checked.manifest.catalog_store_identity != m.catalog_identity
                 || checked.manifest.published_sequence != m.sequence
                 || checked.manifest.shared_config != m.shared_config
-                || reference_hit(&checked.manifest, op, &digests)
+                || reference_hit(&checked.manifest, op)
             {
                 return Err(l.verification());
             }
@@ -411,6 +531,7 @@ fn audit_members_valid(
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
     let op = audit.operation_id.to_string();
+    let geometry = audit.geometry.as_ref().ok_or_else(|| l.verification())?;
     let mut seen = BTreeSet::new();
     let mut receipt = 0;
     let mut manifest = 0;
@@ -421,8 +542,8 @@ fn audit_members_valid(
             .map(|p| p.as_os_str().to_str().ok_or_else(|| l.verification()))
             .collect::<Result<Vec<_>, _>>()?;
         let name = match parts.as_slice() {
-            [p, n] if *p == op => *n,
-            [".staging", p, n] if *p == op => *n,
+            [p, n] if *p == op && !geometry.staged => *n,
+            [".staging", p, n] if *p == op && geometry.staged => *n,
             [".quarantine", p, "receipt.json"] if *p == op => {
                 receipt += 1;
                 "receipt.json"
@@ -473,6 +594,162 @@ fn verify_present(
     held.unchanged(l)?;
     Ok(held)
 }
+fn replay_target(
+    root: &Dir,
+    catalog: &Dir,
+    audit: &PurgeAuditV1,
+    hash: &str,
+    l: &OperationLimits,
+) -> Result<PurgeTarget, RecoveryError> {
+    audit_members_valid(root, audit, l)?;
+    let binding = audit.geometry.as_ref().ok_or_else(|| l.verification())?;
+    let target = open_target(root, audit.operation_id, Some(binding), l)?;
+    target.validate(root, catalog, audit.operation_id, l)?;
+    // Directory names must be the exact surviving subset of the admitted audit.
+    // No unrelated entry is adopted, including after all audited files are gone.
+    for dir in [&target.bundle, &target.quarantine] {
+        dir.visit_names(l, |name| {
+            if !audit
+                .members
+                .iter()
+                .any(|m| root.path.join(&m.relative_name) == dir.path.join(name))
+            {
+                return Err(l.verification());
+            }
+            Ok(())
+        })?;
+    }
+    let mut manifest_absent = false;
+    let mut all_nonmanifest_complete = true;
+    for (index, m) in audit.members.iter().enumerate() {
+        l.check()?;
+        let manifest = m.relative_name.ends_with("/manifest.json");
+        let path = root.path.join(&m.relative_name);
+        let parent = if path.parent() == Some(target.bundle.path.as_path()) {
+            &target.bundle
+        } else if path.parent() == Some(target.quarantine.path.as_path()) {
+            &target.quarantine
+        } else {
+            return Err(l.verification());
+        };
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| l.verification())?;
+        let completion = format!("purge-{}.member-{index}.json", audit.operation_id);
+        let done = catalog.exists(&completion, l)?;
+        if done {
+            check_completion(
+                catalog,
+                &completion,
+                hash,
+                Some(index),
+                audit.operation_id,
+                l,
+            )?;
+        }
+        if parent.exists(name, l)? {
+            verify_present(root, m, l)?;
+            if done {
+                return Err(l.verification());
+            }
+            if !manifest {
+                all_nonmanifest_complete = false;
+            }
+        } else if manifest {
+            manifest_absent = true;
+        } else if !done {
+            // A previous unlink may have succeeded before parent sync/completion.
+            // Keep it OutcomeUnknown until the mutating path syncs and records it.
+            all_nonmanifest_complete = false;
+        }
+    }
+    if manifest_absent && !all_nonmanifest_complete {
+        return Err(l.verification());
+    }
+    target.validate(root, catalog, audit.operation_id, l)?;
+    Ok(target)
+}
+// Retain completion descriptors and original bindings through all injected reads.
+fn hold_manifest_predecessors(
+    catalog: &Dir,
+    audit: &PurgeAuditV1,
+    hash: &str,
+    l: &OperationLimits,
+) -> Result<(Vec<PrivateFile>, OperationLimits), RecoveryError> {
+    // Charge full bounded vector capacity and owned path/name buffers before
+    // allocation. Each temporary decode and final hash adds to this same scope.
+    let per_entry = (catalog.path.as_os_str().len() as u64)
+        .checked_add(128)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(std::mem::size_of::<PrivateFile>() as u64))
+        .ok_or_else(|| l.verification())?;
+    let retained = per_entry
+        .checked_mul(audit.members.len() as u64)
+        .ok_or_else(|| l.verification())?;
+    let scope = l.with_retained_memory(retained)?;
+    let mut held = Vec::with_capacity(audit.members.len());
+    for (index, member) in audit.members.iter().enumerate() {
+        if member.relative_name.ends_with("/manifest.json") {
+            continue;
+        }
+        let completion = format!("purge-{}.member-{index}.json", audit.operation_id);
+        held.push(hold_completion(
+            catalog,
+            &completion,
+            hash,
+            Some(index),
+            audit.operation_id,
+            &scope,
+        )?);
+    }
+    Ok((held, scope))
+}
+// Raw binding and absence checks only: no injected open or read after the hash.
+fn manifest_predecessors_unchanged(
+    root: &Dir,
+    audit: &PurgeAuditV1,
+    target: &PurgeTarget,
+    held: &[PrivateFile],
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    for completion in held {
+        completion.unchanged(l)?;
+    }
+    for member in &audit.members {
+        if member.relative_name.ends_with("/manifest.json") {
+            continue;
+        }
+        let path = root.path.join(&member.relative_name);
+        let parent = if path.parent() == Some(target.bundle.path.as_path()) {
+            &target.bundle
+        } else if path.parent() == Some(target.quarantine.path.as_path()) {
+            &target.quarantine
+        } else {
+            return Err(l.verification());
+        };
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| l.verification())?;
+        if parent.exists(name, l)? {
+            return Err(l.verification());
+        }
+    }
+    Ok(())
+}
+fn manifest_predecessors_complete(
+    root: &Dir,
+    catalog: &Dir,
+    audit: &PurgeAuditV1,
+    hash: &str,
+    target: &PurgeTarget,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    let (held, scope) = hold_manifest_predecessors(catalog, audit, hash, l)?;
+    manifest_predecessors_unchanged(root, audit, target, &held, &scope)?;
+    target.validate(root, catalog, audit.operation_id, &scope)
+}
 pub fn purge_quarantined(
     request: &PurgeRequest,
     lease: &OfflineLease,
@@ -482,6 +759,9 @@ pub fn purge_quarantined(
     let mut l = limits.clone();
     l.operation_id = request.operation_id;
     l.publication_io = None;
+    // Keep the bounded canonical paths, held target directories and iterator
+    // scratch charged alongside every audit decode/hash and completion write.
+    l = l.with_retained_memory(65536)?;
     l.check()?;
     if request.operation_id.is_nil() || request.confirm.is_some_and(|op| op != request.operation_id)
     {
@@ -574,8 +854,12 @@ pub fn purge_quarantined(
     let catalog = Dir::open(&root.path.join(".catalog"), &l)?;
     let intent_name = format!("purge-{}.intent.json", request.operation_id);
     let mut pending = false;
+    let mut admitted_geometry = None;
+    let mut observed_audit = None;
     let mut audit = if catalog.exists(&intent_name, &l)? {
-        let a: PurgeAuditV1 = fs::read_json(&catalog, &intent_name, &l)?;
+        let held = PrivateFile::open(&catalog.path.join(&intent_name), false, &l)?;
+        let (a, scope): (PurgeAuditV1, _) = read_held_json(&held, &l)?;
+        l = scope;
         if a.version != 1
             || a.operation_id != request.operation_id
             || a.manifest_sha256 != expected_hash
@@ -585,6 +869,10 @@ pub fn purge_quarantined(
             return Err(l.verification());
         }
         audit_members_valid(&root, &a, &l)?;
+        let hash = verify::hash_file(&held.file, &l)?.1;
+        replay_target(&root, &catalog, &a, &hash, &l)?;
+        held.unchanged(&l)?;
+        observed_audit = Some(held);
         Some(a)
     } else {
         None
@@ -604,7 +892,14 @@ pub fn purge_quarantined(
         )?;
         (a.members.clone(), hash)
     } else {
-        let (manifest, hash, members, withdraw) = target(&root, request.operation_id, &l)?;
+        let InspectedTarget {
+            manifest,
+            hash,
+            members,
+            pending: withdraw,
+            geometry,
+        } = target(&root, request.operation_id, &l)?;
+        admitted_geometry = Some(geometry);
         if hash != expected_hash
             || manifest.catalog_store_identity != lease.request.catalog_identity
             || manifest.validation_profile_sha256 != lease.request.profile_sha256
@@ -626,7 +921,8 @@ pub fn purge_quarantined(
     };
     if request.confirm.is_none() {
         if let Some(a) = &audit {
-            inspect_audit(&root, &catalog, a, &mut report, &l)?;
+            let held = observed_audit.as_ref().ok_or_else(|| l.verification())?;
+            inspect_audit(&root, &catalog, a, held, &mut report, &l)?;
         }
         return Ok(report);
     }
@@ -654,8 +950,21 @@ pub fn purge_quarantined(
             &l,
             &access,
         )?;
-        let (_, hash, latest, still_pending) = target(&root, request.operation_id, &l)?;
-        if still_pending || hash != expected_hash || latest != report.members {
+        let InspectedTarget {
+            manifest: _,
+            hash,
+            members: latest,
+            pending: still_pending,
+            geometry,
+        } = target(&root, request.operation_id, &l)?;
+        let previous = admitted_geometry.as_ref().ok_or_else(|| l.verification())?;
+        if still_pending
+            || hash != expected_hash
+            || latest != report.members
+            || geometry.staged != previous.staged
+            || geometry.target_identity != previous.target_identity
+            || geometry.quarantine_identity != previous.quarantine_identity
+        {
             return Err(l.verification());
         }
         if closure(&root, request.operation_id, &latest, &expected_hash, &l)?
@@ -678,6 +987,7 @@ pub fn purge_quarantined(
             actor: lease.request.operator.clone(),
             at_unix_ms: io.unix_ms().map_err(|_| fs::destination(&l))?,
             administrative_evidence: evidence.clone(),
+            geometry: admitted_geometry,
             members: report.members.clone(),
         };
         audit_members_valid(&root, &a, &l)?;
@@ -686,8 +996,25 @@ pub fn purge_quarantined(
         audit = Some(a);
     }
     let audit = audit.ok_or_else(|| l.verification())?;
-    let held_audit = PrivateFile::open(&catalog.path.join(&intent_name), false, &l)?;
+    let held_audit = match observed_audit {
+        Some(held) => held,
+        None => {
+            // Bind the freshly written model to the descriptor used thereafter.
+            let retained = verify::serialized_checksum(&audit, &l)?
+                .0
+                .checked_mul(32)
+                .ok_or_else(|| l.verification())?;
+            l = l.with_retained_memory(retained)?;
+            let held = PrivateFile::open(&catalog.path.join(&intent_name), false, &l)?;
+            if verify::hash_file(&held.file, &l)? != verify::serialized_checksum(&audit, &l)? {
+                return Err(l.verification());
+            }
+            held.unchanged(&l)?;
+            held
+        }
+    };
     let audit_hash = verify::hash_file(&held_audit.file, &l)?.1;
+    let target = replay_target(&root, &catalog, &audit, &audit_hash, &l)?;
     control.sync(&held_audit.file, Member::PurgeAudit, &l)?;
     catalog.sync(&*io, Directory::CatalogParent, &l)?;
     report.audit_durable = true;
@@ -695,6 +1022,7 @@ pub fn purge_quarantined(
         l.check()?;
         access.validate(&root, &l)?;
         held_audit.unchanged(&l)?;
+        target.validate(&root, &catalog, request.operation_id, &l)?;
         let complete_name = format!("purge-{}.member-{index}.json", request.operation_id);
         let path = root.path.join(&m.relative_name);
         let parent = Dir::open(path.parent().ok_or_else(|| l.verification())?, &l)?;
@@ -714,22 +1042,58 @@ pub fn purge_quarantined(
             if parent.exists(name, &l)? {
                 return Err(l.verification());
             }
+            target.validate(&root, &catalog, request.operation_id, &l)?;
             report.members[index].state = PurgeMemberState::Removed;
             continue;
         }
         if parent.exists(name, &l)? {
+            if name == "manifest.json" {
+                manifest_predecessors_complete(&root, &catalog, &audit, &audit_hash, &target, &l)?;
+            }
             let held = verify_present(&root, m, &l)?;
             fs::event(&*io, RecoveryEvent::PurgeUnlink, &l)?;
-            held.unchanged(&l)?;
-            let again = verify_present(&root, m, &l)?;
-            if again.identity() != held.identity() {
-                return Err(l.verification());
+            access.validate(&root, &l)?;
+            held_audit.unchanged(&l)?;
+            target.validate(&root, &catalog, request.operation_id, &l)?;
+            if name == "manifest.json" {
+                manifest_predecessors_complete(&root, &catalog, &audit, &audit_hash, &target, &l)?;
             }
-            parent.remove_file(name, held.identity(), &l)?;
+            parent.remove_file_checked(name, held.identity(), &l, |last| {
+                // The helper has performed the final injectable descriptor open.
+                // Complete any remaining injected reads first, then revalidate
+                // all authority with noninjectable descriptor/name checks last.
+                let (predecessors, final_scope) = if name == "manifest.json" {
+                    hold_manifest_predecessors(&catalog, &audit, &audit_hash, &l)?
+                } else {
+                    (Vec::new(), l.clone())
+                };
+                final_scope.admit_memory(65536)?;
+                if verify::hash_file(&last.file, &final_scope)? != (m.bytes, m.sha256.clone()) {
+                    return Err(final_scope.verification());
+                }
+                // All injectable reads finished. Never adopt new completion
+                // authority after this boundary; check original bindings/absence.
+                if name == "manifest.json" {
+                    manifest_predecessors_unchanged(
+                        &root,
+                        &audit,
+                        &target,
+                        &predecessors,
+                        &final_scope,
+                    )?;
+                }
+                held.unchanged(&final_scope)?;
+                access.validate(&root, &final_scope)?;
+                held_audit.unchanged(&final_scope)?;
+                target.validate(&root, &catalog, request.operation_id, &final_scope)
+            })?;
         }
         // Missing after an interrupted unlink is only completed once its parent is
         // synced. No planned name is reported removed merely from audit intent.
         parent.sync(&*io, Directory::PurgeParent, &l)?;
+        access.validate(&root, &l)?;
+        held_audit.unchanged(&l)?;
+        target.validate(&root, &catalog, request.operation_id, &l)?;
         let done = PurgeCompletionV1 {
             version: 1,
             operation_id: request.operation_id,
@@ -745,8 +1109,14 @@ pub fn purge_quarantined(
             &l,
         )?;
         catalog.sync(&*io, Directory::CatalogParent, &l)?;
+        target.validate(&root, &catalog, request.operation_id, &l)?;
+        if parent.exists(name, &l)? {
+            return Err(l.verification());
+        }
         report.members[index].state = PurgeMemberState::Removed;
     }
+    // Recheck the full surviving-name/completion set before final completion.
+    replay_target(&root, &catalog, &audit, &audit_hash, &l)?;
     let complete_name = format!("purge-{}.complete.json", request.operation_id);
     if catalog.exists(&complete_name, &l)? {
         check_completion(
@@ -764,7 +1134,7 @@ pub fn purge_quarantined(
             &PurgeCompletionV1 {
                 version: 1,
                 operation_id: request.operation_id,
-                audit_sha256: audit_hash,
+                audit_sha256: audit_hash.clone(),
                 member_index: None,
             },
             Member::PurgeAudit,
@@ -773,6 +1143,8 @@ pub fn purge_quarantined(
         )?;
         catalog.sync(&*io, Directory::CatalogParent, &l)?;
     }
+    replay_target(&root, &catalog, &audit, &audit_hash, &l)?;
+    held_audit.unchanged(&l)?;
     report.complete = true;
     drop(observed_operation);
     drop(operation_lock);
@@ -787,28 +1159,35 @@ fn check_completion(
     op: uuid::Uuid,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
+    hold_completion(catalog, name, hash, index, op, l).map(|_| ())
+}
+fn hold_completion(
+    catalog: &Dir,
+    name: &str,
+    hash: &str,
+    index: Option<usize>,
+    op: uuid::Uuid,
+    l: &OperationLimits,
+) -> Result<PrivateFile, RecoveryError> {
     let held = PrivateFile::open(&catalog.path.join(name), false, l)?;
-    let d: PurgeCompletionV1 = fs::read_json(catalog, name, l)?;
+    let (d, scope): (PurgeCompletionV1, _) = read_held_json(&held, l)?;
     if d.version != 1 || d.operation_id != op || d.audit_sha256 != hash || d.member_index != index {
         return Err(l.verification());
     }
-    held.unchanged(l)
+    held.unchanged(&scope)?;
+    Ok(held)
 }
 fn inspect_audit(
     root: &Dir,
     catalog: &Dir,
     audit: &PurgeAuditV1,
+    held: &PrivateFile,
     report: &mut PurgeReport,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
-    let held = PrivateFile::open(
-        &catalog
-            .path
-            .join(format!("purge-{}.intent.json", audit.operation_id)),
-        false,
-        l,
-    )?;
+    held.unchanged(l)?;
     let hash = verify::hash_file(&held.file, l)?.1;
+    let target = replay_target(root, catalog, audit, &hash, l)?;
     for (index, m) in audit.members.iter().enumerate() {
         let completion = format!("purge-{}.member-{index}.json", audit.operation_id);
         let path = root.path.join(&m.relative_name);
@@ -836,6 +1215,7 @@ fn inspect_audit(
             report.members[index].state = PurgeMemberState::OutcomeUnknown;
         }
     }
+    target.validate(root, catalog, audit.operation_id, l)?;
     let complete = format!("purge-{}.complete.json", audit.operation_id);
     if catalog.exists(&complete, l)? {
         check_completion(catalog, &complete, &hash, None, audit.operation_id, l)?;
@@ -848,12 +1228,136 @@ fn inspect_audit(
         }
         report.complete = true;
     }
+    target.validate(root, catalog, audit.operation_id, l)?;
     held.unchanged(l)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // RED plan after approved application: temporarily derive pin_limits from
+    // l instead of scan (the original missing-retained-scope behavior), then run
+    // this test: the last scan reads/succeeds, failing the Quota/no-read check.
+    // GREEN plan: restore scan.with_retained_memory and rerun this exact test,
+    // then required recovery checks. No tests have run for this inert proposal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_pin_read_includes_prior_evidence_before_json_allocation() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct CountReads(AtomicUsize);
+        impl super::super::fs::RecoveryIo for CountReads {
+            fn read_exact_at(
+                &self,
+                file: &std::fs::File,
+                bytes: &mut [u8],
+                offset: u64,
+            ) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                file.read_exact_at(bytes, offset)
+            }
+        }
+        let fixture = super::super::test_support::fixture_root();
+        let mut generous = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            1 << 20,
+            16 << 20,
+            super::super::CancelToken::new(),
+        );
+        let reads = Arc::new(CountReads(AtomicUsize::new(0)));
+        generous.publication_io = Some(Arc::new(super::super::fs::PublicationIo::new(
+            reads.clone(),
+            1 << 20,
+            1 << 20,
+            1 << 20,
+            4096,
+        )));
+        let mut evidence = ClosureEvidence {
+            entries: Vec::new(),
+        };
+        let target = uuid::Uuid::now_v7();
+        // Single-pin fixture directories force small-before-large order without
+        // depending on readdir order. One evidence collection spans every scan.
+        let write_pin = |index: usize, padded: bool| {
+            let catalog_path = fixture.path().join(format!("catalog-{index}"));
+            let pins = catalog_path.join("restore-pins");
+            std::fs::create_dir(&catalog_path).unwrap();
+            std::fs::create_dir(&pins).unwrap();
+            for path in [&catalog_path, &pins] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let operation = uuid::Uuid::now_v7();
+            let staging = fixture
+                .path()
+                .join(format!(".restore-{operation}-{}", uuid::Uuid::now_v7()));
+            let value = serde_json::json!({
+                "version": 1,
+                "restore_operation": operation,
+                "bundle_operation": uuid::Uuid::now_v7(),
+                "bundle_sha256": "a".repeat(64),
+                "destination": fixture.path().join("destination.fls"),
+                "journal": staging.join("journal.bin"),
+                "journal_identity": [1, 2],
+                "operation_lock_identity": [1, 3],
+            });
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            if padded {
+                assert!(bytes.len() < 32768);
+                bytes.resize(32768, b' '); // Valid JSON at the private pin ceiling.
+            }
+            let path = pins.join(format!("{operation}.json"));
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            (catalog_path, path, bytes)
+        };
+        for index in 0..256 {
+            let (path, _, _) = write_pin(index, false);
+            let catalog = Dir::open(&path, &generous).unwrap();
+            retain_restore_pins(&catalog, target, &mut evidence, &generous).unwrap();
+        }
+        assert_eq!(evidence.entries.len(), 256);
+        let (path, pin_path, pin_bytes) = write_pin(256, true);
+        let catalog = Dir::open(&path, &generous).unwrap();
+        let capacity = evidence.entries.capacity().max(evidence.entries.len() + 1) as u64;
+        let ceiling = capacity * CLOSURE_ENTRY_MEMORY + 3 * 65536 + 2 * 32768 * 32;
+        // Use fresh admission counters so prior generous scans cannot mask it.
+        let bounded = |limit| {
+            let mut limits = OperationLimits::new(
+                generous.deadline,
+                generous.byte_limit,
+                limit,
+                super::super::CancelToken::new(),
+            );
+            limits.publication_io = generous.publication_io.clone();
+            limits
+        };
+        let limits = bounded(ceiling - 1);
+        let before = reads.0.load(Ordering::SeqCst);
+        assert!(matches!(
+            retain_restore_pins(&catalog, target, &mut evidence, &limits),
+            Err(RecoveryError::Quota {
+                resource: "working memory",
+                ..
+            })
+        ));
+        assert_eq!(
+            reads.0.load(Ordering::SeqCst),
+            before,
+            "must refuse before reading pin JSON"
+        );
+        assert_eq!(evidence.entries.len(), 256);
+        assert!(limits.admitted_memory_bytes() <= limits.memory_byte_limit);
+        assert_eq!(std::fs::read(&pin_path).unwrap(), pin_bytes);
+        let sufficient = bounded(ceiling);
+        retain_restore_pins(&catalog, target, &mut evidence, &sufficient).unwrap();
+        assert_eq!(evidence.entries.len(), 257);
+        assert!(reads.0.load(Ordering::SeqCst) > before);
+        assert_eq!(sufficient.admitted_memory_bytes(), ceiling);
+    }
+
     #[test]
     fn closure_evidence_refuses_before_vector_growth() {
         let generous = OperationLimits::new(

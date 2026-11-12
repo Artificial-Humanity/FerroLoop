@@ -74,8 +74,8 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
                 .spawn()
                 .unwrap();
             // Aggregate watchdog covers fixture setup plus five separately
-            // bounded phases; each operation retains its 120s/1GiB limits.
-            let deadline = Instant::now() + Duration::from_secs(600);
+            // bounded phases, each with a 1GiB memory ceiling.
+            let deadline = Instant::now() + Duration::from_secs(1200);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success(), "isolated {shape} measurement failed");
@@ -341,9 +341,12 @@ fn offline_source_and_original_memory(
     let root = tmp.path().join("offline-backups");
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Linux CI's wide cold backup exhausted its 120s deadline after earlier
+    // phases took ~185s; charge was 846676376 bytes, below the 1GiB ceiling.
+    // Give this fixture 3x that observed deadline, keeping a finite bound.
     let new_limits = || {
         OperationLimits::new(
-            Instant::now() + Duration::from_secs(120),
+            Instant::now() + Duration::from_secs(360),
             1 << 30,
             1 << 30,
             CancelToken::new(),
@@ -462,6 +465,7 @@ fn offline_source_and_original_memory(
         limits: l.clone(),
         metadata_byte_limit: 1 << 20,
         space_margin_bytes: 4096,
+        original_profile: request.profile.clone(),
         available_dependencies: vec![],
     };
     measure("bounded_physical_original_and_candidate", &l, &mut || {
