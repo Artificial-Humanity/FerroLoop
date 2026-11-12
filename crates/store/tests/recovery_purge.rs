@@ -1324,3 +1324,204 @@ fn purge_manifest_final_hash_preserves_predecessor_authority_on_late_changes() {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum PurgeLeaseExpiryAt {
+    AuditRead,
+    Unlink(usize),
+    FinalRead(usize),
+}
+fn assert_purge_stops_at_lease_expiry(at: PurgeLeaseExpiryAt) {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::sync::atomic::AtomicUsize;
+    struct ExpiringIo {
+        at: PurgeLeaseExpiryAt,
+        issued: u128,
+        expires: u128,
+        audit: std::path::PathBuf,
+        member_identities: Vec<(u64, u64)>,
+        unlinks: AtomicUsize,
+        expired: AtomicBool,
+    }
+    impl RecoveryIo for ExpiringIo {
+        fn unix_ms(&self) -> std::io::Result<u128> {
+            Ok(if self.expired.load(Ordering::Acquire) {
+                self.expires
+            } else {
+                self.issued
+            })
+        }
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::PurgeUnlink {
+                let index = self.unlinks.fetch_add(1, Ordering::AcqRel);
+                if matches!(self.at, PurgeLeaseExpiryAt::Unlink(stop) if index == stop) {
+                    self.expired.store(true, Ordering::Release);
+                }
+            }
+            Ok(())
+        }
+        fn read_exact_at(
+            &self,
+            file: &std::fs::File,
+            bytes: &mut [u8],
+            offset: u64,
+        ) -> std::io::Result<()> {
+            let metadata = file.metadata()?;
+            let identity = (metadata.dev(), metadata.ino());
+            if matches!(self.at, PurgeLeaseExpiryAt::AuditRead) {
+                let audit = fs::metadata(&self.audit)?;
+                if identity == (audit.dev(), audit.ino()) {
+                    // Expire immediately before the first existing audit read.
+                    self.expired.store(true, Ordering::Release);
+                }
+            }
+            file.read_exact_at(bytes, offset)?;
+            if let PurgeLeaseExpiryAt::FinalRead(index) = self.at {
+                if self.unlinks.load(Ordering::Acquire) == index + 1
+                    && identity == self.member_identities[index]
+                    && offset + bytes.len() as u64 == metadata.len()
+                {
+                    // The PurgeUnlink seam has passed; this is the final held
+                    // member digest read, not the earlier verification hash.
+                    self.expired.store(true, Ordering::Release);
+                }
+            }
+            Ok(())
+        }
+    }
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    // Persist the exact intent without removing any member. Replaying it
+    // also exercises expiry during its read, before the unlink loop starts.
+    let report = admitted_purge(&f, op, &lease, 0);
+    assert!(report.members.len() > 1);
+    let member_bytes: Vec<_> = report
+        .members
+        .iter()
+        .map(|member| fs::read(f.backups.join(&member.relative_name)).unwrap())
+        .collect();
+    let request: OfflineLeaseRequest =
+        serde_json::from_slice(&fs::read(lease.path()).unwrap()).unwrap();
+    let catalog = f.backups.join(".catalog");
+    let audit = catalog.join(format!("purge-{op}.intent.json"));
+    let audit_before = fs::read(&audit).unwrap();
+    let hook = Arc::new(ExpiringIo {
+        at,
+        issued: request.issued_at_unix_ms,
+        expires: request.expires_at_unix_ms,
+        audit: audit.clone(),
+        member_identities: report.members.iter().map(|m| m.identity).collect(),
+        unlinks: AtomicUsize::new(0),
+        expired: AtomicBool::new(false),
+    });
+    let filesystem = HookFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let error =
+        purge_quarantined(&confirmation(&report), &lease, &filesystem, &limits()).unwrap_err();
+    assert!(error.to_string().contains("lease"), "{at:?}: {error}");
+    assert!(
+        hook.expired.load(Ordering::Acquire),
+        "{at:?}: hook not reached"
+    );
+    let (removed, seams) = match at {
+        PurgeLeaseExpiryAt::AuditRead => (0, 0),
+        PurgeLeaseExpiryAt::Unlink(index) | PurgeLeaseExpiryAt::FinalRead(index) => {
+            (index, index + 1)
+        }
+    };
+    assert_eq!(hook.unlinks.load(Ordering::Acquire), seams, "{at:?}");
+    for (index, member) in report.members.iter().enumerate() {
+        let path = f.backups.join(&member.relative_name);
+        if index < removed {
+            assert!(!path.exists());
+        } else {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                member_bytes[index],
+                "{at:?}: member {index}"
+            );
+        }
+        assert_eq!(
+            catalog
+                .join(format!("purge-{op}.member-{index}.json"))
+                .exists(),
+            index < removed,
+            "only members removed before expiry may have completion rows"
+        );
+    }
+    assert_eq!(fs::read(audit).unwrap(), audit_before);
+    assert!(!catalog.join(format!("purge-{op}.complete.json")).exists());
+    // Issue separate renewed authority at the injected expiry; do not
+    // extend or rewrite the old lease, or move its clock backwards.
+    struct RenewedClock(u128);
+    impl RecoveryIo for RenewedClock {
+        fn unix_ms(&self) -> std::io::Result<u128> {
+            Ok(self.0)
+        }
+    }
+    let old_lease_bytes = fs::read(lease.path()).unwrap();
+    let mut renewed_request = request.clone();
+    renewed_request.issued_at_unix_ms = request.expires_at_unix_ms;
+    renewed_request.expires_at_unix_ms = request.expires_at_unix_ms + 600000;
+    renewed_request.exclusion.evidence = "renewed fixture administrative exclusion".into();
+    let renewed_fs = HookFs {
+        f: &f,
+        io: Arc::new(RenewedClock(renewed_request.issued_at_unix_ms)),
+        limits: limits(),
+    };
+    let renewed = create_offline_lease(&renewed_request, &renewed_fs, &limits()).unwrap();
+    assert_ne!(renewed.path(), lease.path());
+    assert_eq!(fs::read(lease.path()).unwrap(), old_lease_bytes);
+    // Expiry returns Err, never a successful partial/complete report.
+    // Renewed-authority inspection reconstructs the durable partial outcome.
+    let partial = purge_quarantined(&inspection(op), &renewed, &renewed_fs, &limits()).unwrap();
+    assert!(partial.audit_durable && !partial.complete);
+    for (index, member) in partial.members.iter().enumerate() {
+        assert_eq!(
+            member.state,
+            if index < removed {
+                PurgeMemberState::Removed
+            } else {
+                PurgeMemberState::Present
+            }
+        );
+    }
+    let resumed =
+        purge_quarantined(&confirmation(&partial), &renewed, &renewed_fs, &limits()).unwrap();
+    assert!(resumed.complete && resumed.audit_durable);
+    assert!(
+        resumed
+            .members
+            .iter()
+            .all(|m| m.state == PurgeMemberState::Removed)
+    );
+    assert_eq!(fs::read(lease.path()).unwrap(), old_lease_bytes);
+}
+
+#[test]
+fn purge_lease_expiry_before_audit_read_retains_all_members() {
+    assert_purge_stops_at_lease_expiry(PurgeLeaseExpiryAt::AuditRead);
+}
+
+#[test]
+fn purge_lease_expiry_at_first_unlink_retains_all_members() {
+    assert_purge_stops_at_lease_expiry(PurgeLeaseExpiryAt::Unlink(0));
+}
+
+#[test]
+fn purge_lease_expiry_after_first_final_read_retains_all_members() {
+    assert_purge_stops_at_lease_expiry(PurgeLeaseExpiryAt::FinalRead(0));
+}
+
+#[test]
+fn purge_lease_expiry_at_later_unlink_retains_pending_members() {
+    assert_purge_stops_at_lease_expiry(PurgeLeaseExpiryAt::Unlink(1));
+}
+
+#[test]
+fn purge_lease_expiry_after_later_final_read_retains_pending_members() {
+    assert_purge_stops_at_lease_expiry(PurgeLeaseExpiryAt::FinalRead(1));
+}

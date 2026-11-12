@@ -750,6 +750,26 @@ fn manifest_predecessors_complete(
     manifest_predecessors_unchanged(root, audit, target, &held, &scope)?;
     target.validate(root, catalog, audit.operation_id, &scope)
 }
+// Read the administrative clock before the final noninjectable authority checks.
+// The monotonic deadline also bounds lock waits and work between these samples.
+fn lease_time_remaining(
+    lease: &OfflineLease,
+    io: &dyn fs::RecoveryIo,
+    l: &OperationLimits,
+) -> Result<std::time::Duration, RecoveryError> {
+    l.check()?;
+    let now = io.unix_ms().map_err(|_| fs::destination(l))?;
+    l.check()?;
+    if now < lease.request.issued_at_unix_ms || now >= lease.request.expires_at_unix_ms {
+        return Err(fs::refused(
+            l,
+            "valid bound lease and renewed administrative exclusion required",
+        ));
+    }
+    let remaining =
+        u64::try_from(lease.request.expires_at_unix_ms - now).map_err(|_| l.verification())?;
+    Ok(std::time::Duration::from_millis(remaining))
+}
 pub fn purge_quarantined(
     request: &PurgeRequest,
     lease: &OfflineLease,
@@ -770,6 +790,16 @@ pub fn purge_quarantined(
             "confirmation must match exact quarantine operation",
         ));
     }
+    // Sample Instant first so time spent in the injectable clock cannot extend
+    // the administrative lease. Never widen the caller's deadline.
+    let started = std::time::Instant::now();
+    let io = filesystem.io();
+    let remaining = lease_time_remaining(lease, &*io, &l)?;
+    l.deadline = l.deadline.min(
+        started
+            .checked_add(remaining)
+            .ok_or_else(|| l.verification())?,
+    );
     lease.validate(filesystem, &l)?;
     if lease.request.operation_id != request.operation_id {
         return Err(l.verification());
@@ -796,7 +826,6 @@ pub fn purge_quarantined(
     let _ownership = OperationOwnership::acquire(&lease.request.physical_path, &l)?;
     let root = Dir::open(filesystem.root(), &l)?;
     let locks = Dir::open(&root.path.join(".locks"), &l)?;
-    let io = filesystem.io();
     // Fixed order: physical store, operation, catalog. Inspection creates no lock
     // inode and refuses an unbootstrapped root rather than silently initializing it.
     let control = if request.confirm.is_some() {
@@ -1019,7 +1048,7 @@ pub fn purge_quarantined(
     catalog.sync(&*io, Directory::CatalogParent, &l)?;
     report.audit_durable = true;
     for (index, m) in audit.members.iter().enumerate() {
-        l.check()?;
+        lease_time_remaining(lease, &*io, &l)?;
         access.validate(&root, &l)?;
         held_audit.unchanged(&l)?;
         target.validate(&root, &catalog, request.operation_id, &l)?;
@@ -1071,8 +1100,11 @@ pub fn purge_quarantined(
                 if verify::hash_file(&last.file, &final_scope)? != (m.bytes, m.sha256.clone()) {
                     return Err(final_scope.verification());
                 }
-                // All injectable reads finished. Never adopt new completion
-                // authority after this boundary; check original bindings/absence.
+                // Sample expiry after the final injectable read, before held
+                // authority checks. No injected clock/open/read follows them.
+                lease_time_remaining(lease, &*io, &final_scope)?;
+                // Never adopt new completion authority after this boundary;
+                // check original bindings/absence.
                 if name == "manifest.json" {
                     manifest_predecessors_unchanged(
                         &root,
@@ -1090,7 +1122,9 @@ pub fn purge_quarantined(
         }
         // Missing after an interrupted unlink is only completed once its parent is
         // synced. No planned name is reported removed merely from audit intent.
+        lease_time_remaining(lease, &*io, &l)?;
         parent.sync(&*io, Directory::PurgeParent, &l)?;
+        lease_time_remaining(lease, &*io, &l)?;
         access.validate(&root, &l)?;
         held_audit.unchanged(&l)?;
         target.validate(&root, &catalog, request.operation_id, &l)?;
@@ -1109,6 +1143,7 @@ pub fn purge_quarantined(
             &l,
         )?;
         catalog.sync(&*io, Directory::CatalogParent, &l)?;
+        lease_time_remaining(lease, &*io, &l)?;
         target.validate(&root, &catalog, request.operation_id, &l)?;
         if parent.exists(name, &l)? {
             return Err(l.verification());
@@ -1117,6 +1152,7 @@ pub fn purge_quarantined(
     }
     // Recheck the full surviving-name/completion set before final completion.
     replay_target(&root, &catalog, &audit, &audit_hash, &l)?;
+    lease_time_remaining(lease, &*io, &l)?;
     let complete_name = format!("purge-{}.complete.json", request.operation_id);
     if catalog.exists(&complete_name, &l)? {
         check_completion(
@@ -1144,6 +1180,7 @@ pub fn purge_quarantined(
         catalog.sync(&*io, Directory::CatalogParent, &l)?;
     }
     replay_target(&root, &catalog, &audit, &audit_hash, &l)?;
+    lease_time_remaining(lease, &*io, &l)?;
     held_audit.unchanged(&l)?;
     report.complete = true;
     drop(observed_operation);
