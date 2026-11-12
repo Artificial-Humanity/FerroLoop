@@ -11,6 +11,8 @@ import {
   type ProjectSummary,
   type WireMessage,
 } from "../types/api";
+import { roleLabel } from "../hooks/useRoles";
+import type { RoleRecord } from "../types/api";
 import { projectLabel } from "../hooks/useProjects";
 import {
   evaluateQuotaStatus,
@@ -333,6 +335,7 @@ export function hasTrailingIncompleteWork(turns: TranscriptTurn[]): boolean {
 }
 
 export interface RosterSidebarProps {
+  roles?: readonly RoleRecord[];
   agents: AgentRecord[];
   routes: DiscoveredSessionSummary[];
   sessions?: DiscoveredSessionSummary[];
@@ -552,12 +555,8 @@ interface EnrichedAgent {
   contextEstimate: EstimatedContextUsage;
 }
 
-export function formatRoleLabel(role: string): string {
-  const clean = role.trim();
-  if (clean === "lab_manager") {
-    return "lab_manager";
-  }
-  return clean || "member";
+export function formatRoleLabel(role: string, roles: readonly RoleRecord[] = []): string {
+  return roleLabel(role.trim() || "member", roles);
 }
 
 export function getAdapterBadgeClass(adapter: string | null | undefined): string {
@@ -638,6 +637,7 @@ function inferSessionProject(
 }
 
 export const RosterSidebar: React.FC<RosterSidebarProps> = ({
+  roles = [],
   agents = [],
   routes = [],
   sessions = [],
@@ -918,6 +918,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         record.display_name.toLowerCase().includes(query) ||
         record.project.toLowerCase().includes(query) ||
         record.role.toLowerCase().includes(query) ||
+        formatRoleLabel(record.role, roles).toLowerCase().includes(query) ||
         (adapter && adapter.toLowerCase().includes(query))
       );
     });
@@ -981,6 +982,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     pinnedAgents,
     projects,
     showEmptyProjects,
+    roles,
   ]);
 
   const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
@@ -1693,7 +1695,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               }}
                             >
                               <span className="fd-badge" data-testid={`role-badge-${key}`}>
-                                {formatRoleLabel(record.role)}
+                                {formatRoleLabel(record.role, roles)}
                               </span>
                               {adapter && (
                                 <span

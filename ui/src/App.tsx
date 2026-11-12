@@ -1,3 +1,4 @@
+import { useRoles } from "./hooks/useRoles";
 import {
   codexSendNowReceipt,
   isPromptDeliveryFailure,
@@ -695,6 +696,7 @@ export const App: React.FC<AppProps> = ({
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
+  const { roles: rosterRoles } = useRoles(Boolean(authority) && !settingsModalOpen, apiClient);
   const [settingsInitialProject, setSettingsInitialProject] = useState<string | null>(null);
   const [settingsInitialProjectFilter, setSettingsInitialProjectFilter] =
     useState<string | null>(null);
@@ -3721,6 +3723,7 @@ export const App: React.FC<AppProps> = ({
 
   const renderRosterSidebar = (embedded: boolean) => (
     <RosterSidebar
+          roles={rosterRoles}
       projects={projects}
       showEmptyProjects={projectsFromHub}
       loading={loading}
@@ -3842,6 +3845,7 @@ export const App: React.FC<AppProps> = ({
     >
       {isPhoneLayout ? (
         <PhoneShell
+          roles={rosterRoles}
           view={effectivePhoneView}
           hasAgent={Boolean(selectedAgent)}
           onNavigate={setPhoneView}
@@ -3871,6 +3875,7 @@ export const App: React.FC<AppProps> = ({
       ) : (
         <>
           <ContextHeader
+          roles={rosterRoles}
             selectedAgent={selectedAgent}
             sessions={mergedRoutes}
             selectedSessionId={activeSession?.id ?? null}
