@@ -437,7 +437,10 @@ fn usage_reports_offline_windows_and_rejects_bad_arguments() {
         file_identity: None,
         anchor: String::new(),
         discarding_line: false,
-        parser: Default::default(),
+        parser: fl_watch::usage::ParserState {
+            parser_revision: Some(fl_watch::usage::USAGE_PARSER_REVISION),
+            ..Default::default()
+        },
         buckets: vec![
             bucket.clone(),
             fl_watch::usage::UsageBucket {
@@ -504,10 +507,76 @@ fn usage_reports_offline_windows_and_rejects_bad_arguments() {
         .args(["watch", "usage", "--by", "bogus"])
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let help = env
+        .fl()
+        .args(["watch", "usage", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("possible values: persona, vendor, model")
+    );
     let out = env.fl().args(["watch", "usage"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Effective"));
     assert!(text.contains("undated\t17\tNo data"), "{text}");
+    assert!(
+        text.contains("not dated; excluded from this window"),
+        "{text}"
+    );
+    assert!(text.contains("unattributed: 1"), "{text}");
+    assert!(text.contains("Codex input includes cache"), "{text}");
+}
+
+#[test]
+fn usage_collection_is_not_in_ferrostate_search_or_render() {
+    let env = Env::new();
+    let store = env.open();
+    store
+        .as_ferro()
+        .unwrap()
+        .put_doc(
+            "watch_usage_v1",
+            "usage-isolation",
+            &json!({"kind":"source", "document":{"marker":"xqzusageisolationmarker"}}),
+        )
+        .unwrap();
+    drop(store);
+    let search = env
+        .fl()
+        .args(["state", "search", "xqzusageisolationmarker", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert_eq!(json_of(&search.stdout)["total_hits"], 0);
+    let render = env
+        .fl()
+        .args(["state", "render", "--scope", "workspace"])
+        .output()
+        .unwrap();
+    assert!(
+        render.status.success(),
+        "{}",
+        String::from_utf8_lossy(&render.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&render.stdout).contains("xqzusageisolationmarker"));
+}
+
+#[test]
+fn empty_usage_text_says_no_usage() {
+    let env = Env::new();
+    let store = env.open();
+    drop(store);
+    let output = env.fl().args(["watch", "usage"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No usage for this period."));
 }

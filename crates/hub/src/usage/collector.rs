@@ -66,11 +66,60 @@ fn read_source(
         .transpose()
 }
 
+fn claude_subagent_parent(source: &UsageSource) -> Option<&str> {
+    if source.vendor != UsageVendor::Claude || !source.session_id.starts_with("agent-") {
+        return None;
+    }
+    let subagents = source.path.parent()?;
+    if subagents.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+    let parent = subagents.parent()?.file_name()?.to_str()?;
+    uuid::Uuid::parse_str(parent).ok()?;
+    Some(parent)
+}
+/// Structural Claude child identity; read only the first bounded record for launch time.
+fn claude_subagent_identity(source: &UsageSource) -> Option<IdentityMappingDocument> {
+    use std::io::{BufRead, BufReader, Read};
+    let parent = claude_subagent_parent(source)?;
+    let file = std::fs::File::open(&source.path).ok()?;
+    let mut first = Vec::new();
+    BufReader::new(file)
+        .take(1024 * 1024 + 1)
+        .read_until(b'\n', &mut first)
+        .ok()?;
+    let record: Option<serde_json::Value> = if first.len() <= 1024 * 1024 {
+        serde_json::from_slice(&first).ok()
+    } else {
+        None
+    };
+    if let Some(session) = record
+        .as_ref()
+        .and_then(|v| v.get("sessionId"))
+        .and_then(|v| v.as_str())
+        && session != parent
+    {
+        return None;
+    }
+    let launch_time_ms = record
+        .as_ref()
+        .and_then(|v| v.get("timestamp"))
+        .and_then(crate::discovery::parse_timestamp_value_ms);
+    Some(IdentityMappingDocument {
+        session_id: source.session_id.clone(),
+        persona: None,
+        parent_id: Some(parent.to_owned()),
+        launch_time_ms,
+        provenance: format!("claude-subagent-path:{parent}"),
+    })
+}
+
 fn save_candidate(
     store: &AnyStore,
     source: &UsageSource,
     old: Option<&SourceUsageDocument>,
     candidate: Result<SourceUsageDocument, super::scan::UsageScanError>,
+    claude_identity: Option<IdentityMappingDocument>,
 ) -> anyhow::Result<()> {
     let ferro = store
         .as_ferro()
@@ -78,6 +127,10 @@ fn save_candidate(
     let candidate = match candidate {
         Ok(doc) => doc,
         Err(super::scan::UsageScanError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            let id = key("source-error", &source.source_id);
+            if ferro.get_doc(COLLECTION, &id)?.is_some() {
+                ferro.delete_doc(COLLECTION, &id)?;
+            }
             return Ok(());
         }
         Err(_) => {
@@ -98,6 +151,21 @@ fn save_candidate(
             COLLECTION,
             &key("source", &source.source_id),
             &serde_json::json!({"kind":"source", "document":candidate}),
+        )?;
+    }
+    if let Some(identity) = claude_identity {
+        put_identity(store, &identity)?;
+    }
+    if let Some(parent) = candidate.parser.codex_parent_id.as_ref() {
+        put_identity(
+            store,
+            &IdentityMappingDocument {
+                session_id: candidate.session_id.clone(),
+                persona: None,
+                parent_id: Some(parent.clone()),
+                launch_time_ms: candidate.parser.codex_launch_time_ms,
+                provenance: format!("codex-parent:{parent}"),
+            },
         )?;
     }
     for launch in &candidate.parser.antigravity_launches {
@@ -148,7 +216,8 @@ pub fn collect_once(
     for source in sources {
         let old = read_source(store, source)?;
         let candidate = scan_source(source, old.as_ref(), limits);
-        save_candidate(store, source, old.as_ref(), candidate)?;
+        let identity = claude_subagent_identity(source);
+        save_candidate(store, source, old.as_ref(), candidate, identity)?;
     }
     Ok(())
 }
@@ -246,31 +315,70 @@ fn discover_usage_sources(home: &std::path::Path) -> (Vec<UsageSource>, bool) {
     (sources, incomplete)
 }
 
-/// Run one bounded sweep in the hub's background task. The rotating start prevents
-/// a busy source or a long source list from starving later conversations.
-pub fn collect_hub(
-    state: &crate::HubState,
-    start: usize,
-    prior_pending: bool,
-) -> anyhow::Result<(usize, bool)> {
-    collect_hub_with_hook(state, start, prior_pending, || {})
+/// Cached scheduler state is hub-owned and never shared between collectors.
+#[derive(Default)]
+pub struct CollectionScheduler {
+    initialized: bool,
+    sources: std::collections::HashMap<String, SourceProgress>,
+    claude_identified: std::collections::HashSet<(String, String)>,
+    claude_checked: std::collections::HashSet<(String, String)>,
+    last_identity_refresh: Option<std::time::Instant>,
+    identity_refresh_failed: bool,
+    invalid_source_documents: std::collections::HashSet<String>,
+    invalid_identity_documents: std::collections::HashSet<String>,
+    last_success_ms: Option<u64>,
+    tick: u64,
 }
-
-fn collect_hub_with_hook(
-    state: &crate::HubState,
-    start: usize,
-    prior_pending: bool,
-    mut hook: impl FnMut(),
-) -> anyhow::Result<(usize, bool)> {
-    let home = state
-        .config
-        .home_override
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(Into::into))
-        .ok_or_else(|| anyhow::anyhow!("usage source home unavailable"))?;
-    // The flight spans snapshots, scans, and writes, while each store guard is brief.
-    let _flight = COLLECTING.lock().unwrap_or_else(|e| e.into_inner());
-    let (sources, enumeration_incomplete) = discover_usage_sources(&home);
+#[derive(Default)]
+struct SourceProgress {
+    offset: u64,
+    observed_len: Option<u64>,
+    observed_mtime_ns: Option<u64>,
+    file_identity: Option<String>,
+    pending: bool,
+    needs_migration: bool,
+    last_serviced: u64,
+}
+fn file_identity(metadata: &std::fs::Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+fn modified_ns(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|v| v.as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+fn source_progress(doc: &SourceUsageDocument, tick: u64) -> SourceProgress {
+    SourceProgress {
+        offset: doc.offset,
+        observed_len: doc.parser.observed_len,
+        observed_mtime_ns: doc.parser.observed_mtime_ns,
+        file_identity: doc.file_identity.clone(),
+        pending: doc.coverage.pending,
+        needs_migration: doc.parser.parser_revision != Some(fl_watch::usage::USAGE_PARSER_REVISION),
+        last_serviced: tick,
+    }
+}
+fn unchanged_source(progress: &SourceProgress, metadata: &std::fs::Metadata) -> bool {
+    !progress.pending
+        && !progress.needs_migration
+        && progress.observed_len == Some(metadata.len())
+        && progress.observed_mtime_ns.is_some()
+        && progress.observed_mtime_ns == modified_ns(metadata)
+        && progress.file_identity == file_identity(metadata)
+}
+fn refresh_identities(state: &crate::HubState) -> anyhow::Result<()> {
     let (snap, hosted) = {
         let store = state.open_store()?;
         store
@@ -310,45 +418,368 @@ fn collect_hub_with_hook(
             });
         }
     }
+    let store = state.open_store()?;
+    for identity in &identities {
+        put_identity(&store, identity)?;
+    }
+    Ok(())
+}
+/// Scan at most this many bytes per tick, prioritizing recent changes while giving
+/// every source a turn before revisiting one with a large backlog.
+pub fn collect_hub(
+    state: &crate::HubState,
+    schedule: &mut CollectionScheduler,
+) -> anyhow::Result<bool> {
+    collect_hub_with_hook(state, schedule, 32 * 1024 * 1024, || {})
+}
+fn collect_hub_with_hook(
+    state: &crate::HubState,
+    schedule: &mut CollectionScheduler,
+    byte_budget: usize,
+    hook: impl FnMut(),
+) -> anyhow::Result<bool> {
+    collect_hub_with_hooks(state, schedule, byte_budget, hook, || {
+        refresh_identities(state)
+    })
+}
+fn collect_hub_with_hooks(
+    state: &crate::HubState,
+    schedule: &mut CollectionScheduler,
+    byte_budget: usize,
+    mut hook: impl FnMut(),
+    mut refresh: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let home = state
+        .config
+        .home_override
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(Into::into))
+        .ok_or_else(|| anyhow::anyhow!("usage source home unavailable"))?;
+    let _flight = COLLECTING.lock().unwrap_or_else(|e| e.into_inner());
+    let (sources, enumeration_incomplete) = discover_usage_sources(&home);
+    if !schedule.initialized {
+        let store = state.open_store()?;
+        let ferro = store
+            .as_ferro()
+            .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+        for id in ferro.query_by_field(COLLECTION, "kind", "source")? {
+            match ferro
+                .get_doc(COLLECTION, &id)
+                .map_err(anyhow::Error::from)
+                .and_then(|value| {
+                    value
+                        .map(|v| {
+                            serde_json::from_value::<SourceUsageDocument>(v["document"].clone())
+                                .map_err(Into::into)
+                        })
+                        .transpose()
+                }) {
+                Ok(Some(doc)) => {
+                    schedule
+                        .sources
+                        .insert(doc.source_id.clone(), source_progress(&doc, 0));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    schedule.invalid_source_documents.insert(id);
+                }
+            }
+        }
+        for id in ferro.query_by_field(COLLECTION, "kind", "identity")? {
+            match ferro
+                .get_doc(COLLECTION, &id)
+                .map_err(anyhow::Error::from)
+                .and_then(|value| {
+                    value
+                        .map(|v| {
+                            serde_json::from_value::<IdentityMappingDocument>(v["document"].clone())
+                                .map_err(Into::into)
+                        })
+                        .transpose()
+                }) {
+                Ok(Some(mapping)) => {
+                    if let Some(parent) = mapping.parent_id.as_deref()
+                        && mapping.provenance == format!("claude-subagent-path:{parent}")
+                    {
+                        schedule
+                            .claude_identified
+                            .insert((mapping.session_id, parent.to_owned()));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    schedule.invalid_identity_documents.insert(id);
+                }
+            }
+        }
+        schedule.claude_checked = schedule.claude_identified.clone();
+        let ferro = store
+            .as_ferro()
+            .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+        schedule.last_success_ms = ferro
+            .get_doc(COLLECTION, "collector-status")?
+            .and_then(|v| v["last_success_ms"].as_u64());
+        schedule.initialized = true;
+    }
+    if schedule
+        .last_identity_refresh
+        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60))
+    {
+        schedule.identity_refresh_failed =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut refresh)) {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => {
+                    eprintln!("usage collector: identity refresh failed: {error}");
+                    true
+                }
+                Err(_) => {
+                    eprintln!("usage collector: identity refresh panicked");
+                    true
+                }
+            };
+        schedule.last_identity_refresh = Some(std::time::Instant::now());
+    }
+    schedule.tick = schedule.tick.saturating_add(1);
+    let source_ids: std::collections::HashSet<_> = sources
+        .iter()
+        .map(|s| key("source-error", &s.source_id))
+        .collect();
     {
         let store = state.open_store()?;
-        for identity in &identities {
-            put_identity(&store, identity)?;
+        let ferro = store
+            .as_ferro()
+            .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+        schedule
+            .invalid_source_documents
+            .retain(|id| match ferro.get_doc(COLLECTION, id) {
+                Ok(None) => false,
+                Ok(Some(value)) => {
+                    serde_json::from_value::<SourceUsageDocument>(value["document"].clone())
+                        .is_err()
+                }
+                Err(_) => true,
+            });
+        schedule
+            .invalid_identity_documents
+            .retain(|id| match ferro.get_doc(COLLECTION, id) {
+                Ok(None) => false,
+                Ok(Some(value)) => {
+                    serde_json::from_value::<IdentityMappingDocument>(value["document"].clone())
+                        .is_err()
+                }
+                Err(_) => true,
+            });
+        if !enumeration_incomplete {
+            for id in ferro.query_by_field(COLLECTION, "kind", "source_error")? {
+                if !source_ids.contains(&id) {
+                    ferro.delete_doc(COLLECTION, &id)?;
+                }
+            }
         }
     }
-    let start = if start >= sources.len() { 0 } else { start };
-    let end = (start + 8).min(sources.len());
-    let selected = &sources[start..end];
-    for source in selected {
+    let mut candidates = Vec::new();
+    let mut enumeration_errors = enumeration_incomplete
+        || schedule.identity_refresh_failed
+        || !schedule.invalid_source_documents.is_empty()
+        || !schedule.invalid_identity_documents.is_empty();
+    for source in &sources {
+        let metadata = match std::fs::metadata(&source.path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                enumeration_errors = true;
+                continue;
+            }
+        };
+        let progress = schedule
+            .sources
+            .entry(source.source_id.clone())
+            .or_default();
+        let needs_identity = claude_subagent_parent(source).is_some_and(|parent| {
+            !schedule
+                .claude_checked
+                .contains(&(source.session_id.clone(), parent.to_owned()))
+        });
+        if unchanged_source(progress, &metadata) && !needs_identity {
+            continue;
+        }
+        candidates.push((source.clone(), metadata, progress.last_serviced));
+    }
+    // Alternate freshest-first with a fair pass: active agents stay current while
+    // a set of very large recent sources cannot indefinitely starve old ones.
+    candidates.sort_by(|a, b| {
+        let freshness = || modified_ns(&b.1).cmp(&modified_ns(&a.1));
+        let fairness = || a.2.cmp(&b.2);
+        (if schedule.tick % 2 == 1 {
+            freshness().then_with(fairness)
+        } else {
+            fairness().then_with(freshness)
+        })
+        .then_with(|| a.0.source_id.cmp(&b.0.source_id))
+    });
+    let mut spent = 0usize;
+    for (source, meta, _) in candidates {
+        if spent >= byte_budget.max(1)
+            || (spent > 0 && byte_budget.saturating_sub(spent) <= 1024 * 1024)
+        {
+            break;
+        }
+        let progress = schedule
+            .sources
+            .get_mut(&source.source_id)
+            .expect("source indexed");
+        progress.last_serviced = schedule.tick;
+        let migrating = progress.needs_migration;
         let old = {
             let store = state.open_store()?;
-            read_source(&store, source)?
+            match read_source(&store, &source) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    eprintln!(
+                        "usage collector: source {} document unreadable: {error}",
+                        key("source", &source.source_id)
+                    );
+                    schedule
+                        .invalid_source_documents
+                        .insert(key("source", &source.source_id));
+                    enumeration_errors = true;
+                    spent = spent.saturating_add(1);
+                    continue;
+                }
+            }
         };
-        hook();
-        let candidate = scan_source(source, old.as_ref(), ScanLimits::default());
+        // Existing installations may already have a complete source document but
+        // lack its newly supported Claude parent mapping. Backfill only the first
+        // record, rather than parsing the entire unchanged transcript again.
+        if schedule
+            .sources
+            .get(&source.source_id)
+            .is_some_and(|progress| unchanged_source(progress, &meta))
+        {
+            if let Some(parent) = claude_subagent_parent(&source) {
+                let pair = (source.session_id.clone(), parent.to_owned());
+                if let Some(identity) = claude_subagent_identity(&source) {
+                    let store = state.open_store()?;
+                    put_identity(&store, &identity)?;
+                    schedule.claude_identified.insert(pair.clone());
+                }
+                schedule.claude_checked.insert(pair);
+            }
+            spent = spent.saturating_add((meta.len().min(1024 * 1024) as usize).max(1));
+            continue;
+        }
+        let limits = ScanLimits {
+            max_batch_bytes: (byte_budget - spent).clamp(1024 * 1024 + 1, 4 * 1024 * 1024),
+            ..ScanLimits::default()
+        };
+        let candidate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook();
+            scan_source(&source, old.as_ref(), limits)
+        }));
+        let candidate = match candidate {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!(
+                    "usage collector: source {} panicked",
+                    key("source", &source.source_id)
+                );
+                Err(super::scan::UsageScanError::Invalid)
+            }
+        };
+        if let Err(error) = &candidate {
+            eprintln!(
+                "usage collector: source {} scan failed: {error}",
+                key("source", &source.source_id)
+            );
+        }
+        let identity = claude_subagent_identity(&source);
+        let identified = identity.as_ref().and_then(|i| {
+            i.parent_id
+                .as_ref()
+                .map(|p| (i.session_id.clone(), p.clone()))
+        });
+        let new_progress = candidate
+            .as_ref()
+            .ok()
+            .map(|d| source_progress(d, schedule.tick));
+        let old_offset = if migrating {
+            0
+        } else {
+            old.as_ref().map_or(0, |d| d.offset)
+        };
+        let bytes = meta
+            .len()
+            .saturating_sub(old_offset)
+            .min(limits.max_batch_bytes as u64) as usize;
+        // Scanning also hashes the old and new prefixes. Charge those reads so a
+        // small append to many medium-sized files does not evade the byte budget.
+        let anchor_bytes = |offset: u64| -> usize {
+            if offset <= 4 * 1024 * 1024 {
+                offset as usize
+            } else {
+                4096
+            }
+        };
+        let new_offset = candidate.as_ref().ok().map_or(old_offset, |d| d.offset);
+        let hash_reads = anchor_bytes(old_offset).saturating_add(anchor_bytes(new_offset));
+        spent = spent
+            .saturating_add(bytes.max(1))
+            .saturating_add(hash_reads);
         let store = state.open_store()?;
-        save_candidate(&store, source, old.as_ref(), candidate)?;
+        if let Err(error) = save_candidate(&store, &source, old.as_ref(), candidate, identity) {
+            eprintln!(
+                "usage collector: source {} could not be saved: {error}",
+                key("source", &source.source_id)
+            );
+            enumeration_errors = true;
+        } else if let Some(p) = new_progress {
+            schedule.sources.insert(source.source_id.clone(), p);
+            if let Some(pair) = identified {
+                schedule.claude_checked.insert(pair.clone());
+                schedule.claude_identified.insert(pair);
+            }
+        }
     }
-    let store = state.open_store()?;
-    let next = if end >= sources.len() { 0 } else { end };
+    // Recompute from all discovered files and committed offsets. A sweep cursor alone
+    // is not evidence of unread bytes.
+    let pending = sources.iter().any(|source| {
+        let Some(progress) = schedule.sources.get(&source.source_id) else {
+            return std::fs::metadata(&source.path).is_ok_and(|m| m.len() > 0);
+        };
+        std::fs::metadata(&source.path).is_ok_and(|m| {
+            progress.pending
+                || (progress.needs_migration && m.len() > 0)
+                || m.len() > progress.offset
+                || (m.len() > 0
+                    && !unchanged_source(progress, &m)
+                    && (m.len() <= progress.offset || file_identity(&m) != progress.file_identity))
+        })
+    });
+    let identity_work = sources.iter().any(|source| {
+        claude_subagent_parent(source).is_some_and(|parent| {
+            !schedule
+                .claude_checked
+                .contains(&(source.session_id.clone(), parent.to_owned()))
+        })
+    });
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
+    let store = state.open_store()?;
     let ferro = store
         .as_ferro()
         .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
-    let mut batch_pending = false;
-    for source in selected {
-        let value = ferro.get_doc(COLLECTION, &key("source", &source.source_id))?;
-        batch_pending |= value
-            .and_then(|v| v["document"]["coverage"]["pending"].as_bool())
-            .unwrap_or(true);
+    let incomplete = enumeration_errors
+        || !ferro
+            .query_by_field(COLLECTION, "kind", "source_error")?
+            .is_empty();
+    if !pending && !identity_work && !incomplete {
+        schedule.last_success_ms = Some(now);
     }
-    let cumulative = (start != 0 && prior_pending) || batch_pending;
-    ferro.put_doc(COLLECTION, "collector-status", &serde_json::json!({"kind":"status", "last_success_ms":now, "pending":next != 0 || cumulative, "incomplete":enumeration_incomplete || !ferro.query_by_field(COLLECTION, "kind", "source_error")?.is_empty()}))?;
-    Ok((next, cumulative))
+    ferro.put_doc(COLLECTION, "collector-status", &serde_json::json!({"kind":"status", "last_success_ms":schedule.last_success_ms, "pending":pending, "incomplete":incomplete}))?;
+    Ok(pending || identity_work)
 }
 
 #[cfg(test)]
@@ -363,6 +794,518 @@ mod tests {
         };
         let store = fl_store::open_store_with(&dir.path().join("test.fls"), &opts).unwrap();
         (dir, store)
+    }
+    #[test]
+    fn corrupt_source_document_does_not_block_other_sources() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&logs).unwrap();
+        let line =
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":42}}}\n";
+        std::fs::write(logs.join("a.jsonl"), line).unwrap();
+        std::fs::write(logs.join("b.jsonl"), line).unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let sources = discover_usage_sources(home.path()).0;
+        {
+            let store = state.open_store().unwrap();
+            store
+                .as_ferro()
+                .unwrap()
+                .put_doc(
+                    COLLECTION,
+                    &key("source", &sources[0].source_id),
+                    &serde_json::json!({"kind":"source","document":{"broken":true}}),
+                )
+                .unwrap();
+        }
+        let mut schedule = CollectionScheduler::default();
+        collect_hub_with_hooks(&state, &mut schedule, 32 * 1024 * 1024, || {}, || Ok(())).unwrap();
+        let store = state.open_store().unwrap();
+        let ferro = store.as_ferro().unwrap();
+        let good = ferro
+            .get_doc(COLLECTION, &key("source", &sources[1].source_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(good["document"]["buckets"][0]["counts"]["input"], 42);
+        let status = ferro
+            .get_doc(COLLECTION, "collector-status")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["incomplete"], true);
+    }
+    #[test]
+    fn failed_identity_refresh_does_not_block_source_scans() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("abc.jsonl"),
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":42}}}\n",
+        )
+        .unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut schedule = CollectionScheduler::default();
+        collect_hub_with_hooks(
+            &state,
+            &mut schedule,
+            32 * 1024 * 1024,
+            || {},
+            || Err(anyhow::anyhow!("identity error")),
+        )
+        .unwrap();
+        let store = state.open_store().unwrap();
+        assert_eq!(
+            read_sources(&store).unwrap()[0].buckets[0].counts.input,
+            Some(42)
+        );
+        let status = store
+            .as_ferro()
+            .unwrap()
+            .get_doc(COLLECTION, "collector-status")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["incomplete"], true);
+        drop(store);
+        schedule.last_identity_refresh = None;
+        collect_hub_with_hooks(
+            &state,
+            &mut schedule,
+            32 * 1024 * 1024,
+            || {},
+            || panic!("fixture panic"),
+        )
+        .unwrap();
+        let store = state.open_store().unwrap();
+        assert_eq!(
+            read_sources(&store).unwrap()[0].buckets[0].counts.input,
+            Some(42)
+        );
+    }
+    #[test]
+    fn codex_fork_parent_metadata_attributes_child_usage_and_launch() {
+        let (_dir, store) = store();
+        let home = tempfile::tempdir().unwrap();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let path = home.path().join("fork.jsonl");
+        let records = [
+            serde_json::json!({"type":"session_meta", "timestamp":"2026-11-10T12:30:00Z", "payload":{"parent_thread_id":parent,"timestamp":"2026-11-10T12:30:00Z", "subagent_history_start_ordinal":5}}),
+            serde_json::json!({"type":"event_msg", "ordinal":4, "timestamp":"2026-11-10T12:30:00Z", "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":100}}}}),
+            serde_json::json!({"type":"event_msg", "ordinal":6, "timestamp":"2026-11-10T12:31:00Z", "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":142}}}}),
+        ];
+        std::fs::write(
+            &path,
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let source = UsageSource {
+            path,
+            source_id: "fork".into(),
+            session_id: child.into(),
+            vendor: UsageVendor::Codex,
+        };
+        let identity = IdentityMappingDocument {
+            session_id: parent.into(),
+            persona: Some("Felix".into()),
+            parent_id: None,
+            launch_time_ms: None,
+            provenance: "route".into(),
+        };
+        collect_once(&store, &[source], &[identity], ScanLimits::default()).unwrap();
+        let mappings = read_identities(&store).unwrap();
+        let report = fl_watch::usage::aggregate_documents(
+            &read_sources(&store).unwrap(),
+            &mappings,
+            None,
+            &fl_watch::usage::UsageReportQuery {
+                since_ms: 1794312000000,
+                by: fl_watch::usage::UsageGroupBy::Persona,
+            },
+            1794315600000,
+        )
+        .unwrap();
+        let row = report.rows.iter().find(|r| r.key == "Felix").unwrap();
+        assert_eq!(row.input, Some(42));
+        assert_eq!(row.subagents, 1);
+    }
+    #[test]
+    fn claude_subagent_path_attributes_usage_and_counts_launch() {
+        let (_dir, store) = store();
+        let home = tempfile::tempdir().unwrap();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let logs = home
+            .path()
+            .join(".claude/projects/project")
+            .join(parent)
+            .join("subagents");
+        std::fs::create_dir_all(&logs).unwrap();
+        let file = logs.join("agent-child.jsonl");
+        std::fs::write(&file, format!("{}\n", serde_json::json!({
+            "type":"assistant", "timestamp":"2026-11-10T12:30:00Z", "sessionId":parent,
+            "message":{"id":"msg1", "model":"claude", "usage":{"input_tokens":42,"output_tokens":3}}
+        }))).unwrap();
+        let identity = IdentityMappingDocument {
+            session_id: parent.into(),
+            persona: Some("Felix".into()),
+            parent_id: None,
+            launch_time_ms: None,
+            provenance: "route".into(),
+        };
+        let (sources, _) = discover_usage_sources(home.path());
+        collect_once(&store, &sources, &[identity], ScanLimits::default()).unwrap();
+        let mappings = read_identities(&store).unwrap();
+        assert!(mappings.iter().any(|m| m.session_id == "agent-child"
+            && m.parent_id.as_deref() == Some(parent)
+            && m.launch_time_ms == Some(1794313800000)));
+        let report = fl_watch::usage::aggregate_documents(
+            &read_sources(&store).unwrap(),
+            &mappings,
+            None,
+            &fl_watch::usage::UsageReportQuery {
+                since_ms: 1794312000000,
+                by: fl_watch::usage::UsageGroupBy::Persona,
+            },
+            1794315600000,
+        )
+        .unwrap();
+        let row = report.rows.iter().find(|r| r.key == "Felix").unwrap();
+        assert_eq!(row.input, Some(42));
+        assert_eq!(row.subagents, 1);
+    }
+    #[test]
+    fn deleted_source_clears_prior_source_error() {
+        let (dir, store) = store();
+        let path = dir.path().join("missing");
+        let source = UsageSource {
+            source_id: "deleted".into(),
+            session_id: "s".into(),
+            vendor: UsageVendor::Claude,
+            path,
+        };
+        let ferro = store.as_ferro().unwrap();
+        ferro
+            .put_doc(
+                COLLECTION,
+                &key("source-error", &source.source_id),
+                &serde_json::json!({"kind":"source_error"}),
+            )
+            .unwrap();
+        collect_once(&store, &[source], &[], ScanLimits::default()).unwrap();
+        assert!(
+            ferro
+                .query_by_field(COLLECTION, "kind", "source_error")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn scheduler_skips_unchanged_and_reports_only_unread_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        for i in 0..3 {
+            let line = format!(
+                "{{\"type\":\"assistant\",\"padding\":\"{}\"}}\n",
+                "x".repeat(200)
+            );
+            std::fs::write(projects.join(format!("{i}.jsonl")), line.repeat(8000)).unwrap();
+        }
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut schedule = CollectionScheduler::default();
+        let mut scans = 0;
+        assert!(
+            collect_hub_with_hook(&state, &mut schedule, 1024 * 1024 + 1, || scans += 1).unwrap()
+        );
+        assert_eq!(scans, 1, "byte budget must bound each scan");
+        for _ in 0..20 {
+            if !collect_hub_with_hook(&state, &mut schedule, 1024 * 1024 + 1, || scans += 1)
+                .unwrap()
+            {
+                break;
+            }
+        }
+        let before = scans;
+        assert!(
+            !collect_hub_with_hook(&state, &mut schedule, 1024 * 1024 + 1, || scans += 1).unwrap()
+        );
+        assert_eq!(
+            scans, before,
+            "unchanged files must not be opened to scan again"
+        );
+        let mut restarted = CollectionScheduler::default();
+        assert!(
+            !collect_hub_with_hook(&state, &mut restarted, 1024 * 1024 + 1, || scans += 1).unwrap()
+        );
+        assert_eq!(
+            scans, before,
+            "persisted metadata must also skip unchanged files after restart"
+        );
+        let store = state.open_store().unwrap();
+        let status = store
+            .as_ferro()
+            .unwrap()
+            .get_doc(COLLECTION, "collector-status")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["pending"], false);
+    }
+    #[test]
+    fn previously_scanned_claude_child_gets_parent_without_usage_rescan() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let logs = home
+            .path()
+            .join(".claude/projects/project")
+            .join(parent)
+            .join("subagents");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("agent-child.jsonl"), format!("{}\n", serde_json::json!({"type":"assistant", "timestamp":"2026-11-10T12:30:00Z", "sessionId":parent, "message":{"id":"msg1","usage":{"input_tokens":42}}}))).unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let source = discover_usage_sources(home.path()).0.pop().unwrap();
+        let doc = scan_source(&source, None, ScanLimits::default()).unwrap();
+        {
+            let store = state.open_store().unwrap();
+            store
+                .as_ferro()
+                .unwrap()
+                .put_doc(
+                    COLLECTION,
+                    &key("source", &source.source_id),
+                    &serde_json::json!({"kind":"source", "document":doc}),
+                )
+                .unwrap();
+        }
+        let mut scans = 0;
+        let mut scheduler = CollectionScheduler::default();
+        assert!(
+            !collect_hub_with_hook(&state, &mut scheduler, 32 * 1024 * 1024, || scans += 1)
+                .unwrap()
+        );
+        assert_eq!(scans, 0);
+        {
+            let store = state.open_store().unwrap();
+            assert!(
+                read_identities(&store)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.session_id == "agent-child"
+                        && m.parent_id.as_deref() == Some(parent)
+                        && m.launch_time_ms == Some(1794313800000))
+            );
+        }
+        let mut restarted = CollectionScheduler::default();
+        assert!(
+            !collect_hub_with_hook(&state, &mut restarted, 32 * 1024 * 1024, || scans += 1)
+                .unwrap()
+        );
+        assert_eq!(scans, 0);
+    }
+    #[test]
+    fn legacy_codex_document_is_rebuilt_even_if_file_metadata_is_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".codex/sessions/2026/11/10");
+        std::fs::create_dir_all(&logs).unwrap();
+        let session = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let path = logs.join(format!("rollout-2026-11-10T12-00-00-{session}.jsonl"));
+        std::fs::write(&path, format!("{}\n", serde_json::json!({"type":"event_msg","timestamp":"2026-11-10T12:30:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42,"output_tokens":3}}}}))).unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let source = discover_usage_sources(home.path()).0.pop().unwrap();
+        let mut legacy = scan_source(&source, None, ScanLimits::default()).unwrap();
+        legacy.parser.parser_revision = None;
+        legacy.buckets[0].counts.input = Some(10_000);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .as_ferro()
+                .unwrap()
+                .put_doc(
+                    COLLECTION,
+                    &key("source", &source.source_id),
+                    &serde_json::json!({"kind":"source", "document":legacy}),
+                )
+                .unwrap();
+        }
+        let mut scans = 0;
+        let mut scheduler = CollectionScheduler::default();
+        assert!(
+            !collect_hub_with_hook(&state, &mut scheduler, 32 * 1024 * 1024, || scans += 1)
+                .unwrap()
+        );
+        assert_eq!(scans, 1);
+        let store = state.open_store().unwrap();
+        let corrected = read_sources(&store).unwrap();
+        assert_eq!(corrected[0].buckets[0].counts.input, Some(42));
+        assert_eq!(
+            corrected[0].parser.parser_revision,
+            Some(fl_watch::usage::USAGE_PARSER_REVISION)
+        );
+    }
+    #[test]
+    fn identity_evidence_refreshes_no_more_than_once_per_minute() {
+        let home = tempfile::tempdir().unwrap();
+        let route_path = home.path().join(".cache/agent-bus/routes.json");
+        let make_routes = |names: &[&str]| {
+            let mut routes = fl_wire::identity::RouteTable::default();
+            for persona in names {
+                routes.upsert_explicit(
+                    persona,
+                    fl_wire::identity::VendorRoute::Codex {
+                        thread_id: format!("thread-{persona}"),
+                        cwd: None,
+                    },
+                    fl_core::at::At::from_unix_millis(1),
+                );
+            }
+            routes.save(Some(&route_path)).unwrap();
+        };
+        make_routes(&["alice"]);
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut schedule = CollectionScheduler::default();
+        collect_hub(&state, &mut schedule).unwrap();
+        make_routes(&["alice", "bob"]);
+        collect_hub(&state, &mut schedule).unwrap();
+        {
+            let store = state.open_store().unwrap();
+            assert!(
+                !read_identities(&store)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.persona.as_deref() == Some("bob"))
+            );
+        }
+        schedule.last_identity_refresh =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        collect_hub(&state, &mut schedule).unwrap();
+        let store = state.open_store().unwrap();
+        assert!(
+            read_identities(&store)
+                .unwrap()
+                .iter()
+                .any(|m| m.persona.as_deref() == Some("bob"))
+        );
+    }
+    #[test]
+    fn scheduler_prioritizes_recent_source_without_starving_backlog() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        let line = format!(
+            "{{\"type\":\"assistant\",\"padding\":\"{}\"}}\n",
+            "x".repeat(200)
+        );
+        std::fs::write(projects.join("old.jsonl"), line.repeat(8000)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::write(projects.join("new.jsonl"), line.repeat(8000)).unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut schedule = CollectionScheduler::default();
+        assert!(collect_hub_with_hook(&state, &mut schedule, 1024 * 1024 + 1, || {}).unwrap());
+        {
+            let store = state.open_store().unwrap();
+            let docs = read_sources(&store).unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].session_id, "new");
+        }
+        assert!(collect_hub_with_hook(&state, &mut schedule, 1024 * 1024 + 1, || {}).unwrap());
+        let store = state.open_store().unwrap();
+        assert!(
+            read_sources(&store)
+                .unwrap()
+                .iter()
+                .any(|d| d.session_id == "old")
+        );
+    }
+    #[test]
+    fn scheduler_recovers_after_source_panic_and_retries_later() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("a.jsonl"), "{}\n").unwrap();
+        std::fs::write(projects.join("b.jsonl"), "{}\n").unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut schedule = CollectionScheduler::default();
+        let mut calls = 0;
+        assert!(
+            collect_hub_with_hook(&state, &mut schedule, 32 * 1024 * 1024, || {
+                calls += 1;
+                assert_ne!(calls, 1, "simulated poison source");
+            })
+            .unwrap()
+        );
+        assert_eq!(calls, 2, "later source must still be scanned");
+        assert!(!collect_hub(&state, &mut schedule).unwrap());
+        let store = state.open_store().unwrap();
+        assert_eq!(read_sources(&store).unwrap().len(), 2);
+        assert!(
+            store
+                .as_ferro()
+                .unwrap()
+                .query_by_field(COLLECTION, "kind", "source_error")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn scheduler_removes_error_documents_for_disappeared_sources() {
+        let home = tempfile::tempdir().unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        {
+            let store = state.open_store().unwrap();
+            store
+                .as_ferro()
+                .unwrap()
+                .put_doc(
+                    COLLECTION,
+                    &key("source-error", "gone"),
+                    &serde_json::json!({"kind":"source_error"}),
+                )
+                .unwrap();
+        }
+        collect_hub(&state, &mut CollectionScheduler::default()).unwrap();
+        let store = state.open_store().unwrap();
+        assert!(
+            store
+                .as_ferro()
+                .unwrap()
+                .query_by_field(COLLECTION, "kind", "source_error")
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn identical_identity_is_not_written_again() {
@@ -652,7 +1595,7 @@ mod tests {
             home_override: Some(home.path().into()),
             ..Default::default()
         });
-        collect_hub(&state, 0, false).unwrap();
+        collect_hub(&state, &mut CollectionScheduler::default()).unwrap();
         let store = state.open_store().unwrap();
         let mappings = read_identities(&store).unwrap();
         assert_eq!(
@@ -673,13 +1616,18 @@ mod tests {
             ..Default::default()
         });
         let mut scanned = false;
-        collect_hub_with_hook(&state, 0, false, || {
-            scanned = true;
-            assert!(
-                state.store_lock.try_lock().is_ok(),
-                "store lock held while scanning"
-            );
-        })
+        collect_hub_with_hook(
+            &state,
+            &mut CollectionScheduler::default(),
+            32 * 1024 * 1024,
+            || {
+                scanned = true;
+                assert!(
+                    state.store_lock.try_lock().is_ok(),
+                    "store lock held while scanning"
+                );
+            },
+        )
         .unwrap();
         assert!(scanned);
     }
@@ -751,10 +1699,8 @@ mod tests {
             ..Default::default()
         };
         let state = crate::HubState::new(config);
-        let (next, pending) = collect_hub(&state, 0, false).unwrap();
-        assert_eq!(next, 8);
-        let (next, _) = collect_hub(&state, next, pending).unwrap();
-        assert_eq!(next, 0);
+        let mut scheduler = CollectionScheduler::default();
+        assert!(!collect_hub(&state, &mut scheduler).unwrap());
         let store = state.open_store().unwrap();
         assert_eq!(read_sources(&store).unwrap().len(), 9);
         let status = store

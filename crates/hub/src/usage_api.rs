@@ -2,8 +2,14 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use fl_store::AnyStore;
-use fl_watch::usage::{UsageError, UsageGroupBy, UsageReportQuery, aggregate_usage, parse_since};
+#[cfg(test)]
+use fl_watch::usage::aggregate_usage;
+use fl_watch::usage::{
+    UsageError, UsageGroupBy, UsageReportQuery, aggregate_snapshot, parse_since,
+    read_usage_documents,
+};
 use serde_json::json;
 
 use crate::auth::HubAuthority;
@@ -48,16 +54,18 @@ pub(crate) fn route(
         Ok(query) => query,
         Err(err) => return Some(HttpResponse::json(400, json!({"error": err.to_string()}))),
     };
-    let store = match state.open_store() {
-        Ok(store) => store,
-        Err(_) => {
-            return Some(HttpResponse::json(
-                503,
-                json!({"error": "usage store unavailable"}),
-            ));
-        }
-    };
-    Some(read_report(&store, &query, now))
+    Some(report_response(snapshot_for_hub(state).and_then(
+        |snapshot| aggregate_snapshot(snapshot, &query, now),
+    )))
+}
+
+fn snapshot_for_hub(
+    state: &HubState,
+) -> Result<fl_watch::usage::UsageDocumentSnapshot, UsageError> {
+    let store = state
+        .open_store()
+        .map_err(|e| UsageError::Store(e.to_string()))?;
+    read_usage_documents(&store)
 }
 
 fn validate(req: &HttpRequest, now: u64) -> Result<UsageReportQuery, UsageError> {
@@ -86,8 +94,13 @@ fn validate(req: &HttpRequest, now: u64) -> Result<UsageReportQuery, UsageError>
     Ok(UsageReportQuery { since_ms, by })
 }
 
+#[cfg(test)]
 fn read_report(store: &AnyStore, query: &UsageReportQuery, now: u64) -> HttpResponse {
-    match aggregate_usage(store, query, now) {
+    report_response(aggregate_usage(store, query, now))
+}
+
+fn report_response(report: Result<fl_watch::usage::UsageReport, UsageError>) -> HttpResponse {
+    match report {
         Ok(report) => HttpResponse::json(200, json!(report)),
         Err(UsageError::Invalid(message)) => HttpResponse::json(400, json!({"error": message})),
         Err(UsageError::Unsupported) => HttpResponse::json(
@@ -145,7 +158,7 @@ mod tests {
             )
             .unwrap();
             let initial = aggregate_usage(&store, &query, now).unwrap();
-            assert_eq!(initial.rows[0].key, "unattributed");
+            assert_eq!(initial.rows[0].key, "[unattributed]");
             assert_eq!(initial.rows[0].input, Some(42));
         }
         {
@@ -181,6 +194,25 @@ mod tests {
         }
     }
     #[test]
+    fn snapshot_releases_hub_guard_before_aggregation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = HubState::new(crate::HubServerConfig {
+            store_path: tmp.path().join("test.fls"),
+            ..Default::default()
+        });
+        let snapshot = snapshot_for_hub(&state).unwrap();
+        let guard = state
+            .store_lock
+            .try_lock()
+            .expect("snapshot released store guard");
+        let query = UsageReportQuery {
+            since_ms: 1,
+            by: UsageGroupBy::Persona,
+        };
+        assert!(aggregate_snapshot(snapshot, &query, 3_600_001).is_ok());
+        drop(guard);
+    }
+    #[test]
     fn same_store_and_clock_produce_identical_json() {
         let store = AnyStore::in_memory();
         let query = UsageReportQuery {
@@ -193,16 +225,54 @@ mod tests {
         assert_eq!(first.body, second.body);
     }
     #[test]
-    fn malformed_document_is_service_unavailable() {
+    fn malformed_documents_keep_healthy_usage_and_mark_incomplete() {
+        use crate::usage::collector::collect_once;
+        use crate::usage::scan::{ScanLimits, UsageSource};
+        use fl_watch::usage::UsageVendor;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-08T00:30:00Z\",\"input_tokens\":42}\n").unwrap();
+        let store = AnyStore::in_memory();
+        let source = UsageSource {
+            path,
+            source_id: "healthy".into(),
+            session_id: "healthy".into(),
+            vendor: UsageVendor::Antigravity,
+        };
+        collect_once(&store, &[source], &[], ScanLimits::default()).unwrap();
+        let ferro = store.as_ferro().unwrap();
+        ferro
+            .put_doc(
+                "watch_usage_v1",
+                "bad-source",
+                &json!({"kind":"source", "document":{}}),
+            )
+            .unwrap();
+        ferro
+            .put_doc(
+                "watch_usage_v1",
+                "bad-identity",
+                &json!({"kind":"identity", "document":{}}),
+            )
+            .unwrap();
+        let query = UsageReportQuery {
+            since_ms: 1_794_096_000_000,
+            by: UsageGroupBy::Vendor,
+        };
+        let response = read_report(&store, &query, 1_794_099_600_000);
+        assert_eq!(response.status, 200);
+        let body = response.json_value().unwrap();
+        assert_eq!(body["rows"][0]["key"], "antigravity");
+        assert_eq!(body["rows"][0]["input"], 42);
+        assert_eq!(body["coverage"]["incomplete"], true);
+    }
+    #[test]
+    fn malformed_status_still_returns_service_unavailable() {
         let store = AnyStore::in_memory();
         store
             .as_ferro()
             .unwrap()
-            .put_doc(
-                "watch_usage_v1",
-                "bad",
-                &json!({"kind":"source", "document":{}}),
-            )
+            .put_doc("watch_usage_v1", "collector-status", &json!({"bad":true}))
             .unwrap();
         let query = UsageReportQuery {
             since_ms: 1,

@@ -58,6 +58,14 @@ fn unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     }
     true
 }
+fn record_observation(doc: &mut SourceUsageDocument, meta: &std::fs::Metadata) {
+    doc.parser.observed_len = Some(meta.len());
+    doc.parser.observed_mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64);
+}
 fn anchor(file: &mut std::fs::File, offset: u64) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Seek, SeekFrom};
@@ -211,6 +219,12 @@ fn scan_source_with_hook(
     }
     let mut file = std::fs::File::open(&source.path)?;
     let meta = file.metadata()?;
+    // Documents written before the corrected parsers and scanner can contain
+    // inflated, missing, or spuriously incomplete data. Rebuild from byte zero;
+    // the collector atomically commits the replacement only after a good scan.
+    let previous = current.cloned();
+    let current = current
+        .filter(|doc| doc.parser.parser_revision == Some(fl_watch::usage::USAGE_PARSER_REVISION));
     let mut doc = current.cloned().unwrap_or_else(|| SourceUsageDocument {
         source_id: source.source_id.clone(),
         session_id: source.session_id.clone(),
@@ -224,6 +238,15 @@ fn scan_source_with_hook(
         buckets: Vec::new(),
         coverage: Default::default(),
     });
+    doc.parser.parser_revision = Some(fl_watch::usage::USAGE_PARSER_REVISION);
+    if current.is_none()
+        && let Some(old) = &previous
+        && old.generation > 0
+    {
+        // Retired generations are no longer available for a full rescan.
+        doc.generation = old.generation;
+        doc.coverage.incomplete = true;
+    }
     if source.vendor == UsageVendor::Grok {
         doc.coverage.unavailable = true;
     }
@@ -257,7 +280,7 @@ fn scan_source_with_hook(
         let path_meta = std::fs::metadata(&source.path)?;
         if !unchanged(&meta, &after) || identity(&after) != identity(&path_meta) {
             let mut retry = original;
-            retry.coverage.incomplete = true;
+            retry.coverage.pending = true;
             return Ok(retry);
         }
         match source.vendor {
@@ -271,9 +294,11 @@ fn scan_source_with_hook(
             }
             _ => {}
         }
+        record_observation(&mut doc, &after);
         return Ok(doc);
     }
     let original = doc.clone();
+    let retry_origin = previous.unwrap_or_else(|| original.clone());
     file.seek(SeekFrom::Start(doc.offset))?;
     let mut buffer = Vec::with_capacity(limits.max_batch_bytes.min(1024 * 1024));
     (&mut file)
@@ -307,9 +332,10 @@ fn scan_source_with_hook(
                     match parse_line(source.vendor, &rest[..i], &mut doc.parser) {
                         ParseOutcome::Ignore => {}
                         ParseOutcome::Incomplete => {
-                            doc.coverage.incomplete = true;
                             if source.vendor == UsageVendor::Grok {
                                 doc.coverage.unavailable = true;
+                            } else {
+                                doc.coverage.incomplete = true;
                             }
                         }
                         ParseOutcome::Malformed => {
@@ -355,7 +381,6 @@ fn scan_source_with_hook(
     doc.offset = doc.offset.saturating_add(at as u64);
     doc.coverage.pending = doc.offset < meta.len();
     if doc.offset > 4 * 1024 * 1024 {
-        doc.coverage.incomplete = true;
         doc.coverage.unverified_prefix = true;
     }
     // An in-place rewrite or replacement while reading cannot be paired with
@@ -363,8 +388,8 @@ fn scan_source_with_hook(
     let new_anchor = match anchor(&mut file, doc.offset) {
         Ok(anchor) => anchor,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            let mut retry = original;
-            retry.coverage.incomplete = true;
+            let mut retry = retry_origin;
+            retry.coverage.pending = true;
             return Ok(retry);
         }
         Err(error) => return Err(error.into()),
@@ -372,11 +397,28 @@ fn scan_source_with_hook(
     let after = file.metadata()?;
     let path_meta = std::fs::metadata(&source.path)?;
     if identity(&after) != identity(&path_meta) || !unchanged(&meta, &after) {
-        let mut retry = original;
-        retry.coverage.incomplete = true;
-        return Ok(retry);
+        // A concurrent append is safe only if the prefix and the exact bytes we
+        // parsed remain unchanged. A replacement or rewrite is retried from
+        // the old cursor and inspected again on the next scan.
+        let append_only = identity(&meta) == identity(&after)
+            && identity(&after) == identity(&path_meta)
+            && after.len() > meta.len()
+            && (original.anchor.is_empty()
+                || anchor(&mut file, original.offset).ok().as_deref() == Some(&original.anchor));
+        let mut reread = vec![0; buffer.len()];
+        let same_bytes = append_only
+            && file.seek(SeekFrom::Start(original.offset)).is_ok()
+            && file.read_exact(&mut reread).is_ok()
+            && reread == buffer;
+        if !same_bytes {
+            let mut retry = retry_origin;
+            retry.coverage.pending = true;
+            return Ok(retry);
+        }
+        doc.coverage.pending = true;
     }
     doc.anchor = new_anchor;
+    record_observation(&mut doc, &after);
     Ok(doc)
 }
 
@@ -384,6 +426,40 @@ fn scan_source_with_hook(
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn stale_grok_documents_are_rebuilt_to_clear_routine_incomplete() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{}\n").unwrap();
+        let s = UsageSource {
+            path: f.path().into(),
+            source_id: "grok".into(),
+            session_id: "s".into(),
+            vendor: UsageVendor::Grok,
+        };
+        let mut old = scan_source(&s, None, ScanLimits::default()).unwrap();
+        old.coverage.incomplete = true;
+        old.parser.parser_revision = None;
+        let rebuilt = scan_source(&s, Some(&old), ScanLimits::default()).unwrap();
+        assert!(!rebuilt.coverage.incomplete);
+        assert!(rebuilt.coverage.unavailable);
+    }
+    #[test]
+    fn stale_claude_documents_are_rebuilt_to_clear_routine_incomplete() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"assistant\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":42}}}\n").unwrap();
+        let s = UsageSource {
+            path: f.path().into(),
+            source_id: "claude".into(),
+            session_id: "s".into(),
+            vendor: UsageVendor::Claude,
+        };
+        let mut old = scan_source(&s, None, ScanLimits::default()).unwrap();
+        old.coverage.incomplete = true;
+        old.parser.parser_revision = None;
+        let rebuilt = scan_source(&s, Some(&old), ScanLimits::default()).unwrap();
+        assert!(!rebuilt.coverage.incomplete);
+        assert_eq!(rebuilt.buckets[0].counts.input, Some(42));
+    }
     #[test]
     fn scan_appends_only_complete_lines_and_handles_partial_lines() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -540,15 +616,16 @@ mod tests {
     fn large_prefix_is_explicitly_unverified() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         for _ in 0..1100 {
+            f.write_all(br#"{"type":"OTHER","padding":""#).unwrap();
             f.write_all(&vec![b' '; 4000]).unwrap();
-            f.write_all(b"\n").unwrap();
+            f.write_all(b"\"}\n").unwrap();
         }
         let src = source(f.path());
         let mut doc = scan_source(&src, None, ScanLimits::default()).unwrap();
         while doc.coverage.pending {
             doc = scan_source(&src, Some(&doc), ScanLimits::default()).unwrap();
         }
-        assert!(doc.coverage.incomplete);
+        assert!(!doc.coverage.incomplete);
         assert!(doc.coverage.unverified_prefix);
     }
     #[test]
@@ -609,7 +686,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.buckets, old.buckets);
         assert_eq!(result.offset, old.offset);
-        assert!(result.coverage.incomplete);
+        assert!(result.coverage.pending);
     }
     #[test]
     fn codex_rotation_establishes_new_baseline_before_counting_deltas() {
@@ -645,7 +722,8 @@ mod tests {
         let first = scan_source(&src, None, ScanLimits::default()).unwrap();
         f.write_all(record(1).as_bytes()).unwrap();
         let reset = scan_source(&src, Some(&first), ScanLimits::default()).unwrap();
-        assert!(reset.parser.codex_unsafe);
+        assert!(!reset.parser.codex_unsafe);
+        assert!(reset.coverage.incomplete);
         std::fs::write(f.path(), b"{}\n").unwrap();
         let rotated = scan_source(&src, Some(&reset), ScanLimits::default()).unwrap();
         use std::io::{Seek, SeekFrom};
@@ -678,5 +756,217 @@ mod tests {
         assert_eq!(next.buckets[0].counts.input, Some(30));
         assert!(next.coverage.incomplete);
         assert!(next.coverage.ambiguous_generation);
+    }
+    #[test]
+    fn rv_append_during_scan_is_sticky_incomplete() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"input_tokens\":1}\n")
+            .unwrap();
+        let src = source(f.path());
+        let old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        assert!(!old.coverage.incomplete);
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":2,\"input_tokens\":2}\n")
+            .unwrap();
+        let path = f.path().to_owned();
+        let r = scan_source_with_hook(&src, Some(&old), ScanLimits::default(), || {
+            use std::io::Write as _;
+            let mut a = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            a.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":3,\"input_tokens\":4}\n")
+                .unwrap();
+        })
+        .unwrap();
+        assert!(r.offset > old.offset);
+        let next = scan_source(&src, Some(&r), ScanLimits::default()).unwrap();
+        assert_eq!(next.buckets[0].counts.input, Some(7));
+        assert!(!next.coverage.incomplete);
+    }
+    #[test]
+    fn rv_codex_fork_inherited_snapshot_is_counted() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let tc = |ord: u64, total: u64, last: u64| {
+            format!(
+                "{}\n",
+                serde_json::json!({"ordinal":ord,"timestamp":"2026-11-10T20:45:55Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":total,"cached_input_tokens":0,"output_tokens":0,"cache_write_input_tokens":0},"last_token_usage":{"input_tokens":last}}}})
+            )
+        };
+        f.write_all(b"{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"parent_thread_id\":\"p\",\"subagent_history_start_ordinal\":5}}\n").unwrap();
+        f.write_all(tc(4, 1_556_797, 76_531).as_bytes()).unwrap();
+        f.write_all(tc(15, 1_636_063, 79_266).as_bytes()).unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let doc = scan_source(&src, None, ScanLimits::default()).unwrap();
+        let input: u64 = doc.buckets.iter().filter_map(|b| b.counts.input).sum();
+        assert_eq!(input, 79_266, "child charged with inherited pre-fork total");
+        assert!(!doc.coverage.incomplete);
+        assert!(
+            doc.buckets.iter().all(|b| !b.unavailable.cache_write),
+            "real cache_write_input_tokens ignored"
+        );
+    }
+    #[test]
+    fn raced_legacy_rebuild_retains_old_document_for_retry() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":10}\n")
+            .unwrap();
+        let src = source(f.path());
+        let mut old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        old.parser.parser_revision = None;
+        old.buckets[0].counts.input = Some(99);
+        let path = f.path().to_owned();
+        let candidate = scan_source_with_hook(&src, Some(&old), ScanLimits::default(), || {
+            std::fs::write(
+                path,
+                b"{\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":123456}\n",
+            )
+            .unwrap();
+        })
+        .unwrap();
+        assert_eq!(candidate.buckets, old.buckets);
+        assert_eq!(candidate.parser.parser_revision, None);
+        assert!(candidate.coverage.pending);
+    }
+    #[test]
+    fn rebuilding_rotated_legacy_source_stays_incomplete() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":10}\n")
+            .unwrap();
+        let src = source(f.path());
+        let mut old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        old.parser.parser_revision = None;
+        old.generation = 1;
+        let rebuilt = scan_source(&src, Some(&old), ScanLimits::default()).unwrap();
+        assert!(rebuilt.coverage.incomplete);
+        assert_eq!(rebuilt.generation, 1);
+    }
+    #[test]
+    fn stale_antigravity_document_is_rebuilt_to_recover_lost_rewind_calls() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":27,\"created_at\":\"2026-10-29T13:59:53Z\",\"input_tokens\":10}\n").unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"2026-10-29T16:40:24Z\",\"input_tokens\":20}\n").unwrap();
+        let src = source(f.path());
+        let current = scan_source(&src, None, ScanLimits::default()).unwrap();
+        let mut stale = serde_json::to_value(current).unwrap();
+        stale["parser"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parser_revision");
+        stale["buckets"].as_array_mut().unwrap().truncate(1);
+        let stale: SourceUsageDocument = serde_json::from_value(stale).unwrap();
+        let rebuilt = scan_source(&src, Some(&stale), ScanLimits::default()).unwrap();
+        let total: u64 = rebuilt.buckets.iter().filter_map(|b| b.counts.input).sum();
+        assert_eq!(total, 30);
+    }
+    #[test]
+    fn stale_codex_document_is_rebuilt_from_source_without_old_inflated_totals() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"parent_thread_id\":\"parent\",\"subagent_history_start_ordinal\":5}}\n").unwrap();
+        f.write_all(b"{\"ordinal\":4,\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000}}}}\n").unwrap();
+        f.write_all(b"{\"ordinal\":6,\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1020}}}}\n").unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let current = scan_source(&src, None, ScanLimits::default()).unwrap();
+        let mut stale = serde_json::to_value(current).unwrap();
+        stale["parser"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parser_revision");
+        stale["buckets"][0]["counts"]["input"] = 1020.into();
+        let stale: SourceUsageDocument = serde_json::from_value(stale).unwrap();
+        let rebuilt = scan_source(&src, Some(&stale), ScanLimits::default()).unwrap();
+        assert_eq!(rebuilt.buckets[0].counts.input, Some(20));
+    }
+    #[test]
+    fn codex_fork_tracks_each_copied_snapshot_across_batches() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let rec = |ord, count| {
+            format!(
+                "{}\n",
+                serde_json::json!({"ordinal":ord,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":count}}}})
+            )
+        };
+        f.write_all(b"{\"type\":\"session_meta\",\"payload\":{\"parent_thread_id\":\"parent\",\"subagent_history_start_ordinal\":5}}\n").unwrap();
+        f.write_all(rec(1, 100).as_bytes()).unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let first = scan_source(&src, None, ScanLimits::default()).unwrap();
+        assert!(first.buckets.is_empty());
+        f.write_all(rec(4, 200).as_bytes()).unwrap();
+        f.write_all(rec(6, 225).as_bytes()).unwrap();
+        let second = scan_source(&src, Some(&first), ScanLimits::default()).unwrap();
+        assert_eq!(second.buckets[0].counts.input, Some(25));
+        assert!(!second.coverage.incomplete);
+    }
+    #[test]
+    fn fork_without_copied_baseline_never_charges_inherited_total() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let rec = |ord, count| {
+            format!(
+                "{}\n",
+                serde_json::json!({"ordinal":ord,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":count}}}})
+            )
+        };
+        f.write_all(b"{\"type\":\"session_meta\",\"payload\":{\"parent_thread_id\":\"parent\",\"subagent_history_start_ordinal\":5}}\n").unwrap();
+        f.write_all(rec(6, 1000).as_bytes()).unwrap();
+        f.write_all(rec(7, 1005).as_bytes()).unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let doc = scan_source(&src, None, ScanLimits::default()).unwrap();
+        assert!(doc.coverage.incomplete);
+        assert_eq!(doc.buckets[0].counts.input, Some(5));
+    }
+    #[test]
+    fn rv_codex_reset_stops_counting_forever() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let tc = |total: u64| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":total}}}})
+            )
+        };
+        for t in [20, 1, 50, 900] {
+            f.write_all(tc(t).as_bytes()).unwrap();
+        }
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let doc = scan_source(&src, None, ScanLimits::default()).unwrap();
+        assert_eq!(
+            doc.buckets[0].counts.input,
+            Some(919),
+            "post-reset usage (899) dropped"
+        );
+    }
+    #[test]
+    fn older_planner_record_is_not_counted_even_with_higher_step() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":2,\"created_at\":\"2026-10-29T16:40:32Z\",\"input_tokens\":10}\n").unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"step_index\":3,\"created_at\":\"2026-10-29T16:40:24Z\",\"input_tokens\":1000}\n").unwrap();
+        let doc = scan_source(&source(f.path()), None, ScanLimits::default()).unwrap();
+        assert_eq!(doc.buckets[0].counts.input, Some(10));
+        assert!(doc.coverage.incomplete);
+    }
+    #[test]
+    fn rv_agy_step_reset_drops_new_calls() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let p = |step: u64, ts: &str, n: u64| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"PLANNER_RESPONSE","step_index":step,"created_at":ts,"input_tokens":n})
+            )
+        };
+        f.write_all(p(25, "2026-10-29T13:59:35Z", 1).as_bytes())
+            .unwrap();
+        f.write_all(p(27, "2026-10-29T13:59:53Z", 1).as_bytes())
+            .unwrap();
+        f.write_all(b"{\"type\":\"SYSTEM_MESSAGE\",\"step_index\":1,\"created_at\":\"2026-10-29T16:40:24Z\"}\n").unwrap();
+        f.write_all(p(2, "2026-10-29T16:40:24Z", 1000).as_bytes())
+            .unwrap();
+        f.write_all(p(4, "2026-10-29T16:40:32Z", 1000).as_bytes())
+            .unwrap();
+        let doc = scan_source(&source(f.path()), None, ScanLimits::default()).unwrap();
+        let input: u64 = doc.buckets.iter().filter_map(|b| b.counts.input).sum();
+        assert_eq!(input, 2002, "later distinct calls dropped");
     }
 }

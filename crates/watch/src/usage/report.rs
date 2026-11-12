@@ -57,6 +57,10 @@ pub struct ReportCoverage {
     pub incomplete: bool,
     pub pending: bool,
     pub unavailable_sources: u64,
+    #[serde(default)]
+    pub unverified_prefix_sources: u64,
+    #[serde(default)]
+    pub stale_parser_sources: u64,
     pub malformed_lines: u64,
     pub oversized_lines: u64,
     pub last_success_ms: Option<u64>,
@@ -316,9 +320,10 @@ pub fn aggregate_documents(
     let mut undated = Accum::default();
     undated.row.key = "undated".into();
     for source in sources {
-        coverage.incomplete |= source.coverage.incomplete
-            || source.coverage.ambiguous_generation
-            || source.coverage.unverified_prefix;
+        coverage.incomplete |= source.coverage.incomplete || source.coverage.ambiguous_generation;
+        coverage.unverified_prefix_sources = coverage
+            .unverified_prefix_sources
+            .saturating_add(u64::from(source.coverage.unverified_prefix));
         coverage.pending |= source.coverage.pending;
         coverage.unavailable_sources = coverage
             .unavailable_sources
@@ -335,9 +340,17 @@ pub fn aggregate_documents(
             Attribution::Ambiguous => coverage.ambiguous_sources += 1,
             _ => (),
         }
+        // Older documents can contain inflated, omitted, or misleadingly marked
+        // counts. Exclude them until a safe rebuild, including deleted sources.
+        if source.parser.parser_revision != Some(super::USAGE_PARSER_REVISION) {
+            coverage.incomplete = true;
+            coverage.stale_parser_sources = coverage.stale_parser_sources.saturating_add(1);
+            continue;
+        }
         let persona = match attribution {
             Attribution::Persona(p) => p,
-            _ => "unattributed".into(),
+            Attribution::Unattributed => "[unattributed]".into(),
+            Attribution::Ambiguous => "[ambiguous]".into(),
         };
         let vendor = match source.vendor {
             super::UsageVendor::Antigravity => "antigravity",
@@ -346,7 +359,13 @@ pub fn aggregate_documents(
             super::UsageVendor::Muse => "muse",
             super::UsageVendor::Grok => "grok",
         };
-        if source.coverage.unavailable && source.buckets.is_empty() {
+        if source.coverage.unavailable
+            && source.buckets.is_empty()
+            && source.parser.observed_mtime_ns.is_some_and(|ns| {
+                let ms = ns / 1_000_000;
+                ms >= start && ms < end
+            })
+        {
             let key = match query.by {
                 UsageGroupBy::Persona => persona.clone(),
                 UsageGroupBy::Vendor => vendor.into(),
@@ -408,7 +427,8 @@ pub fn aggregate_documents(
         let key = match query.by {
             UsageGroupBy::Persona => match index.resolve(child) {
                 Attribution::Persona(p) => p,
-                _ => "unattributed".into(),
+                Attribution::Unattributed => "[unattributed]".into(),
+                Attribution::Ambiguous => "[ambiguous]".into(),
             },
             UsageGroupBy::Vendor => {
                 // Only the collector's structured launch mapping is vendor evidence;
@@ -464,11 +484,13 @@ pub fn format_time(ms: u64) -> String {
     fl_core::at::At::from_unix_millis(ms).as_str().to_owned()
 }
 
-pub fn aggregate_usage(
-    store: &AnyStore,
-    query: &UsageReportQuery,
-    now_ms: u64,
-) -> Result<UsageReport, UsageError> {
+/// Serialized document snapshot. Gathering is the only phase requiring the hub store guard.
+pub struct UsageDocumentSnapshot {
+    sources: Vec<serde_json::Value>,
+    identities: Vec<serde_json::Value>,
+    status: Option<serde_json::Value>,
+}
+pub fn read_usage_documents(store: &AnyStore) -> Result<UsageDocumentSnapshot, UsageError> {
     let ferro = store.as_ferro().ok_or(UsageError::Unsupported)?;
     let read = |kind: &str| -> Result<Vec<serde_json::Value>, UsageError> {
         let ids = ferro
@@ -485,23 +507,61 @@ pub fn aggregate_usage(
         }
         Ok(values)
     };
-    let sources = read("source")?
+    Ok(UsageDocumentSnapshot {
+        sources: read("source")?,
+        identities: read("identity")?,
+        status: ferro
+            .get_doc(COLLECTION, "collector-status")
+            .map_err(|e| UsageError::Store(e.to_string()))?,
+    })
+}
+pub fn aggregate_snapshot(
+    snapshot: UsageDocumentSnapshot,
+    query: &UsageReportQuery,
+    now_ms: u64,
+) -> Result<UsageReport, UsageError> {
+    let mut invalid_documents = false;
+    let sources = snapshot
+        .sources
         .into_iter()
-        .map(serde_json::from_value)
-        .collect::<Result<Vec<SourceUsageDocument>, _>>()
-        .map_err(|e| UsageError::Store(e.to_string()))?;
-    let identities = read("identity")?
+        .filter_map(
+            |value| match serde_json::from_value::<SourceUsageDocument>(value) {
+                Ok(source) => Some(source),
+                Err(_) => {
+                    invalid_documents = true;
+                    None
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let identities = snapshot
+        .identities
         .into_iter()
-        .map(serde_json::from_value)
-        .collect::<Result<Vec<IdentityMappingDocument>, _>>()
-        .map_err(|e| UsageError::Store(e.to_string()))?;
-    let status = ferro
-        .get_doc(COLLECTION, "collector-status")
-        .map_err(|e| UsageError::Store(e.to_string()))?
+        .filter_map(
+            |value| match serde_json::from_value::<IdentityMappingDocument>(value) {
+                Ok(identity) => Some(identity),
+                Err(_) => {
+                    invalid_documents = true;
+                    None
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let status = snapshot
+        .status
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| UsageError::Store(e.to_string()))?;
-    aggregate_documents(&sources, &identities, status, query, now_ms)
+    let mut report = aggregate_documents(&sources, &identities, status, query, now_ms)?;
+    report.coverage.incomplete |= invalid_documents;
+    Ok(report)
+}
+pub fn aggregate_usage(
+    store: &AnyStore,
+    query: &UsageReportQuery,
+    now_ms: u64,
+) -> Result<UsageReport, UsageError> {
+    aggregate_snapshot(read_usage_documents(store)?, query, now_ms)
 }
 
 #[cfg(test)]
@@ -550,5 +610,176 @@ mod indexed_attribution_tests {
                 "{id}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use crate::usage::{CategoryUnavailable, TokenCounts, UsageCoverage, UsageVendor};
+    fn source(id: &str, vendor: UsageVendor) -> SourceUsageDocument {
+        SourceUsageDocument {
+            source_id: id.into(),
+            session_id: id.into(),
+            vendor,
+            offset: 0,
+            generation: 0,
+            file_identity: None,
+            anchor: String::new(),
+            discarding_line: false,
+            parser: super::super::ParserState {
+                parser_revision: Some(super::super::USAGE_PARSER_REVISION),
+                ..Default::default()
+            },
+            buckets: vec![UsageBucket {
+                model: None,
+                hour_ms: Some(3_600_000),
+                counts: TokenCounts {
+                    input: Some(10),
+                    ..Default::default()
+                },
+                turns: 0,
+                turns_unavailable: true,
+                unavailable: CategoryUnavailable::default(),
+                missing: Default::default(),
+                observations: 1,
+            }],
+            coverage: UsageCoverage::default(),
+        }
+    }
+    fn map(id: &str, persona: &str) -> IdentityMappingDocument {
+        IdentityMappingDocument {
+            session_id: id.into(),
+            persona: Some(persona.into()),
+            parent_id: None,
+            launch_time_ms: None,
+            provenance: "test".into(),
+        }
+    }
+    #[test]
+    fn malformed_source_or_identity_is_skipped_with_incomplete_coverage() {
+        for kind in ["source", "identity"] {
+            let good = serde_json::to_value(source("healthy", UsageVendor::Claude)).unwrap();
+            let bad = serde_json::json!({"unexpected":true});
+            let snapshot = UsageDocumentSnapshot {
+                sources: if kind == "source" {
+                    vec![good.clone(), bad.clone()]
+                } else {
+                    vec![good]
+                },
+                identities: if kind == "identity" {
+                    vec![bad]
+                } else {
+                    vec![]
+                },
+                status: None,
+            };
+            let report = aggregate_snapshot(
+                snapshot,
+                &UsageReportQuery {
+                    since_ms: 1,
+                    by: UsageGroupBy::Vendor,
+                },
+                7_200_000,
+            )
+            .unwrap();
+            assert_eq!(report.rows[0].input, Some(10));
+            assert!(report.coverage.incomplete, "{kind}");
+        }
+    }
+    #[test]
+    fn ambiguous_unattributed_and_persona_are_separate() {
+        let sources = [
+            source("x", UsageVendor::Claude),
+            source("y", UsageVendor::Claude),
+            source("z", UsageVendor::Claude),
+        ];
+        let identities = [map("x", "A"), map("x", "B"), map("z", "unattributed")];
+        let result = aggregate_documents(
+            &sources,
+            &identities,
+            Some(CollectorStatus::default()),
+            &UsageReportQuery {
+                since_ms: 1,
+                by: UsageGroupBy::Persona,
+            },
+            7_200_000,
+        )
+        .unwrap();
+        assert_eq!(result.rows.len(), 3, "{:?}", result.rows);
+        assert!(result.rows.iter().any(|r| r.key == "[ambiguous]"));
+        assert!(result.rows.iter().any(|r| r.key == "[unattributed]"));
+        assert!(result.rows.iter().any(|r| r.key == "unattributed"));
+    }
+    #[test]
+    fn unverified_prefix_is_disclosed_separately() {
+        let mut src = source("x", UsageVendor::Claude);
+        src.coverage.unverified_prefix = true;
+        let result = aggregate_documents(
+            &[src],
+            &[],
+            Some(CollectorStatus::default()),
+            &UsageReportQuery {
+                since_ms: 1,
+                by: UsageGroupBy::Vendor,
+            },
+            7_200_000,
+        )
+        .unwrap();
+        assert!(!result.coverage.incomplete);
+        assert_eq!(
+            serde_json::to_value(result.coverage).unwrap()["unverified_prefix_sources"],
+            1
+        );
+    }
+    #[test]
+    fn legacy_documents_with_inaccurate_vendor_semantics_are_not_reported() {
+        let mut codex = source("deleted-codex", UsageVendor::Codex);
+        let mut antigravity = source("unreadable-agy", UsageVendor::Antigravity);
+        let mut stale_claude = source("deleted-claude", UsageVendor::Claude);
+        let mut stale_muse = source("unreadable-muse", UsageVendor::Muse);
+        codex.parser.parser_revision = None;
+        antigravity.parser.parser_revision = None;
+        stale_claude.parser.parser_revision = None;
+        stale_muse.parser.parser_revision = None;
+        let claude = source("still-valid", UsageVendor::Claude);
+        let result = aggregate_documents(
+            &[codex, antigravity, stale_claude, stale_muse, claude],
+            &[],
+            Some(CollectorStatus::default()),
+            &UsageReportQuery {
+                since_ms: 1,
+                by: UsageGroupBy::Vendor,
+            },
+            7_200_000,
+        )
+        .unwrap();
+        assert!(result.coverage.incomplete);
+        assert_eq!(
+            serde_json::to_value(&result.coverage).unwrap()["stale_parser_sources"],
+            4
+        );
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, "claude");
+        assert_eq!(result.rows[0].input, Some(10));
+    }
+    #[test]
+    fn old_grok_no_data_does_not_mark_current_vendor_row_partial() {
+        let mut grok = source("g", UsageVendor::Grok);
+        grok.buckets.clear();
+        grok.coverage.unavailable = true;
+        grok.parser.observed_mtime_ns = Some(1_000_000_000);
+        let result = aggregate_documents(
+            &[grok],
+            &[],
+            Some(CollectorStatus::default()),
+            &UsageReportQuery {
+                since_ms: 3_600_000,
+                by: UsageGroupBy::Vendor,
+            },
+            7_200_000,
+        )
+        .unwrap();
+        assert!(result.rows.is_empty());
     }
 }

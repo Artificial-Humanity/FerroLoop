@@ -2355,7 +2355,7 @@ export interface WatchUsageReport {
   rows: WatchUsageRow[];
   undated: WatchUsageRow;
   coverage: {
-    incomplete: boolean; pending: boolean; unavailable_sources: number;
+    incomplete: boolean; pending: boolean; unavailable_sources: number; unverified_prefix_sources?: number; stale_parser_sources?: number;
     malformed_lines: number; oversized_lines: number; last_success_ms: number | null;
     unattributed_sources: number; ambiguous_sources: number; unknown_launch_times: number;
     undated_observations: number;

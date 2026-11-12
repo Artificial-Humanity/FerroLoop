@@ -271,19 +271,29 @@ impl HubServer {
         let usage_state = state.clone();
         let mut usage_stop = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut next = 0;
-            let mut pending = false;
+            let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::usage::collector::CollectionScheduler::default(),
+            ));
             loop {
                 let work = usage_state.clone();
-                if let Ok(Ok((position, accumulated))) = tokio::task::spawn_blocking(move || {
-                    crate::usage::collector::collect_hub(&work, next, pending)
+                let collector = scheduler.clone();
+                let pending = match tokio::task::spawn_blocking(move || {
+                    let mut schedule = collector.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::usage::collector::collect_hub(&work, &mut schedule)
                 })
                 .await
                 {
-                    next = position;
-                    pending = accumulated;
-                }
-                let delay = if next == 0 && !pending { 30 } else { 5 };
+                    Ok(Ok(pending)) => pending,
+                    Ok(Err(error)) => {
+                        eprintln!("usage collector failed: {error}");
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("usage collector task failed: {error}");
+                        true
+                    }
+                };
+                let delay = if pending { 1 } else { 30 };
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
                     _ = usage_stop.wait_for(|down| *down) => break,

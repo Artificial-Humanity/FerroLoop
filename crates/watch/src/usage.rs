@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 mod report;
 pub use report::*;
 
+pub const USAGE_PARSER_REVISION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageVendor {
@@ -65,25 +67,140 @@ pub struct AntigravityLaunch {
     pub launch_time_ms: u64,
 }
 
+// Filters were originally persisted as arrays of JSON numbers. Keep reading
+// those documents while encoding new writes as compact base64 little-endian words.
+mod compact_filter {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    pub fn serialize<S: Serializer>(words: &[u64], serializer: S) -> Result<S::Ok, S::Error> {
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            encoded.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+            encoded.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+            encoded.push(if chunk.len() > 1 {
+                ALPHABET[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                ALPHABET[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        encoded.serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Encoded {
+            Compact(String),
+            Legacy(Vec<u64>),
+        }
+        let words = match Encoded::deserialize(deserializer)? {
+            Encoded::Legacy(words) => words,
+            Encoded::Compact(encoded) => {
+                if encoded.len() > 87_384 || encoded.len() % 4 != 0 {
+                    return Err(D::Error::custom("invalid usage filter length"));
+                }
+                let decode = |c: u8| ALPHABET.iter().position(|x| *x == c).map(|x| x as u32);
+                let mut bytes = Vec::with_capacity(encoded.len() / 4 * 3);
+                let chunks = encoded.as_bytes().as_chunks::<4>().0;
+                let count = chunks.len();
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let a = decode(chunk[0])
+                        .ok_or_else(|| D::Error::custom("invalid usage filter encoding"))?;
+                    let b = decode(chunk[1])
+                        .ok_or_else(|| D::Error::custom("invalid usage filter encoding"))?;
+                    let pad2 = chunk[2] == b'=';
+                    let pad3 = chunk[3] == b'=';
+                    if (pad2 && !pad3) || ((pad2 || pad3) && i + 1 != count) {
+                        return Err(D::Error::custom("invalid usage filter padding"));
+                    }
+                    let c = if pad2 {
+                        0
+                    } else {
+                        decode(chunk[2])
+                            .ok_or_else(|| D::Error::custom("invalid usage filter encoding"))?
+                    };
+                    let d = if pad3 {
+                        0
+                    } else {
+                        decode(chunk[3])
+                            .ok_or_else(|| D::Error::custom("invalid usage filter encoding"))?
+                    };
+                    if (pad2 && b & 15 != 0) || (pad3 && !pad2 && c & 3 != 0) {
+                        return Err(D::Error::custom("invalid usage filter padding"));
+                    }
+                    let n = (a << 18) | (b << 12) | (c << 6) | d;
+                    bytes.push((n >> 16) as u8);
+                    if !pad2 {
+                        bytes.push((n >> 8) as u8);
+                    }
+                    if !pad3 {
+                        bytes.push(n as u8);
+                    }
+                }
+                if bytes.len() % 8 != 0 {
+                    return Err(D::Error::custom("invalid usage filter length"));
+                }
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u64::from_le_bytes)
+                    .collect()
+            }
+        };
+        if words.len() > 8192 {
+            return Err(D::Error::custom("usage filter too large"));
+        }
+        Ok(words)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParserState {
+    #[serde(default)]
+    pub parser_revision: Option<u32>,
+    #[serde(default)]
+    pub observed_len: Option<u64>,
+    #[serde(default)]
+    pub observed_mtime_ns: Option<u64>,
     pub codex_totals: Option<TokenCounts>,
     pub codex_unsafe: bool,
     #[serde(default)]
     pub codex_baseline_only: bool,
     #[serde(default)]
+    pub codex_fork_start_ordinal: Option<u64>,
+    #[serde(default)]
+    pub codex_fork_unbounded: bool,
+    #[serde(default)]
+    pub codex_parent_id: Option<String>,
+    #[serde(default)]
+    pub codex_launch_time_ms: Option<u64>,
+    #[serde(default)]
+    pub codex_fork_baseline_seen: bool,
+    #[serde(default)]
     pub codex_model_changed: bool,
     #[serde(default)]
     pub antigravity_last_step: Option<u64>,
     #[serde(default)]
-    pub antigravity_unsafe: bool,
+    pub antigravity_last_planner_ms: Option<u64>,
     #[serde(default)]
+    pub antigravity_unsafe: bool,
+    #[serde(default, with = "compact_filter")]
     pub antigravity_seen: Vec<u64>,
     #[serde(default)]
     pub antigravity_parents: Vec<String>,
     #[serde(default)]
     pub antigravity_launches: Vec<AntigravityLaunch>,
-    #[serde(default)]
+    #[serde(default, with = "compact_filter")]
     pub claude_seen: Vec<u64>,
     pub model: Option<String>,
     pub claude_recent: Vec<ClaudeBaseline>,
@@ -231,7 +348,10 @@ mod report_tests {
             file_identity: None,
             anchor: String::new(),
             discarding_line: false,
-            parser: Default::default(),
+            parser: ParserState {
+                parser_revision: Some(USAGE_PARSER_REVISION),
+                ..Default::default()
+            },
             coverage: Default::default(),
             buckets: vec![UsageBucket {
                 model: Some("m".into()),
@@ -303,7 +423,7 @@ mod report_tests {
             no_mapping
                 .rows
                 .iter()
-                .find(|r| r.key == "unattributed")
+                .find(|r| r.key == "[unattributed]")
                 .unwrap()
                 .input,
             Some(10)
@@ -418,7 +538,11 @@ mod store_report_tests {
             file_identity: None,
             anchor: String::new(),
             discarding_line: false,
-            parser: Default::default(),
+            parser: ParserState {
+                parser_revision: Some(USAGE_PARSER_REVISION),
+                observed_mtime_ns: Some(150_000_000),
+                ..Default::default()
+            },
             buckets: vec![],
             coverage: UsageCoverage {
                 unavailable: true,
@@ -490,7 +614,10 @@ mod partial_report_tests {
             file_identity: None,
             anchor: String::new(),
             discarding_line: false,
-            parser: Default::default(),
+            parser: ParserState {
+                parser_revision: Some(USAGE_PARSER_REVISION),
+                ..Default::default()
+            },
             coverage: Default::default(),
             buckets: vec![UsageBucket {
                 model: None,

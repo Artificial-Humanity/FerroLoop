@@ -3,7 +3,7 @@
 //! Every report comes from `fl-watch`; this module only resolves arguments, supplies the clock,
 //! this host's name and the pid probe, and renders the result.
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use fl_core::ids::ProjectId;
 use fl_core::telemetry::DEFAULT_STALE_AFTER_MS;
 use fl_store::AnyStore;
@@ -21,6 +21,22 @@ const QUOTA_NOTE: &str = "The CLI has no live vendor quota source: its quota ale
 from `watch-quota-*` workspace runtime entries in the store (no fl component writes them today). \
 The hub's /api/v1/watch/summary and /api/v1/watch/alerts add the quota of its discovered sessions.";
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum UsageBy {
+    Persona,
+    Vendor,
+    Model,
+}
+impl From<UsageBy> for fl_watch::usage::UsageGroupBy {
+    fn from(value: UsageBy) -> Self {
+        match value {
+            UsageBy::Persona => Self::Persona,
+            UsageBy::Vendor => Self::Vendor,
+            UsageBy::Model => Self::Model,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum WatchCmd {
     /// Token usage collected by the hub, grouped by persona, vendor, or model.
@@ -29,8 +45,8 @@ pub enum WatchCmd {
         #[arg(long, default_value = "24h")]
         since: String,
         /// Group by persona, vendor, or model.
-        #[arg(long, default_value = "persona")]
-        by: String,
+        #[arg(long, value_enum, default_value = "persona")]
+        by: UsageBy,
         #[arg(long)]
         json: bool,
     },
@@ -345,9 +361,7 @@ pub fn run_at(
         WatchCmd::Usage { since, by, json } => {
             use fl_watch::usage::{UsageReportQuery, aggregate_usage, format_time, parse_since};
             let since_ms = parse_since(&since, now_ms).map_err(|e| (1, e.to_string()))?;
-            let by = by
-                .parse()
-                .map_err(|e: fl_watch::usage::UsageError| (1, e.to_string()))?;
+            let by = by.into();
             let report = aggregate_usage(store, &UsageReportQuery { since_ms, by }, now_ms)
                 .map_err(|e| (1, e.to_string()))?;
             if json {
@@ -380,6 +394,18 @@ pub fn run_at(
                         .last_success_ms
                         .map_or_else(|| "unknown".into(), format_time)
                 );
+                println!(
+                    "Sources: unattributed: {}, ambiguous: {}, unavailable: {}, unverified prefix: {}, awaiting reprocessing: {}",
+                    report.coverage.unattributed_sources,
+                    report.coverage.ambiguous_sources,
+                    report.coverage.unavailable_sources,
+                    report.coverage.unverified_prefix_sources,
+                    report.coverage.stale_parser_sources
+                );
+                println!("Codex input includes cache reads; Claude input excludes cache reads.");
+                if report.rows.is_empty() {
+                    println!("No usage for this period.");
+                }
                 println!("GROUP\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE\tTURNS\tSUBAGENTS");
                 let number = |v: Option<u64>, unavailable: bool| {
                     v.map_or_else(
@@ -407,7 +433,7 @@ pub fn run_at(
                 }
                 if report.coverage.undated_observations > 0 {
                     println!(
-                        "Undated observations: {} (outside the window)",
+                        "Undated observations: {} (not dated; excluded from this window)",
                         report.coverage.undated_observations
                     );
                     let row = &report.undated;

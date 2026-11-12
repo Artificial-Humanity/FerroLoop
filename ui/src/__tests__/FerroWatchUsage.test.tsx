@@ -87,10 +87,14 @@ describe("FerroWatch usage", () => {
   it("shows unavailable-source coverage and both requested and effective boundaries", async () => {
     const sample = report();
     sample.coverage.unavailable_sources = 1;
+    (sample.coverage as typeof sample.coverage & { unverified_prefix_sources: number }).unverified_prefix_sources = 3;
+    sample.coverage.stale_parser_sources = 2;
     sample.coverage.unattributed_sources = 2;
     render(<FerroWatchUsage apiClient={client(vi.fn().mockResolvedValue(sample))} />);
     expect(await screen.findByText(/1 source.*no data/i)).toBeInTheDocument();
     expect(screen.getByText(/2.*unattributed/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 source.*earlier data could not be verified/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 source.*need reprocessing.*excluded/i)).toBeInTheDocument();
     expect(screen.getByText(/requested window: 2026-11-10 00:10 UTC.*2026-11-11 00:10 UTC/i)).toBeInTheDocument();
   });
 
@@ -157,6 +161,57 @@ describe("FerroWatch usage", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("explains vendor input semantics and excludes undated totals from the window", async () => {
+    const sample = report();
+    sample.coverage.undated_observations = 1;
+    render(<FerroWatchUsage apiClient={client(vi.fn().mockResolvedValue(sample))} />);
+    expect(await screen.findByText(/Codex input includes cached tokens.*Claude input does not/i)).toBeInTheDocument();
+    expect(screen.getByText(/undated usage.*excluded from this window/i)).toBeInTheDocument();
+  });
+
+  it("keeps automatic refresh silent while a request is pending", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolve!: (value: WatchUsageReport) => void;
+      const pending = new Promise<WatchUsageReport>((r) => { resolve = r; });
+      const getUsage = vi.fn().mockResolvedValueOnce(report()).mockReturnValue(pending);
+      render(<FerroWatchUsage apiClient={client(getUsage)} />);
+      await act(async () => {});
+      expect(screen.queryByText(/loading usage/i)).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(getUsage).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText(/loading usage/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/showing previous results/i)).not.toBeInTheDocument();
+      await act(async () => { resolve(report()); });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps initial loading visible across a periodic retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = new Promise<WatchUsageReport>(() => {});
+      const getUsage = vi.fn().mockReturnValue(pending);
+      render(<FerroWatchUsage apiClient={client(getUsage)} />);
+      expect(screen.getByText(/loading usage/i)).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(getUsage).toHaveBeenCalledTimes(2);
+      expect(screen.getByText(/loading usage/i)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("places usage beside rollups after live alerts in the all view", async () => {
+    render(<FerroWatchPane authority={{ tier: "owner", login: "owner" }} apiClient={client(vi.fn().mockResolvedValue(report()))} />);
+    const usage = await screen.findByTestId("watch-usage-section");
+    const alerts = screen.getByTestId("watch-alerts-section");
+    const rollups = screen.getByTestId("watch-rollups-section");
+    expect(alerts.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(rollups.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
 });

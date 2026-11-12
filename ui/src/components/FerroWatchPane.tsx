@@ -1757,10 +1757,6 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
           </div>
         )}
 
-        {isOwner && apiClient && typeof apiClient.getWatchUsage === "function" && (sectionFilter === "all" || showRollups) && (
-          <FerroWatchUsage apiClient={apiClient} />
-        )}
-
         {/* 1. Live Alerts Banner / List */}
         {showAlerts && (
           <div
@@ -2873,6 +2869,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 ))}
               </select>
             </div>
+
+            {isOwner && apiClient && typeof apiClient.getWatchUsage === "function" && (
+              <FerroWatchUsage apiClient={apiClient} />
+            )}
 
             {/* Totals Strip */}
             {activeTelemetry && (

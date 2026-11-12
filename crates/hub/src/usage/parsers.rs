@@ -19,10 +19,6 @@ fn identifier(v: Option<&serde_json::Value>) -> Option<String> {
     .then(|| s.to_owned())
 }
 
-fn timestamp(v: Option<&serde_json::Value>) -> Option<u64> {
-    v.and_then(crate::discovery::parse_timestamp_value_ms)
-        .map(|t| t / 3_600_000 * 3_600_000)
-}
 fn token(v: &serde_json::Value, key: &str) -> Option<u64> {
     v.get(key).and_then(serde_json::Value::as_u64)
 }
@@ -102,10 +98,13 @@ fn seen_before(bits: &mut Vec<u64>, key: &[u8]) -> bool {
     if bits.is_empty() {
         bits.resize(WORDS, 0);
     }
+    // Existing persisted filters may have a different length. Keep their
+    // original modulus so every previously set bit remains meaningful.
+    let bit_count = bits.len() * 64;
     let digest = Sha256::digest(key);
     let mut was_seen = true;
     for chunk in digest.as_chunks::<8>().0 {
-        let n = u64::from_le_bytes(*chunk) as usize % (WORDS * 64);
+        let n = u64::from_le_bytes(*chunk) as usize % bit_count;
         let mask = 1u64 << (n % 64);
         was_seen &= bits[n / 64] & mask != 0;
         bits[n / 64] |= mask;
@@ -121,11 +120,13 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
     if vendor == UsageVendor::Grok {
         return ParseOutcome::Incomplete;
     }
-    let hour = timestamp(
-        v.get("timestamp")
-            .or_else(|| v.get("created_at"))
-            .or_else(|| v.get("recorded_at")),
-    );
+    let event_time = ["timestamp", "created_at", "recorded_at"]
+        .into_iter()
+        .find_map(|key| {
+            v.get(key)
+                .and_then(crate::discovery::parse_timestamp_value_ms)
+        });
+    let hour = event_time.map(|t| t / 3_600_000 * 3_600_000);
     let kind = v.get("type").and_then(Value::as_str);
     match vendor {
         UsageVendor::Antigravity => {
@@ -180,6 +181,17 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                     state.antigravity_parents.push(id);
                 }
             }
+            if kind == Some("PLANNER_RESPONSE")
+                && matches!((event_time, state.antigravity_last_planner_ms),
+                    (Some(current), Some(previous)) if current <= previous)
+            {
+                return ParseOutcome::Incomplete;
+            }
+            let newer_than_planner = matches!((event_time, state.antigravity_last_planner_ms),
+                (Some(current), Some(previous)) if current > previous);
+            if state.antigravity_unsafe && newer_than_planner {
+                state.antigravity_unsafe = false;
+            }
             if state.antigravity_unsafe {
                 match (
                     v.get("step_index").and_then(Value::as_u64),
@@ -196,6 +208,7 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                     && (step < prev
                         || (step <= 1 && step <= prev)
                         || (kind == Some("PLANNER_RESPONSE") && step == prev))
+                    && !newer_than_planner
                 {
                     state.antigravity_unsafe = true;
                     return ParseOutcome::Incomplete;
@@ -248,9 +261,32 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
             if seen_before(&mut state.antigravity_seen, &digest) {
                 return ParseOutcome::Incomplete;
             }
+            if let Some(event_time) = event_time {
+                state.antigravity_last_planner_ms = Some(event_time);
+            }
             ParseOutcome::Observation(bucket(identifier(v.get("model")), hour, c, 0))
         }
         UsageVendor::Codex => {
+            if kind == Some("session_meta") {
+                if let Some(parent) = v
+                    .pointer("/payload/parent_thread_id")
+                    .and_then(Value::as_str)
+                {
+                    state.codex_parent_id =
+                        uuid::Uuid::parse_str(parent).ok().map(|id| id.to_string());
+                    state.codex_launch_time_ms = v
+                        .pointer("/payload/timestamp")
+                        .and_then(crate::discovery::parse_timestamp_value_ms);
+                    state.codex_fork_start_ordinal = v
+                        .pointer("/payload/subagent_history_start_ordinal")
+                        .and_then(Value::as_u64);
+                    state.codex_fork_unbounded = state.codex_fork_start_ordinal.is_none();
+                    if state.codex_fork_unbounded {
+                        return ParseOutcome::Incomplete;
+                    }
+                }
+                return ParseOutcome::Ignore;
+            }
             if kind == Some("turn_context") {
                 let model = identifier(v.pointer("/payload/model"));
                 if state.codex_totals.is_some() && state.model != model {
@@ -275,8 +311,30 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                 "input_tokens",
                 "output_tokens",
                 "cached_input_tokens",
-                "cache_creation_input_tokens",
+                "cache_write_input_tokens",
             );
+            if state.codex_fork_unbounded {
+                return ParseOutcome::Incomplete;
+            }
+            if let Some(start) = state.codex_fork_start_ordinal {
+                match v.get("ordinal").and_then(Value::as_u64) {
+                    Some(ordinal) if ordinal < start => {
+                        state.codex_totals = Some(c);
+                        state.codex_fork_baseline_seen = true;
+                        return ParseOutcome::Ignore;
+                    }
+                    Some(_) if !state.codex_fork_baseline_seen => {
+                        state.codex_totals = Some(c);
+                        state.codex_fork_baseline_seen = true;
+                        return ParseOutcome::Incomplete;
+                    }
+                    None => {
+                        state.codex_totals = Some(c);
+                        return ParseOutcome::Incomplete;
+                    }
+                    Some(_) => {}
+                }
+            }
             if state.codex_baseline_only {
                 state.codex_totals = Some(c);
                 state.codex_baseline_only = false;
@@ -284,11 +342,16 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                 return ParseOutcome::Incomplete;
             }
             if state.codex_unsafe {
+                // Older documents could be left unsafe indefinitely after a
+                // counter reset. Establish one conservative baseline and resume.
+                state.codex_totals = Some(c);
+                state.codex_unsafe = false;
                 return ParseOutcome::Incomplete;
             }
             let delta = if let Some(previous) = &state.codex_totals {
                 let Some(delta) = difference(&c, previous) else {
-                    state.codex_unsafe = true;
+                    state.codex_totals = Some(c);
+                    state.codex_unsafe = false;
                     return ParseOutcome::Incomplete;
                 };
                 delta
@@ -395,6 +458,79 @@ mod tests {
         } else {
             panic!("expected observation: {outcome:?}")
         }
+    }
+    #[test]
+    fn codex_fork_without_boundary_never_counts_ambiguous_snapshots() {
+        let mut state = ParserState::default();
+        let meta = br#"{"type":"session_meta","payload":{"parent_thread_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}"#;
+        assert_eq!(
+            parse_line(UsageVendor::Codex, meta, &mut state),
+            ParseOutcome::Incomplete
+        );
+        for n in [100, 200, 300] {
+            let line=serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":n}}}}).to_string();
+            assert_eq!(
+                parse_line(UsageVendor::Codex, line.as_bytes(), &mut state),
+                ParseOutcome::Incomplete
+            );
+        }
+    }
+    #[test]
+    fn codex_legacy_unsafe_baseline_recovers_without_counting_snapshot() {
+        let mut state = ParserState {
+            codex_unsafe: true,
+            ..Default::default()
+        };
+        let event = |n| {
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":n}}}}).to_string()
+        };
+        assert_eq!(
+            parse_line(UsageVendor::Codex, event(100).as_bytes(), &mut state),
+            ParseOutcome::Incomplete
+        );
+        assert!(!state.codex_unsafe);
+        assert_eq!(
+            observation(parse_line(
+                UsageVendor::Codex,
+                event(105).as_bytes(),
+                &mut state
+            ))
+            .counts
+            .input,
+            Some(5)
+        );
+    }
+    #[test]
+    fn new_replay_filters_are_bounded_and_legacy_filters_keep_their_membership() {
+        let mut new_filter = Vec::new();
+        assert!(!seen_before(&mut new_filter, b"new-key"));
+        assert_eq!(new_filter.len(), 8192);
+        assert!(seen_before(&mut new_filter, b"new-key"));
+        let mut legacy = vec![0; 8192];
+        assert!(!seen_before(&mut legacy, b"legacy-key"));
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        let mut decoded: Vec<u64> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.len(), 8192);
+        assert!(seen_before(&mut decoded, b"legacy-key"));
+        let state = ParserState {
+            claude_seen: decoded,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&state).unwrap();
+        assert!(serialized["claude_seen"].is_string());
+        let restored: ParserState = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.claude_seen, state.claude_seen);
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy["claude_seen"] = serde_json::json!(state.claude_seen);
+        let restored: ParserState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.claude_seen, state.claude_seen);
+    }
+    #[test]
+    fn null_timestamp_falls_back_to_created_at() {
+        let mut state = ParserState::default();
+        let line = br#"{"type":"PLANNER_RESPONSE","timestamp":null,"created_at":"2026-11-10T12:30:00Z","input_tokens":1}"#;
+        let result = observation(parse_line(UsageVendor::Antigravity, line, &mut state));
+        assert_eq!(result.hour_ms, Some(1794312000000));
     }
     #[test]
     fn muse_recorded_at_microseconds_sets_hour() {
