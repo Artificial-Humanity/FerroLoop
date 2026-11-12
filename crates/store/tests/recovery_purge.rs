@@ -1376,15 +1376,14 @@ fn assert_purge_stops_at_lease_expiry(at: PurgeLeaseExpiryAt) {
                 }
             }
             file.read_exact_at(bytes, offset)?;
-            if let PurgeLeaseExpiryAt::FinalRead(index) = self.at {
-                if self.unlinks.load(Ordering::Acquire) == index + 1
-                    && identity == self.member_identities[index]
-                    && offset + bytes.len() as u64 == metadata.len()
-                {
-                    // The PurgeUnlink seam has passed; this is the final held
-                    // member digest read, not the earlier verification hash.
-                    self.expired.store(true, Ordering::Release);
-                }
+            if let PurgeLeaseExpiryAt::FinalRead(index) = self.at
+                && self.unlinks.load(Ordering::Acquire) == index + 1
+                && identity == self.member_identities[index]
+                && offset + bytes.len() as u64 == metadata.len()
+            {
+                // The PurgeUnlink seam has passed; this is the final held
+                // member digest read, not the earlier verification hash.
+                self.expired.store(true, Ordering::Release);
             }
             Ok(())
         }
