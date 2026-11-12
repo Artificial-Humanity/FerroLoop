@@ -23,6 +23,17 @@ The hub's /api/v1/watch/summary and /api/v1/watch/alerts add the quota of its di
 
 #[derive(Subcommand)]
 pub enum WatchCmd {
+    /// Token usage collected by the hub, grouped by persona, vendor, or model.
+    Usage {
+        /// Relative duration (e.g. 48h) or RFC3339 UTC timestamp.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Group by persona, vendor, or model.
+        #[arg(long, default_value = "persona")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Telemetry totals, agent health and active alerts, in one view.
     ///
     /// The CLI has no live vendor quota source: quota alerts come only from `watch-quota-*`
@@ -331,6 +342,84 @@ pub fn run_at(
 ) -> Result<i32, (i32, String)> {
     let fail = |e: fl_watch::WatchError| (1, e.to_string());
     match cmd {
+        WatchCmd::Usage { since, by, json } => {
+            use fl_watch::usage::{UsageReportQuery, aggregate_usage, format_time, parse_since};
+            let since_ms = parse_since(&since, now_ms).map_err(|e| (1, e.to_string()))?;
+            let by = by
+                .parse()
+                .map_err(|e: fl_watch::usage::UsageError| (1, e.to_string()))?;
+            let report = aggregate_usage(store, &UsageReportQuery { since_ms, by }, now_ms)
+                .map_err(|e| (1, e.to_string()))?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "Requested: {} .. {}",
+                    format_time(report.requested_start_ms),
+                    format_time(report.requested_end_ms)
+                );
+                println!(
+                    "Effective: {} .. {} (whole UTC hours)",
+                    format_time(report.effective_start_ms),
+                    format_time(report.effective_end_ms)
+                );
+                println!(
+                    "Coverage: {}{}; last successful scan: {}",
+                    if report.coverage.incomplete {
+                        "incomplete"
+                    } else {
+                        "complete"
+                    },
+                    if report.coverage.pending {
+                        ", pending"
+                    } else {
+                        ""
+                    },
+                    report
+                        .coverage
+                        .last_success_ms
+                        .map_or_else(|| "unknown".into(), format_time)
+                );
+                println!("GROUP\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE\tTURNS\tSUBAGENTS");
+                let number = |v: Option<u64>, unavailable: bool| {
+                    v.map_or_else(
+                        || "No data".into(),
+                        |n| {
+                            if unavailable {
+                                format!("{n} (partial)")
+                            } else {
+                                n.to_string()
+                            }
+                        },
+                    )
+                };
+                for row in &report.rows {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        row.key,
+                        number(row.input, row.unavailable.input),
+                        number(row.output, row.unavailable.output),
+                        number(row.cache_read, row.unavailable.cache_read),
+                        number(row.cache_write, row.unavailable.cache_write),
+                        number(row.turns, row.turns_unavailable),
+                        row.subagents
+                    );
+                }
+                if report.coverage.undated_observations > 0 {
+                    println!(
+                        "Undated observations: {} (outside the window)",
+                        report.coverage.undated_observations
+                    );
+                }
+                if report.coverage.unknown_launch_times > 0 {
+                    println!(
+                        "Subagents with unknown launch time: {}",
+                        report.coverage.unknown_launch_times
+                    );
+                }
+            }
+            Ok(0)
+        }
         WatchCmd::Status { project, json } => {
             let project = project_arg(store, project.as_deref())?;
             let s = build_summary(
