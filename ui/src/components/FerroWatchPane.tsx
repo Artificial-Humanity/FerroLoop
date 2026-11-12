@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { FerroWatchUsage } from "./FerroWatchUsage";
 import { formatCurrencyFromMicros, useActiveCurrency } from "../lib/currency";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
@@ -1754,6 +1755,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
           >
             {error}
           </div>
+        )}
+
+        {isOwner && apiClient && typeof apiClient.getWatchUsage === "function" && (sectionFilter === "all" || showRollups) && (
+          <FerroWatchUsage apiClient={apiClient} />
         )}
 
         {/* 1. Live Alerts Banner / List */}
