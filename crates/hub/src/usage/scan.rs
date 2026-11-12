@@ -879,6 +879,25 @@ mod tests {
         assert_eq!(rebuilt.buckets[0].counts.input, Some(20));
     }
     #[test]
+    fn older_codex_revision_rebuilds_previously_suppressed_fresh_fork() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{\"type\":\"session_meta\",\"payload\":{\"parent_thread_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\"}}\n").unwrap();
+        f.write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":42},\"last_token_usage\":{\"input_tokens\":42}}}}\n").unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let mut old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        old.parser.parser_revision = Some(1);
+        old.coverage.incomplete = true;
+        old.buckets.clear();
+        let new = scan_source(&src, Some(&old), ScanLimits::default()).unwrap();
+        assert_eq!(new.buckets[0].counts.input, Some(42));
+        assert!(!new.coverage.incomplete);
+        assert_eq!(
+            new.parser.parser_revision,
+            Some(fl_watch::usage::USAGE_PARSER_REVISION)
+        );
+    }
+    #[test]
     fn codex_fork_tracks_each_copied_snapshot_across_batches() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         let rec = |ord, count| {

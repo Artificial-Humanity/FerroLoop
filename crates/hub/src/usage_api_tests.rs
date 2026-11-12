@@ -79,8 +79,8 @@ fn store_failure_is_service_unavailable_after_authorization() {
 #[test]
 fn report_uses_persisted_buckets_without_scanning_and_keeps_unavailable_data() {
     use fl_watch::usage::{
-        CategoryUnavailable, ParserState, SourceUsageDocument, TokenCounts, UsageBucket,
-        UsageCoverage, UsageVendor,
+        CategoryUnavailable, ParserState, SourceUsageDocument, TokenCounts, USAGE_PARSER_REVISION,
+        UsageBucket, UsageCoverage, UsageVendor,
     };
     let tmp = TempDir::new().unwrap();
     let state = hub(&tmp);
@@ -98,7 +98,10 @@ fn report_uses_persisted_buckets_without_scanning_and_keeps_unavailable_data() {
         file_identity: None,
         anchor: String::new(),
         discarding_line: false,
-        parser: ParserState::default(),
+        parser: ParserState {
+            parser_revision: Some(USAGE_PARSER_REVISION),
+            ..Default::default()
+        },
         buckets: vec![UsageBucket {
             model: None,
             hour_ms: Some(hour),

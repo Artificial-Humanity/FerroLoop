@@ -181,14 +181,22 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                     state.antigravity_parents.push(id);
                 }
             }
+            let step = v.get("step_index").and_then(Value::as_u64);
+            let newer_than_planner = match (event_time, state.antigravity_last_planner_ms) {
+                (Some(current), Some(previous)) if current > previous => true,
+                (Some(current), Some(previous)) if current == previous => matches!(
+                    (step, state.antigravity_last_planner_step),
+                    (Some(current), Some(previous)) if current > previous
+                ),
+                _ => false,
+            };
             if kind == Some("PLANNER_RESPONSE")
-                && matches!((event_time, state.antigravity_last_planner_ms),
-                    (Some(current), Some(previous)) if current <= previous)
+                && event_time.is_some()
+                && state.antigravity_last_planner_ms.is_some()
+                && !newer_than_planner
             {
                 return ParseOutcome::Incomplete;
             }
-            let newer_than_planner = matches!((event_time, state.antigravity_last_planner_ms),
-                (Some(current), Some(previous)) if current > previous);
             if state.antigravity_unsafe && newer_than_planner {
                 state.antigravity_unsafe = false;
             }
@@ -263,6 +271,7 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
             }
             if let Some(event_time) = event_time {
                 state.antigravity_last_planner_ms = Some(event_time);
+                state.antigravity_last_planner_step = step;
             }
             ParseOutcome::Observation(bucket(identifier(v.get("model")), hour, c, 0))
         }
@@ -281,9 +290,6 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                         .pointer("/payload/subagent_history_start_ordinal")
                         .and_then(Value::as_u64);
                     state.codex_fork_unbounded = state.codex_fork_start_ordinal.is_none();
-                    if state.codex_fork_unbounded {
-                        return ParseOutcome::Incomplete;
-                    }
                 }
                 return ParseOutcome::Ignore;
             }
@@ -314,7 +320,27 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                 "cache_write_input_tokens",
             );
             if state.codex_fork_unbounded {
-                return ParseOutcome::Incomplete;
+                state.codex_fork_unbounded = false;
+                let last = v
+                    .pointer("/payload/info/last_token_usage")
+                    .filter(|value| value.is_object())
+                    .map(|value| {
+                        counts(
+                            value,
+                            "input_tokens",
+                            "output_tokens",
+                            "cached_input_tokens",
+                            "cache_write_input_tokens",
+                        )
+                    });
+                if last.as_ref() != Some(&c)
+                    || [c.input, c.output, c.cache_read, c.cache_write]
+                        .iter()
+                        .all(Option::is_none)
+                {
+                    state.codex_totals = Some(c);
+                    return ParseOutcome::Incomplete;
+                }
             }
             if let Some(start) = state.codex_fork_start_ordinal {
                 match v.get("ordinal").and_then(Value::as_u64) {
@@ -364,7 +390,23 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
             }
             if state.codex_model_changed {
                 state.codex_model_changed = false;
-                return ParseOutcome::IncompleteObservation(bucket(None, hour, delta, 0));
+                // The last-response counters prove the entire delta belongs to
+                // the new model. Otherwise a late snapshot may straddle models.
+                let last = v
+                    .pointer("/payload/info/last_token_usage")
+                    .filter(|value| value.is_object())
+                    .map(|value| {
+                        counts(
+                            value,
+                            "input_tokens",
+                            "output_tokens",
+                            "cached_input_tokens",
+                            "cache_write_input_tokens",
+                        )
+                    });
+                if last.as_ref() != Some(&delta) {
+                    return ParseOutcome::IncompleteObservation(bucket(None, hour, delta, 0));
+                }
             }
             ParseOutcome::Observation(bucket(state.model.clone(), hour, delta, 0))
         }
@@ -460,20 +502,98 @@ mod tests {
         }
     }
     #[test]
-    fn codex_fork_without_boundary_never_counts_ambiguous_snapshots() {
-        let mut state = ParserState::default();
+    fn unbounded_fork_counts_fresh_snapshot_and_baselines_inherited() {
         let meta = br#"{"type":"session_meta","payload":{"parent_thread_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}"#;
+        let event = |total, last| {
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":total},"last_token_usage":{"input_tokens":last}}}}).to_string()
+        };
+        let mut fresh = ParserState::default();
         assert_eq!(
-            parse_line(UsageVendor::Codex, meta, &mut state),
+            parse_line(UsageVendor::Codex, meta, &mut fresh),
+            ParseOutcome::Ignore
+        );
+        assert_eq!(
+            observation(parse_line(
+                UsageVendor::Codex,
+                event(10, 10).as_bytes(),
+                &mut fresh
+            ))
+            .counts
+            .input,
+            Some(10)
+        );
+        assert_eq!(
+            observation(parse_line(
+                UsageVendor::Codex,
+                event(15, 5).as_bytes(),
+                &mut fresh
+            ))
+            .counts
+            .input,
+            Some(5)
+        );
+        let mut inherited = ParserState::default();
+        parse_line(UsageVendor::Codex, meta, &mut inherited);
+        assert_eq!(
+            parse_line(UsageVendor::Codex, event(100, 5).as_bytes(), &mut inherited),
             ParseOutcome::Incomplete
         );
-        for n in [100, 200, 300] {
-            let line=serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":n}}}}).to_string();
-            assert_eq!(
-                parse_line(UsageVendor::Codex, line.as_bytes(), &mut state),
-                ParseOutcome::Incomplete
-            );
+        assert_eq!(
+            observation(parse_line(
+                UsageVendor::Codex,
+                event(110, 10).as_bytes(),
+                &mut inherited
+            ))
+            .counts
+            .input,
+            Some(10)
+        );
+    }
+    #[test]
+    fn compact_small_filter_stays_small_and_preserves_membership() {
+        let mut state = ParserState::default();
+        for key in [b"first".as_slice(), b"second"] {
+            assert!(!seen_before(&mut state.claude_seen, key));
         }
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded["claude_seen"].as_str().unwrap().len() < 200);
+        let mut decoded: ParserState = serde_json::from_value(encoded).unwrap();
+        assert!(seen_before(&mut decoded.claude_seen, b"first"));
+        assert!(seen_before(&mut decoded.claude_seen, b"second"));
+    }
+    #[test]
+    fn dense_filter_remains_compatible_when_sparse_would_be_larger() {
+        let state = ParserState {
+            claude_seen: vec![u64::MAX; 8192],
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&state).unwrap();
+        let encoded_filter = encoded["claude_seen"].as_str().unwrap();
+        assert!(!encoded_filter.starts_with("s:"));
+        assert_eq!(encoded_filter.len(), 87384);
+        let decoded: ParserState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.claude_seen, state.claude_seen);
+    }
+    #[test]
+    fn antigravity_same_second_distinct_steps_are_counted() {
+        let mut state = ParserState::default();
+        let event = |step| {
+            serde_json::json!({"type":"PLANNER_RESPONSE","created_at":"2026-11-10T12:30:00Z","step_index":step,"input_tokens":1}).to_string()
+        };
+        observation(parse_line(
+            UsageVendor::Antigravity,
+            event(1).as_bytes(),
+            &mut state,
+        ));
+        observation(parse_line(
+            UsageVendor::Antigravity,
+            event(2).as_bytes(),
+            &mut state,
+        ));
+        assert_eq!(
+            parse_line(UsageVendor::Antigravity, event(1).as_bytes(), &mut state),
+            ParseOutcome::Incomplete
+        );
     }
     #[test]
     fn codex_legacy_unsafe_baseline_recovers_without_counting_snapshot() {
@@ -639,7 +759,7 @@ mod tests {
     fn codex_model_change_does_not_guess_delta_attribution() {
         let mut state = ParserState::default();
         let snapshot=br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":3}}}}"#;
-        let next=br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":4}}}}"#;
+        let next=br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":4},"last_token_usage":{"input_tokens":10,"output_tokens":1}}}}"#;
         parse_line(
             UsageVendor::Codex,
             br#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
@@ -651,16 +771,41 @@ mod tests {
             br#"{"type":"turn_context","payload":{"model":"model-b"}}"#,
             &mut state,
         );
-        let ParseOutcome::IncompleteObservation(bucket) =
-            parse_line(UsageVendor::Codex, next, &mut state)
-        else {
-            panic!("ambiguous model delta must be retained")
-        };
-        assert_eq!(bucket.model, None);
+        let bucket = observation(parse_line(UsageVendor::Codex, next, &mut state));
+        assert_eq!(bucket.model.as_deref(), Some("model-b"));
         assert_eq!(bucket.counts.input, Some(10));
         assert_eq!(bucket.counts.output, Some(1));
     }
 
+    #[test]
+    fn codex_model_change_unknown_when_last_response_cannot_prove_delta() {
+        let mut state = ParserState::default();
+        let event = |total| {
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":total}}}}).to_string()
+        };
+        parse_line(
+            UsageVendor::Codex,
+            br#"{"type":"turn_context","payload":{"model":"a"}}"#,
+            &mut state,
+        );
+        observation(parse_line(
+            UsageVendor::Codex,
+            event(20).as_bytes(),
+            &mut state,
+        ));
+        parse_line(
+            UsageVendor::Codex,
+            br#"{"type":"turn_context","payload":{"model":"b"}}"#,
+            &mut state,
+        );
+        let ParseOutcome::IncompleteObservation(bucket) =
+            parse_line(UsageVendor::Codex, event(30).as_bytes(), &mut state)
+        else {
+            panic!("ambiguous delta")
+        };
+        assert_eq!(bucket.model, None);
+        assert_eq!(bucket.counts.input, Some(10));
+    }
     #[test]
     fn agy_rewind_with_changed_usage_is_not_counted() {
         let mut s = ParserState::default();

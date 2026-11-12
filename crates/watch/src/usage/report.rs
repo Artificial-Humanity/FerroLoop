@@ -304,9 +304,57 @@ pub fn aggregate_documents(
     } else {
         coverage.incomplete = true;
     }
+    // The workflow file is a copy of a regular Claude subagent transcript in
+    // known layouts. Preserve either source when it is the only retained one,
+    // but never sum both documents. Different file contents cannot be merged
+    // safely from hourly buckets, so expose that ambiguity.
+    let mut canonical: HashMap<String, (usize, bool)> = HashMap::new();
+    for (idx, source) in sources.iter().enumerate() {
+        if source.vendor != super::UsageVendor::Claude {
+            continue;
+        }
+        if let Some(super::ClaudeWorkflowPath::Subagent {
+            canonical: key,
+            workflow,
+        }) = super::claude_workflow_path(&source.source_id)
+        {
+            if let Some((prior_idx, prior_workflow)) = canonical.get_mut(&key) {
+                coverage.incomplete = true;
+                if (*prior_workflow && !workflow)
+                    || (*prior_workflow == workflow
+                        && source.source_id < sources[*prior_idx].source_id)
+                {
+                    *prior_idx = idx;
+                    *prior_workflow = workflow;
+                }
+            } else {
+                canonical.insert(key, (idx, workflow));
+            }
+        }
+    }
+    let selected: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, source)| {
+            if source.vendor == super::UsageVendor::Claude {
+                match super::claude_workflow_path(&source.source_id) {
+                    Some(super::ClaudeWorkflowPath::Journal) => return None,
+                    Some(super::ClaudeWorkflowPath::Subagent { canonical: key, .. })
+                        if canonical
+                            .get(&key)
+                            .is_some_and(|(chosen, _)| *chosen != idx) =>
+                    {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            Some(source)
+        })
+        .collect();
     let mut index = IdentityIndex::new(identities);
     let mut vendors = HashMap::new();
-    for source in sources {
+    for source in &selected {
         vendors
             .entry(source.session_id.as_str())
             .and_modify(|vendor: &mut Option<super::UsageVendor>| {
@@ -319,7 +367,7 @@ pub fn aggregate_documents(
     let mut rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut undated = Accum::default();
     undated.row.key = "undated".into();
-    for source in sources {
+    for source in selected {
         coverage.incomplete |= source.coverage.incomplete || source.coverage.ambiguous_generation;
         coverage.unverified_prefix_sources = coverage
             .unverified_prefix_sources
@@ -655,6 +703,50 @@ mod review_regressions {
             launch_time_ms: None,
             provenance: "test".into(),
         }
+    }
+    #[test]
+    fn workflow_copies_do_not_double_charge_and_legacy_journals_are_ignored() {
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let base = format!("/home/x/.claude/projects/p/{parent}/subagents");
+        let mut regular = source(&format!("{base}/agent-123.jsonl"), UsageVendor::Claude);
+        regular.session_id = "agent-123".into();
+        let mut workflow = source(
+            &format!("{base}/workflows/wf_1/agent-123.jsonl"),
+            UsageVendor::Claude,
+        );
+        workflow.session_id = "agent-123".into();
+        workflow.buckets[0].counts.input = Some(15);
+        let mut journal = source(
+            &format!("{base}/workflows/wf_1/journal.jsonl"),
+            UsageVendor::Claude,
+        );
+        journal.parser.parser_revision = None;
+        let report = aggregate_documents(
+            &[workflow.clone(), regular.clone(), journal],
+            &[],
+            None,
+            &UsageReportQuery {
+                since_ms: 1,
+                by: UsageGroupBy::Vendor,
+            },
+            7_200_000,
+        )
+        .unwrap();
+        assert_eq!(report.rows[0].input, Some(10));
+        assert_eq!(report.coverage.stale_parser_sources, 0);
+        assert!(report.coverage.incomplete);
+        let only_workflow = aggregate_documents(
+            &[workflow],
+            &[],
+            None,
+            &UsageReportQuery {
+                since_ms: 1,
+                by: UsageGroupBy::Vendor,
+            },
+            7_200_000,
+        )
+        .unwrap();
+        assert_eq!(only_workflow.rows[0].input, Some(15));
     }
     #[test]
     fn malformed_source_or_identity_is_skipped_with_incomplete_coverage() {

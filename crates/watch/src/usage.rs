@@ -3,7 +3,56 @@ use serde::{Deserialize, Serialize};
 mod report;
 pub use report::*;
 
-pub const USAGE_PARSER_REVISION: u32 = 1;
+pub const USAGE_PARSER_REVISION: u32 = 2;
+
+/// Classify only the known Claude project layout; unrelated files must never
+/// be discarded as duplicate usage or legacy workflow journals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeWorkflowPath {
+    Subagent { canonical: String, workflow: bool },
+    Journal,
+}
+pub fn claude_workflow_path(path: &str) -> Option<ClaudeWorkflowPath> {
+    let parts: Vec<_> = path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let i = parts
+        .windows(2)
+        .position(|w| w == [".claude", "projects"])?;
+    let tail = &parts[i + 2..];
+    if tail.len() < 4 || tail[2] != "subagents" {
+        return None;
+    }
+    let uuid = tail[1];
+    if uuid.len() != 36
+        || uuid.bytes().enumerate().any(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b != b'-'
+            } else {
+                !b.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
+    }
+    let (file, workflow) = match &tail[3..] {
+        [file] => (*file, false),
+        ["workflows", wf, file] if wf.starts_with("wf_") => (*file, true),
+        _ => return None,
+    };
+    if workflow && file == "journal.jsonl" {
+        return Some(ClaudeWorkflowPath::Journal);
+    }
+    if !file.starts_with("agent-") || !file.ends_with(".jsonl") {
+        return None;
+    }
+    let canonical = format!("{}/{}/{}/{}", parts[..i].join("/"), tail[0], uuid, file);
+    Some(ClaudeWorkflowPath::Subagent {
+        canonical,
+        workflow,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,8 +121,7 @@ pub struct AntigravityLaunch {
 mod compact_filter {
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    pub fn serialize<S: Serializer>(words: &[u64], serializer: S) -> Result<S::Ok, S::Error> {
-        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    fn encode(bytes: &[u8]) -> String {
         let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
             let n = (u32::from(chunk[0]) << 16)
@@ -92,7 +140,23 @@ mod compact_filter {
                 '='
             });
         }
-        encoded.serialize(serializer)
+        encoded
+    }
+    pub fn serialize<S: Serializer>(words: &[u64], serializer: S) -> Result<S::Ok, S::Error> {
+        let dense_len = words.len() * 8;
+        let nonzero = words.iter().filter(|&&word| word != 0).count();
+        if !words.is_empty() && 2 + nonzero * 10 < dense_len {
+            let mut sparse = Vec::with_capacity(2 + nonzero * 10);
+            sparse.extend_from_slice(&(words.len() as u16).to_le_bytes());
+            for (index, &word) in words.iter().enumerate().filter(|(_, word)| **word != 0) {
+                sparse.extend_from_slice(&(index as u16).to_le_bytes());
+                sparse.extend_from_slice(&word.to_le_bytes());
+            }
+            format!("s:{}", encode(&sparse)).serialize(serializer)
+        } else {
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            encode(&bytes).serialize(serializer)
+        }
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u64>, D::Error> {
         #[derive(Deserialize)]
@@ -104,13 +168,16 @@ mod compact_filter {
         let words = match Encoded::deserialize(deserializer)? {
             Encoded::Legacy(words) => words,
             Encoded::Compact(encoded) => {
+                let (sparse, encoded) = match encoded.strip_prefix("s:") {
+                    Some(rest) => (true, rest),
+                    None => (false, encoded.as_str()),
+                };
                 if encoded.len() > 87_384 || encoded.len() % 4 != 0 {
                     return Err(D::Error::custom("invalid usage filter length"));
                 }
                 let decode = |c: u8| ALPHABET.iter().position(|x| *x == c).map(|x| x as u32);
                 let mut bytes = Vec::with_capacity(encoded.len() / 4 * 3);
                 let chunks = encoded.as_bytes().as_chunks::<4>().0;
-                let count = chunks.len();
                 for (i, chunk) in chunks.iter().enumerate() {
                     let a = decode(chunk[0])
                         .ok_or_else(|| D::Error::custom("invalid usage filter encoding"))?;
@@ -118,7 +185,7 @@ mod compact_filter {
                         .ok_or_else(|| D::Error::custom("invalid usage filter encoding"))?;
                     let pad2 = chunk[2] == b'=';
                     let pad3 = chunk[3] == b'=';
-                    if (pad2 && !pad3) || ((pad2 || pad3) && i + 1 != count) {
+                    if (pad2 && !pad3) || ((pad2 || pad3) && i + 1 != chunks.len()) {
                         return Err(D::Error::custom("invalid usage filter padding"));
                     }
                     let c = if pad2 {
@@ -145,16 +212,40 @@ mod compact_filter {
                         bytes.push(n as u8);
                     }
                 }
-                if bytes.len() % 8 != 0 {
-                    return Err(D::Error::custom("invalid usage filter length"));
+                if sparse {
+                    if bytes.len() < 2 || (bytes.len() - 2) % 10 != 0 {
+                        return Err(D::Error::custom("invalid sparse usage filter"));
+                    }
+                    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+                    if count == 0 || count > 8192 {
+                        return Err(D::Error::custom("invalid sparse usage filter length"));
+                    }
+                    let mut words = vec![0; count];
+                    for item in bytes[2..].as_chunks::<10>().0 {
+                        let index = u16::from_le_bytes([item[0], item[1]]) as usize;
+                        if index >= count || words[index] != 0 {
+                            return Err(D::Error::custom("invalid sparse usage filter index"));
+                        }
+                        let word =
+                            u64::from_le_bytes(item[2..].try_into().map_err(D::Error::custom)?);
+                        if word == 0 {
+                            return Err(D::Error::custom("invalid sparse usage filter word"));
+                        }
+                        words[index] = word;
+                    }
+                    words
+                } else {
+                    if bytes.len() % 8 != 0 {
+                        return Err(D::Error::custom("invalid usage filter length"));
+                    }
+                    bytes
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u64::from_le_bytes)
+                        .collect()
                 }
-                bytes
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .copied()
-                    .map(u64::from_le_bytes)
-                    .collect()
             }
         };
         if words.len() > 8192 {
@@ -192,6 +283,8 @@ pub struct ParserState {
     pub antigravity_last_step: Option<u64>,
     #[serde(default)]
     pub antigravity_last_planner_ms: Option<u64>,
+    #[serde(default)]
+    pub antigravity_last_planner_step: Option<u64>,
     #[serde(default)]
     pub antigravity_unsafe: bool,
     #[serde(default, with = "compact_filter")]

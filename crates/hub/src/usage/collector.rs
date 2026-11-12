@@ -7,6 +7,10 @@ use std::sync::Mutex;
 pub const COLLECTION: &str = "watch_usage_v1";
 static COLLECTING: Mutex<()> = Mutex::new(());
 
+#[derive(Debug, thiserror::Error)]
+#[error("usage unsupported on redb backend")]
+pub struct UsageUnsupported;
+
 fn key(prefix: &str, id: &str) -> String {
     format!("{prefix}-{:x}", Sha256::digest(id.as_bytes()))
 }
@@ -35,6 +39,32 @@ pub fn read_identities(store: &AnyStore) -> anyhow::Result<Vec<IdentityMappingDo
         }
     }
     Ok(result)
+}
+
+/// Remove only source documents created for Claude workflow journals by old
+/// discovery. Deleted subagent transcripts and all other documents are retained.
+fn cleanup_workflow_journals(store: &AnyStore) -> anyhow::Result<()> {
+    let ferro = store
+        .as_ferro()
+        .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+    for id in ferro.query_by_field(COLLECTION, "kind", "source")? {
+        let Some(value) = ferro.get_doc(COLLECTION, &id)? else {
+            continue;
+        };
+        let document = &value["document"];
+        if document.get("vendor").and_then(serde_json::Value::as_str) != Some("claude") {
+            continue;
+        }
+        if document
+            .get("source_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(fl_watch::usage::claude_workflow_path)
+            == Some(fl_watch::usage::ClaudeWorkflowPath::Journal)
+        {
+            ferro.delete_doc(COLLECTION, &id)?;
+        }
+    }
+    Ok(())
 }
 
 fn put_identity(store: &AnyStore, identity: &IdentityMappingDocument) -> anyhow::Result<bool> {
@@ -70,10 +100,11 @@ fn claude_subagent_parent(source: &UsageSource) -> Option<&str> {
     if source.vendor != UsageVendor::Claude || !source.session_id.starts_with("agent-") {
         return None;
     }
-    let subagents = source.path.parent()?;
-    if subagents.file_name()?.to_str()? != "subagents" {
-        return None;
-    }
+    let subagents = source
+        .path
+        .parent()?
+        .ancestors()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("subagents"))?;
     let parent = subagents.parent()?.file_name()?.to_str()?;
     uuid::Uuid::parse_str(parent).ok()?;
     Some(parent)
@@ -281,7 +312,7 @@ fn discover_usage_sources(home: &std::path::Path) -> (Vec<UsageSource>, bool) {
                         .and_then(|n| uuid::Uuid::parse_str(n).ok())
                         .map(|u| u.to_string())
                 }
-                UsageVendor::Claude if name.ends_with(".jsonl") => {
+                UsageVendor::Claude if name.ends_with(".jsonl") && name != "journal.jsonl" => {
                     path.file_stem().and_then(|n| n.to_str()).map(str::to_owned)
                 }
                 UsageVendor::Muse if name == "session.jsonl" => path
@@ -323,6 +354,7 @@ pub struct CollectionScheduler {
     claude_identified: std::collections::HashSet<(String, String)>,
     claude_checked: std::collections::HashSet<(String, String)>,
     last_identity_refresh: Option<std::time::Instant>,
+    failed_source_retries: std::collections::HashMap<String, std::time::Instant>,
     identity_refresh_failed: bool,
     invalid_source_documents: std::collections::HashSet<String>,
     invalid_identity_documents: std::collections::HashSet<String>,
@@ -456,12 +488,20 @@ fn collect_hub_with_hooks(
         .or_else(|| std::env::var_os("HOME").map(Into::into))
         .ok_or_else(|| anyhow::anyhow!("usage source home unavailable"))?;
     let _flight = COLLECTING.lock().unwrap_or_else(|e| e.into_inner());
+    // Check backend before walking potentially tens of thousands of files.
+    if !schedule.initialized {
+        let store = state.open_store()?;
+        if store.as_ferro().is_none() {
+            return Err(UsageUnsupported.into());
+        }
+    }
     let (sources, enumeration_incomplete) = discover_usage_sources(&home);
     if !schedule.initialized {
         let store = state.open_store()?;
         let ferro = store
             .as_ferro()
             .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+        cleanup_workflow_journals(&store)?;
         for id in ferro.query_by_field(COLLECTION, "kind", "source")? {
             match ferro
                 .get_doc(COLLECTION, &id)
@@ -544,7 +584,7 @@ fn collect_hub_with_hooks(
         .iter()
         .map(|s| key("source-error", &s.source_id))
         .collect();
-    {
+    let mut source_errors = {
         let store = state.open_store()?;
         let ferro = store
             .as_ferro()
@@ -569,25 +609,54 @@ fn collect_hub_with_hooks(
                 }
                 Err(_) => true,
             });
-        if !enumeration_incomplete {
-            for id in ferro.query_by_field(COLLECTION, "kind", "source_error")? {
-                if !source_ids.contains(&id) {
-                    ferro.delete_doc(COLLECTION, &id)?;
-                }
+        let mut errors = std::collections::HashSet::new();
+        for id in ferro.query_by_field(COLLECTION, "kind", "source_error")? {
+            if !enumeration_incomplete && !source_ids.contains(&id) {
+                ferro.delete_doc(COLLECTION, &id)?;
+            } else {
+                errors.insert(id);
             }
         }
-    }
+        errors
+    };
+    schedule
+        .failed_source_retries
+        .retain(|id, _| source_ids.contains(&key("source-error", id)));
     let mut candidates = Vec::new();
+    let mut store_write_failed = false;
     let mut enumeration_errors = enumeration_incomplete
         || schedule.identity_refresh_failed
         || !schedule.invalid_source_documents.is_empty()
         || !schedule.invalid_identity_documents.is_empty();
     for source in &sources {
+        if schedule
+            .failed_source_retries
+            .get(&source.source_id)
+            .is_some_and(|retry| *retry > std::time::Instant::now())
+        {
+            continue;
+        }
         let metadata = match std::fs::metadata(&source.path) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                enumeration_errors = true;
+            Err(error) => {
+                eprintln!(
+                    "usage collector: source {} metadata failed: {error}",
+                    key("source", &source.source_id)
+                );
+                let id = key("source-error", &source.source_id);
+                let store = state.open_store()?;
+                let ferro = store
+                    .as_ferro()
+                    .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
+                if ferro.get_doc(COLLECTION, &id)?.is_none() {
+                    ferro.put_doc(COLLECTION, &id, &serde_json::json!({"kind":"source_error"}))?;
+                }
+                source_errors.insert(id);
+                schedule.failed_source_retries.insert(
+                    source.source_id.clone(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                );
                 continue;
             }
         };
@@ -600,7 +669,10 @@ fn collect_hub_with_hooks(
                 .claude_checked
                 .contains(&(source.session_id.clone(), parent.to_owned()))
         });
-        if unchanged_source(progress, &metadata) && !needs_identity {
+        if unchanged_source(progress, &metadata)
+            && !needs_identity
+            && !source_errors.contains(&key("source-error", &source.source_id))
+        {
             continue;
         }
         candidates.push((source.clone(), metadata, progress.last_serviced));
@@ -651,10 +723,11 @@ fn collect_hub_with_hooks(
         // Existing installations may already have a complete source document but
         // lack its newly supported Claude parent mapping. Backfill only the first
         // record, rather than parsing the entire unchanged transcript again.
-        if schedule
-            .sources
-            .get(&source.source_id)
-            .is_some_and(|progress| unchanged_source(progress, &meta))
+        if !source_errors.contains(&key("source-error", &source.source_id))
+            && schedule
+                .sources
+                .get(&source.source_id)
+                .is_some_and(|progress| unchanged_source(progress, &meta))
         {
             if let Some(parent) = claude_subagent_parent(&source) {
                 let pair = (source.session_id.clone(), parent.to_owned());
@@ -692,6 +765,7 @@ fn collect_hub_with_hooks(
                 key("source", &source.source_id)
             );
         }
+        let scan_failed = candidate.is_err();
         let identity = claude_subagent_identity(&source);
         let identified = identity.as_ref().and_then(|i| {
             i.parent_id
@@ -732,7 +806,14 @@ fn collect_hub_with_hooks(
                 key("source", &source.source_id)
             );
             enumeration_errors = true;
+            store_write_failed = true;
+        } else if scan_failed {
+            schedule.failed_source_retries.insert(
+                source.source_id.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
         } else if let Some(p) = new_progress {
+            schedule.failed_source_retries.remove(&source.source_id);
             schedule.sources.insert(source.source_id.clone(), p);
             if let Some(pair) = identified {
                 schedule.claude_checked.insert(pair.clone());
@@ -740,9 +821,26 @@ fn collect_hub_with_hooks(
             }
         }
     }
+    // Errors remain retryable on the slower idle cadence, but are not unread work.
+    let source_errors = {
+        let store = state.open_store()?;
+        store
+            .as_ferro()
+            .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?
+            .query_by_field(COLLECTION, "kind", "source_error")?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+    };
     // Recompute from all discovered files and committed offsets. A sweep cursor alone
     // is not evidence of unread bytes.
     let pending = sources.iter().any(|source| {
+        if source_errors.contains(&key("source-error", &source.source_id))
+            || schedule
+                .invalid_source_documents
+                .contains(&key("source", &source.source_id))
+        {
+            return false;
+        }
         let Some(progress) = schedule.sources.get(&source.source_id) else {
             return std::fs::metadata(&source.path).is_ok_and(|m| m.len() > 0);
         };
@@ -756,6 +854,13 @@ fn collect_hub_with_hooks(
         })
     });
     let identity_work = sources.iter().any(|source| {
+        if source_errors.contains(&key("source-error", &source.source_id))
+            || schedule
+                .invalid_source_documents
+                .contains(&key("source", &source.source_id))
+        {
+            return false;
+        }
         claude_subagent_parent(source).is_some_and(|parent| {
             !schedule
                 .claude_checked
@@ -775,10 +880,15 @@ fn collect_hub_with_hooks(
         || !ferro
             .query_by_field(COLLECTION, "kind", "source_error")?
             .is_empty();
-    if !pending && !identity_work && !incomplete {
+    if !pending && !identity_work && !enumeration_errors {
         schedule.last_success_ms = Some(now);
     }
     ferro.put_doc(COLLECTION, "collector-status", &serde_json::json!({"kind":"status", "last_success_ms":schedule.last_success_ms, "pending":pending, "incomplete":incomplete}))?;
+    if store_write_failed {
+        return Err(anyhow::anyhow!(
+            "usage collector could not persist a source"
+        ));
+    }
     Ok(pending || identity_work)
 }
 
@@ -935,6 +1045,228 @@ mod tests {
         let row = report.rows.iter().find(|r| r.key == "Felix").unwrap();
         assert_eq!(row.input, Some(42));
         assert_eq!(row.subagents, 1);
+    }
+    #[test]
+    fn overlapping_workflow_copies_never_double_count_and_retained_docs_survive_deletion() {
+        let (_dir, store) = store();
+        let home = tempfile::tempdir().unwrap();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let dir = home
+            .path()
+            .join(".claude/projects/p")
+            .join(parent)
+            .join("subagents");
+        let nested = dir.join("workflows/wf_1");
+        std::fs::create_dir_all(&nested).unwrap();
+        let line = |id: &str, count: u64| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"assistant", "timestamp":"2026-11-10T12:30:00Z", "sessionId":parent,
+                    "message":{"id":id,"usage":{"input_tokens":count}}
+                })
+            )
+        };
+        let direct = dir.join("agent-child.jsonl");
+        std::fs::write(&direct, line("shared", 42)).unwrap();
+        std::fs::write(
+            nested.join("agent-child.jsonl"),
+            format!("{}{}", line("shared", 42), line("extra", 7)),
+        )
+        .unwrap();
+        let (sources, _) = discover_usage_sources(home.path());
+        assert_eq!(sources.len(), 2);
+        collect_once(&store, &sources, &[], ScanLimits::default()).unwrap();
+        let query = fl_watch::usage::UsageReportQuery {
+            since_ms: 1794312000000,
+            by: fl_watch::usage::UsageGroupBy::Vendor,
+        };
+        let report = |docs: &[SourceUsageDocument]| {
+            fl_watch::usage::aggregate_documents(
+                docs,
+                &[],
+                Some(fl_watch::usage::CollectorStatus {
+                    last_success_ms: None,
+                    pending: false,
+                    incomplete: false,
+                }),
+                &query,
+                1794315600000,
+            )
+            .unwrap()
+        };
+        let before = read_sources(&store).unwrap();
+        let out = report(&before);
+        assert_eq!(out.rows[0].input, Some(42));
+        assert!(out.coverage.incomplete);
+        std::fs::remove_file(&direct).unwrap();
+        collect_once(&store, &sources, &[], ScanLimits::default()).unwrap();
+        let after = read_sources(&store).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(report(&after).rows[0].input, Some(42));
+    }
+    #[test]
+    fn cleanup_removes_only_legacy_workflow_journals() {
+        let (_dir, store) = store();
+        let ferro = store.as_ferro().unwrap();
+        let base = "/home/x/.claude/projects/p/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/subagents";
+        let journal = format!("{base}/workflows/wf_1/journal.jsonl");
+        let legitimate = format!("{base}/agent-child.jsonl");
+        let unrelated = "/home/x/.claude/projects/p/journal.jsonl";
+        for path in [&journal, &legitimate, unrelated] {
+            ferro
+                .put_doc(
+                    COLLECTION,
+                    &key("source", path),
+                    &serde_json::json!({
+                        "kind":"source", "document":{"source_id":path, "vendor":"claude"}
+                    }),
+                )
+                .unwrap();
+        }
+        cleanup_workflow_journals(&store).unwrap();
+        assert!(
+            ferro
+                .get_doc(COLLECTION, &key("source", &journal))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ferro
+                .get_doc(COLLECTION, &key("source", &legitimate))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ferro
+                .get_doc(COLLECTION, &key("source", unrelated))
+                .unwrap()
+                .is_some()
+        );
+        cleanup_workflow_journals(&store).unwrap();
+    }
+    #[test]
+    fn workflow_claude_subagent_is_attributed_and_journal_is_excluded() {
+        let (_dir, store) = store();
+        let home = tempfile::tempdir().unwrap();
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let logs = home
+            .path()
+            .join(".claude/projects/project")
+            .join(parent)
+            .join("subagents/workflows/wf_123");
+        std::fs::create_dir_all(&logs).unwrap();
+        let file = logs.join("agent-child.jsonl");
+        std::fs::write(
+            &file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"assistant", "timestamp":"2026-11-10T12:30:00Z", "sessionId":parent,
+                    "message":{"id":"msg1", "usage":{"input_tokens":42}}
+                })
+            ),
+        )
+        .unwrap();
+        std::fs::write(logs.join("journal.jsonl"), "{}\n").unwrap();
+        let (sources, _) = discover_usage_sources(home.path());
+        assert_eq!(
+            sources.len(),
+            1,
+            "workflow journal must not become a source"
+        );
+        let identity = IdentityMappingDocument {
+            session_id: parent.into(),
+            persona: Some("Felix".into()),
+            parent_id: None,
+            launch_time_ms: None,
+            provenance: "route".into(),
+        };
+        collect_once(&store, &sources, &[identity], ScanLimits::default()).unwrap();
+        let mappings = read_identities(&store).unwrap();
+        assert!(mappings.iter().any(|m| m.session_id == "agent-child"
+            && m.parent_id.as_deref() == Some(parent)
+            && m.launch_time_ms == Some(1794313800000)));
+        let report = fl_watch::usage::aggregate_documents(
+            &read_sources(&store).unwrap(),
+            &mappings,
+            None,
+            &fl_watch::usage::UsageReportQuery {
+                since_ms: 1794312000000,
+                by: fl_watch::usage::UsageGroupBy::Persona,
+            },
+            1794315600000,
+        )
+        .unwrap();
+        let row = report.rows.iter().find(|r| r.key == "Felix").unwrap();
+        assert_eq!(row.input, Some(42));
+        assert_eq!(row.subagents, 1);
+    }
+    #[test]
+    fn failed_source_is_not_pending_and_can_recover_on_later_sweep() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("a.jsonl"), "{}\n").unwrap();
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.fls"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        let mut schedule = CollectionScheduler::default();
+        assert!(
+            !collect_hub_with_hook(&state, &mut schedule, 32 * 1024 * 1024, || panic!(
+                "unreadable source"
+            ))
+            .unwrap()
+        );
+        {
+            let store = state.open_store().unwrap();
+            let status = store
+                .as_ferro()
+                .unwrap()
+                .get_doc(COLLECTION, "collector-status")
+                .unwrap()
+                .unwrap();
+            assert_eq!(status["pending"], false);
+            assert_eq!(status["incomplete"], true);
+            assert!(status["last_success_ms"].is_u64());
+        }
+        let mut rescanned = false;
+        assert!(
+            !collect_hub_with_hook(&state, &mut schedule, 32 * 1024 * 1024, || rescanned = true)
+                .unwrap()
+        );
+        assert!(
+            !rescanned,
+            "failed sources must not be retried on each fast tick"
+        );
+        for retry in schedule.failed_source_retries.values_mut() {
+            *retry = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
+        assert!(!collect_hub(&state, &mut schedule).unwrap());
+        let store = state.open_store().unwrap();
+        assert_eq!(read_sources(&store).unwrap().len(), 1);
+        assert!(
+            store
+                .as_ferro()
+                .unwrap()
+                .query_by_field(COLLECTION, "kind", "source_error")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn redb_collect_hub_stops_with_typed_unsupported_error() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("store.redb"),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        });
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let err = collect_hub(&state, &mut CollectionScheduler::default()).unwrap_err();
+        assert!(err.downcast_ref::<UsageUnsupported>().is_some());
     }
     #[test]
     fn claude_subagent_path_attributes_usage_and_counts_launch() {
@@ -1257,13 +1589,16 @@ mod tests {
         let mut schedule = CollectionScheduler::default();
         let mut calls = 0;
         assert!(
-            collect_hub_with_hook(&state, &mut schedule, 32 * 1024 * 1024, || {
+            !collect_hub_with_hook(&state, &mut schedule, 32 * 1024 * 1024, || {
                 calls += 1;
                 assert_ne!(calls, 1, "simulated poison source");
             })
             .unwrap()
         );
         assert_eq!(calls, 2, "later source must still be scanned");
+        for retry in schedule.failed_source_retries.values_mut() {
+            *retry = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
         assert!(!collect_hub(&state, &mut schedule).unwrap());
         let store = state.open_store().unwrap();
         assert_eq!(read_sources(&store).unwrap().len(), 2);
