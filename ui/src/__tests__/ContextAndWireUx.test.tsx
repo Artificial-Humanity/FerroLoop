@@ -19,6 +19,7 @@ import {
 import type { HubWsClient } from "../api/ws";
 import {
   ChatPane,
+  coalesceTurnsWithToolOutputs,
   computeLastTurnKey,
   formatTokenCount,
   estimateSessionContextUsage,
@@ -466,6 +467,78 @@ describe("windowed transcript auto-scroll keys", () => {
 describe("optimistic prompt preservation", () => {
   const diskTurns = [turn({ index: 7, role: "assistant", content: "Earlier reply" })];
 
+  it("prunes a queued operator prompt once its transcript user turn is on disk", () => {
+    const pending = { content: "Can you update the branch?", sentAt: Date.parse("2026-11-12T17:13:46.518Z") };
+    const disk = [turn({ index: 8, role: "user", content: pending.content, created_at: "2026-11-12T17:13:46.518Z" })];
+    expect(pruneOptimisticPrompts([pending], disk, pending.sentAt + 1000)).toEqual([]);
+    expect(preserveOptimisticTurn(disk, pending, pending.sentAt + 1000)).toBe(disk);
+  });
+
+  it("does not append an unmatched optimistic prompt after a later on-disk user turn", () => {
+    const pending = { content: "Can you update the branch?", sentAt: Date.parse("2026-11-12T17:13:46.518Z") };
+    const disk = [
+      turn({ index: 8, role: "user", content: "There is a CI failure", created_at: "2026-11-12T17:15:53.000Z" }),
+      turn({ index: 9, role: "assistant", content: "Checking", created_at: "2026-11-12T17:16:29.000Z" }),
+    ];
+    expect(preserveOptimisticTurn(disk, pending, pending.sentAt + 180_000)).toBe(disk);
+  });
+
+  it("keeps unmatched prompts visible when the server clock is ahead within the applicable skew", () => {
+    const sentAt = Date.parse("2026-11-12T17:13:46.518Z");
+    for (const [anchored, aheadMs] of [[false, 10_000], [true, 1_000]] as const) {
+      const pending = { content: "New prompt", sentAt, sentAtAnchored: anchored };
+      const disk = [turn({ index: 8, role: "user", content: "Earlier prompt", created_at: new Date(sentAt + aheadMs).toISOString() })];
+      expect(preserveOptimisticTurn(disk, pending, sentAt + 11_000).map((item) => item.content)).toContain("New prompt");
+    }
+  });
+
+  it("orders unmatched pending prompts before later disk user turns within clock skew", () => {
+    const sentAt = Date.parse("2026-11-12T17:13:46.518Z");
+    const disk = [
+      turn({ index: 8, role: "assistant", content: "Before", created_at: new Date(sentAt - 1000).toISOString() }),
+      turn({ index: 9, role: "user", content: "Later prompt", created_at: new Date(sentAt + 10_000).toISOString() }),
+    ];
+    const pending = [{ content: "Second pending", sentAt: sentAt + 1000 }, { content: "First pending", sentAt }];
+    const merged = preserveOptimisticTurn(disk, pending, sentAt + 11_000);
+    expect(merged.map((item) => item.content)).toEqual(["Before", "First pending", "Second pending", "Later prompt"]);
+    expect(merged.filter((item) => item.content === "Before" || item.content === "Later prompt").map((item) => item.index)).toEqual([8, 9]);
+    expect(new Set(merged.map((item) => item.index)).size).toBe(merged.length);
+  });
+
+  it("renders pending prompts without a fabricated transcript number", () => {
+    const sentAt = Date.parse("2026-11-12T17:13:46.518Z");
+    const disk = [turn({ index: 9, role: "assistant", content: "Later", created_at: new Date(sentAt + 1000).toISOString() })];
+    const merged = preserveOptimisticTurn(disk, { content: "Pending prompt", sentAt }, sentAt + 2000);
+    render(<ChatPane agentName="ferris" agentDisplayName="Ferris" adapter="claude" sessionId="session" turns={merged} onSendPrompt={vi.fn()} />);
+    const pendingCard = screen.getByTestId(`turn-card-${merged[0].index}`);
+    expect(within(pendingCard).getByText("Pending prompt")).toBeInTheDocument();
+    expect(within(pendingCard).queryByText(`#${merged[0].index}`)).toBeNull();
+    expect(within(screen.getByTestId("turn-card-9")).getByText("#9")).toBeInTheDocument();
+  });
+
+  it("keeps assistant tool calls and their outputs grouped across a pending prompt", () => {
+    const sentAt = Date.parse("2026-11-12T17:13:46.518Z");
+    const disk = [
+      turn({ index: 7, content: "Running", tool_calls: [{ name: "Bash", arguments: {} }], created_at: new Date(sentAt - 1000).toISOString() }),
+      turn({ index: 8, role: "tool", content: "Tool result", created_at: new Date(sentAt + 1000).toISOString() }),
+      turn({ index: 9, role: "user", content: "Later", created_at: new Date(sentAt + 10_000).toISOString() }),
+    ];
+    const merged = preserveOptimisticTurn(disk, { content: "Pending prompt", sentAt }, sentAt + 11_000);
+    const groups = coalesceTurnsWithToolOutputs(merged);
+    expect(groups[0].turn).toBe(disk[0]);
+    expect(groups[0].attachedToolOutputs).toEqual([disk[1]]);
+    expect(groups.map((group) => group.turn.content)).toEqual(["Running", "Pending prompt", "Later"]);
+  });
+
+  it("suppresses unmatched prompts after a user turn beyond the applicable skew", () => {
+    const sentAt = Date.parse("2026-11-12T17:13:46.518Z");
+    for (const [anchored, aheadMs] of [[false, 30_001], [true, 2_001]] as const) {
+      const pending = { content: "New prompt", sentAt, sentAtAnchored: anchored };
+      const disk = [turn({ index: 8, role: "user", content: "Later prompt", created_at: new Date(sentAt + aheadMs).toISOString() })];
+      expect(preserveOptimisticTurn(disk, pending, sentAt + 31_000)).toBe(disk);
+    }
+  });
+
   it("keeps a fresh optimistic user turn that disk does not have yet", () => {
     const merged = preserveOptimisticTurn(
       diskTurns,
@@ -720,7 +793,7 @@ describe("optimistic prompt preservation", () => {
     ).toHaveLength(0);
   });
 
-  it("keeps still-pending optimistic prompts at the tail of turns in sentAt order until they land on disk", () => {
+  it("keeps still-pending optimistic prompts in sentAt order before later replies until they land on disk", () => {
     const turnsWithTimestamps: TranscriptTurn[] = [
       turn({
         index: 10,
@@ -752,9 +825,9 @@ describe("optimistic prompt preservation", () => {
 
     expect(merged.map((t) => t.content)).toEqual([
       "Initial reply",
-      "Later reply while agent is busy",
       "First pending",
       "Second pending",
+      "Later reply while agent is busy",
     ]);
   });
 

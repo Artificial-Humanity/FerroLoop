@@ -791,9 +791,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
               {parsedWireIntent.intent}
             </span>
           )}
-          <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-dim)" }}>
-            #{turn.index}
-          </span>
+          {!turn.optimistic && (
+            <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-dim)" }}>
+              #{turn.index}
+            </span>
+          )}
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>

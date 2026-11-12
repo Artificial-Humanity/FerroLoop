@@ -634,6 +634,8 @@ export interface TranscriptToolCall {
 
 export interface TranscriptTurn {
   index: number;
+  /** Local placeholder awaiting its persisted transcript turn. */
+  optimistic?: boolean;
   role: "user" | "assistant" | "system" | string;
   content: string;
   thinking?: string | null;
