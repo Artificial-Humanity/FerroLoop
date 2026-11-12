@@ -3124,7 +3124,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   minWidth: 0,
                   overflow: "hidden",
                 }}
-                title={`Jump to your prompt at turn #${sinceLastPrompt.promptTurnIndex}`}
+                title={displayedTurns.find((turn) => turn.index === sinceLastPrompt.promptTurnIndex)?.optimistic
+                  ? "Jump to your pending prompt"
+                  : `Jump to your prompt at turn #${sinceLastPrompt.promptTurnIndex}`}
               >
                 <span
                   data-testid="since-last-prompt-text"

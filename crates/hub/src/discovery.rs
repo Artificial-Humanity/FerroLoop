@@ -4832,7 +4832,25 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+        // Claude records prompts delivered during an active turn as queued-command
+        // attachments rather than ordinary user messages. Only known prompt origins
+        // are eligible; task notifications and unknown origins are harness traffic.
+        let queued_prompt = (obj.get("type").and_then(Value::as_str) == Some("attachment"))
+            .then(|| val.get("attachment"))
+            .flatten()
+            .filter(|attachment| {
+                attachment.get("type").and_then(Value::as_str) == Some("queued_command")
+                    && attachment.get("commandMode").and_then(Value::as_str) == Some("prompt")
+                    && attachment
+                        .get("prompt")
+                        .is_some_and(|p| p.is_string() || p.is_array())
+                    && matches!(
+                        attachment.pointer("/origin/kind").and_then(Value::as_str),
+                        Some("human" | "peer")
+                    )
+            });
         if let Some(t) = obj.get("type").and_then(Value::as_str)
+            && queued_prompt.is_none()
             && (t.starts_with("api-request")
                 || matches!(
                     t,
@@ -4852,7 +4870,13 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         }
 
         // Determine role from Antigravity (`type` / `source`), Claude (`type` / `message.role`), or generic (`role`).
-        let role = if let Some(r) = obj.get("role").and_then(Value::as_str) {
+        let created_at = queued_prompt
+            .and_then(|attachment| attachment.get("timestamp").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .or(created_at);
+        let role = if queued_prompt.is_some() {
+            "user".to_string()
+        } else if let Some(r) = obj.get("role").and_then(Value::as_str) {
             normalize_role(r)
         } else if let Some(r) = val.pointer("/message/role").and_then(Value::as_str) {
             normalize_role(r)
@@ -4882,7 +4906,14 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
-        if let Some(c) = obj.get("content") {
+        if let Some(prompt) = queued_prompt.and_then(|attachment| attachment.get("prompt")) {
+            extract_content_and_tools(
+                prompt,
+                &mut content_parts,
+                &mut thinking_parts,
+                &mut tool_calls,
+            );
+        } else if let Some(c) = obj.get("content") {
             extract_content_and_tools(c, &mut content_parts, &mut thinking_parts, &mut tool_calls);
         } else if let Some(msg_c) = val.pointer("/message/content") {
             extract_content_and_tools(
@@ -11609,6 +11640,88 @@ mod tests {
                 .contains("Subscription quota exhausted")
         );
         assert!(!is_transcript_busy(&failed_turns));
+    }
+
+    #[test]
+    fn claude_queued_prompts_keep_file_order_timestamp_and_identity() {
+        let jsonl = [
+            serde_json::json!({"type":"assistant","timestamp":"2026-11-12T17:13:40Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{}}]}}),
+            serde_json::json!({"type":"attachment","timestamp":"2026-11-12T17:13:49Z","isSidechain":false,"attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"humanTurn":true,"prompt":"[Operator Prompt via FerroDeck — from owner]\n\nCheck this","timestamp":"2026-11-12T17:13:46.518Z"}}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"Read","input":{}}]}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"peer"},"prompt":"[Incoming NATS Message — already acknowledged]\nFrom: sonya\nSubject: Update\n\nDone","timestamp":"2026-11-12T17:13:50Z"}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"task-notification"},"prompt":"background task completed"}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"unknown"},"prompt":"unknown origin"}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","origin":{"kind":"human"},"prompt":"not a prompt"}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"other","commandMode":"prompt","origin":{"kind":"human"},"prompt":"not a queued command"}}),
+            serde_json::json!({"type":"attachment","content":"do not use fallback content","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"}}}),
+            serde_json::json!({"type":"attachment","isSidechain":true,"attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":"sidechain"}}),
+        ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 4);
+        assert_eq!(turns[0].role, "assistant");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[1].role, "user");
+        assert_eq!(turns[1].content, "Check this");
+        assert_eq!(
+            turns[1].created_at.as_deref(),
+            Some("2026-11-12T17:13:46.518Z")
+        );
+        assert_eq!(turns[1].index, 1);
+        assert_eq!(turns[2].role, "assistant");
+        assert_eq!(turns[2].tool_calls.len(), 1);
+        assert_eq!(turns[3].role, "wire:sonya");
+        assert_eq!(turns[3].content, "Done");
+    }
+
+    #[test]
+    fn claude_queued_human_prompt_accepts_multimodal_text_blocks() {
+        let line = serde_json::json!({"type":"attachment","attachment":{
+            "type":"queued_command", "commandMode":"prompt", "origin":{"kind":"human"},
+            "timestamp":"2026-11-12T17:13:46Z",
+            "prompt":[{"type":"image","source":{"type":"base64","data":"fixture"}}, {"type":"text","text":"Please check this"}]
+        }}).to_string();
+        let turns = parse_jsonl_transcript(&line);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "Please check this");
+    }
+
+    #[test]
+    fn other_vendor_mid_turn_prompts_remain_in_transcript_order() {
+        let codex = [
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","name":"read","arguments":"{}"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Codex update"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","name":"read","arguments":"{}"}}),
+        ];
+        let muse = [
+            serde_json::json!({"payload_type":"runtime.session","payload":{"kind":"run","event":{"kind":"assistant_tool_calls_committed","tool_calls":[{"name":"read","args":"{}"}]}}}),
+            serde_json::json!({"payload_type":"runtime.user_intent.accepted","payload":{"model_messages":[{"content":"Muse update"}]}}),
+            serde_json::json!({"payload_type":"runtime.session","payload":{"kind":"run","event":{"kind":"assistant_tool_calls_committed","tool_calls":[{"name":"read","args":"{}"}]}}}),
+        ];
+        let agy = [
+            serde_json::json!({"step_index":1,"type":"PLANNER_RESPONSE","tool_calls":[{"name":"read","arguments":{}}]}),
+            serde_json::json!({"step_index":2,"type":"USER_INPUT","content":"Antigravity update"}),
+            serde_json::json!({"step_index":3,"type":"PLANNER_RESPONSE","tool_calls":[{"name":"read","arguments":{}}]}),
+        ];
+        for (records, expected) in [
+            (codex, "Codex update"),
+            (muse, "Muse update"),
+            (agy, "Antigravity update"),
+        ] {
+            let text = records
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let turns = parse_jsonl_transcript(&text);
+            assert_eq!(turns.len(), 3, "{expected}");
+            assert_eq!(turns[0].role, "assistant", "{expected}");
+            assert!(!turns[0].tool_calls.is_empty(), "{expected}");
+            assert_eq!(turns[1].role, "user", "{expected}");
+            assert_eq!(turns[1].content, expected);
+            assert_eq!(turns[2].role, "assistant", "{expected}");
+            assert!(!turns[2].tool_calls.is_empty(), "{expected}");
+        }
     }
 
     #[test]
