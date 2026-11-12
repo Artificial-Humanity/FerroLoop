@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { FerroWatchUsage } from "./FerroWatchUsage";
 import { formatCurrencyFromMicros, useActiveCurrency } from "../lib/currency";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
@@ -2868,6 +2869,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 ))}
               </select>
             </div>
+
+            {isOwner && apiClient && typeof apiClient.getWatchUsage === "function" && (
+              <FerroWatchUsage apiClient={apiClient} />
+            )}
 
             {/* Totals Strip */}
             {activeTelemetry && (

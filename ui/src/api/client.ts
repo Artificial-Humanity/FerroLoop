@@ -110,6 +110,8 @@ import {
   type WatchBalancePolicy,
   type WatchRollupsResponse,
   type WatchSummaryResponse,
+  type WatchUsageGroup,
+  type WatchUsageReport,
   type WatchThresholdOverrides,
 } from "../types/api";
 import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
@@ -2300,6 +2302,11 @@ export class HubApiClient {
     }
     const serialized = qs.toString();
     return serialized ? `?${serialized}` : "";
+  }
+
+  public async getWatchUsage(options: { since: string; by: WatchUsageGroup }): Promise<WatchUsageReport> {
+    const query = new URLSearchParams({ since: options.since, by: options.by });
+    return this.request<WatchUsageReport>(`/api/v1/usage?${query.toString()}`);
   }
 
   public async getWatchSummary(

@@ -27,6 +27,7 @@ pub mod liveness;
 pub mod otlp;
 pub mod rollups;
 pub mod runtime;
+pub mod usage;
 
 use fl_core::ids::ProjectId;
 use fl_core::store::{Catalog, StoreError};
