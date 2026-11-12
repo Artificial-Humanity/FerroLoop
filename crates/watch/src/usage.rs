@@ -302,6 +302,55 @@ mod report_tests {
         );
     }
     #[test]
+    fn unavailable_turns_are_not_reported_as_zero() {
+        let missing = doc("missing", UsageVendor::Codex, Some(0), Some(1));
+        let query = UsageReportQuery {
+            since_ms: 1,
+            by: UsageGroupBy::Vendor,
+        };
+        let report =
+            aggregate_documents(std::slice::from_ref(&missing), &[], None, &query, 100).unwrap();
+        assert_eq!(report.rows[0].turns, None);
+        assert!(report.rows[0].turns_unavailable);
+        let mut known = doc("known", UsageVendor::Codex, Some(0), Some(1));
+        known.buckets[0].turns = 3;
+        known.buckets[0].turns_unavailable = false;
+        let report = aggregate_documents(&[missing, known], &[], None, &query, 100).unwrap();
+        assert_eq!(report.rows[0].turns, Some(3));
+        assert!(report.rows[0].turns_unavailable);
+    }
+    #[test]
+    fn many_deep_parent_mappings_resolve_without_quadratic_work() {
+        let n = 10_000;
+        let mut ids = Vec::new();
+        let mut docs = Vec::new();
+        ids.push(mapping("root", Some("Felix"), None, None));
+        for i in 0..n {
+            let id = format!("child-{i}");
+            let parent = if i == 0 {
+                "root".to_string()
+            } else {
+                format!("child-{}", i - 1)
+            };
+            ids.push(mapping(&id, None, Some(&parent), Some(10)));
+            docs.push(doc(&id, UsageVendor::Codex, Some(0), Some(1)));
+        }
+        let report = aggregate_documents(
+            &docs,
+            &ids,
+            None,
+            &UsageReportQuery {
+                since_ms: 1,
+                by: UsageGroupBy::Persona,
+            },
+            100,
+        )
+        .unwrap();
+        assert_eq!(report.rows[0].key, "Felix");
+        assert_eq!(report.rows[0].input, Some(n));
+        assert_eq!(report.rows[0].subagents, n);
+    }
+    #[test]
     fn aligned_window_overflow_and_invalid_input() {
         let docs = vec![
             doc("a", UsageVendor::Codex, Some(3_600_000), Some(u64::MAX)),

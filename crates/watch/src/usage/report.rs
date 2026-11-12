@@ -1,9 +1,7 @@
-use super::{
-    Attribution, IdentityMappingDocument, SourceUsageDocument, UsageBucket, resolve_persona,
-};
+use super::{Attribution, IdentityMappingDocument, SourceUsageDocument, UsageBucket};
 use fl_store::AnyStore;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const COLLECTION: &str = "watch_usage_v1";
 const HOUR: u64 = 3_600_000;
@@ -192,7 +190,7 @@ impl Accum {
         );
         add_value(
             &mut self.row.turns,
-            Some(b.turns),
+            (!b.turns_unavailable || b.turns > 0).then_some(b.turns),
             b.turns_unavailable,
             &mut self.unavailable[4],
             incomplete,
@@ -207,6 +205,76 @@ impl Accum {
         };
         self.row.turns_unavailable = self.unavailable[4];
         self.row
+    }
+}
+
+/// Index identity evidence once and memoize ancestry results for this report.
+/// The iterative traversal handles deep ancestry without consuming the call stack.
+struct IdentityIndex<'a> {
+    by_session: BTreeMap<&'a str, Vec<&'a IdentityMappingDocument>>,
+    resolved: HashMap<&'a str, Attribution>,
+}
+impl<'a> IdentityIndex<'a> {
+    fn new(mappings: &'a [IdentityMappingDocument]) -> Self {
+        let mut by_session: BTreeMap<&str, Vec<&IdentityMappingDocument>> = BTreeMap::new();
+        for mapping in mappings {
+            by_session
+                .entry(&mapping.session_id)
+                .or_default()
+                .push(mapping);
+        }
+        Self {
+            by_session,
+            resolved: HashMap::new(),
+        }
+    }
+    fn resolve(&mut self, session: &'a str) -> Attribution {
+        let mut path: Vec<(&str, Option<&str>)> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = session;
+        let mut result = loop {
+            if let Some(value) = self.resolved.get(current) {
+                break value.clone();
+            }
+            if !seen.insert(current) {
+                break Attribution::Ambiguous;
+            }
+            let Some(entries) = self.by_session.get(current) else {
+                break Attribution::Unattributed;
+            };
+            let mut persona = None;
+            let mut parent = None;
+            let mut conflict = false;
+            for entry in entries {
+                if let Some(p) = entry.persona.as_deref() {
+                    conflict |= persona.is_some_and(|old| old != p);
+                    persona = Some(p);
+                }
+                if let Some(p) = entry.parent_id.as_deref() {
+                    conflict |= parent.is_some_and(|old| old != p);
+                    parent = Some(p);
+                }
+            }
+            path.push((current, persona));
+            if conflict {
+                break Attribution::Ambiguous;
+            }
+            match parent {
+                Some(p) => current = p,
+                None => break Attribution::Unattributed,
+            }
+        };
+        while let Some((id, persona)) = path.pop() {
+            if let Some(persona) = persona {
+                result = match result {
+                    Attribution::Ambiguous => Attribution::Ambiguous,
+                    Attribution::Persona(ref p) if p != persona => Attribution::Ambiguous,
+                    _ => Attribution::Persona(persona.to_owned()),
+                };
+            }
+            self.resolved.insert(id, result.clone());
+        }
+        result
     }
 }
 
@@ -232,6 +300,13 @@ pub fn aggregate_documents(
     } else {
         coverage.incomplete = true;
     }
+    let mut index = IdentityIndex::new(identities);
+    let mut vendors = HashMap::new();
+    for source in sources {
+        vendors
+            .entry(source.session_id.as_str())
+            .or_insert(source.vendor);
+    }
     let mut rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut undated = Accum::default();
     undated.row.key = "undated".into();
@@ -249,7 +324,7 @@ pub fn aggregate_documents(
         coverage.oversized_lines = coverage
             .oversized_lines
             .saturating_add(source.coverage.oversized_lines);
-        let attribution = resolve_persona(&source.session_id, identities);
+        let attribution = index.resolve(&source.session_id);
         match attribution {
             Attribution::Unattributed => coverage.unattributed_sources += 1,
             Attribution::Ambiguous => coverage.ambiguous_sources += 1,
@@ -297,16 +372,14 @@ pub fn aggregate_documents(
         }
     }
     // Each session with a unique parent is one subagent; provenance duplicates do not multiply it.
-    let children: BTreeSet<&str> = identities
+    let children: Vec<&str> = index
+        .by_session
         .iter()
-        .filter(|m| m.parent_id.is_some())
-        .map(|m| m.session_id.as_str())
+        .filter(|(_, entries)| entries.iter().any(|m| m.parent_id.is_some()))
+        .map(|(id, _)| *id)
         .collect();
     for child in children {
-        let mappings: Vec<_> = identities
-            .iter()
-            .filter(|m| m.session_id == child)
-            .collect();
+        let mappings = &index.by_session[child];
         let parents: BTreeSet<_> = mappings
             .iter()
             .filter_map(|m| m.parent_id.as_deref())
@@ -328,14 +401,13 @@ pub fn aggregate_documents(
             continue;
         }
         let key = match query.by {
-            UsageGroupBy::Persona => match resolve_persona(child, identities) {
+            UsageGroupBy::Persona => match index.resolve(child) {
                 Attribution::Persona(p) => p,
                 _ => "unattributed".into(),
             },
-            UsageGroupBy::Vendor => sources
-                .iter()
-                .find(|s| s.session_id == child)
-                .map(|s| match s.vendor {
+            UsageGroupBy::Vendor => vendors
+                .get(child)
+                .map(|vendor| match vendor {
                     super::UsageVendor::Antigravity => "antigravity",
                     super::UsageVendor::Codex => "codex",
                     super::UsageVendor::Claude => "claude",
@@ -405,4 +477,53 @@ pub fn aggregate_usage(
         .transpose()
         .map_err(|e| UsageError::Store(e.to_string()))?;
     aggregate_documents(&sources, &identities, status, query, now_ms)
+}
+
+#[cfg(test)]
+mod indexed_attribution_tests {
+    use super::*;
+    fn mapping(id: &str, persona: Option<&str>, parent: Option<&str>) -> IdentityMappingDocument {
+        IdentityMappingDocument {
+            session_id: id.into(),
+            persona: persona.map(str::to_owned),
+            parent_id: parent.map(str::to_owned),
+            launch_time_ms: None,
+            provenance: "fixture".into(),
+        }
+    }
+    #[test]
+    fn indexed_resolution_matches_existing_identity_semantics() {
+        let mappings = vec![
+            mapping("parent", Some("Felix"), None),
+            mapping("child", None, Some("parent")),
+            mapping("consistent", Some("Felix"), Some("child")),
+            mapping("conflict", Some("Ferris"), Some("child")),
+            mapping("cycle1", None, Some("cycle2")),
+            mapping("cycle2", None, Some("cycle1")),
+            mapping("ambiguous", Some("Felix"), None),
+            mapping("ambiguous", Some("Ferris"), None),
+            mapping("orphan", Some("Felix"), Some("missing")),
+            mapping("parents", None, Some("parent")),
+            mapping("parents", None, Some("missing")),
+        ];
+        let mut index = IdentityIndex::new(&mappings);
+        for id in [
+            "parent",
+            "child",
+            "consistent",
+            "conflict",
+            "cycle1",
+            "cycle2",
+            "ambiguous",
+            "orphan",
+            "parents",
+            "missing",
+        ] {
+            assert_eq!(
+                index.resolve(id),
+                super::super::resolve_persona(id, &mappings),
+                "{id}"
+            );
+        }
+    }
 }

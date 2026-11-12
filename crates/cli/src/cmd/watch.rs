@@ -410,6 +410,17 @@ pub fn run_at(
                         "Undated observations: {} (outside the window)",
                         report.coverage.undated_observations
                     );
+                    let row = &report.undated;
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        row.key,
+                        number(row.input, row.unavailable.input),
+                        number(row.output, row.unavailable.output),
+                        number(row.cache_read, row.unavailable.cache_read),
+                        number(row.cache_write, row.unavailable.cache_write),
+                        number(row.turns, row.turns_unavailable),
+                        row.subagents
+                    );
                 }
                 if report.coverage.unknown_launch_times > 0 {
                     println!(

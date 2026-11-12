@@ -438,7 +438,24 @@ fn usage_reports_offline_windows_and_rejects_bad_arguments() {
         anchor: String::new(),
         discarding_line: false,
         parser: Default::default(),
-        buckets: vec![bucket],
+        buckets: vec![
+            bucket.clone(),
+            fl_watch::usage::UsageBucket {
+                hour_ms: None,
+                counts: fl_watch::usage::TokenCounts {
+                    input: Some(17),
+                    output: None,
+                    ..Default::default()
+                },
+                unavailable: fl_watch::usage::CategoryUnavailable {
+                    input: false,
+                    output: true,
+                    cache_read: true,
+                    cache_write: true,
+                },
+                ..bucket
+            },
+        ],
         coverage: Default::default(),
     };
     ferro
@@ -490,5 +507,7 @@ fn usage_reports_offline_windows_and_rejects_bad_arguments() {
     assert!(!out.status.success());
     let out = env.fl().args(["watch", "usage"]).output().unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Effective"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Effective"));
+    assert!(text.contains("undated\t17\tNo data"), "{text}");
 }
