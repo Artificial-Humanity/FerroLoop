@@ -59,6 +59,12 @@ pub struct ClaudeBaseline {
     pub counts: TokenCounts,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AntigravityLaunch {
+    pub session_id: String,
+    pub launch_time_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParserState {
     pub codex_totals: Option<TokenCounts>,
@@ -75,6 +81,8 @@ pub struct ParserState {
     pub antigravity_seen: Vec<u64>,
     #[serde(default)]
     pub antigravity_parents: Vec<String>,
+    #[serde(default)]
+    pub antigravity_launches: Vec<AntigravityLaunch>,
     #[serde(default)]
     pub claude_seen: Vec<u64>,
     pub model: Option<String>,

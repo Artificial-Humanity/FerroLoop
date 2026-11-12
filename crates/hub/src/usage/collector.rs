@@ -37,7 +37,7 @@ pub fn read_identities(store: &AnyStore) -> anyhow::Result<Vec<IdentityMappingDo
     Ok(result)
 }
 
-fn put_identity(store: &AnyStore, identity: &IdentityMappingDocument) -> anyhow::Result<()> {
+fn put_identity(store: &AnyStore, identity: &IdentityMappingDocument) -> anyhow::Result<bool> {
     let ferro = store
         .as_ferro()
         .ok_or_else(|| anyhow::anyhow!("usage unsupported on redb backend"))?;
@@ -45,12 +45,12 @@ fn put_identity(store: &AnyStore, identity: &IdentityMappingDocument) -> anyhow:
         "identity",
         &format!("{}\0{}", identity.session_id, identity.provenance),
     );
-    ferro.put_doc(
-        COLLECTION,
-        &id,
-        &serde_json::json!({"kind":"identity", "document":identity}),
-    )?;
-    Ok(())
+    let document = serde_json::json!({"kind":"identity", "document":identity});
+    if ferro.get_doc(COLLECTION, &id)?.as_ref() == Some(&document) {
+        return Ok(false);
+    }
+    ferro.put_doc(COLLECTION, &id, &document)?;
+    Ok(true)
 }
 
 fn read_source(
@@ -98,6 +98,21 @@ fn save_candidate(
             COLLECTION,
             &key("source", &source.source_id),
             &serde_json::json!({"kind":"source", "document":candidate}),
+        )?;
+    }
+    for launch in &candidate.parser.antigravity_launches {
+        put_identity(
+            store,
+            &IdentityMappingDocument {
+                session_id: launch.session_id.clone(),
+                persona: None,
+                parent_id: Some(candidate.session_id.clone()),
+                launch_time_ms: Some(launch.launch_time_ms),
+                provenance: format!(
+                    "antigravity-launch:{}:{}",
+                    candidate.session_id, launch.launch_time_ms
+                ),
+            },
         )?;
     }
     for parent in &candidate.parser.antigravity_parents {
@@ -348,6 +363,97 @@ mod tests {
         };
         let store = fl_store::open_store_with(&dir.path().join("test.fls"), &opts).unwrap();
         (dir, store)
+    }
+    #[test]
+    fn identical_identity_is_not_written_again() {
+        let (_dir, store) = store();
+        let identity = IdentityMappingDocument {
+            session_id: "child".into(),
+            persona: Some("Felix".into()),
+            parent_id: None,
+            launch_time_ms: None,
+            provenance: "route".into(),
+        };
+        assert!(put_identity(&store, &identity).unwrap());
+        assert!(!put_identity(&store, &identity).unwrap());
+        let changed = IdentityMappingDocument {
+            launch_time_ms: Some(1794313800000),
+            ..identity
+        };
+        assert!(put_identity(&store, &changed).unwrap());
+    }
+    #[test]
+    fn discovered_launch_result_counts_once_in_window() {
+        let (_dir, store) = store();
+        let home = tempfile::tempdir().unwrap();
+        let logs = home
+            .path()
+            .join(".gemini/antigravity-cli/brain/parent/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut file = std::fs::File::create(logs.join("transcript.jsonl")).unwrap();
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let content = format!(
+            "Created At: 2026-11-10T12:30:00Z\nCompleted At: 2026-11-10T12:30:01Z\nCreated the following subagent:\n{{\n  \"conversationId\": \"{child}\",\n  \"logAbsoluteUri\": \"private text\",\n  \"workspaceUris\": []\n}}\nThe subagent will send you a message."
+        );
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"GENERIC", "content":content})
+        )
+        .unwrap();
+        drop(file);
+        let (mut sources, incomplete) = discover_usage_sources(home.path());
+        assert!(!incomplete);
+        assert_eq!(sources.len(), 1);
+        let source = sources.pop().unwrap();
+        assert_eq!(source.session_id, "parent");
+        let identity = IdentityMappingDocument {
+            session_id: "parent".into(),
+            persona: Some("Felix".into()),
+            parent_id: None,
+            launch_time_ms: None,
+            provenance: "route".into(),
+        };
+        collect_once(
+            &store,
+            std::slice::from_ref(&source),
+            std::slice::from_ref(&identity),
+            ScanLimits::default(),
+        )
+        .unwrap();
+        collect_once(&store, &[source], &[identity], ScanLimits::default()).unwrap();
+        let sources = read_sources(&store).unwrap();
+        let identities = read_identities(&store).unwrap();
+        assert!(
+            !serde_json::to_string(&identities)
+                .unwrap()
+                .contains("private text")
+        );
+        assert!(identities.iter().any(|m| m.session_id == child
+            && m.parent_id.as_deref() == Some("parent")
+            && m.launch_time_ms == Some(1794313800000)));
+        let query = fl_watch::usage::UsageReportQuery {
+            since_ms: 1794312000000,
+            by: fl_watch::usage::UsageGroupBy::Persona,
+        };
+        let report = fl_watch::usage::aggregate_documents(
+            &sources,
+            &identities,
+            None,
+            &query,
+            1794315600000,
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .find(|r| r.key == "Felix")
+                .unwrap()
+                .subagents,
+            1
+        );
+        assert_eq!(report.coverage.unknown_launch_times, 0);
     }
     #[test]
     fn scan_commit_and_deleted_source_are_idempotent() {

@@ -121,10 +121,45 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
     if vendor == UsageVendor::Grok {
         return ParseOutcome::Incomplete;
     }
-    let hour = timestamp(v.get("timestamp").or_else(|| v.get("created_at")));
+    let hour = timestamp(
+        v.get("timestamp")
+            .or_else(|| v.get("created_at"))
+            .or_else(|| v.get("recorded_at")),
+    );
     let kind = v.get("type").and_then(Value::as_str);
     match vendor {
         UsageVendor::Antigravity => {
+            // An invoke_subagent tool result records its own creation timestamp and
+            // the newly created conversation ID. Retain only these fields; neither
+            // the result body nor its workspace paths belong in usage documents.
+            if kind == Some("GENERIC")
+                && let Some(content) = v.get("content").and_then(Value::as_str)
+                && let Some(created) = content
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("Created At: "))
+                && let Some(launch_time_ms) =
+                    crate::discovery::parse_timestamp_value_ms(&Value::String(created.to_owned()))
+                && let Some((_, object)) = content.split_once("Created the following subagent:\n")
+                && let Some(Ok(result)) = serde_json::Deserializer::from_str(object.trim_start())
+                    .into_iter::<Value>()
+                    .next()
+                && let Some(id) = result
+                    .get("conversationId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            {
+                let launch = fl_watch::usage::AntigravityLaunch {
+                    session_id: id.to_string(),
+                    launch_time_ms,
+                };
+                if !state.antigravity_launches.contains(&launch) {
+                    if state.antigravity_launches.len() >= 4096 {
+                        return ParseOutcome::Incomplete;
+                    }
+                    state.antigravity_launches.push(launch);
+                }
+            }
             if kind == Some("GENERIC")
                 && let Some(id) = v
                     .get("content")
@@ -360,6 +395,32 @@ mod tests {
         } else {
             panic!("expected observation: {outcome:?}")
         }
+    }
+    #[test]
+    fn muse_recorded_at_microseconds_sets_hour() {
+        let mut state = ParserState::default();
+        let line = br#"{"recorded_at":1794313800000000,"payload":{"event":{"kind":"model_completed","usage":{"input_tokens":25,"output_tokens":3}}}}"#;
+        let bucket = observation(parse_line(UsageVendor::Muse, line, &mut state));
+        assert_eq!(bucket.hour_ms, Some(1794312000000));
+        assert_eq!(bucket.counts.input, Some(25));
+    }
+    #[test]
+    fn launch_result_requires_structured_identity_and_recorded_time() {
+        let mut state = ParserState::default();
+        let result = serde_json::json!({"type":"GENERIC", "content":"Created the following subagent:\n{\"conversationId\":\"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\"}"});
+        parse_line(
+            UsageVendor::Antigravity,
+            result.to_string().as_bytes(),
+            &mut state,
+        );
+        assert!(state.antigravity_launches.is_empty());
+        let result = serde_json::json!({"type":"GENERIC", "content":"Created At: 2026-11-10T12:30:00Z\nCreated the following subagent:\n{\"conversationId\":\"invalid\"}"});
+        parse_line(
+            UsageVendor::Antigravity,
+            result.to_string().as_bytes(),
+            &mut state,
+        );
+        assert!(state.antigravity_launches.is_empty());
     }
     #[test]
     fn antigravity_planner_records_real_fields_and_marks_missing_write() {
