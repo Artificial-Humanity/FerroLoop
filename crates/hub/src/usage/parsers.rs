@@ -215,9 +215,6 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
             else {
                 return ParseOutcome::Ignore;
             };
-            if state.codex_unsafe {
-                return ParseOutcome::Incomplete;
-            }
             let c = counts(
                 total,
                 "input_tokens",
@@ -229,6 +226,9 @@ pub fn parse_line(vendor: UsageVendor, bytes: &[u8], state: &mut ParserState) ->
                 state.codex_totals = Some(c);
                 state.codex_baseline_only = false;
                 state.codex_unsafe = false;
+                return ParseOutcome::Incomplete;
+            }
+            if state.codex_unsafe {
                 return ParseOutcome::Incomplete;
             }
             let delta = if let Some(previous) = &state.codex_totals {

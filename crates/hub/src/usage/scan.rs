@@ -262,7 +262,13 @@ fn scan_source_with_hook(
         }
         match source.vendor {
             UsageVendor::Codex => doc.parser.codex_baseline_only = true,
-            UsageVendor::Antigravity => doc.parser.antigravity_unsafe = true,
+            // Without a prior index there is no high-water mark to recover
+            // against. Continue through the existing bounded replay filter,
+            // with the generation permanently marked incomplete: altered
+            // replays cannot be distinguished from genuinely new records.
+            UsageVendor::Antigravity => {
+                doc.parser.antigravity_unsafe = doc.parser.antigravity_last_step.is_some()
+            }
             _ => {}
         }
         return Ok(doc);
@@ -623,5 +629,54 @@ mod tests {
         let next = scan_source(&src, Some(&baseline), ScanLimits::default()).unwrap();
         assert_eq!(next.buckets[0].counts.input, Some(15));
         assert!(next.coverage.incomplete);
+    }
+    #[test]
+    fn codex_reset_then_rotation_recovers_after_new_baseline() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let record = |count| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":count}}}})
+            )
+        };
+        f.write_all(record(10).as_bytes()).unwrap();
+        let mut src = source(f.path());
+        src.vendor = UsageVendor::Codex;
+        let first = scan_source(&src, None, ScanLimits::default()).unwrap();
+        f.write_all(record(1).as_bytes()).unwrap();
+        let reset = scan_source(&src, Some(&first), ScanLimits::default()).unwrap();
+        assert!(reset.parser.codex_unsafe);
+        std::fs::write(f.path(), b"{}\n").unwrap();
+        let rotated = scan_source(&src, Some(&reset), ScanLimits::default()).unwrap();
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(record(100).as_bytes()).unwrap();
+        let baseline = scan_source(&src, Some(&rotated), ScanLimits::default()).unwrap();
+        assert!(!baseline.parser.codex_unsafe);
+        assert_eq!(baseline.buckets[0].counts.input, Some(10));
+        f.write_all(record(105).as_bytes()).unwrap();
+        let next = scan_source(&src, Some(&baseline), ScanLimits::default()).unwrap();
+        assert_eq!(next.buckets[0].counts.input, Some(15));
+        assert!(next.coverage.incomplete);
+    }
+
+    #[test]
+    fn unindexed_antigravity_rotation_continues_with_replay_filter() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let old_line = b"{\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":10}\n";
+        f.write_all(old_line).unwrap();
+        let src = source(f.path());
+        let old = scan_source(&src, None, ScanLimits::default()).unwrap();
+        std::fs::write(f.path(), b"{}\n").unwrap();
+        let rotated = scan_source(&src, Some(&old), ScanLimits::default()).unwrap();
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(old_line).unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":20}\n")
+            .unwrap();
+        let next = scan_source(&src, Some(&rotated), ScanLimits::default()).unwrap();
+        assert_eq!(next.buckets[0].counts.input, Some(30));
+        assert!(next.coverage.incomplete);
+        assert!(next.coverage.ambiguous_generation);
     }
 }
