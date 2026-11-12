@@ -398,3 +398,185 @@ fn a_lone_redb_under_the_ferro_engine_is_not_migrated() {
     assert_eq!(after.permissions().mode() & 0o777, 0o644, "not chmodded");
     assert_eq!(after.modified().unwrap(), meta.modified().unwrap());
 }
+
+#[test]
+fn usage_reports_offline_windows_and_rejects_bad_arguments() {
+    let env = Env::new();
+    let store = env.open();
+    let ferro = store.as_ferro().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let bucket = fl_watch::usage::UsageBucket {
+        model: Some("fixture-model".into()),
+        hour_ms: Some(now / 3_600_000 * 3_600_000),
+        counts: fl_watch::usage::TokenCounts {
+            input: Some(42),
+            output: Some(0),
+            cache_read: None,
+            cache_write: None,
+        },
+        turns: 0,
+        turns_unavailable: true,
+        unavailable: fl_watch::usage::CategoryUnavailable {
+            input: false,
+            output: false,
+            cache_read: true,
+            cache_write: true,
+        },
+        missing: Default::default(),
+        observations: 1,
+    };
+    let source = fl_watch::usage::SourceUsageDocument {
+        source_id: "safe".into(),
+        session_id: "s".into(),
+        vendor: fl_watch::usage::UsageVendor::Codex,
+        offset: 0,
+        generation: 0,
+        file_identity: None,
+        anchor: String::new(),
+        discarding_line: false,
+        parser: fl_watch::usage::ParserState {
+            parser_revision: Some(fl_watch::usage::USAGE_PARSER_REVISION),
+            ..Default::default()
+        },
+        buckets: vec![
+            bucket.clone(),
+            fl_watch::usage::UsageBucket {
+                hour_ms: None,
+                counts: fl_watch::usage::TokenCounts {
+                    input: Some(17),
+                    output: None,
+                    ..Default::default()
+                },
+                unavailable: fl_watch::usage::CategoryUnavailable {
+                    input: false,
+                    output: true,
+                    cache_read: true,
+                    cache_write: true,
+                },
+                ..bucket
+            },
+        ],
+        coverage: Default::default(),
+    };
+    ferro
+        .put_doc(
+            "watch_usage_v1",
+            "source-1",
+            &json!({"kind":"source","document":source}),
+        )
+        .unwrap();
+    ferro
+        .put_doc(
+            "watch_usage_v1",
+            "collector-status",
+            &json!({"kind":"status","last_success_ms":now,"pending":false,"incomplete":false}),
+        )
+        .unwrap();
+    drop(store);
+    let out = env
+        .fl()
+        .args([
+            "watch", "usage", "--since", "48h", "--by", "vendor", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = json_of(&out.stdout);
+    assert_eq!(report["rows"][0]["key"], "codex");
+    assert_eq!(report["rows"][0]["input"], 42);
+    assert!(report["rows"][0]["cache_read"].is_null());
+    assert!(
+        report["effective_start_ms"].as_u64().unwrap()
+            <= report["requested_start_ms"].as_u64().unwrap()
+    );
+    let out = env
+        .fl()
+        .args(["watch", "usage", "--since", "0h"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = env
+        .fl()
+        .args(["watch", "usage", "--by", "bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let help = env
+        .fl()
+        .args(["watch", "usage", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("possible values: persona, vendor, model")
+    );
+    let out = env.fl().args(["watch", "usage"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Effective"));
+    assert!(text.contains("undated\t17\tNo data"), "{text}");
+    assert!(
+        text.contains("not dated; excluded from this window"),
+        "{text}"
+    );
+    assert!(text.contains("unattributed: 1"), "{text}");
+    assert!(text.contains("Codex input includes cache"), "{text}");
+}
+
+#[test]
+fn usage_collection_is_not_in_ferrostate_search_or_render() {
+    let env = Env::new();
+    let store = env.open();
+    store
+        .as_ferro()
+        .unwrap()
+        .put_doc(
+            "watch_usage_v1",
+            "usage-isolation",
+            &json!({"kind":"source", "document":{"marker":"xqzusageisolationmarker"}}),
+        )
+        .unwrap();
+    drop(store);
+    let search = env
+        .fl()
+        .args(["state", "search", "xqzusageisolationmarker", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert_eq!(json_of(&search.stdout)["total_hits"], 0);
+    let render = env
+        .fl()
+        .args(["state", "render", "--scope", "workspace"])
+        .output()
+        .unwrap();
+    assert!(
+        render.status.success(),
+        "{}",
+        String::from_utf8_lossy(&render.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&render.stdout).contains("xqzusageisolationmarker"));
+}
+
+#[test]
+fn empty_usage_text_says_no_usage() {
+    let env = Env::new();
+    let store = env.open();
+    drop(store);
+    let output = env.fl().args(["watch", "usage"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No usage for this period."));
+}

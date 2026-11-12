@@ -2331,3 +2331,33 @@ export interface WatchBalanceApplyResponse {
   warnings?: string[];
 }
 
+
+/** Durable FerroWatch usage report, returned to Owners. */
+export type WatchUsageGroup = "persona" | "vendor" | "model";
+export interface WatchUsageRow {
+  key: string;
+  input: number | null;
+  output: number | null;
+  cache_read: number | null;
+  cache_write: number | null;
+  turns: number | null;
+  subagents: number;
+  unavailable: { input: boolean; output: boolean; cache_read: boolean; cache_write: boolean };
+  turns_unavailable: boolean;
+}
+export interface WatchUsageReport {
+  requested_start_ms: number;
+  requested_end_ms: number;
+  effective_start_ms: number;
+  effective_end_ms: number;
+  by: WatchUsageGroup;
+  unit: string;
+  rows: WatchUsageRow[];
+  undated: WatchUsageRow;
+  coverage: {
+    incomplete: boolean; pending: boolean; unavailable_sources: number; unverified_prefix_sources?: number; stale_parser_sources?: number;
+    malformed_lines: number; oversized_lines: number; last_success_ms: number | null;
+    unattributed_sources: number; ambiguous_sources: number; unknown_launch_times: number;
+    undated_observations: number;
+  };
+}

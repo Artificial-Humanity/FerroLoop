@@ -30,6 +30,26 @@ pub(crate) const MAX_HTTP_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_WS_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn usage_error_backoff(failures: &mut u32) -> Duration {
+    let exponent = (*failures).min(4);
+    *failures = failures.saturating_add(1);
+    Duration::from_secs((30u64 << exponent).min(300))
+}
+
+#[cfg(test)]
+#[test]
+fn usage_error_backoff_is_bounded_and_can_be_reset() {
+    let mut failures = 0;
+    assert_eq!(usage_error_backoff(&mut failures), Duration::from_secs(30));
+    assert_eq!(usage_error_backoff(&mut failures), Duration::from_secs(60));
+    for _ in 0..10 {
+        usage_error_backoff(&mut failures);
+    }
+    assert_eq!(usage_error_backoff(&mut failures), Duration::from_secs(300));
+    failures = 0;
+    assert_eq!(usage_error_backoff(&mut failures), Duration::from_secs(30));
+}
+
 /// The most connections the hub serves at once, every phase counted: reading a request,
 /// running a handler, and a WebSocket session. The accept loop answers `503` to any more. A
 /// FerroDeck tab uses a handful of short connections and one WebSocket, so 256 leaves room for
@@ -267,6 +287,50 @@ impl HubServer {
                 }
             });
         }
+        // One hub-owned worker performs scans serially, away from the async accept loop.
+        let usage_state = state.clone();
+        let mut usage_stop = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::usage::collector::CollectionScheduler::default(),
+            ));
+            let mut failures = 0;
+            loop {
+                let work = usage_state.clone();
+                let collector = scheduler.clone();
+                let delay = match tokio::task::spawn_blocking(move || {
+                    let mut schedule = collector.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::usage::collector::collect_hub(&work, &mut schedule)
+                })
+                .await
+                {
+                    Ok(Ok(pending)) => {
+                        failures = 0;
+                        Duration::from_secs(if pending { 1 } else { 30 })
+                    }
+                    Ok(Err(error))
+                        if error
+                            .downcast_ref::<crate::usage::collector::UsageUnsupported>()
+                            .is_some() =>
+                    {
+                        eprintln!("usage collector stopped: {error}");
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("usage collector failed: {error}");
+                        usage_error_backoff(&mut failures)
+                    }
+                    Err(error) => {
+                        eprintln!("usage collector task failed: {error}");
+                        usage_error_backoff(&mut failures)
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = usage_stop.wait_for(|down| *down) => break,
+                }
+            }
+        });
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut hosted_reconcile_tick = tokio::time::interval_at(

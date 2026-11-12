@@ -786,6 +786,33 @@ pub fn discover_route_sessions_without_model_info(
     discover_sessions_impl(snap, home_override, false)
 }
 
+/// Retain all route claims for usage attribution, including conflicting personas.
+/// Unlike session discovery, this deliberately does not deduplicate native IDs.
+pub(crate) fn usage_route_claims(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<(String, String, String)> {
+    let routes = discovered_route_table(home_override);
+    let file_decommissioned = fl_wire::identity::load_decommissioned_session_ids(home_override);
+    routes
+        .entries
+        .into_iter()
+        .filter_map(|(persona, entry)| {
+            if (!entry.explicit && snap.retired_names.contains(&persona.to_ascii_lowercase()))
+                || route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route)
+                || route_was_decommissioned(&file_decommissioned, &entry.route)
+            {
+                return None;
+            }
+            let (vendor, id) = entry.route.session_identity()?;
+            if id.trim().is_empty() {
+                return None;
+            }
+            Some((id.to_owned(), persona, vendor.to_owned()))
+        })
+        .collect()
+}
+
 /// Shared body of [`discover_sessions_from_snapshot`]. `with_model_info` is false for
 /// callers that only look a session up by id, so they never read model files or transcripts
 /// for quota, run a quota probe, or wait on a language server.
