@@ -304,6 +304,14 @@ pub fn aggregate_documents(
     } else {
         coverage.incomplete = true;
     }
+    fn same_usage(a: &SourceUsageDocument, b: &SourceUsageDocument) -> bool {
+        let mut a: Vec<_> = a.buckets.iter().collect();
+        let mut b: Vec<_> = b.buckets.iter().collect();
+        let key = |bucket: &&UsageBucket| (bucket.model.clone(), bucket.hour_ms);
+        a.sort_by_key(key);
+        b.sort_by_key(key);
+        a == b
+    }
     // The workflow file is a copy of a regular Claude subagent transcript in
     // known layouts. Preserve either source when it is the only retained one,
     // but never sum both documents. Different file contents cannot be merged
@@ -319,7 +327,7 @@ pub fn aggregate_documents(
         }) = super::claude_workflow_path(&source.source_id)
         {
             if let Some((prior_idx, prior_workflow)) = canonical.get_mut(&key) {
-                coverage.incomplete = true;
+                coverage.incomplete |= !same_usage(&sources[*prior_idx], source);
                 if (*prior_workflow && !workflow)
                     || (*prior_workflow == workflow
                         && source.source_id < sources[*prior_idx].source_id)
@@ -747,6 +755,71 @@ mod review_regressions {
         )
         .unwrap();
         assert_eq!(only_workflow.rows[0].input, Some(15));
+    }
+    #[test]
+    fn matching_workflow_copies_do_not_mark_coverage_incomplete() {
+        let base = "/home/x/.claude/projects/p/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/subagents";
+        let regular = source(&format!("{base}/agent-123.jsonl"), UsageVendor::Claude);
+        let mut workflow = source(
+            &format!("{base}/workflows/wf_1/agent-123.jsonl"),
+            UsageVendor::Claude,
+        );
+        let query = UsageReportQuery {
+            since_ms: 1,
+            by: UsageGroupBy::Vendor,
+        };
+        let status = Some(CollectorStatus::default());
+        let report = aggregate_documents(
+            &[regular.clone(), workflow.clone()],
+            &[],
+            status.clone(),
+            &query,
+            7_200_000,
+        )
+        .unwrap();
+        assert_eq!(report.rows[0].input, Some(10));
+        assert!(!report.coverage.incomplete);
+        workflow.buckets[0].observations += 1;
+        let different = aggregate_documents(
+            &[regular.clone(), workflow.clone()],
+            &[],
+            status.clone(),
+            &query,
+            7_200_000,
+        )
+        .unwrap();
+        assert!(different.coverage.incomplete);
+        workflow.buckets[0].observations -= 1;
+        workflow.buckets[0].counts.input = Some(11);
+        let different = aggregate_documents(
+            &[regular.clone(), workflow.clone()],
+            &[],
+            status.clone(),
+            &query,
+            7_200_000,
+        )
+        .unwrap();
+        assert!(different.coverage.incomplete);
+        workflow.buckets[0].counts.input = Some(10);
+        workflow.buckets[0].unavailable.input = true;
+        let different = aggregate_documents(
+            &[regular.clone(), workflow.clone()],
+            &[],
+            status.clone(),
+            &query,
+            7_200_000,
+        )
+        .unwrap();
+        assert!(different.coverage.incomplete);
+        workflow.buckets[0].unavailable.input = false;
+        let mut second = regular.buckets[0].clone();
+        second.model = Some("another-model".into());
+        let mut regular = regular;
+        regular.buckets.push(second.clone());
+        workflow.buckets.insert(0, second);
+        let matching =
+            aggregate_documents(&[regular, workflow], &[], status, &query, 7_200_000).unwrap();
+        assert!(!matching.coverage.incomplete);
     }
     #[test]
     fn malformed_source_or_identity_is_skipped_with_incomplete_coverage() {
