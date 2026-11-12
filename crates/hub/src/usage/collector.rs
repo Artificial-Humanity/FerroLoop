@@ -454,6 +454,60 @@ mod tests {
             1
         );
         assert_eq!(report.coverage.unknown_launch_times, 0);
+
+        // The child has no transcript yet; the launch result still identifies its vendor.
+        let vendor_query = fl_watch::usage::UsageReportQuery {
+            by: fl_watch::usage::UsageGroupBy::Vendor,
+            ..query
+        };
+        let vendor_report = fl_watch::usage::aggregate_documents(
+            &sources,
+            &identities,
+            None,
+            &vendor_query,
+            1794315600000,
+        )
+        .unwrap();
+        assert_eq!(
+            vendor_report
+                .rows
+                .iter()
+                .find(|r| r.key == "antigravity")
+                .unwrap()
+                .subagents,
+            1
+        );
+        assert!(
+            !vendor_report
+                .rows
+                .iter()
+                .any(|r| r.key == "unknown" && r.subagents > 0)
+        );
+
+        // A contradictory child source must not be silently assigned to either vendor.
+        let mut conflicting = sources.clone();
+        let mut child_source = sources[0].clone();
+        child_source.session_id = child.into();
+        child_source.vendor = UsageVendor::Codex;
+        conflicting.push(child_source);
+        let conflict_report = fl_watch::usage::aggregate_documents(
+            &conflicting,
+            &identities,
+            None,
+            &vendor_query,
+            1794315600000,
+        )
+        .unwrap();
+        assert_eq!(
+            conflict_report
+                .rows
+                .iter()
+                .find(|r| r.key == "unknown")
+                .unwrap()
+                .subagents,
+            1
+        );
+        assert!(conflict_report.coverage.incomplete);
     }
     #[test]
     fn scan_commit_and_deleted_source_are_idempotent() {

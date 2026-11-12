@@ -305,7 +305,12 @@ pub fn aggregate_documents(
     for source in sources {
         vendors
             .entry(source.session_id.as_str())
-            .or_insert(source.vendor);
+            .and_modify(|vendor: &mut Option<super::UsageVendor>| {
+                if *vendor != Some(source.vendor) {
+                    *vendor = None;
+                }
+            })
+            .or_insert(Some(source.vendor));
     }
     let mut rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut undated = Accum::default();
@@ -405,17 +410,37 @@ pub fn aggregate_documents(
                 Attribution::Persona(p) => p,
                 _ => "unattributed".into(),
             },
-            UsageGroupBy::Vendor => vendors
-                .get(child)
-                .map(|vendor| match vendor {
-                    super::UsageVendor::Antigravity => "antigravity",
-                    super::UsageVendor::Codex => "codex",
-                    super::UsageVendor::Claude => "claude",
-                    super::UsageVendor::Muse => "muse",
-                    super::UsageVendor::Grok => "grok",
-                })
-                .unwrap_or("unknown")
-                .into(),
+            UsageGroupBy::Vendor => {
+                // Only the collector's structured launch mapping is vendor evidence;
+                // unrelated identity provenance cannot identify a child's vendor.
+                let parent = *parents.first().unwrap();
+                let antigravity_launch = mappings.iter().any(|mapping| {
+                    mapping.parent_id.as_deref() == Some(parent)
+                        && mapping.launch_time_ms == Some(time)
+                        && mapping.provenance == format!("antigravity-launch:{parent}:{time}")
+                });
+                let source_vendor = vendors.get(child).copied();
+                let vendor = match (source_vendor, antigravity_launch) {
+                    (None, true) | (Some(Some(super::UsageVendor::Antigravity)), true) => {
+                        Some(super::UsageVendor::Antigravity)
+                    }
+                    (Some(Some(vendor)), false) => Some(vendor),
+                    (Some(None), _) | (Some(Some(_)), true) => {
+                        coverage.incomplete = true;
+                        None
+                    }
+                    (None, false) => None,
+                };
+                match vendor {
+                    Some(super::UsageVendor::Antigravity) => "antigravity",
+                    Some(super::UsageVendor::Codex) => "codex",
+                    Some(super::UsageVendor::Claude) => "claude",
+                    Some(super::UsageVendor::Muse) => "muse",
+                    Some(super::UsageVendor::Grok) => "grok",
+                    None => "unknown",
+                }
+                .into()
+            }
             UsageGroupBy::Model => "unknown".into(),
         };
         let row = rows.entry(key.clone()).or_default();
