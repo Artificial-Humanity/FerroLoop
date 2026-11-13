@@ -1035,8 +1035,70 @@ pub fn repair_claude_session_transcript_tail(
     Ok(removed_bytes.len())
 }
 
+/// Return a Claude queued prompt attachment only for conversational human or peer input.
+pub fn claude_queued_prompt(val: &Value) -> Option<&Value> {
+    if val.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || val.get("type").and_then(Value::as_str) != Some("attachment")
+    {
+        return None;
+    }
+    val.get("attachment").filter(|attachment| {
+        attachment.get("type").and_then(Value::as_str) == Some("queued_command")
+            && attachment.get("commandMode").and_then(Value::as_str) == Some("prompt")
+            && attachment
+                .get("prompt")
+                .is_some_and(|p| p.is_string() || p.is_array())
+            && matches!(
+                attachment.pointer("/origin/kind").and_then(Value::as_str),
+                Some("human" | "peer")
+            )
+    })
+}
+
+// Match the hub's text extraction for queued prompt blocks. Thinking and tool calls
+// are not conversational text; nested tool results may contain further text blocks.
+fn extract_queued_prompt_text(content: &Value, parts: &mut Vec<String>) {
+    match content {
+        Value::String(s) if !s.trim().is_empty() => parts.push(s.trim().to_string()),
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) if !s.trim().is_empty() => parts.push(s.trim().to_string()),
+                    Value::Object(map) => {
+                        let kind = map.get("type").and_then(Value::as_str).unwrap_or("");
+                        let text = match kind {
+                            "thinking" | "tool_use" | "tool_call" => None,
+                            "tool_result" => {
+                                if let Some(nested) = map.get("content") {
+                                    extract_queued_prompt_text(nested, parts);
+                                }
+                                None
+                            }
+                            "text" => map.get("text"),
+                            _ => map.get("text").or_else(|| map.get("content")),
+                        };
+                        if let Some(text) = text.and_then(Value::as_str)
+                            && !text.trim().is_empty()
+                        {
+                            parts.push(text.trim().to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extract displayable text / tool summary content from a Claude JSONL record.
 pub fn extract_claude_message_content(val: &Value) -> String {
+    if let Some(prompt) = claude_queued_prompt(val).and_then(|attachment| attachment.get("prompt"))
+    {
+        let mut parts = Vec::new();
+        extract_queued_prompt_text(prompt, &mut parts);
+        return parts.join("\n");
+    }
     let Some(content) = val
         .get("content")
         .or_else(|| val.pointer("/message/content"))
@@ -1126,6 +1188,9 @@ pub fn classify_claude_turn_role(val: &Value) -> Option<String> {
     let obj = val.as_object()?;
     if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return None;
+    }
+    if claude_queued_prompt(val).is_some() {
+        return Some("user".to_string());
     }
     if let Some(t) = obj.get("type").and_then(Value::as_str)
         && is_claude_skipped_record_type(t)
@@ -1309,9 +1374,7 @@ pub fn estimate_claude_post_compaction_context(
             continue;
         }
 
-        if matches!(record_type, "user" | "assistant")
-            && !is_claude_skipped_record_type(record_type)
-        {
+        if matches!(record_type, "user" | "assistant") || claude_queued_prompt(&val).is_some() {
             post_compact_conversational_bytes =
                 post_compact_conversational_bytes.saturating_add(no_cr.len() as u64);
         }

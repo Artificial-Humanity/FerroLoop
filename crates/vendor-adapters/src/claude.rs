@@ -475,6 +475,9 @@ impl VendorHostAdapter for ClaudeHostAdapter {
                     _ => Ok(AdapterReadiness::Unknown),
                 };
             }
+            // A trailing queued prompt reads as Busy. Before using this probe for delivery,
+            // check what Claude writes when a queued prompt is removed before it runs; if
+            // nothing is written, the session would otherwise remain Busy indefinitely.
             if path.extension().and_then(|s| s.to_str()) == Some("jsonl")
                 && path.is_file()
                 && let Ok(report) = self.normalize_session_transcript_file(path, None)
@@ -1164,6 +1167,79 @@ mod tests {
         assert_eq!(delta.turns.len(), 2);
         assert_eq!(delta.turns[0].turn_id, "a-1");
         assert_eq!(delta.turns[1].turn_id, "t-1");
+    }
+
+    #[test]
+    fn normalizer_keeps_queued_prompts_in_order_and_excludes_notifications() {
+        let adapter = ClaudeHostAdapter::new();
+        let raw = [
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"first tool"}]}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":"operator prompt"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"peer"},"prompt":"peer prompt"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"task-notification"},"prompt":"notification"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"second tool"}]}}"#,
+        ].join("\n");
+        let report = adapter.normalize_transcript(&raw, None).unwrap();
+        let turns: Vec<_> = report
+            .turns
+            .iter()
+            .map(|t| (t.role.as_str(), t.content.as_str()))
+            .collect();
+        assert_eq!(
+            turns,
+            [
+                ("tool", "first tool"),
+                ("user", "operator prompt"),
+                ("user", "peer prompt"),
+                ("tool", "second tool")
+            ]
+        );
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join(".claude/projects/test");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+        fs::write(&path, &raw).unwrap();
+        let context = adapter.estimate_post_compaction_context(&path).unwrap();
+        assert_eq!(context.turn_count, 4);
+        let expected_bytes: usize = raw
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 3)
+            .map(|(_, line)| line.len())
+            .sum();
+        assert_eq!(
+            context.post_compact_conversational_bytes,
+            expected_bytes as u64
+        );
+    }
+
+    #[test]
+    fn queued_prompt_arrays_normalize_the_same_text_shapes_as_the_hub() {
+        let adapter = ClaudeHostAdapter::new();
+        let raw = [
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":["raw string",{"text":"untyped text"},{"content":"untyped content"},{"type":"text","text":"typed text"},{"type":"image","source":{"type":"base64","data":"ignored"}},{"type":"thinking","text":"hidden"},{"type":"tool_use","name":"ignored"},{"type":"tool_result","content":["nested string",{"content":"nested content"}]}]}}"#,
+            r#"{"type":"attachment","isSidechain":true,"attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":["sidechain"]}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"task-notification"},"prompt":["notification"]}}"#,
+        ].join("\n");
+        let report = adapter.normalize_transcript(&raw, None).unwrap();
+        assert_eq!(report.turns.len(), 1);
+        assert_eq!(report.turns[0].role, "user");
+        assert_eq!(
+            report.turns[0].content,
+            "raw string\nuntyped text\nuntyped content\ntyped text\nnested string\nnested content"
+        );
+        assert_eq!(report.turns[0].source_cursor, "line:1");
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join(".claude/projects/test");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+        fs::write(&path, &raw).unwrap();
+        let context = adapter.estimate_post_compaction_context(&path).unwrap();
+        assert_eq!(context.turn_count, 1);
+        assert_eq!(
+            context.post_compact_conversational_bytes,
+            raw.lines().next().unwrap().len() as u64
+        );
     }
 
     #[test]
