@@ -411,11 +411,10 @@ fn pidfd_send(fd: std::os::fd::RawFd, signal: i32) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn linux_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            HostError::Io("esrch".into())
-        } else {
-            HostError::Io(err.to_string())
-        }
+        probe_error(
+            err.kind() == io::ErrorKind::NotFound,
+            format!("proc stat: {err}"),
+        )
     })?;
     parse_stat(&text).ok_or_else(|| HostError::Io("stat".into()))
 }
@@ -452,7 +451,10 @@ fn macos_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
         )
     };
     if wrote != size {
-        return Err(HostError::Io("esrch".into()));
+        // Only ESRCH proves the pid is gone; EPERM etc. mean unprobeable.
+        return Err(macos_pidinfo_error(
+            std::io::Error::last_os_error().raw_os_error(),
+        ));
     }
     let start = info
         .pbi_start_tvsec
@@ -469,7 +471,7 @@ fn macos_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
 #[cfg(windows)]
 fn windows_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -479,7 +481,10 @@ fn windows_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
     // SAFETY: OpenProcess yields a handle this function owns, or null.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if raw.is_null() {
-        return Err(HostError::Io("esrch".into()));
+        // Capture before any other call can overwrite it. Only
+        // ERROR_INVALID_PARAMETER is definitive; access-denied is a live pid.
+        let code = unsafe { GetLastError() };
+        return Err(windows_open_process_error(code));
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
     let mut created: FILETIME = unsafe { std::mem::zeroed() };
@@ -496,7 +501,8 @@ fn windows_identity(pid: u32) -> Result<ProcessIdentity, HostError> {
         )
     };
     if ok == 0 {
-        return Err(HostError::Io("esrch".into()));
+        let code = unsafe { GetLastError() };
+        return Err(windows_process_times_error(code));
     }
     let start = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
     let _ = CloseHandle;
@@ -512,10 +518,65 @@ fn is_gone(err: &HostError) -> bool {
     matches!(err, HostError::Io(text) if text == "esrch")
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::parse_stat;
+/// The only producer of the definitive `"esrch"` marker. Callers pass
+/// `definitive_not_exist` only for an OS error that proves no such process
+/// exists (Linux `/proc` `ENOENT`, macOS `ESRCH`, Windows
+/// `ERROR_INVALID_PARAMETER` from `OpenProcess`). Access-denied and every
+/// other probe failure stay non-definitive so consumers (e.g. stale-temp
+/// cleanup via `is_gone`) keep the file/process rather than treating an
+/// unprobeable live process as dead.
+fn probe_error(definitive_not_exist: bool, detail: String) -> HostError {
+    if definitive_not_exist {
+        HostError::Io("esrch".into())
+    } else {
+        HostError::Io(detail)
+    }
+}
 
+#[cfg(target_os = "macos")]
+fn macos_pidinfo_error(raw_os_error: Option<i32>) -> HostError {
+    probe_error(
+        raw_os_error == Some(libc::ESRCH),
+        format!("proc_pidinfo errno {raw_os_error:?}"),
+    )
+}
+
+#[cfg(windows)]
+fn windows_open_process_error(code: u32) -> HostError {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    // ERROR_INVALID_PARAMETER proves the pid does not exist; ERROR_ACCESS_DENIED
+    // proves the opposite (a live, protected process), so it must not be "esrch".
+    probe_error(
+        code == ERROR_INVALID_PARAMETER,
+        format!("OpenProcess error {code}"),
+    )
+}
+
+#[cfg(windows)]
+fn windows_process_times_error(code: u32) -> HostError {
+    // A failure on an already-open handle never proves the process is gone.
+    probe_error(false, format!("GetProcessTimes error {code}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use super::parse_stat;
+    use super::{is_gone, probe_error};
+
+    #[test]
+    fn probe_error_only_definitive_not_exist_is_esrch() {
+        // Definitive no-such-process is the sole "gone" signal; an
+        // access/unprobeable failure (e.g. macOS EPERM, Windows
+        // ERROR_ACCESS_DENIED from OpenProcess on a live protected pid)
+        // must never be classified as gone.
+        assert!(is_gone(&probe_error(true, "ignored".into())));
+        let denied = probe_error(false, "access denied".into());
+        assert!(!is_gone(&denied));
+        assert_ne!(denied, super::HostError::Io("esrch".into()));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn stat_comm_with_spaces_and_parens() {
         // starttime is the 20th field after ')': state, ppid, pgrp, then 16 fields, then starttime.

@@ -283,6 +283,29 @@ pub fn clean_stale_publish_temps(dir: &Path) {
     clean_stale_publish_temps_with(dir, std::process::id(), &pid_provably_dead);
 }
 
+/// Portable file identity for the pre-unlink recheck, where available.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(windows)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // By-handle identity (`file_index`/`volume_serial_number`) is unstable;
+    // creation/write times + size are the stable identity for the recheck.
+    a.len() == b.len()
+        && a.creation_time() == b.creation_time()
+        && a.last_write_time() == b.last_write_time()
+        && a.modified().ok() == b.modified().ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.len() == b.len() && a.modified().ok() == b.modified().ok()
+}
+
 fn clean_stale_publish_temps_with(dir: &Path, own_pid: u32, pid_dead: &dyn Fn(u32) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -303,6 +326,18 @@ fn clean_stale_publish_temps_with(dir: &Path, own_pid: u32, pid_dead: &dyn Fn(u3
             continue;
         };
         if !meta.file_type().is_file() || pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        // Recheck identity immediately pre-unlink: if the entry was swapped
+        // (e.g. for a symlink or a new file) since the scan, keep it. This
+        // narrows but cannot eliminate the name-based unlink race — std has
+        // no portable conditional-unlink-by-inode — so it is accepted: the
+        // residual worst case is unlinking a same-named structured temp
+        // entry itself, and unlink never follows a symlink to its target.
+        let Ok(fresh) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !fresh.file_type().is_file() || !same_file(&meta, &fresh) {
             continue;
         }
         let _ = std::fs::remove_file(entry.path());
@@ -333,6 +368,16 @@ fn die_for_crash() -> ! {
 
 #[cfg(unix)]
 fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Result<(), HostError> {
+    replace_atomic_with_temp(path, bytes, crash, temp_name()?)
+}
+
+#[cfg(unix)]
+fn replace_atomic_with_temp(
+    path: &Path,
+    bytes: &[u8],
+    crash: Option<CrashPoint>,
+    temp: std::ffi::CString,
+) -> Result<(), HostError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -362,7 +407,6 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
     let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
     // mode_t is u16 on macOS; the shared permission validator accepts u32.
     private_parent_ok(st.st_uid, unix_euid(), st.st_mode as _, is_dir)?;
-    let temp = temp_name()?;
     // SAFETY: `temp` is a relative name. O_EXCL|O_NOFOLLOW creates a new file and refuses a symlink.
     let fd = unsafe {
         libc::openat(
@@ -515,6 +559,26 @@ fn temp_name() -> Result<std::ffi::CString, HostError> {
 
 #[cfg(windows)]
 fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Result<(), HostError> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_name = temp_name_text(
+        unsafe { GetCurrentProcessId() },
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        nanos,
+    );
+    replace_atomic_with_temp(path, bytes, crash, temp_name)
+}
+
+#[cfg(windows)]
+fn replace_atomic_with_temp(
+    path: &Path,
+    bytes: &[u8],
+    crash: Option<CrashPoint>,
+    temp_name: String,
+) -> Result<(), HostError> {
     use std::os::windows::io::{FromRawHandle, IntoRawHandle};
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
@@ -524,8 +588,6 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-
     ensure_registry_dirs(path)?;
     let owner = current_sid()?;
     if let Some(existing) = open_reparse_file(path)? {
@@ -552,15 +614,7 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         lpSecurityDescriptor: raw_sd,
         bInheritHandle: 0,
     };
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp = path.with_file_name(temp_name_text(
-        unsafe { GetCurrentProcessId() },
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
-        nanos,
-    ));
+    let temp = path.with_file_name(temp_name);
     let temp_w = wide_os(temp.as_os_str());
     // SAFETY: CREATE_NEW refuses an existing name. The DACL is applied at creation and the
     // handle is not inheritable.
@@ -1253,6 +1307,146 @@ mod tests {
         clean_stale_publish_temps(&dir);
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         assert!(!stale.exists(), "provably dead pid temp removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flh-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_atomic_precreated_structured_temp_is_collision() {
+        let dir = unique_test_dir("collision");
+        let dest = dir.join("state.json");
+        let temp_text = temp_name_text(std::process::id(), 99, 12345);
+        let planted = dir.join(&temp_text);
+        std::fs::write(&planted, b"planted").expect("plant");
+        let temp = std::ffi::CString::new(temp_text).expect("cstr");
+        let err = replace_atomic_with_temp(&dest, b"new", None, temp).expect_err("collision");
+        assert_eq!(err, HostError::EndpointStateCollision);
+        assert_eq!(std::fs::read(&planted).expect("planted read"), b"planted");
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_atomic_unwritable_parent_is_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        if unix_euid() == 0 {
+            return; // root bypasses directory write permission
+        }
+        let dir = unique_test_dir("denied");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("readonly");
+        let dest = dir.join("state.json");
+        let temp =
+            std::ffi::CString::new(temp_name_text(std::process::id(), 98, 12345)).expect("cstr");
+        let err = replace_atomic_with_temp(&dest, b"new", None, temp).expect_err("denied");
+        assert_eq!(err, HostError::EndpointStateDenied);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_cleanup_keeps_real_live_nonown_pid() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("ping")
+            .args(["127.0.0.1", "-n", "30"])
+            .spawn()
+            .expect("ping");
+        #[cfg(not(any(unix, windows)))]
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .arg("--help")
+            .spawn()
+            .expect("child");
+        let dir = unique_test_dir("live");
+        let temp = dir.join(format!(".flh-{}-1-1000", child.id()));
+        std::fs::write(&temp, b"x").expect("plant");
+        clean_stale_publish_temps(&dir);
+        assert!(
+            temp.exists(),
+            "live non-own pid temp preserved by real probe"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_cleanup_reprobe_flip_to_live_keeps_file() {
+        let dir = unique_test_dir("flip");
+        let temp = dir.join(".flh-424242-1-1000");
+        std::fs::write(&temp, b"x").expect("plant");
+        let calls = std::cell::Cell::new(0usize);
+        // Dead at scan, live at the pre-unlink re-probe.
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|_| {
+            calls.set(calls.get() + 1);
+            calls.get() == 1
+        });
+        assert!(calls.get() >= 2, "pid was re-probed");
+        assert!(temp.exists(), "pid live at re-probe, temp kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_symlink_temp_never_deletes_target() {
+        let dir = unique_test_dir("symlink");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"keep").expect("target");
+        let link = dir.join(".flh-424242-1-1000");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|pid| pid == 424242);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link")
+                .file_type()
+                .is_symlink(),
+            "symlink entry preserved"
+        );
+        assert_eq!(std::fs::read(&target).expect("target read"), b"keep");
+        // Swap a regular temp for a symlink during the re-probe: the
+        // pre-unlink identity recheck must keep both link and target.
+        let swapped = dir.join(".flh-424243-1-1000");
+        std::fs::write(&swapped, b"x").expect("plant swapped");
+        let calls = std::cell::Cell::new(0usize);
+        let target2 = target.clone();
+        let swapped2 = swapped.clone();
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                let _ = std::fs::remove_file(&swapped2);
+                let _ = std::os::unix::fs::symlink(&target2, &swapped2);
+            }
+            true
+        });
+        assert!(
+            std::fs::symlink_metadata(&swapped)
+                .expect("swapped")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).expect("target2 read"), b"keep");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
