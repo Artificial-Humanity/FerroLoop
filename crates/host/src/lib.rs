@@ -347,10 +347,10 @@ impl Host {
         let listener = runtime.block_on(HostListener::bind(opts.config))?;
         let endpoint = listener.endpoint().clone();
         let path = registry_path(&endpoint)?;
+        let mut registry = load_registry(&endpoint)?;
         if let Some(dir) = path.parent() {
             clean_stale_publish_temps(dir);
         }
-        let mut registry = load_registry(&endpoint)?;
         let deadline = Instant::now() + STARTUP_CLEANUP_DEADLINE;
         if let Err(err) = recover(
             &mut registry,
@@ -2388,6 +2388,35 @@ mod deadline_tests {
         assert!(!cleanup_deadline_expired(None, now));
         assert!(!cleanup_deadline_expired(Some(now), now));
         assert!(cleanup_deadline_expired(Some(running_since), now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_open_cleans_stale_temp_and_tolerates_undeletable_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = unresolved_endpoint(dir.path());
+        let stale = dir.path().join(format!(".flh-{}-1-1000", u32::MAX - 1));
+        let undeletable = dir.path().join(format!(".flh-{}-2-1000", u32::MAX - 1));
+        for file in [&stale, &undeletable] {
+            std::fs::write(file, b"x").expect("plant");
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .expect("open")
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+                .expect("age");
+        }
+        // A hard link makes the second temp undeletable by cleanup policy.
+        std::fs::hard_link(&undeletable, dir.path().join("alias")).expect("hardlink");
+        let host = Host::open(OpenOptions::new(HostConfig::new(endpoint))).expect("open");
+        assert!(!stale.exists(), "stale dead-pid temp cleaned at open");
+        assert!(
+            undeletable.exists(),
+            "undeletable temp kept, open stayed best-effort"
+        );
+        host.shutdown().unwrap();
     }
 
     #[test]
