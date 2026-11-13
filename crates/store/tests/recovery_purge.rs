@@ -468,6 +468,8 @@ fn purge_every_audit_write_sync_unlink_cut_preserves_other_material() {
         matches!(
             e,
             RecoveryEvent::Create(_)
+                | RecoveryEvent::Allocate
+                | RecoveryEvent::Publish
                 | RecoveryEvent::Write(_)
                 | RecoveryEvent::Flush(_)
                 | RecoveryEvent::Sync(_)
@@ -591,6 +593,10 @@ fn purge_every_audit_write_sync_unlink_cut_preserves_other_material() {
         assert_eq!(fs::read(&f.source).unwrap(), source);
         assert_eq!(fs::read(foreign).unwrap(), b"retain unrelated bytes");
         eprintln!("purge_cut index={cut} event={event:?} errno={errno} recovered={recovered}");
+        assert!(
+            recovered,
+            "cut {cut} {event:?} must recover through typed purge retry"
+        );
     }
 }
 
@@ -1523,4 +1529,251 @@ fn purge_lease_expiry_at_later_unlink_retains_pending_members() {
 #[test]
 fn purge_lease_expiry_after_later_final_read_retains_pending_members() {
     assert_purge_stops_at_lease_expiry(PurgeLeaseExpiryAt::FinalRead(1));
+}
+
+#[test]
+fn purge_audit_temps_are_ignored_only_with_private_regular_canonical_names() {
+    use std::os::unix::fs::MetadataExt;
+    for kind in 0..10 {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let before =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        let name = match kind {
+            0 => format!("purge-{op}.intent.json.tmp"),
+            1 => format!("purge-{op}.member-0.json.tmp"),
+            2 => format!("purge-{op}.complete.json.tmp"),
+            3 => format!("purge-{op}.member-01.json.tmp"),
+            4 => format!("purge-{}.intent.json.tmp", uuid::Uuid::nil()),
+            5 => format!("purge-{op}.intent.json.tmp.extra"),
+            6 => format!("purge-{op}.intent.json"),
+            _ => format!("purge-{op}.intent.json.tmp"),
+        };
+        let path = f.backups.join(".catalog").join(name);
+        match kind {
+            7 => std::os::unix::fs::symlink("missing", &path).unwrap(),
+            8 => fs::create_dir(&path).unwrap(),
+            _ => fs::write(&path, b"torn audit temp").unwrap(),
+        }
+        if kind == 8 {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        } else if kind != 7 {
+            fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(if kind == 9 { 0o644 } else { 0o600 }),
+            )
+            .unwrap();
+        }
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let result = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits());
+        if kind <= 2 {
+            let report = result.expect("private canonical audit temp is not published authority");
+            assert_eq!(report.catalog_set_sha256, before.catalog_set_sha256);
+            assert!(!report.audit_durable);
+        } else {
+            assert!(result.is_err(), "kind {kind} must refuse");
+        }
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (
+                meta.dev(),
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec()
+            ),
+            (
+                after.dev(),
+                after.ino(),
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec()
+            )
+        );
+        if kind != 7 && kind != 8 {
+            assert_eq!(fs::read(&path).unwrap(), b"torn audit temp");
+        }
+        for m in before.members {
+            assert!(f.backups.join(m.relative_name).exists());
+        }
+    }
+}
+
+#[test]
+fn purge_audit_own_torn_temps_retry_without_decoding() {
+    for row in ["intent", "member-0", "complete"] {
+        let f = empty_fixture();
+        let (op, lease) = quarantined(&f);
+        let report =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        let temp = f
+            .backups
+            .join(".catalog")
+            .join(format!("purge-{op}.{row}.json.tmp"));
+        fs::write(&temp, b"{").unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+        let inspected =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+        assert_eq!(fs::read(&temp).unwrap(), b"{");
+        assert_eq!(inspected.catalog_set_sha256, report.catalog_set_sha256);
+        assert!(
+            purge_quarantined(
+                &confirmation(&inspected),
+                &lease,
+                &f.filesystem(),
+                &limits()
+            )
+            .unwrap()
+            .complete
+        );
+        assert!(!temp.exists(), "own {row} temp remains after retry");
+    }
+}
+
+#[test]
+fn purge_audit_publication_refuses_collisions_replacements_and_expiry() {
+    use std::os::{fd::AsRawFd, unix::fs::FileExt};
+    struct Race {
+        temp: std::path::PathBuf,
+        final_path: std::path::PathBuf,
+        lock: std::path::PathBuf,
+        live_receipt: std::path::PathBuf,
+        receipt: Vec<u8>,
+        issued: u128,
+        expires: u128,
+        change: u8,
+        fired: AtomicBool,
+    }
+    impl RecoveryIo for Race {
+        fn unix_ms(&self) -> std::io::Result<u128> {
+            Ok(if self.change >= 5 && self.fired.load(Ordering::Acquire) {
+                self.expires
+            } else {
+                self.issued
+            })
+        }
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event != RecoveryEvent::Publish
+                || !self.temp.exists()
+                || self.change == 6
+                || self.fired.swap(true, Ordering::AcqRel)
+            {
+                return Ok(());
+            }
+            match self.change {
+                0 => {
+                    fs::write(&self.final_path, b"foreign final audit")?;
+                    fs::set_permissions(&self.final_path, fs::Permissions::from_mode(0o600))?;
+                }
+                1 | 2 => {
+                    fs::rename(&self.temp, self.temp.with_extension("saved"))?;
+                    if self.change == 1 {
+                        fs::write(&self.temp, b"foreign temp audit")?;
+                        fs::set_permissions(&self.temp, fs::Permissions::from_mode(0o600))?;
+                    } else {
+                        std::os::unix::fs::symlink("foreign-target", &self.temp)?;
+                    }
+                }
+                3 => {
+                    fs::rename(&self.lock, self.lock.with_extension("saved"))?;
+                    fs::write(&self.lock, b"foreign operation lock")?;
+                    fs::set_permissions(&self.lock, fs::Permissions::from_mode(0o600))?;
+                }
+                4 => {
+                    fs::write(&self.live_receipt, &self.receipt)?;
+                    fs::set_permissions(&self.live_receipt, fs::Permissions::from_mode(0o600))?;
+                }
+                5 => {}
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        fn read_exact_at(
+            &self,
+            file: &fs::File,
+            bytes: &mut [u8],
+            offset: u64,
+        ) -> std::io::Result<()> {
+            file.read_exact_at(bytes, offset)?;
+            if self.change == 6
+                && fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))? == self.temp
+            {
+                self.fired.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+    }
+    for row in ["intent", "member-0", "complete"] {
+        for change in 0..7 {
+            let f = empty_fixture();
+            let (op, lease) = quarantined(&f);
+            let report =
+                purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+            let binding: OfflineLeaseRequest =
+                serde_json::from_slice(&fs::read(lease.path()).unwrap()).unwrap();
+            let final_path = f
+                .backups
+                .join(".catalog")
+                .join(format!("purge-{op}.{row}.json"));
+            let temp = final_path.with_extension("json.tmp");
+            let hook = Arc::new(Race {
+                temp: temp.clone(),
+                final_path: final_path.clone(),
+                lock: f
+                    .backups
+                    .join(".locks")
+                    .join(format!("operation-{op}.lock")),
+                live_receipt: f.backups.join(".catalog").join(format!("{op}.json")),
+                receipt: fs::read(
+                    f.backups
+                        .join(".quarantine")
+                        .join(op.to_string())
+                        .join("receipt.json"),
+                )
+                .unwrap(),
+                issued: binding.issued_at_unix_ms,
+                expires: binding.expires_at_unix_ms,
+                change,
+                fired: AtomicBool::new(false),
+            });
+            let result = purge_quarantined(
+                &confirmation(&report),
+                &lease,
+                &HookFs {
+                    f: &f,
+                    io: hook.clone(),
+                    limits: limits(),
+                },
+                &limits(),
+            );
+            assert!(
+                hook.fired.load(Ordering::Acquire),
+                "row {row} change {change} seam not reached"
+            );
+            assert!(result.is_err(), "row {row} change {change} completed");
+            match change {
+                0 => assert_eq!(fs::read(&final_path).unwrap(), b"foreign final audit"),
+                1 => assert_eq!(fs::read(&temp).unwrap(), b"foreign temp audit"),
+                2 => assert_eq!(
+                    fs::read_link(&temp).unwrap(),
+                    std::path::Path::new("foreign-target")
+                ),
+                3 => assert_eq!(fs::read(&hook.lock).unwrap(), b"foreign operation lock"),
+                4 => assert_eq!(fs::read(&hook.live_receipt).unwrap(), hook.receipt),
+                5 | 6 => assert!(!final_path.exists(), "expired row must not publish"),
+                _ => unreachable!(),
+            }
+            if change != 0 {
+                assert!(!final_path.exists());
+            }
+            if row == "intent" {
+                assert!(
+                    report
+                        .members
+                        .iter()
+                        .all(|m| f.backups.join(&m.relative_name).exists())
+                );
+            }
+        }
+    }
 }

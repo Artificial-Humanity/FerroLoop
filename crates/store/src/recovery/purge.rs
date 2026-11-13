@@ -383,6 +383,13 @@ fn closure(
             return Ok(());
         }
         if name.starts_with("purge-") {
+            if let Some(published) = name.strip_suffix(".tmp") {
+                validate_audit_name(published, &l)?;
+                // Catalog EX excludes a live audit writer. A canonical private
+                // regular temp is unpublished, so do not decode or retain it.
+                let held = PrivateFile::open(&catalog.path.join(name), false, &l)?;
+                return held.unchanged(&l);
+            }
             validate_audit_name(name, &l)?;
             return Ok(());
         }
@@ -503,6 +510,67 @@ fn validate_audit_name(name: &str, l: &OperationLimits) -> Result<(), RecoveryEr
         .ok()
         .is_none_or(|n| n.to_string() != index)
     {
+        return Err(l.verification());
+    }
+    Ok(())
+}
+// Called only by confirmed purge under physical, operation and catalog EX locks.
+// A stopped writer's own exact temp is disposable without decoding; final names
+// remain immutable, typed authority and are never overwritten or repaired.
+fn publish_audit_row<T: Serialize>(
+    catalog: &Dir,
+    name: &str,
+    value: &T,
+    control: &Arc<PublicationIo>,
+    l: &OperationLimits,
+    authority: impl Fn() -> Result<(), RecoveryError>,
+) -> Result<(), RecoveryError> {
+    validate_audit_name(name, l)?;
+    let temp = format!("{name}.tmp");
+    if catalog.exists(&temp, l)? {
+        let held = PrivateFile::open(&catalog.path.join(&temp), false, l)?;
+        catalog.remove_file_checked(&temp, held.identity(), l, |last| {
+            // remove_file_checked has completed its last injected open.
+            authority()?;
+            held.unchanged(l)?;
+            last.unchanged(l)?;
+            if catalog.exists(name, l)? {
+                return Err(l.verification());
+            }
+            Ok(())
+        })?;
+    }
+    let expected = fs::write_json(catalog, &temp, value, Member::PurgeAudit, control, l)?;
+    let prepared = PrivateFile::open(&catalog.path.join(&temp), false, l)?;
+    if verify::hash_file(&prepared.file, l)? != expected {
+        return Err(l.verification());
+    }
+    prepared.unchanged(l)?;
+    catalog.rename_checked(
+        &temp,
+        catalog,
+        name,
+        &*control.io,
+        RecoveryEvent::Publish,
+        l,
+        || {
+            // All injectable events/reads precede the clock and held authority.
+            authority()?;
+            prepared.unchanged(l)
+        },
+    )?;
+    // Rename changes ctime; bind the final descriptor to the same inode/bytes.
+    let published = PrivateFile::open(&catalog.path.join(name), false, l)?;
+    if published.identity() != prepared.identity()
+        || verify::hash_file(&published.file, l)? != expected
+    {
+        return Err(l.verification());
+    }
+    published.unchanged(l)?;
+    catalog.sync(&*control.io, Directory::CatalogParent, l)?;
+    authority()?;
+    published.unchanged(l)?;
+    if catalog.exists(&temp, l)? {
         return Err(l.verification());
     }
     Ok(())
@@ -866,6 +934,36 @@ pub fn purge_quarantined(
     } else {
         observed_operation = active_operation(&root, request.operation_id, &l)?;
     }
+    // Carry private name/inode witnesses for the already-held locks through
+    // publication hooks. Binding itself has no injectable descriptor-open seam.
+    let lock_witnesses = if request.confirm.is_some() {
+        let mut binding_limits = l.clone();
+        binding_limits.publication_io = None;
+        let physical = match lease.request.expected_file {
+            FileBinding::Readable { identity, .. } | FileBinding::Forensic { identity, .. } => {
+                identity
+            }
+            FileBinding::Absent => return Err(l.verification()),
+        };
+        Some([
+            PrivateFile::open(
+                &locks
+                    .path
+                    .join(format!("{}:{}.lock", physical.0, physical.1)),
+                false,
+                &binding_limits,
+            )?,
+            PrivateFile::open(
+                &locks
+                    .path
+                    .join(format!("operation-{}.lock", request.operation_id)),
+                false,
+                &binding_limits,
+            )?,
+        ])
+    } else {
+        None
+    };
     let access = CatalogLock::acquire(&root, CatalogLockMode::Exclusive, false, io.clone(), &l)
         .map_err(|e| {
             if !locks.exists("catalog.lock", &l).unwrap_or(false) {
@@ -1020,8 +1118,15 @@ pub fn purge_quarantined(
             members: report.members.clone(),
         };
         audit_members_valid(&root, &a, &l)?;
-        fs::write_json(&catalog, &intent_name, &a, Member::PurgeAudit, &control, &l)?;
-        catalog.sync(&*io, Directory::CatalogParent, &l)?;
+        let target = open_target(&root, request.operation_id, a.geometry.as_ref(), &l)?;
+        publish_audit_row(&catalog, &intent_name, &a, &control, &l, || {
+            lease_time_remaining(lease, &*io, &l)?;
+            for held in lock_witnesses.as_ref().ok_or_else(|| l.verification())? {
+                held.unchanged(&l)?;
+            }
+            access.validate(&root, &l)?;
+            target.validate(&root, &catalog, request.operation_id, &l)
+        })?;
         audit = Some(a);
     }
     let audit = audit.ok_or_else(|| l.verification())?;
@@ -1134,15 +1239,19 @@ pub fn purge_quarantined(
             audit_sha256: audit_hash.clone(),
             member_index: Some(index),
         };
-        fs::write_json(
-            &catalog,
-            &complete_name,
-            &done,
-            Member::PurgeAudit,
-            &control,
-            &l,
-        )?;
-        catalog.sync(&*io, Directory::CatalogParent, &l)?;
+        publish_audit_row(&catalog, &complete_name, &done, &control, &l, || {
+            lease_time_remaining(lease, &*io, &l)?;
+            for held in lock_witnesses.as_ref().ok_or_else(|| l.verification())? {
+                held.unchanged(&l)?;
+            }
+            access.validate(&root, &l)?;
+            held_audit.unchanged(&l)?;
+            target.validate(&root, &catalog, request.operation_id, &l)?;
+            if parent.exists(name, &l)? {
+                return Err(l.verification());
+            }
+            Ok(())
+        })?;
         lease_time_remaining(lease, &*io, &l)?;
         target.validate(&root, &catalog, request.operation_id, &l)?;
         if parent.exists(name, &l)? {
@@ -1164,20 +1273,53 @@ pub fn purge_quarantined(
             &l,
         )?;
     } else {
-        fs::write_json(
+        let done = PurgeCompletionV1 {
+            version: 1,
+            operation_id: request.operation_id,
+            audit_sha256: audit_hash.clone(),
+            member_index: None,
+        };
+        // Retain the predecessor descriptors across the publication hooks;
+        // re-opening them after the final clock sample could adopt replacements.
+        let (mut predecessors, scope) =
+            hold_manifest_predecessors(&catalog, &audit, &audit_hash, &l)?;
+        let manifest_index = audit
+            .members
+            .iter()
+            .position(|m| m.relative_name.ends_with("/manifest.json"))
+            .ok_or_else(|| l.verification())?;
+        predecessors.push(hold_completion(
             &catalog,
-            &complete_name,
-            &PurgeCompletionV1 {
-                version: 1,
-                operation_id: request.operation_id,
-                audit_sha256: audit_hash.clone(),
-                member_index: None,
-            },
-            Member::PurgeAudit,
-            &control,
-            &l,
-        )?;
-        catalog.sync(&*io, Directory::CatalogParent, &l)?;
+            &format!(
+                "purge-{}.member-{manifest_index}.json",
+                request.operation_id
+            ),
+            &audit_hash,
+            Some(manifest_index),
+            request.operation_id,
+            &scope,
+        )?);
+        publish_audit_row(&catalog, &complete_name, &done, &control, &scope, || {
+            lease_time_remaining(lease, &*io, &scope)?;
+            for held in lock_witnesses
+                .as_ref()
+                .ok_or_else(|| scope.verification())?
+            {
+                held.unchanged(&scope)?;
+            }
+            access.validate(&root, &scope)?;
+            held_audit.unchanged(&scope)?;
+            manifest_predecessors_unchanged(&root, &audit, &target, &predecessors, &scope)?;
+            target.validate(&root, &catalog, request.operation_id, &scope)?;
+            for m in &audit.members {
+                let path = root.path.join(&m.relative_name);
+                if !matches!(path.symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(scope.verification());
+                }
+            }
+            Ok(())
+        })?;
     }
     replay_target(&root, &catalog, &audit, &audit_hash, &l)?;
     lease_time_remaining(lease, &*io, &l)?;
@@ -1272,6 +1414,94 @@ fn inspect_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn audit_temp_cleanup_refuses_replacement_nonregular_and_lost_authority() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ReplaceAtFinalOpen {
+            path: std::path::PathBuf,
+            opens: AtomicUsize,
+            replace: bool,
+        }
+        impl fs::RecoveryIo for ReplaceAtFinalOpen {
+            fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+                if event == RecoveryEvent::OpenFile
+                    && self.opens.fetch_add(1, Ordering::AcqRel) == 1
+                    && self.replace
+                {
+                    std::fs::rename(&self.path, self.path.with_extension("saved"))?;
+                    std::fs::write(&self.path, b"foreign replacement")?;
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                Ok(())
+            }
+        }
+        for case in 0..6 {
+            let root = super::super::test_support::fixture_root();
+            let name = format!("purge-{}.intent.json", uuid::Uuid::now_v7());
+            let path = root.path().join(format!("{name}.tmp"));
+            if case == 2 {
+                std::os::unix::fs::symlink("unowned", &path).unwrap();
+            } else if case == 3 {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"{").unwrap();
+                std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(if case == 5 { 0o644 } else { 0o600 }),
+                )
+                .unwrap();
+                if case == 4 {
+                    std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+                }
+            }
+            let hook = Arc::new(ReplaceAtFinalOpen {
+                path: path.clone(),
+                opens: AtomicUsize::new(0),
+                replace: case == 0,
+            });
+            let mut l = OperationLimits::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                1 << 20,
+                1 << 20,
+                super::super::CancelToken::new(),
+            );
+            let control = Arc::new(PublicationIo::new(hook.clone(), 1 << 20, 1 << 20, 0, 4096));
+            l.publication_io = Some(control.clone());
+            let catalog = Dir::open(root.path(), &l).unwrap();
+            let result = publish_audit_row(
+                &catalog,
+                &name,
+                &serde_json::json!({"fixture":"row"}),
+                &control,
+                &l,
+                || {
+                    if case == 1 {
+                        return Err(RecoveryError::Deadline {
+                            operation_id: l.operation_id,
+                        });
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "case {case} must retain the temp");
+            assert!(!root.path().join(&name).exists());
+            match case {
+                0 => assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement"),
+                2 => assert_eq!(
+                    std::fs::read_link(&path).unwrap(),
+                    std::path::Path::new("unowned")
+                ),
+                3 => assert!(path.is_dir()),
+                _ => assert_eq!(std::fs::read(&path).unwrap(), b"{"),
+            }
+            if case == 1 {
+                assert!(matches!(result, Err(RecoveryError::Deadline { .. })));
+            }
+        }
+    }
+
     // RED plan after approved application: temporarily derive pin_limits from
     // l instead of scan (the original missing-retained-scope behavior), then run
     // this test: the last scan reads/succeeds, failing the Quota/no-read check.
