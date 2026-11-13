@@ -451,17 +451,22 @@ fn closure(
         }
         if name.starts_with("purge-") {
             if let Some(published) = name.strip_suffix(".tmp") {
-                validate_audit_name(published, &l)?;
+                validate_audit_name(published, &l)
+                    .map_err(|error| catalog_name_error(error, &catalog, name, &l))?;
                 // Catalog EX excludes a live audit writer. A canonical private
                 // regular temp is unpublished, so do not decode or retain it.
                 let held = PrivateFile::open(&catalog.path.join(name), false, &l)?;
                 return held.unchanged(&l);
             }
-            validate_audit_name(name, &l)?;
+            validate_audit_name(name, &l)
+                .map_err(|error| catalog_name_error(error, &catalog, name, &l))?;
             return Ok(());
         }
-        let text = name.strip_suffix(".json").ok_or_else(|| l.verification())?;
-        let other = canonical_op(text, &l)?;
+        let text = name
+            .strip_suffix(".json")
+            .ok_or_else(|| catalog_name_error(l.verification(), &catalog, name, &l))?;
+        let other = canonical_op(text, &l)
+            .map_err(|error| catalog_name_error(error, &catalog, name, &l))?;
         if other == op {
             return Ok(());
         }
@@ -553,6 +558,23 @@ fn closure(
     verify::serialized_checksum(&evidence.entries, &serialize).map(|(_, hash)| hash)
 }
 
+// Invalid name grammar used to refuse before opening. For diagnostics only,
+// verify a private O_NOFOLLOW file before naming that lexical entry. Failure
+// of this extra check preserves the original refusal and never exposes a target.
+fn catalog_name_error(
+    error: RecoveryError,
+    catalog: &Dir,
+    name: &str,
+    l: &OperationLimits,
+) -> RecoveryError {
+    if matches!(error, RecoveryError::Verification { .. })
+        && PrivateFile::open(&catalog.path.join(name), false, l).is_ok()
+    {
+        error.at_metadata_entry(|| Path::new(".catalog").join(name))
+    } else {
+        error
+    }
+}
 fn validate_audit_name(name: &str, l: &OperationLimits) -> Result<(), RecoveryError> {
     let text = name
         .strip_prefix("purge-")
@@ -654,11 +676,7 @@ fn active_operation(
     held.unchanged(l)?;
     Ok(Some(held))
 }
-fn audit_members_valid(
-    root: &Dir,
-    audit: &PurgeAuditV1,
-    l: &OperationLimits,
-) -> Result<(), RecoveryError> {
+fn audit_members_valid(audit: &PurgeAuditV1, l: &OperationLimits) -> Result<(), RecoveryError> {
     let op = audit.operation_id.to_string();
     let geometry = audit.geometry.as_ref().ok_or_else(|| l.verification())?;
     let mut seen = BTreeSet::new();
@@ -707,7 +725,7 @@ fn audit_members_valid(
     if receipt != 1 || manifest != 1 || audit.members.len() > 10 {
         return Err(l.verification());
     }
-    root.same_name(l)
+    Ok(())
 }
 fn verify_present(
     root: &Dir,
@@ -730,7 +748,8 @@ fn replay_target(
     hash: &str,
     l: &OperationLimits,
 ) -> Result<PurgeTarget, RecoveryError> {
-    audit_members_valid(root, audit, l)?;
+    audit_members_valid(audit, l)?;
+    root.same_name(l)?;
     let binding = audit.geometry.as_ref().ok_or_else(|| l.verification())?;
     let target = open_target(root, audit.operation_id, Some(binding), l)?;
     target.validate(root, catalog, audit.operation_id, l)?;
@@ -1046,7 +1065,9 @@ pub fn purge_quarantined(
     let mut observed_audit = None;
     let mut audit = if catalog.exists(&intent_name, &l)? {
         let held = PrivateFile::open(&catalog.path.join(&intent_name), false, &l)?;
-        let (a, scope): (PurgeAuditV1, _) = read_held_json(&held, &l)?;
+        let (a, scope): (PurgeAuditV1, _) = read_held_json(&held, &l).map_err(|error| {
+            error.at_metadata_entry(|| Path::new(".catalog").join(&intent_name))
+        })?;
         l = scope;
         if a.version != 1
             || a.operation_id != request.operation_id
@@ -1054,9 +1075,14 @@ pub fn purge_quarantined(
             || a.actor.trim().is_empty()
             || !manifest::sha256(&a.catalog_set_sha256)
         {
-            return Err(l.verification());
+            return Err(l
+                .verification()
+                .at_metadata_entry(|| Path::new(".catalog").join(&intent_name)));
         }
-        audit_members_valid(&root, &a, &l)?;
+        audit_members_valid(&a, &l).map_err(|error| {
+            error.at_metadata_entry(|| Path::new(".catalog").join(&intent_name))
+        })?;
+        root.same_name(&l)?;
         let hash = verify::hash_file(&held.file, &l)?.1;
         replay_target(&root, &catalog, &a, &hash, &l)?;
         held.unchanged(&l)?;
@@ -1178,7 +1204,8 @@ pub fn purge_quarantined(
             geometry: admitted_geometry,
             members: report.members.clone(),
         };
-        audit_members_valid(&root, &a, &l)?;
+        audit_members_valid(&a, &l)?;
+        root.same_name(&l)?;
         let target = open_target(&root, request.operation_id, a.geometry.as_ref(), &l)?;
         publish_audit_row(&catalog, &intent_name, &a, &control, &l, || {
             lease_time_remaining(lease, &*io, &l)?;
@@ -1410,11 +1437,18 @@ fn hold_completion(
     l: &OperationLimits,
 ) -> Result<PrivateFile, RecoveryError> {
     let held = PrivateFile::open(&catalog.path.join(name), false, l)?;
-    let (d, scope): (PurgeCompletionV1, _) = read_held_json(&held, l)?;
-    if d.version != 1 || d.operation_id != op || d.audit_sha256 != hash || d.member_index != index {
-        return Err(l.verification());
-    }
-    held.unchanged(&scope)?;
+    (|| {
+        let (d, scope): (PurgeCompletionV1, _) = read_held_json(&held, l)?;
+        if d.version != 1
+            || d.operation_id != op
+            || d.audit_sha256 != hash
+            || d.member_index != index
+        {
+            return Err(l.verification());
+        }
+        held.unchanged(&scope)
+    })()
+    .map_err(|error| error.at_metadata_entry(|| Path::new(".catalog").join(name)))?;
     Ok(held)
 }
 fn inspect_audit(

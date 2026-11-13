@@ -2578,3 +2578,106 @@ fn purge_review13_completed_batch_quarantined_dependency_still_refuses() {
             .exists()
     );
 }
+
+#[test]
+fn purge_review14_metadata_diagnostics_name_only_root_relative_entries() {
+    for case in [
+        "pin",
+        "stray",
+        "intent",
+        "member",
+        "complete",
+        "pin-symlink",
+        "stray-symlink",
+        "intent-symlink",
+        "member-symlink",
+        "complete-symlink",
+    ] {
+        let kind = case.strip_suffix("-symlink").unwrap_or(case);
+        let symlink = case.ends_with("-symlink");
+        let f = Fixture::new();
+        let (op, lease) = quarantined(&f);
+        if matches!(kind, "member" | "complete") {
+            let report =
+                purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+            purge_quarantined(&confirmation(&report), &lease, &f.filesystem(), &limits()).unwrap();
+        }
+        let name = match kind {
+            "pin" => format!(".catalog/restore-pins/{}.json", uuid::Uuid::now_v7()),
+            "stray" => ".catalog/stray-metadata.json".into(),
+            "intent" => format!(".catalog/purge-{op}.intent.json"),
+            "member" => format!(".catalog/purge-{op}.member-0.json"),
+            "complete" => format!(".catalog/purge-{op}.complete.json"),
+            _ => unreachable!(),
+        };
+        let path = f.backups.join(&name);
+        if kind == "pin" {
+            fs::create_dir(path.parent().unwrap()).unwrap();
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let secret = "PRIVATE_METADATA_CONTENT_MUST_NOT_APPEAR";
+        if symlink {
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            std::os::unix::fs::symlink("PRIVATE_SYMLINK_TARGET_MUST_NOT_APPEAR", &path).unwrap();
+        } else {
+            fs::write(&path, secret).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        type Snapshot = std::collections::BTreeMap<std::path::PathBuf, (u64, u64, u64, Vec<u8>)>;
+        fn snapshot(path: &std::path::Path) -> Snapshot {
+            use std::os::unix::fs::MetadataExt;
+            let mut rows = std::collections::BTreeMap::new();
+            for e in fs::read_dir(path).unwrap() {
+                let e = e.unwrap();
+                let p = e.path();
+                let m = fs::symlink_metadata(&p).unwrap();
+                if m.is_dir() {
+                    rows.extend(snapshot(&p));
+                } else {
+                    rows.insert(
+                        p,
+                        (
+                            m.dev(),
+                            m.ino(),
+                            m.len(),
+                            if m.is_file() {
+                                fs::read(e.path()).unwrap()
+                            } else {
+                                vec![]
+                            },
+                        ),
+                    );
+                }
+            }
+            rows
+        }
+        let before = snapshot(&f.backups);
+        let error =
+            purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap_err();
+        let message = error.to_string();
+        if !symlink {
+            assert!(
+                matches!(&error, fl_store::recovery::RecoveryError::MetadataVerification { entry, source, .. }
+                if entry == std::path::Path::new(&name) && matches!(source.as_ref(), fl_store::recovery::RecoveryError::Verification { .. })),
+                "wrong diagnostic type: {error:?}"
+            );
+            assert!(message.contains(&name), "{case}: {message}");
+            assert!(
+                !message.contains(f.backups.to_str().unwrap()),
+                "diagnostic must be root-relative: {message}"
+            );
+        }
+        assert!(!message.contains(secret), "{case}: {message}");
+        assert!(
+            !message.contains("PRIVATE_SYMLINK_TARGET_MUST_NOT_APPEAR"),
+            "{case}: {message}"
+        );
+        assert_eq!(
+            snapshot(&f.backups),
+            before,
+            "{case}: read-only refusal changed artifacts"
+        );
+    }
+}

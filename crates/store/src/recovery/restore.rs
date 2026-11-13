@@ -991,6 +991,13 @@ pub fn restore_offline(
     })()
     .map_err(|source| RecoveryError::RestoreAdmissionArtifactsRetained {
         operation_id: l.operation_id,
+        fence_state: match std::fs::symlink_metadata(admission::guard_path(&physical)) {
+            Ok(_) => super::RestoreAdmissionFenceState::Fenced,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                super::RestoreAdmissionFenceState::Unfenced
+            }
+            Err(_) => super::RestoreAdmissionFenceState::Uncertain,
+        },
         staging: staging_path.clone(),
         staging_identity: admission_staging_identity,
         operation_lock_identity: admission_lock_identity,
@@ -2054,7 +2061,21 @@ pub fn rollback_restore(
     ) {
         return Err(fs::refused(
             filesystem.reconciliation_limits(),
-            "rollback requires installed or rollback-continuation phase",
+            match j.phase {
+                RestorePhase::Admitted | RestorePhase::Prepared | RestorePhase::Abandoned => {
+                    "rollback unavailable in this phase; use abandon_restore"
+                }
+                RestorePhase::FinalizeIntent | RestorePhase::Finalized => {
+                    "rollback unavailable in this phase; use finalize_restore with the accepted reconciliation"
+                }
+                RestorePhase::FinalizeOriginalIntent | RestorePhase::OriginalFinalized => {
+                    "rollback unavailable in this phase; use finalize_rollback with the accepted reconciliation"
+                }
+                RestorePhase::OriginalAbsenceFinalized => {
+                    "rollback unavailable in this phase; use finalize_original_absence"
+                }
+                _ => "rollback requires installed or rollback-continuation phase",
+            },
         ));
     }
     let precheck = continuation_limits(&j, lease, filesystem, &lock)?;
@@ -2068,7 +2089,7 @@ pub fn rollback_restore(
     if j.phase == RestorePhase::ExchangeIntent && dest != Some(j.candidate_identity) {
         return Err(fs::refused(
             &precheck,
-            "rollback requires the completed forward exchange",
+            "rollback requires the completed forward exchange; use abandon_restore before exchange",
         ));
     }
     let candidate_path = if dest == Some(j.candidate_identity) {
@@ -3886,59 +3907,74 @@ pub(crate) fn check_restore_pins<S>(
     // rebuilt from l, so the initial reservation is not charged twice.
     let _iteration = reserve(state, 0, l)?;
     pins.visit_names(l, |name| {
-        if let Some(text) = name.strip_suffix(".json.tmp") {
+        let mut checked_descriptor = false;
+        let result = (|| {
+            if let Some(text) = name.strip_suffix(".json.tmp") {
+                let op = uuid::Uuid::parse_str(text).map_err(|_| l.verification())?;
+                if op.is_nil() || op.to_string() != text {
+                    return Err(l.verification());
+                }
+                // Catalog EX excludes a live writer (publication holds SH). Only
+                // a canonical private regular temp from a stopped admission is ignored;
+                // it neither protects a bundle nor enters the retained pin closure.
+                let scan = reserve(state, 0, l)?;
+                let held = PrivateFile::open(&pins.path.join(name), false, &scan)?;
+                checked_descriptor = true;
+                return held.unchanged(&scan);
+            }
+            let scan = reserve(state, 1, l)?;
+            let text = name.strip_suffix(".json").ok_or_else(|| l.verification())?;
             let op = uuid::Uuid::parse_str(text).map_err(|_| l.verification())?;
             if op.is_nil() || op.to_string() != text {
                 return Err(l.verification());
             }
-            // Catalog EX excludes a live writer (publication holds SH). Only
-            // a canonical private regular temp from a stopped admission is ignored;
-            // it neither protects a bundle nor enters the retained pin closure.
-            let scan = reserve(state, 0, l)?;
             let held = PrivateFile::open(&pins.path.join(name), false, &scan)?;
-            return held.unchanged(&scan);
-        }
-        let scan = reserve(state, 1, l)?;
-        let text = name.strip_suffix(".json").ok_or_else(|| l.verification())?;
-        let op = uuid::Uuid::parse_str(text).map_err(|_| l.verification())?;
-        if op.is_nil() || op.to_string() != text {
-            return Err(l.verification());
-        }
-        let held = PrivateFile::open(&pins.path.join(name), false, &scan)?;
-        // Decode the capped descriptor that retain() later hashes. A path
-        // reopen here could validate a different pin after directory replacement.
-        let (pin, pin_limits) = read_restore_pin(&held, &scan)?;
-        let prefix = format!(".restore-{op}-");
-        let staging = pin.journal.parent().ok_or_else(|| l.verification())?;
-        let suffix_valid = staging
-            .file_name()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_prefix(&prefix))
-            .is_some_and(|s| {
-                uuid::Uuid::parse_str(s).is_ok_and(|id| !id.is_nil() && id.to_string() == s)
-            });
-        if pin.version != 1
-            || pin.restore_operation != op
-            || pin.bundle_operation.is_nil()
-            || !super::manifest::sha256(&pin.bundle_sha256)
-            || !pin.destination.is_absolute()
-            || !pin.journal.is_absolute()
-            || pin.journal.file_name() != Some(std::ffi::OsStr::new("journal.bin"))
-            || staging.parent() != pin.destination.parent()
-            || !suffix_valid
-            || pin.journal_identity == (0, 0)
-            || pin.operation_lock_identity == (0, 0)
-        {
-            return Err(l.verification());
-        }
-        if pin.bundle_operation == target {
-            return Err(fs::refused(
-                l,
-                "selected bundle is pinned by an unfinished restore",
-            ));
-        }
-        retain(state, name, &held, &pin_limits)?;
-        held.unchanged(&pin_limits)
+            checked_descriptor = true;
+            // Decode the capped descriptor that retain() later hashes. A path
+            // reopen here could validate a different pin after directory replacement.
+            let (pin, pin_limits) = read_restore_pin(&held, &scan)?;
+            let prefix = format!(".restore-{op}-");
+            let staging = pin.journal.parent().ok_or_else(|| l.verification())?;
+            let suffix_valid = staging
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix(&prefix))
+                .is_some_and(|s| {
+                    uuid::Uuid::parse_str(s).is_ok_and(|id| !id.is_nil() && id.to_string() == s)
+                });
+            if pin.version != 1
+                || pin.restore_operation != op
+                || pin.bundle_operation.is_nil()
+                || !super::manifest::sha256(&pin.bundle_sha256)
+                || !pin.destination.is_absolute()
+                || !pin.journal.is_absolute()
+                || pin.journal.file_name() != Some(std::ffi::OsStr::new("journal.bin"))
+                || staging.parent() != pin.destination.parent()
+                || !suffix_valid
+                || pin.journal_identity == (0, 0)
+                || pin.operation_lock_identity == (0, 0)
+            {
+                return Err(l.verification());
+            }
+            if pin.bundle_operation == target {
+                return Err(fs::refused(
+                    l,
+                    "selected bundle is pinned by an unfinished restore",
+                ));
+            }
+            retain(state, name, &held, &pin_limits)?;
+            held.unchanged(&pin_limits)
+        })();
+        result.map_err(|error| {
+            if matches!(error, RecoveryError::Verification { .. })
+                && (checked_descriptor
+                    || PrivateFile::open(&pins.path.join(name), false, l).is_ok())
+            {
+                error.at_metadata_entry(|| Path::new(".catalog/restore-pins").join(name))
+            } else {
+                error
+            }
+        })
     })
 }
 
@@ -4008,6 +4044,41 @@ mod pin_descriptor_tests {
     fn write_pin(path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn restore_pin_review14_resource_errors_keep_type_without_diagnostic_allocation() {
+        for case in ["memory", "deadline", "cancelled"] {
+            let root = super::super::test_support::fixture_root();
+            let operation = uuid::Uuid::now_v7();
+            let path = root.path().join(format!("{operation}.json"));
+            write_pin(
+                &path,
+                &pin_bytes(root.path(), operation, uuid::Uuid::now_v7()),
+            );
+            let reads = Arc::new(Reads::default());
+            let mut l = limits(reads.clone());
+            let held = PrivateFile::open(&path, false, &l).unwrap();
+            match case {
+                "memory" => l.memory_byte_limit = 1,
+                "deadline" => l.deadline = std::time::Instant::now(),
+                "cancelled" => l.cancel.cancel(),
+                _ => unreachable!(),
+            }
+            let error = read_restore_pin(&held, &l)
+                .unwrap_err()
+                .at_metadata_entry(|| panic!("resource refusal allocated a diagnostic path"));
+            assert!(
+                match case {
+                    "memory" => matches!(error, RecoveryError::Quota { .. }),
+                    "deadline" => matches!(error, RecoveryError::Deadline { .. }),
+                    "cancelled" => matches!(error, RecoveryError::Cancelled { .. }),
+                    _ => false,
+                },
+                "{case}: {error:?}"
+            );
+            assert_eq!(reads.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

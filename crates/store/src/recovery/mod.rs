@@ -31,10 +31,11 @@ pub enum RecoveryError {
         source: std::io::Error,
     },
     #[error(
-        "recovery {operation_id}: admission failed; retained metadata requires operator review"
+        "recovery {operation_id}: admission failed; store is {fence_state}; retained metadata requires operator review"
     )]
     RestoreAdmissionArtifactsRetained {
         operation_id: uuid::Uuid,
+        fence_state: RestoreAdmissionFenceState,
         staging: std::path::PathBuf,
         staging_identity: Option<(u64, u64)>,
         operation_lock_identity: Option<(u64, u64)>,
@@ -95,6 +96,14 @@ pub enum RecoveryError {
     Cancelled { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: image or captured expectations verification failed")]
     Verification { operation_id: uuid::Uuid },
+    #[error("recovery {operation_id}: metadata verification failed at {entry:?}")]
+    MetadataVerification {
+        operation_id: uuid::Uuid,
+        /// Lexical entry path relative to the approved recovery root.
+        entry: std::path::PathBuf,
+        #[source]
+        source: Box<RecoveryError>,
+    },
     #[error("recovery {operation_id}: transient resource failure ({errno})")]
     Transient {
         operation_id: uuid::Uuid,
@@ -106,6 +115,39 @@ pub enum RecoveryError {
     OutcomeUnknown { operation_id: uuid::Uuid },
     #[error("inventory metadata unavailable: {0}")]
     Metadata(String),
+}
+
+/// Observation of the admission name after an interrupted admission. No guard
+/// contents are read, repaired or removed to produce this diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreAdmissionFenceState {
+    Fenced,
+    Unfenced,
+    Uncertain,
+}
+impl std::fmt::Display for RestoreAdmissionFenceState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fenced => "fenced",
+            Self::Unfenced => "unfenced",
+            Self::Uncertain => "of uncertain fence state",
+        })
+    }
+}
+impl RecoveryError {
+    /// Call only after private O_NOFOLLOW descriptor checks. Construct the
+    /// lexical entry path lazily: resource/authority refusals keep their type
+    /// and do not allocate diagnostic paths, including on memory exhaustion.
+    pub(crate) fn at_metadata_entry(self, entry: impl FnOnce() -> std::path::PathBuf) -> Self {
+        match self {
+            Self::Verification { operation_id } => Self::MetadataVerification {
+                operation_id,
+                entry: entry(),
+                source: Box::new(self),
+            },
+            other => other,
+        }
+    }
 }
 
 /// A shared cooperative cancellation flag. Cancellation never writes the source.

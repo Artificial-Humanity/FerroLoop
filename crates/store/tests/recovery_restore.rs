@@ -1325,6 +1325,7 @@ fn restore_preguard_lock_failure_preserves_typed_cause_original_and_admission_me
             staging_identity,
             operation_lock_identity,
             source,
+            ..
         } => {
             assert_eq!(*operation_id, request.operation_id);
             let held = fs::metadata(staging).unwrap();
@@ -5692,6 +5693,15 @@ fn restore_guard_publication_every_cut_keeps_named_guard_loadable_or_temp_retain
             limits: limits(),
         };
         let error = restore_offline(&request, &lease, &filesystem).unwrap_err();
+        let fenced = f.source.with_extension("fls.restore-guard").exists();
+        assert!(
+            error.to_string().contains(if fenced {
+                "store is fenced"
+            } else {
+                "store is unfenced"
+            }),
+            "{error}"
+        );
         let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained {
             staging,
             staging_identity: Some(staging_identity),
@@ -5703,6 +5713,15 @@ fn restore_guard_publication_every_cut_keeps_named_guard_loadable_or_temp_retain
             panic!("publication cut must retain admission artifacts: {error:?}")
         };
         assert!(hook.count.load(Ordering::Acquire) > cut);
+        if cut == first {
+            assert!(
+                matches!(
+                    &*source,
+                    fl_store::recovery::RecoveryError::Destination { .. }
+                ),
+                "pre-guard failure lost its typed source: {source:?}"
+            );
+        }
         let metadata = fs::metadata(&staging).unwrap();
         assert_eq!((metadata.dev(), metadata.ino()), staging_identity);
         let metadata = fs::metadata(staging.join("journal.bin.lock")).unwrap();
@@ -5832,6 +5851,14 @@ fn restore_guard_publication_refuses_foreign_named_guard_and_changed_temp_withou
             limits: limits(),
         };
         let error = restore_offline(&request, &lease, &filesystem).unwrap_err();
+        assert!(
+            error.to_string().contains(if temp {
+                "store is unfenced"
+            } else {
+                "store is fenced"
+            }),
+            "{error}"
+        );
         let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained {
             staging, ..
         } = error
@@ -7720,7 +7747,8 @@ fn restore_bundleless_pre_exchange_rollback_refuses_without_attempt() {
     let path = j.staging.join("journal.bin");
     let bytes = fs::read(&path).unwrap();
     let layout = restore_expiry_layout(&j.destination, &j.staging);
-    assert!(rollback_restore(&j, &lease, &f.filesystem()).is_err());
+    let error = rollback_restore(&j, &lease, &f.filesystem()).unwrap_err();
+    assert!(error.to_string().contains("abandon_restore"), "{error}");
     assert_eq!(fs::read(path).unwrap(), bytes);
     assert_eq!(restore_expiry_layout(&j.destination, &j.staging), layout);
 }
@@ -8156,6 +8184,7 @@ fn restore_review11_prepared_and_pre_exchange_abandon_retain_generations() {
         let path = staging.join("journal.bin");
         let j = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
         assert_eq!(j.phase, phase);
+        review14_assert_rollback_action(&f, &j, &lease, "abandon_restore");
         let guard = f.source.with_extension("fls.restore-guard");
         let pin = f
             .backups
@@ -8210,5 +8239,107 @@ fn restore_review11_prepared_and_pre_exchange_abandon_retain_generations() {
             fs::read(path).unwrap() == bytes,
             "cleanup retry appended a frame"
         );
+    }
+}
+
+fn review14_assert_rollback_action(
+    f: &Fixture,
+    j: &RestoreJournal,
+    lease: &OfflineLease,
+    action: &str,
+) {
+    let path = j.staging.join("journal.bin");
+    let guard = j.destination.with_extension("fls.restore-guard");
+    let pin = terminal_negative_pin(f, j);
+    let snapshot = || {
+        [&path, &guard, &pin].map(|p| {
+            fs::symlink_metadata(p)
+                .ok()
+                .map(|m| ((m.dev(), m.ino()), fs::read(p).unwrap()))
+        })
+    };
+    let before = snapshot();
+    let error = rollback_restore(j, lease, &f.filesystem()).unwrap_err();
+    assert!(error.to_string().contains(action), "{:?}: {error}", j.phase);
+    assert_eq!(snapshot(), before, "diagnostic refusal changed metadata");
+    let loaded = load_restore_journal(&path, lease, &f.filesystem()).unwrap();
+    assert_eq!(
+        terminal_negative_counters(&loaded),
+        terminal_negative_counters(j)
+    );
+}
+#[test]
+fn restore_review14_rollback_refusals_name_typed_terminal_actions_without_spending() {
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        for intent in [true, false] {
+            if intent
+                && matches!(
+                    mode,
+                    TerminalFixtureMode::Absence | TerminalFixtureMode::Abandon
+                )
+            {
+                continue;
+            }
+            let (f, j, lease) = terminal_fixture(mode);
+            if matches!(mode, TerminalFixtureMode::Abandon) {
+                review14_assert_rollback_action(&f, &j, &lease, "abandon_restore");
+                let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+                let filesystem = CutFs {
+                    f: &f,
+                    io: cut.clone(),
+                    limits: limits(),
+                };
+                assert!(abandon_restore(&j, &lease, &filesystem).is_err());
+                assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+                let journal =
+                    load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem())
+                        .unwrap();
+                assert_eq!(journal.phase, RestorePhase::Abandoned);
+                review14_assert_rollback_action(&f, &journal, &lease, "abandon_restore");
+                continue;
+            }
+            let event = if intent {
+                RecoveryEvent::Sync(Directory::RestoreDestinationParent)
+            } else {
+                RecoveryEvent::RestoreGuardRemove
+            };
+            let cut = Arc::new(TerminalCutIo::new(event));
+            let filesystem = CutFs {
+                f: &f,
+                io: cut.clone(),
+                limits: limits(),
+            };
+            assert!(terminal_call(mode, &j, &lease, &filesystem, false).is_err());
+            assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+            let loaded =
+                load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem())
+                    .unwrap();
+            let (expected_phase, action) = match (mode, intent) {
+                (TerminalFixtureMode::Selected, true) => {
+                    (RestorePhase::FinalizeIntent, "finalize_restore")
+                }
+                (TerminalFixtureMode::Selected, false) => {
+                    (RestorePhase::Finalized, "finalize_restore")
+                }
+                (TerminalFixtureMode::Original, true) => {
+                    (RestorePhase::FinalizeOriginalIntent, "finalize_rollback")
+                }
+                (TerminalFixtureMode::Original, false) => {
+                    (RestorePhase::OriginalFinalized, "finalize_rollback")
+                }
+                (TerminalFixtureMode::Absence, false) => (
+                    RestorePhase::OriginalAbsenceFinalized,
+                    "finalize_original_absence",
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(loaded.phase, expected_phase);
+            review14_assert_rollback_action(&f, &loaded, &lease, action);
+        }
     }
 }
