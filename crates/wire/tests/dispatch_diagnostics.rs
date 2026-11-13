@@ -106,6 +106,7 @@ fn fake_transport_fixture() {
     );
     let tmux = home.join("fake-tmux");
     executable(&tmux, "#!/bin/sh\nexit 1\n");
+    let _muse_fixture = fl_wire::test_isolation::register_executable(&muse).unwrap();
 
     // The parent never mutates its environment. Each child has one test and a clean,
     // fixture-only environment, so it cannot race other tests' TMUX_ENV_LOCK guards.
@@ -491,6 +492,7 @@ fn daemon_store_fault_fixture() {
     );
     let tmux = home.join("fake-tmux");
     executable(&tmux, "#!/bin/sh\nexit 1\n");
+    let _muse_fixture = fl_wire::test_isolation::register_executable(&muse).unwrap();
     // The subprocess owns all fixture paths; no inherited path can authorize access.
     unsafe {
         std::env::set_var("HOME", home);

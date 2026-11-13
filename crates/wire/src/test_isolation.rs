@@ -96,6 +96,20 @@ pub(crate) fn ensure_fixture(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+fn fixture_key(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing fixture name")
+    })?;
+    Ok(path
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing fixture parent")
+        })?
+        .canonicalize()?
+        .join(name))
+}
+
+#[cfg(unix)]
 static UNIX_FIXTURES: std::sync::Mutex<Vec<(PathBuf, u64, u64)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -135,7 +149,7 @@ pub fn register_unix_socket(path: &Path) -> std::io::Result<UnixFixture> {
         ));
     }
     let fixture = UnixFixture {
-        path: path.to_path_buf(),
+        path: fixture_key(path)?,
         dev: metadata.dev(),
         ino: metadata.ino(),
     };
@@ -162,7 +176,7 @@ pub(crate) fn ensure_socket(path: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| denied())?;
     if metadata.file_type().is_socket()
         && UNIX_FIXTURES.lock().unwrap().contains(&(
-            path.to_path_buf(),
+            fixture_key(path).map_err(|_| denied())?,
             metadata.dev(),
             metadata.ino(),
         ))
@@ -220,6 +234,104 @@ pub(crate) fn tmux_fixture() -> PathBuf {
                 .path()
                 .join("no-tmux")
         })
+}
+
+#[cfg(unix)]
+static EXEC_FIXTURES: std::sync::Mutex<Vec<(PathBuf, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct ExecutableFixture {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+#[cfg(unix)]
+impl Drop for ExecutableFixture {
+    fn drop(&mut self) {
+        let mut fixtures = EXEC_FIXTURES.lock().unwrap();
+        if let Some(i) = fixtures
+            .iter()
+            .position(|f| f == &(self.path.clone(), self.dev, self.ino))
+        {
+            fixtures.remove(i);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn register_executable(path: &Path) -> std::io::Result<ExecutableFixture> {
+    use std::os::unix::fs::MetadataExt;
+    ensure_fixture(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fixture is not a regular file",
+        ));
+    }
+    let guard = ExecutableFixture {
+        path: fixture_key(path)?,
+        dev: meta.dev(),
+        ino: meta.ino(),
+    };
+    EXEC_FIXTURES
+        .lock()
+        .unwrap()
+        .push((guard.path.clone(), guard.dev, guard.ino));
+    Ok(guard)
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !is_enabled() {
+        return Ok(());
+    }
+    let denied = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unregistered wire test executable",
+        )
+    };
+    ensure_fixture(path)?;
+    let meta = std::fs::symlink_metadata(path).map_err(|_| denied())?;
+    if meta.file_type().is_file()
+        && EXEC_FIXTURES.lock().unwrap().contains(&(
+            fixture_key(path).map_err(|_| denied())?,
+            meta.dev(),
+            meta.ino(),
+        ))
+    {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_executable(_path: &Path) -> std::io::Result<()> {
+    if is_enabled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unregistered wire test executable",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+static HELD_EXEC_FIXTURES: std::sync::Mutex<Vec<ExecutableFixture>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(all(test, unix))]
+pub(crate) fn retain_executable_fixture(path: &Path) {
+    HELD_EXEC_FIXTURES
+        .lock()
+        .unwrap()
+        .push(register_executable(path).unwrap());
 }
 
 static TCP_FIXTURES: std::sync::Mutex<Vec<std::net::SocketAddr>> =

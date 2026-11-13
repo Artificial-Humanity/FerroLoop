@@ -1070,6 +1070,9 @@ fn run_codex_queue(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), CodexQueueError> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(bin)
+        .map_err(|err| CodexQueueError::Spawn(err.to_string()))?;
     let mut cmd = Command::new(bin);
     cmd.args(["queue", "--thread", thread_id, "--message", text])
         .stdout(std::process::Stdio::null())
@@ -1152,6 +1155,8 @@ fn run_muse_exec(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), String> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(bin).map_err(|err| err.to_string())?;
     let mut cmd = Command::new(bin);
     cmd.args(["exec", "--session-id", session_id, "--json", text])
         .stdout(std::process::Stdio::null())
@@ -1262,6 +1267,8 @@ fn run_grok_turn(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<CapturedRun, String> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(bin).map_err(|err| err.to_string())?;
     let mut cmd = Command::new(bin);
     cmd.args([
         "--no-auto-update",
@@ -1442,6 +1449,8 @@ fn deliver_to_agy_route(
         (String::new(), r_csrf)
     };
 
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(&exe).map_err(|err| err.to_string())?;
     let mut cmd = Command::new(&exe);
     // `agy agentapi send-message [--title=<title>] <recipient_id> <content>`: a bare title
     // would be read as the recipient.
@@ -9878,6 +9887,8 @@ mod tests {
         prev: Option<std::ffi::OsString>,
         #[cfg(unix)]
         _host_fixture: Option<fl_host_proto::HubTestHostFixture>,
+        #[cfg(unix)]
+        _exec_fixture: Option<crate::test_isolation::ExecutableFixture>,
     }
 
     impl EnvGuard {
@@ -9888,6 +9899,15 @@ mod tests {
                 crate::test_isolation::ensure_fixture(value).unwrap();
                 fl_host_proto::register_hub_test_host_fixture(value).unwrap()
             });
+            #[cfg(unix)]
+            let exec_fixture = if matches!(
+                key,
+                "FL_WIRE_CODEX_BIN" | "FL_WIRE_MUSE_BIN" | "FL_WIRE_GROK_BIN" | "FL_WIRE_AGY_BIN"
+            ) {
+                crate::test_isolation::register_executable(value).ok()
+            } else {
+                None
+            };
             // SAFETY: the guard restores the previous value on drop. Callers hold
             // the matching env lock for the whole test.
             unsafe {
@@ -9898,6 +9918,8 @@ mod tests {
                 prev,
                 #[cfg(unix)]
                 _host_fixture: host_fixture,
+                #[cfg(unix)]
+                _exec_fixture: exec_fixture,
             }
         }
 
@@ -9913,6 +9935,8 @@ mod tests {
                 prev,
                 #[cfg(unix)]
                 _host_fixture: None,
+                #[cfg(unix)]
+                _exec_fixture: None,
             }
         }
     }
@@ -10112,7 +10136,30 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_isolation::retain_executable_fixture(&path);
         path
+    }
+
+    #[test]
+    fn vendor_defaults_are_refused_in_the_wire_test_process() {
+        assert!(matches!(
+            run_codex_queue(Path::new("codex"), "thread", None, "hello"),
+            Err(CodexQueueError::Spawn(_))
+        ));
+        assert!(run_muse_exec(Path::new("muse"), "session", None, "hello").is_err());
+        assert!(run_grok_headless(Path::new("grok"), "session", None, "hello").is_err());
+        assert!(
+            deliver_to_agy_route(
+                None,
+                "conversation",
+                &None,
+                &None,
+                &Some(PathBuf::from("agy")),
+                "title",
+                "hello"
+            )
+            .is_err()
+        );
     }
 
     #[test]

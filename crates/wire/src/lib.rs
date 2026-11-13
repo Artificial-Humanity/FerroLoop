@@ -117,6 +117,46 @@ mod host_isolation_tests {
 
     #[cfg(unix)]
     #[test]
+    fn wire_host_validation_rechecks_after_pre_connect_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("host.sock");
+        let endpoint = fl_host_proto::HostEndpoint::unix(&path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener =
+                fl_host_proto::HostListener::bind(fl_host_proto::HostConfig::new(endpoint.clone()))
+                    .await
+                    .unwrap();
+            let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
+            let replacement = path.clone();
+            let options = fl_host_proto::ConnectOptions {
+                pre_connect: Some(std::sync::Arc::new(move || {
+                    std::fs::remove_file(&replacement).unwrap();
+                    std::os::unix::fs::symlink(
+                        "/run/user/1000/ferroloop/fl-host.sock",
+                        &replacement,
+                    )
+                    .unwrap();
+                })),
+                ..Default::default()
+            };
+            let error = fl_host_proto::AsyncHostClient::connect_with(&endpoint, options)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("unregistered wire test"));
+            listener.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn wire_unix_registration_rejects_unregistered_replaced_and_symlinked_sockets() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("socket");
@@ -142,6 +182,22 @@ mod host_isolation_tests {
         assert!(crate::test_isolation::register_unix_socket(&path).is_err());
         assert!(crate::test_isolation::ensure_socket(&path).is_err());
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wire_executable_registration_is_exact_and_rejects_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fake-vendor");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(crate::test_isolation::ensure_executable(&path).is_err());
+        let fixture = crate::test_isolation::register_executable(&path).unwrap();
+        assert!(crate::test_isolation::ensure_executable(&path).is_ok());
+        let link = dir.path().join("symlink");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(crate::test_isolation::register_executable(&link).is_err());
+        drop(fixture);
+        assert!(crate::test_isolation::ensure_executable(&path).is_err());
     }
 
     #[test]

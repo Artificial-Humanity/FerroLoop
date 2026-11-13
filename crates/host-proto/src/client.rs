@@ -1021,6 +1021,11 @@ async fn connect_unix(
     if let Some(hook) = &options.pre_connect {
         hook();
     }
+    // Recheck immediately before each connect, including auth retries and test hooks.
+    #[cfg(feature = "hub-test-isolation")]
+    if let Some(validate) = TEST_ENDPOINT_VALIDATOR.get() {
+        validate(endpoint)?;
+    }
     let stream = tokio::net::UnixStream::connect(endpoint.socket_path())
         .await
         .map_err(|err| HostError::Io(err.to_string()))?;
