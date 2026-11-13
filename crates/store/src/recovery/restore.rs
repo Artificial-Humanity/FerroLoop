@@ -2955,9 +2955,6 @@ pub(crate) fn finalize_absence(
 }
 
 fn inspect_abandon_layout(j: &RestoreJournal, l: &OperationLimits) -> Result<(), RecoveryError> {
-    if matches!(j.original, FileBinding::Forensic { .. }) {
-        return Err(fs::refused(l, "forensic original cannot be abandoned"));
-    }
     if !matches!(
         j.phase,
         RestorePhase::Admitted
@@ -4763,10 +4760,7 @@ fn check_terminal_metadata(
         caps.payload,
         &scoped,
     )?;
-    if (context.mode == TerminalMode::Abandon && matches!(j.original, FileBinding::Forensic { .. }))
-        || (context.mode == TerminalMode::OriginalAbsence
-            && !matches!(j.original, FileBinding::Absent))
-    {
+    if context.mode == TerminalMode::OriginalAbsence && !matches!(j.original, FileBinding::Absent) {
         return Err(l.verification());
     }
     // Time/operator validation deliberately uses accepting authority, never the
@@ -5603,4 +5597,35 @@ mod metadata_tests {
         metadata::measure(&original, caps.payload, &l).unwrap();
     }
     const FIXTURE: &str = r###"{"version":1,"operation_id":"01a1ce11-0000-7000-8000-000000000001","destination":"/home/lmcfarlin/Projects/Artificial-Humanity/scratch/ferroloop/fixture/native-store.fls","staging":"/home/lmcfarlin/Projects/Artificial-Humanity/scratch/ferroloop/fixture/.restore-01a1ce11-0000-7000-8000-000000000001-01a1ce11-0000-7000-8000-000000000002","rollback":"/home/lmcfarlin/Projects/Artificial-Humanity/scratch/ferroloop/fixture/.restore-01a1ce11-0000-7000-8000-000000000001-01a1ce11-0000-7000-8000-000000000002/original.fls","original":{"state":"readable","identity":[11,22],"bytes":23068672,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"original_verification":{"report_version":1,"copy_evidence":{"verified_file_identity":[11,22],"source_image_identity":null,"creation":"caller_supplied_existing","image_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"operation_id":"01a1ce11-0000-7000-8000-000000000001","image_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","image_bytes":23068672,"published_sequence":7,"logical_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","profile_version":1,"profile_sha256":"4444444444444444444444444444444444444444444444444444444444444444","canonical_encoding_version":1,"intrinsic_lineage_available":false,"external_publish_status":"exclusion_unproven_before_single_ownership","verified_collection_count":2,"unknown_collection_count":0,"opaque_runtime_references":false,"query_probe_count":4,"exception_count":0,"dependency_count":0,"transient_rpc_dedupe_persisted":false,"durable_rpc_receipts_claimed":false,"readiness":"verified_local_contents","verifier_build_identity":{"package_version":"0.1.0","source_revision":{"availability":"unavailable"},"executable_sha256":{"availability":"unavailable"}}},"original_read_error":null,"selected_profile":{"version":1,"kind":"small_empty","catalog_identity":"fixture/catalog/store","dependencies":[{"reference_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","catalog_identity":"original-or-selected-external-store","required_sequence":9,"policy":"reconcile_before_admission"}],"preexisting_exceptions":[],"reference_rules":[],"probes":[]},"selected_dependencies":{"references":[{"reference_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","catalog_identity":"original-or-selected-external-store","required_sequence":9,"policy":"reconcile_before_admission"}]},"selected_sequence":11,"selected_logical_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","generation_metadata_sha256":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"terminal_evidence_context":null,"original_dependencies":{"references":[]},"original_profile":{"version":1,"kind":"small_empty","catalog_identity":"fixture/catalog/store","dependencies":[],"preexisting_exceptions":[],"reference_rules":[],"probes":[]},"candidate_bytes":23068672,"probe_identities":[[11,25],[11,26]],"candidate_identity":[11,23],"candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","staging_identity":[11,21],"journal_identity":[11,24],"operation_lock_identity":[11,27],"journal_capacity":983040,"selected_bundle_operation":"01a1ce11-0000-7000-8000-000000000002","selected_bundle_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","binding":{"version":1,"operation_id":"01a1ce11-0000-7000-8000-000000000001","action":{"action":"restore","bundle_operation":"01a1ce11-0000-7000-8000-000000000002","bundle_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"catalog_identity":"fixture/catalog/store","approved_root_identity":[11,10],"physical_path":"/home/lmcfarlin/Projects/Artificial-Humanity/scratch/ferroloop/fixture/native-store.fls","parent_identity":[11,20],"expected_file":{"state":"readable","identity":[11,22],"bytes":23068672,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"profile_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","build":{"package_version":"0.1.0","source_revision":{"availability":"unavailable"},"executable_sha256":{"availability":"unavailable"}},"issued_at_unix_ms":1000,"expires_at_unix_ms":2000,"operator":"fixture operator","exclusion":{"legacy_and_cached_handles_excluded":true,"external_dispatch_excluded":true,"active_owner_excluded":true,"evidence":"fixture administrative exclusion"}},"verification":{"report_version":1,"copy_evidence":{"verified_file_identity":[11,23],"source_image_identity":null,"creation":"caller_supplied_existing","image_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"operation_id":"01a1ce11-0000-7000-8000-000000000001","image_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","image_bytes":23068672,"published_sequence":11,"logical_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","profile_version":1,"profile_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","canonical_encoding_version":1,"intrinsic_lineage_available":false,"external_publish_status":"exclusion_unproven_before_single_ownership","verified_collection_count":2,"unknown_collection_count":0,"opaque_runtime_references":false,"query_probe_count":4,"exception_count":0,"dependency_count":1,"transient_rpc_dedupe_persisted":false,"durable_rpc_receipts_claimed":false,"readiness":"verified_local_contents","verifier_build_identity":{"package_version":"0.1.0","source_revision":{"availability":"unavailable"},"executable_sha256":{"availability":"unavailable"}}},"budget":{"baseline_bytes":23068672,"backup_bytes":23134208,"destination_bytes":23068672,"candidate_bytes":23068672,"rollback_new_bytes":0,"verifier_scratch_bytes":0,"metadata_bytes":18874368,"allocation_ceiling":46137344,"read_byte_ceiling":134217728,"memory_ceiling":536870912,"metadata_payload_ceiling":1048576,"space_margin_bytes":4096},"phase":"installed","resume_finalize_attempts":0,"rollback_attempts":0,"current_attempt":0,"attempt_deadline_unix_ms":1800,"forensic_handling_required":false,"reconciliation":null,"absence_reconciliation":null}"###;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod forensic_binding_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn forensic_original_binding_rejects_a_different_read_error_code() {
+        let root = crate::recovery::test_support::fixture_root();
+        let path = root.path().join("unreadable.fls");
+        std::fs::write(&path, b"forensic original").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let m = std::fs::metadata(&path).unwrap();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        let mut binding = FileBinding::Forensic {
+            identity: (m.dev(), m.ino()),
+            bytes: m.len(),
+            read_error: libc::EACCES,
+        };
+        matches_binding(&path, &binding, &l).unwrap();
+        if let FileBinding::Forensic { read_error, .. } = &mut binding {
+            *read_error = libc::EIO;
+        }
+        assert!(matches_binding(&path, &binding, &l).is_err());
+    }
 }

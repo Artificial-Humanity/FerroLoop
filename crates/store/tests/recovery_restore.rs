@@ -5985,3 +5985,235 @@ fn catalog_large_streamed_config_does_not_reserve_a_parsed_payload() {
         "small decoded metadata plus live fixed buffers must not scale with config bytes"
     );
 }
+
+fn forensic_admitted_fixture() -> (Fixture, RestoreJournal, OfflineLease, fs::File) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let bundle = f.bundle();
+    // Retain a fixture-only descriptor to inspect bytes without changing the
+    // original's unreadable classification during the operation.
+    let original = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&f.source)
+        .unwrap();
+    fs::set_permissions(&f.source, fs::Permissions::from_mode(0o000)).unwrap();
+    let (request, lease) = prepare_restore_bundle(&f, &f.source, bundle);
+    let hook = journal_boundary_io(Some(RecoveryEvent::Flush(Member::Image)));
+    let filesystem = CutFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    assert!(restore_offline(&request, &lease, &filesystem).is_err());
+    assert!(
+        hook.events
+            .lock()
+            .unwrap()
+            .contains(&RecoveryEvent::Flush(Member::Image)),
+        "the candidate-copy flush cut must be reached"
+    );
+    let guard: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.source.with_extension("fls.restore-guard")).unwrap())
+            .unwrap();
+    let path = std::path::Path::new(guard["journal"].as_str().unwrap());
+    let journal = load_restore_journal(path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(journal.phase, RestorePhase::Admitted);
+    assert!(journal.verification.is_none());
+    let m = original.metadata().unwrap();
+    assert_eq!(
+        journal.original,
+        FileBinding::Forensic {
+            identity: (m.dev(), m.ino()),
+            bytes: m.len(),
+            read_error: libc::EACCES,
+        }
+    );
+    (f, journal, lease, original)
+}
+
+fn forensic_descriptor_digest(file: &fs::File) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let mut hash = sha2::Sha256::new();
+    let mut bytes = [0; 65536];
+    let mut offset = 0;
+    loop {
+        let count = file.read_at(&mut bytes, offset).unwrap();
+        if count == 0 {
+            return hash.finalize().to_vec();
+        }
+        hash.update(&bytes[..count]);
+        offset += count as u64;
+    }
+}
+
+#[test]
+fn restore_forensic_admitted_abandon_preserves_original_and_retained_artifacts() {
+    use std::os::unix::fs::PermissionsExt;
+    let (f, journal, lease, original) = forensic_admitted_fixture();
+    let original_bytes = forensic_descriptor_digest(&original);
+    let metadata = original.metadata().unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0);
+    let guard = f.source.with_extension("fls.restore-guard");
+    let pin = f
+        .backups
+        .join(".catalog/restore-pins")
+        .join(format!("{}.json", journal.operation_id));
+    assert!(guard.exists());
+    assert!(pin.exists());
+    let retained: std::collections::BTreeMap<_, _> = fs::read_dir(&journal.staging)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let m = entry.metadata().unwrap();
+            let digest = if entry.file_name() == "journal.bin" {
+                None
+            } else {
+                Some(forensic_descriptor_digest(&fs::File::open(&path).unwrap()))
+            };
+            (entry.file_name(), ((m.dev(), m.ino()), m.len(), digest))
+        })
+        .collect();
+    assert!(retained.contains_key(std::ffi::OsStr::new("candidate.fls")));
+    assert!(retained.contains_key(std::ffi::OsStr::new("journal.bin.lock")));
+    assert!(matches!(
+        abandon_restore(&journal, &lease, &f.filesystem()).unwrap(),
+        RestoreOutcome::Abandoned { .. }
+    ));
+    assert!(!guard.exists());
+    assert!(!pin.exists());
+    assert_eq!(
+        inspect_file_binding(&f.source, &limits()).unwrap(),
+        journal.original
+    );
+    assert_eq!(forensic_descriptor_digest(&original), original_bytes);
+    let m = fs::metadata(&f.source).unwrap();
+    assert_eq!((m.dev(), m.ino()), (metadata.dev(), metadata.ino()));
+    assert_eq!(m.len(), metadata.len());
+    assert_eq!(m.permissions().mode(), metadata.permissions().mode());
+    assert_eq!(
+        fs::read_dir(&journal.staging).unwrap().count(),
+        retained.len()
+    );
+    for (name, (identity, len, digest)) in retained {
+        let path = journal.staging.join(name);
+        let m = fs::metadata(&path).unwrap();
+        assert_eq!((m.dev(), m.ino()), identity);
+        assert_eq!(m.len(), len);
+        if let Some(digest) = digest {
+            assert_eq!(
+                forensic_descriptor_digest(&fs::File::open(path).unwrap()),
+                digest
+            );
+        }
+    }
+    let path = journal.staging.join("journal.bin");
+    let terminal = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(terminal.phase, RestorePhase::Abandoned);
+    assert_eq!(terminal.original, journal.original);
+    assert_eq!(terminal.rollback_attempts, journal.rollback_attempts + 1);
+    let bytes = fs::read(&path).unwrap();
+    assert!(matches!(
+        abandon_restore(&terminal, &lease, &f.filesystem()).unwrap(),
+        RestoreOutcome::Abandoned { .. }
+    ));
+    assert_eq!(
+        fs::read(path).unwrap(),
+        bytes,
+        "terminal retry must not append"
+    );
+}
+
+#[test]
+fn restore_forensic_admitted_abandon_refuses_changed_original_binding_without_attempt() {
+    use std::os::unix::fs::PermissionsExt;
+    for change in ["identity", "size", "readability"] {
+        let (f, journal, lease, original) = forensic_admitted_fixture();
+        match change {
+            "identity" => {
+                let replacement = f.source.with_extension("replacement");
+                let mut reader = original.try_clone().unwrap();
+                let mut writer = fs::File::create(&replacement).unwrap();
+                std::io::copy(&mut reader, &mut writer).unwrap();
+                assert_eq!(
+                    writer.metadata().unwrap().len(),
+                    original.metadata().unwrap().len()
+                );
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o000)).unwrap();
+                fs::rename(replacement, &f.source).unwrap();
+            }
+            "size" => original
+                .set_len(original.metadata().unwrap().len() + 1)
+                .unwrap(),
+            "readability" => {
+                fs::set_permissions(&f.source, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let changed_binding = inspect_file_binding(&f.source, &limits()).unwrap();
+        assert_ne!(changed_binding, journal.original);
+        if change == "identity" {
+            let FileBinding::Forensic {
+                identity,
+                bytes,
+                read_error,
+            } = changed_binding
+            else {
+                panic!("replacement must remain forensic")
+            };
+            assert_ne!(
+                identity,
+                (
+                    original.metadata().unwrap().dev(),
+                    original.metadata().unwrap().ino()
+                )
+            );
+            assert_eq!(bytes, original.metadata().unwrap().len());
+            assert_eq!(read_error, libc::EACCES);
+        }
+        let path = journal.staging.join("journal.bin");
+        let guard = f.source.with_extension("fls.restore-guard");
+        let pin = f
+            .backups
+            .join(".catalog/restore-pins")
+            .join(format!("{}.json", journal.operation_id));
+        let before = [
+            fs::read(&path).unwrap(),
+            fs::read(&guard).unwrap(),
+            fs::read(&pin).unwrap(),
+        ];
+        let hook = journal_boundary_io(None);
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(
+            abandon_restore(&journal, &lease, &filesystem).is_err(),
+            "{change}"
+        );
+        assert_eq!(
+            [
+                fs::read(path).unwrap(),
+                fs::read(guard).unwrap(),
+                fs::read(pin).unwrap()
+            ],
+            before,
+            "changed metadata for {change}"
+        );
+        let events = hook.events.lock().unwrap();
+        assert!(
+            !events.contains(&RecoveryEvent::Write(Member::RestoreJournal)),
+            "charged attempt for {change}"
+        );
+        assert!(
+            !events.contains(&RecoveryEvent::RestoreGuardRemove),
+            "unfenced for {change}"
+        );
+        assert!(
+            !events.contains(&RecoveryEvent::RestorePinRemove),
+            "un-pinned for {change}"
+        );
+    }
+}
