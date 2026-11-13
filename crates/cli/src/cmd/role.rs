@@ -139,7 +139,7 @@ mod tests {
     fn role_line_names_slug_label_policy_and_kind() {
         let roles = builtin_role_records();
         assert_eq!(
-            role_line(&roles[0]),
+            role_line(roles.iter().find(|role| role.slug == "lead").unwrap()),
             "lead Project Lead lab-manager-review builtin"
         );
         let custom =

@@ -794,6 +794,21 @@ mod tests {
     }
 
     #[test]
+    fn director_selectors_cover_primary_and_extra_areas() {
+        let director = AgentRole::from_wire("director").unwrap();
+        let agents = vec![
+            seat(1, "dana", director, "kaggle", &["competition"]),
+            seat(2, "lea", AgentRole::Lead, "competition", &[]),
+        ];
+        assert_eq!(names("@role:director", &agents, "owner"), ["dana"]);
+        assert_eq!(
+            names("@area:competition/director", &agents, "owner"),
+            ["dana"]
+        );
+        assert!(names("@area:other/director", &agents, "owner").is_empty());
+    }
+
+    #[test]
     fn at_council_reaches_the_council_area_and_every_strategist_once() {
         let mut retired_strategist = seat(6, "gone", AgentRole::Strategist, "ferroloop", &[]);
         retired_strategist.status = AgentStatus::Retired;

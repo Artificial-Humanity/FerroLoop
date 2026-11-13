@@ -79,6 +79,7 @@ impl AreaRecord {
 /// `Custom` (`custom:<slug>`); catalog metadata does not confer structural authority.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AgentRole {
+    Director,
     Lead,
     Assistant,
     LabManager,
@@ -112,6 +113,7 @@ impl AgentRole {
         }
         let name = lower.strip_prefix("custom:").unwrap_or(&lower);
         let default = match name {
+            "director" => Some(Self::Director),
             "ui-developer" | "ui_developer" => Some(Self::UiDeveloper),
             "web-developer" | "web_developer" => Some(Self::WebDeveloper),
             "mobile-developer" | "mobile_developer" => Some(Self::MobileDeveloper),
@@ -133,6 +135,7 @@ impl AgentRole {
 
     pub fn as_wire(&self) -> String {
         match self {
+            Self::Director => "director".to_string(),
             Self::Lead => "lead".to_string(),
             Self::Assistant => "assistant".to_string(),
             Self::LabManager => "lab_manager".to_string(),
@@ -428,7 +431,8 @@ pub fn normalize_role_slug(raw: &str) -> Result<String, RoleError> {
     Ok(validate_slug(aliased)?)
 }
 
-const BUILTIN_ROLE_SLUGS: [&str; 11] = [
+const BUILTIN_ROLE_SLUGS: [&str; 12] = [
+    "director",
     "lead",
     "assistant",
     "strategist",
@@ -530,7 +534,14 @@ impl RoleRecord {
 
 /// Editable, deletion-protected defaults, independent of runtime role variants.
 pub fn builtin_role_records() -> Vec<RoleRecord> {
-    let raw: [(&str, &str, &str, RoleReviewPolicy, &str); 11] = [
+    let raw: [(&str, &str, &str, RoleReviewPolicy, &str); 12] = [
+        (
+            "director",
+            "Project Director",
+            "Coordinates a portfolio of projects and their leads.",
+            RoleReviewPolicy::LeadReview,
+            "Read .agents/roles/director.md and coordinate the project portfolio.",
+        ),
         (
             "lead",
             "Project Lead",
@@ -789,8 +800,23 @@ mod tests {
     use crate::ids::seq_iri;
 
     #[test]
+    fn director_role_is_canonical_and_catalogued() {
+        let role = AgentRole::from_wire("director").unwrap();
+        assert_eq!(role.as_wire(), "director");
+        assert_eq!(AgentRole::from_wire("custom:director").unwrap(), role);
+        let record = builtin_role_records()
+            .into_iter()
+            .find(|r| r.slug == "director")
+            .unwrap();
+        assert_eq!(record.label, "Project Director");
+        assert!(record.builtin);
+        assert!(record.prompt_template.contains(".agents/roles/director.md"));
+    }
+
+    #[test]
     fn agent_role_flat_wire_round_trips() {
         let canonical = [
+            (AgentRole::Director, "director"),
             (AgentRole::Lead, "lead"),
             (AgentRole::Assistant, "assistant"),
             (AgentRole::LabManager, "lab_manager"),
@@ -866,6 +892,7 @@ mod tests {
     #[test]
     fn stored_legacy_role_records_deserialize_to_the_new_canonical_form() {
         for (old, new) in [
+            ("custom:director", "director"),
             ("custom:scribe", "journalist"),
             ("scribe", "journalist"),
             ("custom:ui-developer", "ui-developer"),
@@ -1166,11 +1193,12 @@ mod tests {
         use crate::MemStore;
         let store = MemStore::default();
         let roles = list_roles(&store).unwrap();
-        assert_eq!(roles.len(), 12);
+        assert_eq!(roles.len(), 13);
         let slugs: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
         assert_eq!(
             slugs,
             [
+                "director",
                 "lead",
                 "assistant",
                 "strategist",
@@ -1185,7 +1213,7 @@ mod tests {
                 "council-chair"
             ]
         );
-        assert_eq!(roles.iter().filter(|r| r.builtin).count(), 11);
+        assert_eq!(roles.iter().filter(|r| r.builtin).count(), 12);
         // Custom upsert appears and persists on re-read (same store = reopen).
         let custom = RoleRecord::new(
             "reviewer",
@@ -1200,7 +1228,7 @@ mod tests {
             get_role(&store, "reviewer").unwrap().unwrap().label,
             "Reviewer"
         );
-        assert_eq!(list_roles(&store).unwrap().len(), 13);
+        assert_eq!(list_roles(&store).unwrap().len(), 14);
         // Lab-manager alias lookup finds the builtin.
         assert_eq!(
             get_role(&store, "lab_manager").unwrap().unwrap().slug,
@@ -1215,7 +1243,7 @@ mod tests {
         let lead2 = get_role(&store, "lead").unwrap().unwrap();
         assert_eq!(lead2.label, "Boss");
         assert!(lead2.builtin);
-        assert_eq!(list_roles(&store).unwrap().len(), 13);
+        assert_eq!(list_roles(&store).unwrap().len(), 14);
         // Delete builtin refused; delete custom gone.
         assert!(matches!(
             delete_role(&store, "lead"),
@@ -1223,7 +1251,7 @@ mod tests {
         ));
         delete_role(&store, "reviewer").unwrap();
         assert!(get_role(&store, "reviewer").unwrap().is_none());
-        assert_eq!(list_roles(&store).unwrap().len(), 12);
+        assert_eq!(list_roles(&store).unwrap().len(), 13);
         assert!(matches!(
             delete_role(&store, "reviewer"),
             Err(RoleError::NotFound(_))
@@ -1262,7 +1290,7 @@ mod tests {
         // Value tries to hijack the builtin `lead` from a custom key.
         insert_raw_role(&store, "role-ghost", role_value("lead", "Hijacked"));
         let roles = list_roles(&store).unwrap();
-        assert_eq!(roles.len(), 12);
+        assert_eq!(roles.len(), 13);
         assert!(
             roles
                 .iter()
@@ -1287,7 +1315,7 @@ mod tests {
         insert_raw_role(&store, "role-broken", serde_json::json!({"not": "a role"}));
         insert_raw_role(&store, "role-lead", serde_json::json!("garbage"));
         let roles = list_roles(&store).unwrap();
-        assert_eq!(roles.len(), 12);
+        assert_eq!(roles.len(), 13);
         assert_eq!(
             roles.iter().find(|r| r.slug == "lead").unwrap().label,
             "Project Lead"
