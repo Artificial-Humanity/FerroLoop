@@ -3955,6 +3955,9 @@ fn prepare_clean_composer_before_paste_impl(
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
     if !contents1.trim().is_empty() && !composer_located_for_style(&contents1, composer_style) {
+        if composer_style == ComposerStyle::CodexPrompt {
+            log_codex_unlocatable(&contents1);
+        }
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
@@ -3989,6 +3992,9 @@ fn prepare_clean_composer_before_paste_impl(
             .to_string());
     };
     if !contents2.trim().is_empty() && !composer_located_for_style(&contents2, composer_style) {
+        if composer_style == ComposerStyle::CodexPrompt {
+            log_codex_unlocatable(&contents2);
+        }
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
@@ -4029,6 +4035,9 @@ fn prepare_clean_composer_before_paste_impl(
             };
             if !contents.trim().is_empty() && !composer_located_for_style(&contents, composer_style)
             {
+                if composer_style == ComposerStyle::CodexPrompt {
+                    log_codex_unlocatable(&contents);
+                }
                 return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
             if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
@@ -4859,6 +4868,38 @@ fn log_unlisted_muse_hint(candidate: &str) {
     let line = unlisted_muse_hint_log_line(candidate);
     #[cfg(test)]
     UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().push(line.clone()));
+    eprintln!("fl-wire: warning: {line}");
+}
+
+fn codex_unlocatable_log_line(screen: &str) -> Option<String> {
+    if codex_composer_state(screen) != CodexComposerState::Unlocatable {
+        return None;
+    }
+    if screen_has_dialog_or_menu_markers_with_context(screen, None, None, &[]) {
+        return None;
+    }
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let footer_lines_seen = lines.iter().filter(|l| is_codex_footer_line(l)).count();
+    let has_prompt = lines
+        .iter()
+        .any(|l| l.trim_start().starts_with("› ") || l.trim_start() == "›");
+    let part = if has_prompt {
+        "footer not recognised"
+    } else {
+        "no prompt line"
+    };
+    Some(format!(
+        "codex composer could not be located: {part} (footer_lines_seen={footer_lines_seen})"
+    ))
+}
+
+fn log_codex_unlocatable(screen: &str) {
+    let Some(line) = codex_unlocatable_log_line(screen) else {
+        return;
+    };
+    #[cfg(test)]
+    CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow_mut().push(line.clone()));
     eprintln!("fl-wire: warning: {line}");
 }
 
@@ -6656,6 +6697,8 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
 #[cfg(test)]
 thread_local! {
     pub(crate) static UNLISTED_MUSE_HINT_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static CODEX_UNLOCATABLE_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -18828,6 +18871,86 @@ exit 1"#,
             .expect_err("occupied/unlocatable Codex composer must hold");
             assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
             assert_eq!(e, 0);
+        }
+    }
+
+    #[test]
+    fn codex_unlocatable_logs_distinct_line_only_on_unlocatable_refusal() {
+        let footer = "  GPT-6.1-Sol medium · ~/Projects/x\n  ← for agents · ? for shortcuts";
+        let idle = format!("› Ask Codex to do anything\n\n{footer}");
+        let typed = format!("› fix the failing test please\n\n{footer}");
+        let dialog = "Do you want to proceed?\n  1. Yes\n  2. No".to_string();
+        let no_prompt = format!("some output without a composer\n\n{footer}");
+        let unrecognised_footer = "› Ask Codex to do anything\n\n  GPT-6.1-Sol medium ~/Projects/x\n  left for agents ? for shortcuts".to_string();
+        assert_eq!(
+            codex_composer_state(&unrecognised_footer),
+            CodexComposerState::Unlocatable
+        );
+        // Pure helper: reason + footer count, no screen text.
+        let no_prompt_line = codex_unlocatable_log_line(&no_prompt).expect("no_prompt line");
+        assert!(
+            no_prompt_line.contains("codex composer could not be located"),
+            "{no_prompt_line}"
+        );
+        assert!(
+            no_prompt_line.contains("no prompt line"),
+            "{no_prompt_line}"
+        );
+        assert!(
+            no_prompt_line.contains("footer_lines_seen=2"),
+            "{no_prompt_line}"
+        );
+        assert!(!no_prompt_line.contains("some output"), "{no_prompt_line}");
+        let footer_line = codex_unlocatable_log_line(&unrecognised_footer).expect("footer line");
+        assert!(
+            footer_line.contains("footer not recognised"),
+            "{footer_line}"
+        );
+        assert!(footer_line.contains("footer_lines_seen=0"), "{footer_line}");
+        assert!(!footer_line.contains("GPT-6.1"), "{footer_line}");
+        for screen in [&idle, &typed, &dialog] {
+            assert_eq!(codex_unlocatable_log_line(screen), None, "{screen:?}");
+        }
+        // Refusal path calls it exactly once per refusal.
+        for (screen, needle) in [
+            (&no_prompt, "no prompt line"),
+            (&unrecognised_footer, "footer not recognised"),
+        ] {
+            CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow_mut().clear());
+            let err = prepare_clean_composer_before_paste_impl(
+                "hello codex",
+                &[],
+                false,
+                ComposerStyle::CodexPrompt,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || Ok(()),
+            )
+            .expect_err("unlocatable Codex composer must hold");
+            assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+            let warnings =
+                CODEX_UNLOCATABLE_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+            assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+            assert!(warnings[0].contains(needle), "{warnings:?}");
+            assert!(!warnings[0].contains("GPT-6.1"), "{warnings:?}");
+        }
+        for screen in [&idle, &typed, &dialog] {
+            CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow_mut().clear());
+            let _ = prepare_clean_composer_before_paste_impl(
+                "hello codex",
+                &[],
+                false,
+                ComposerStyle::CodexPrompt,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || Ok(()),
+            );
+            assert!(
+                CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow().is_empty()),
+                "no line for {screen:?}"
+            );
         }
     }
 
