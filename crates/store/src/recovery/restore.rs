@@ -3072,6 +3072,7 @@ fn terminal_cleanup(
         let catalog = Dir::open(&filesystem.root().join(".catalog"), l)?;
         let pins = catalog.child("restore-pins", false, l)?;
         let pin_name = format!("{}.json", j.operation_id);
+        let temp_name = format!("{pin_name}.tmp");
         if let Some(expected) = entry_identity(&pins.path.join(&pin_name), l)? {
             pins.remove_file_checked(&pin_name, expected, l, |held| {
                 let (pin, scoped) = read_restore_pin(held, l)?;
@@ -3082,16 +3083,30 @@ fn terminal_cleanup(
                 witness.unchanged(j, true)
             })?;
         }
+        // The journal-bound operation owns this exact temporary name under
+        // its operation lock. Do not decode: torn writes must remain cleanable.
+        if let Some(expected) = entry_identity(&pins.path.join(&temp_name), l)? {
+            pins.remove_file_checked(&temp_name, expected, l, |held| {
+                fs::event(&*control.io, RecoveryEvent::RestorePinRemove, l)?;
+                final_terminal_authority(j, lease, filesystem, lock, l)?;
+                held.unchanged(l)?;
+                witness.unchanged(j, true)
+            })?;
+        }
         pins.sync(&*control.io, Directory::RestorePinParent, l)?;
         final_terminal_authority(j, lease, filesystem, lock, l)?;
         witness.unchanged(j, true)?;
-        if entry_identity(&pins.path.join(&pin_name), l)?.is_some() {
+        if entry_identity(&pins.path.join(&pin_name), l)?.is_some()
+            || entry_identity(&pins.path.join(&temp_name), l)?.is_some()
+        {
             return Err(l.verification());
         }
         catalog.sync(&*control.io, Directory::CatalogParent, l)?;
         final_terminal_authority(j, lease, filesystem, lock, l)?;
         witness.unchanged(j, true)?;
-        if entry_identity(&pins.path.join(&pin_name), l)?.is_some() {
+        if entry_identity(&pins.path.join(&pin_name), l)?.is_some()
+            || entry_identity(&pins.path.join(&temp_name), l)?.is_some()
+        {
             return Err(l.verification());
         }
         Ok(())
@@ -3744,16 +3759,37 @@ fn write_restore_pin(
     let catalog = Dir::open(&filesystem.root().join(".catalog"), l)?;
     let pins = catalog.child("restore-pins", false, l)?;
     catalog.sync(&*control.io, Directory::CatalogParent, l)?;
-    fs::write_json(
+    let name = format!("{}.json", j.operation_id);
+    let temp_name = format!("{name}.tmp");
+    let expected = fs::write_json(&pins, &temp_name, &pin, Member::RestorePin, control, l)?;
+    // The operation-scoped temp is deliberately not a pin. A crash before
+    // this no-replace publication leaves only a private, undecoded cleanup artifact.
+    let prepared = PrivateFile::open(&pins.path.join(&temp_name), false, l)?;
+    if verify::hash_file(&prepared.file, l)? != expected {
+        return Err(l.verification());
+    }
+    prepared.unchanged(l)?;
+    pins.rename_checked(
+        &temp_name,
         &pins,
-        &format!("{}.json", j.operation_id),
-        &pin,
-        Member::RestorePin,
-        control,
+        &name,
+        &*control.io,
+        RecoveryEvent::Publish,
         l,
+        || prepared.unchanged(l),
     )?;
-    pins.sync(&*control.io, Directory::CatalogParent, l)?;
-    catalog.sync(&*control.io, Directory::CatalogParent, l)
+    // Rename changes ctime; bind the published name to the same inode and bytes.
+    let published = PrivateFile::open(&pins.path.join(&name), false, l)?;
+    if published.identity() != prepared.identity()
+        || verify::hash_file(&published.file, l)? != expected
+    {
+        return Err(l.verification());
+    }
+    published.unchanged(l)?;
+    pins.sync(&*control.io, Directory::RestorePinParent, l)?;
+    catalog.sync(&*control.io, Directory::CatalogParent, l)?;
+    pins.same_name(l)?;
+    published.unchanged(l)
 }
 /// Read only the held private descriptor. Keep the decoded pin reservation
 /// in the returned scope through validation and hashing by the caller.
@@ -3803,6 +3839,18 @@ pub(crate) fn check_restore_pins<S>(
     // rebuilt from l, so the initial reservation is not charged twice.
     let _iteration = reserve(state, 0, l)?;
     pins.visit_names(l, |name| {
+        if let Some(text) = name.strip_suffix(".json.tmp") {
+            let op = uuid::Uuid::parse_str(text).map_err(|_| l.verification())?;
+            if op.is_nil() || op.to_string() != text {
+                return Err(l.verification());
+            }
+            // Catalog EX excludes a live writer (publication holds SH). Only
+            // a canonical private regular temp from a stopped admission is ignored;
+            // it neither protects a bundle nor enters the retained pin closure.
+            let scan = reserve(state, 0, l)?;
+            let held = PrivateFile::open(&pins.path.join(name), false, &scan)?;
+            return held.unchanged(&scan);
+        }
         let scan = reserve(state, 1, l)?;
         let text = name.strip_suffix(".json").ok_or_else(|| l.verification())?;
         let op = uuid::Uuid::parse_str(text).map_err(|_| l.verification())?;
@@ -3938,6 +3986,65 @@ mod pin_descriptor_tests {
         assert_eq!(l.admitted_memory_bytes(), admitted);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         held.unchanged(&l).unwrap();
+    }
+
+    #[test]
+    fn restore_pin_scan_ignores_only_private_canonical_regular_temps_without_reads() {
+        for case in 0..9 {
+            let root = super::super::test_support::fixture_root();
+            let pins = root.path().join("restore-pins");
+            private_dir(&pins);
+            let operation = uuid::Uuid::parse_str("01234567-89ab-7cde-8fab-0123456789ab").unwrap();
+            let name = match case {
+                1 => format!("{}.json.tmp", uuid::Uuid::nil()),
+                2 => format!("{}.json.tmp", operation.to_string().to_uppercase()),
+                3 => format!("{operation}.json.tmp.extra"),
+                4 => format!("{operation}.json"),
+                _ => format!("{operation}.json.tmp"),
+            };
+            let path = pins.join(&name);
+            match case {
+                5 => std::os::unix::fs::symlink("missing", &path).unwrap(),
+                6 => private_dir(&path),
+                _ => write_pin(&path, b"torn undecodable metadata"),
+            }
+            if case == 7 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            if case == 8 {
+                std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+            }
+            let reads = Arc::new(Reads::default());
+            let l = limits(reads.clone());
+            let catalog = Dir::open(root.path(), &l).unwrap();
+            let mut retained = 0usize;
+            let result = check_restore_pins(
+                &catalog,
+                uuid::Uuid::now_v7(),
+                &l,
+                &mut retained,
+                |_, _, l| Ok(l.clone()),
+                |count, _, _, _| {
+                    *count += 1;
+                    Ok(())
+                },
+            );
+            if case == 0 {
+                result.unwrap();
+            } else {
+                assert!(result.is_err(), "case {case}");
+            }
+            assert_eq!(retained, 0, "a temp must never protect a bundle");
+            // Malformed final pins are decoded and refuse. Every temp variant
+            // is either ignored without payload reads or refused before them.
+            if case != 4 {
+                assert_eq!(reads.bytes.load(Ordering::SeqCst), 0);
+            }
+            assert!(
+                std::fs::symlink_metadata(path).is_ok(),
+                "scan must be read-only"
+            );
+        }
     }
 
     // This exercises the exact after-open/before-decode helper boundary.

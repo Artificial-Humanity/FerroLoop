@@ -630,17 +630,20 @@ fn mutation_boundary(e: RecoveryEvent) -> bool {
         e,
         RecoveryEvent::Create(
             Member::RestoreGuard
+                | Member::RestorePin
                 | Member::RestoreJournal
                 | Member::RestoreOperationLock
                 | Member::Image
         ) | RecoveryEvent::Write(
             Member::RestoreGuard
+                | Member::RestorePin
                 | Member::RestoreJournal
                 | Member::RestoreOperationLock
                 | Member::Image
                 | Member::VerificationCopy
         ) | RecoveryEvent::Flush(
             Member::RestoreGuard
+                | Member::RestorePin
                 | Member::RestoreJournal
                 | Member::RestoreOperationLock
                 | Member::Image
@@ -5786,22 +5789,22 @@ struct GuardPublicationReplacement {
 }
 impl RecoveryIo for GuardPublicationReplacement {
     fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
-        if event == RecoveryEvent::Publish && self.fired.fetch_add(1, Ordering::AcqRel) == 0 {
+        if event != RecoveryEvent::Publish {
+            return Ok(());
+        }
+        let parent = self.named_guard.parent().unwrap();
+        let temporary = fs::read_dir(parent)?
+            .map(|e| e.map(|e| e.path().join("restore-guard.tmp")))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|p| p.exists());
+        // Pin publication uses the same generic event; wait for the actual
+        // guard temp so this race remains attached to guard publication.
+        if let Some(temporary) = temporary
+            && self.fired.fetch_add(1, Ordering::AcqRel) == 0
+        {
             let path = if self.temp {
-                let parent = self.named_guard.parent().unwrap();
-                let staging = fs::read_dir(parent)?
-                    .map(|e| e.map(|e| e.path()))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .find(|p| {
-                        p.is_dir()
-                            && p.file_name()
-                                .unwrap()
-                                .to_string_lossy()
-                                .starts_with(".restore-")
-                    })
-                    .unwrap();
-                staging.join("restore-guard.tmp")
+                temporary
             } else {
                 self.named_guard.clone()
             };
@@ -5810,6 +5813,7 @@ impl RecoveryIo for GuardPublicationReplacement {
         Ok(())
     }
 }
+
 #[test]
 fn restore_guard_publication_refuses_foreign_named_guard_and_changed_temp_without_overwrite() {
     for temp in [false, true] {
@@ -5950,7 +5954,14 @@ struct LateGuardPublicationMutation {
 impl RecoveryIo for LateGuardPublicationMutation {
     fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
         if event == RecoveryEvent::Publish {
-            self.published.store(1, Ordering::Release);
+            let guard_temp_present = fs::read_dir(self.destination.parent().unwrap())?
+                .map(|entry| entry.map(|entry| entry.path().join("restore-guard.tmp")))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|path| path.exists());
+            if guard_temp_present {
+                self.published.store(1, Ordering::Release);
+            }
         }
         if self.published.load(Ordering::Acquire) != 1
             || event != RecoveryEvent::Sync(self.target)
@@ -7215,6 +7226,282 @@ fn restore_terminal_reservation_dependency_graph_admission() {
                 assert_eq!(fs::read(&f.source).unwrap(), before);
             }
             eprintln!("reservation dependency original={original} graph={graph}");
+        }
+    }
+}
+
+// A final-name writer leaves an undecodable pin at allocate/write/flush cuts.
+// Exercise every publication boundary through the public typed abandon path.
+#[test]
+fn restore_pin_publication_every_cut_abandons_and_permits_unrelated_purge() {
+    use fl_store::recovery::purge::*;
+    use std::os::unix::fs::PermissionsExt;
+    let trace = Fixture::new();
+    let (request, lease) = prepare_restore(&trace, &trace.source);
+    let hook = Arc::new(CutIo::new(usize::MAX, libc::EIO));
+    restore_offline(
+        &request,
+        &lease,
+        &CutFs {
+            f: &trace,
+            io: hook.clone(),
+            limits: limits(),
+        },
+    )
+    .unwrap();
+    let events = hook.events.lock().unwrap().clone();
+    let first = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::Create(Member::RestorePin))
+        .unwrap();
+    let last = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::Create(Member::RestoreGuard))
+        .unwrap();
+    assert!(events[first..last].contains(&RecoveryEvent::Allocate));
+    assert!(events[first..last].contains(&RecoveryEvent::Write(Member::RestorePin)));
+    assert!(events[first..last].contains(&RecoveryEvent::Flush(Member::RestorePin)));
+    assert!(events[first..last].contains(&RecoveryEvent::RenameEntry));
+    assert!(events[first..last].contains(&RecoveryEvent::Sync(Directory::RestorePinParent)));
+    assert!(events[first..last].contains(&RecoveryEvent::Sync(Directory::CatalogParent)));
+    for (cut, observed_event) in events.iter().enumerate().take(last).skip(first) {
+        let f = Fixture::new();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let unrelated = f.bundle();
+        let op =
+            uuid::Uuid::parse_str(unrelated.path().file_name().unwrap().to_str().unwrap()).unwrap();
+        let manifest_bytes = fs::read(unrelated.path().join("manifest.json")).unwrap();
+        let manifest: BundleManifestV1 = serde_json::from_slice(&manifest_bytes).unwrap();
+        let purge_request = f.lease_request(
+            OfflineAction::Purge {
+                quarantined_operation: op,
+                manifest_sha256: format!("{:x}", sha2::Sha256::digest(&manifest_bytes)),
+            },
+            op,
+            manifest.validation_profile_sha256,
+            &f.source,
+        );
+        let purge_lease = create_offline_lease(&purge_request, &f.filesystem(), &limits()).unwrap();
+        let entry = f.backups.join(".quarantine").join(op.to_string());
+        fs::create_dir(&entry).unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(
+            f.backups.join(".catalog").join(format!("{op}.json")),
+            entry.join("receipt.json"),
+        )
+        .unwrap();
+        let original = fs::read(&f.source).unwrap();
+        let original_metadata = fs::metadata(&f.source).unwrap();
+        let hook = Arc::new(CutIo::new(cut, libc::EIO));
+        let error = restore_offline(
+            &request,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            },
+        )
+        .unwrap_err();
+        assert!(hook.count.load(Ordering::Acquire) > cut);
+        let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained {
+            staging, ..
+        } = error
+        else {
+            panic!("pin cut must retain typed admission artifacts: {error:?}")
+        };
+        let journal_path = staging.join("journal.bin");
+        let journal = load_restore_journal(&journal_path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(journal.phase, RestorePhase::Admitted);
+        let pins = f.backups.join(".catalog/restore-pins");
+        let final_path = pins.join(format!("{}.json", journal.operation_id));
+        let temp_path = pins.join(format!("{}.json.tmp", journal.operation_id));
+        if final_path.exists() {
+            let pin: serde_json::Value = serde_json::from_slice(&fs::read(&final_path).unwrap())
+                .expect("named final pin must always be complete");
+            assert_eq!(pin["restore_operation"], journal.operation_id.to_string());
+        }
+        // The temp is not a pin: unrelated purge works before terminal cleanup.
+        let inspect = PurgeRequest {
+            operation_id: op,
+            confirm: None,
+            reference_closure: None,
+        };
+        let report = purge_quarantined(&inspect, &purge_lease, &f.filesystem(), &limits())
+            .expect("pin publication interruption must not block unrelated purge");
+        let confirm = PurgeRequest {
+            operation_id: op,
+            confirm: Some(op),
+            reference_closure: Some(ReferenceClosureEvidence {
+                catalog_set_sha256: report.catalog_set_sha256,
+                non_ferroloop_writers_excluded: true,
+                evidence_sha256: "d".repeat(64),
+            }),
+        };
+        assert!(
+            purge_quarantined(&confirm, &purge_lease, &f.filesystem(), &limits())
+                .unwrap()
+                .complete
+        );
+        assert!(matches!(
+            abandon_restore(&journal, &lease, &f.filesystem())
+                .expect("every pin publication cut must have a typed exit"),
+            RestoreOutcome::Abandoned { .. }
+        ));
+        assert_eq!(
+            load_restore_journal(&journal_path, &lease, &f.filesystem())
+                .unwrap()
+                .phase,
+            RestorePhase::Abandoned
+        );
+        assert!(!final_path.exists() && !temp_path.exists());
+        let now = fs::metadata(&f.source).unwrap();
+        assert_eq!(
+            (now.dev(), now.ino()),
+            (original_metadata.dev(), original_metadata.ino())
+        );
+        assert_eq!(fs::read(&f.source).unwrap(), original);
+        eprintln!(
+            "pin_publication_cut index={cut} event={:?} abandon=true unrelated_purge=true",
+            observed_event
+        );
+    }
+}
+
+struct PinPublicationRace {
+    pins: std::path::PathBuf,
+    operation: uuid::Uuid,
+    target: RecoveryEvent,
+    temp: bool,
+    replace: bool,
+    fired: AtomicUsize,
+}
+impl RecoveryIo for PinPublicationRace {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == self.target && self.fired.fetch_add(1, Ordering::AcqRel) == 0 {
+            let suffix = if self.temp { "json.tmp" } else { "json" };
+            let path = self.pins.join(format!("{}.{suffix}", self.operation));
+            if self.replace && path.exists() {
+                fs::rename(&path, path.with_extension("parked"))?;
+            }
+            fs::write(&path, b"foreign pin artifact")?;
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_pin_publication_never_replaces_a_final_pin_or_changed_temp() {
+    for temp in [false, true] {
+        let f = Fixture::new();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let pins = f.backups.join(".catalog/restore-pins");
+        let before = fs::read(&f.source).unwrap();
+        let hook = Arc::new(PinPublicationRace {
+            pins: pins.clone(),
+            operation: request.operation_id,
+            target: RecoveryEvent::Publish,
+            temp,
+            replace: temp,
+            fired: AtomicUsize::new(0),
+        });
+        let error = restore_offline(
+            &request,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            error,
+            fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained { .. }
+        ));
+        let path = pins.join(format!(
+            "{}.{}",
+            request.operation_id,
+            if temp { "json.tmp" } else { "json" }
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"foreign pin artifact");
+        assert!(!f.source.with_extension("fls.restore-guard").exists());
+        assert_eq!(fs::read(&f.source).unwrap(), before);
+    }
+}
+#[test]
+fn restore_pin_temp_cleanup_rechecks_identity_and_both_names_after_sync_hooks() {
+    for target in [
+        RecoveryEvent::RestorePinRemove,
+        RecoveryEvent::Sync(Directory::RestorePinParent),
+        RecoveryEvent::Sync(Directory::CatalogParent),
+    ] {
+        for temp in [false, true] {
+            if target == RecoveryEvent::RestorePinRemove && !temp {
+                continue;
+            }
+            let f = Fixture::new();
+            let (request, lease) = prepare_restore(&f, &f.source);
+            // Stop before the pin flush: retain a complete but unpublished temp.
+            let stop = Arc::new(TerminalCutIo::new(RecoveryEvent::Flush(Member::RestorePin)));
+            let error = restore_offline(
+                &request,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: stop.clone(),
+                    limits: limits(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(stop.fired.load(Ordering::Acquire), 1);
+            let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained {
+                staging,
+                ..
+            } = error
+            else {
+                panic!("{error:?}")
+            };
+            let journal =
+                load_restore_journal(&staging.join("journal.bin"), &lease, &f.filesystem())
+                    .unwrap();
+            let pins = f.backups.join(".catalog/restore-pins");
+            let hook = Arc::new(PinPublicationRace {
+                pins: pins.clone(),
+                operation: request.operation_id,
+                target,
+                temp,
+                replace: target == RecoveryEvent::RestorePinRemove,
+                fired: AtomicUsize::new(0),
+            });
+            assert!(matches!(
+                abandon_restore(
+                    &journal,
+                    &lease,
+                    &CutFs {
+                        f: &f,
+                        io: hook.clone(),
+                        limits: limits()
+                    }
+                )
+                .unwrap(),
+                RestoreOutcome::OutcomeUnknown { .. }
+            ));
+            assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+            let path = pins.join(format!(
+                "{}.{}",
+                request.operation_id,
+                if temp { "json.tmp" } else { "json" }
+            ));
+            assert_eq!(fs::read(path).unwrap(), b"foreign pin artifact");
+            assert_eq!(
+                load_restore_journal(&staging.join("journal.bin"), &lease, &f.filesystem())
+                    .unwrap()
+                    .phase,
+                RestorePhase::Abandoned
+            );
         }
     }
 }
