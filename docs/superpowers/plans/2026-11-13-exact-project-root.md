@@ -19,7 +19,8 @@
 - Project role lookup remains keyed by the project key, never by path components.
 - `fl agent area set --path Kaggle/<Competition>/` preserves the nested path; use isolated test state for the live throwaway-key check.
 - Enumerate all readers and mixed-version behavior in the PR body, including strict CLI/`fl host` frontend, lenient hub readers, Wire startup, and standalone `fl-host`. Audit source and dependencies: standalone `fl-host` has no `fl` config reader; distinguish it from its CLI frontend.
-- Document that the field can be added only after every running FerroLoop process is upgraded, and must be removed before rollback to an older binary.
+- Document that the field can be added only after every running FerroLoop process is upgraded, and must be removed before rollback to an older binary. Older `fl host` silently falls back to its default store on a strict parse failure; explain that this can differ from the configured store. In the current live layout both select `/home/lmcfarlin/.local/share/fl/fl.redb`.
+- If confined to a few lines in the CLI helper, emit one stderr warning on failed config load before the existing fallback, naming the config path and parse error; preserve the fallback behavior and do not touch standalone fl-host. Verify the warning and fallback.
 - Cover spin-up, crash respawn, remodel, re-spin, and host-restart recovery with the same resolver; list resolver call sites in the PR body. Add respawn and remodel tests.
 - Keep existing canonical symlink behavior; add no new restriction on canonical roots outside the written tree. Add named default-behavior fixtures for Sonora and Kaggle-Gemma4.
 
