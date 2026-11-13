@@ -3629,6 +3629,255 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_mutation_and_send_now_require_owner_or_queuing_peer() {
+        let _queued_delivery = crate::api::stub_queued_delivery_success();
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let conv_id = "conv-ferris-1";
+        let logs_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let turn0 = json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "You will take the name of Ferris. Run cargo test.",
+            "created_at": "2026-10-27T16:00:00Z"
+        })
+        .to_string();
+        fs::write(logs_dir.join("transcript.jsonl"), format!("{turn0}\n")).unwrap();
+
+        fn queue_prompt(
+            state: &HubState,
+            token: &str,
+            agent: Option<&str>,
+            prompt: &str,
+        ) -> String {
+            let mut req = HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", format!("Bearer {token}"))
+                .with_json_body(&json!({ "prompt": prompt, "send_now": false }));
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            let resp = handle_http_request(state, &req);
+            assert_eq!(resp.status, 200, "queue resp: {:?}", resp.body);
+            let value = resp.json_value().unwrap();
+            assert_eq!(value["status"], "queued", "expected busy queue: {value}");
+            value["queued_prompt"]["id"].as_str().unwrap().to_string()
+        }
+        fn call(
+            state: &HubState,
+            method: &str,
+            path: String,
+            token: &str,
+            agent: Option<&str>,
+            body: Option<serde_json::Value>,
+        ) -> crate::api::HttpResponse {
+            let mut req = HttpRequest::new(method, path)
+                .with_header("Authorization", format!("Bearer {token}"));
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            if let Some(body) = body {
+                req = req.with_json_body(&body);
+            }
+            handle_http_request(state, &req)
+        }
+        fn queued_prompt_text(state: &HubState, prompt_id: &str) -> Option<String> {
+            let resp = call(
+                state,
+                "GET",
+                "/api/v1/sessions/ferris/queue".to_string(),
+                "owner-tok-secret",
+                None,
+                None,
+            );
+            assert_eq!(resp.status, 200);
+            resp.json_value().unwrap()["queue"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == prompt_id)
+                .map(|item| item["prompt"].as_str().unwrap().to_string())
+        }
+
+        // Owner-queued item: a non-queuing peer is refused on every verb, changing nothing.
+        let owner_item = queue_prompt(&state, "owner-tok-secret", None, "Owner queued prompt");
+        let peer_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            Some(json!({ "prompt": "peer edit" })),
+        );
+        assert_eq!(peer_patch.status, 403, "peer PATCH owner item");
+        assert_eq!(
+            queued_prompt_text(&state, &owner_item).as_deref(),
+            Some("Owner queued prompt")
+        );
+        let peer_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            None,
+        );
+        assert_eq!(peer_delete.status, 403, "peer DELETE owner item");
+        assert!(queued_prompt_text(&state, &owner_item).is_some());
+        crate::api::reset_queued_delivery_calls();
+        let peer_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}/send-now"),
+            "peer-tok-secret",
+            Some("mallory"),
+            None,
+        );
+        assert_eq!(peer_send.status, 403, "peer send-now owner item");
+        assert_eq!(crate::api::queued_delivery_calls(), 0);
+        assert!(queued_prompt_text(&state, &owner_item).is_some());
+
+        // Owner PATCH and send-now still work on the owner's item.
+        let owner_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "owner-tok-secret",
+            None,
+            Some(json!({ "prompt": "Owner queued prompt (edited)" })),
+        );
+        assert_eq!(
+            owner_patch.status, 200,
+            "owner PATCH: {:?}",
+            owner_patch.body
+        );
+        let owner_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}/send-now"),
+            "owner-tok-secret",
+            None,
+            None,
+        );
+        assert_eq!(
+            owner_send.status, 200,
+            "owner send-now: {:?}",
+            owner_send.body
+        );
+        assert!(queued_prompt_text(&state, &owner_item).is_none());
+
+        // Owner DELETE still works.
+        let owner_item2 = queue_prompt(&state, "owner-tok-secret", None, "Owner second prompt");
+        let owner_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{owner_item2}"),
+            "owner-tok-secret",
+            None,
+            None,
+        );
+        assert_eq!(owner_delete.status, 200);
+        assert!(queued_prompt_text(&state, &owner_item2).is_none());
+
+        // Peer-queued item: peers can queue; only that peer (and the owner) may act on it.
+        let peer_item = queue_prompt(
+            &state,
+            "peer-tok-secret",
+            Some("felicia"),
+            "Peer queued prompt",
+        );
+        let owner_patch_peer = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+            "owner-tok-secret",
+            None,
+            Some(json!({ "prompt": "Peer queued prompt (owner edit)" })),
+        );
+        assert_eq!(owner_patch_peer.status, 200, "owner PATCH peer item");
+        for (method, path, body) in [
+            (
+                "PATCH",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+                Some(json!({ "prompt": "mallory edit" })),
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}/send-now"),
+                None,
+            ),
+        ] {
+            crate::api::reset_queued_delivery_calls();
+            let refused = call(
+                &state,
+                method,
+                path,
+                "peer-tok-secret",
+                Some("mallory"),
+                body,
+            );
+            assert_eq!(refused.status, 403, "non-queuing peer {method} peer item");
+            assert_eq!(crate::api::queued_delivery_calls(), 0);
+            assert_eq!(
+                queued_prompt_text(&state, &peer_item).as_deref(),
+                Some("Peer queued prompt (owner edit)")
+            );
+        }
+        let queuing_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+            "peer-tok-secret",
+            Some("felicia"),
+            Some(json!({ "prompt": "Peer queued prompt (edited)" })),
+        );
+        assert_eq!(queuing_patch.status, 200, "queuing peer PATCH");
+        let queuing_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}/send-now"),
+            "peer-tok-secret",
+            Some("felicia"),
+            None,
+        );
+        assert_eq!(
+            queuing_send.status, 200,
+            "queuing peer send-now: {:?}",
+            queuing_send.body
+        );
+        assert!(queued_prompt_text(&state, &peer_item).is_none());
+
+        let peer_item2 = queue_prompt(
+            &state,
+            "peer-tok-secret",
+            Some("felicia"),
+            "Peer second prompt",
+        );
+        let queuing_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{peer_item2}"),
+            "peer-tok-secret",
+            Some("felicia"),
+            None,
+        );
+        assert_eq!(queuing_delete.status, 200, "queuing peer DELETE");
+        assert!(queued_prompt_text(&state, &peer_item2).is_none());
+    }
+
+    #[test]
     fn store_open_failure_keeps_vendor_busy_and_sessions_returns_500() {
         let tmp = TempDir::new().unwrap();
         let mut state = test_hub_state(&tmp);
@@ -8775,12 +9024,14 @@ mod tests {
                 .remove_queued_prompt("codex-thread-fixture", &item.id)
                 .is_some()
         );
+        // The queuing peer's authenticated name (no `X-Fl-Agent` in this helper): only it
+        // or the Owner may send this item now, and as Ordinary intent, never steering.
         let (peer_item, _) = state.enqueue_session_prompt(
             "codex-thread-fixture",
             Some("freya".into()),
             "peer queued".into(),
             "peer queued".into(),
-            "owner".into(),
+            "peer".into(),
             vec![],
         );
         let peer_queued = call(
