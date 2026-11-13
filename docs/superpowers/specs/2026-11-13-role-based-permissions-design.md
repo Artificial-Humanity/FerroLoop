@@ -42,6 +42,13 @@ What exists today (code-verified):
    separate roadmap record (Record #192) with its own design.
 4. **Approved.** The Lead drafts one permission profile per role; no profile is applied before
    the owner approves it.
+5. **Review chain.** The Project Manager has pull-request review authority. An author asks
+   the lowest available tier above it first: Project Lead, then Project Manager, then
+   Director. The next tier is asked only when the lower one is offline or unavailable. The
+   same rule applies to those roles as authors: a Project Lead asks its Project Manager before
+   the Director. System-level changes stay with the Director.
+6. **Council.** A Project Manager may petition The Council. A Project Lead may still petition
+   directly and need not go through its Project Manager.
 
 Owner direction of the same day, recorded as Record #193 and used for the names below: the hierarchy
 is **Director** (was Lab Manager) → **Project Manager** (was Project Director) → **Project
@@ -66,6 +73,32 @@ Structural authority must not hang on a role's spelling. `RoleRecord` gains a `t
 A user-defined role is an ordinary `RoleRecord` with tier `member` unless the owner sets
 another tier. The wire form of every role is its bare slug. `custom:<slug>` is accepted on
 input for compatibility and never written.
+
+### 2.1.1 Review chain
+
+The reviewer of a pull request is the first *available* agent in the chain above its author:
+
+| Author tier | Chain |
+|---|---|
+| `member` | Lead → Project Manager → Director → Owner |
+| `lead` | Project Manager → Director → Owner |
+| `project-manager` | Director → Owner |
+| `director` | Owner |
+
+"Available" keeps today's meaning: an active registry record with a live route that answers a
+review request within 15 minutes. A tier with no agent for the project (most projects have no
+Project Manager) is skipped at once, not waited for. The Project Manager of a project is an
+agent of tier `project-manager` whose registered areas include that project; this uses the
+extra areas a manager already registers and needs no parent link between projects. A
+co-author is never its own reviewer, and the Owner-tier triggers of `pr_policy` (protected
+paths, missing trailers, instruction files) are unchanged and come before the chain.
+System-level changes (the workspace, the lab host, shared services) stay with the Director:
+the chain does not move them to a Project Manager.
+
+`fl_core::pr_policy` gains the `project-manager` tier between `lead` and `director`, and
+`fl github pr create` reports the whole chain with the first available reviewer as the
+target. An approval from any tier at or above the target counts, as an approval from a higher
+tier does today.
 
 ### 2.2 Two kinds of grant
 
@@ -225,13 +258,15 @@ Taken from the role files and `WORKFLOW.md`. "Open" cells are not answered by to
 | Action | Member | Lead | Project Manager | Director |
 |---|---|---|---|---|
 | Open a pull request | allow | allow | allow | allow |
-| Approve a member's pull request | deny | allow, own team | open (O1) | allow when the Lead does not answer |
-| Approve a Lead's pull request | deny | deny | open (O1) | allow |
+| Approve a member's pull request | deny | allow, own team | allow when the Lead is unavailable | allow when Lead and Project Manager are unavailable |
+| Approve a Lead's pull request | deny | deny | allow, portfolio | allow when the Project Manager is unavailable or absent |
+| Approve a Project Manager's pull request | deny | deny | deny | allow |
 | Merge own approved pull request | allow | allow | allow | allow |
-| Merge another agent's pull request | deny | allow when a permission blocks the author | deny | same, for a Lead's pull request |
+| Merge another agent's pull request | deny | allow when a permission blocks the author | open (O2), for a pull request it approved | same, for a pull request it approved |
 | Change instruction files or protected paths | pull request, owner approves | pull request, owner approves | pull request, owner approves | pull request, owner approves |
 | File an issue in own project | open (O2) | allow | open (O2) | open (O2) |
 | Clear or reforge another agent's session | deny | open (O2), own team | open (O2) | open (O2) |
+| Petition The Council | deny | allow | allow | deny (today's rule) |
 
 ## 7. Migration (Record #193)
 
@@ -245,8 +280,9 @@ The slug `director` changes meaning, so order and atomicity matter.
    old name of the new Director). It never maps `director` to `project-manager`: that reading
    existed only before the migration.
 3. `RoleReviewPolicy` `lab-manager-review` is renamed `director-review`; the old spelling is
-   read, not written. `pr_policy` tiers are renamed the same way. `fl-review` markers already
-   posted keep their `role` text; verification accepts both spellings.
+   read, not written. `pr_policy` tiers are renamed the same way and gain `project-manager`
+   (§2.1.1). `fl-review` markers already posted keep their `role` text; verification accepts
+   both spellings.
 4. `custom:<slug>` values are rewritten to `<slug>`. `council-chair` becomes a built-in role
    with tier `council-chair`.
 5. The virtual area `lab-manager`, `@role:` addressing, hydration role-file names and FerroDeck
@@ -273,11 +309,11 @@ The slug `director` changes meaning, so order and atomicity matter.
 
 ## 9. Open decisions
 
-- **O1 (owner).** Does a Project Manager review a sub-project Lead's pull requests, with the
-  Director as the next tier, or does the role keep no review authority as
-  `.agents/roles/director.md` says today?
+- **O1.** Resolved by the owner on 2026-11-13: see §1 items 5 and 6 and §2.1.1.
 - **O2 (owner).** The open cells of §6: issues filed by members, the Project Manager and the
-  Director; session clear and reforge by a Lead for its own team and by the Director.
+  Director; session clear and reforge by a Lead for its own team, by the Project Manager and
+  by the Director; and whether a Project Manager may merge a blocked author's pull request
+  that it approved, as a Lead and the Director may.
 - **O3.** Gate timeout and the deny-on-timeout class in §3.3, after M2 and M3.
 - **O4.** Whether the interim deny rules for raw `gh` writes (P2) ship before or with the new
   broker commands; before means a short period in which members cannot file issues at all.
