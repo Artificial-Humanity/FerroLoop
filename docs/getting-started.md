@@ -828,13 +828,11 @@ store = "/home/you/.local/share/fl/app.redb"
 
 For a hosted agent, a project binding may opt into starting at its exact registered root:
 
-```toml
-[[project]]
-name = "competition"
-root = "/home/you/workspace/Kaggle/Competition"
-store = "/home/you/.local/share/fl/competition.redb"
-cwd = "exact"
-```
+    [[project]]
+    name = "competition"
+    root = "/home/you/workspace/Kaggle/Competition"
+    store = "/home/you/.local/share/fl/competition.redb"
+    cwd = "exact"
 
 Without `cwd`, or with `cwd = "workspace"`, the existing workspace umbrella behavior applies.
 Both settings preserve canonical symlink resolution, including roots outside the workspace.
