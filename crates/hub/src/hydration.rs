@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use fl_core::store::Catalog;
 use fl_mcp::project_paths::{GitProjectLayout, resolve_git_project};
 
-use crate::project_init::{config_entries, read_config, user_config_path};
+use crate::project_init::{binding_config_entries, read_config, user_config_path};
 
 pub(crate) struct HydrationPrompt {
     pub text: String,
@@ -113,17 +113,31 @@ impl Context {
         };
         let mut roots = Vec::new();
         let mut bound = false;
+        let mut invalid_binding = false;
+        let mut binding_policies = Vec::new();
         if let Some(config) = user_config_path(home) {
-            match read_config(&config).and_then(|doc| config_entries(&doc, &config)) {
+            match read_config(&config).and_then(|doc| binding_config_entries(&doc, &config)) {
                 Ok(entries) => {
+                    if let Err(error) = crate::project_init::resolve_bound_project(&entries, name) {
+                        invalid_binding = true;
+                        context.warnings.push(error);
+                    }
                     for entry in entries
                         .iter()
                         .filter(|e| e.slug().is_some_and(|slug| slug.eq_ignore_ascii_case(name)))
                     {
                         bound = true;
+                        match entry.exact_cwd() {
+                            Ok(policy) => binding_policies.push(policy),
+                            Err(error) => {
+                                invalid_binding = true;
+                                context.warnings.push(error);
+                            }
+                        }
                         if let Some(root) = registered_dir(Path::new(&entry.root)) {
                             roots.push(root);
                         } else {
+                            invalid_binding = true;
                             context
                                 .warnings
                                 .push(format!("registered project root unavailable for {name}"));
@@ -190,12 +204,20 @@ impl Context {
         if !bound && let Some(workspace) = &context.workspace {
             roots = matching_dirs(workspace, name);
         }
+        binding_policies.sort();
+        binding_policies.dedup();
+        if binding_policies.len() > 1 {
+            invalid_binding = true;
+            context.warnings.push(format!(
+                "conflicting cwd policies for {name}; project guidance unavailable"
+            ));
+        }
         let roots = unique(roots);
         if roots.len() > 1 {
             context.warnings.push(format!(
                 "ambiguous project roots for {name}; project guidance unavailable"
             ));
-        } else {
+        } else if !invalid_binding {
             context.project = roots.into_iter().next();
         }
         if let (Some(root), Some(cwd)) = (&context.project, cwd) {
@@ -385,6 +407,57 @@ mod tests {
     use fl_core::MemStore;
     use tempfile::TempDir;
 
+    #[test]
+    fn malformed_named_roots_block_catalog_and_duplicate_guidance() {
+        let f = Fixture::new();
+        let config = f.home.path().join(".config/fl/config.toml");
+        f.store.add_project(f.project.to_str().unwrap()).unwrap();
+        for malformed in ["", "root = 123\n"] {
+            for valid_duplicate in [false, true] {
+                let valid = if valid_duplicate {
+                    format!(
+                        "[[project]]\nname='logical-name'\nroot={:?}\n",
+                        f.project.to_str().unwrap()
+                    )
+                } else {
+                    String::new()
+                };
+                std::fs::write(
+                    &config,
+                    format!("{valid}[[project]]\nname='logical-name'\n{malformed}cwd='exact'\n"),
+                )
+                .unwrap();
+                let context = f.context(&f.project);
+                assert!(
+                    context.project.is_none(),
+                    "{malformed:?}, duplicate={valid_duplicate}"
+                );
+                assert!(
+                    context
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("registered project root unavailable"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_cwd_policies_do_not_select_project_guidance() {
+        let f = Fixture::new();
+        let config = f.home.path().join(".config/fl/config.toml");
+        let root = f.project.to_str().unwrap();
+        std::fs::write(config, format!("[[project]]\nname='logical-name'\nroot={root:?}\ncwd='exact'\n[[project]]\nname='logical-name'\nroot={root:?}\ncwd='workspace'\n")).unwrap();
+        let context = f.context(&f.project);
+        assert!(context.project.is_none());
+        assert!(
+            context
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("conflicting cwd"))
+        );
+    }
+
     struct Fixture {
         home: TempDir,
         workspace: PathBuf,
@@ -439,6 +512,38 @@ mod tests {
         }
         fn prompt(&self, cwd: &Path, role: &str, guidance: RoleGuidance<'_>) -> HydrationPrompt {
             render(self.context(cwd), "Ada", "logical-name", role, guidance)
+        }
+    }
+
+    #[test]
+    fn nested_exact_binding_uses_project_guidance_and_project_key_role() {
+        let f = Fixture::new();
+        let root = f.workspace.join("Kaggle/Competition");
+        let role = f.workspace.join(".agents/roles/logical-name/assistant.md");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(role.parent().unwrap()).unwrap();
+        std::fs::write(&role, "project specific").unwrap();
+        for name in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+            std::fs::write(root.join(name), "nested").unwrap();
+        }
+        f.bind(std::slice::from_ref(&root));
+        let config = f.home.path().join(".config/fl/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(config, format!("{text}cwd='exact'\n")).unwrap();
+        for cwd in [&root, f.home.path()] {
+            let prompt = f.prompt(cwd, "assistant", RoleGuidance::File);
+            assert!(
+                prompt
+                    .text
+                    .contains(&format!("`{}`", root.join("AGENTS.md").display())),
+                "{}",
+                prompt.text
+            );
+            assert!(
+                prompt.text.contains(&format!("`{}`", role.display())),
+                "{}",
+                prompt.text
+            );
         }
     }
 

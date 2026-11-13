@@ -1978,6 +1978,7 @@ mod tests {
                     store: primary.clone(),
                     tracker: None,
                     state: None,
+                    cwd: None,
                 },
                 crate::config::Entry {
                     name: Some("other".into()),
@@ -1985,6 +1986,7 @@ mod tests {
                     store: alias.clone(),
                     tracker: None,
                     state: None,
+                    cwd: None,
                 },
             ],
             ..Config::default()
@@ -2039,6 +2041,7 @@ mod tests {
             store: store.to_path_buf(),
             tracker: None,
             state: None,
+            cwd: None,
         };
         let cfg = Config {
             projects: vec![entry("proj", &primary), entry("other", &alias)],
