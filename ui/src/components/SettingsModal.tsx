@@ -804,6 +804,7 @@ export function resolveProjectFilterValue(
 export const CREATE_CUSTOM_ROLE_VALUE = "__create_custom__";
 
 export const RECAST_ROLE_OPTIONS = [
+  { value: "director", label: "director" },
   { value: "lead", label: "lead" },
   { value: "assistant", label: "assistant" },
   { value: "lab_manager", label: "lab_manager" },

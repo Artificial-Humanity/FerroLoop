@@ -38,7 +38,8 @@ use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decomm
 use crate::api::canonical_reforge_prompt;
 
 /// Legacy executable role choices; spin-up also accepts roles in the current catalog.
-pub const SPIN_UP_ROLES: [&str; 11] = [
+pub const SPIN_UP_ROLES: [&str; 12] = [
+    "director",
     "lead",
     "assistant",
     "ui-developer",
@@ -10213,6 +10214,7 @@ mod tests {
     #[test]
     fn every_spin_up_label_is_a_first_class_role_that_round_trips_the_registry_wire_form() {
         let expected = [
+            ("director", AgentRole::Director),
             ("lead", AgentRole::Lead),
             ("assistant", AgentRole::Assistant),
             ("ui-developer", AgentRole::UiDeveloper),
