@@ -152,6 +152,19 @@ mod host_isolation_tests {
 
     #[cfg(unix)]
     #[test]
+    fn wire_private_store_listener_remains_a_usable_fixture() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("store.sock");
+        let mut server =
+            fl_store::FerroStoreServer::bind_unix(&path, fl_store::FerroStore::in_memory())
+                .unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
+        assert!(fl_store::test_isolation::validate_unix(&path).is_ok());
+        server.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn wire_host_listener_refuses_unregistered_socket_probe() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::Builder::new()
