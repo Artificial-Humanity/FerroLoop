@@ -5644,10 +5644,10 @@ fn handle_dynamic_api_routes(
             return handle_post_queued_prompt_send_now(state, authority, &session_id, &prompt_id);
         }
         if segments.len() == 6 && (method == "PATCH" || method == "PUT") {
-            return handle_patch_queued_prompt(state, &session_id, &prompt_id, req);
+            return handle_patch_queued_prompt(state, authority, &session_id, &prompt_id, req);
         }
         if segments.len() == 6 && method == "DELETE" {
-            return handle_delete_queued_prompt(state, &session_id, &prompt_id);
+            return handle_delete_queued_prompt(state, authority, &session_id, &prompt_id);
         }
     }
 
@@ -6501,6 +6501,33 @@ pub fn drain_ready_session_queues(state: &HubState) {
     }
 }
 
+/// Refusal for a queued-prompt verb (send-now, PATCH, DELETE) when the caller neither owns
+/// the hub nor queued this item. Peers can queue operator prompts; the item's `by` records
+/// its sender, so a peer may act only when that is its own authenticated, non-owner name.
+/// `None` also when the item is absent: the caller's normal 404/409 path then applies.
+fn queued_prompt_refusal(
+    state: &HubState,
+    authority: &HubAuthority,
+    canonical_id: &str,
+    raw_session_id: &str,
+    prompt_id: &str,
+) -> Option<HttpResponse> {
+    let item = state
+        .session_queue(canonical_id)
+        .into_iter()
+        .chain(state.session_queue(raw_session_id))
+        .find(|item| item.id == prompt_id)?;
+    if authority.is_owner()
+        || (!fl_wire::dispatcher::is_owner_sender(&item.by) && authority.actor_name() == item.by)
+    {
+        return None;
+    }
+    Some(HttpResponse::json(
+        403,
+        json!({ "error": "only the owner or the peer that queued this prompt may change it" }),
+    ))
+}
+
 fn handle_post_queued_prompt_send_now(
     state: &HubState,
     authority: &HubAuthority,
@@ -6514,6 +6541,11 @@ fn handle_post_queued_prompt_send_now(
             return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
         }
     };
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
     let claimed = state.claim_queued_for_dispatch(&canonical_id, raw_session_id, prompt_id, false);
     let Some((item, claim)) = claimed else {
         let exists = state
@@ -6624,6 +6656,7 @@ fn handle_post_queued_prompt_send_now(
 
 fn handle_patch_queued_prompt(
     state: &HubState,
+    authority: &HubAuthority,
     raw_session_id: &str,
     prompt_id: &str,
     req: &HttpRequest,
@@ -6634,6 +6667,13 @@ fn handle_patch_queued_prompt(
         prompt: String,
     }
 
+    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
+
     let payload: PatchQueuedPromptPayload = match req.json() {
         Ok(p) => p,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
@@ -6642,8 +6682,6 @@ fn handle_patch_queued_prompt(
     if trimmed.is_empty() {
         return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
     }
-
-    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
     let updated = state
         .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
         .or_else(|| state.update_queued_prompt(raw_session_id, prompt_id, trimmed));
@@ -6677,10 +6715,16 @@ fn handle_patch_queued_prompt(
 
 fn handle_delete_queued_prompt(
     state: &HubState,
+    authority: &HubAuthority,
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
     let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
     let removed = state
         .remove_queued_prompt(&canonical_id, prompt_id)
         .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
