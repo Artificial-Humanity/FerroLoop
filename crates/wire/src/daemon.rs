@@ -3230,6 +3230,15 @@ impl DaemonHandle {
             #[cfg(not(feature = "wire-test-isolation"))]
             let tcp_safe = true;
             if tcp_safe {
+                #[cfg(feature = "wire-test-isolation")]
+                if crate::test_isolation::is_enabled() {
+                    if let Ok(address) = addr.parse::<std::net::SocketAddr>() {
+                        let _ = TcpStream::connect(address);
+                    }
+                } else {
+                    let _ = TcpStream::connect(addr);
+                }
+                #[cfg(not(feature = "wire-test-isolation"))]
                 let _ = TcpStream::connect(addr);
             }
         }

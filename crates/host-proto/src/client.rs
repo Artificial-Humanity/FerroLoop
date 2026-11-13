@@ -121,6 +121,14 @@ pub fn install_test_endpoint_validator(validator: fn(&HostEndpoint) -> Result<()
         .expect("host test validator installed twice");
 }
 
+#[cfg(feature = "hub-test-isolation")]
+pub(crate) fn validate_test_endpoint(endpoint: &HostEndpoint) -> Result<(), HostError> {
+    if let Some(validate) = TEST_ENDPOINT_VALIDATOR.get() {
+        validate(endpoint)?;
+    }
+    Ok(())
+}
+
 impl AsyncHostClient {
     pub async fn connect(endpoint: &HostEndpoint) -> Result<Self, HostError> {
         Self::connect_with(endpoint, ConnectOptions::default()).await
@@ -131,9 +139,7 @@ impl AsyncHostClient {
         options: ConnectOptions,
     ) -> Result<Self, HostError> {
         #[cfg(feature = "hub-test-isolation")]
-        if let Some(validate) = TEST_ENDPOINT_VALIDATOR.get() {
-            validate(endpoint)?;
-        }
+        validate_test_endpoint(endpoint)?;
         #[cfg(unix)]
         {
             let mut client = connect_retry(endpoint, &options).await?;
@@ -1023,9 +1029,7 @@ async fn connect_unix(
     }
     // Recheck immediately before each connect, including auth retries and test hooks.
     #[cfg(feature = "hub-test-isolation")]
-    if let Some(validate) = TEST_ENDPOINT_VALIDATOR.get() {
-        validate(endpoint)?;
-    }
+    validate_test_endpoint(endpoint)?;
     let stream = tokio::net::UnixStream::connect(endpoint.socket_path())
         .await
         .map_err(|err| HostError::Io(err.to_string()))?;

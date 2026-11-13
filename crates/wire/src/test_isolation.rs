@@ -45,6 +45,24 @@ pub fn enable() {
             libc::atexit(cleanup);
         }
     }
+    fl_store::test_isolation::install(
+        |path| {
+            ensure_fixture(path)?;
+            match std::fs::symlink_metadata(path) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(err),
+                _ => ensure_socket(path),
+            }
+        },
+        |target| {
+            let address: std::net::SocketAddr = target.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unregistered wire test store address",
+                )
+            })?;
+            ensure_tcp(&address)
+        },
+    );
     fl_host_proto::enable_hub_test_isolation();
     fl_host_proto::install_test_endpoint_validator(|endpoint| {
         ensure_socket(endpoint.socket_path())

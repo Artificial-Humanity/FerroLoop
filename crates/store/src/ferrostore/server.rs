@@ -375,6 +375,14 @@ impl FerroStoreServer {
                  (ServerAuth)",
             ));
         }
+        // The generic ToSocketAddrs value cannot be inspected before it resolves.
+        // Isolated test processes fail closed here rather than invoke system NSS.
+        #[cfg(feature = "wire-test-isolation")]
+        if crate::test_isolation::active() {
+            return Err(backend(
+                "TCP store listeners are unavailable in isolated wire tests",
+            ));
+        }
         let addrs: Vec<SocketAddr> = addr
             .to_socket_addrs()
             .map_err(|err| backend(format!("bind tcp: resolve the address: {err}")))?
@@ -592,10 +600,16 @@ impl FerroStoreServer {
         shutdown_conns(&self.state);
         match &self.bound {
             Bound::Unix { path, .. } => {
-                let _ = UnixStream::connect(path);
+                let _ = crate::guarded_unix_connect(path);
             }
             Bound::Tcp { addr } => {
-                let _ = TcpStream::connect_timeout(addr, Duration::from_millis(200));
+                #[cfg(feature = "wire-test-isolation")]
+                let allowed = crate::test_isolation::validate_tcp(&addr.to_string()).is_ok();
+                #[cfg(not(feature = "wire-test-isolation"))]
+                let allowed = true;
+                if allowed {
+                    let _ = TcpStream::connect_timeout(addr, Duration::from_millis(200));
+                }
             }
         }
         let joined = self.accept.take().map(|handle| handle.join());
@@ -628,7 +642,7 @@ impl Drop for FerroStoreServer {
 /// live server and is left alone.
 fn prepare_bind_path(path: &Path) -> Result<(), StoreError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => match UnixStream::connect(path) {
+        Ok(meta) if meta.file_type().is_socket() => match crate::guarded_unix_connect(path) {
             Ok(_) => Err(backend(format!(
                 "a FerroStore server is already listening on {}",
                 path.display()
@@ -2684,8 +2698,8 @@ pub(super) fn connect_unix_with(
             "a bearer token is for ws:// and wss://; a Unix socket takes the peer uid and, optionally, a PSK",
         ));
     }
-    let stream =
-        UnixStream::connect(path).map_err(|err| backend(format!("connect {path}: {err}")))?;
+    let stream = crate::guarded_unix_connect(path)
+        .map_err(|err| backend(format!("connect {path}: {err}")))?;
     client_from_unix(stream, cred)
 }
 

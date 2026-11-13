@@ -65,8 +65,20 @@ pub(super) fn check_bearer(bearer: Option<&str>) -> Result<(), StoreError> {
 /// The TCP connection to `host_port`, with no delay, and the address it
 /// reached.
 pub(super) fn dial(host_port: &str) -> Result<(TcpStream, SocketAddr), StoreError> {
-    let stream = TcpStream::connect(host_port)
-        .map_err(|err| backend(format!("connect {host_port}: {err}")))?;
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::validate_tcp(host_port).map_err(|err| backend(err.to_string()))?;
+    #[cfg(feature = "wire-test-isolation")]
+    let stream = if crate::test_isolation::active() {
+        let addr = host_port
+            .parse::<SocketAddr>()
+            .map_err(|err| backend(format!("invalid test address: {err}")))?;
+        TcpStream::connect(addr)
+    } else {
+        TcpStream::connect(host_port)
+    };
+    #[cfg(not(feature = "wire-test-isolation"))]
+    let stream = TcpStream::connect(host_port);
+    let stream = stream.map_err(|err| backend(format!("connect {host_port}: {err}")))?;
     let peer = stream
         .peer_addr()
         .map_err(|err| backend(format!("peer address of {host_port}: {err}")))?;

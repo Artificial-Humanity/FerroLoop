@@ -117,6 +117,28 @@ mod host_isolation_tests {
 
     #[cfg(unix)]
     #[test]
+    fn wire_host_listener_refuses_unregistered_socket_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("host.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let endpoint = fl_host_proto::HostEndpoint::unix(&path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(fl_host_proto::HostListener::bind(
+            fl_host_proto::HostConfig::new(endpoint),
+        ));
+        assert!(result.is_err());
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn wire_host_validation_rechecks_after_pre_connect_hook() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::Builder::new()
@@ -200,15 +222,58 @@ mod host_isolation_tests {
         assert!(crate::test_isolation::ensure_executable(&path).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wire_store_connections_refuse_external_and_allow_private_auto_fallback() {
+        let private = tempfile::TempDir::new().unwrap();
+        let private_store = private.path().join("private.fls");
+        let _store = fl_store::FerroStore::auto(&private_store)
+            .expect("private absent socket falls back to embedded store");
+        assert!(private_store.exists());
+        let listener_path = private.path().join("unregistered-store.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+        assert!(
+            fl_store::FerroStore::connect_uri(&format!("unix://{}", listener_path.display()))
+                .is_err()
+        );
+        let fixture = crate::test_isolation::register_unix_socket(&listener_path).unwrap();
+        assert!(fl_store::test_isolation::validate_unix(&listener_path).is_ok());
+        drop(fixture);
+        assert!(fl_store::test_isolation::validate_unix(&listener_path).is_err());
+        assert!(
+            fl_store::FerroStore::connect_uri("unix:///run/user/1000/ferroloop/store.sock")
+                .is_err()
+        );
+        assert!(fl_store::FerroStore::connect_uri("ws://localhost:9999").is_err());
+        let auth = fl_store::ServerAuth::new()
+            .with_psk("fixture", &[7; 32])
+            .unwrap();
+        assert!(
+            fl_store::FerroStoreServer::bind_tcp(
+                "localhost:0",
+                fl_store::FerroStore::in_memory(),
+                auth
+            )
+            .is_err()
+        );
+        let external = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        let external_store = external.path().join("external.fls");
+        assert!(fl_store::FerroStore::auto(&external_store).is_err());
+        assert!(!external_store.exists());
+    }
+
     #[test]
     fn wire_tcp_fixture_registration_is_scoped() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         assert!(crate::test_isolation::ensure_tcp(&address).is_err());
+        assert!(fl_store::test_isolation::validate_tcp(&address.to_string()).is_err());
         let guard = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+        assert!(fl_store::test_isolation::validate_tcp(&address.to_string()).is_ok());
         drop(guard);
         assert!(crate::test_isolation::ensure_tcp(&address).is_err());
+        assert!(fl_store::test_isolation::validate_tcp(&address.to_string()).is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-wire-test-isolation = ["dep:tempfile", "fl-host-proto/hub-test-isolation"]
+wire-test-isolation = ["dep:tempfile", "fl-host-proto/hub-test-isolation", "fl-store/wire-test-isolation"]
 
 [dependencies]
 tempfile = { workspace = true, optional = true }

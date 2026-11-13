@@ -160,15 +160,28 @@ impl WsStream {
             )
             .into());
         }
-        let addr = format!("{host}:{port}")
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| {
+        let endpoint = format!("{host}:{port}");
+        let resolve = || {
+            endpoint.to_socket_addrs()?.next().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
                     format!("could not resolve {host}:{port}"),
                 )
-            })?;
+            })
+        };
+        #[cfg(feature = "wire-test-isolation")]
+        let addr = if crate::test_isolation::is_enabled() {
+            endpoint.parse::<std::net::SocketAddr>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "test address must be numeric",
+                )
+            })?
+        } else {
+            resolve()?
+        };
+        #[cfg(not(feature = "wire-test-isolation"))]
+        let addr = resolve()?;
         #[cfg(feature = "wire-test-isolation")]
         crate::test_isolation::ensure_tcp(&addr)?;
         let tcp = TcpStream::connect_timeout(&addr, timeout)?;
