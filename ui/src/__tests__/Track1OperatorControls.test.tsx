@@ -356,7 +356,7 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       [true, "deferred", false, /saved.*deferred/i, "claude-sonnet-5-5"],
       [true, "held", true, /saved.*held/i, "claude-sonnet-5-5"],
       [true, "failed", true, /saved.*failed/i, "claude-sonnet-5-5"],
-      [false, "deferred", false, /not.*saved/i, "claude-opus-5-5"],
+      [false, "deferred", false, /not applied.*not saved/i, "claude-opus-5-5"],
       [false, "failed", false, /not.*saved/i, "claude-opus-5-5"],
     ])("reports callback result persisted=%s live=%s restart=%s", async (persisted, status, restartApplies, message, expectedModel) => {
       const onSetSessionModel = vi.fn().mockResolvedValue({
@@ -374,6 +374,23 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       if (!persisted || !restartApplies || status !== "deferred") {
         expect(screen.getByTestId("compact-feedback")).not.toHaveTextContent(/applies on next restart/i);
       }
+    });
+
+    it("reports an unsaved Codex choice as not applied", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        persisted: false, record_id: null, restart_applies: false,
+        live: { status: "deferred", mechanism: "override-only", model_applied: false },
+      });
+      render(<ChatPane agentName="fixture-only" adapter="codex" model="gpt-6-sol"
+        sessionId="fixture-only-thread" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "gpt-6-astra" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
+        "Model change was not applied; the choice was not saved.",
+      ));
+      expect(select.value).toBe("gpt-6-sol");
+      expect(screen.getByTestId("compact-feedback")).not.toHaveTextContent(/deferred|restart/i);
     });
 
     it.each([undefined, null, {}, { persisted: true }, { persisted: true, live: {} }, { persisted: true, live: { status: "unknown" } }])("restores the previous choice when outcome fields are missing (%s)", async (response) => {

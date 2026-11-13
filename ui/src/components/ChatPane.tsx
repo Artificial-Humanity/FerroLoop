@@ -1911,7 +1911,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         } else if (!persisted) {
           showModelFeedback(live.status === "applied"
             ? "Model changed for this session; the choice was not saved."
-            : `Model change ${live.status}; the choice was not saved.`);
+            : "Model change was not applied; the choice was not saved.");
         } else if (live.status === "deferred") {
           showModelFeedback(response.restart_applies
             ? "Model saved. Applies on next restart."
