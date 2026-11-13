@@ -355,6 +355,7 @@ export interface AgentSettingsModalProps {
   availableModels?: string[] | null;
   switchingModel?: boolean;
   modelSwitchFeedback?: string | null;
+  onModelValidation?: (message: string) => void;
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
   /**
@@ -500,6 +501,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   availableModels,
   switchingModel = false,
   modelSwitchFeedback,
+  onModelValidation,
   onChangeModelAndThinking,
   contextEstimate,
   quotaUsage,
@@ -1459,6 +1461,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       agyModelRequiresThinkingLevel(nextModel, effectiveAvailableModels)
                     ) {
                       setPendingAgyModel(nextModel);
+                      onModelValidation?.("Choose a thinking level to switch this Antigravity model.");
                       return;
                     }
                     setPendingAgyModel(null);
@@ -1537,7 +1540,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               >
                 {modelSwitchFeedback}
               </div>
-              {agyThinkingRequired && (
+              {agyThinkingRequired && !pendingAgyModel && (
                 <div
                   data-testid="agy-thinking-required-hint"
                   style={{

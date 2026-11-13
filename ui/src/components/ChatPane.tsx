@@ -1852,7 +1852,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       agyModelRequiresThinkingLevel(nextModel, availableModels)
     ) {
       setSelectedModel(nextModel);
-      setSubmitError("choose a thinking level for this Antigravity model");
+      const message = "Choose a thinking level to switch this Antigravity model.";
+      showModelFeedback(message);
+      setSubmitError(message);
       return;
     }
     setSelectedModel(nextModel);
@@ -4905,6 +4907,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         availableModels={availableModels}
         switchingModel={switchingModel}
         modelSwitchFeedback={modelSwitchFeedback}
+        onModelValidation={(message) => {
+          setCompactFeedback(null);
+          setSubmitError(null);
+          setModelSwitchFeedback(message);
+        }}
         onChangeModelAndThinking={(nextModel, nextThinking) =>
           void handleChangeModelAndThinking(nextModel, nextThinking)
         }

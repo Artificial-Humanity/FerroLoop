@@ -440,6 +440,21 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       expect(select.value).toBe("claude-sonnet-5-5");
     });
 
+    it("replaces stale model feedback with the Antigravity thinking validation in the dialog", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({ persisted: true, record_id: "hosted-felix", restart_applies: true,
+        live: { status: "deferred", mechanism: "override", model_applied: false, queued: false } });
+      const props = { agentName: "felix", adapter: "antigravity", model: "gemini-4-argon", sessionId: "sess-felix", turns: [], agentSettingsOpen: true, onSetSessionModel };
+      const { rerender } = render(<ChatPane {...props} thinkingLevel="high" />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "gemini-3.8-flash" } });
+      await waitFor(() => expect(screen.getByTestId("model-switch-feedback")).toHaveTextContent(/applies on next restart/i));
+      rerender(<ChatPane {...props} thinkingLevel={null} />);
+      await waitFor(() => expect((screen.getByTestId("session-thinking-select") as HTMLSelectElement).value).toBe(""));
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "gemini-4-argon" } });
+      expect(screen.getByTestId("model-switch-feedback")).toHaveTextContent(/choose a thinking level/i);
+      expect(screen.getByTestId("model-switch-feedback")).not.toHaveTextContent(/restart/i);
+      expect(onSetSessionModel).toHaveBeenCalledTimes(1);
+    });
+
     it("announces the model result inside the open settings dialog", async () => {
       const onSetSessionModel = vi.fn().mockResolvedValue({ persisted: true, record_id: "hosted-ada", restart_applies: true,
         live: { status: "deferred", mechanism: "override", model_applied: false, queued: false } });
