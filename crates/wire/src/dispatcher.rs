@@ -4426,13 +4426,18 @@ fn starts_with_numbered_choice(line: &str, prefix: &str) -> bool {
     after_selector.starts_with(prefix)
 }
 
-fn line_has_selector_first_choice(line: &str) -> bool {
+fn line_has_selector_numbered_choice(line: &str) -> bool {
     let trimmed = strip_dialog_box_prefix(line);
-    trimmed
+    let Some(rest) = trimmed
         .strip_prefix('❯')
         .or_else(|| trimmed.strip_prefix('›'))
         .or_else(|| trimmed.strip_prefix('>'))
-        .is_some_and(|rest| rest.trim_start().starts_with("1."))
+    else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits_len > 0 && rest[digits_len..].starts_with('.')
 }
 
 fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
@@ -4440,7 +4445,7 @@ fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
     let mut saw_choice_2 = false;
     for &line in candidate_lines {
         let trimmed = line.trim_start();
-        if line_has_selector_first_choice(line) {
+        if line_has_selector_numbered_choice(line) {
             return true;
         }
         if starts_with_numbered_choice(trimmed, "1. ") {
@@ -4465,13 +4470,13 @@ fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
 }
 
 /// Strong dialog markers that cannot appear in ordinary assistant prose: a selector-prefixed
-/// first choice, an explicit cancel/allow affordance, or a `[y/n]` prompt. Weak markers
+/// numbered choice, an explicit cancel/allow affordance, or a `[y/n]` prompt. Weak markers
 /// (`"do you want"`, paired plain `1. `/`2. ` lines) only count inside the composer/dialog
 /// box, never in scrollback or an agent reply.
 fn lines_have_strong_dialog_markers(candidate_lines: &[&str]) -> bool {
     for &line in candidate_lines {
         let trimmed = line.trim_start();
-        if line_has_selector_first_choice(line) {
+        if line_has_selector_numbered_choice(line) {
             return true;
         }
         let lower = trimmed.to_ascii_lowercase();
@@ -14737,6 +14742,61 @@ exit 1"#,
         let idle =
             "› Ask Codex to do anything\n\n  gpt-5.2-codex · 80% left · ~/proj\n  footer two\n";
         assert!(!screen_has_dialog_or_menu_markers(idle));
+    }
+
+    #[test]
+    fn nb4_selector_on_any_numbered_choice_must_hold() {
+        let hold: Vec<(&str, &str)> = vec![
+            (
+                "would_you_like_sel2_then_empty_prompt",
+                "• Proposed plan ready.\n\nWould you like to proceed?\n\n  1. Yes\n❯ 2. No, keep planning\n\n› \n",
+            ),
+            (
+                "would_you_like_sel2_then_ghost_prompt",
+                "• Proposed plan ready.\n\nWould you like to proceed?\n\n  1. Yes\n› 2. No, keep planning\n\n› Ask Codex to do anything\n\n  GPT-6.1 · ~/proj\n",
+            ),
+            (
+                "question_sel3_notes_field",
+                "  Which option should I use?\n\n    1. Fast path\n    2. Safe path\n  › 3. Something else\n\n  › \n  tab to add notes | enter to submit answer\n",
+            ),
+            // Fail-closed case that must stay held (NB4 note).
+            (
+                "reply_do_you_want_then_list_ghost",
+                "• Do you want me to continue? Options:\n  1. Patch the test\n  2. Fix the code\n\n› Ask Codex to do anything\n\n  GPT-6.1 · ~/proj\n",
+            ),
+        ];
+        for (name, screen) in &hold {
+            assert!(
+                screen_has_dialog_or_menu_markers(screen),
+                "{name} must hold"
+            );
+            assert_eq!(
+                probe_composer_ready_from_screen(screen, None, &[], ComposerStyle::Ruleless, false),
+                Some(false),
+                "{name} probe must hold"
+            );
+        }
+        let proceed: Vec<(&str, &str)> = vec![
+            (
+                "plain_choices_no_selector_then_empty_prompt",
+                "Pick one:\n  1. Alpha\n  2. Beta\n\n> \n",
+            ),
+            (
+                "reply_list_then_question_empty_prompt",
+                "• I can do this two ways:\n  1. Patch the test\n  2. Fix the code\n  Which do you prefer?\n\n› \n",
+            ),
+        ];
+        for (name, screen) in &proceed {
+            assert!(
+                !screen_has_dialog_or_menu_markers(screen),
+                "{name} must proceed"
+            );
+            assert_eq!(
+                probe_composer_ready_from_screen(screen, None, &[], ComposerStyle::Ruleless, false),
+                Some(true),
+                "{name} probe must proceed"
+            );
+        }
     }
 
     #[test]
