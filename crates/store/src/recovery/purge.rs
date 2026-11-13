@@ -531,7 +531,8 @@ fn closure(
             }
             let text = m.operation_id.to_string();
             let dir = Dir::open(&root.path.join(&text), &member_limits)?;
-            let checked = catalog::check_bundle(&dir, &text, &member_limits)?;
+            let checked = catalog::check_bundle(&dir, &text, &member_limits)
+                .map_err(|error| error.at_metadata_entry(|| std::path::PathBuf::from(&text)))?;
             let receipt_limits =
                 member_limits.with_retained_memory(checked_memory(&checked, &member_limits)?)?;
             if checked.manifest_sha256 != m.manifest_sha256

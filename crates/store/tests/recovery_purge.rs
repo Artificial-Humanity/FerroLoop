@@ -2834,3 +2834,159 @@ fn purge_every_named_audit_row_is_file_and_catalog_synced_before_next_action() {
         );
     }
 }
+
+// Removing the referenced-member context must fail all three corruption cases.
+fn purge_r4_corrupt_completed_batch_member_diagnostic(case: &str) {
+    use fl_store::recovery::RecoveryError;
+    use std::{collections::BTreeMap, error::Error, os::unix::fs::MetadataExt, path::PathBuf};
+
+    type Snapshot = BTreeMap<PathBuf, (u64, u64, u32, u64, Vec<u8>)>;
+    fn snapshot(path: &std::path::Path) -> Snapshot {
+        let mut rows = BTreeMap::new();
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            rows.insert(
+                path.clone(),
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.len(),
+                    if metadata.is_file() {
+                        fs::read(&path).unwrap()
+                    } else {
+                        Vec::new()
+                    },
+                ),
+            );
+            if metadata.is_dir() {
+                rows.extend(snapshot(&path));
+            }
+        }
+        rows
+    }
+
+    let (f, target, lease, other) = review13_batch_fixture(false);
+    review13_quarantine_other(&f, other);
+    assert_ne!(target, other);
+    // The completed set and its quarantined receipt permit this unrelated target.
+    let report =
+        purge_quarantined(&inspection(target), &lease, &f.filesystem(), &limits()).unwrap();
+    // Establish the target's existing lock diagnostics before corrupting the
+    // unrelated member. A changed closure digest refuses before purge.
+    let mut unconfirmed_evidence = confirmation(&report);
+    unconfirmed_evidence
+        .reference_closure
+        .as_mut()
+        .unwrap()
+        .catalog_set_sha256 = "0".repeat(64);
+    assert!(matches!(
+        purge_quarantined(&unconfirmed_evidence, &lease, &f.filesystem(), &limits()),
+        Err(RecoveryError::RefusedInput {
+            reason: "reference closure changed or administrative evidence incomplete",
+            ..
+        })
+    ));
+    let source = fs::metadata(&f.source).unwrap();
+    let physical_lock =
+        f.backups
+            .join(".locks")
+            .join(format!("{}:{}.lock", source.dev(), source.ino()));
+    assert!(physical_lock.is_file());
+    let member = f.backups.join(other.to_string());
+    let secret = "PRIVATE_CORRUPT_BATCH_CONTENT_MUST_NOT_APPEAR";
+    match case {
+        "image" => fs::write(member.join("image.fls"), secret).unwrap(),
+        "manifest" => fs::write(member.join("manifest.json"), format!("{{{secret}")).unwrap(),
+        "report" => fs::remove_file(member.join("report.json")).unwrap(),
+        _ => unreachable!(),
+    }
+    let before = snapshot(f.root.path());
+    let hook = Arc::new(PurgeReplayCut {
+        stop: usize::MAX,
+        seen: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let filesystem = HookFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    for request in [inspection(target), confirmation(&report)] {
+        let error = purge_quarantined(&request, &lease, &filesystem, &limits()).unwrap_err();
+        assert_eq!(
+            hook.seen.load(Ordering::Acquire),
+            0,
+            "{case}: attempted unlink"
+        );
+        let mut after = snapshot(f.root.path());
+        if request.confirm.is_some() {
+            // StoreLock refreshes this pre-existing physical lock's real-time
+            // diagnostic before closure. Only its timestamp may differ; all
+            // lock identity/metadata and all other artifact bytes stay exact.
+            let old = &before.get(&physical_lock).unwrap().4;
+            let new = &mut after.get_mut(&physical_lock).unwrap().4;
+            let mut previous: serde_json::Value = serde_json::from_slice(old).unwrap();
+            let mut current: serde_json::Value = serde_json::from_slice(new).unwrap();
+            for value in [&mut previous, &mut current] {
+                let object = value.as_object_mut().unwrap();
+                assert_eq!(object.len(), 3);
+                assert_eq!(object["operation_id"], target.to_string());
+                assert_eq!(object["pid"], std::process::id());
+                assert!(
+                    object
+                        .remove("started_at_unix_ms")
+                        .unwrap()
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+            }
+            assert_eq!(
+                current, previous,
+                "{case}: non-timestamp lock diagnostics changed"
+            );
+            *new = old.clone();
+        }
+        assert!(
+            after == before,
+            "{case}: refusal changed artifacts beyond the confirmed physical-lock timestamp"
+        );
+        assert!(
+            matches!(&error, RecoveryError::MetadataVerification { operation_id, entry, source }
+                if *operation_id == target
+                    && entry == &PathBuf::from(other.to_string())
+                    && matches!(source.as_ref(), RecoveryError::Verification { operation_id } if *operation_id == target)),
+            "{case}: missing referenced member diagnostic: {error:?}"
+        );
+        assert!(
+            error.source().and_then(|source| source.downcast_ref::<Box<RecoveryError>>())
+                .is_some_and(|source| matches!(source.as_ref(), RecoveryError::Verification { operation_id } if *operation_id == target)),
+            "{case}: typed verification cause lost: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&other.to_string()), "{case}: {message}");
+        assert!(
+            !message.contains(f.backups.to_str().unwrap()),
+            "{case}: {message}"
+        );
+        assert!(!message.contains(secret), "{case}: {message}");
+        eprintln!(
+            "r4 item7 corrupt={case} confirmed={} member={other} typed_source=true zero_unlinks=true exact_artifacts_except_confirmed_lock_timestamp=true",
+            request.confirm.is_some()
+        );
+    }
+}
+
+#[test]
+fn purge_r4_completed_batch_corrupt_image_names_member() {
+    purge_r4_corrupt_completed_batch_member_diagnostic("image");
+}
+#[test]
+fn purge_r4_completed_batch_truncated_manifest_names_member() {
+    purge_r4_corrupt_completed_batch_member_diagnostic("manifest");
+}
+#[test]
+fn purge_r4_completed_batch_missing_report_names_member() {
+    purge_r4_corrupt_completed_batch_member_diagnostic("report");
+}
