@@ -979,7 +979,9 @@ impl HubState {
         let composer_held = queue.iter().any(|q| {
             q.id == prompt_id
                 && q.delivery_state == QueuedDeliveryState::Pending
-                && q.delivery_error.as_deref().is_some_and(is_composer_occupied_error)
+                && q.delivery_error
+                    .as_deref()
+                    .is_some_and(is_composer_occupied_error)
         });
         let out = queue.clone();
         if composer_held {

@@ -14639,11 +14639,11 @@ exit 1"#,
         );
         assert!(!screen_has_dialog_or_menu_markers(&single_rule));
         // A real dialog in the dialog region still reads as a dialog, framed or not.
-        let framed_dialog = format!(
-            "{rule}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  Esc to cancel"
-        );
+        let framed_dialog =
+            format!("{rule}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  Esc to cancel");
         assert!(screen_has_dialog_or_menu_markers(&framed_dialog));
-        let ruleless_dialog = "⏺ Tool call pending\nDo you want to allow always?\n› 1. Yes\n  2. No";
+        let ruleless_dialog =
+            "⏺ Tool call pending\nDo you want to allow always?\n› 1. Yes\n  2. No";
         assert!(screen_has_dialog_or_menu_markers(ruleless_dialog));
     }
 
