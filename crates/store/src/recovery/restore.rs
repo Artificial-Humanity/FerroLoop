@@ -165,6 +165,40 @@ fn binding_bytes(binding: &FileBinding) -> u64 {
         FileBinding::Readable { bytes, .. } | FileBinding::Forensic { bytes, .. } => *bytes,
     }
 }
+// Recheck after the final injectable digest read, immediately before mutation.
+fn lease_time_remaining(
+    expires_at_unix_ms: u128,
+    io: &dyn fs::RecoveryIo,
+    l: &OperationLimits,
+) -> Result<std::time::Duration, RecoveryError> {
+    l.check()?;
+    let now = io.unix_ms().map_err(|_| fs::destination(l))?;
+    l.check()?;
+    let remaining = expires_at_unix_ms
+        .checked_sub(now)
+        .filter(|ms| *ms > 0)
+        .ok_or(RecoveryError::Deadline {
+            operation_id: l.operation_id,
+        })?;
+    Ok(std::time::Duration::from_millis(
+        u64::try_from(remaining).map_err(|_| l.verification())?,
+    ))
+}
+fn cap_lease_deadline(
+    expires_at_unix_ms: u128,
+    io: &dyn fs::RecoveryIo,
+    l: &mut OperationLimits,
+) -> Result<(), RecoveryError> {
+    // Sampling before the injectable clock cannot extend authority by its latency.
+    let started = std::time::Instant::now();
+    let remaining = lease_time_remaining(expires_at_unix_ms, io, l)?;
+    l.deadline = l.deadline.min(
+        started
+            .checked_add(remaining)
+            .ok_or_else(|| l.verification())?,
+    );
+    l.check()
+}
 fn deadline_unix(
     fs: &dyn RecoveryFs,
     l: &OperationLimits,
@@ -416,9 +450,9 @@ fn rename_exchange(
     fs::event(io, RecoveryEvent::Exchange, l)?;
     assert_named_identity(from, old, first, l)?;
     assert_named_identity(to, new, second, l)?;
-    validate()?;
     let old = std::ffi::CString::new(old).map_err(|_| l.verification())?;
     let new = std::ffi::CString::new(new).map_err(|_| l.verification())?;
+    validate()?;
     #[cfg(target_os = "linux")]
     let result = unsafe {
         libc::renameat2(
@@ -461,6 +495,7 @@ fn sync_both(
 }
 fn install(
     j: &mut RestoreJournal,
+    lease: &OfflineLease,
     control: &Arc<PublicationIo>,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
@@ -491,7 +526,9 @@ fn install(
                     &candidate_binding(j),
                     l,
                 )?;
-                matches_binding(&j.destination, &j.original, l)
+                matches_binding(&j.destination, &j.original, l)?;
+                lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, l)?;
+                Ok(())
             },
         )?;
         sync_both(&parent, &staging, &*control.io, l)?;
@@ -504,7 +541,11 @@ fn install(
             &*control.io,
             RecoveryEvent::RestoreRelocate,
             l,
-            || matches_binding(&staging.path.join("candidate.fls"), &j.original, l),
+            || {
+                matches_binding(&staging.path.join("candidate.fls"), &j.original, l)?;
+                lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, l)?;
+                Ok(())
+            },
         )?;
         sync_both(&parent, &staging, &*control.io, l)?;
     } else {
@@ -522,7 +563,9 @@ fn install(
                     &staging.path.join("candidate.fls"),
                     &candidate_binding(j),
                     l,
-                )
+                )?;
+                lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, l)?;
+                Ok(())
             },
         )?;
         sync_both(&parent, &staging, &*control.io, l)?;
@@ -546,6 +589,7 @@ pub fn restore_offline(
         });
     }
     lease.validate(filesystem, &l)?;
+    cap_lease_deadline(lease.request.expires_at_unix_ms, &*filesystem.io(), &mut l)?;
     let _owner = OperationOwnership::acquire(&lease.request.physical_path, &l)?;
     let physical = admission::canonical_physical(&request.destination)?;
     admission::check_restore_admission(&physical)?;
@@ -1001,7 +1045,7 @@ pub fn restore_offline(
         journal.phase = RestorePhase::Prepared;
         journal_append(&mut journal, &control, &l)?;
         sync_both(&parent, staging, &*control.io, &l)?;
-        install(&mut journal, &control, &l)?;
+        install(&mut journal, lease, &control, &l)?;
         Ok(RestoreOutcome::Installed { journal })
     })();
     result.map_err(|error| match error {
@@ -1901,7 +1945,7 @@ pub fn resume_restore(
             &lock,
             &l,
         )?;
-        install(&mut j, &control, &l)?;
+        install(&mut j, lease, &control, &l)?;
     } else if dest == Some(j.candidate_identity)
         && candidate == binding_identity(&j.original)
         && original.is_none()
@@ -1918,7 +1962,11 @@ pub fn resume_restore(
             &*control.io,
             RecoveryEvent::RestoreRelocate,
             &l,
-            || matches_binding(&staging.path.join("candidate.fls"), &j.original, &l),
+            || {
+                matches_binding(&staging.path.join("candidate.fls"), &j.original, &l)?;
+                lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, &l)?;
+                Ok(())
+            },
         )?;
         sync_both(&parent, &staging, &*control.io, &l)?;
         j.phase = RestorePhase::Installed;
@@ -2024,7 +2072,11 @@ pub fn rollback_restore(
                 &*control.io,
                 RecoveryEvent::RestoreRelocate,
                 &l,
-                || matches_binding(&j.destination, &candidate_binding(&j), &l),
+                || {
+                    matches_binding(&j.destination, &candidate_binding(&j), &l)?;
+                    lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, &l)?;
+                    Ok(())
+                },
             )?;
             sync_both(&parent, &staging, &*control.io, &l)?;
         } else if dest.is_none() && candidate == Some(j.candidate_identity) {
@@ -2081,7 +2133,9 @@ pub fn rollback_restore(
         j.candidate_identity,
         || {
             matches_binding(&staging.path.join("original.fls"), &j.original, &l)?;
-            matches_binding(&j.destination, &candidate_binding(&j), &l)
+            matches_binding(&j.destination, &candidate_binding(&j), &l)?;
+            lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, &l)?;
+            Ok(())
         },
     )?;
     sync_both(&parent, &staging, &*control.io, &l)?;
@@ -5633,5 +5687,101 @@ mod forensic_binding_tests {
             *read_error = libc::EIO;
         }
         assert!(matches_binding(&path, &binding, &l).is_err());
+    }
+}
+
+#[cfg(test)]
+mod restore_lease_deadline_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    struct Clock {
+        now: u128,
+        sampled: Mutex<Option<Instant>>,
+        cancel: Option<super::super::CancelToken>,
+    }
+    impl fs::RecoveryIo for Clock {
+        fn unix_ms(&self) -> std::io::Result<u128> {
+            *self.sampled.lock().unwrap() = Some(Instant::now());
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            Ok(self.now)
+        }
+    }
+    fn clock(now: u128) -> Clock {
+        Clock {
+            now,
+            sampled: Mutex::new(None),
+            cancel: None,
+        }
+    }
+    fn limits() -> OperationLimits {
+        OperationLimits::new(
+            Instant::now() + Duration::from_secs(30),
+            1234,
+            5678,
+            super::super::CancelToken::new(),
+        )
+    }
+    #[test]
+    fn initial_cap_uses_preclock_instant_and_preserves_budgets() {
+        let mut l = limits();
+        l.charge_query_work(7).unwrap();
+        let shared = l.clone();
+        let io = clock(1000);
+        cap_lease_deadline(2000, &io, &mut l).unwrap();
+        assert!(l.deadline <= io.sampled.lock().unwrap().unwrap() + Duration::from_secs(1));
+        assert_eq!(
+            (l.byte_limit, l.memory_byte_limit, l.query_work_limit),
+            (
+                shared.byte_limit,
+                shared.memory_byte_limit,
+                shared.query_work_limit
+            )
+        );
+        assert_eq!(
+            l.query_work_used.load(std::sync::atomic::Ordering::Acquire),
+            7
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &l.query_work_used,
+            &shared.query_work_used
+        ));
+        let caller_deadline = Instant::now() + Duration::from_millis(100);
+        l.deadline = caller_deadline;
+        cap_lease_deadline(2000, &io, &mut l).unwrap();
+        assert_eq!(l.deadline, caller_deadline);
+    }
+    #[test]
+    fn expired_wallclock_and_monotonic_limits_return_deadline() {
+        let mut l = limits();
+        for now in [2000, 2001] {
+            assert!(matches!(
+                cap_lease_deadline(2000, &clock(now), &mut l),
+                Err(RecoveryError::Deadline { .. })
+            ));
+            assert!(matches!(
+                lease_time_remaining(2000, &clock(now), &l),
+                Err(RecoveryError::Deadline { .. })
+            ));
+        }
+        l.deadline = Instant::now();
+        assert!(matches!(
+            lease_time_remaining(2000, &clock(1000), &l),
+            Err(RecoveryError::Deadline { .. })
+        ));
+    }
+    #[test]
+    fn final_clock_callback_cannot_bypass_limits() {
+        let l = limits();
+        let io = Clock {
+            cancel: Some(l.cancel.clone()),
+            ..clock(1000)
+        };
+        assert!(matches!(
+            lease_time_remaining(2000, &io, &l),
+            Err(RecoveryError::Cancelled { .. })
+        ));
     }
 }

@@ -6344,3 +6344,290 @@ fn restore_absence_resume_refuses_changed_layout_without_mutation() {
     fs::rename(&parked, &candidate).unwrap();
     assert_eq!(absence_resume_snapshot(&f, &journal), before);
 }
+
+use std::sync::atomic::AtomicBool;
+
+// Markers arm the clock, but only inode/digest snapshots prove a syscall did not run.
+#[derive(Clone, Copy, Debug)]
+enum RestoreExpiryCut {
+    BeforeDigest,
+    FinalRead,
+}
+type RestoreExpiryLayout = Vec<Option<((u64, u64), Vec<u8>)>>;
+fn restore_expiry_layout(
+    destination: &std::path::Path,
+    staging: &std::path::Path,
+) -> RestoreExpiryLayout {
+    [
+        destination.to_path_buf(),
+        staging.join("candidate.fls"),
+        staging.join("original.fls"),
+    ]
+    .iter()
+    .map(|path| {
+        fs::metadata(path).ok().map(|m| {
+            (
+                (m.dev(), m.ino()),
+                sha2::Sha256::digest(fs::read(path).unwrap()).to_vec(),
+            )
+        })
+    })
+    .collect()
+}
+struct RestoreExpiryIo {
+    marker: RecoveryEvent,
+    cut: RestoreExpiryCut,
+    destination: std::path::PathBuf,
+    issued: u128,
+    expires: u128,
+    expired: AtomicBool,
+    armed: AtomicBool,
+    final_identity: Mutex<Option<(u64, u64)>>,
+    before_layout: Mutex<Option<RestoreExpiryLayout>>,
+    subsequent_actions: AtomicUsize,
+}
+impl RecoveryIo for RestoreExpiryIo {
+    fn unix_ms(&self) -> std::io::Result<u128> {
+        Ok(if self.expired.load(Ordering::Acquire) {
+            self.expires
+        } else {
+            self.issued
+        })
+    }
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if matches!(
+            event,
+            RecoveryEvent::RestoreInstall
+                | RecoveryEvent::RestoreRelocate
+                | RecoveryEvent::RestoreReverseExchange
+        ) {
+            if self.expired.load(Ordering::Acquire) {
+                self.subsequent_actions.fetch_add(1, Ordering::AcqRel);
+            }
+            if event == self.marker && !self.armed.swap(true, Ordering::AcqRel) {
+                let guard: serde_json::Value = serde_json::from_slice(&fs::read(
+                    self.destination.with_extension("fls.restore-guard"),
+                )?)?;
+                let staging = std::path::Path::new(guard["journal"].as_str().unwrap())
+                    .parent()
+                    .unwrap();
+                *self.before_layout.lock().unwrap() =
+                    Some(restore_expiry_layout(&self.destination, staging));
+                // The exchange's second digest is the destination. Relocation
+                // hashes the original now named candidate; absent rollback hashes destination.
+                let target = if event == RecoveryEvent::RestoreRelocate
+                    && self.destination.exists()
+                    && staging.join("candidate.fls").exists()
+                {
+                    staging.join("candidate.fls")
+                } else if self.destination.exists() {
+                    self.destination.clone()
+                } else {
+                    staging.join("candidate.fls")
+                };
+                let m = fs::metadata(target)?;
+                *self.final_identity.lock().unwrap() = Some((m.dev(), m.ino()));
+                if matches!(self.cut, RestoreExpiryCut::BeforeDigest) {
+                    self.expired.store(true, Ordering::Release);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn read_exact_at(&self, file: &fs::File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(bytes, offset)?;
+        let m = file.metadata()?;
+        if self.armed.load(Ordering::Acquire)
+            && matches!(self.cut, RestoreExpiryCut::FinalRead)
+            && *self.final_identity.lock().unwrap() == Some((m.dev(), m.ino()))
+            && offset + bytes.len() as u64 == m.len()
+        {
+            self.expired.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+fn restore_expiry_io(
+    destination: &std::path::Path,
+    lease: &OfflineLease,
+    marker: RecoveryEvent,
+    cut: RestoreExpiryCut,
+) -> Arc<RestoreExpiryIo> {
+    let binding = fixture_lease_request(lease);
+    Arc::new(RestoreExpiryIo {
+        marker,
+        cut,
+        destination: destination.to_path_buf(),
+        issued: binding.issued_at_unix_ms,
+        expires: binding.expires_at_unix_ms,
+        expired: AtomicBool::new(false),
+        armed: AtomicBool::new(false),
+        final_identity: Mutex::new(None),
+        before_layout: Mutex::new(None),
+        subsequent_actions: AtomicUsize::new(0),
+    })
+}
+fn assert_restore_expiry_layout(
+    f: &Fixture,
+    destination: &std::path::Path,
+    hook: &RestoreExpiryIo,
+) {
+    assert!(
+        hook.expired.load(Ordering::Acquire),
+        "expiry hook must reach protected action"
+    );
+    let guard: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.with_extension("fls.restore-guard")).unwrap())
+            .unwrap();
+    let journal = std::path::Path::new(guard["journal"].as_str().unwrap());
+    assert!(journal.exists());
+    assert_eq!(
+        restore_expiry_layout(destination, journal.parent().unwrap()),
+        *hook.before_layout.lock().unwrap().as_ref().unwrap(),
+        "namespace changed after lease expiry"
+    );
+    assert_eq!(hook.subsequent_actions.load(Ordering::Acquire), 0);
+    let pins = f.backups.join(".catalog/restore-pins");
+    assert!(
+        fs::read_dir(pins).unwrap().next().is_some(),
+        "restore pin retained"
+    );
+}
+fn assert_forward_restore_expiry(resume: bool) {
+    for absent in [false, true] {
+        for marker in [
+            RecoveryEvent::RestoreInstall,
+            RecoveryEvent::RestoreRelocate,
+        ] {
+            if absent && marker == RecoveryEvent::RestoreRelocate {
+                continue;
+            }
+            for cut in [RestoreExpiryCut::BeforeDigest, RestoreExpiryCut::FinalRead] {
+                let f = Fixture::new();
+                if absent {
+                    let writer = FerroStore::open(&f.source).unwrap();
+                    writer
+                        .put_doc(
+                            "fixture_unknown",
+                            "one",
+                            &serde_json::json!({"body": "x".repeat(20 << 20)}),
+                        )
+                        .unwrap();
+                    drop(writer);
+                }
+                let destination = if absent {
+                    f.root.path().join("absent.fls")
+                } else {
+                    f.source.clone()
+                };
+                let (request, lease) = prepare_restore(&f, &destination);
+                let hook = restore_expiry_io(&destination, &lease, marker, cut);
+                let filesystem = CutFs {
+                    f: &f,
+                    io: hook.clone(),
+                    limits: limits(),
+                };
+                let error = if resume {
+                    // Cut before any protected namespace operation, then resume
+                    // from the real durable intent with separate clock authority.
+                    let stop = CutFs {
+                        f: &f,
+                        io: journal_boundary_io(Some(marker)),
+                        limits: limits(),
+                    };
+                    assert!(restore_offline(&request, &lease, &stop).is_err());
+                    let guard: serde_json::Value = serde_json::from_slice(
+                        &fs::read(destination.with_extension("fls.restore-guard")).unwrap(),
+                    )
+                    .unwrap();
+                    let j = load_restore_journal(
+                        std::path::Path::new(guard["journal"].as_str().unwrap()),
+                        &lease,
+                        &f.filesystem(),
+                    )
+                    .unwrap();
+                    resume_restore(&j, &lease, &filesystem).unwrap_err()
+                } else {
+                    restore_offline(&request, &lease, &filesystem).unwrap_err()
+                };
+                if resume {
+                    assert!(
+                        matches!(error, fl_store::recovery::RecoveryError::Deadline { .. }),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            error,
+                            fl_store::recovery::RecoveryError::OutcomeUnknown { .. }
+                        ),
+                        "{error:?}"
+                    );
+                }
+                assert_restore_expiry_layout(&f, &destination, &hook);
+                eprintln!(
+                    "restore_expiry_case resume={resume} absent={absent} marker={marker:?} cut={cut:?} preserved=true"
+                );
+            }
+        }
+    }
+}
+#[test]
+fn restore_lease_expiry_initial_forward_actions_preserve_namespace() {
+    assert_forward_restore_expiry(false);
+}
+#[test]
+fn restore_lease_expiry_resumed_forward_actions_preserve_namespace() {
+    assert_forward_restore_expiry(true);
+}
+#[test]
+fn restore_lease_expiry_reverse_actions_preserve_namespace() {
+    for absent in [false, true] {
+        for cut in [RestoreExpiryCut::BeforeDigest, RestoreExpiryCut::FinalRead] {
+            let f = Fixture::new();
+            if absent {
+                let writer = FerroStore::open(&f.source).unwrap();
+                writer
+                    .put_doc(
+                        "fixture_unknown",
+                        "one",
+                        &serde_json::json!({"body": "x".repeat(20 << 20)}),
+                    )
+                    .unwrap();
+                drop(writer);
+            }
+            let destination = if absent {
+                f.root.path().join("absent.fls")
+            } else {
+                f.source.clone()
+            };
+            let (request, lease) = prepare_restore(&f, &destination);
+            let RestoreOutcome::Installed { journal } =
+                restore_offline(&request, &lease, &f.filesystem()).unwrap()
+            else {
+                panic!("not installed")
+            };
+            let marker = if absent {
+                RecoveryEvent::RestoreRelocate
+            } else {
+                RecoveryEvent::RestoreReverseExchange
+            };
+            let hook = restore_expiry_io(&destination, &lease, marker, cut);
+            let filesystem = CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            };
+            let error = rollback_restore(&journal, &lease, &filesystem).unwrap_err();
+            assert!(
+                matches!(error, fl_store::recovery::RecoveryError::Deadline { .. }),
+                "{error:?}"
+            );
+            assert_restore_expiry_layout(&f, &destination, &hook);
+            eprintln!(
+                "restore_expiry_case reverse=true absent={absent} cut={cut:?} preserved=true"
+            );
+        }
+    }
+}
