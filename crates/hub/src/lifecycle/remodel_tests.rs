@@ -2267,3 +2267,38 @@ fn spin_up_and_remodel_json_contracts_parse_posture_and_serialize_receipts() {
         assert!(item["evidence"].is_string(), "{item}");
     }
 }
+
+#[test]
+fn remodel_prepare_adopts_a_live_route_over_a_decommissioned_record() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    spin(&store, &env, "ada", "assistant", "claude");
+    let stale = target(&store, "claude:ada");
+    teardown_session(&store, &env, &stale, "owner", Caller::Owner, |_| {}).unwrap();
+    store
+        .register_agent(RegisterAgentArgs {
+            display_name: "Ada".into(),
+            email: Some("ada@example.org".into()),
+            project: "FerroLoop".into(),
+            role: AgentRole::Assistant,
+            extra_areas: Vec::new(),
+            create_area: true,
+            replace: true,
+            at: stamp::now(),
+            by: "ada".into(),
+        })
+        .unwrap();
+    webhook_route(home.path(), "ada");
+    let _listener = std::os::unix::net::UnixListener::bind(home.path().join("none.sock")).unwrap();
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    // Without a live route the same target would 409; with one, Owner prepare adopts it.
+    let out = remodel(&store, &env, "ada", &prepare, Caller::Owner).unwrap();
+    assert_eq!(out.mode, RemodelMode::Prepare);
+    assert_eq!(out.status, "decommissioning");
+    assert_eq!(record(&store, "claude:ada").status, "decommissioned");
+    assert_eq!(record(&store, &out.session_id).status, "decommissioning");
+}
