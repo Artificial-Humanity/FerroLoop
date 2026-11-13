@@ -7592,7 +7592,10 @@ pub(crate) fn handle_post_session_model_with(
     // that could select another vendor's record and persist an incompatible model.
     let route_vendor_hint = route
         .as_ref()
-        .map(route_vendor)
+        .map(|route| match route {
+            fl_wire::identity::VendorRoute::HostCli { vendor, .. } => vendor.as_str(),
+            _ => route_vendor(route),
+        })
         .or_else(|| matched.map(|session| session.adapter.as_str()));
     let qualified_key = route_vendor_hint.and_then(|vendor| {
         persona
@@ -7625,6 +7628,7 @@ pub(crate) fn handle_post_session_model_with(
         );
     }
     let vendor = match (&route, matched, &hosted) {
+        (Some(fl_wire::identity::VendorRoute::HostCli { vendor, .. }), _, _) => vendor.clone(),
         (Some(route), _, _) => route_vendor(route).to_string(),
         (None, Some(s), _) => s.adapter.clone(),
         (None, None, Some(record)) => record.vendor.clone(),

@@ -7679,6 +7679,39 @@ mod tests {
     }
 
     #[test]
+    fn claude_host_cli_route_saves_to_claude_record_but_defers_delivery() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-hostcli";
+        assert_eq!(spin_up(&state, &spin_up_body(persona)).status, 200);
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::HostCli {
+                vendor: "claude".into(),
+                session_id: "fixture-536-hostcli".into(),
+                cwd: None,
+                tmux_target: None,
+                tmux_pane: None,
+            },
+        );
+        let resp = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{persona}/model"),
+            OWNER,
+            &json!({"model":"sonnet", "thinking_level":"high"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["vendor"], "claude");
+        assert_eq!(result["record_id"], format!("claude:{persona}"));
+        assert_eq!(result["persisted"], true);
+        assert_eq!(result["live"]["status"], "deferred");
+    }
+
+    #[test]
     fn model_decommissioned_record_does_not_promise_restart() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
@@ -7749,12 +7782,15 @@ mod tests {
             json!({"status":"busy"}).to_string(),
         )
         .unwrap();
+        // An empty native ID forbids host lookup even if the idle guard regresses;
+        // an explicit key without a pane likewise cannot fall back to a live terminal.
+        fs::write(tmp.path().join("missing.key"), "{}").unwrap();
         install_route(
             tmp.path(),
             persona,
             VendorRoute::Claude {
                 pid: 0,
-                session_id: "a7624d88-6ddc-4127-b80c-e6e28df718fd".into(),
+                session_id: String::new(),
                 socket_path: tmp.path().join("missing.sock"),
                 key_path: Some(tmp.path().join("missing.key")),
             },
