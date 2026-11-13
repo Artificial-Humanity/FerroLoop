@@ -1793,6 +1793,7 @@ mod tests {
         listener.bind(&address).unwrap();
         listener.listen(0).unwrap();
         let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
+        crate::test_isolation::ensure_socket(&path).unwrap();
         let filler = UnixStream::connect(&path).unwrap();
         // Release the backlog eventually even if a regression makes connect block.
         let release = std::thread::spawn(move || {

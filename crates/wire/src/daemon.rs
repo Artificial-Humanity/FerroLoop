@@ -6844,6 +6844,7 @@ mod tests {
         let sock = cfg.socket_path.clone();
         let _daemon = spawn_daemon(store, cfg).unwrap();
 
+        crate::test_isolation::ensure_socket(&sock).unwrap();
         let mut raw = UnixStream::connect(&sock).unwrap();
         raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let chunk = vec![b'a'; 64 * 1024];
@@ -6882,6 +6883,7 @@ mod tests {
             "{\"op\":\"nope\"}\n",
             "{\"op\":\"send\"}\n",
         ] {
+            crate::test_isolation::ensure_socket(&sock).unwrap();
             let mut raw = UnixStream::connect(&sock).unwrap();
             raw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             raw.write_all(line.as_bytes()).unwrap();
@@ -6890,6 +6892,7 @@ mod tests {
             assert!(resp.contains("invalid request JSON"), "{line:?} -> {resp}");
         }
         // A client that connects and hangs up sends nothing; the daemon must shrug it off.
+        crate::test_isolation::ensure_socket(&sock).unwrap();
         drop(UnixStream::connect(&sock).unwrap());
         let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         assert!(
@@ -7771,6 +7774,7 @@ mod tests {
         assert!(st1.codex_queues.is_empty());
 
         // Legacy raw `{"op":"status"}` line from an older client.
+        crate::test_isolation::ensure_socket(&daemon_sock).unwrap();
         let mut raw = UnixStream::connect(&daemon_sock).unwrap();
         raw.set_read_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT))
             .unwrap();

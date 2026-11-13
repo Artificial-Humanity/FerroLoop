@@ -688,6 +688,7 @@ mod tests {
         let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let raw = std::thread::spawn(move || {
+            crate::test_isolation::ensure_tcp(&addr).unwrap();
             let mut tcp = TcpStream::connect(addr).unwrap();
             tcp.write_all(
                 b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
