@@ -1772,7 +1772,10 @@ mod tests {
     fn steering_connect_reports_a_local_refused_socket() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("refused.sock");
-        drop(crate::test_isolation::bind_unix_fixture(&path).unwrap());
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
+        drop(listener);
+        assert!(crate::test_isolation::ensure_socket(&path).is_ok());
         let error = connect_for_steering(&path, Instant::now() + SHORT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
@@ -1789,6 +1792,7 @@ mod tests {
         let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
         listener.bind(&address).unwrap();
         listener.listen(0).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
         let filler = UnixStream::connect(&path).unwrap();
         // Release the backlog eventually even if a regression makes connect block.
         let release = std::thread::spawn(move || {

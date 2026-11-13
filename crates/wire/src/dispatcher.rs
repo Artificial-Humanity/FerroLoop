@@ -8206,12 +8206,16 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
             let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+            let mut refused_fixture = None;
             let socket = match case {
                 "empty" => PathBuf::new(),
                 "missing" => tmp.path().join("gone.sock"),
                 _ => {
                     let path = tmp.path().join("refused.sock");
-                    drop(crate::test_isolation::bind_unix_fixture(&path).unwrap());
+                    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                    refused_fixture =
+                        Some(crate::test_isolation::register_unix_socket(&path).unwrap());
+                    drop(listener);
                     path
                 }
             };
@@ -8220,6 +8224,7 @@ mod tests {
             let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
 
             let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+            drop(refused_fixture);
             assert_eq!(rcpt.status, DeliveryStatus::Acked, "{case}");
             let cmds = fs::read_to_string(&tmux_out).unwrap();
             assert!(cmds.contains("paste-buffer -d -b"), "{case}: {cmds}");

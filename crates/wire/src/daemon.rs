@@ -6939,7 +6939,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         drop(first);
         // A socket file left behind by a crashed daemon is stale and gets replaced.
-        drop(crate::test_isolation::bind_unix_fixture(&cfg.socket_path).unwrap());
+        let stale_listener = UnixListener::bind(&cfg.socket_path).unwrap();
+        let _stale_fixture = crate::test_isolation::register_unix_socket(&cfg.socket_path).unwrap();
+        drop(stale_listener);
         assert!(cfg.socket_path.exists());
         let deadline = Instant::now() + Duration::from_secs(10);
         let replaced = loop {
@@ -7094,7 +7096,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // A socket file that nothing listens on any more refuses the connect.
         let stale = dir.path().join("stale.sock");
-        drop(crate::test_isolation::bind_unix_fixture(&stale).unwrap());
+        let stale_listener = UnixListener::bind(&stale).unwrap();
+        let _stale_fixture = crate::test_isolation::register_unix_socket(&stale).unwrap();
+        drop(stale_listener);
         for sock in [dir.path().join("none.sock"), stale] {
             let started = Instant::now();
             let err = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT);
