@@ -7850,3 +7850,365 @@ fn restore_bundleless_corrupt_bundle_resume_refuses_without_attempt() {
         }
     }
 }
+
+// R3 item 11: observe durable payloads as well as namespace event ordering.
+type ResumeDurabilityTrace = Vec<(RecoveryEvent, Option<(RestorePhase, u32)>)>;
+struct ResumeDurabilityIo {
+    journal: std::path::PathBuf,
+    trace: Mutex<ResumeDurabilityTrace>,
+}
+impl RecoveryIo for ResumeDurabilityIo {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        let committed = if event == RecoveryEvent::Sync(Directory::RestoreJournalParent) {
+            let bytes = fs::read(&self.journal).unwrap();
+            let frames = journal_frame_ranges(&bytes);
+            let last = frames.last().unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes[last.start + 72..last.end]).unwrap();
+            Some((
+                journal_phase(&bytes, last),
+                value["current_attempt"].as_u64().unwrap() as u32,
+            ))
+        } else {
+            None
+        };
+        self.trace.lock().unwrap().push((event, committed));
+        Ok(())
+    }
+}
+#[test]
+fn restore_review11_exchanged_resume_resyncs_before_each_phase_append() {
+    let (f, j, lease) = bundleless_fixture_with_bundle(BundlelessLayout::Relocating, false);
+    let hook = Arc::new(ResumeDurabilityIo {
+        journal: j.staging.join("journal.bin"),
+        trace: Mutex::new(vec![]),
+    });
+    let filesystem = CutFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let RestoreOutcome::Installed { journal: installed } =
+        resume_restore(&j, &lease, &filesystem).unwrap()
+    else {
+        panic!("resume did not install")
+    };
+    let trace = hook.trace.lock().unwrap();
+    let commits: Vec<_> = trace
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, payload))| payload.clone().map(|payload| (index, payload)))
+        .collect();
+    assert_eq!(
+        commits.len(),
+        3,
+        "attempt, relocation intent, installed: {trace:?}"
+    );
+    assert_eq!(
+        commits.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(),
+        vec![
+            (RestorePhase::RelocateIntent, j.current_attempt + 1),
+            (RestorePhase::RelocateIntent, j.current_attempt + 1),
+            (RestorePhase::Installed, j.current_attempt + 1),
+        ]
+    );
+    let relocation = trace
+        .iter()
+        .position(|(e, _)| *e == RecoveryEvent::RestoreRelocate)
+        .unwrap();
+    let rename = trace
+        .iter()
+        .position(|(e, _)| *e == RecoveryEvent::RenameEntry)
+        .unwrap();
+    assert!(commits[1].0 < relocation && relocation < rename && rename < commits[2].0);
+    for (boundary, label) in [
+        (commits[0].0, "exchange re-sync"),
+        (rename, "relocation re-sync"),
+    ] {
+        let suffix = &trace[boundary + 1..];
+        let write = suffix
+            .iter()
+            .position(|(e, _)| *e == RecoveryEvent::Write(Member::RestoreJournal))
+            .unwrap();
+        for directory in [
+            Directory::RestoreDestinationParent,
+            Directory::RestoreStagingParent,
+        ] {
+            assert!(
+                suffix[..write]
+                    .iter()
+                    .any(|(e, _)| *e == RecoveryEvent::Sync(directory)),
+                "{label}: missing {directory:?} before next journal write: {trace:?}"
+            );
+        }
+    }
+    assert!(
+        !trace
+            .iter()
+            .any(|(e, _)| matches!(e, RecoveryEvent::RestoreInstall | RecoveryEvent::Exchange)),
+        "resume must not repeat the forward exchange"
+    );
+    assert_eq!(
+        inspect_file_binding(&installed.staging.join("original.fls"), &limits()).unwrap(),
+        j.original
+    );
+    assert_eq!(installed.candidate_identity, j.candidate_identity);
+}
+
+fn review11_staging(parent: &std::path::Path, operation: uuid::Uuid) -> std::path::PathBuf {
+    let prefix = format!(".restore-{operation}-");
+    let entries: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    entries[0].clone()
+}
+fn review11_probe_ids(staging: &std::path::Path) -> [(u64, u64); 2] {
+    ["exchange-probe-a", "exchange-probe-b"].map(|name| {
+        let metadata = fs::metadata(staging.join(name)).unwrap();
+        (metadata.dev(), metadata.ino())
+    })
+}
+struct ProbeBeforeGuardIo {
+    parent: std::path::PathBuf,
+    operation: uuid::Uuid,
+    events: Mutex<Vec<RecoveryEvent>>,
+    probe_ids: Mutex<Option<[(u64, u64); 2]>>,
+    guard_seen: AtomicBool,
+    fail_probe: bool,
+}
+impl RecoveryIo for ProbeBeforeGuardIo {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(event);
+        if event == RecoveryEvent::RestoreExchangeProbe {
+            *self.probe_ids.lock().unwrap() = Some(review11_probe_ids(&review11_staging(
+                &self.parent,
+                self.operation,
+            )));
+            if self.fail_probe {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+        if event == RecoveryEvent::Create(Member::RestoreGuard) {
+            self.guard_seen.store(true, Ordering::Release);
+            let before = self
+                .probe_ids
+                .lock()
+                .unwrap()
+                .expect("guard creation preceded exchange probe");
+            assert_ne!(before[0], before[1]);
+            let now = review11_probe_ids(&review11_staging(&self.parent, self.operation));
+            assert_eq!(
+                now,
+                [before[1], before[0]],
+                "probe did not actually exchange before guard"
+            );
+            let events = self.events.lock().unwrap();
+            let probe = events
+                .iter()
+                .position(|e| *e == RecoveryEvent::RestoreExchangeProbe)
+                .unwrap();
+            assert_eq!(events[probe + 1], RecoveryEvent::Exchange);
+            let after = &events[probe + 2..events.len() - 1];
+            for directory in [
+                Directory::RestoreDestinationParent,
+                Directory::RestoreStagingParent,
+            ] {
+                assert!(
+                    after.contains(&RecoveryEvent::Sync(directory)),
+                    "probe missing {directory:?} before guard: {events:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+#[test]
+fn restore_review11_native_probe_completes_and_syncs_before_guard() {
+    for fail_probe in [false, true] {
+        let f = Fixture::new();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let original = inspect_file_binding(&f.source, &limits()).unwrap();
+        let hook = Arc::new(ProbeBeforeGuardIo {
+            parent: f.root.path().to_path_buf(),
+            operation: request.operation_id,
+            events: Mutex::new(vec![]),
+            probe_ids: Mutex::new(None),
+            guard_seen: AtomicBool::new(false),
+            fail_probe,
+        });
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        let outcome = restore_offline(&request, &lease, &filesystem);
+        if fail_probe {
+            assert!(outcome.is_err(), "{outcome:?}");
+            assert!(
+                hook.probe_ids.lock().unwrap().is_some(),
+                "probe cut never reached"
+            );
+            assert!(!hook.guard_seen.load(Ordering::Acquire));
+            assert!(!f.source.with_extension("fls.restore-guard").exists());
+            assert_eq!(
+                inspect_file_binding(&f.source, &limits()).unwrap(),
+                original
+            );
+            let events = hook.events.lock().unwrap();
+            assert!(!events.contains(&RecoveryEvent::RestoreInstall));
+        } else {
+            assert!(matches!(outcome.unwrap(), RestoreOutcome::Installed { .. }));
+            assert!(hook.guard_seen.load(Ordering::Acquire));
+            let events = hook.events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| **e == RecoveryEvent::RestoreExchangeProbe)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| **e == RecoveryEvent::RestoreInstall)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| **e == RecoveryEvent::Exchange)
+                    .count(),
+                2
+            );
+        }
+    }
+}
+
+struct PreparedAbandonCut {
+    parent: std::path::PathBuf,
+    operation: uuid::Uuid,
+    prepared_seen: AtomicBool,
+    fired: AtomicBool,
+}
+impl RecoveryIo for PreparedAbandonCut {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::Sync(Directory::RestoreJournalParent) {
+            let path = review11_staging(&self.parent, self.operation).join("journal.bin");
+            let bytes = fs::read(path).unwrap();
+            let frames = journal_frame_ranges(&bytes);
+            if frames
+                .last()
+                .is_some_and(|last| journal_phase(&bytes, last) == RestorePhase::Prepared)
+            {
+                self.prepared_seen.store(true, Ordering::Release);
+            }
+        }
+        if event == RecoveryEvent::Write(Member::RestoreJournal)
+            && self.prepared_seen.load(Ordering::Acquire)
+        {
+            self.fired.store(true, Ordering::Release);
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn restore_review11_prepared_and_pre_exchange_abandon_retain_generations() {
+    for phase in [RestorePhase::Prepared, RestorePhase::ExchangeIntent] {
+        let f = Fixture::new();
+        let (request, lease) = prepare_restore(&f, &f.source);
+        let original = inspect_file_binding(&f.source, &limits()).unwrap();
+        let prepared = Arc::new(PreparedAbandonCut {
+            parent: f.root.path().to_path_buf(),
+            operation: request.operation_id,
+            prepared_seen: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let exchange = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreInstall));
+        let io: Arc<dyn RecoveryIo> = if phase == RestorePhase::Prepared {
+            prepared.clone()
+        } else {
+            exchange.clone()
+        };
+        let filesystem = CutFs {
+            f: &f,
+            io,
+            limits: limits(),
+        };
+        assert!(restore_offline(&request, &lease, &filesystem).is_err());
+        if phase == RestorePhase::Prepared {
+            assert!(prepared.fired.load(Ordering::Acquire));
+        } else {
+            assert_eq!(exchange.fired.load(Ordering::Acquire), 1);
+        }
+        let staging = review11_staging(f.root.path(), request.operation_id);
+        let path = staging.join("journal.bin");
+        let j = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(j.phase, phase);
+        let guard = f.source.with_extension("fls.restore-guard");
+        let pin = f
+            .backups
+            .join(".catalog/restore-pins")
+            .join(format!("{}.json", j.operation_id));
+        assert!(guard.exists() && pin.exists());
+        let retained: std::collections::BTreeMap<_, _> = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                let digest = (entry.file_name() != "journal.bin")
+                    .then(|| forensic_descriptor_digest(&fs::File::open(entry.path()).unwrap()));
+                (
+                    entry.file_name(),
+                    ((metadata.dev(), metadata.ino()), metadata.len(), digest),
+                )
+            })
+            .collect();
+        assert!(retained.contains_key(std::ffi::OsStr::new("candidate.fls")));
+        assert!(matches!(
+            abandon_restore(&j, &lease, &f.filesystem()).unwrap(),
+            RestoreOutcome::Abandoned { .. }
+        ));
+        assert!(!guard.exists() && !pin.exists());
+        assert_eq!(
+            inspect_file_binding(&f.source, &limits()).unwrap(),
+            original
+        );
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), retained.len());
+        for (name, (identity, bytes, digest)) in retained {
+            let file = staging.join(name);
+            let metadata = fs::metadata(&file).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), identity);
+            assert_eq!(metadata.len(), bytes);
+            if let Some(digest) = digest {
+                assert_eq!(
+                    forensic_descriptor_digest(&fs::File::open(file).unwrap()),
+                    digest
+                );
+            }
+        }
+        let terminal = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(terminal.phase, RestorePhase::Abandoned);
+        assert_eq!(terminal.rollback_attempts, j.rollback_attempts + 1);
+        let bytes = fs::read(&path).unwrap();
+        assert!(matches!(
+            abandon_restore(&terminal, &lease, &f.filesystem()).unwrap(),
+            RestoreOutcome::Abandoned { .. }
+        ));
+        assert!(
+            fs::read(path).unwrap() == bytes,
+            "cleanup retry appended a frame"
+        );
+    }
+}

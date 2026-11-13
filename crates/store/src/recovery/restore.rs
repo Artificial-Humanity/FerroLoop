@@ -4165,6 +4165,53 @@ mod tests {
     use crate::recovery::{admission::*, manifest::BundleManifestV1};
     use std::fs;
     use std::os::unix::fs::MetadataExt;
+    #[test]
+    fn exchange_error_classifies_native_errno_without_fallback() {
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        for errno in [libc::EINVAL, libc::ENOSYS] {
+            assert!(
+                matches!(
+                    exchange_error(&std::io::Error::from_raw_os_error(errno), &l),
+                    RecoveryError::Unsupported { operation_id, .. } if operation_id == l.operation_id
+                ),
+                "errno={errno}"
+            );
+        }
+        for expected in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EINTR,
+            libc::EAGAIN,
+        ] {
+            assert!(
+                matches!(
+                    exchange_error(&std::io::Error::from_raw_os_error(expected), &l),
+                    RecoveryError::Transient { operation_id, errno } if operation_id == l.operation_id && errno == expected
+                ),
+                "errno={expected}"
+            );
+        }
+        for error in [
+            std::io::Error::from_raw_os_error(libc::EIO),
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+            std::io::Error::from_raw_os_error(libc::EXDEV),
+            std::io::Error::other("no native errno"),
+        ] {
+            assert!(
+                matches!(
+                    exchange_error(&error, &l),
+                    RecoveryError::Destination { operation_id } if operation_id == l.operation_id
+                ),
+                "{error:?}"
+            );
+        }
+    }
     mod fixture_support {
         #![allow(dead_code)]
         use crate::recovery::test_support;
