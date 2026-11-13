@@ -1387,7 +1387,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               </div>
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-                  Active Model
+                  Model
                 </div>
                 <span
                   className="fd-badge fd-mono"

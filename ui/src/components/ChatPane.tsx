@@ -1844,25 +1844,51 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setCompactFeedback(null);
     setSubmitError(null);
     try {
+      let result: unknown;
       if (onSetSessionModel) {
-        await onSetSessionModel(nextModel, thinkingArg);
+        result = await onSetSessionModel(nextModel, thinkingArg);
       } else if (apiClient) {
-        await apiClient.setSessionModel(
+        result = await apiClient.setSessionModel(
           targetSessionOrAgent,
           nextModel,
           thinkingArg,
         );
-        if (onRefresh) {
-          onRefresh();
+        // Refreshing the view must not turn a saved change into a failed save.
+        try {
+          onRefresh?.();
+        } catch {
+          // A later refresh can reconcile the view.
         }
       } else {
         throw new Error("No session route is configured for switching model.");
       }
-      setCompactFeedback(
-        effectiveThinking
-          ? `Model: ${nextModel} (${effectiveThinking})`
-          : `Model: ${nextModel}`,
-      );
+      const response = result as Partial<SetSessionModelResponse> | null | undefined;
+      if (typeof response?.persisted !== "boolean" || !response.live) {
+        setCompactFeedback("Model change status unavailable.");
+      } else {
+        const { persisted, live } = response;
+        if (!persisted && live.status !== "applied") {
+          setSelectedModel(prevModel);
+          setSelectedThinkingLevel(prevThinking);
+        }
+        if (!persisted) {
+          setCompactFeedback(live.status === "applied"
+            ? "Model changed for this session; the choice was not saved."
+            : `Model change ${live.status}; the choice was not saved.`);
+        } else if (live.status === "deferred") {
+          setCompactFeedback(response.restart_applies
+            ? "Model saved. Applies on next restart."
+            : "Model saved. Live change deferred.");
+        } else if (live.status === "held") {
+          setCompactFeedback("Model saved. Live change held.");
+        } else if (live.status === "failed") {
+          setCompactFeedback("Model saved. Live change failed.");
+        } else {
+          setCompactFeedback(effectiveThinking
+            ? `Model: ${nextModel} (${effectiveThinking})`
+            : `Model: ${nextModel}`);
+        }
+      }
     } catch (err) {
       setSelectedModel(prevModel);
       setSelectedThinkingLevel(prevThinking);
