@@ -3006,8 +3006,11 @@ enum ComposerStyle {
     /// Vendor draws a rule-delimited composer (Claude, Muse, Antigravity): fail closed
     /// when `composer_region_lines` cannot locate it.
     Ruled,
-    /// Vendor draws no rules (Codex, Grok, HostCli codex/grok, unknown): keep the
-    /// pre-r2 behaviour; the compact extraction still applies.
+    /// Codex draws no rules: locate the composer by its `› ` prompt line above the
+    /// footer (`codex_composer_state`, #520) and fail closed when it cannot be located.
+    CodexPrompt,
+    /// Vendor draws no rules and has no prompt locator (Grok, HostCli grok, unknown):
+    /// keep the pre-r2 behaviour; the compact extraction still applies.
     Ruleless,
 }
 
@@ -3015,6 +3018,7 @@ impl ComposerStyle {
     fn for_vendor(vendor: &str) -> Self {
         match crate::identity::canonical_vendor_id(vendor) {
             "claude" | "muse" | "antigravity" => Self::Ruled,
+            "codex" => Self::CodexPrompt,
             _ => Self::Ruleless,
         }
     }
@@ -3028,6 +3032,9 @@ impl ComposerStyle {
             let v = crate::identity::canonical_vendor_id(token);
             if matches!(v, "claude" | "muse" | "antigravity") {
                 return Self::Ruled;
+            }
+            if v == "codex" {
+                return Self::CodexPrompt;
             }
         }
         Self::Ruleless
@@ -3142,10 +3149,11 @@ fn execute_verified_paste_delivery(
                     break;
                 }
                 if composer_is_rendering_target_prefix(&contents, &d_target)
-                    || !composer_has_unsubmitted_content_for_route(
+                    || !composer_has_unsubmitted_content_for_style(
                         &contents,
                         cursor,
                         spec.is_muse_route,
+                        spec.composer_style,
                     )
                 {
                     continue;
@@ -3946,16 +3954,18 @@ fn prepare_clean_composer_before_paste_impl(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
-    if composer_style == ComposerStyle::Ruled
-        && !contents1.trim().is_empty()
-        && !composer_region_located(&contents1)
-    {
+    if !contents1.trim().is_empty() && !composer_located_for_style(&contents1, composer_style) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content_for_route(&contents1, cursor1, is_muse_route) {
+    if !composer_has_unsubmitted_content_for_style(
+        &contents1,
+        cursor1,
+        is_muse_route,
+        composer_style,
+    ) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -3978,16 +3988,18 @@ fn prepare_clean_composer_before_paste_impl(
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
-    if composer_style == ComposerStyle::Ruled
-        && !contents2.trim().is_empty()
-        && !composer_region_located(&contents2)
-    {
+    if !contents2.trim().is_empty() && !composer_located_for_style(&contents2, composer_style) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content_for_route(&contents2, cursor2, is_muse_route) {
+    if !composer_has_unsubmitted_content_for_style(
+        &contents2,
+        cursor2,
+        is_muse_route,
+        composer_style,
+    ) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -4015,16 +4027,19 @@ fn prepare_clean_composer_before_paste_impl(
             let Some((contents, cursor)) = capture_rendered_only() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            if composer_style == ComposerStyle::Ruled
-                && !contents.trim().is_empty()
-                && !composer_region_located(&contents)
+            if !contents.trim().is_empty() && !composer_located_for_style(&contents, composer_style)
             {
                 return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
             if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
                 return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
-            if composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route) {
+            if composer_has_unsubmitted_content_for_style(
+                &contents,
+                cursor,
+                is_muse_route,
+                composer_style,
+            ) {
                 if !composer_equals_recorded_wire_deliveries(&contents, route_keys) {
                     return RetryPollDecision::Abort(
                         composer_occupied_after_pre_paste_flush_error(),
@@ -5005,6 +5020,89 @@ fn composer_region_located(screen: &str) -> bool {
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
     composer_region_lines(&lines).is_some()
+}
+
+/// Ghost placeholder Codex prints in an empty composer (capture, 2026-11-13).
+const CODEX_GHOST_PLACEHOLDER: &str = "Ask Codex to do anything";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexComposerState {
+    Empty,
+    Occupied,
+    Unlocatable,
+}
+
+/// Footer lines in real Codex captures are two-space indented and carry a ` · `
+/// separator (model line and shortcuts line).
+fn is_codex_footer_line(line: &str) -> bool {
+    line.starts_with("  ") && line.contains('·')
+}
+
+/// Locate a ruleless Codex composer (#520): the last `› ` prompt line above the
+/// footer. Everything between the prompt line and the footer (continuation lines,
+/// slash-menu lines) is composer content; only the ghost placeholder is empty.
+/// No prompt line, or an unrecognisable footer, is `Unlocatable` (fail closed).
+fn codex_composer_state(screen: &str) -> CodexComposerState {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let Some(prompt_idx) = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("› ") || l.trim_start() == "›")
+    else {
+        return CodexComposerState::Unlocatable;
+    };
+    let Some(last) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
+        return CodexComposerState::Unlocatable;
+    };
+    if last <= prompt_idx {
+        return CodexComposerState::Unlocatable;
+    }
+    let mut footer_start = last;
+    while footer_start > 0 && !lines[footer_start - 1].trim().is_empty() {
+        footer_start -= 1;
+    }
+    if footer_start <= prompt_idx || !(footer_start..=last).all(|i| is_codex_footer_line(lines[i]))
+    {
+        return CodexComposerState::Unlocatable;
+    }
+    if lines[prompt_idx + 1..footer_start]
+        .iter()
+        .any(|l| !l.trim().is_empty())
+    {
+        return CodexComposerState::Occupied;
+    }
+    let first = strip_composer_prompt_prefix(lines[prompt_idx]).trim();
+    if first.is_empty() || first == CODEX_GHOST_PLACEHOLDER {
+        CodexComposerState::Empty
+    } else {
+        CodexComposerState::Occupied
+    }
+}
+
+fn composer_located_for_style(screen: &str, style: ComposerStyle) -> bool {
+    match style {
+        ComposerStyle::Ruled => composer_region_located(screen),
+        ComposerStyle::CodexPrompt => {
+            codex_composer_state(screen) != CodexComposerState::Unlocatable
+        }
+        ComposerStyle::Ruleless => true,
+    }
+}
+
+fn composer_has_unsubmitted_content_for_style(
+    screen: &str,
+    cursor: Option<CursorState>,
+    is_muse_route: bool,
+    style: ComposerStyle,
+) -> bool {
+    if style == ComposerStyle::CodexPrompt {
+        if composer_shows_pasted_placeholder(screen) {
+            return true;
+        }
+        // Unlocatable fails closed: treated as occupied so callers hold.
+        return codex_composer_state(screen) != CodexComposerState::Empty;
+    }
+    composer_has_unsubmitted_content_for_route(screen, cursor, is_muse_route)
 }
 
 fn composer_has_unsubmitted_content_for_route(
@@ -6076,16 +6174,13 @@ fn probe_composer_ready_from_screen(
     composer_style: ComposerStyle,
     is_muse_route: bool,
 ) -> Option<bool> {
-    if composer_style == ComposerStyle::Ruled
-        && !contents.trim().is_empty()
-        && !composer_region_located(contents)
-    {
+    if !contents.trim().is_empty() && !composer_located_for_style(contents, composer_style) {
         return None;
     }
     if screen_has_dialog_or_menu_markers_with_context(contents, None, None, route_keys) {
         return Some(false);
     }
-    if !composer_has_unsubmitted_content_for_route(contents, cursor, is_muse_route)
+    if !composer_has_unsubmitted_content_for_style(contents, cursor, is_muse_route, composer_style)
         || composer_equals_recorded_wire_deliveries(contents, route_keys)
     {
         Some(true)
@@ -18517,12 +18612,12 @@ exit 1"#,
 
     #[test]
     fn nb1_ruleless_vendors_proceed_and_ruled_vendors_fail_closed() {
-        let codex_idle = "› Ask Codex to do anything\n  footer one\n  footer two";
+        let codex_idle = "› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/x\n  ← for agents · ? for shortcuts";
         // Idle Codex: pre-paste proceeds (ruleless), through the verified-delivery path
         // `host_write_text_then_enter` builds (style derived from the host session id).
         assert_eq!(
             ComposerStyle::for_host_session("Fiona.codex"),
-            ComposerStyle::Ruleless
+            ComposerStyle::CodexPrompt
         );
         assert_eq!(
             ComposerStyle::for_host_session("Ada.claude"),
@@ -18556,7 +18651,7 @@ exit 1"#,
         // Same screen with typed text after `›`: today (and kept) it also proceeds clean —
         // `composer_has_unsubmitted_content_for_route` returns false with no located region,
         // so the paste appends after the typed text. Asserted to keep that behaviour visible.
-        let codex_typed = "› fix the failing test\n  footer one\n  footer two";
+        let codex_typed = "› fix the failing test\n\n  GPT-6.1-Sol medium · ~/x";
         let out = prepare_clean_composer_before_paste_impl(
             "hello codex",
             &[],
@@ -18637,6 +18732,103 @@ exit 1"#,
         )
         .expect_err("dialog screen must fail closed on ruled vendor");
         assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+    }
+
+    // Fixtures below are trimmed from real captures (2026-11-13): idle from
+    // `tmux capture-pane -p` of a running Codex screen shape, typed/slash/multi-line
+    // from a throwaway `codex` tmux session under scratch/ferroloop/520-captures/
+    // launched with `env -u AGENT_PERSONA -u AGENT_NAME -u FL_HOSTED_ID
+    // -u AGENT_HYDRATION_GENERATION`. Footer: model line + shortcuts line.
+    #[test]
+    fn codex_prompt_locator_holds_drafts_and_fails_closed() {
+        let footer = "  GPT-6.1-Sol medium · ~/Projects/x\n  ← for agents · ? for shortcuts";
+        let idle = format!("› Ask Codex to do anything\n\n{footer}");
+        let typed = format!("› fix the failing test please\n\n{footer}");
+        let slash = format!(
+            "› /model         choose what model and reasoning effort to use\n  /fast          2x speed, increased usage\n\n› /\n\n{footer}"
+        );
+        let multiline = format!("› line one of draft\n  line two of draft\n\n{footer}");
+        let no_prompt = format!("some output without a composer\n\n{footer}");
+        let dialog = "Do you want to proceed?\n  1. Yes\n  2. No".to_string();
+        assert_eq!(codex_composer_state(&idle), CodexComposerState::Empty);
+        assert_eq!(codex_composer_state(&typed), CodexComposerState::Occupied);
+        assert_eq!(codex_composer_state(&slash), CodexComposerState::Occupied);
+        assert_eq!(
+            codex_composer_state(&multiline),
+            CodexComposerState::Occupied
+        );
+        assert_eq!(
+            codex_composer_state(&no_prompt),
+            CodexComposerState::Unlocatable
+        );
+        assert_eq!(
+            codex_composer_state(&dialog),
+            CodexComposerState::Unlocatable
+        );
+        // Grok/Ruleless keep the old behaviour on the same typed screen.
+        assert!(!composer_has_unsubmitted_content_for_style(
+            &typed,
+            None,
+            false,
+            ComposerStyle::Ruleless
+        ));
+        for (screen, ready) in [
+            (&idle, Some(true)),
+            (&typed, Some(false)),
+            (&slash, Some(false)),
+            (&multiline, Some(false)),
+            (&no_prompt, None),
+            (&dialog, None),
+        ] {
+            assert_eq!(
+                probe_composer_ready_from_screen(
+                    screen,
+                    None,
+                    &[],
+                    ComposerStyle::CodexPrompt,
+                    false
+                ),
+                ready,
+                "probe for {screen:?}"
+            );
+        }
+        // Idle proceeds; every occupied/unlocatable screen holds with zero keys.
+        let mut enters = 0u32;
+        let out = prepare_clean_composer_before_paste_impl(
+            "hello codex",
+            &[],
+            false,
+            ComposerStyle::CodexPrompt,
+            |_| {},
+            || Some((idle.clone(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect("idle Codex placeholder must proceed");
+        assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+        assert_eq!(enters, 0);
+        for screen in [&typed, &slash, &multiline, &no_prompt, &dialog] {
+            let mut e = 0u32;
+            let err = prepare_clean_composer_before_paste_impl(
+                "hello codex",
+                &[],
+                false,
+                ComposerStyle::CodexPrompt,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || {
+                    e += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("occupied/unlocatable Codex composer must hold");
+            assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+            assert_eq!(e, 0);
+        }
     }
 
     #[test]
