@@ -9720,3 +9720,82 @@ fn restore_initial_lease_cap_stops_frozen_wall_clock_namespace_stall() {
         hook.stalled.load(Ordering::Acquire)
     );
 }
+
+#[test]
+fn restore_corrupt_preserved_candidate_rollback_refuses_without_attempt() {
+    use std::os::unix::fs::FileExt;
+    let (f, j, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+    assert_eq!(j.phase, RestorePhase::Installed);
+    let candidate_before = inspect_file_binding(&j.destination, &limits()).unwrap();
+    let original_path = j.staging.join("original.fls");
+    let original_binding = inspect_file_binding(&original_path, &limits()).unwrap();
+    let candidate = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&j.destination)
+        .unwrap();
+    let mut byte = [0];
+    candidate.read_exact_at(&mut byte, 0).unwrap();
+    byte[0] ^= 1;
+    candidate.write_all_at(&byte, 0).unwrap();
+    candidate.sync_all().unwrap();
+    let corrupt_binding = inspect_file_binding(&j.destination, &limits()).unwrap();
+    assert_ne!(corrupt_binding, candidate_before);
+    assert_eq!(
+        (
+            candidate.metadata().unwrap().dev(),
+            candidate.metadata().unwrap().ino()
+        ),
+        j.candidate_identity,
+        "corruption must retain the admitted candidate inode"
+    );
+    assert_eq!(candidate.metadata().unwrap().len(), j.candidate_bytes);
+    let journal_path = j.staging.join("journal.bin");
+    let before = review15_artifact_snapshot(&f, &j);
+    let frames = journal_frame_ranges(&fs::read(&journal_path).unwrap()).len();
+    let namespace = |path: &std::path::Path| {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let staging_names = namespace(&j.staging);
+    let parent_names = namespace(f.root.path());
+    let error = rollback_restore(&j, &lease, &f.filesystem()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            fl_store::recovery::RecoveryError::Verification { .. }
+        ),
+        "corrupt preserved candidate must refuse verification: {error:?}"
+    );
+    assert_eq!(
+        review15_artifact_snapshot(&f, &j),
+        before,
+        "rollback refusal changed artifact bytes, identities, or names"
+    );
+    assert_eq!(namespace(&j.staging), staging_names);
+    assert_eq!(namespace(f.root.path()), parent_names);
+    assert_eq!(
+        inspect_file_binding(&j.destination, &limits()).unwrap(),
+        corrupt_binding,
+        "refusal changed the corrupt candidate binding"
+    );
+    assert_eq!(
+        inspect_file_binding(&original_path, &limits()).unwrap(),
+        original_binding,
+        "refusal changed the preserved original binding"
+    );
+    let loaded = load_restore_journal(&journal_path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(loaded.phase, j.phase);
+    assert_eq!(loaded.rollback_attempts, j.rollback_attempts);
+    assert_eq!(
+        terminal_negative_counters(&loaded),
+        terminal_negative_counters(&j)
+    );
+    assert_eq!(
+        journal_frame_ranges(&fs::read(&journal_path).unwrap()).len(),
+        frames,
+        "rollback refusal appended a journal frame"
+    );
+}
