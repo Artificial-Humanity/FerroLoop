@@ -1011,6 +1011,10 @@ export const sessionDeliveryReceipts = new Map<string, {
   stage: PromptResponse["delivery_stage"];
   text: string;
 }>();
+/** A prompt held because the vendor composer holds non-wire input or a dialog (#496). Zero keys were sent, so it is known not to have landed and stays retryable. */
+export function isComposerHeldPrompt(item: QueuedOperatorPrompt): boolean {
+  return Boolean(item.delivery_error?.includes("composer_occupied_by_non_wire_input"));
+}
 // A lost Send Now reply must also hold its queue item against another click.
 const unconfirmedQueuedPrompts = new Map<string, Set<string>>();
 const deliveryReceiptListeners = new Set<() => void>();
@@ -1459,6 +1463,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const metadataMatches = sameTranscriptOwner(metadataOwner, owner);
   const effectiveIsBusy = isBusy ?? (metadataMatches ? internalIsBusy : false);
   const effectiveQueue = (queue ?? (metadataMatches ? internalQueue : [])).map((item) =>
+    // A composer-held prompt is known not to have landed, so a lost-reply fence must not mask it as unconfirmed (#496).
+    isComposerHeldPrompt(item) ? item :
     unconfirmedQueuedPrompts.get(targetSessionOrAgent)?.has(item.id)
       ? { ...item, delivery_state: "unconfirmed" as const } : item,
   );
@@ -2457,7 +2463,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const handleSendQueuedNow = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
     const submittedTarget = targetSessionOrAgent;
-    if (unconfirmedQueuedPrompts.get(submittedTarget)?.has(promptId)) return;
+    // Composer-held prompts are known not to have landed; Send Now goes through the hub send-now endpoint, which re-runs the clean-composer check and fails closed over non-wire input (#496).
+    const heldItem = effectiveQueue.find((queued) => queued.id === promptId);
+    if (!heldItem || !isComposerHeldPrompt(heldItem)) {
+      if (unconfirmedQueuedPrompts.get(submittedTarget)?.has(promptId)) return;
+    }
     const codexSendNow = adapter === "codex" && authority?.tier !== "peer";
     let response: PromptResponse | undefined;
     let attempted = false;
@@ -2521,7 +2531,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const handleCancelQueued = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
     const item = effectiveQueue.find((queued) => queued.id === promptId);
-    if (item?.delivery_state === "unconfirmed" && !window.confirm(
+    if (item?.delivery_state === "unconfirmed" && !(item && isComposerHeldPrompt(item)) && !window.confirm(
       "Delivery may have succeeded. Check the session before removing this record. Remove it anyway?",
     )) return;
     const submittedTarget = targetSessionOrAgent;
@@ -3998,14 +4008,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
               {effectiveQueue.map((item, idx) => {
                 const isEditing = editingQueueId === item.id;
+                const isHeld = isComposerHeldPrompt(item);
+                const composerEmpty = promptText.trim().length === 0 && attachments.length === 0;
+                const sendNowDisabled = isHeld
+                  ? effectiveIsBusy || !composerEmpty || item.delivery_state === "sending"
+                  : Boolean(item.delivery_state && item.delivery_state !== "pending");
+                const deleteDisabled = isHeld ? false : item.delivery_state === "sending";
                 return (
                   <div
                     key={item.id}
                     data-testid={`queued-prompt-item-${item.id}`}
                     style={{
                       display: "flex",
-                      alignItems: "center",
-                      gap: "8px",
+                      flexDirection: "column",
+                      gap: "4px",
                       padding: "4px 8px",
                       borderRadius: "4px",
                       backgroundColor: "var(--bg-surface)",
@@ -4013,6 +4029,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                       fontSize: "12px",
                     }}
                   >
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                     <span
                       className="fd-badge"
                       data-testid={`queued-prompt-pos-${idx}`}
@@ -4082,11 +4099,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         >
                           {item.prompt}
                         </span>
+                        {isHeld && item.by && (
+                          <span data-testid={`queued-prompt-sender-${item.id}`} style={{ color: "var(--text-muted)", fontSize: "11px", whiteSpace: "nowrap" }}>
+                            by {item.by}
+                          </span>
+                        )}
                         {item.delivery_state === "refused" && <span role="status">Send now refused. Remove this item before submitting a new prompt.</span>}
-                        {item.delivery_state === "unconfirmed" && deliveryReceipt?.stage !== "unconfirmed" && (
+                        {!isHeld && item.delivery_state === "unconfirmed" && deliveryReceipt?.stage !== "unconfirmed" && (
                           <span role="status">Delivery unconfirmed. Check the session before removing this item.</span>
                         )}
-                        {item.delivery_error && <span role="status">{item.delivery_error}</span>}
+                        {!isHeld && item.delivery_error && <span role="status">{item.delivery_error}</span>}
                         {item.attachments && item.attachments.length > 0 && (
                           <span className="fd-badge" style={{ fontSize: "10px" }}>
                             {item.attachments.length} file{item.attachments.length === 1 ? "" : "s"}
@@ -4110,7 +4132,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           type="button"
                           className="fd-btn fd-btn-primary"
                           data-testid={`queued-send-now-${item.id}`}
-                          disabled={Boolean(item.delivery_state && item.delivery_state !== "pending")}
+                          disabled={sendNowDisabled}
                           onClick={() => void handleSendQueuedNow(item.id)}
                           style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
                         >
@@ -4121,7 +4143,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           className="fd-btn"
                           aria-label="Remove"
                           data-testid={`queued-cancel-${item.id}`}
-                          disabled={item.delivery_state === "sending"}
+                          disabled={deleteDisabled}
                           onClick={() => void handleCancelQueued(item.id)}
                           style={{ fontSize: "11px", padding: "2px 6px", height: "24px" }}
                           title="Remove from queue"
@@ -4130,6 +4152,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         </button>
                       </>
                     )}
+                  </div>
+                  {isHeld && item.delivery_error && (
+                    <div role="status" data-testid={`queued-hold-reason-${item.id}`} style={{ color: "#FBBF24", fontSize: "11px", paddingLeft: "34px" }}>
+                      {item.delivery_error}
+                    </div>
+                  )}
                   </div>
                 );
               })}
