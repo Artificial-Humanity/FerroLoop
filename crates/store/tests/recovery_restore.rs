@@ -1204,15 +1204,13 @@ fn restore_absence_finalize_recreated_destination_preserves_bytes_and_records_fo
     else {
         panic!("not installed")
     };
-    let mut journal = journal;
-    for _ in 0..3 {
-        let RestoreOutcome::OriginalAbsenceRestored { journal: next } =
-            rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
-        else {
-            panic!("absence not restored")
-        };
-        journal = next;
-    }
+    let journal = interrupt_two_installed_rollback_attempts(&f, journal, &lease);
+    let RestoreOutcome::OriginalAbsenceRestored { journal } =
+        rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("absence not restored")
+    };
+    assert_eq!(journal.rollback_attempts, 3);
     let candidate = journal.staging.join("candidate.fls");
     let before = fs::read(&candidate).unwrap();
     fs::write(&destination, b"unexpected destination generation").unwrap();
@@ -1522,9 +1520,13 @@ fn restore_concurrent_resume_child() {
     struct Notify {
         socket: std::path::PathBuf,
         sent: std::sync::atomic::AtomicBool,
+        writes: AtomicUsize,
     }
     impl RecoveryIo for Notify {
         fn before(&self, e: RecoveryEvent) -> std::io::Result<()> {
+            if e == RecoveryEvent::Write(Member::RestoreJournal) {
+                self.writes.fetch_add(1, Ordering::AcqRel);
+            }
             if e == RecoveryEvent::RestoreOperationLockWait
                 && !self.sent.swap(true, Ordering::AcqRel)
             {
@@ -1534,12 +1536,14 @@ fn restore_concurrent_resume_child() {
             Ok(())
         }
     }
+    let notify = Arc::new(Notify {
+        socket: input["wait_socket"].as_str().unwrap().into(),
+        sent: std::sync::atomic::AtomicBool::new(false),
+        writes: AtomicUsize::new(0),
+    });
     let filesystem = NativeWithIo {
         native: fl_store::recovery::fs::NativeRecoveryFs::new(root, concurrent_resume_limits()),
-        io: Arc::new(Notify {
-            socket: input["wait_socket"].as_str().unwrap().into(),
-            sent: std::sync::atomic::AtomicBool::new(false),
-        }),
+        io: notify.clone(),
     };
     let lease = OfflineLease::load(&lease_path, &filesystem, &limits()).unwrap();
     let RestoreOutcome::Installed { journal } =
@@ -1548,8 +1552,14 @@ fn restore_concurrent_resume_child() {
         panic!("not installed")
     };
     assert_eq!(
-        journal.current_attempt, 2,
+        journal.current_attempt, 1,
         "waiting process must reread the first process's completed attempt"
+    );
+    assert_eq!(journal.resume_finalize_attempts, 1);
+    assert_eq!(
+        notify.writes.load(Ordering::Acquire),
+        0,
+        "waiting resume must not append after rereading Installed"
     );
 }
 #[test]
@@ -1563,11 +1573,28 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
     let (mut request, lease) = prepare_restore(&f, &f.source);
     request.limits = concurrent_resume_limits();
     request.limits.operation_id = request.operation_id;
-    let RestoreOutcome::Installed { journal } =
-        restore_offline(&request, &lease, &f.filesystem()).unwrap()
-    else {
-        panic!("not installed")
+    // Pause real unfinished forward work: a completed Installed resume is free
+    // and never reaches the journal write used to hold the operation lock below.
+    let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreRelocate));
+    let filesystem = CutFs {
+        f: &f,
+        io: hook.clone(),
+        limits: concurrent_resume_limits(),
     };
+    let outcome = restore_offline(&request, &lease, &filesystem);
+    assert!(outcome.is_err() || matches!(outcome, Ok(RestoreOutcome::OutcomeUnknown { .. })));
+    assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+    let guard: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.source.with_extension("fls.restore-guard")).unwrap())
+            .unwrap();
+    let journal = load_restore_journal(
+        std::path::Path::new(guard["journal"].as_str().unwrap()),
+        &lease,
+        &f.filesystem(),
+    )
+    .unwrap();
+    assert_eq!(journal.phase, RestorePhase::RelocateIntent);
+    assert_eq!(journal.current_attempt, 0);
     let wait_socket = f.root.path().join("wait.sock");
     let listener = std::os::unix::net::UnixListener::bind(&wait_socket).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -1677,7 +1704,7 @@ fn restore_concurrent_process_resumes_serialize_and_reread_latest_journal() {
     .unwrap();
     assert_eq!(
         (status.current_attempt, status.resume_finalize_attempts),
-        (2, 2)
+        (1, 1)
     );
 }
 
@@ -3804,17 +3831,59 @@ fn request_bundle_path(f: &Fixture, operation: uuid::Uuid) -> std::path::PathBuf
         .path()
         .to_path_buf()
 }
+// Spend rollback capacity on interrupted unfinished work, never completed no-ops.
+fn interrupt_two_installed_rollback_attempts(
+    f: &Fixture,
+    mut journal: RestoreJournal,
+    lease: &OfflineLease,
+) -> RestoreJournal {
+    assert_eq!(journal.phase, RestorePhase::Installed);
+    assert_eq!(journal.rollback_attempts, 0);
+    let path = journal.staging.join("journal.bin");
+    let destination = inspect_file_binding(&journal.destination, &limits()).unwrap();
+    let rollback = journal
+        .rollback
+        .as_ref()
+        .map(|path| (path.clone(), inspect_file_binding(path, &limits()).unwrap()));
+    let guard = journal.destination.with_extension("fls.restore-guard");
+    let guard_bytes = fs::read(&guard).unwrap();
+    for expected in 1..=2 {
+        let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+            Directory::RestoreJournalParent,
+        )));
+        let filesystem = CutFs {
+            f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(rollback_restore(&journal, lease, &filesystem).is_err());
+        assert_eq!(hook.fired.load(Ordering::Acquire), 1);
+        journal = load_restore_journal(&path, lease, &f.filesystem()).unwrap();
+        assert_eq!(journal.phase, RestorePhase::Installed);
+        assert_eq!(journal.rollback_attempts, expected);
+        assert_eq!(journal.current_attempt, expected);
+        assert_eq!(journal.resume_finalize_attempts, 0);
+        assert_eq!(
+            inspect_file_binding(&journal.destination, &limits()).unwrap(),
+            destination,
+            "journal cut must precede namespace changes"
+        );
+        if let Some((path, binding)) = &rollback {
+            assert_eq!(&inspect_file_binding(path, &limits()).unwrap(), binding);
+        }
+        assert_eq!(fs::read(&guard).unwrap(), guard_bytes);
+    }
+    journal
+}
 #[test]
 fn restore_fourth_reserved_attempt_terminal_cleanup_is_free_despite_exhausted_flag() {
-    let (f, mut journal, lease) = terminal_fixture(TerminalFixtureMode::Original);
-    for _ in 0..2 {
-        let RestoreOutcome::RolledBack { journal: next } =
-            rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
-        else {
-            panic!("not rolled back")
-        };
-        journal = next;
-    }
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+    let journal = interrupt_two_installed_rollback_attempts(&f, journal, &lease);
+    let RestoreOutcome::RolledBack { journal } =
+        rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not rolled back")
+    };
     assert_eq!(journal.rollback_attempts, 3);
     let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
         Directory::RestorePinParent,
