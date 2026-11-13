@@ -6440,14 +6440,46 @@ mod metadata_tests {
         // At E=1,150 the 1,095-byte admission-operator record fits, but
         // the 1,205-byte maximum-accepting-operator record cannot fit.
         j.journal_capacity -= (1613 - 1150) * metadata::MAX_FRAMES;
-        assert_eq!(terminal_caps(&j, &l).unwrap().evidence, 1150);
-        assert!(matches!(
-            check_terminal_reservation(&j, &l),
-            Err(RecoveryError::Quota {
-                resource: "restore mandatory terminal evidence",
-                ..
-            })
-        ));
+        j.budget.metadata_payload_ceiling = j.journal_capacity + GUARD_ALLOWANCE;
+        let caps = terminal_caps(&j, &l).unwrap();
+        assert_eq!(caps.evidence, 1150);
+        let mut record = selected_record(&j);
+        record.recorded_at_unix_ms = u128::MAX;
+        record.affected_scopes = vec![j.selected_profile.catalog_identity.clone()];
+        record.index = IndexReadiness::Degraded;
+        let admission_bytes = serde_json::to_vec(&record).unwrap().len() as u64;
+        assert_eq!(admission_bytes, 1095);
+        assert!(admission_bytes <= caps.evidence);
+        record.operator = encoded_string(ACCEPTING_OPERATOR_ENCODED_MAX);
+        let accepting_bytes = serde_json::to_vec(&record).unwrap().len() as u64;
+        assert_eq!(accepting_bytes, 1205);
+        assert!(accepting_bytes > caps.evidence);
+        let error = check_terminal_reservation(&j, &l).unwrap_err();
+        let RecoveryError::RestoreMetadataReservationQuota {
+            operation_id,
+            offered_bytes,
+            required_bytes,
+            ..
+        } = &error
+        else {
+            panic!("fixed accepting operator must exceed the reservation: {error}");
+        };
+        assert_eq!(*operation_id, l.operation_id);
+        assert_eq!(*offered_bytes, j.budget.metadata_payload_ceiling);
+        assert_eq!(
+            *required_bytes,
+            offered_bytes + (accepting_bytes - caps.evidence) * metadata::MAX_FRAMES
+        );
+        assert!(required_bytes > offered_bytes);
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("metadata_byte_limit"));
+        assert!(diagnostic.contains(&offered_bytes.to_string()));
+        assert!(diagnostic.contains(&required_bytes.to_string()));
+        assert!(diagnostic.contains("at least") && diagnostic.contains("headroom"));
+        eprintln!(
+            "operator reservation: admission={admission_bytes} accepting={accepting_bytes} E={} offered={offered_bytes} required={required_bytes}",
+            caps.evidence
+        );
     }
     #[test]
     fn terminal_reservation_maximum_accepting_fields_fit_every_terminal_mode() {
