@@ -35,6 +35,29 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+## Clear and Reforge
+
+Codex, Muse, Grok and every generic `HostCli` route refuse both actions before reset
+commands, startup prompts, queue/model changes or discovery invalidation. FerroLoop cannot
+confirm a changed native session identity bound to the exact terminal for these routes.
+This also applies to a `HostCli` route whose vendor label is Claude or Codex.
+
+Single-session requests return HTTP 409 with `code: reset_unsupported`, the canonical
+`vendor`, `reason: identity_unconfirmable`, `alternative: remodel_same_vendor` and a plain
+`error` message. Bulk actions retain those fields with `session_id`, `ok: false` and
+`status: 409` per refused session. The alternative is an explicit remodel to the same
+vendor to start a fresh session; FerroLoop does not run it automatically.
+
+Claude's strengthened reset confirmation is owned by the separate #544/#545 change. That
+change must be integrated from main before release: its contract requires a changed native
+`sessionId`, a bounded 20-second wait and an error without a startup prompt on timeout.
+This branch does not claim that the current Claude reset tail already enforces that contract.
+
+Antigravity keeps its in-place cascade rewind described below. It does not establish a new
+native session identity and remains outside this confirmation contract, pending a separate
+audit. Webhook routes remain a deterministic test transport, not evidence of native reset
+confirmation.
+
 ## Host reboot behaviour
 
 A host boot can restore tmux sessions (tmux-resurrect with continuum restore). Hub keeps three

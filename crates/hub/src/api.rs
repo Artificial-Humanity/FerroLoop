@@ -62,7 +62,8 @@ use fl_store::AnyStore;
 use fl_wire::dispatcher::{
     CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
     PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
-    push_operator_prompt_to_route, push_operator_prompt_with_intent, push_to_route_for_recipient,
+    preflight_session_reset, push_operator_prompt_to_route, push_operator_prompt_with_intent,
+    push_to_route_for_recipient,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -7188,15 +7189,16 @@ fn handle_post_session_clear(
         mode,
     ) {
         Ok(data) => HttpResponse::json(200, data),
-        Err((status, error)) => HttpResponse::json(status, json!({ "error": error })),
+        Err((status, error)) => HttpResponse::json(status, error),
     }
 }
 
-/// Clear or reforge one session: prepare the reforge prompt, then drop queued prompts and model
-/// overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
+/// Clear or reforge one session: select and preflight its route, prepare guidance, then drop
+/// queued prompts and model overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
 /// is the id the caller used (its queue is dropped too); `canonical_id` and `persona` come from
 /// [`resolve_session_target`]. Returns the response body, or `(status, error)`: 404 when there
-/// is no agent record (reforge) or no live route, 502 when the dispatch itself fails.
+/// is no agent record (reforge) or no live route, 409 for an unsupported reset, and 502
+/// when the dispatch itself fails. Error bodies retain structured refusal fields.
 /// Shared by the single-session clear handler and the bulk action.
 fn reset_session(
     state: &HubState,
@@ -7205,13 +7207,45 @@ fn reset_session(
     canonical_id: &str,
     persona: Option<&str>,
     mode: &str,
-) -> Result<Value, (u16, String)> {
+) -> Result<Value, (u16, Value)> {
+    reset_session_with_prompt(
+        state,
+        actor,
+        raw_session_id,
+        canonical_id,
+        persona,
+        mode,
+        || build_reforge_prompt(state, persona.unwrap_or(canonical_id)),
+    )
+}
+
+/// Prepare guidance only after the selected route passes the pure reset policy. Retain that
+/// route through dispatch: re-resolving it could send a reset to a different conversation.
+fn reset_session_with_prompt(
+    state: &HubState,
+    actor: &str,
+    raw_session_id: &str,
+    canonical_id: &str,
+    persona: Option<&str>,
+    mode: &str,
+    prepare_prompt: impl FnOnce() -> Result<String, LifecycleError>,
+) -> Result<Value, (u16, Value)> {
+    let route = crate::lifecycle::lookup_reset_route_read_only(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, canonical_id),
+    )
+    .ok_or_else(|| {
+        (
+            404,
+            json!({ "error": no_route_error(persona, canonical_id) }),
+        )
+    })?;
+    preflight_session_reset(&route).map_err(|refusal| (409, json!(refusal)))?;
     // Fallible guidance preparation must not erase queues or model choices on refusal.
     let prompt = if mode == "reforge" {
-        let lookup = persona.unwrap_or(canonical_id);
-        match build_reforge_prompt(state, lookup) {
+        match prepare_prompt() {
             Ok(prompt) => Some(prompt),
-            Err(error) => return Err((error.status(), error.to_string())),
+            Err(error) => return Err((error.status(), json!({ "error": error.to_string() }))),
         }
     } else {
         None
@@ -7242,16 +7276,10 @@ fn reset_session(
     };
     // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
     // that then fails is never run again on another route.
-    let reset = crate::lifecycle::dispatch_once(
-        state.config.home_override.as_deref(),
-        session_route_query(persona, canonical_id),
-        |route| clear_or_reforge_session(route, reset_mode, actor, prompt.as_deref()),
-    )
-    .ok_or_else(|| no_route_error(persona, canonical_id))
-    .map_err(|e| (404, e))?;
+    let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
     // A clear can start a new vendor session (a new id) behind the same persona.
     crate::discovery::invalidate_route_discovery_cache();
-    reset.map_err(|e| (502, e))?;
+    reset.map_err(|e| (502, json!({ "error": e })))?;
 
     let data = json!({
         "ok": true,
@@ -7968,15 +7996,22 @@ fn handle_post_session_bulk_action(
     let actor = authority.actor_name();
     let mut results = Vec::with_capacity(targets.len());
     for (id, persona) in &targets {
-        let outcome: Result<(), String> = match action.as_str() {
-            "compact" => compact_session(state, actor, id, persona.as_deref()),
-            mode => reset_session(state, actor, id, id, persona.as_deref(), mode)
-                .map(|_| ())
-                .map_err(|(_, error)| error),
+        let outcome = match action.as_str() {
+            "compact" => compact_session(state, actor, id, persona.as_deref())
+                .map_err(|error| (502, json!({ "error": error }))),
+            mode => reset_session(state, actor, id, id, persona.as_deref(), mode).map(|_| ()),
         };
         results.push(match outcome {
             Ok(()) => json!({ "session_id": id, "ok": true }),
-            Err(error) => json!({ "session_id": id, "ok": false, "error": error }),
+            Err((status, mut error)) => {
+                // Compact and legacy reset errors keep their original per-item shape.
+                if error["code"] == "reset_unsupported" {
+                    error["status"] = json!(status);
+                }
+                error["session_id"] = json!(id);
+                error["ok"] = json!(false);
+                error
+            }
         });
     }
     let succeeded = results.iter().filter(|r| r["ok"] == true).count();
@@ -11411,6 +11446,410 @@ mod council_guidance_tests {
     }
 
     #[test]
+    fn unsupported_clear_refuses_before_queue_model_or_route_mutation() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "fixture-thread".into(),
+                cwd: None,
+            },
+            stamp::now(),
+        );
+        let path = tmp.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&path)).unwrap();
+        let keys = ["codex-fixture-thread", "raw-alias", "ada"];
+        for key in keys {
+            state.prompt_queues.lock().unwrap().enqueue(
+                key,
+                crate::DirectPromptInput {
+                    queue_target: None,
+                    intended_codex_thread_id: None,
+                    persona: Some("ada".into()),
+                    prompt: format!("prompt-{key}"),
+                    effective_body: format!("body-{key}"),
+                    by: "owner".into(),
+                    attachments: vec![],
+                },
+            );
+            state.set_session_model_override(
+                key,
+                session_actions::ModelOverride::new(format!("model-{key}"), None),
+            );
+        }
+        let before: Vec<_> = keys
+            .iter()
+            .map(|key| (state.session_queue(key), state.session_model_override(key)))
+            .collect();
+        let route_bytes = fs::read(&path).unwrap();
+        let invalidations =
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+        let mut events = state.subscribe();
+        let error =
+            reset_session(&state, "owner", keys[1], keys[0], Some(keys[2]), "clear").unwrap_err();
+        assert_eq!(error.0, 409, "{error:?}");
+        for (key, expected) in keys.iter().zip(before) {
+            assert_eq!(
+                (state.session_queue(key), state.session_model_override(key)),
+                expected,
+                "{key}"
+            );
+        }
+        assert_eq!(fs::read(path).unwrap(), route_bytes);
+        assert_eq!(
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+            invalidations
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    fn unsupported_reset_routes() -> Vec<fl_wire::identity::VendorRoute> {
+        use fl_wire::identity::VendorRoute;
+        let mut routes = vec![
+            VendorRoute::Codex {
+                thread_id: "thread-fixture".into(),
+                cwd: None,
+            },
+            VendorRoute::Muse {
+                session_id: "muse-fixture".into(),
+                cwd: None,
+                tmux_target: Some("unprobed-muse".into()),
+                tmux_pane: None,
+            },
+            VendorRoute::Grok {
+                session_id: "grok-fixture".into(),
+                cwd: None,
+                tmux_target: Some("unprobed-grok".into()),
+                tmux_pane: None,
+            },
+        ];
+        for vendor in ["host_cli", " ClAuDe ", " CoDeX "] {
+            routes.push(VendorRoute::HostCli {
+                vendor: vendor.into(),
+                session_id: format!("host-fixture-{}", routes.len()),
+                cwd: None,
+                tmux_target: Some("unprobed-host".into()),
+                tmux_pane: Some("%987654".into()),
+            });
+        }
+        routes
+    }
+
+    fn seed_reset_choices(state: &HubState, keys: &[&str]) {
+        for key in keys {
+            state.prompt_queues.lock().unwrap().enqueue(
+                key,
+                crate::DirectPromptInput {
+                    queue_target: None,
+                    intended_codex_thread_id: None,
+                    persona: Some("ada".into()),
+                    prompt: format!("prompt-{key}"),
+                    effective_body: format!("body-{key}"),
+                    by: "owner".into(),
+                    attachments: vec![],
+                },
+            );
+            state.set_session_model_override(
+                key,
+                session_actions::ModelOverride::new(
+                    format!("model-{key}"),
+                    Some("thinking-fixture".into()),
+                ),
+            );
+        }
+    }
+
+    fn assert_reset_refusal(body: &Value, vendor: &str) {
+        assert_eq!(body["code"], "reset_unsupported", "{body}");
+        assert_eq!(body["vendor"], vendor, "{body}");
+        assert_eq!(body["reason"], "identity_unconfirmable");
+        assert_eq!(body["alternative"], "remodel_same_vendor");
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("same vendor"), "{message}");
+        assert!(!message.starts_with('{'));
+    }
+
+    #[test]
+    fn unsupported_resets_preserve_aliases_and_skip_guidance_and_discovery() {
+        use fl_wire::identity::RouteTable;
+        for route in unsupported_reset_routes() {
+            for mode in ["clear", "reforge"] {
+                let tmp = TempDir::new().unwrap();
+                let state = HubState::new(HubServerConfig {
+                    store_path: tmp.path().join("store.redb"),
+                    repo_root: tmp.path().into(),
+                    home_override: Some(tmp.path().into()),
+                    ..HubServerConfig::default()
+                });
+                let vendor = route.canonical_vendor().to_owned();
+                let id = route.session_identity().unwrap().1.to_owned();
+                let mut routes = RouteTable::default();
+                routes.upsert("ada", route.clone(), stamp::now());
+                let path = tmp.path().join(".cache/agent-bus/routes.json");
+                routes.save(Some(&path)).unwrap();
+                // No scan has ever been saved for this fixture: the saved route is stale.
+                assert!(!crate::discovery::saved_routes_fresh(
+                    Some(tmp.path()),
+                    std::time::Instant::now()
+                ));
+                let keys = [id.as_str(), "raw-alias", "ada"];
+                seed_reset_choices(&state, &keys);
+                let before: Vec<_> = keys
+                    .iter()
+                    .map(|key| (state.session_queue(key), state.session_model_override(key)))
+                    .collect();
+                let route_bytes = fs::read(&path).unwrap();
+                let invalidations =
+                    crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+                let mut events = state.subscribe();
+                let (error, costs) = crate::discovery::cost_counters::measure(|| {
+                    reset_session_with_prompt(
+                        &state,
+                        "owner",
+                        keys[1],
+                        keys[0],
+                        Some(keys[2]),
+                        mode,
+                        || panic!("unsupported route must not prepare guidance or run a helper"),
+                    )
+                    .unwrap_err()
+                });
+                assert_eq!(error.0, 409);
+                assert_reset_refusal(&error.1, &vendor);
+                assert_eq!(
+                    costs.route_scans, 0,
+                    "stale unsupported route must never scan/probe"
+                );
+                assert_eq!(
+                    costs.store_opens, 0,
+                    "must refuse before guidance authority lookup"
+                );
+                for (key, expected) in keys.iter().zip(before) {
+                    assert_eq!(
+                        (state.session_queue(key), state.session_model_override(key)),
+                        expected,
+                        "{mode}: {key}"
+                    );
+                }
+                assert_eq!(fs::read(path).unwrap(), route_bytes);
+                assert_eq!(
+                    crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+                    invalidations
+                );
+                assert!(
+                    events.try_recv().is_err(),
+                    "no cleared event or startup prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_and_bulk_unsupported_resets_expose_structured_conflicts() {
+        use fl_wire::identity::RouteTable;
+        for mode in ["clear", "reforge"] {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let peer = HubAuthority::Peer {
+                agent: Some("peer".into()),
+            };
+            let mut routes = RouteTable::default();
+            let mut targets = vec![];
+            for (n, route) in unsupported_reset_routes().into_iter().enumerate() {
+                let persona = format!("fixture-{n}");
+                let vendor = route.canonical_vendor().to_owned();
+                let id = route.session_identity().unwrap().1.to_owned();
+                seed_reset_choices(&state, &[&persona, &id]);
+                routes.upsert(&persona, route, stamp::now());
+                targets.push((persona, id, vendor));
+            }
+            let path = tmp.path().join(".cache/agent-bus/routes.json");
+            routes.save(Some(&path)).unwrap();
+            let route_bytes = fs::read(&path).unwrap();
+            let invalidations =
+                crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+            let mut events = state.subscribe();
+            for (persona, id, vendor) in &targets {
+                let req =
+                    HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":mode}));
+                let denied = handle_post_session_clear(&state, &peer, persona, &req);
+                assert_eq!(denied.status, 403);
+                for alias in [persona, id] {
+                    let response = handle_post_session_clear(&state, &owner, alias, &req);
+                    assert_eq!(
+                        response.status,
+                        409,
+                        "{}",
+                        String::from_utf8_lossy(&response.body)
+                    );
+                    assert_reset_refusal(&response.json_value().unwrap(), vendor);
+                }
+            }
+            let bulk = handle_post_session_bulk_action(
+                &state,
+                &owner,
+                &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":mode})),
+            );
+            assert_eq!(bulk.status, 200);
+            let body = bulk.json_value().unwrap();
+            assert_eq!(body["total"], targets.len());
+            assert_eq!(body["succeeded"], 0);
+            for (persona, id, vendor) in &targets {
+                let result = body["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["session_id"] == *id)
+                    .unwrap();
+                assert_eq!(result["status"], 409);
+                assert_eq!(result["ok"], false);
+                assert_reset_refusal(result, vendor);
+                for key in [persona, id] {
+                    assert_eq!(state.session_queue(key).len(), 1);
+                    assert!(state.session_model_override(key).is_some());
+                }
+            }
+            assert_eq!(fs::read(path).unwrap(), route_bytes);
+            assert_eq!(
+                crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+                invalidations
+            );
+            let frame = events.try_recv().unwrap();
+            assert_eq!(frame.event, "session.bulk_action");
+            assert!(
+                events.try_recv().is_err(),
+                "no cleared event or startup prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_reset_route_preserves_choices_before_prompt_preparation() {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        seed_reset_choices(&state, &["missing"]);
+        for mode in ["clear", "reforge"] {
+            let error = reset_session_with_prompt(
+                &state,
+                "owner",
+                "missing",
+                "missing",
+                Some("missing"),
+                mode,
+                || panic!("missing route must not prepare a prompt"),
+            )
+            .unwrap_err();
+            assert_eq!(error.0, 404);
+            assert_eq!(error.1.as_object().unwrap().len(), 1);
+            assert!(
+                error.1["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no active vendor route")
+            );
+            assert_eq!(state.session_queue("missing").len(), 1);
+            assert!(state.session_model_override("missing").is_some());
+        }
+    }
+
+    #[test]
+    fn supported_reset_dispatch_failure_retains_plain_error() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Webhook {
+                socket_path: tmp.path().join("absent-fixture.sock"),
+            },
+            stamp::now(),
+        );
+        routes
+            .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+            .unwrap();
+        let mut events = state.subscribe();
+        let error = reset_session_with_prompt(
+            &state,
+            "owner",
+            "ada",
+            "webhook-ada",
+            Some("ada"),
+            "clear",
+            || panic!("Clear must not prepare guidance"),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, 502);
+        assert_eq!(error.1.as_object().unwrap().len(), 1);
+        assert!(error.1["error"].is_string());
+        assert!(
+            events.try_recv().is_err(),
+            "failed dispatch must not report a clear"
+        );
+    }
+
+    #[test]
+    fn read_only_reset_scan_keeps_supported_session_identity_pinned() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        let tmp = TempDir::new().unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "other-session".into(),
+                socket_path: tmp.path().join("never-connect.sock"),
+                key_path: None,
+            },
+            stamp::now(),
+        );
+        let path = tmp.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&path)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let invalidations =
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+        let route = crate::lifecycle::lookup_reset_route_read_only(
+            Some(tmp.path()),
+            session_route_query(Some("ada"), "wanted-session"),
+        );
+        assert!(
+            route.is_none(),
+            "a scanned supported route must not cross the requested native ID"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+            invalidations
+        );
+    }
+
+    #[test]
     fn refused_reforge_preflight_preserves_alias_queues_and_model_overrides() {
         use fl_wire::identity::{RouteTable, VendorRoute};
         for corruption in ["deleted", "corrupt"] {
@@ -11497,7 +11936,13 @@ mod council_guidance_tests {
             let error = reset_session(&state, "owner", keys[1], keys[0], Some(keys[2]), "reforge")
                 .unwrap_err();
             assert_eq!(error.0, 400, "{corruption}: {error:?}");
-            assert!(error.1.contains("missing or deleted"), "{error:?}");
+            assert!(
+                error.1["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing or deleted"),
+                "{error:?}"
+            );
             for (key, expected) in keys.iter().zip(before) {
                 assert_eq!(
                     (state.session_queue(key), state.session_model_override(key)),
