@@ -6787,3 +6787,434 @@ fn restore_lease_expiry_reverse_actions_preserve_namespace() {
         }
     }
 }
+
+// Reservation oracle uses independent owned JSON normalization in tests only.
+fn reservation_json_bytes<T: serde::Serialize>(v: &T) -> u64 {
+    serde_json::to_vec(v).unwrap().len() as u64
+}
+fn reservation_expected_caps(j: &RestoreJournal) -> (u64, u64, u64) {
+    use serde_json::json;
+    let mut base = serde_json::to_value(j).unwrap();
+    for field in [
+        "verification",
+        "terminal_evidence_context",
+        "reconciliation",
+        "absence_reconciliation",
+    ] {
+        base[field] = serde_json::Value::Null;
+    }
+    base["phase"] = json!("original_absence_finalized");
+    for field in [
+        "resume_finalize_attempts",
+        "rollback_attempts",
+        "current_attempt",
+    ] {
+        base[field] = json!(u32::MAX);
+    }
+    base["attempt_deadline_unix_ms"] = json!(u64::MAX);
+    base["forensic_handling_required"] = json!(false);
+    base["generation_metadata_sha256"] = json!(([255u8; 32]));
+    // Value cannot represent u128::MAX: add its 19 extra decimal digits.
+    let b = reservation_json_bytes(&base) + 19;
+    let mut binding = serde_json::to_value(&j.binding).unwrap();
+    binding["expected_file"] = json!({"state":"readable", "identity":[u64::MAX,u64::MAX], "bytes":u64::MAX, "sha256":"f".repeat(64)});
+    binding["issued_at_unix_ms"] = json!(u64::MAX);
+    binding["expires_at_unix_ms"] = json!(u64::MAX);
+    for field in [
+        "legacy_and_cached_handles_excluded",
+        "external_dispatch_excluded",
+        "active_owner_excluded",
+    ] {
+        binding["exclusion"][field] = json!(false);
+    }
+    let l = reservation_json_bytes(&binding) + 38;
+    let mut report = serde_json::to_value(
+        j.verification
+            .as_ref()
+            .or(j.original_verification.as_ref())
+            .unwrap(),
+    )
+    .unwrap();
+    for field in [
+        "report_version",
+        "profile_version",
+        "canonical_encoding_version",
+    ] {
+        report[field] = json!(u32::MAX);
+    }
+    for field in [
+        "image_bytes",
+        "published_sequence",
+        "verified_collection_count",
+        "unknown_collection_count",
+        "query_probe_count",
+        "exception_count",
+        "dependency_count",
+    ] {
+        report[field] = json!(u64::MAX);
+    }
+    for field in [
+        "intrinsic_lineage_available",
+        "opaque_runtime_references",
+        "transient_rpc_dedupe_persisted",
+        "durable_rpc_receipts_claimed",
+    ] {
+        report[field] = json!(false);
+    }
+    report["readiness"] = json!("dependencies_require_reconciliation");
+    report["copy_evidence"] = json!({"verified_file_identity":[u64::MAX,u64::MAX], "source_image_identity":[u64::MAX,u64::MAX], "creation":"caller_supplied_existing", "image_sha256":"f".repeat(64)});
+    report["verifier_build_identity"] = serde_json::to_value(&j.binding.build).unwrap();
+    let r = reservation_json_bytes(&report);
+    assert_eq!(r, 1265 + reservation_json_bytes(&j.binding.build));
+    let e = (j.journal_capacity / 96 - 72)
+        .checked_sub(b + r + l + 768)
+        .unwrap();
+    (reservation_json_bytes(&j.binding.operator), l, e)
+}
+fn reservation_pad_record(
+    j: &RestoreJournal,
+    original: bool,
+    bytes: u64,
+) -> fl_store::recovery::readiness::ReconciliationRecord {
+    let mut record = generation_evidence(j, original);
+    let n = reservation_json_bytes(&record);
+    assert!(n <= bytes, "mandatory record {n} exceeds target {bytes}");
+    record.affected_scopes[0].push_str(&"x".repeat((bytes - n) as usize));
+    assert_eq!(reservation_json_bytes(&record), bytes);
+    record
+}
+#[test]
+fn restore_terminal_reservation_padded_admission_refuses_before_guard() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let mut binding = fixture_lease_request(&lease);
+    binding.exclusion.evidence.push_str(&"x".repeat(3000));
+    fs::remove_file(lease.path()).unwrap();
+    let lease = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+    let before = fs::read(&f.source).unwrap();
+    assert!(
+        restore_offline(&request, &lease, &f.filesystem()).is_err(),
+        "no terminal frame was reserved before admission"
+    );
+    assert!(!f.source.with_extension("fls.restore-guard").exists());
+    assert_eq!(fs::read(&f.source).unwrap(), before);
+    eprintln!("reservation admission padded lease: 1 case");
+}
+fn reservation_exact_lease(j: &RestoreJournal, lease: &OfflineLease, f: &Fixture) -> OfflineLease {
+    let (o, l, _) = reservation_expected_caps(j);
+    let mut binding = fixture_lease_request(lease);
+    binding.expected_file = inspect_file_binding(&j.destination, &limits()).unwrap();
+    let bytes = reservation_json_bytes(&binding);
+    assert!(bytes <= l);
+    binding
+        .exclusion
+        .evidence
+        .push_str(&"x".repeat((l - bytes) as usize));
+    assert_eq!(reservation_json_bytes(&binding.operator), o);
+    assert_eq!(reservation_json_bytes(&binding), l);
+    fs::remove_file(lease.path()).unwrap();
+    create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap()
+}
+#[test]
+fn restore_terminal_reservation_exact_e_and_restart_complete() {
+    use fl_store::recovery::readiness::*;
+    for original in [false, true] {
+        let mode = if original {
+            TerminalFixtureMode::Original
+        } else {
+            TerminalFixtureMode::Selected
+        };
+        let (f, journal, lease) = terminal_fixture(mode);
+        let expected = reservation_expected_caps(&journal);
+        let lease = reservation_exact_lease(&journal, &lease, &f);
+        let path = journal.staging.join("journal.bin");
+        let restarted = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(reservation_expected_caps(&restarted), expected);
+        let record = reservation_pad_record(&restarted, original, expected.2);
+        let outcome = if original {
+            finalize_rollback(&restarted, &lease, &record, &f.filesystem())
+        } else {
+            finalize_restore(&restarted, &lease, &record, &f.filesystem())
+        };
+        assert!(matches!(outcome.unwrap(), RestoreOutcome::Finalized { .. }));
+        assert!(
+            !journal
+                .destination
+                .with_extension("fls.restore-guard")
+                .exists()
+        );
+        let done = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(done.reconciliation.as_ref(), Some(&record));
+        let bytes = fs::read(&path).unwrap();
+        let maximum = journal_frame_ranges(&bytes)
+            .iter()
+            .map(|frame| frame.end - frame.start - 72)
+            .max()
+            .unwrap();
+        assert!(maximum as u64 <= journal.journal_capacity / 96 - 72);
+        eprintln!(
+            "reservation combined boundary actual max frame={maximum} P={}",
+            journal.journal_capacity / 96 - 72
+        );
+        assert_eq!(reservation_expected_caps(&done), expected);
+        eprintln!("reservation exact E original={original} E={}", expected.2);
+    }
+    for mode in [TerminalFixtureMode::Absence, TerminalFixtureMode::Abandon] {
+        let (f, journal, lease) = terminal_fixture(mode);
+        let (o, _, e) = reservation_expected_caps(&journal);
+        let lease = reservation_exact_lease(&journal, &lease, &f);
+        assert_eq!(
+            reservation_json_bytes(&fixture_lease_request(&lease).operator),
+            o
+        );
+        terminal_call(mode, &journal, &lease, &f.filesystem(), false).unwrap();
+        let done = load_restore_journal(
+            &journal.staging.join("journal.bin"),
+            &lease,
+            &f.filesystem(),
+        )
+        .unwrap();
+        if let Some(record) = &done.absence_reconciliation {
+            assert!(reservation_json_bytes(record) <= e);
+        }
+        assert!(
+            !journal
+                .destination
+                .with_extension("fls.restore-guard")
+                .exists()
+        );
+        eprintln!("reservation bounded {mode:?} completes with exact O");
+    }
+}
+#[test]
+fn restore_terminal_reservation_one_byte_over_caps_is_free() {
+    use fl_store::recovery::readiness::finalize_restore;
+    for kind in ["operator", "lease", "evidence"] {
+        let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+        let (o, l, e) = reservation_expected_caps(&journal);
+        let mut binding = fixture_lease_request(&lease);
+        let mut record = generation_evidence(&journal, false);
+        if kind == "operator" {
+            binding.operator.push('x');
+            record.operator = binding.operator.clone();
+            assert_eq!(reservation_json_bytes(&binding.operator), o + 1);
+        } else if kind == "lease" {
+            // Current-file renewal is semantically valid, but its accepted lease is L+1.
+            binding.expected_file = inspect_file_binding(&journal.destination, &limits()).unwrap();
+            let n = reservation_json_bytes(&binding);
+            assert!(n <= l + 1);
+            binding
+                .exclusion
+                .evidence
+                .push_str(&"x".repeat((l + 1 - n) as usize));
+            assert_eq!(reservation_json_bytes(&binding), l + 1);
+        } else {
+            record = reservation_pad_record(&journal, false, e + 1);
+        }
+        binding.expected_file = inspect_file_binding(&journal.destination, &limits()).unwrap();
+        fs::remove_file(lease.path()).unwrap();
+        let current = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+        let before = terminal_negative_metadata(&f, &journal);
+        let error = finalize_restore(&journal, &current, &record, &f.filesystem()).unwrap_err();
+        let expected_resource = match kind {
+            "operator" => "restore accepting operator",
+            "lease" => "restore accepting lease",
+            _ => "restore accepting evidence",
+        };
+        assert!(
+            matches!(error, fl_store::recovery::RecoveryError::Quota { resource, .. } if resource == expected_resource),
+            "wrong refusal for {kind}: {error:?}"
+        );
+        assert_eq!(
+            terminal_negative_metadata(&f, &journal),
+            before,
+            "{kind} over cap changed durable metadata"
+        );
+        let loaded = load_restore_journal(
+            &journal.staging.join("journal.bin"),
+            &current,
+            &f.filesystem(),
+        )
+        .unwrap();
+        assert_eq!(
+            terminal_negative_counters(&loaded),
+            terminal_negative_counters(&journal)
+        );
+        eprintln!("reservation {kind}+1 refusal without attempt/append/namespace change");
+    }
+}
+
+fn reservation_retry_compatibility(historical: bool) {
+    use fl_store::recovery::readiness::finalize_restore;
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
+    let cut = CutFs {
+        f: &f,
+        io: Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+            Directory::RestoreDestinationParent,
+        ))),
+        limits: limits(),
+    };
+    assert!(
+        finalize_restore(
+            &journal,
+            &lease,
+            &generation_evidence(&journal, false),
+            &cut
+        )
+        .is_err()
+    );
+    let path = journal.staging.join("journal.bin");
+    let mut intent = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(intent.phase, RestorePhase::FinalizeIntent);
+    if historical {
+        // Genuine durable intent from a pre-reservation writer: authentication,
+        // context digest and semantics remain valid; only the new E is exceeded.
+        let mut legacy = intent.clone();
+        let e = reservation_expected_caps(&intent).2;
+        legacy.reconciliation = Some(reservation_pad_record(&intent, false, e + 1));
+        legacy.reconciliation.as_mut().unwrap().recorded_at_unix_ms =
+            intent.reconciliation.as_ref().unwrap().recorded_at_unix_ms;
+        assert_eq!(
+            reservation_json_bytes(legacy.reconciliation.as_ref().unwrap()),
+            e + 1
+        );
+        legacy
+            .terminal_evidence_context
+            .as_mut()
+            .unwrap()
+            .reconciliation_sha256 = Some(terminal_negative_digest(
+            legacy.reconciliation.as_ref().unwrap(),
+        ));
+        terminal_negative_reframe_last(&intent, &legacy);
+        intent = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(
+            reservation_json_bytes(intent.reconciliation.as_ref().unwrap()),
+            e + 1
+        );
+    }
+    let accepted = intent.reconciliation.as_ref().unwrap().clone();
+    let context = intent.terminal_evidence_context.as_ref().unwrap().clone();
+    let mut binding = fixture_lease_request(&lease);
+    binding
+        .operator
+        .push_str(" renewed authority longer than admission");
+    binding.expected_file = inspect_file_binding(&intent.destination, &limits()).unwrap();
+    assert!(
+        reservation_json_bytes(&binding.operator)
+            > reservation_json_bytes(&intent.binding.operator)
+    );
+    fs::remove_file(lease.path()).unwrap();
+    let current = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+    let cut = CutFs {
+        f: &f,
+        io: Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove)),
+        limits: limits(),
+    };
+    assert!(finalize_restore(&intent, &current, &accepted, &cut).is_err());
+    let terminal = load_restore_journal(&path, &current, &f.filesystem()).unwrap();
+    assert_eq!(terminal.phase, RestorePhase::Finalized);
+    assert_eq!(terminal.reconciliation.as_ref(), Some(&accepted));
+    assert_eq!(terminal.terminal_evidence_context.as_ref(), Some(&context));
+    let before = fs::read(&path).unwrap();
+    let counters = terminal_negative_counters(&terminal);
+    assert!(matches!(
+        finalize_restore(&terminal, &current, &accepted, &f.filesystem()).unwrap(),
+        RestoreOutcome::Finalized { .. }
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before, "cleanup appended a frame");
+    let done = load_restore_journal(&path, &current, &f.filesystem()).unwrap();
+    assert_eq!(terminal_negative_counters(&done), counters);
+    assert_eq!(done.terminal_evidence_context.as_ref(), Some(&context));
+    eprintln!("reservation retry compatibility historical={historical}: intent + cleanup 2 cases");
+}
+#[test]
+fn restore_terminal_reservation_long_renewal_preserves_acceptance() {
+    reservation_retry_compatibility(false);
+}
+#[test]
+fn restore_terminal_reservation_historical_large_accepted_record_retries() {
+    reservation_retry_compatibility(true);
+}
+#[test]
+fn restore_terminal_reservation_dependency_graph_admission() {
+    use fl_store::recovery::{
+        backup::*,
+        profiles::{DependencyPolicy, ReferenceDependency},
+        readiness::*,
+    };
+    for original in [false, true] {
+        for graph in ["unique", "duplicate", "conflict"] {
+            let f = Fixture::new();
+            let dependency = ReferenceDependency {
+                reference_sha256: "a".repeat(64),
+                catalog_identity: "reservation-dependency".into(),
+                required_sequence: Some(17),
+                policy: DependencyPolicy::ReconcileBeforeAdmission,
+            };
+            let mut dependencies = vec![dependency.clone()];
+            if graph != "unique" {
+                let mut second = dependency.clone();
+                if graph == "conflict" {
+                    second.required_sequence = Some(18);
+                }
+                dependencies.push(second);
+            }
+            let mut backup_request = f.backup_request();
+            if !original {
+                backup_request.profile.dependencies = dependencies.clone();
+            }
+            let owner = FerroStore::open(&f.source).unwrap();
+            let PublicationOutcome::Durable(bundle) = backup(
+                &owner,
+                &backup_request,
+                &f.filesystem(),
+                &fl_store::recovery::CancelToken::new(),
+            )
+            .unwrap() else {
+                panic!("not durable")
+            };
+            drop(owner);
+            let (mut request, lease) = prepare_restore_bundle(&f, &f.source, bundle);
+            if original {
+                request.original_profile.dependencies = dependencies;
+            }
+            request.available_dependencies = vec![DependencyResolution {
+                reference_sha256: dependency.reference_sha256.clone(),
+                catalog_identity: dependency.catalog_identity.clone(),
+                observed_sequence: 17,
+                evidence_sha256: "e".repeat(64),
+            }];
+            let before = fs::read(&f.source).unwrap();
+            let outcome = restore_offline(&request, &lease, &f.filesystem());
+            if graph == "unique" {
+                let RestoreOutcome::Installed { mut journal } = outcome.unwrap() else {
+                    panic!("not installed")
+                };
+                if original {
+                    let RestoreOutcome::RolledBack { journal: next } =
+                        rollback_restore(&journal, &lease, &f.filesystem()).unwrap()
+                    else {
+                        panic!("not rolled back")
+                    };
+                    journal = next;
+                }
+                let mut record = generation_evidence(&journal, original);
+                record.dependencies = request.available_dependencies.clone();
+                let outcome = if original {
+                    finalize_rollback(&journal, &lease, &record, &f.filesystem())
+                } else {
+                    finalize_restore(&journal, &lease, &record, &f.filesystem())
+                };
+                assert!(matches!(outcome.unwrap(), RestoreOutcome::Finalized { .. }));
+            } else {
+                assert!(
+                    outcome.is_err(),
+                    "accepted ambiguous {graph} original={original}"
+                );
+                assert!(!f.source.with_extension("fls.restore-guard").exists());
+                assert_eq!(fs::read(&f.source).unwrap(), before);
+            }
+            eprintln!("reservation dependency original={original} graph={graph}");
+        }
+    }
+}

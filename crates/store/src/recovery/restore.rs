@@ -885,6 +885,10 @@ pub fn restore_offline(
         )?
         .1;
         check_generation_metadata(&journal, &l)?;
+        if journal.binding.build != super::manifest::BuildIdentity::current() {
+            return Err(l.verification());
+        }
+        check_terminal_reservation(&journal, &l)?;
         journal_append(&mut journal, &control, &l)?;
         staging.sync(&*control.io, Directory::RestoreStagingParent, &l)?;
         parent.sync(&*control.io, Directory::RestoreDestinationParent, &l)?;
@@ -1022,7 +1026,8 @@ pub fn restore_offline(
             &profile,
             &l,
         )?;
-        if verification.image_sha256 != manifest.image_sha256
+        if verification.verifier_build_identity != journal.binding.build
+            || verification.image_sha256 != manifest.image_sha256
             || verification.copy_evidence.as_ref().is_none_or(|e| {
                 e.verified_file_identity != candidate_identity
                     || e.verified_file_identity == image.identity()
@@ -2213,7 +2218,430 @@ fn terminal_control(
     Ok((limits, control))
 }
 
-// Count borrowed inputs and the conservative repeated-frame bound BEFORE any
+// A frame must have room for every future scalar/phase and one accepted
+// context/evidence pair before the admission name can be published. The saved
+// capacity is the only byte budget; current process build text is not an input.
+const TERMINAL_CONTEXT_ENVELOPE_MAX: u64 = 768; // Current schema maximum: 732.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalCaps {
+    operator: u64,
+    lease: u64,
+    evidence: u64,
+}
+fn replace_encoded<A: Serialize, B: Serialize>(
+    bytes: u64,
+    old: &A,
+    new: &B,
+    cap: u64,
+    l: &OperationLimits,
+) -> Result<u64, RecoveryError> {
+    use super::restore_metadata::measure;
+    let old_bytes = measure(old, cap, l)?.0;
+    let new_bytes = measure(new, cap, l)?.0;
+    bytes
+        .checked_sub(old_bytes)
+        .and_then(|n| n.checked_add(new_bytes))
+        .ok_or_else(|| l.verification())
+}
+
+// Borrow the real build, including every available/unavailable string. This
+// maximum template deliberately permits an impossible copy/source combination:
+// every valid report is smaller. Schema additions must update this audit.
+#[derive(Serialize)]
+struct MaximumCopyEvidence {
+    verified_file_identity: (u64, u64),
+    source_image_identity: Option<(u64, u64)>,
+    creation: super::manifest::CopyCreation,
+    image_sha256: &'static str,
+}
+#[derive(Serialize)]
+struct MaximumVerificationReport<'a> {
+    report_version: u32,
+    copy_evidence: Option<MaximumCopyEvidence>,
+    operation_id: &'static str,
+    image_sha256: &'static str,
+    image_bytes: u64,
+    published_sequence: u64,
+    logical_sha256: &'static str,
+    profile_version: u32,
+    profile_sha256: &'static str,
+    canonical_encoding_version: u32,
+    intrinsic_lineage_available: bool,
+    external_publish_status: crate::ferrostore::ExternalPublishStatus,
+    verified_collection_count: u64,
+    unknown_collection_count: u64,
+    opaque_runtime_references: bool,
+    query_probe_count: u64,
+    exception_count: u64,
+    dependency_count: u64,
+    transient_rpc_dedupe_persisted: bool,
+    durable_rpc_receipts_claimed: bool,
+    readiness: super::manifest::Readiness,
+    verifier_build_identity: &'a super::manifest::BuildIdentity,
+}
+const RESERVATION_SHA: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+fn maximum_report(build: &super::manifest::BuildIdentity) -> MaximumVerificationReport<'_> {
+    MaximumVerificationReport {
+        report_version: u32::MAX,
+        copy_evidence: Some(MaximumCopyEvidence {
+            verified_file_identity: (u64::MAX, u64::MAX),
+            source_image_identity: Some((u64::MAX, u64::MAX)),
+            creation: super::manifest::CopyCreation::CallerSuppliedExisting,
+            image_sha256: RESERVATION_SHA,
+        }),
+        operation_id: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        image_sha256: RESERVATION_SHA,
+        image_bytes: u64::MAX,
+        published_sequence: u64::MAX,
+        logical_sha256: RESERVATION_SHA,
+        profile_version: u32::MAX,
+        profile_sha256: RESERVATION_SHA,
+        canonical_encoding_version: u32::MAX,
+        intrinsic_lineage_available: false,
+        external_publish_status:
+            crate::ferrostore::ExternalPublishStatus::ExclusionUnprovenBeforeSingleOwnership,
+        verified_collection_count: u64::MAX,
+        unknown_collection_count: u64::MAX,
+        opaque_runtime_references: false,
+        query_probe_count: u64::MAX,
+        exception_count: u64::MAX,
+        dependency_count: u64::MAX,
+        transient_rpc_dedupe_persisted: false,
+        durable_rpc_receipts_claimed: false,
+        readiness: super::manifest::Readiness::DependenciesRequireReconciliation,
+        verifier_build_identity: build,
+    }
+}
+fn terminal_caps(j: &RestoreJournal, l: &OperationLimits) -> Result<TerminalCaps, RecoveryError> {
+    use super::restore_metadata::{Caps, measure};
+    let p = Caps::new(j.journal_capacity, l)?.payload;
+    // Exact field substitutions preserve the serializer's existing field names,
+    // punctuation and immutable fields, without owning a normalized journal.
+    let mut b = measure(j, p, l)?.0;
+    b = replace_encoded(b, &j.verification, &None::<()>, p, l)?;
+    b = replace_encoded(b, &j.terminal_evidence_context, &None::<()>, p, l)?;
+    b = replace_encoded(b, &j.reconciliation, &None::<()>, p, l)?;
+    b = replace_encoded(b, &j.absence_reconciliation, &None::<()>, p, l)?;
+    b = replace_encoded(b, &j.phase, &RestorePhase::OriginalAbsenceFinalized, p, l)?;
+    for counter in [
+        j.resume_finalize_attempts,
+        j.rollback_attempts,
+        j.current_attempt,
+    ] {
+        b = replace_encoded(b, &counter, &u32::MAX, p, l)?;
+    }
+    b = replace_encoded(b, &j.attempt_deadline_unix_ms, &u128::MAX, p, l)?;
+    b = replace_encoded(b, &j.forensic_handling_required, &false, p, l)?;
+    b = replace_encoded(b, &j.generation_metadata_sha256, &[255u8; 32], p, l)?;
+    let r = measure(&maximum_report(&j.binding.build), p, l)?.0;
+    let operator = measure(&j.binding.operator, p, l)?.0;
+    let binding = &j.binding;
+    let mut lease = measure(binding, p, l)?.0;
+    lease = replace_encoded(lease, &binding.issued_at_unix_ms, &u128::MAX, p, l)?;
+    lease = replace_encoded(lease, &binding.expires_at_unix_ms, &u128::MAX, p, l)?;
+    // Use the same tagged representation as FileBinding without allocating its
+    // SHA string. Readable's maximal representation exceeds Forensic and Absent.
+    #[derive(Serialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    enum MaximumFile {
+        Readable {
+            identity: (u64, u64),
+            bytes: u64,
+            sha256: &'static str,
+        },
+    }
+    lease = replace_encoded(
+        lease,
+        &binding.expected_file,
+        &MaximumFile::Readable {
+            identity: (u64::MAX, u64::MAX),
+            bytes: u64::MAX,
+            sha256: RESERVATION_SHA,
+        },
+        p,
+        l,
+    )?;
+    for flag in [
+        binding.exclusion.legacy_and_cached_handles_excluded,
+        binding.exclusion.external_dispatch_excluded,
+        binding.exclusion.active_owner_excluded,
+    ] {
+        lease = replace_encoded(lease, &flag, &false, p, l)?;
+    }
+    let evidence = b
+        .checked_add(r)
+        .and_then(|n| n.checked_add(TERMINAL_CONTEXT_ENVELOPE_MAX))
+        .and_then(|n| n.checked_add(lease))
+        .and_then(|n| p.checked_sub(n))
+        .ok_or_else(|| {
+            fs::refused(
+                l,
+                "immutable restore metadata leaves no terminal reservation",
+            )
+        })?;
+    Ok(TerminalCaps {
+        operator,
+        lease,
+        evidence,
+    })
+}
+
+#[derive(Serialize)]
+struct CanonicalResolution<'a> {
+    reference_sha256: &'a str,
+    catalog_identity: &'a str,
+    observed_sequence: u64,
+    evidence_sha256: &'static str,
+}
+struct CanonicalDependencies<'a>(&'a [super::profiles::ReferenceDependency]);
+impl Serialize for CanonicalDependencies<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for d in self.0 {
+            seq.serialize_element(&CanonicalResolution {
+                reference_sha256: &d.reference_sha256,
+                catalog_identity: &d.catalog_identity,
+                observed_sequence: d.required_sequence.unwrap_or(u64::MAX),
+                evidence_sha256: RESERVATION_SHA,
+            })?;
+        }
+        seq.end()
+    }
+}
+#[derive(Serialize)]
+struct CanonicalReconciliation<'a> {
+    version: u32,
+    operation_id: uuid::Uuid,
+    image_sha256: &'a str,
+    published_sequence: u64,
+    operator: &'a str,
+    recorded_at_unix_ms: u128,
+    affected_scopes: [&'a str; 1],
+    identity_confirmed: bool,
+    reference_closure_confirmed: bool,
+    external_effect_coverage_confirmed: bool,
+    source_publication_resolution_sha256: &'static str,
+    clients: CanonicalClients,
+    dependencies: CanonicalDependencies<'a>,
+    external_outcomes: [(); 0],
+    unresolved_items: [(); 0],
+    index: super::readiness::IndexReadiness,
+}
+#[derive(Serialize)]
+struct CanonicalClients {
+    clients_invalidated: bool,
+    rpc_sessions_restarted: bool,
+    transactions_drained: bool,
+    caches_invalidated: bool,
+    retry_assumptions_reconciled: bool,
+    evidence_sha256: &'static str,
+}
+fn check_terminal_reservation(
+    j: &RestoreJournal,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    use super::{
+        manifest::Availability,
+        readiness::*,
+        restore_metadata::{Caps, measure},
+    };
+    let caps = terminal_caps(j, l)?;
+    let p = Caps::new(j.journal_capacity, l)?.payload;
+    for original in [false, true] {
+        if original && j.original_verification.is_none() {
+            continue;
+        }
+        let dependencies = if original {
+            &j.original_dependencies
+        } else {
+            &j.selected_dependencies
+        };
+        // This is a NEW-admission refusal only. Legacy graph validation and
+        // typed exits deliberately do not call this helper.
+        for (i, d) in dependencies.references.iter().enumerate() {
+            l.check()?;
+            if dependencies.references[..i].iter().any(|old| {
+                old.reference_sha256 == d.reference_sha256
+                    && old.catalog_identity == d.catalog_identity
+            }) {
+                return Err(fs::refused(l, "duplicate terminal dependency identity"));
+            }
+        }
+        let (sha, sequence, profile) = if original {
+            let report = j
+                .original_verification
+                .as_ref()
+                .ok_or_else(|| l.verification())?;
+            (
+                report.image_sha256.as_str(),
+                report.published_sequence,
+                &j.original_profile,
+            )
+        } else {
+            (
+                j.candidate_sha256.as_str(),
+                j.selected_sequence,
+                &j.selected_profile,
+            )
+        };
+        let scope = if profile.catalog_identity.trim().is_empty() {
+            j.destination.to_str().ok_or_else(|| l.verification())?
+        } else {
+            profile.catalog_identity.as_str()
+        };
+        let template = CanonicalReconciliation {
+            version: 1,
+            operation_id: j.operation_id,
+            image_sha256: sha,
+            published_sequence: sequence,
+            operator: &j.binding.operator,
+            recorded_at_unix_ms: u128::MAX,
+            affected_scopes: [scope],
+            identity_confirmed: true,
+            reference_closure_confirmed: true,
+            external_effect_coverage_confirmed: true,
+            source_publication_resolution_sha256: RESERVATION_SHA,
+            clients: CanonicalClients {
+                clients_invalidated: true,
+                rpc_sessions_restarted: true,
+                transactions_drained: true,
+                caches_invalidated: true,
+                retry_assumptions_reconciled: true,
+                evidence_sha256: RESERVATION_SHA,
+            },
+            dependencies: CanonicalDependencies(&dependencies.references),
+            external_outcomes: [],
+            unresolved_items: [],
+            index: IndexReadiness::Degraded,
+        };
+        let q = measure(&template, p, l)?.0;
+        l.quota(q, caps.evidence, "restore mandatory terminal evidence")?;
+        // The borrowed template has no heap allocation. Admit its owned model,
+        // the selected synthetic report and readiness scratch BEFORE allocating
+        // any of them, one role at a time. Immutable loaded metadata stays borrowed.
+        let scratch = q
+            .checked_mul(64)
+            .and_then(|n| n.checked_add(8192))
+            .and_then(|n| {
+                n.checked_add(
+                    (dependencies.references.len() as u64)
+                        .checked_mul(std::mem::size_of::<&DependencyResolution>() as u64)?,
+                )
+            })
+            .ok_or_else(|| l.verification())?;
+        let scoped = l.with_retained_memory(scratch)?;
+        let record = ReconciliationRecord {
+            version: 1,
+            operation_id: j.operation_id,
+            image_sha256: sha.into(),
+            published_sequence: sequence,
+            operator: j.binding.operator.clone(),
+            recorded_at_unix_ms: u128::MAX,
+            affected_scopes: vec![scope.into()],
+            identity_confirmed: true,
+            reference_closure_confirmed: true,
+            external_effect_coverage_confirmed: true,
+            source_publication_resolution_sha256: RESERVATION_SHA.into(),
+            clients: ClientReconciliation {
+                clients_invalidated: true,
+                rpc_sessions_restarted: true,
+                transactions_drained: true,
+                caches_invalidated: true,
+                retry_assumptions_reconciled: true,
+                evidence_sha256: RESERVATION_SHA.into(),
+            },
+            dependencies: dependencies
+                .references
+                .iter()
+                .map(|d| DependencyResolution {
+                    reference_sha256: d.reference_sha256.clone(),
+                    catalog_identity: d.catalog_identity.clone(),
+                    observed_sequence: d.required_sequence.unwrap_or(u64::MAX),
+                    evidence_sha256: RESERVATION_SHA.into(),
+                })
+                .collect(),
+            external_outcomes: vec![],
+            unresolved_items: vec![],
+            index: IndexReadiness::Degraded,
+        };
+        // assess_readiness reads only identity, sequence and dependency count
+        // from the report; these are the actual immutable selected generation.
+        let selected_report;
+        let report = if original {
+            j.original_verification
+                .as_ref()
+                .ok_or_else(|| l.verification())?
+        } else {
+            selected_report = super::VerificationReport {
+                report_version: 1,
+                copy_evidence: None,
+                operation_id: j.operation_id.to_string(),
+                image_sha256: sha.into(),
+                image_bytes: j.candidate_bytes,
+                published_sequence: sequence,
+                logical_sha256: j.selected_logical_sha256.clone(),
+                profile_version: profile.version,
+                profile_sha256: j.binding.profile_sha256.clone(),
+                canonical_encoding_version: 1,
+                intrinsic_lineage_available: false,
+                external_publish_status:
+                    crate::ferrostore::ExternalPublishStatus::ExclusionUnprovenBeforeSingleOwnership,
+                verified_collection_count: 0,
+                unknown_collection_count: 0,
+                opaque_runtime_references: false,
+                query_probe_count: 0,
+                exception_count: 0,
+                dependency_count: dependencies.references.len() as u64,
+                transient_rpc_dedupe_persisted: false,
+                durable_rpc_receipts_claimed: false,
+                readiness: super::manifest::Readiness::VerifiedLocalContents,
+                verifier_build_identity: super::manifest::BuildIdentity {
+                    package_version: String::new(),
+                    source_revision: Availability::Unavailable,
+                    executable_sha256: Availability::Unavailable,
+                },
+            };
+            &selected_report
+        };
+        scoped.check()?;
+        if !assess_readiness(report, dependencies, &record).ordinary_admission_ready {
+            return Err(fs::refused(
+                &scoped,
+                "mandatory terminal reconciliation cannot be satisfied",
+            ));
+        }
+    }
+    if matches!(j.original, FileBinding::Absent) {
+        #[derive(Serialize)]
+        struct Absence<'a> {
+            version: u32,
+            operation_id: uuid::Uuid,
+            candidate_sha256: &'a str,
+            operator: &'a str,
+            recorded_at_unix_ms: u128,
+            no_client_opened_path_while_installed: bool,
+            evidence_sha256: &'static str,
+        }
+        let absence = Absence {
+            version: 1,
+            operation_id: j.operation_id,
+            candidate_sha256: &j.candidate_sha256,
+            operator: &j.binding.operator,
+            recorded_at_unix_ms: u128::MAX,
+            no_client_opened_path_while_installed: true,
+            evidence_sha256: RESERVATION_SHA,
+        };
+        l.quota(
+            measure(&absence, p, l)?.0,
+            caps.evidence,
+            "restore mandatory absence evidence",
+        )?;
+    }
+    Ok(())
+}
+
+// Count borrowed inputs against the immutable reservation BEFORE any
 // evidence/context clone or durable attempt. Shape charges caller capacities and
 // all simultaneously live clones, including readiness results.
 fn terminal_input_scope(
@@ -2235,24 +2663,31 @@ fn terminal_input_scope(
         shape.absence(record)?;
     }
     let scoped = shape.finish(2, l)?;
-    let lease_bytes = metadata::measure(&lease.request, caps.payload, &scoped)?.0;
-    let evidence_bytes = if let Some(record) = record {
-        metadata::measure(record, caps.payload, &scoped)?.0
-    } else if let Some(record) = absence {
-        metadata::measure(record, caps.payload, &scoped)?.0
-    } else {
-        0
-    };
-    // Context's three SHA arrays and optional SHA arrays need at most 1024B in
-    // compact JSON. Count the full lease and evidence separately; current null
-    // fields stay included, giving a conservative upper bound, never a discount.
-    let bound = metadata::measure(j, caps.payload, &scoped)?
-        .0
-        .checked_add(lease_bytes)
-        .and_then(|n| n.checked_add(evidence_bytes))
-        .and_then(|n| n.checked_add(1024))
-        .ok_or_else(|| l.verification())?;
-    caps.frame(bound, &scoped)?;
+    let reserved = terminal_caps(j, &scoped)?;
+    l.quota(
+        metadata::measure(&lease.request.operator, caps.payload, &scoped)?.0,
+        reserved.operator,
+        "restore accepting operator",
+    )?;
+    l.quota(
+        metadata::measure(&lease.request, caps.payload, &scoped)?.0,
+        reserved.lease,
+        "restore accepting lease",
+    )?;
+    if let Some(record) = record {
+        l.quota(
+            metadata::measure(record, caps.payload, &scoped)?.0,
+            reserved.evidence,
+            "restore accepting evidence",
+        )?;
+    }
+    if let Some(record) = absence {
+        l.quota(
+            metadata::measure(record, caps.payload, &scoped)?.0,
+            reserved.evidence,
+            "restore accepting evidence",
+        )?;
+    }
     Ok(scoped)
 }
 
@@ -4689,6 +5124,7 @@ fn check_generation_metadata(j: &RestoreJournal, l: &OperationLimits) -> Result<
     }
     if let Some(report) = &j.verification
         && (report.report_version != 1
+            || report.verifier_build_identity != j.binding.build
             || report.profile_version != j.selected_profile.version
             || report.image_bytes != j.candidate_bytes
             || report.image_sha256 != j.candidate_sha256
@@ -5435,6 +5871,106 @@ mod metadata_tests {
                 .unwrap()
                 .1;
         j
+    }
+    #[test]
+    fn terminal_reservation_persisted_candidate_build_must_equal_admission() {
+        let l = limits();
+        let mut j = fixture();
+        check_generation_metadata(&j, &l).unwrap();
+        j.verification
+            .as_mut()
+            .unwrap()
+            .verifier_build_identity
+            .package_version
+            .push_str("different producer");
+        assert!(check_generation_metadata(&j, &l).is_err());
+    }
+    #[test]
+    fn terminal_reservation_original_report_keeps_its_independent_build() {
+        let l = limits();
+        let mut j = fixture();
+        j.original_verification
+            .as_mut()
+            .unwrap()
+            .verifier_build_identity
+            .package_version = "old producer \"\n".repeat(128);
+        j.generation_metadata_sha256 = metadata::measure(
+            &generation_metadata(&j),
+            metadata::Caps::new(j.journal_capacity, &l).unwrap().payload,
+            &l,
+        )
+        .unwrap()
+        .1;
+        check_generation_metadata(&j, &l).unwrap();
+    }
+    #[test]
+    fn terminal_reservation_report_schema_has_a_complete_encoded_build_bound() {
+        let l = limits();
+        let mut j = fixture();
+        let expected = TerminalCaps {
+            operator: 18,
+            lease: 1182,
+            evidence: 1635,
+        };
+        assert_eq!(terminal_caps(&j, &l).unwrap(), expected);
+        j.phase = RestorePhase::OriginalAbsenceFinalized;
+        j.resume_finalize_attempts = u32::MAX;
+        j.rollback_attempts = u32::MAX;
+        j.current_attempt = u32::MAX;
+        j.attempt_deadline_unix_ms = u128::MAX;
+        j.verification = None;
+        assert_eq!(terminal_caps(&j, &l).unwrap(), expected);
+        let old_build_bytes = metadata::measure(&j.binding.build, 10168, &l).unwrap().0;
+        j.binding.build.package_version = "escaped \"\n".repeat(8);
+        let build_growth =
+            metadata::measure(&j.binding.build, 10168, &l).unwrap().0 - old_build_bytes;
+        let expanded = terminal_caps(&j, &l).unwrap();
+        assert_eq!(expanded.lease, expected.lease + build_growth);
+        assert_eq!(expanded.evidence, expected.evidence - 3 * build_growth);
+        let mut report = fixture().verification.unwrap();
+        report.report_version = u32::MAX;
+        report.profile_version = u32::MAX;
+        report.canonical_encoding_version = u32::MAX;
+        report.image_bytes = u64::MAX;
+        report.published_sequence = u64::MAX;
+        report.verified_collection_count = u64::MAX;
+        report.unknown_collection_count = u64::MAX;
+        report.query_probe_count = u64::MAX;
+        report.exception_count = u64::MAX;
+        report.dependency_count = u64::MAX;
+        report.readiness = super::super::manifest::Readiness::DependenciesRequireReconciliation;
+        let copy = report.copy_evidence.as_mut().unwrap();
+        copy.verified_file_identity = (u64::MAX, u64::MAX);
+        copy.source_image_identity = Some((u64::MAX, u64::MAX));
+        report.verifier_build_identity.package_version = "escaped \"\n".repeat(64);
+        let build = metadata::measure(&report.verifier_build_identity, 10168, &l)
+            .unwrap()
+            .0;
+        assert_eq!(
+            metadata::measure(&report, 10168, &l).unwrap().0,
+            1265 + build
+        );
+        assert_eq!(
+            metadata::measure(&maximum_report(&report.verifier_build_identity), 10168, &l)
+                .unwrap()
+                .0,
+            1265 + build
+        );
+        let context = TerminalEvidenceContext {
+            mode: TerminalMode::OriginalAbsence,
+            accepting_lease: j.binding.clone(),
+            accepting_lease_sha256: [255; 32],
+            admission_generation_sha256: [255; 32],
+            prepared_report_sha256: Some([255; 32]),
+            reconciliation_sha256: Some([255; 32]),
+            accepted_at_unix_ms: u128::MAX,
+        };
+        let envelope = metadata::measure(&context, 10168, &l).unwrap().0
+            - metadata::measure(&context.accepting_lease, 10168, &l)
+                .unwrap()
+                .0;
+        assert_eq!(envelope, 732);
+        assert!(envelope <= TERMINAL_CONTEXT_ENVELOPE_MAX);
     }
     fn selected_record(j: &RestoreJournal) -> ReconciliationRecord {
         let dep = &j.selected_dependencies.references[0];
