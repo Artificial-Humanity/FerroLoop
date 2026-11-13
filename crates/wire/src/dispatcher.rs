@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
@@ -157,6 +159,7 @@ pub fn dispatch_to_route_for_recipient_with_status(
             .map(|()| DeliveryStatus::Acked)
         }
         VendorRoute::HostCli {
+            vendor,
             session_id,
             tmux_target,
             tmux_pane,
@@ -164,6 +167,7 @@ pub fn dispatch_to_route_for_recipient_with_status(
         } => {
             let formatted = format_push_message(msg);
             deliver_to_host_cli_route(
+                vendor,
                 session_id,
                 tmux_target.as_deref(),
                 tmux_pane.as_deref(),
@@ -456,6 +460,7 @@ fn dispatch_to_claude(
                             verify_submission: true,
                             session_id: Some(session_id).filter(|s| !s.trim().is_empty()),
                             is_muse_route: false,
+                            composer_style: ComposerStyle::Ruled,
                         },
                     );
                 }
@@ -589,6 +594,7 @@ fn push_claude_tmux(
             verify_submission: true,
             session_id: Some(session_id).filter(|s| !s.trim().is_empty()),
             is_muse_route: false,
+            composer_style: ComposerStyle::Ruled,
         },
     )
 }
@@ -1493,6 +1499,7 @@ fn deliver_to_agy_route(
 }
 
 fn deliver_to_host_cli_route(
+    vendor: &str,
     session_id: &str,
     tmux_target: Option<&str>,
     tmux_pane: Option<&str>,
@@ -1508,7 +1515,11 @@ fn deliver_to_host_cli_route(
     }
     for target in &candidates {
         if tmux_target_alive(target) {
-            return deliver_via_tmux_paste(target, text);
+            return deliver_via_tmux_paste_with_style(
+                target,
+                text,
+                ComposerStyle::for_vendor(vendor),
+            );
         }
     }
     Err("the host_cli route's session is not live".to_string())
@@ -2528,9 +2539,25 @@ fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
 }
 
+pub(crate) fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
+    is_composer_occupied_error(err) && err.contains("without sending keys")
+}
+
 fn composer_occupied_by_non_wire_input_error() -> String {
     format!(
         "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input or active dialog; holding delivery without sending keys"
+    )
+}
+
+fn composer_occupied_after_pre_paste_flush_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input after pre-paste flush Enter; holding delivery"
+    )
+}
+
+fn composer_occupied_after_paste_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input after paste; aborting Enter retries"
     )
 }
 
@@ -2818,22 +2845,24 @@ fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
         .copied()
         .filter(|l| !l.trim().is_empty())
         .collect();
-    if !non_empty_tail
-        .iter()
-        .rev()
-        .take(3)
-        .any(|l| l.contains("[Pasted Content"))
-    {
+    let recent = &non_empty_tail[non_empty_tail.len().saturating_sub(3)..];
+    let slice = if let Some(prompt_pos) = recent.iter().rposition(|l| line_starts_with_prompt(l)) {
+        &recent[prompt_pos..]
+    } else if recent.iter().any(|l| l.contains("[Pasted Content")) {
+        if let Some(prompt_pos) = non_empty_tail
+            .iter()
+            .rposition(|l| line_starts_with_prompt(l))
+        {
+            &non_empty_tail[prompt_pos..]
+        } else {
+            recent
+        }
+    } else {
+        return None;
+    };
+    if lines_have_dialog_or_menu_markers(slice) {
         return None;
     }
-    let slice = if let Some(prompt_pos) = non_empty_tail
-        .iter()
-        .rposition(|l| line_starts_with_prompt(l))
-    {
-        &non_empty_tail[prompt_pos..]
-    } else {
-        &non_empty_tail[non_empty_tail.len().saturating_sub(3)..]
-    };
     build_compact_from_composer_slice(slice, false)
 }
 
@@ -2972,12 +3001,46 @@ fn composer_equals_recorded_wire_deliveries_on_lines(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerStyle {
+    /// Vendor draws a rule-delimited composer (Claude, Muse, Antigravity): fail closed
+    /// when `composer_region_lines` cannot locate it.
+    Ruled,
+    /// Vendor draws no rules (Codex, Grok, HostCli codex/grok, unknown): keep the
+    /// pre-r2 behaviour; the compact extraction still applies.
+    Ruleless,
+}
+
+impl ComposerStyle {
+    fn for_vendor(vendor: &str) -> Self {
+        match crate::identity::canonical_vendor_id(vendor) {
+            "claude" | "muse" | "antigravity" => Self::Ruled,
+            _ => Self::Ruleless,
+        }
+    }
+    fn for_route(route: &VendorRoute) -> Self {
+        Self::for_vendor(route.canonical_vendor())
+    }
+    /// Derive from an `fl-host` session id (`Ada.claude`, `muse.ada`, `Fiona.codex`,
+    /// `Feira.antigravity`); unknown ids keep the old (ruleless) behaviour.
+    fn for_host_session(session_id: &str) -> Self {
+        for token in session_id.split(['.', ':']) {
+            let v = crate::identity::canonical_vendor_id(token);
+            if matches!(v, "claude" | "muse" | "antigravity") {
+                return Self::Ruled;
+            }
+        }
+        Self::Ruleless
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TmuxPasteOptions<'a> {
     bracketed: bool,
     verify_submission: bool,
     session_id: Option<&'a str>,
     is_muse_route: bool,
+    composer_style: ComposerStyle,
 }
 
 impl<'a> TmuxPasteOptions<'a> {
@@ -2987,6 +3050,7 @@ impl<'a> TmuxPasteOptions<'a> {
             verify_submission: true,
             session_id: None,
             is_muse_route: false,
+            composer_style: ComposerStyle::Ruleless,
         }
     }
 }
@@ -2996,6 +3060,7 @@ struct VerifiedDeliverySpec<'a> {
     transcript_target: &'a str,
     session_id: Option<&'a str>,
     is_muse_route: bool,
+    composer_style: ComposerStyle,
     bracketed: bool,
     verify_submission: bool,
     raw_text: Option<&'a str>,
@@ -3026,9 +3091,11 @@ fn execute_verified_paste_delivery(
     }
 
     if spec.verify_submission && !trimmed.is_empty() {
-        let prep = prepare_clean_composer_before_paste_for_route(
+        let prep = prepare_clean_composer_before_paste_impl(
             trimmed,
             &spec.route_keys,
+            spec.is_muse_route,
+            spec.composer_style,
             &mut wait,
             &mut capture_rendered,
             || transcript.confirmed(trimmed),
@@ -3075,7 +3142,11 @@ fn execute_verified_paste_delivery(
                     break;
                 }
                 if composer_is_rendering_target_prefix(&contents, &d_target)
-                    || !composer_has_unsubmitted_content(&contents, cursor)
+                    || !composer_has_unsubmitted_content_for_route(
+                        &contents,
+                        cursor,
+                        spec.is_muse_route,
+                    )
                 {
                     continue;
                 }
@@ -3094,9 +3165,10 @@ fn execute_verified_paste_delivery(
     if !spec.verify_submission || trimmed.is_empty() {
         return Ok(());
     }
-    match confirm_paste_submission_with_raw(
+    match confirm_paste_submission_with_raw_for_route(
         trimmed,
         spec.raw_text,
+        spec.is_muse_route,
         &mut wait,
         &mut capture_screen,
         || transcript.confirmed(trimmed),
@@ -3156,7 +3228,9 @@ fn capture_host_rendered_screen(
 }
 
 fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
-    deliver_via_tmux_paste_with_opts(target, text, TmuxPasteOptions::verified(false))
+    let mut opts = TmuxPasteOptions::verified(false);
+    opts.composer_style = ComposerStyle::for_host_session(target);
+    deliver_via_tmux_paste_with_opts(target, text, opts)
 }
 
 /// Write `text` to a raw-mode `fl-host` session, then press Enter as its own 1-byte `\r` write
@@ -3190,6 +3264,7 @@ pub fn host_write_text_then_enter(
         transcript_target: &session_str,
         session_id: None,
         is_muse_route: false,
+        composer_style: ComposerStyle::for_host_session(&session_str),
         bracketed: false,
         verify_submission: true,
         raw_text: Some(text),
@@ -3439,7 +3514,19 @@ impl ScreenCapture {
 /// (`C-u`) so a retry does not leave the message twice; on the `fl-host` branch, an unconfirmed
 /// `Enter` leaves the text in the composer for operator inspection.
 fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Result<(), String> {
-    deliver_via_tmux_paste_with_opts(target, text, TmuxPasteOptions::verified(bracketed))
+    let mut opts = TmuxPasteOptions::verified(bracketed);
+    opts.composer_style = ComposerStyle::for_host_session(target);
+    deliver_via_tmux_paste_with_opts(target, text, opts)
+}
+
+fn deliver_via_tmux_paste_with_style(
+    target: &str,
+    text: &str,
+    composer_style: ComposerStyle,
+) -> Result<(), String> {
+    let mut opts = TmuxPasteOptions::verified(false);
+    opts.composer_style = composer_style;
+    deliver_via_tmux_paste_with_opts(target, text, opts)
 }
 
 fn deliver_via_tmux_paste_with_session(
@@ -3457,6 +3544,11 @@ fn deliver_via_tmux_paste_with_session(
             verify_submission: true,
             session_id,
             is_muse_route,
+            composer_style: if is_muse_route {
+                ComposerStyle::Ruled
+            } else {
+                ComposerStyle::for_host_session(target)
+            },
         },
     )
 }
@@ -3487,6 +3579,7 @@ fn deliver_via_tmux_paste_with_opts(
             transcript_target: raw_target,
             session_id: opts.session_id,
             is_muse_route: opts.is_muse_route,
+            composer_style: opts.composer_style,
             bracketed: opts.bracketed,
             verify_submission: opts.verify_submission,
             raw_text: None,
@@ -3559,6 +3652,7 @@ fn deliver_via_tmux_paste_with_opts(
         transcript_target: raw_target,
         session_id: opts.session_id,
         is_muse_route: opts.is_muse_route,
+        composer_style: opts.composer_style,
         bracketed: opts.bracketed,
         verify_submission: opts.verify_submission,
         raw_text: None,
@@ -3814,9 +3908,33 @@ fn prepare_clean_composer_before_paste(
 /// sent. Only content proven to equal 1 or more ordered recorded unconfirmed FerroWire deliveries
 /// for `route_keys` ([`composer_equals_recorded_wire_deliveries`]) is flushed via
 /// [`run_bounded_enter_retry_loop`].
+#[cfg(test)]
 fn prepare_clean_composer_before_paste_for_route(
     trimmed: &str,
     route_keys: &[String],
+    wait: impl FnMut(Duration),
+    capture_rendered_only: impl FnMut() -> Option<(String, Option<CursorState>)>,
+    transcript_confirmed: impl FnMut() -> bool,
+    send_enter: impl FnMut() -> Result<(), String>,
+) -> Result<PrePasteOutcome, String> {
+    prepare_clean_composer_before_paste_impl(
+        trimmed,
+        route_keys,
+        true,
+        ComposerStyle::Ruled,
+        wait,
+        capture_rendered_only,
+        transcript_confirmed,
+        send_enter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_clean_composer_before_paste_impl(
+    trimmed: &str,
+    route_keys: &[String],
+    is_muse_route: bool,
+    composer_style: ComposerStyle,
     mut wait: impl FnMut(Duration),
     mut capture_rendered_only: impl FnMut() -> Option<(String, Option<CursorState>)>,
     mut transcript_confirmed: impl FnMut() -> bool,
@@ -3828,10 +3946,16 @@ fn prepare_clean_composer_before_paste_for_route(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
+    if composer_style == ComposerStyle::Ruled
+        && !contents1.trim().is_empty()
+        && !composer_region_located(&contents1)
+    {
+        return Err(composer_occupied_by_non_wire_input_error());
+    }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content(&contents1, cursor1) {
+    if !composer_has_unsubmitted_content_for_route(&contents1, cursor1, is_muse_route) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -3854,10 +3978,16 @@ fn prepare_clean_composer_before_paste_for_route(
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
+    if composer_style == ComposerStyle::Ruled
+        && !contents2.trim().is_empty()
+        && !composer_region_located(&contents2)
+    {
+        return Err(composer_occupied_by_non_wire_input_error());
+    }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content(&contents2, cursor2) {
+    if !composer_has_unsubmitted_content_for_route(&contents2, cursor2, is_muse_route) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -3885,12 +4015,20 @@ fn prepare_clean_composer_before_paste_for_route(
             let Some((contents, cursor)) = capture_rendered_only() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
-                return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
+            if composer_style == ComposerStyle::Ruled
+                && !contents.trim().is_empty()
+                && !composer_region_located(&contents)
+            {
+                return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
-            if composer_has_unsubmitted_content(&contents, cursor) {
+            if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
+                return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
+            }
+            if composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route) {
                 if !composer_equals_recorded_wire_deliveries(&contents, route_keys) {
-                    return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
+                    return RetryPollDecision::Abort(
+                        composer_occupied_after_pre_paste_flush_error(),
+                    );
                 }
                 preexisting_matches_target.set(
                     preexisting_matches_target.get()
@@ -3948,9 +4086,31 @@ fn confirm_paste_submission(
     .map(|_| ())
 }
 
+#[cfg(test)]
 fn confirm_paste_submission_with_raw(
     trimmed: &str,
     raw_text: Option<&str>,
+    wait: impl FnMut(Duration),
+    capture_screen: impl FnMut() -> Option<ScreenCapture>,
+    transcript_confirmed: impl FnMut() -> bool,
+    send_enter: impl FnMut() -> Result<(), String>,
+) -> Result<PostPasteOutcome, String> {
+    confirm_paste_submission_with_raw_for_route(
+        trimmed,
+        raw_text,
+        true,
+        wait,
+        capture_screen,
+        transcript_confirmed,
+        send_enter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_paste_submission_with_raw_for_route(
+    trimmed: &str,
+    raw_text: Option<&str>,
+    is_muse_route: bool,
     wait: impl FnMut(Duration),
     mut capture_screen: impl FnMut() -> Option<ScreenCapture>,
     mut transcript_confirmed: impl FnMut() -> bool,
@@ -4010,10 +4170,9 @@ fn confirm_paste_submission_with_raw(
                             exhausted_detail: "composer still rendering pasted payload",
                         };
                     }
-                    if composer_has_unsubmitted_content(&contents, cursor) {
-                        return RetryPollDecision::Abort(
-                            composer_occupied_by_non_wire_input_error(),
-                        );
+                    if composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route)
+                    {
+                        return RetryPollDecision::Abort(composer_occupied_after_paste_error());
                     }
                     last_poll_rendered_empty.set(true);
                     if composer_visibly_submitted_with_cursor_and_raw(
@@ -4436,6 +4595,123 @@ fn is_known_static_ghost_placeholder(ghost_text: &str) -> bool {
         || ghost_text.starts_with("? for shortcuts")
 }
 
+fn is_known_static_ghost_placeholder_for_route(ghost_text: &str, is_muse_route: bool) -> bool {
+    is_known_static_ghost_placeholder(ghost_text)
+        || (is_muse_route && is_muse_placeholder_hint(ghost_text))
+}
+
+/// Muse rotates grey hint texts in an empty composer (for example
+/// `/resume reopens a past session (--last for the latest)`). The rendered capture does not
+/// always carry ghost styling for them, so recognise the maintained hint list and the
+/// leading-slash hint pattern: a `/command` followed by a descriptive sentence. This is only
+/// consulted inside the ghost gate in `composer_has_unsubmitted_content`, where the cursor
+/// sits immediately after the prompt prefix — real typed input has the cursor past the text.
+// Complete composer placeholder hint set extracted from the installed Muse build
+// Muse Code 1.4.18 (1.4.18-R8587.1), binary `~/.local/bin/muse-bin-1.4.18-R8587.1`
+// (strings table adjacent to `/resume reopens a past session (--last for the latest)`).
+const MUSE_HINTS: &[&str] = &[
+    "Type @ to search and insert workspace file paths",
+    "Start a message with ! to run a shell command yourself",
+    "Paste an image with Ctrl+V \u{2014} file paths and URLs work too",
+    "Press Alt+V to dictate instead of typing",
+    "Tab queues or steers while a run is active",
+    "Press ? on an empty composer to see keyboard shortcuts",
+    "Press Ctrl+O to expand collapsed tool output",
+    "/side asks a quick question without touching this thread",
+    "/fork branches the conversation from the latest point",
+    "/goal pins a session objective with a progress bar",
+    "/resume reopens a past session (--last for the latest)",
+    "Ask to 'use a workflow' to fan out parallel agents on big tasks",
+    "Say 'use a workflow' to fan out agents on big tasks",
+    "Ask to monitor a running build or log and get pinged on changes",
+    "/agent opens the subagent command center",
+    "/tasks shows workflows, subagents and terminals in one place",
+    "/loop 10m <prompt> schedules a recurring prompt",
+    "Ctrl+B sends the selected task to the background queue",
+    "/skills browses ready-made skills for repeatable procedures",
+    "/plugins marketplace installs new commands and skills",
+    "/effort adjusts reasoning depth vs speed",
+    "/usage shows this session's token usage",
+    "/export saves the conversation to a text file",
+];
+
+fn is_muse_placeholder_hint(ghost_text: &str) -> bool {
+    // Exact list only, Muse routes only (see `is_known_static_ghost_placeholder_for_route`):
+    // a typed `/review the open PR please` is real input, not a hint.
+    MUSE_HINTS.contains(&ghost_text)
+}
+
+/// Prompt-start candidate on a Muse route that is not a known ghost/hint, if any.
+/// Mirrors the single-line ghost gate in `composer_has_unsubmitted_content_for_route`.
+fn unlisted_muse_prompt_start_candidate(
+    screen: &str,
+    cursor: Option<CursorState>,
+) -> Option<String> {
+    if composer_shows_pasted_placeholder(screen) {
+        return None;
+    }
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let (composer_lines, top_rule) = composer_region_lines(&lines)?;
+    let non_empty: Vec<(usize, &str)> = composer_lines
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, line)| !strip_composer_prompt_prefix(line).trim().is_empty())
+        .collect();
+    let [(rel_idx, line)] = non_empty.as_slice() else {
+        return None;
+    };
+    if !line_starts_with_prompt(line) {
+        return None;
+    }
+    let cs = cursor?;
+    let leading_ws = line.chars().take_while(|c| c.is_whitespace()).count();
+    if usize::from(cs.col) > leading_ws + 2
+        || !cs
+            .dims
+            .is_none_or(|(_, cols)| cols == 0 || line.chars().count() < usize::from(cols))
+    {
+        return None;
+    }
+    let prompt_idx = top_rule + 1 + rel_idx;
+    let lines_below = lines.len().saturating_sub(1 + prompt_idx);
+    let exact_row = usize::from(cs.row) == prompt_idx;
+    let soft_wrapped = composer_lines.len() == rel_idx + 1
+        && cs.dims.is_some_and(|(rows, _)| {
+            usize::from(cs.row) >= prompt_idx
+                && usize::from(cs.row).saturating_add(lines_below) < usize::from(rows)
+        });
+    if !exact_row && !soft_wrapped {
+        return None;
+    }
+    let ghost_text = strip_composer_prompt_prefix(line).trim();
+    if ghost_text.is_empty()
+        || cs.ghost_styled
+        || is_known_static_ghost_placeholder_for_route(ghost_text, true)
+        || ansi_stream_styles_ghost_text(screen, ghost_text)
+    {
+        return None;
+    }
+    Some(ghost_text.to_string())
+}
+
+fn unlisted_muse_hint_log_line(candidate: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+    format!(
+        "muse composer held: unlisted prompt-start candidate len={} sha256={}",
+        candidate.len(),
+        &digest[..12]
+    )
+}
+
+fn log_unlisted_muse_hint(candidate: &str) {
+    let line = unlisted_muse_hint_log_line(candidate);
+    #[cfg(test)]
+    UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().push(line.clone()));
+    eprintln!("fl-wire: warning: {line}");
+}
+
 /// `true` when `raw_ansi` applies ANSI dim/faint/gray SGR styling (`\x1b[2m`, `\x1b[90m`,
 /// `\x1b[38;5;240..255m`, or muted `\x1b[38;2;...m`) to `ghost_text` at its last occurrence.
 fn ansi_stream_styles_ghost_text(raw_ansi: &str, ghost_text: &str) -> bool {
@@ -4585,7 +4861,22 @@ fn ansi_stream_styles_ghost_text(raw_ansi: &str, ghost_text: &str) -> bool {
 /// `[Pasted Content` placeholder, ignoring ghost prompt suggestions ONLY when the cursor sits
 /// immediately after the prompt prefix AND the text is ghost-styled (`\x1b[2m` / gray SGR) or a
 /// known static vendor placeholder.
+#[cfg(test)]
 fn composer_has_unsubmitted_content(screen: &str, cursor: Option<CursorState>) -> bool {
+    composer_has_unsubmitted_content_for_route(screen, cursor, true)
+}
+
+fn composer_region_located(screen: &str) -> bool {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    composer_region_lines(&lines).is_some()
+}
+
+fn composer_has_unsubmitted_content_for_route(
+    screen: &str,
+    cursor: Option<CursorState>,
+    is_muse_route: bool,
+) -> bool {
     if composer_shows_pasted_placeholder(screen) {
         return true;
     }
@@ -4623,7 +4914,7 @@ fn composer_has_unsubmitted_content(screen: &str, cursor: Option<CursorState>) -
                 });
             let ghost_text = strip_composer_prompt_prefix(line).trim();
             let proven_ghost = cs.ghost_styled
-                || is_known_static_ghost_placeholder(ghost_text)
+                || is_known_static_ghost_placeholder_for_route(ghost_text, is_muse_route)
                 || ansi_stream_styles_ghost_text(screen, ghost_text);
             if (exact_row || soft_wrapped_scrollback_row) && proven_ghost {
                 return false;
@@ -5572,6 +5863,107 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     })
 }
 
+/// Passively inspect `route`'s terminal composer without sending any keys.
+///
+/// Returns `Some(true)` when a rendered capture shows no dialog/menu markers and either an empty
+/// composer or only recorded unconfirmed FerroWire deliveries for `route`; `Some(false)` when the
+/// composer still holds non-wire input or an active dialog/menu; and `None` when the route does not
+/// use terminal composer verification or its rendered screen cannot be captured right now.
+pub(crate) fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
+    let target = match route {
+        VendorRoute::Muse {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::HostCli {
+            session_id,
+            tmux_target,
+            tmux_pane,
+            ..
+        } => tmux_pane
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| tmux_target.as_deref().filter(|s| !s.trim().is_empty()))
+            .unwrap_or(session_id.as_str())
+            .to_string(),
+        VendorRoute::Claude { .. } => claude_route_live_pane(route)?,
+        VendorRoute::Codex { .. } | VendorRoute::Agy { .. } | VendorRoute::Webhook { .. } => {
+            return None;
+        }
+    };
+    if target.trim().is_empty() {
+        return None;
+    }
+    let (contents, cursor, route_keys) = if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+        && let Some((mut client, stream, true)) = resolve_live_host_session_with_mode(&target)
+    {
+        let (contents, cursor) = capture_host_rendered_screen(&mut client, &stream)?.into_parts();
+        let route_keys = vec![
+            format!("host:{}", stream.session.as_str()),
+            format!("target:{target}"),
+        ];
+        (contents, cursor, route_keys)
+    } else {
+        let exact = tmux_exact_target(&target);
+        if !tmux_target_alive_passive(&exact) {
+            return None;
+        }
+        let (contents, cursor) = capture_tmux_rendered_screen(&tmux_bin(), &exact)?.into_parts();
+        let route_keys = vec![format!("tmux:{exact}"), format!("target:{target}")];
+        (contents, cursor, route_keys)
+    };
+    let is_muse_route = matches!(route, VendorRoute::Muse { .. });
+    probe_composer_ready_from_screen(
+        &contents,
+        cursor,
+        &route_keys,
+        ComposerStyle::for_route(route),
+        is_muse_route,
+    )
+}
+
+/// Core of [`probe_route_composer_ready`] on an already-captured screen.
+/// Ruled vendors fail closed (`None`) on an unlocated composer; ruleless vendors keep the
+/// old behaviour and are judged by the compact extraction, so an idle ruleless screen
+/// yields `Some(true)` instead of `None` forever.
+fn probe_composer_ready_from_screen(
+    contents: &str,
+    cursor: Option<CursorState>,
+    route_keys: &[String],
+    composer_style: ComposerStyle,
+    is_muse_route: bool,
+) -> Option<bool> {
+    if composer_style == ComposerStyle::Ruled
+        && !contents.trim().is_empty()
+        && !composer_region_located(contents)
+    {
+        return None;
+    }
+    if screen_has_dialog_or_menu_markers_with_context(contents, None, None, route_keys) {
+        return Some(false);
+    }
+    if !composer_has_unsubmitted_content_for_route(contents, cursor, is_muse_route)
+        || composer_equals_recorded_wire_deliveries(contents, route_keys)
+    {
+        Some(true)
+    } else {
+        if is_muse_route
+            && let Some(candidate) = unlisted_muse_prompt_start_candidate(contents, cursor)
+        {
+            log_unlisted_muse_hint(&candidate);
+        }
+        Some(false)
+    }
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -5605,6 +5997,7 @@ pub fn dispatch_operator_prompt_to_route(
                                     session_id: Some(session_id.as_str())
                                         .filter(|s| !s.trim().is_empty()),
                                     is_muse_route: false,
+                                    composer_style: ComposerStyle::Ruled,
                                 },
                             );
                         }
@@ -5632,6 +6025,7 @@ pub fn dispatch_operator_prompt_to_route(
                         verify_submission: true,
                         session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
                         is_muse_route: false,
+                        composer_style: ComposerStyle::Ruled,
                     },
                 );
             }
@@ -5724,11 +6118,13 @@ pub fn dispatch_operator_prompt_to_route(
             body,
         ),
         VendorRoute::HostCli {
+            vendor,
             session_id,
             tmux_target,
             tmux_pane,
             ..
         } => deliver_to_host_cli_route(
+            vendor,
             session_id,
             tmux_target.as_deref(),
             tmux_pane.as_deref(),
@@ -5931,8 +6327,15 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
             continue;
         };
         attempted = true;
+        // Keys may have been sent by either dispatch call; a later zero-key hold must not
+        // erase that (duplicate-delivery risk), so track it across the re-route retry.
+        let mut may_have_sent_keys = false;
         let slot = report.record_call_started(&entry);
         let mut pushed = dispatch(&entry.route, Some(rcpt.recipient_name.as_str()), msg);
+        if let Err(ref e) = pushed {
+            may_have_sent_keys = matches!(e, PushError::Failed(_))
+                && !is_composer_occupied_zero_keys_error(e.as_str());
+        }
         report.record_call_finished(
             slot,
             if pushed.is_ok() {
@@ -5964,6 +6367,11 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                 {
                     let slot = report.record_call_started(&fresh);
                     pushed = dispatch(&fresh.route, Some(rcpt.recipient_name.as_str()), msg);
+                    if let Err(ref e) = pushed {
+                        may_have_sent_keys = may_have_sent_keys
+                            || (matches!(e, PushError::Failed(_))
+                                && !is_composer_occupied_zero_keys_error(e.as_str()));
+                    }
                     report.record_call_finished(
                         slot,
                         if pushed.is_ok() {
@@ -5993,15 +6401,18 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                 }
             }
         }
-        let target_status = match pushed {
-            Ok(status) => status,
-            Err(_) => DeliveryStatus::Pending,
+        let (target_status, increment_attempts) = match pushed {
+            Ok(status) => (status, true),
+            Err(ref err) => (
+                DeliveryStatus::Pending,
+                may_have_sent_keys || !is_composer_occupied_zero_keys_error(err.as_str()),
+            ),
         };
         match store.update_wire_receipt(
             &msg.id,
             &rcpt.recipient_name,
             target_status,
-            true,
+            increment_attempts,
             now.clone(),
         ) {
             Ok(Some(new_rcpt)) => updated.push(new_rcpt),
@@ -6010,6 +6421,12 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         }
     }
     (updated, Some(attempted))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static UNLISTED_MUSE_HINT_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it
@@ -13212,6 +13629,26 @@ exit 1"#,
             Some(CursorState::new(2, 2))
         ));
 
+        // Muse rotating placeholder hint in an empty composer (exact live line, Melisandre
+        // 2026-11-10): grey hint text, no ghost styling in the capture, cursor after `❯ ` ->
+        // empty (`false`). The same text with the cursor past it is real input (`true`).
+        let mut muse_hint_rows: Vec<String> = (0..36).map(|i| format!("row {i}")).collect();
+        muse_hint_rows[35] = "⏺ Done.".to_string();
+        muse_hint_rows.push(claude_titled_top.clone());
+        muse_hint_rows
+            .push("❯\u{a0}/resume reopens a past session (--last for the latest)".to_string());
+        muse_hint_rows.push(rule.clone());
+        muse_hint_rows.push("  claude-opus-4-6 · bypass permissions".to_string());
+        let muse_hint_screen = muse_hint_rows.join("\n");
+        assert!(
+            !composer_has_unsubmitted_content(&muse_hint_screen, Some(CursorState::new(37, 2))),
+            "Muse placeholder hint must not read as composer input"
+        );
+        assert!(composer_has_unsubmitted_content(
+            &muse_hint_screen,
+            Some(CursorState::new(37, 33))
+        ));
+
         // End-to-end mock-host delivery to `Hector.claude` displaying ANSI-dim ghost suggestion at
         // `(37, 2)` before paste and again after submit: 0 pre-paste Enters and 0 post-paste retry Enters!
         let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -17075,6 +17512,7 @@ exit 1"#,
             transcript_target: "muse:melisandre.r3",
             session_id: Some(muse_sid),
             is_muse_route: true,
+            composer_style: ComposerStyle::Ruled,
             bracketed: false,
             verify_submission: true,
             raw_text: None,
@@ -17576,6 +18014,7 @@ exit 1"#,
             transcript_target: "muse:melisandre.479",
             session_id: None,
             is_muse_route: true,
+            composer_style: ComposerStyle::Ruled,
             bracketed: false,
             verify_submission: true,
             raw_text: None,
@@ -17802,6 +18241,483 @@ exit 1"#,
             crate::dispatch_diagnostics::take_last_paste_settle_ms(),
             Some(50),
             "long placeholder must break on settle poll 1 (50ms)"
+        );
+    }
+
+    #[test]
+    fn nb1_ruleless_vendors_proceed_and_ruled_vendors_fail_closed() {
+        let codex_idle = "› Ask Codex to do anything\n  footer one\n  footer two";
+        // Idle Codex: pre-paste proceeds (ruleless), through the verified-delivery path
+        // `host_write_text_then_enter` builds (style derived from the host session id).
+        assert_eq!(
+            ComposerStyle::for_host_session("Fiona.codex"),
+            ComposerStyle::Ruleless
+        );
+        assert_eq!(
+            ComposerStyle::for_host_session("Ada.claude"),
+            ComposerStyle::Ruled
+        );
+        assert_eq!(
+            ComposerStyle::for_host_session("muse.ada"),
+            ComposerStyle::Ruled
+        );
+        assert_eq!(
+            ComposerStyle::for_host_session("unknown-session"),
+            ComposerStyle::Ruleless
+        );
+        let mut enters = 0u32;
+        let out = prepare_clean_composer_before_paste_impl(
+            "hello codex",
+            &[],
+            false,
+            ComposerStyle::Ruleless,
+            |_| {},
+            || Some((codex_idle.to_string(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect("idle ruleless Codex screen must proceed to paste");
+        assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+        assert_eq!(enters, 0);
+        // Same screen with typed text after `›`: today (and kept) it also proceeds clean —
+        // `composer_has_unsubmitted_content_for_route` returns false with no located region,
+        // so the paste appends after the typed text. Asserted to keep that behaviour visible.
+        let codex_typed = "› fix the failing test\n  footer one\n  footer two";
+        let out = prepare_clean_composer_before_paste_impl(
+            "hello codex",
+            &[],
+            false,
+            ComposerStyle::Ruleless,
+            |_| {},
+            || Some((codex_typed.to_string(), None)),
+            || false,
+            || Ok(()),
+        )
+        .expect("typed ruleless Codex screen keeps old proceed behaviour");
+        assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+        // The three r2 fixtures still fail closed on Claude and on Muse routes.
+        let rule = "─".repeat(40);
+        let fixtures = [
+            format!(
+                "◆ Ready.\n{rule}\n❯ /re\n{rule}\n  /review\n  /resume\n  /help\n  /model\n  /clear"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ owner draft\n{rule}\n  line1\n  line2\n  line3\n  line4\n  line5"
+            ),
+            "❯ owner draft without rules".to_string(),
+        ];
+        for is_muse_route in [false, true] {
+            for screen in &fixtures {
+                let mut e = 0u32;
+                let err = prepare_clean_composer_before_paste_impl(
+                    "next wire payload",
+                    &[],
+                    is_muse_route,
+                    ComposerStyle::Ruled,
+                    |_| {},
+                    || Some((screen.clone(), Some(CursorState::new(2, 4)))),
+                    || false,
+                    || {
+                        e += 1;
+                        Ok(())
+                    },
+                )
+                .expect_err("ruled vendor unlocated composer must fail closed");
+                assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+                assert_eq!(e, 0);
+                assert_eq!(
+                    probe_composer_ready_from_screen(
+                        screen,
+                        Some(CursorState::new(2, 4)),
+                        &[],
+                        ComposerStyle::Ruled,
+                        is_muse_route
+                    ),
+                    None
+                );
+            }
+        }
+        // HostCli Codex / Grok probe: idle ruleless screen is ready, not None forever.
+        for style in [
+            ComposerStyle::for_vendor("codex"),
+            ComposerStyle::for_vendor("grok"),
+        ] {
+            assert_eq!(
+                probe_composer_ready_from_screen(codex_idle, None, &[], style, false),
+                Some(true)
+            );
+        }
+        // Dialog screen on a ruled vendor is refused by the dialog-marker check (0 keys),
+        // as it already was before r2: a startup-prompt text answer does not reach it.
+        let dialog =
+            format!("◆ Ready.\n{rule}\n❯ Do you want to proceed?\n{rule}\n❯ 1. Yes\n  2. No");
+        let err = prepare_clean_composer_before_paste_impl(
+            "y",
+            &[],
+            false,
+            ComposerStyle::Ruled,
+            |_| {},
+            || Some((dialog.clone(), None)),
+            || false,
+            || Ok(()),
+        )
+        .expect_err("dialog screen must fail closed on ruled vendor");
+        assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+    }
+
+    #[test]
+    fn ruleless_extract_composer_compact_handles_short_inline_prompt_and_fails_closed_on_output() {
+        let short_payload = "[fl-wire mail/normal] from felix (id: urn:uuid:019d8b30-4400-7000-8000-000000000471): ping\n\nok";
+        let d_short = UnconfirmedWireDelivery::from_payload(short_payload);
+
+        // Ruleless screen with short (< 150 char) inline prompt text in the last 3 non-empty lines.
+        let ruleless_short_prompt = "◆ Ready.\n\n❯ [fl-wire mail/normal] from felix (id: urn:uuid:019d8b30-4400-7000-8000-000000000471): ping\n  ok";
+        assert_eq!(
+            composer_equals_single_target(ruleless_short_prompt, &d_short),
+            (true, false),
+            "ruleless screen with inline short prompt must extract composer compact"
+        );
+
+        // Ruleless screen with model output only and no prompt or placeholder must fail closed (`None`).
+        let ruleless_output_only =
+            "◆ Thinking...\n  line 1 of model output\n  line 2 of model output";
+        let out_lines: Vec<&str> = ruleless_output_only.lines().collect();
+        assert_eq!(extract_composer_compact(&out_lines), None);
+
+        // Ruleless screen with an interactive menu (`❯ 1. Allow once`) must fail closed (`None`).
+        let ruleless_menu = "◆ Tool approval needed\n❯ 1. Allow once\n  2. Deny";
+        let menu_lines: Vec<&str> = ruleless_menu.lines().collect();
+        assert_eq!(extract_composer_compact(&menu_lines), None);
+    }
+
+    #[test]
+    fn unlocated_composer_fails_closed_and_typed_slash_input_is_not_a_muse_hint() {
+        let rule = "─".repeat(40);
+        // Slash menu: 5 entries below the bottom rule -> composer cannot be located.
+        let slash_menu = format!(
+            "◆ Ready.\n{rule}\n❯ /re\n{rule}\n  /review\n  /resume\n  /help\n  /model\n  /clear"
+        );
+        // Tall footer: draft between rules, 5 lines below the bottom rule.
+        let tall_footer = format!(
+            "◆ Ready.\n{rule}\n❯ owner draft\n{rule}\n  line1\n  line2\n  line3\n  line4\n  line5"
+        );
+        // Ruleless draft.
+        let ruleless = "❯ owner draft without rules".to_string();
+        for screen in [&slash_menu, &tall_footer, &ruleless] {
+            assert!(!composer_region_located(screen), "screen: {screen}");
+            let mut enters = 0u32;
+            let err = prepare_clean_composer_before_paste(
+                "next wire payload",
+                |_| {},
+                || Some((screen.clone(), Some(CursorState::new(2, 4)))),
+                || false,
+                || {
+                    enters += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("unlocated composer must fail closed without paste");
+            assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+            assert_eq!(enters, 0);
+        }
+        // Hint: generic `/word + >=2 words` is gone; typed input at prompt-start is input.
+        assert!(!is_muse_placeholder_hint("/review the open PR please"));
+        assert!(is_muse_placeholder_hint(
+            "/resume reopens a past session (--last for the latest)"
+        ));
+        let typed = format!("◆ Ready.\n{rule}\n❯ /review the open PR please\n{rule}\n  footer");
+        assert!(
+            composer_has_unsubmitted_content(&typed, Some(CursorState::new(2, 2))),
+            "typed /review at prompt-start must read as input"
+        );
+        // Exact Muse hint is a hint only on Muse routes.
+        let hint = format!(
+            "◆ Ready.\n{rule}\n❯ /resume reopens a past session (--last for the latest)\n{rule}\n  footer"
+        );
+        assert!(!composer_has_unsubmitted_content_for_route(
+            &hint,
+            Some(CursorState::new(2, 2)),
+            true
+        ));
+        assert!(composer_has_unsubmitted_content_for_route(
+            &hint,
+            Some(CursorState::new(2, 2)),
+            false
+        ));
+        // After a pre-paste flush Enter, occupied errors must not claim zero keys.
+        assert!(!is_composer_occupied_zero_keys_error(
+            &composer_occupied_after_pre_paste_flush_error()
+        ));
+    }
+
+    #[test]
+    fn muse_hints_complete_list_route_and_cursor_gating() {
+        let rule = "─".repeat(40);
+        let screen_for = |text: &str| format!("◆ Ready.\n{rule}\n❯ {text}\n{rule}\n  footer");
+        // Every listed hint: empty at prompt start on Muse, input on non-Muse.
+        // `Press …` hints are also generic static ghosts for every vendor, so they
+        // stay empty on non-Muse routes by that pre-existing rule.
+        for hint in MUSE_HINTS {
+            let screen = screen_for(hint);
+            assert!(
+                !composer_has_unsubmitted_content_for_route(
+                    &screen,
+                    Some(CursorState::new(2, 2)),
+                    true
+                ),
+                "Muse hint must read empty: {hint}"
+            );
+            if hint.starts_with("Press ") {
+                assert!(!composer_has_unsubmitted_content_for_route(
+                    &screen,
+                    Some(CursorState::new(2, 2)),
+                    false
+                ));
+            } else {
+                assert!(
+                    composer_has_unsubmitted_content_for_route(
+                        &screen,
+                        Some(CursorState::new(2, 2)),
+                        false
+                    ),
+                    "Muse hint must read as input on non-Muse route: {hint}"
+                );
+            }
+            // Listed hint with cursor NOT at prompt start reads as input.
+            assert!(
+                composer_has_unsubmitted_content_for_route(
+                    &screen,
+                    Some(CursorState::new(2, 20)),
+                    true
+                ),
+                "hint away from prompt start must read as input: {hint}"
+            );
+        }
+        // Named regressions from NB2.
+        for hint in [
+            "Ask to monitor a running build or log and get pinged on changes",
+            "/goal pins a session objective with a progress bar",
+        ] {
+            assert!(is_muse_placeholder_hint(hint));
+            assert!(!composer_has_unsubmitted_content_for_route(
+                &screen_for(hint),
+                Some(CursorState::new(2, 2)),
+                true
+            ));
+            assert_eq!(
+                probe_composer_ready_from_screen(
+                    &screen_for(hint),
+                    Some(CursorState::new(2, 2)),
+                    &[],
+                    ComposerStyle::Ruled,
+                    true
+                ),
+                Some(true)
+            );
+        }
+        assert!(!is_muse_placeholder_hint("/review the open PR please"));
+        assert!(composer_has_unsubmitted_content_for_route(
+            &screen_for("/review the open PR please"),
+            Some(CursorState::new(2, 2)),
+            true
+        ));
+    }
+
+    #[test]
+    fn unlisted_muse_prompt_start_candidate_is_held_and_logged_redacted() {
+        let rule = "─".repeat(40);
+        let candidate = "Totally unlisted draft text xyz";
+        let screen = format!("◆ Ready.\n{rule}\n❯ {candidate}\n{rule}\n  footer");
+        UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().clear());
+        assert_eq!(
+            probe_composer_ready_from_screen(
+                &screen,
+                Some(CursorState::new(2, 2)),
+                &[],
+                ComposerStyle::Ruled,
+                true
+            ),
+            Some(false)
+        );
+        let warnings = UNLISTED_MUSE_HINT_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        let line = &warnings[0];
+        let digest = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+        assert!(line.contains(&format!("len={}", candidate.len())), "{line}");
+        assert!(
+            line.contains(&format!("sha256={}", &digest[..12])),
+            "{line}"
+        );
+        assert!(!line.contains(candidate), "must not log text: {line}");
+        // Non-Muse route: held as input but no unlisted-hint line.
+        UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().clear());
+        assert_eq!(
+            probe_composer_ready_from_screen(
+                &screen,
+                Some(CursorState::new(2, 2)),
+                &[],
+                ComposerStyle::Ruled,
+                false
+            ),
+            Some(false)
+        );
+        assert!(UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow().is_empty()));
+    }
+
+    #[test]
+    fn zero_key_composer_occupied_leaves_receipt_attempts_at_zero_while_post_paste_increments() {
+        let store = MemStore::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let routes_path = tmp.path().join("routes.json");
+        let mut routes = RouteTable::load(Some(&routes_path));
+        routes.upsert_explicit(
+            "kacey",
+            VendorRoute::Muse {
+                session_id: "sid-471".into(),
+                cwd: None,
+                tmux_target: Some("muse:kacey".into()),
+                tmux_pane: Some("%47".into()),
+            },
+            At::from_unix_millis(10),
+        );
+
+        let (msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kacey".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "zero-key occupied".into(),
+                body: "hold without burning attempt".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(20),
+            })
+            .unwrap();
+
+        // 1. Pre-paste occupied composer error (0 keys sent) must keep `attempts == 0`.
+        let mut report = DispatchReport::default();
+        let (updated, attempted) = dispatch_message_for_recipient_with_test_dispatch(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(30),
+            "kacey",
+            &mut report,
+            |_, _| Err(composer_occupied_by_non_wire_input_error()),
+        );
+        assert_eq!(attempted, Some(true));
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].status, DeliveryStatus::Pending);
+        assert_eq!(
+            updated[0].attempts, 0,
+            "pre-paste zero-key composer_occupied hold must not increment receipt attempts"
+        );
+        assert_eq!(
+            report.failure_stages,
+            vec![FailureStage::ComposerOccupiedByNonWireInput]
+        );
+
+        // 2. Post-paste occupied composer error (after `write_payload` sent keys) MUST increment `attempts` to 1.
+        let mut post_report = DispatchReport::default();
+        let (updated_post, _) = dispatch_message_for_recipient_with_test_dispatch(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(40),
+            "kacey",
+            &mut post_report,
+            |_, _| Err(composer_occupied_after_paste_error()),
+        );
+        assert_eq!(updated_post.len(), 1);
+        assert_eq!(updated_post[0].status, DeliveryStatus::Pending);
+        assert_eq!(
+            updated_post[0].attempts, 1,
+            "post-paste composer_occupied abort must increment receipt attempts because keys were sent"
+        );
+    }
+
+    #[test]
+    fn transport_error_then_rerouted_zero_key_hold_still_increments_attempts() {
+        let store = MemStore::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let sessions = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let write_session = |pid: u32| {
+            fs::write(
+                sessions.join(format!("{pid}.json")),
+                serde_json::json!({
+                    "name": "Kacey",
+                    "nameSource": "user",
+                    "sessionId": format!("sess-{pid}"),
+                    "messagingSocketPath": home.join(format!("{pid}.sock")),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_session(111);
+        let routes_path = tmp.path().join("routes.json");
+        let mut routes = RouteTable::load(Some(&routes_path));
+        routes.discover_routes(Some(&home), At::from_unix_millis(10));
+        assert!(routes.get("kacey").is_some());
+        let (msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kacey".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "reroute".into(),
+                body: "may have been pasted".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(20),
+            })
+            .unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let mut report = DispatchReport::default();
+        let (updated, _) = dispatch_message_for_recipient_with_test_dispatch(
+            &store,
+            &mut routes,
+            Some(&home),
+            &msg,
+            At::from_unix_millis(30),
+            "kacey",
+            &mut report,
+            |_, _| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n == 1 {
+                    // Route changes so the retry runs, and the first call may have sent keys.
+                    fs::remove_file(sessions.join("111.json")).unwrap();
+                    write_session(222);
+                    Err("transport error after paste".to_string())
+                } else {
+                    Err(composer_occupied_by_non_wire_input_error())
+                }
+            },
+        );
+        assert_eq!(calls.get(), 2, "re-routed retry must run");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0].attempts, 1,
+            "may-have-sent-keys from the first call must survive a later zero-key hold"
         );
     }
 }
