@@ -1983,6 +1983,21 @@ pub fn resume_restore(
             verify_candidate_at(&j, &path, lease, filesystem, &lock, &precheck)?;
         }
     }
+    // Completed continuations retain all authority, layout and evidence checks,
+    // but must not consume the budget needed for typed finalization.
+    match j.phase {
+        RestorePhase::Installed => return Ok(RestoreOutcome::Installed { journal: j }),
+        RestorePhase::RolledBack => {
+            if j.original_verification.is_none() {
+                return Err(fs::refused(
+                    &precheck,
+                    "forensic original is not verified rollback",
+                ));
+            }
+            return Ok(RestoreOutcome::RolledBack { journal: j });
+        }
+        _ => {}
+    }
     let (l, control) = attempt(&mut j, lease, filesystem, false)?;
     let (dest, candidate, original) = inspect_layout(&j, &l)?;
     let parent = Dir::open(j.destination.parent().ok_or_else(|| l.verification())?, &l)?;
@@ -2114,6 +2129,13 @@ pub fn rollback_restore(
         return Err(precheck.verification());
     };
     verify_preserved_candidate(&j, &candidate_path, &precheck)?;
+    match j.phase {
+        RestorePhase::RolledBack => return Ok(RestoreOutcome::RolledBack { journal: j }),
+        RestorePhase::OriginalAbsenceRestored => {
+            return Ok(RestoreOutcome::OriginalAbsenceRestored { journal: j });
+        }
+        _ => {}
+    }
     let (l, control) = attempt(&mut j, lease, filesystem, true)?;
     if matches!(j.original, FileBinding::Absent) {
         let (dest, candidate, original) = inspect_layout(&j, &l)?;

@@ -416,13 +416,9 @@ fn restore_guard_refuses_cached_server_bind_before_socket_creation() {
 #[test]
 fn restore_twelve_shared_attempts_preserve_reserved_rollback_and_verified_finalize() {
     use fl_store::recovery::readiness::*;
-    let f = Fixture::new();
-    let (request, lease) = prepare_restore(&f, &f.source);
-    let RestoreOutcome::Installed { journal } =
-        restore_offline(&request, &lease, &f.filesystem()).unwrap()
-    else {
-        panic!("not installed")
-    };
+    // Each cut interrupts real unfinished relocation work; completed Installed
+    // resumes are free and cannot exercise shared attempt exhaustion.
+    let (f, journal, lease) = bundleless_fixture_with_bundle(BundlelessLayout::Relocated, false);
     let mut bad = reconciliation(&journal);
     bad.clients.caches_invalidated = false;
     assert!(finalize_restore(&journal, &lease, &bad, &f.filesystem()).is_err());
@@ -2980,8 +2976,25 @@ fn restore_adjacent_intents_admit_only_their_before_and_after_layouts() {
                     "{layout}: {error}"
                 );
             } else {
-                assert_eq!(attempted, admitted, "{phase:?} {layout}: {result:?}");
-                if !admitted {
+                let completed =
+                    admitted && matches!(phase, RestorePhase::Installed | RestorePhase::RolledBack);
+                assert_eq!(
+                    attempted,
+                    admitted && !completed,
+                    "{phase:?} {layout}: {result:?}"
+                );
+                if completed {
+                    assert!(matches!(
+                        (phase.clone(), result),
+                        (
+                            RestorePhase::Installed,
+                            Ok(RestoreOutcome::Installed { .. })
+                        ) | (
+                            RestorePhase::RolledBack,
+                            Ok(RestoreOutcome::RolledBack { .. })
+                        )
+                    ));
+                } else if !admitted {
                     assert!(matches!(
                         result,
                         Err(fl_store::recovery::RecoveryError::Verification { .. })
@@ -7933,7 +7946,18 @@ fn bundleless_fixture_with_bundle(
     (f, j, lease)
 }
 fn assert_bundleless_rolled_back(_f: &Fixture, before: &RestoreJournal, after: &RestoreJournal) {
-    assert_eq!(after.rollback_attempts, before.rollback_attempts + 1);
+    if matches!(
+        before.phase,
+        RestorePhase::RolledBack | RestorePhase::OriginalAbsenceRestored
+    ) {
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "completed rollback retry changed journal state"
+        );
+    } else {
+        assert_eq!(after.rollback_attempts, before.rollback_attempts + 1);
+    }
     let candidate_path = if matches!(before.original, FileBinding::Absent) {
         assert_eq!(after.phase, RestorePhase::OriginalAbsenceRestored);
         assert!(!after.destination.exists());
@@ -8069,17 +8093,20 @@ fn restore_bundleless_normalization_cuts_reload_and_rollback() {
         assert!(hook.count.load(Ordering::Acquire) > cut);
         let loaded = load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem())
             .unwrap_or_else(|e| panic!("cut {cut} {event:?}: {e:?}"));
-        let frames = journal_frame_ranges(&fs::read(j.staging.join("journal.bin")).unwrap()).len();
+        let before = fs::read(j.staging.join("journal.bin")).unwrap();
+        let frames = journal_frame_ranges(&before).len();
         let RestoreOutcome::RolledBack { journal: next } =
             rollback_restore(&loaded, &lease, &f.filesystem()).unwrap()
         else {
             panic!("cut {cut}: not rolled back")
         };
         assert_bundleless_rolled_back(&f, &loaded, &next);
+        let after = fs::read(next.staging.join("journal.bin")).unwrap();
+        if loaded.phase == RestorePhase::RolledBack {
+            assert_eq!(after, before, "completed cut {cut} appended journal data");
+        }
         assert!(
-            journal_frame_ranges(&fs::read(next.staging.join("journal.bin")).unwrap()).len()
-                - frames
-                <= 4,
+            journal_frame_ranges(&after).len() - frames <= 4,
             "cut {cut}: frame schedule widened"
         );
         eprintln!("bundleless_normalization_cut index={cut} event={event:?} recovered=true");
@@ -9061,5 +9088,150 @@ fn restore_bundleless_unverified_corrupt_candidate_refuses_without_attempt() {
                 (original_metadata.dev(), original_metadata.ino())
             );
         }
+    }
+}
+
+// Completed continuations must leave both budgets available for typed finalization.
+fn assert_completed_continuation_preserves_finalization(mode: TerminalFixtureMode, resume: bool) {
+    let (f, journal, lease) = terminal_fixture(mode);
+    let path = journal.staging.join("journal.bin");
+    let bytes = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&bytes).len();
+    let artifacts = review15_artifact_snapshot(&f, &journal);
+    let state = serde_json::to_value(&journal).unwrap();
+    let io = Arc::new(AbsenceResumeIo::default());
+    let filesystem = CutFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    for retry in 0..20 {
+        let outcome = if resume {
+            resume_restore(&journal, &lease, &filesystem)
+        } else {
+            rollback_restore(&journal, &lease, &filesystem)
+        }
+        .unwrap_or_else(|e| panic!("{mode:?} resume={resume} retry={retry}: {e:?}"));
+        let next = match (mode, outcome) {
+            (TerminalFixtureMode::Selected, RestoreOutcome::Installed { journal })
+            | (TerminalFixtureMode::Original, RestoreOutcome::RolledBack { journal })
+            | (TerminalFixtureMode::Absence, RestoreOutcome::OriginalAbsenceRestored { journal }) => {
+                journal
+            }
+            (_, other) => panic!("wrong completed outcome: {other:?}"),
+        };
+        assert_eq!(
+            serde_json::to_value(next).unwrap(),
+            state,
+            "{mode:?} resume={resume} retry={retry}: changed attempts or forensic state"
+        );
+        let loaded = load_restore_journal(&path, &lease, &filesystem).unwrap();
+        assert_eq!(serde_json::to_value(loaded).unwrap(), state);
+        let current = fs::read(&path).unwrap();
+        assert_eq!(journal_frame_ranges(&current).len(), frames);
+        assert_eq!(current, bytes, "completed operation appended journal data");
+    }
+    assert_eq!(review15_artifact_snapshot(&f, &journal), artifacts);
+    assert_absence_resume_read_only(&io);
+    let finalized = terminal_call(mode, &journal, &lease, &f.filesystem(), false).unwrap();
+    assert!(
+        matches!(
+            finalized,
+            RestoreOutcome::Finalized { .. } | RestoreOutcome::OriginalAbsenceFinalized { .. }
+        ),
+        "{mode:?}: {finalized:?}"
+    );
+    assert!(
+        !journal
+            .destination
+            .with_extension("fls.restore-guard")
+            .exists()
+    );
+    assert!(!terminal_negative_pin(&f, &journal).exists());
+}
+#[test]
+fn restore_completed_installed_resumes_preserve_finalization_budget() {
+    assert_completed_continuation_preserves_finalization(TerminalFixtureMode::Selected, true);
+}
+#[test]
+fn restore_completed_rolled_back_resumes_preserve_finalization_budget() {
+    assert_completed_continuation_preserves_finalization(TerminalFixtureMode::Original, true);
+}
+#[test]
+fn restore_completed_rolled_back_rollbacks_preserve_finalization_budget() {
+    assert_completed_continuation_preserves_finalization(TerminalFixtureMode::Original, false);
+}
+#[test]
+fn restore_completed_absence_rollbacks_preserve_finalization_budget() {
+    assert_completed_continuation_preserves_finalization(TerminalFixtureMode::Absence, false);
+}
+
+#[test]
+fn restore_completed_continuations_refuse_expiry_and_replaced_generation_without_mutation() {
+    for (mode, resume) in [
+        (TerminalFixtureMode::Selected, true),
+        (TerminalFixtureMode::Original, true),
+        (TerminalFixtureMode::Original, false),
+        (TerminalFixtureMode::Absence, false),
+    ] {
+        let (f, journal, lease) = terminal_fixture(mode);
+        let before = review15_artifact_snapshot(&f, &journal);
+        let io = Arc::new(AbsenceResumeIo {
+            now: Some(journal.binding.expires_at_unix_ms + 1),
+            ..Default::default()
+        });
+        let filesystem = CutFs {
+            f: &f,
+            io: io.clone(),
+            limits: limits(),
+        };
+        let result = if resume {
+            resume_restore(&journal, &lease, &filesystem)
+        } else {
+            rollback_restore(&journal, &lease, &filesystem)
+        };
+        assert!(
+            result.is_err(),
+            "{mode:?} resume={resume}: accepted expired lease"
+        );
+        assert_eq!(review15_artifact_snapshot(&f, &journal), before);
+        assert_absence_resume_read_only(&io);
+
+        // Preserve identical bytes but replace the retained candidate's inode.
+        // Completed outcomes must still enforce the admitted generation binding.
+        let candidate = match mode {
+            TerminalFixtureMode::Selected => journal.destination.clone(),
+            TerminalFixtureMode::Original => journal.staging.join("original.fls"),
+            TerminalFixtureMode::Absence => journal.staging.join("candidate.fls"),
+            _ => unreachable!(),
+        };
+        let parked = journal.staging.join("retained-candidate-for-test.fls");
+        fs::rename(&candidate, &parked).unwrap();
+        fs::copy(&parked, &candidate).unwrap();
+        assert_ne!(
+            fs::metadata(&candidate).unwrap().ino(),
+            fs::metadata(&parked).unwrap().ino()
+        );
+        let changed = review15_artifact_snapshot(&f, &journal);
+        let io = Arc::new(AbsenceResumeIo::default());
+        let filesystem = CutFs {
+            f: &f,
+            io: io.clone(),
+            limits: limits(),
+        };
+        let result = if resume {
+            resume_restore(&journal, &lease, &filesystem)
+        } else {
+            rollback_restore(&journal, &lease, &filesystem)
+        };
+        assert!(
+            result.is_err(),
+            "{mode:?} resume={resume}: accepted replaced generation"
+        );
+        assert_eq!(review15_artifact_snapshot(&f, &journal), changed);
+        assert_absence_resume_read_only(&io);
+        fs::remove_file(&candidate).unwrap();
+        fs::rename(parked, candidate).unwrap();
+        assert_eq!(review15_artifact_snapshot(&f, &journal), before);
     }
 }
