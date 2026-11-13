@@ -71,8 +71,23 @@ Structural authority must not hang on a role's spelling. `RoleRecord` gains a `t
 | `council-member` | Council Strategist | Council Chair |
 
 A user-defined role is an ordinary `RoleRecord` with tier `member` unless the owner sets
-another tier. The wire form of every role is its bare slug. `custom:<slug>` is accepted on
-input for compatibility and never written.
+another tier. The wire form of every role is its bare slug. `custom:<slug>` is never written.
+
+Removing the prefix is a change of spelling only. It never changes an agent's tier, review
+authority or profile, and a user-defined role keeps its own role record. The bare slug cannot
+always stand for the prefixed one: today `AgentRole::from_wire` keeps `custom:lead`,
+`custom:assistant`, `custom:lab_manager` and `custom:lab-manager` as custom roles, distinct
+from the structural built-ins, while `custom:<other built-in>` already reads as that built-in
+(code-verified). Two rules follow:
+
+- **Structural names are reserved.** They are `lead`, `assistant`, `director`,
+  `project-manager`, `council-chair` and the legacy spellings `lab-manager` and `lab_manager`.
+  Creating a user-defined role with one of these slugs is refused. The migration does not
+  strip the prefix from such a role by itself (§7.4).
+- **`custom:<slug>` on input** is accepted after the migration only as a spelling of a
+  non-structural role. `custom:lead` and the like are refused with a message that names the
+  role, the bare structural slug and the Owner mapping of §7.4. They are never read as the
+  structural role.
 
 ### 2.1.1 Review chain
 
@@ -196,17 +211,35 @@ targets:
 ### 3.3 The tool gate
 
 `fl wire hook` gains `PreToolUse` (and `PermissionRequest` where the vendor has it). The gate
-evaluates the caller's canonical tool rules:
+evaluates the caller's complete effective policy (§2.3), canonical defaults included: a
+capability that no rule names takes the profile's canonical deny/ask default, never an unknown
+vendor default (#103 §2). Every call therefore gets one of three outcomes. There is no "no
+rule" outcome, and the gate never hands an undecided call to the vendor layer.
 
 - **deny** → the hook blocks the call and returns the reason and, where one exists, the broker
   command to use instead;
-- **allow** → the hook pre-answers, where measurement (§4) shows the vendor honours it;
-- **no rule** → the vendor layer decides as today.
+- **ask** → the gate never allows the call by itself. The call goes to a real prompt channel:
+  the vendor's own prompt, or a FerroDeck channel on a transport where #103 §3 proves one.
+  Where no prompt channel is proven for that vendor, transport and posture, ask is treated as
+  deny (#103 §2: a deny never degrades to ask, and an ask with no prompt is a run);
+- **allow** → the hook pre-answers only where Phase 0 (M1, M2) proves that the vendor honours
+  it. Elsewhere the gate does not answer for the vendor: the vendor layer may still prompt or
+  refuse, which can only tighten the result.
 
-It is a local policy engine with a bounded timeout. On timeout a call that matches a deny
-pattern is denied and every other call falls through to the vendor layer. Every decision is
-journaled. FerroLoop installs the hook through the same per-session settings as §3.2; the
-hand-registered user-level entries are retired with it.
+It is a local policy engine with a bounded timeout: pre-answer by rule, not remote resolution
+(#103 §3). On a timeout or a gate error (the effective policy is missing or unreadable, or
+the call cannot be classified) the result is deny, for every call. This is the #103 rule:
+bounded timeout, deny on timeout.
+
+Fallback never widens. No path through the gate yields a more permissive result than the
+canonical policy: the gate can refuse a call or leave it to a layer that can only tighten,
+and it cannot turn a deny or an ask into a run. What a vendor does when the hook process
+returns no decision at all is vendor behaviour and is unmeasured. Until it is proven to
+block, the gate is not counted as the control for that vendor, and a deny rests on the
+compiled rules of §3.2.
+
+Every decision is journaled. FerroLoop installs the hook through the same per-session
+settings as §3.2; the hand-registered user-level entries are retired with it.
 
 ### 3.4 What is not enforcement
 
@@ -270,24 +303,153 @@ Taken from the role files and `WORKFLOW.md`. "Open" cells are not answered by to
 
 ## 7. Migration (Record #193)
 
-The slug `director` changes meaning, so order and atomicity matter.
+The slug `director` changes meaning. The rewrite must therefore run exactly once, a binary
+that still writes the old names must be shut out, and every role value must be read in the
+namespace it was written in.
 
-1. One store migration, one transaction: every `director` role value and role record becomes
-   `project-manager`; then every `lab-manager` / `lab_manager` value becomes `director`. No
-   agent holds `director` today, so the first step is empty in this workspace; it still runs
-   first.
-2. After the migration `from_wire` reads `lab-manager` and `lab_manager` as `director` (the
-   old name of the new Director). It never maps `director` to `project-manager`: that reading
-   existed only before the migration.
-3. `RoleReviewPolicy` `lab-manager-review` is renamed `director-review`; the old spelling is
-   read, not written. `pr_policy` tiers are renamed the same way and gain `project-manager`
-   (§2.1.1). `fl-review` markers already posted keep their `role` text; verification accepts
-   both spellings.
-4. `custom:<slug>` values are rewritten to `<slug>`. `council-chair` becomes a built-in role
-   with tier `council-chair`.
-5. The virtual area `lab-manager`, `@role:` addressing, hydration role-file names and FerroDeck
-   labels follow. Role files and workflow files in `.agents` and in each repository are
-   instruction files: Owner-tier pull requests, coordinated with the Director.
+### 7.1 Role namespaces and the epoch
+
+| Meaning | Namespace 1 (before the epoch) | Namespace 2 (at and after the epoch) |
+|---|---|---|
+| Director tier (was Lab Manager) | `lab_manager`, `lab-manager` | `director` |
+| Project Manager tier (was Project Director) | `director` | `project-manager` |
+| User-defined role | `custom:<slug>` | `<slug>` |
+
+The epoch is a store format version: a new constant on the `fl_store` format ladder, in the
+style of `FORMAT_WITH_WORKFLOW` and `FORMAT_WITH_AREA_DELETE`, called
+`FORMAT_WITH_ROLE_NAMESPACE` here. It takes the next free number on the ladder (the newest is
+9 at main `361e75f7`). It is durable and it only rises: `raise_format` never lowers a format.
+It is the only statement of which namespace the live role state of a store is in. The live
+role state is the role value of every registry record and every role record.
+
+### 7.2 The rewrite
+
+One store migration, one transaction. In this order it:
+
+1. reads the stored format. At or above the epoch it changes nothing and reports that;
+2. checks the `custom:` collisions of §7.4 and refuses, before any write, if one has no Owner
+   mapping;
+3. rewrites every `director` role value and role record to `project-manager`;
+4. then rewrites every `lab-manager` / `lab_manager` value to `director`;
+5. strips `custom:` where §7.4 allows it, and makes `council-chair` a built-in role with tier
+   `council-chair`;
+6. raises the store format to the epoch.
+
+Steps 3 to 6 commit together or not at all. No committed store holds new names below the
+epoch or old names at it. Step 1 guards on a format that only rises, so the rewrite cannot
+run a second time on a store: a repeated run is a no-op, and in particular it does not turn
+the new `director` into `project-manager`. No agent holds `director` today, so step 3 is
+empty in this workspace; it still runs before step 4.
+
+### 7.3 Decoding by namespace
+
+A role value is decoded in the namespace it was written under. The namespace is an explicit
+input to the decoder; no reader infers it from the text of the value.
+
+| Input | Namespace 1 | Namespace 2 |
+|---|---|---|
+| `director` | Project Director: the Project Manager tier, `project-manager` | Director |
+| `lab-manager`, `lab_manager` | Lab Manager: the Director tier | `director` (legacy spelling: read, never written) |
+| `project-manager` | not a built-in role | Project Manager |
+| `custom:<slug>` | as `from_wire` reads it today | a non-structural role only (§2.1) |
+
+- A value with no namespace information is namespace 1. That covers every record, marker and
+  message written before the epoch. An unversioned or pre-epoch `director` means Project
+  Director and is read as `project-manager`. It never silently acquires the new Director
+  meaning.
+- `director` means the new Director only in the live role state of a store at the epoch, and
+  in records and messages that state namespace 2.
+- Every stored role value is in one of two classes: the migration rewrites it in the
+  transaction of §7.2, or it is history and is decoded as namespace 1. There is no third
+  class.
+- A build at the epoch reads a role that its operator gives it as a command argument as
+  namespace 2. A role that arrives from another process is covered by §7.5.
+
+**History is not rewritten.** Posted `fl-review` markers, FerroWire messages (their `@role:`
+addresses included) and journal entries keep their text. Each is read in its original
+namespace: a pre-epoch `lab_manager` or `lab-manager` is the Director tier, and a pre-epoch
+`director` is the Project Manager tier. New markers carry an explicit role-namespace field
+(`role_ns: 2`), and so do new messages and journal entries that carry a role. A marker without
+the field is namespace 1. Verification decodes the role of a marker under that marker's
+namespace and then compares tiers, not spellings. The marker struct refuses unknown fields
+today (code-verified), so a build older than the epoch cannot read a new marker as an old
+one; it fails closed.
+
+### 7.4 The `custom:` prefix
+
+The migration classifies every namespace-1 `custom:<slug>` value before it writes:
+
+| Namespace-1 value | Migration |
+|---|---|
+| `custom:<slug>`, slug not a structural name of §2.1 (`custom:reviewer`) | Becomes `<slug>`. Same role record, same tier (`member` unless the owner set another), same profile. |
+| `custom:<built-in>` that namespace 1 already reads as the built-in (`custom:tester`, `custom:director`) | Handled as that namespace-1 built-in. `custom:director` is Project Director there, so it becomes `project-manager`, never the new `director`. |
+| `custom:council-chair` | Becomes `council-chair`. This is the one mapping to a structural name that Record #193 fixes (§1): the existing Council Chair role becomes the built-in, with the tier §2.1 gives it. That tier is not in the review chain of §2.1.1. |
+| `custom:<slug>`, slug any other structural name (`custom:lead`, `custom:assistant`, `custom:lab_manager`, `custom:lab-manager`, `custom:project-manager`) | **Collision.** Not stripped. |
+
+A user-defined role record whose slug is a structural name of namespace 2 (`project-manager`)
+is a collision in the same way.
+
+On a collision the migration refuses. It reports each colliding role and the agents that hold
+it, writes nothing, and leaves the store below the epoch. It runs again only with an Owner
+mapping for every colliding role, given with Owner authority (§2.3) and journaled. The mapping
+is one of:
+
+- **rename**: the custom role gets a non-colliding slug. It stays a user-defined role with its
+  own role record and tier `member` unless the owner sets another;
+- **structural**: an explicit Owner decision that these agents hold the structural role.
+
+The migration never chooses between the two. With a complete mapping it applies the mapping in
+the same transaction as the rest of §7.2.
+
+### 7.5 Older writers, upgrade order and rollback
+
+**Fencing.** The store already refuses a format that is not on its ladder: a build older than
+the epoch gets `FormatVersion` from a store at the epoch, as an older build does today from a
+store raised to `FORMAT_WITH_WORKFLOW` or `FORMAT_WITH_AREA_DELETE` (code-verified). This
+mechanism is the fence. Once the epoch is committed, the store refuses a hub, wire daemon,
+CLI, store server or hosted hook older than the epoch as a writer. A mixed-version write
+fails closed. It is never accepted with an old spelling and never translated on the way in.
+
+Two cases need more than the format check, and the P1 plan must close both:
+
+- A process that opened the store before the epoch was committed. Whether it meets the format
+  check again on a later write is not verified here. The upgrade order below removes the
+  case; the migration must also refuse to start while another process holds the store, or the
+  plan must prove that such a write is refused.
+- A role that reaches a build at the epoch from another process (a hub request, a FerroWire
+  frame) and not through the store. It must state namespace 2, by a field or by a protocol
+  version that implies it. A role-bearing write without that statement is refused; it is not
+  decoded as namespace 2.
+
+**Supported upgrade order.**
+
+1. Stop every writer: the hub, the wire daemon, the store server and the hosted sessions,
+   whose hooks call `fl`.
+2. Upgrade every binary to a build at the epoch.
+3. Run the migration once. It takes its backup (below) and then commits §7.2.
+4. Start the writers.
+
+No other order is supported. A build at the epoch that finds a store below the epoch refuses
+role writes and names the migration; it does not migrate implicitly on first write. A new,
+empty store is the trivial case: the migration has nothing to rewrite and only raises the
+format. Whether a build at the epoch creates a new store at the epoch directly is for the P1
+plan.
+
+**Rollback.** Before it writes, the migration takes a backup of the pre-migration store and
+reports where the backup is. Rollback is: stop every writer, restore that backup, reinstall
+the builds older than the epoch. There is no in-place downgrade: the format never lowers, and
+a reverse rewrite would be ambiguous for the same reason the forward one must run once. Writes
+made after the migration are lost by a restore.
+
+### 7.6 Renames that follow
+
+- `RoleReviewPolicy` `lab-manager-review` is renamed `director-review`; the old spelling is
+  read, not written. No `director-review` value exists in namespace 1 (code-verified), so
+  this rename is not ambiguous. `pr_policy` tiers are renamed the same way and gain
+  `project-manager` (§2.1.1).
+- The virtual area `lab-manager`, `@role:` addressing, hydration role-file names and FerroDeck
+  labels follow. Role files and workflow files in `.agents` and in each repository are
+  instruction files: Owner-tier pull requests, coordinated with the Director.
 
 ## 8. Acceptance sketches
 
@@ -303,9 +465,28 @@ The slug `director` changes meaning, so order and atomicity matter.
   neither run changes a shared settings file.
 - A raw `gh pr merge` in a gated session is denied with a message that names
   `fl github pr merge`.
-- Migration fixtures: a store holding `lab_manager`, `lab-manager`, `director` and
-  `custom:council-chair` reads back as `director`, `director`, `project-manager` and
-  `council-chair`, and a second run changes nothing.
+- Migration fixtures: a store below the epoch holding `lab_manager`, `lab-manager`,
+  `director`, `custom:director`, `custom:council-chair` and `custom:reviewer` reads back as
+  `director`, `director`, `project-manager`, `project-manager`, `council-chair` and
+  `reviewer`, at the epoch format. The agent that held `custom:reviewer` has the same role
+  record, tier `member` and the same profile as before the run.
+- Repeated run: a second run of the migration on that store is a no-op. Role values and the
+  format are unchanged, and the agent that became `director` is still `director`, not
+  `project-manager`.
+- Structural-name collisions: a store holding `custom:lead` and `custom:lab_manager` makes the
+  migration stop with the Owner-mapping refusal. The refusal names both roles and the agents
+  that hold them, and the store is unchanged and still below the epoch. With an Owner mapping
+  for both, the run completes and each agent has exactly the mapped role.
+- After the migration, `custom:reviewer` on input is read as `reviewer`; `custom:lead`,
+  `custom:director` and `custom:lab_manager` on input are refused with the message of §2.1;
+  creating a user-defined role named `lead` or `project-manager` is refused.
+- Mixed version: after the epoch is committed, a write by a build older than the epoch is
+  refused with `FormatVersion` and the store is unchanged; no `lab_manager` or `custom:` value
+  is written. A role-bearing request without namespace 2 to a hub at the epoch is refused.
+- Marker decoding: a posted marker without a namespace field and with role `lab_manager`
+  verifies as the Director tier, and one with role `director` verifies as the Project Manager
+  tier. A marker with `role_ns: 2` and role `director` verifies as the Director tier. Neither
+  old marker gains or loses a tier by the migration.
 
 ## 9. Open decisions
 
@@ -314,6 +495,8 @@ The slug `director` changes meaning, so order and atomicity matter.
   Director; session clear and reforge by a Lead for its own team, by the Project Manager and
   by the Director; and whether a Project Manager may merge a blocked author's pull request
   that it approved, as a Lead and the Director may.
-- **O3.** Gate timeout and the deny-on-timeout class in §3.3, after M2 and M3.
+- **O3.** The gate timeout duration, and how a timeout or a gate error is reported to the
+  operator, after M2 and M3. The authorization semantics of §3.3 are fixed and not open:
+  canonical defaults, an ask is never auto-allowed, and deny on timeout or error.
 - **O4.** Whether the interim deny rules for raw `gh` writes (P2) ship before or with the new
   broker commands; before means a short period in which members cannot file issues at all.
