@@ -6042,6 +6042,23 @@ pub(crate) fn stub_queued_delivery_success() -> StubQueuedDelivery {
     QUEUED_TEST_DELIVERY.with(|flag| flag.set(true));
     StubQueuedDelivery
 }
+#[cfg(test)]
+thread_local! {
+    static QUEUED_TEST_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct StubQueuedError;
+#[cfg(test)]
+impl Drop for StubQueuedError {
+    fn drop(&mut self) {
+        QUEUED_TEST_ERROR.with(|e| *e.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(crate) fn stub_queued_delivery_error(msg: &str) -> StubQueuedError {
+    QUEUED_TEST_ERROR.with(|e| *e.borrow_mut() = Some(msg.to_string()));
+    StubQueuedError
+}
 
 #[cfg(test)]
 thread_local! {
@@ -6231,6 +6248,11 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     intended_codex_thread_id: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
+    if let Some(err) = QUEUED_TEST_ERROR.with(|e| e.borrow().clone()) {
+        QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
+        return Err(OperatorPromptError::Push(PushError::Failed(err)));
+    }
+    #[cfg(test)]
     if QUEUED_TEST_DELIVERY.with(|flag| flag.get())
         && matches!(state.prompt_queue_target(session_id), Ok(None))
     {
@@ -6272,6 +6294,11 @@ fn with_operator_delivery(
             let stage = match error {
                 OperatorPromptError::Steer(CodexSteerError::Refused { .. }) => "refused",
                 OperatorPromptError::Push(PushError::NotConnected(_)) => "not_connected",
+                OperatorPromptError::Push(PushError::Failed(e))
+                    if fl_wire::is_composer_occupied_zero_keys_error(e) =>
+                {
+                    "held"
+                }
                 _ => "unconfirmed",
             };
             let mut fields = json!({"delivery_stage":stage, "delivered":false, "delivery_error":error.to_string()});
@@ -6394,10 +6421,13 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobe {probes}/{} ready={ready:?}",
                     crate::COMPOSER_HELD_MAX_PROBES
                 ),
-                None => eprintln!(
-                    "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobes exhausted after {} probes; holding until owner action",
-                    crate::COMPOSER_HELD_MAX_PROBES
-                ),
+                None => {
+                    state.mark_hold_retries_exhausted(&session_id, prompt_id);
+                    eprintln!(
+                        "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobes exhausted after {} probes; holding until owner action",
+                        crate::COMPOSER_HELD_MAX_PROBES
+                    );
+                }
             }
             if !state.release_composer_held_prompt(&session_id, prompt_id, ready) {
                 continue;
@@ -6424,7 +6454,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     f();
                 }
             });
-            if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
+            let zero_key_hold = state.is_composer_held_prompt(&session_id, &item.id);
+            if !zero_key_hold && !matches!(delivery_res, Err(PushError::NotConnected(_))) {
                 let after = transcript_observation_from_sessions(
                     &canonical_id,
                     &sessions,
@@ -6538,6 +6569,7 @@ fn handle_post_queued_prompt_send_now(
         state.reset_composer_hold_probe(prompt_id, stamp::now().unix_millis() as i64);
     }
     if !refused
+        && !state.is_composer_held_prompt(&queue_key, prompt_id)
         && !matches!(
             delivery_res,
             Err(OperatorPromptError::Push(PushError::NotConnected(_)))

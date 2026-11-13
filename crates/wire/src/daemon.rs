@@ -1121,6 +1121,8 @@ struct DaemonInner<S> {
     // Daemon-lifetime only: in-memory reprobe state, lost on restart (which re-arms the
     // budget). An exhausted entry is reset only by a new message, a read/ack, or restart.
     composer_occupied_reprobes: Mutex<BTreeMap<String, ComposerOccupiedReprobeEntry>>,
+    /// Route identity recorded when a fence was raised, for B2/S2 release checks.
+    fence_routes: Mutex<BTreeMap<String, crate::identity::VendorRoute>>,
     #[cfg(test)]
     composer_probe_hook: Mutex<Option<ComposerProbeHook>>,
     #[cfg(test)]
@@ -1215,7 +1217,7 @@ where
     }
 
     fn dispatch_and_propagate(
-        &self,
+        self: &Arc<Self>,
         msg: &WireMessage,
         recipient: &str,
         now: At,
@@ -1232,7 +1234,7 @@ where
             &mut working,
             self.config.home_override.as_deref(),
             msg,
-            now,
+            now.clone(),
             recipient,
             report,
         );
@@ -1244,7 +1246,15 @@ where
         if changed {
             let _ = live.save(self.config.routes_path.as_deref());
         }
+        let winning_after_merge = live.get(recipient).map(|e| e.route.clone());
         drop(live);
+        if let Some(winning) = winning_after_merge {
+            // Passive discovery: vendor change alone satisfies the S2 gate.
+            let gone = base.get(recipient).is_none();
+            if self.should_release_fence_for(recipient, &winning, false, gone) {
+                self.release_fence_for_new_route(recipient, now.clone());
+            }
+        }
         for rcpt in updated {
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
@@ -1540,6 +1550,7 @@ where
                 let queue_limit = MAX_QUEUED_PER_RECIPIENT;
                 if queue.overflowed || queue.pending.len() >= queue_limit {
                     if !queue.overflowed {
+                        self.record_fence_route(&name);
                         let _blocked = lock(&self.overflow_recipients);
                         let mut diagnostics = lock(&self.dispatch_diagnostics);
                         let mut row = evidence.clone();
@@ -1770,11 +1781,25 @@ where
     }
 
     /// The caller holds `dispatch_queues`; this matches `schedule_dispatch` lock order.
+    fn record_fence_route(&self, recipient: &str) {
+        let norm =
+            normalize_persona(recipient).unwrap_or_else(|| recipient.trim().to_ascii_lowercase());
+        // Registration may already hold `routes` on this thread; recording then would
+        // deadlock and would capture the winning route instead of the fenced one.
+        let Ok(routes) = self.routes.try_lock() else {
+            return;
+        };
+        if let Some(entry) = routes.get(&norm) {
+            lock(&self.fence_routes).insert(norm, entry.route.clone());
+        }
+    }
+
     fn retain_overflow_fence(
         &self,
         recipient: &str,
         mut row: FenceDiagnostic,
     ) -> Option<FenceDiagnostic> {
+        self.record_fence_route(recipient);
         let mut blocked = lock(&self.overflow_recipients);
         let mut diagnostics = lock(&self.dispatch_diagnostics);
         row.hold_observed_at = now_at();
@@ -1818,10 +1843,10 @@ where
         }
     }
 
-    /// Release a retained fence because registration replaced the route identity
-    /// (a remodel or vendor change): the fence was raised against the old, now-dead
-    /// route, so it must not block the new session. Pending receipts are rescheduled
-    /// for delivery to the new route. The diagnostic first-hold record is kept.
+    /// Release a retained fence because a winning registration replaced the route
+    /// identity recorded on the fence (remodel/vendor change). Redelivery after a
+    /// release is at-least-once: a message with `attempts > 0` may already have been
+    /// received, so it is redelivered with a notice line before the body.
     fn release_fence_for_new_route(self: &Arc<Self>, recipient: &str, now: At) {
         let name =
             normalize_persona(recipient).unwrap_or_else(|| recipient.trim().to_ascii_lowercase());
@@ -1835,12 +1860,8 @@ where
         if !is_fenced {
             return;
         }
-        warn(&format!(
-            "released retained fence for {}: route identity replaced by remodel/vendor change; rescheduling pending delivery to the new route",
-            sanitize_for_warning(&name)
-        ));
-        lock(&self.composer_occupied_reprobes).remove(&name);
         let _order = lock(&self.enqueue_gate);
+        // Fallible store read first: do not drop re-probe/fence state before it succeeds.
         let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
             recipient: Some(name.clone()),
             unread_only: true,
@@ -1848,25 +1869,67 @@ where
         }) else {
             return;
         };
+        warn(&format!(
+            "released retained fence for {}: route identity replaced by remodel/vendor change; rescheduling pending delivery to the new route (at-least-once)",
+            sanitize_for_warning(&name)
+        ));
+        lock(&self.composer_occupied_reprobes).remove(&name);
+        lock(&self.fence_routes).remove(&name);
+        lock(&self.dispatch_diagnostics).clear_recipient(&name);
         let mut first_holds = Vec::new();
         lock(&self.overflow_recipients).remove(&name);
         if let Some(queue) = lock(&self.dispatch_queues).get_mut(&name) {
             queue.overflowed = false;
         }
         for item in &unread {
-            if item.receipt.status == DeliveryStatus::Pending
-                && let Err(message) = self.schedule_dispatch(
+            if item.receipt.status == DeliveryStatus::Pending {
+                if item.receipt.attempts > 0 {
+                    let mut msg = item.message.clone();
+                    msg.body = format!(
+                        "Note: this is a redelivery after a session change; an earlier delivery attempt was unconfirmed and may already have been received.\n\n{}",
+                        msg.body
+                    );
+                    if let Err(message) = self.schedule_dispatch(
+                        &msg,
+                        std::slice::from_ref(&item.receipt),
+                        now.clone(),
+                        &mut first_holds,
+                    ) {
+                        warn(&message);
+                    }
+                } else if let Err(message) = self.schedule_dispatch(
                     &item.message,
                     std::slice::from_ref(&item.receipt),
                     now.clone(),
                     &mut first_holds,
-                )
-            {
-                warn(&message);
+                ) {
+                    warn(&message);
+                }
             }
         }
         drop(_order);
         log_first_holds(first_holds);
+    }
+
+    /// S2 gate: release only when the winning identity differs from the fence-recorded
+    /// identity AND (explicit OR vendor changed OR fenced route gone).
+    fn should_release_fence_for(
+        &self,
+        norm: &str,
+        winning: &crate::identity::VendorRoute,
+        explicit: bool,
+        route_gone_before: bool,
+    ) -> bool {
+        let recorded = lock(&self.fence_routes).get(norm).cloned();
+        let Some(old) = recorded else {
+            // No recorded identity: the S2 gate requires a recorded identity that
+            // differs, so there is nothing to prove a release from.
+            return false;
+        };
+        if !route_identity_changed(&old, winning) {
+            return false;
+        }
+        explicit || route_gone_before || old.canonical_vendor() != winning.canonical_vendor()
     }
 
     /// Clear `overflow_recipients` and resume queued/pending push delivery for `recipient`
@@ -1933,6 +1996,8 @@ where
             return;
         }
         let mut first_holds = Vec::new();
+        lock(&self.dispatch_diagnostics).clear_recipient(&name);
+        lock(&self.fence_routes).remove(&name);
         lock(&self.overflow_recipients).remove(&name);
         if let Some(queue) = lock(&self.dispatch_queues).get_mut(&name) {
             queue.overflowed = false;
@@ -2497,11 +2562,16 @@ where
                         // after publication. A passive same-identity re-registration
                         // keeps the fence, since the unconfirmed delivery may have
                         // reached that same session.
-                        if let Some(new_entry) = routes.get(&norm)
-                            && let Some(old_entry) = before.entries.get(&norm)
-                            && route_identity_changed(&old_entry.route, &new_entry.route)
-                        {
-                            fence_release = true;
+                        if let Some(new_entry) = routes.get(&norm) {
+                            let gone = !before.entries.contains_key(&norm);
+                            if self.should_release_fence_for(
+                                &norm,
+                                &new_entry.route,
+                                explicit,
+                                gone,
+                            ) {
+                                fence_release = true;
+                            }
                         }
                         // Route publication and the worker's wake generation must be observed
                         // together: a no-route worker may not evict in between them.
@@ -3227,6 +3297,7 @@ where
         overflow_recipients: Mutex::new(BTreeSet::new()),
         overflow_capacity_exhausted: AtomicBool::new(false),
         dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
+        fence_routes: Mutex::new(BTreeMap::new()),
         pending_by_recipient: Mutex::new(initial_pending),
         awaiting_daemon_state: Mutex::new(BTreeMap::new()),
         composer_occupied_reprobes: Mutex::new(BTreeMap::new()),
@@ -3480,6 +3551,7 @@ mod tests {
             overflow_recipients: Mutex::new(BTreeSet::new()),
             overflow_capacity_exhausted: AtomicBool::new(false),
             dispatch_diagnostics: Mutex::new(new_dispatch_diagnostics()),
+            fence_routes: Mutex::new(BTreeMap::new()),
             pending_by_recipient: Mutex::new(BTreeMap::new()),
             awaiting_daemon_state: Mutex::new(BTreeMap::new()),
             composer_occupied_reprobes: Mutex::new(BTreeMap::new()),
@@ -4062,7 +4134,11 @@ mod tests {
                 true,
             ));
             assert!(matches!(response, LocalResponse::RouteRegistered));
-            assert_eq!(inner.diagnostics_snapshot(), first);
+            // S6: fence release clears the diagnostics record.
+            assert!(
+                inner.diagnostics_snapshot().records.is_empty(),
+                "release must clear diagnostics record"
+            );
             let calls = TRANSPORT_CALLS.with(|n| n.get());
             let (response, _) = inner.handle_local_request(LocalRequest::Send {
                 args: mail("held", "later"),
@@ -4089,7 +4165,7 @@ mod tests {
                 inner.store.inner.list_wire_receipts(&other).unwrap()[0].status,
                 DeliveryStatus::Acked
             );
-            assert_eq!(inner.diagnostics_snapshot(), first);
+            assert!(inner.diagnostics_snapshot().records.is_empty());
         });
     }
 
@@ -4142,6 +4218,47 @@ mod tests {
     }
 
     #[test]
+    fn unregister_then_register_new_vendor_releases_fence_b2() {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            let _first = run_fault_job(&inner, "held");
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+            let (r, _) = inner.handle_local_request(LocalRequest::UnregisterRoute {
+                persona: "held".into(),
+            });
+            assert!(matches!(r, LocalResponse::RouteUnregistered));
+            assert!(
+                lock(&inner.overflow_recipients).contains("held"),
+                "unregister alone keeps fence"
+            );
+            let (r, _) = inner.handle_local_request(LocalRequest::register(
+                "held",
+                VendorRoute::Claude {
+                    pid: 0,
+                    session_id: "new-claude".into(),
+                    socket_path: std::path::PathBuf::from("/tmp/x.sock"),
+                    key_path: None,
+                },
+                true,
+            ));
+            assert!(matches!(r, LocalResponse::RouteRegistered));
+            assert!(
+                !lock(&inner.overflow_recipients).contains("held"),
+                "register after unregister must release fence (B2 remodel)"
+            );
+            assert!(
+                inner
+                    .diagnostics_snapshot()
+                    .records
+                    .iter()
+                    .all(|r| r.recipient.as_deref() != Some("held")),
+                "S6 diagnostics cleared"
+            );
+        });
+    }
+
+    #[test]
     fn same_vendor_new_session_without_replace_releases_fence() {
         let (_tmp, inner) = fault_rig();
         lock(&inner.store.writes).push_back(Fault::Error);
@@ -4162,8 +4279,7 @@ mod tests {
                 lock(&inner.overflow_recipients).contains("held"),
                 "same-identity passive re-registration must keep the fence"
             );
-            // Same vendor, new session identity, no --replace: identity changed and
-            // the new entry won registration, so the old fence must be released.
+            // S2: passive same-vendor new session over a live incumbent does NOT release.
             let (response, _) = inner.handle_local_request(LocalRequest::register(
                 "held",
                 VendorRoute::Codex {
@@ -4174,8 +4290,22 @@ mod tests {
             ));
             assert!(matches!(response, LocalResponse::RouteRegistered));
             assert!(
+                lock(&inner.overflow_recipients).contains("held"),
+                "passive same-vendor registration must keep the fence (S2)"
+            );
+            // Explicit registration with the new identity does release.
+            let (response, _) = inner.handle_local_request(LocalRequest::register(
+                "held",
+                VendorRoute::Codex {
+                    thread_id: "new-session".into(),
+                    cwd: None,
+                },
+                true,
+            ));
+            assert!(matches!(response, LocalResponse::RouteRegistered));
+            assert!(
                 !lock(&inner.overflow_recipients).contains("held"),
-                "same-vendor new-session registration must release the old fence"
+                "explicit new-session registration must release the old fence (S2)"
             );
         });
     }

@@ -1013,7 +1013,12 @@ export const sessionDeliveryReceipts = new Map<string, {
 }>();
 /** A prompt held because the vendor composer holds non-wire input or a dialog (#496). Zero keys were sent, so it is known not to have landed and stays retryable. */
 export function isComposerHeldPrompt(item: QueuedOperatorPrompt): boolean {
-  return Boolean(item.delivery_error?.includes("composer_occupied_by_non_wire_input"));
+  return item.hold_reason === "composer_occupied_zero_keys";
+}
+export function composerHoldText(item: QueuedOperatorPrompt): string {
+  return item.retries_exhausted
+    ? "Held: the session composer is occupied, so nothing was sent. Automatic retries have stopped — use Send Now or remove this item."
+    : "Held: the session composer is occupied, so nothing was sent. It will retry automatically when the composer clears.";
 }
 // A lost Send Now reply must also hold its queue item against another click.
 const unconfirmedQueuedPrompts = new Map<string, Set<string>>();
@@ -4153,9 +4158,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                       </>
                     )}
                   </div>
-                  {isHeld && item.delivery_error && (
+                  {isHeld && (
                     <div role="status" data-testid={`queued-hold-reason-${item.id}`} style={{ color: "#FBBF24", fontSize: "11px", paddingLeft: "34px" }}>
-                      {item.delivery_error}
+                      {composerHoldText(item)}
+                    </div>
+                  )}
+                  {effectiveQueue.some((q) => q.retries_exhausted) && idx === 0 && (
+                    <div role="status" data-testid="queued-retries-exhausted" style={{ color: "#FBBF24", fontSize: "11px", paddingLeft: "34px" }}>
+                      Automatic retries stopped for the first queued item; the rest of the queue is blocked behind it.
                     </div>
                   )}
                   </div>

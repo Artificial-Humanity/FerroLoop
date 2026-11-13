@@ -130,6 +130,10 @@ pub struct QueuedOperatorPrompt {
     pub delivery_state: QueuedDeliveryState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
+    #[serde(default)]
+    pub retries_exhausted: bool,
 }
 
 /// Sending and unconfirmed items stay visible and cannot be drained automatically.
@@ -193,14 +197,15 @@ impl PromptQueueTarget {
     }
 }
 
-/// Bounded re-probe budget for a prompt held by an occupied composer (mirrors the wire
-/// dispatcher's `#471` schedule: 10s doubling to 120s, at most 16 probes).
+/// Bounded re-probe budget for a prompt held by an occupied composer: first probe is
+/// immediate, then 10s doubling to 120s (10, 20, 40, 80, 120, ...), at most 16 probes.
 pub(crate) const COMPOSER_HELD_MAX_PROBES: u32 = 16;
 pub(crate) const COMPOSER_HELD_INITIAL_BACKOFF_MS: i64 = 10_000;
 pub(crate) const COMPOSER_HELD_MAX_BACKOFF_MS: i64 = 120_000;
 
 fn is_composer_occupied_error(error: &str) -> bool {
-    error.contains("composer_occupied_by_non_wire_input")
+    // Only the zero-keys wire error may auto-retry; every other Failed stays Unconfirmed.
+    fl_wire::is_composer_occupied_zero_keys_error(error)
 }
 
 #[derive(Debug, Default)]
@@ -283,7 +288,7 @@ pub(crate) struct DirectPromptInput {
 
 pub(crate) enum DirectPromptDecision<'a> {
     Dispatch(SessionDispatchGuard<'a>),
-    Queued(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>),
+    Queued(Box<QueuedOperatorPrompt>, Vec<QueuedOperatorPrompt>),
     DispatchBusy,
     FencedAlias(String),
 }
@@ -318,6 +323,8 @@ impl PromptQueueState {
             created_at: now.to_string(),
             delivery_state: QueuedDeliveryState::Pending,
             delivery_error: None,
+            hold_reason: None,
+            retries_exhausted: false,
         };
         let queue = self.queues.entry(session_key.to_string()).or_default();
         queue.push(item.clone());
@@ -898,7 +905,7 @@ impl HubState {
                 || guard.queues.get(raw).is_some_and(|q| !q.is_empty()))
         {
             let (item, queue) = guard.enqueue(canonical, input);
-            return DirectPromptDecision::Queued(item, queue);
+            return DirectPromptDecision::Queued(Box::new(item), queue);
         }
         guard.remember_target(input.queue_target);
         guard.active_queue_sends.insert(canonical.into());
@@ -965,15 +972,14 @@ impl HubState {
                 }
                 Err(fl_wire::dispatcher::PushError::Failed(error)) => {
                     if is_composer_occupied_error(&error) {
-                        // Zero keys were sent over the non-wire input, so this delivery
-                        // is known not to have landed: keep it retryable (Pending) and
-                        // arm the bounded clean-composer re-probe instead of fencing it
-                        // as Unconfirmed forever.
                         queue[pos].delivery_state = QueuedDeliveryState::Pending;
                         queue[pos].delivery_error = Some(error);
+                        queue[pos].hold_reason = Some("composer_occupied_zero_keys".to_string());
+                        queue[pos].retries_exhausted = false;
                     } else {
                         queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
                         queue[pos].delivery_error = Some(error);
+                        queue[pos].hold_reason = None;
                     }
                 }
             }
@@ -1006,6 +1012,20 @@ impl HubState {
         guard
             .composer_hold_probes
             .insert(prompt_id.to_string(), (0, now_ms));
+        for q in guard.queues.values_mut() {
+            for i in q.iter_mut().filter(|i| i.id == prompt_id) {
+                i.retries_exhausted = false;
+            }
+        }
+    }
+
+    pub(crate) fn mark_hold_retries_exhausted(&self, session_key: &str, prompt_id: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(q) = guard.queues.get_mut(session_key) {
+            for i in q.iter_mut().filter(|i| i.id == prompt_id) {
+                i.retries_exhausted = true;
+            }
+        }
     }
 
     /// Whether `prompt_id` in `session_key`'s queue is a retryable composer-occupied hold.
@@ -1037,6 +1057,14 @@ impl HubState {
     /// when the bounded budget is exhausted and the prompt stays held.
     pub(crate) fn note_composer_hold_probe(&self, prompt_id: &str, now_ms: i64) -> Option<u32> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.composer_hold_probes.contains_key(prompt_id)
+            && !guard
+                .queues
+                .values()
+                .any(|q| q.iter().any(|i| i.id == prompt_id))
+        {
+            return None; // prompt deleted during probe: do not re-create entry
+        }
         let entry = guard
             .composer_hold_probes
             .entry(prompt_id.to_string())
@@ -1078,6 +1106,8 @@ impl HubState {
             return false;
         };
         item.delivery_error = None;
+        item.hold_reason = None;
+        item.retries_exhausted = false;
         guard.composer_hold_probes.remove(prompt_id);
         true
     }
@@ -1107,7 +1137,15 @@ impl HubState {
     pub fn clear_session_prompt_queue(&self, session_key: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(queue) = guard.queues.get_mut(session_key) {
+            let dropped: Vec<String> = queue
+                .iter()
+                .filter(|q| q.delivery_state == QueuedDeliveryState::Pending)
+                .map(|q| q.id.clone())
+                .collect();
             queue.retain(|q| q.delivery_state != QueuedDeliveryState::Pending);
+            for id in dropped {
+                guard.composer_hold_probes.remove(&id);
+            }
         }
         guard.in_flight.remove(session_key);
     }
@@ -1787,7 +1825,7 @@ mod tests {
             "ada",
             &item.id,
             Err(fl_wire::dispatcher::PushError::Failed(
-                "composer_occupied_by_non_wire_input: busy".into(),
+                "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys".into(),
             )),
         );
         claim.finish();

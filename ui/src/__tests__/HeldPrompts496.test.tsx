@@ -17,6 +17,7 @@ function heldItem(overrides: Partial<QueuedOperatorPrompt> = {}): QueuedOperator
     created_at: "2026-11-10T20:00:00Z",
     delivery_state: "pending",
     delivery_error: HOLD_REASON,
+    hold_reason: "composer_occupied_zero_keys",
     ...overrides,
   };
 }
@@ -27,10 +28,11 @@ describe("held operator prompts (#496 defect 1)", () => {
     window.localStorage.clear();
   });
 
-  it("detects composer-held prompts by their hold reason", () => {
+  it("detects composer-held prompts by their structured hold_reason, not error text", () => {
     expect(isComposerHeldPrompt(heldItem())).toBe(true);
-    expect(isComposerHeldPrompt(heldItem({ delivery_error: "receiver unavailable" }))).toBe(false);
-    expect(isComposerHeldPrompt(heldItem({ delivery_error: null }))).toBe(false);
+    // Post-paste error shares the wire prefix but is not a zero-key hold (B1).
+    expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: "composer_occupied_by_non_wire_input: composer holds non-wire input after paste; aborting Enter retries" }))).toBe(false);
+    expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: null }))).toBe(false);
   });
 
   it("shows the owner's text and sender with the hold reason as a separate status line", () => {
@@ -55,11 +57,11 @@ describe("held operator prompts (#496 defect 1)", () => {
 
     const holdLine = screen.getByTestId("queued-hold-reason-held-1");
     expect(holdLine).toHaveAttribute("role", "status");
-    expect(holdLine).toHaveTextContent(HOLD_REASON);
-    // Separate line: the hold reason is not inside the message body element.
+    // Human-readable hold text, not the raw internal error string (nit).
+    expect(holdLine).toHaveTextContent(/Held: the session composer is occupied/);
+    expect(holdLine.textContent).not.toContain("composer_occupied_by_non_wire_input");
     expect(body.contains(holdLine)).toBe(false);
     expect(holdLine.contains(body)).toBe(false);
-    expect(within(item).getByText(HOLD_REASON)).toBe(holdLine);
     expect(item.textContent).not.toContain("Delivery unconfirmed");
   });
 
@@ -160,6 +162,46 @@ describe("held operator prompts (#496 defect 1)", () => {
 
     fireEvent.change(composer, { target: { value: "" } });
     expect(sendNow).toBeEnabled();
+  });
+
+  it("S7: Delete is disabled while a non-held prompt is sending", () => {
+    render(
+      <ChatPane agentName="kayla" sessionId="sess-kayla-sending" turns={[]} isBusy={false}
+        queue={[heldItem({ id: "sending-1", session_id: "sess-kayla-sending", hold_reason: null, delivery_error: null, delivery_state: "sending" })]}
+        onSendQueuedNow={vi.fn()} onCancelQueued={vi.fn()} />,
+    );
+    expect(screen.getByTestId("queued-cancel-sending-1")).toBeDisabled();
+    expect(screen.getByTestId("queued-send-now-sending-1")).toBeDisabled();
+  });
+
+  it("S7: lost-reply fence does not mask a held prompt and Send Now still works", async () => {
+    const onSendQueuedNow = vi.fn(async () => { throw new TypeError("lost reply"); });
+    const props = {
+      agentName: "kayla", adapter: "codex" as const, turns: [] as never[], isBusy: false,
+      queue: [heldItem({ id: "lost-held", session_id: "sess-kayla-lost" })],
+      onSendQueuedNow, onCancelQueued: vi.fn(),
+    };
+    const { rerender } = render(<ChatPane sessionId="sess-kayla-lost" {...props} />);
+    fireEvent.click(screen.getByTestId("queued-send-now-lost-held"));
+    await waitFor(() => expect(onSendQueuedNow).toHaveBeenCalledTimes(1));
+    rerender(<ChatPane sessionId="sess-kayla-lost" {...props} />);
+    const item = screen.getByTestId("queued-prompt-item-lost-held");
+    expect(within(item).queryByText(/Delivery unconfirmed/)).toBeNull();
+    expect(screen.getByTestId("queued-hold-reason-lost-held")).toBeInTheDocument();
+    const sendNow = screen.getByTestId("queued-send-now-lost-held");
+    expect(sendNow).toBeEnabled();
+    fireEvent.click(sendNow);
+    await waitFor(() => expect(onSendQueuedNow).toHaveBeenCalledTimes(2));
+  });
+
+  it("S5: retries-exhausted held prompt says retries stopped", () => {
+    render(
+      <ChatPane agentName="kayla" sessionId="sess-kayla-exhausted" turns={[]} isBusy={false}
+        queue={[heldItem({ id: "exh-1", session_id: "sess-kayla-exhausted", retries_exhausted: true })]}
+        onSendQueuedNow={vi.fn()} onCancelQueued={vi.fn()} />,
+    );
+    expect(screen.getByTestId("queued-hold-reason-exh-1")).toHaveTextContent(/Automatic retries have stopped/);
+    expect(screen.getByTestId("queued-retries-exhausted")).toHaveTextContent(/blocked behind it/);
   });
 
   it("keeps non-held queue behaviour unchanged while busy", async () => {
