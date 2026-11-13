@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { FerroWatchUsage } from "./FerroWatchUsage";
 import { formatCurrencyFromMicros, useActiveCurrency } from "../lib/currency";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
@@ -2626,8 +2627,27 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               >
                 {healthAgents.map((item) => {
                   const key = item.agent.trim().toLowerCase();
-                  const hosted = item.hosted_session;
-                  const vendor = hosted?.vendor ?? item.adapter ?? null;
+                  // A decommissioned record is history (issue #485): when a live
+                  // discovered session exists for the persona, show that live
+                  // unmanaged session, not the stale record id. Actions in this
+                  // row already target the persona (`key`).
+                  const liveSession =
+                    sessions.find(
+                      (sess) =>
+                        (sess.persona ?? "").trim().toLowerCase() === key &&
+                        (sess.status ?? "active").trim().toLowerCase() ===
+                          "active",
+                    ) ?? null;
+                  const hosted =
+                    item.hosted_session &&
+                    (item.hosted_session.status ?? "")
+                      .trim()
+                      .toLowerCase() === "decommissioned" &&
+                    liveSession
+                      ? null
+                      : item.hosted_session;
+                  const vendor =
+                    hosted?.vendor ?? liveSession?.adapter ?? item.adapter ?? null;
                   const contextUsage =
                     sessions.find((sess) => sess.id === hosted?.session_id)
                       ?.context_usage ??
@@ -2778,6 +2798,20 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         )}
                       </div>
 
+                      {!hosted && liveSession && (
+                        <div
+                          data-testid={`watch-liveness-live-unmanaged-${key}`}
+                          className="fd-mono"
+                          style={{
+                            fontSize: "10px",
+                            color: "var(--text-secondary)",
+                          }}
+                        >
+                          Live session: {liveSession.id} · status=
+                          {liveSession.status ?? "active"} · unmanaged
+                        </div>
+                      )}
+
                       {hosted && (
                         <div
                           data-testid={`watch-liveness-hosted-${key}`}
@@ -2868,6 +2902,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                 ))}
               </select>
             </div>
+
+            {isOwner && apiClient && typeof apiClient.getWatchUsage === "function" && (
+              <FerroWatchUsage apiClient={apiClient} />
+            )}
 
             {/* Totals Strip */}
             {activeTelemetry && (
