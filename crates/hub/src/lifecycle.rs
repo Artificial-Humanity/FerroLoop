@@ -6422,6 +6422,49 @@ fn record_for_target<S: AgentRegistry>(
     })
 }
 
+/// `true` when the persona has a live route outside a hosted record (see [`find_route`]).
+fn has_live_route(env: &LifecycleEnv<'_>, target: &SessionTarget) -> bool {
+    find_route(
+        env.home_override,
+        RouteQuery::persona(&target.persona, &target.session_id),
+    )
+    .is_some()
+}
+
+/// Whether a decommissioned hosted record may be treated as absent: only for the Owner, and
+/// only when the persona has a live route (issue #485). A Peer keeps the 403/409 it had.
+fn may_adopt_over_decommissioned(
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    caller: Caller,
+) -> bool {
+    caller == Caller::Owner
+        && target.hosted.as_ref().is_some_and(is_decommissioned)
+        && has_live_route(env, target)
+}
+
+/// `target` with its decommissioned record dropped, so adoption creates a new hosted record
+/// as it does when no record exists. The new record's id is the discovered (live) id when it
+/// differs from the stale record's, else the raw id, else the persona.
+fn adopted_target(target: &SessionTarget) -> SessionTarget {
+    let stale_id = target
+        .hosted
+        .as_ref()
+        .map_or(target.session_id.as_str(), |r| r.session_id.as_str());
+    let session_id = if target.discovered_id != stale_id {
+        target.discovered_id.clone()
+    } else if target.raw_id != stale_id {
+        target.raw_id.clone()
+    } else {
+        target.persona.clone()
+    };
+    SessionTarget {
+        session_id,
+        hosted: None,
+        ..target.clone()
+    }
+}
+
 /// Phase one: ask the agent to save its work and hand off. Nothing is stopped or unregistered.
 ///
 /// `handshake_dispatched` is `false` when no live route took the prompt; the caller may queue it.
@@ -6445,9 +6488,19 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
         target.hosted.as_ref(),
         OwnerGate::Decommission,
     )?;
-    if target.hosted.as_ref().is_some_and(is_decommissioned) {
-        return Err(decommissioned_conflict(&target.session_id));
-    }
+    // A decommissioned record is history: for the Owner, a persona that is live again via a
+    // route outside fl-host is adopted as a new hosted record, as when no record exists
+    // (issue #485). The 409 stays when there is no live route.
+    let adopted;
+    let target = if target.hosted.as_ref().is_some_and(is_decommissioned) {
+        if !may_adopt_over_decommissioned(env, target, caller) {
+            return Err(decommissioned_conflict(&target.session_id));
+        }
+        adopted = adopted_target(target);
+        &adopted
+    } else {
+        target
+    };
     // Other running records are updated too. This target may become `stopped`
     // here and is then rewritten to `decommissioning` below.
     reconcile_dead_hosted_sessions(store, env, by)?;
@@ -8918,9 +8971,18 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
 ) -> Result<RemodelPlan, LifecycleError> {
     let mode = RemodelMode::parse(req.mode.as_deref())?;
     authorize_teardown(store, target, caller)?;
-    if target.hosted.as_ref().is_some_and(is_decommissioned) {
-        return Err(decommissioned_conflict(&target.session_id));
-    }
+    // Same adoption as Prepare (issue #485): a decommissioned record with a live route is
+    // treated as no record for the Owner; without a live route the 409 stays.
+    let adopted;
+    let target = if target.hosted.as_ref().is_some_and(is_decommissioned) {
+        if !may_adopt_over_decommissioned(env, target, caller) {
+            return Err(decommissioned_conflict(&target.session_id));
+        }
+        adopted = adopted_target(target);
+        &adopted
+    } else {
+        target
+    };
     let assignment = match current_recast_assignment(store, &target.persona)? {
         Some(agent) => Some((agent.project, role_label_of(&agent.role))),
         None => project_and_role(store, target)?,
@@ -12825,6 +12887,72 @@ mod tests {
             .unwrap();
         assert_eq!(revived.status, "running");
         assert_eq!(revived.created_at_ms, record_before.created_at_ms);
+    }
+
+    #[test]
+    fn owner_prepare_adopts_a_live_route_over_a_decommissioned_record() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        stale_ada(&store, &env);
+        webhook_route_file(home.path(), "ada");
+        let listener =
+            std::os::unix::net::UnixListener::bind(home.path().join("none.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Resolved by persona, as FerroDeck does: the only hosted record is stale history.
+        let target = SessionTarget::resolve(&store, "ada", None).unwrap();
+        assert_eq!(target.hosted.as_ref().unwrap().status, "decommissioned");
+
+        // A Peer on the active agent is still refused, and adopts nothing.
+        let err = prepare_decommission(&store, &env, &target, "peer", Caller::Peer).unwrap_err();
+        assert_eq!(err.status(), 403);
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+        assert!(listener.accept().is_err(), "no prompt may be delivered");
+
+        let out = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
+        assert_eq!(out.status, "decommissioning");
+        assert!(
+            out.handshake_dispatched,
+            "the live route took the handshake"
+        );
+        assert!(listener.accept().is_ok(), "the handshake was delivered");
+        // A new adopted record is decommissioning; the stale record stays history.
+        let adopted = list_hosted_sessions(&store)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.session_id == out.session_id)
+            .unwrap();
+        assert_eq!(adopted.status, "decommissioning");
+        assert_ne!(adopted.session_id, "claude:ada");
+        assert_eq!(
+            record_status(&store, "claude:ada"),
+            Some("decommissioned".to_string())
+        );
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn owner_prepare_of_a_decommissioned_record_without_a_live_route_still_conflicts() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        stale_ada(&store, &env);
+        let target = SessionTarget::resolve(&store, "ada", None).unwrap();
+        let err = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap_err();
+        assert_eq!(err.status(), 409);
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+        assert_eq!(
+            record_status(&store, "claude:ada"),
+            Some("decommissioned".to_string())
+        );
+    }
+
+    fn record_status(store: &MemStore, id: &str) -> Option<String> {
+        list_hosted_sessions(store)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.session_id == id)
+            .map(|r| r.status)
     }
 
     #[test]
