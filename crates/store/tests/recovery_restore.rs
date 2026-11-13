@@ -8343,3 +8343,246 @@ fn restore_review14_rollback_refusals_name_typed_terminal_actions_without_spendi
         }
     }
 }
+
+// Status is the recovery channel when the operator's accepted request is lost.
+type Review15ArtifactSnapshot = Vec<(std::path::PathBuf, Option<((u64, u64), Vec<u8>)>)>;
+fn review15_artifact_snapshot(f: &Fixture, j: &RestoreJournal) -> Review15ArtifactSnapshot {
+    [
+        j.destination.clone(),
+        j.staging.join("candidate.fls"),
+        j.staging.join("original.fls"),
+        j.staging.join("journal.bin"),
+        j.staging.join("journal.bin.lock"),
+        j.destination.with_extension("fls.restore-guard"),
+        terminal_negative_pin(f, j),
+    ]
+    .into_iter()
+    .map(|path| {
+        let value = match fs::symlink_metadata(&path) {
+            Ok(m) => Some(((m.dev(), m.ino()), fs::read(&path).unwrap())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("snapshot: {e}"),
+        };
+        (path, value)
+    })
+    .collect()
+}
+fn review15_status(f: &Fixture, j: &RestoreJournal, lease: &OfflineLease) -> serde_json::Value {
+    let before = review15_artifact_snapshot(f, j);
+    let loaded_before =
+        load_restore_journal(&j.staging.join("journal.bin"), lease, &f.filesystem()).unwrap();
+    let status = restore_status(&j.staging.join("journal.bin"), lease, &f.filesystem()).unwrap();
+    let json = serde_json::to_value(&status).unwrap();
+    // Assert presence explicitly: JSON indexing alone would disguise absent fields as null.
+    assert!(
+        json.get("accepted_reconciliation").is_some(),
+        "status omits accepted reconciliation"
+    );
+    assert!(
+        json.get("accepted_absence_reconciliation").is_some(),
+        "status omits accepted absence reconciliation"
+    );
+    let decoded: RestoreStatus =
+        serde_json::from_slice(&serde_json::to_vec(&status).unwrap()).unwrap();
+    let roundtrip = serde_json::to_value(decoded).unwrap();
+    assert_eq!(roundtrip, json);
+    assert_eq!(
+        review15_artifact_snapshot(f, j),
+        before,
+        "status changed artifact bytes or identities"
+    );
+    let loaded_after =
+        load_restore_journal(&j.staging.join("journal.bin"), lease, &f.filesystem()).unwrap();
+    assert_eq!(
+        terminal_negative_counters(&loaded_after),
+        terminal_negative_counters(&loaded_before)
+    );
+    roundtrip
+}
+fn review15_lost_generation_request(original: bool) {
+    use fl_store::recovery::readiness::{
+        ReconciliationRecord, finalize_restore, finalize_rollback,
+    };
+    let mode = if original {
+        TerminalFixtureMode::Original
+    } else {
+        TerminalFixtureMode::Selected
+    };
+    let (f, j, lease) = terminal_fixture(mode);
+    let before = review15_status(&f, &j, &lease);
+    assert!(before["accepted_reconciliation"].is_null());
+    assert!(before["accepted_absence_reconciliation"].is_null());
+    let request_path = f.root.path().join("operator-finalize-request.json");
+    let evidence = generation_evidence(&j, original);
+    fs::write(&request_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::Sync(
+        Directory::RestoreDestinationParent,
+    )));
+    let filesystem = CutFs {
+        f: &f,
+        io: cut.clone(),
+        limits: limits(),
+    };
+    let result = if original {
+        finalize_rollback(&j, &lease, &evidence, &filesystem)
+    } else {
+        finalize_restore(&j, &lease, &evidence, &filesystem)
+    };
+    assert!(result.is_err());
+    assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+    drop(evidence);
+    fs::remove_file(&request_path).unwrap();
+    assert!(!request_path.exists());
+    let status = review15_status(&f, &j, &lease);
+    let phase = if original {
+        RestorePhase::FinalizeOriginalIntent
+    } else {
+        RestorePhase::FinalizeIntent
+    };
+    assert_eq!(status["phase"], serde_json::to_value(phase).unwrap());
+    assert!(status["accepted_absence_reconciliation"].is_null());
+    let recovered: ReconciliationRecord =
+        serde_json::from_value(status["accepted_reconciliation"].clone()).unwrap();
+    // Only the status roundtrip supplies evidence; the loaded journal is an operation handle.
+    let intent =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    let mut changed = recovered.clone();
+    changed.clients.evidence_sha256 = if changed.clients.evidence_sha256 == "a".repeat(64) {
+        "b".repeat(64)
+    } else {
+        "a".repeat(64)
+    };
+    let report = if original {
+        intent.original_verification.as_ref().unwrap()
+    } else {
+        intent.verification.as_ref().unwrap()
+    };
+    let dependencies = if original {
+        &intent.original_dependencies
+    } else {
+        &intent.selected_dependencies
+    };
+    assert!(
+        fl_store::recovery::readiness::assess_readiness(report, dependencies, &changed)
+            .ordinary_admission_ready
+    );
+    let before = review15_artifact_snapshot(&f, &intent);
+    let counters = terminal_negative_counters(&intent);
+    let trace = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+    let filesystem = CutFs {
+        f: &f,
+        io: trace.clone(),
+        limits: limits(),
+    };
+    let rejected = if original {
+        finalize_rollback(&intent, &lease, &changed, &filesystem)
+    } else {
+        finalize_restore(&intent, &lease, &changed, &filesystem)
+    }
+    .unwrap_err();
+    assert!(
+        matches!(rejected, fl_store::recovery::RecoveryError::RefusedInput { reason, .. } if reason == "intent retry requires the already accepted reconciliation")
+    );
+    assert_eq!(review15_artifact_snapshot(&f, &intent), before);
+    let unchanged =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    assert_eq!(terminal_negative_counters(&unchanged), counters);
+    assert!(!trace.events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        RecoveryEvent::Write(Member::RestoreJournal)
+            | RecoveryEvent::Flush(Member::RestoreJournal)
+            | RecoveryEvent::RestoreGuardRemove
+            | RecoveryEvent::RestorePinRemove
+    )));
+    let result = if original {
+        finalize_rollback(&intent, &lease, &recovered, &f.filesystem())
+    } else {
+        finalize_restore(&intent, &lease, &recovered, &f.filesystem())
+    };
+    assert!(matches!(result.unwrap(), RestoreOutcome::Finalized { .. }));
+    assert!(!j.destination.with_extension("fls.restore-guard").exists());
+    assert!(!terminal_negative_pin(&f, &j).exists());
+}
+#[test]
+fn restore_review15_status_recovers_lost_selected_request() {
+    review15_lost_generation_request(false);
+}
+#[test]
+fn restore_review15_status_recovers_lost_original_request() {
+    review15_lost_generation_request(true);
+}
+#[test]
+fn restore_review15_status_recovers_lost_absence_request_for_appendless_cleanup() {
+    use fl_store::recovery::readiness::{AbsenceReconciliationRecord, finalize_original_absence};
+    let (f, j, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    let before = review15_status(&f, &j, &lease);
+    assert!(before["accepted_reconciliation"].is_null());
+    assert!(before["accepted_absence_reconciliation"].is_null());
+    let request_path = f.root.path().join("operator-absence-request.json");
+    let evidence = AbsenceReconciliationRecord {
+        version: 1,
+        operation_id: j.operation_id,
+        candidate_sha256: j.candidate_sha256.clone(),
+        operator: fixture_lease_request(&lease).operator,
+        recorded_at_unix_ms: f.filesystem().io().unix_ms().unwrap(),
+        no_client_opened_path_while_installed: true,
+        evidence_sha256: "a".repeat(64),
+    };
+    fs::write(&request_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+    assert!(
+        finalize_original_absence(
+            &j,
+            &lease,
+            &evidence,
+            &CutFs {
+                f: &f,
+                io: cut.clone(),
+                limits: limits()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(cut.fired.load(Ordering::Acquire), 1);
+    drop(evidence);
+    fs::remove_file(&request_path).unwrap();
+    assert!(!request_path.exists());
+    let status = review15_status(&f, &j, &lease);
+    assert_eq!(
+        status["phase"],
+        serde_json::to_value(RestorePhase::OriginalAbsenceFinalized).unwrap()
+    );
+    assert!(status["accepted_reconciliation"].is_null());
+    let recovered: AbsenceReconciliationRecord =
+        serde_json::from_value(status["accepted_absence_reconciliation"].clone()).unwrap();
+    let terminal =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    let before = fs::read(j.staging.join("journal.bin")).unwrap();
+    let counters = terminal_negative_counters(&terminal);
+    let trace = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreInstall));
+    assert!(matches!(
+        finalize_original_absence(
+            &terminal,
+            &lease,
+            &recovered,
+            &CutFs {
+                f: &f,
+                io: trace.clone(),
+                limits: limits()
+            }
+        )
+        .unwrap(),
+        RestoreOutcome::OriginalAbsenceFinalized { .. }
+    ));
+    assert_eq!(fs::read(j.staging.join("journal.bin")).unwrap(), before);
+    let after =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    assert_eq!(terminal_negative_counters(&after), counters);
+    assert!(!trace.events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        RecoveryEvent::Write(Member::RestoreJournal) | RecoveryEvent::Flush(Member::RestoreJournal)
+    )));
+    assert!(!j.destination.exists());
+    assert!(!j.destination.with_extension("fls.restore-guard").exists());
+    assert!(!terminal_negative_pin(&f, &j).exists());
+}

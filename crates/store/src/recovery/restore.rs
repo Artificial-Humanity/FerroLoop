@@ -3658,6 +3658,10 @@ pub struct RestoreStatus {
     pub artifacts: Vec<RestoreArtifact>,
     pub total_retained_bytes: u64,
     pub staging_identity: (u64, u64),
+    /// Validated evidence already accepted for generation finalization.
+    pub accepted_reconciliation: Option<super::readiness::ReconciliationRecord>,
+    /// Validated evidence already accepted for original-absence finalization.
+    pub accepted_absence_reconciliation: Option<super::readiness::AbsenceReconciliationRecord>,
     pub budget: RestoreBudget,
 }
 /// Read-only retained-artifact inventory. Missing or replaced journal-bound
@@ -3783,6 +3787,8 @@ pub fn restore_status(
         artifacts,
         total_retained_bytes,
         staging_identity: j.staging_identity,
+        accepted_reconciliation: j.reconciliation,
+        accepted_absence_reconciliation: j.absence_reconciliation,
         budget: j.budget,
     })
 }
