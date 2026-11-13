@@ -1211,6 +1211,35 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_arrays_normalize_the_same_text_shapes_as_the_hub() {
+        let adapter = ClaudeHostAdapter::new();
+        let raw = [
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":["raw string",{"text":"untyped text"},{"content":"untyped content"},{"type":"text","text":"typed text"},{"type":"image","source":{"type":"base64","data":"ignored"}},{"type":"thinking","text":"hidden"},{"type":"tool_use","name":"ignored"},{"type":"tool_result","content":["nested string",{"content":"nested content"}]}]}}"#,
+            r#"{"type":"attachment","isSidechain":true,"attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":["sidechain"]}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"task-notification"},"prompt":["notification"]}}"#,
+        ].join("\n");
+        let report = adapter.normalize_transcript(&raw, None).unwrap();
+        assert_eq!(report.turns.len(), 1);
+        assert_eq!(report.turns[0].role, "user");
+        assert_eq!(
+            report.turns[0].content,
+            "raw string\nuntyped text\nuntyped content\ntyped text\nnested string\nnested content"
+        );
+        assert_eq!(report.turns[0].source_cursor, "line:1");
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join(".claude/projects/test");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+        fs::write(&path, &raw).unwrap();
+        let context = adapter.estimate_post_compaction_context(&path).unwrap();
+        assert_eq!(context.turn_count, 1);
+        assert_eq!(
+            context.post_compact_conversational_bytes,
+            raw.lines().next().unwrap().len() as u64
+        );
+    }
+
+    #[test]
     fn archive_and_delete_require_explicit_session_id_and_preserve_sibling_transcripts() {
         let tmp = TempDir::new().unwrap();
         let proj_dir = tmp

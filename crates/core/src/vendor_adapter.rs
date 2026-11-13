@@ -1055,11 +1055,52 @@ pub fn claude_queued_prompt(val: &Value) -> Option<&Value> {
     })
 }
 
+// Match the hub's text extraction for queued prompt blocks. Thinking and tool calls
+// are not conversational text; nested tool results may contain further text blocks.
+fn extract_queued_prompt_text(content: &Value, parts: &mut Vec<String>) {
+    match content {
+        Value::String(s) if !s.trim().is_empty() => parts.push(s.trim().to_string()),
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) if !s.trim().is_empty() => parts.push(s.trim().to_string()),
+                    Value::Object(map) => {
+                        let kind = map.get("type").and_then(Value::as_str).unwrap_or("");
+                        let text = match kind {
+                            "thinking" | "tool_use" | "tool_call" => None,
+                            "tool_result" => {
+                                if let Some(nested) = map.get("content") {
+                                    extract_queued_prompt_text(nested, parts);
+                                }
+                                None
+                            }
+                            "text" => map.get("text"),
+                            _ => map.get("text").or_else(|| map.get("content")),
+                        };
+                        if let Some(text) = text.and_then(Value::as_str)
+                            && !text.trim().is_empty()
+                        {
+                            parts.push(text.trim().to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extract displayable text / tool summary content from a Claude JSONL record.
 pub fn extract_claude_message_content(val: &Value) -> String {
-    let Some(content) = claude_queued_prompt(val)
-        .and_then(|attachment| attachment.get("prompt"))
-        .or_else(|| val.get("content"))
+    if let Some(prompt) = claude_queued_prompt(val).and_then(|attachment| attachment.get("prompt"))
+    {
+        let mut parts = Vec::new();
+        extract_queued_prompt_text(prompt, &mut parts);
+        return parts.join("\n");
+    }
+    let Some(content) = val
+        .get("content")
         .or_else(|| val.pointer("/message/content"))
     else {
         if let Some(s) = val
