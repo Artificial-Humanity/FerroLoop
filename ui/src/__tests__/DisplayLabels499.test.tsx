@@ -22,7 +22,7 @@ describe("operator labels and settings navigation", () => {
   });
   it("retains established runtime labels when the catalog is empty or incomplete", () => {
     const expected = new Map([
-      ["assistant", "Software Engineer"], ["lead", "Project Lead"],
+      ["assistant", "Software Engineer"], ["director", "Project Director"], ["lead", "Project Lead"],
       ["lab_manager", "Lab Manager"], ["ui-developer", "UI & Full-Stack Application Developer"],
       ["web-developer", "Web Developer"], ["mobile-developer", "Mobile Developer"],
       ["system-developer", "System / Backend Developer"], ["data-engineer", "Data Engineer"],
@@ -36,7 +36,7 @@ describe("operator labels and settings navigation", () => {
     expect(options.find(o => o.value === "tester")?.label).toBe("QA & Tester");
     expect(options.find(o => o.value === "system-developer")?.label).toBe("System / Backend Developer");
     expect(options.map(o => o.label)).toEqual(options.map(o => o.label).sort((a, b) => a.localeCompare(b)));
-    const completeCatalog = ["lead", "assistant", "strategist", "ui-developer", "lab-manager", "qa-tester", "security-engineer", "devops-release", "data-ml-engineer", "technical-writer", "journalist"].map(slug => ({ ...lead, slug, label: `Catalog ${slug}` }));
+    const completeCatalog = ["director", "lead", "assistant", "strategist", "ui-developer", "lab-manager", "qa-tester", "security-engineer", "devops-release", "data-ml-engineer", "technical-writer", "journalist"].map(slug => ({ ...lead, slug, label: `Catalog ${slug}` }));
     const completeOptions = roleOptions([...expected.keys()].map(value => ({ value, label: value })), completeCatalog);
     expect(completeOptions.find(o => o.value === "strategist")?.label).toBe("Catalog strategist");
     expect(completeOptions.find(o => o.value === "tester")?.label).toBe("QA & Tester");

@@ -8330,6 +8330,7 @@ fn contextual_reforge_prompt(state: &HubState, snapshot: ReforgePromptSnapshot) 
 
 pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
     match role {
+        AgentRole::Director => "director".to_string(),
         AgentRole::Lead => "lead".to_string(),
         AgentRole::Assistant => "assistant".to_string(),
         AgentRole::LabManager => "lab_manager".to_string(),
