@@ -314,6 +314,57 @@ describe("FerroWatchPane — Antigravity hosted model suffix", () => {
       expect(row).toHaveTextContent("(claude-opus-5-5, claude-opus-5-5-high)"),
     );
   });
+
+  it("shows a live unmanaged persona instead of its decommissioned record (issue #485)", async () => {
+    const summary = makeSampleWatchSummary();
+    summary.health!.agents = [
+      {
+        ...summary.health!.agents[0],
+        hosted_session: {
+          ...summary.health!.agents[0].hosted_session!,
+          session_id: "63c8a662-stale",
+          status: "decommissioned",
+        },
+      },
+    ];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch })}
+        sessions={[
+          {
+            id: "conv-live",
+            source: "route",
+            adapter: "antigravity",
+            persona: "ferris",
+            status: "active",
+          },
+        ]}
+      />,
+    );
+    const row = await screen.findByTestId("watch-liveness-row-ferris");
+    expect(
+      within(row).getByTestId("watch-liveness-live-unmanaged-ferris"),
+    ).toHaveTextContent("conv-live");
+    expect(
+      within(row).getByTestId("watch-liveness-live-unmanaged-ferris"),
+    ).toHaveTextContent("unmanaged");
+    expect(
+      within(row).queryByTestId("watch-liveness-hosted-ferris"),
+    ).not.toBeInTheDocument();
+    expect(row).not.toHaveTextContent("63c8a662-stale");
+    // The Re-Model action targets the persona, not the stale record.
+    expect(
+      within(row).getByTestId("watch-liveness-remodel-btn-ferris"),
+    ).toBeInTheDocument();
+  });
 });
 
 describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness & Rollups", () => {
