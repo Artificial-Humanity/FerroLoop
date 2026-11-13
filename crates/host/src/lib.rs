@@ -43,7 +43,7 @@ pub use child::SessionHandle;
 use identity::{RecordedPid, SignalHook, cleanup_recorded};
 pub use refusal::ContainmentRefusal;
 use session::{Session, SessionParts};
-use survivor_registry::{load_registry, publish, registry_path};
+use survivor_registry::{clean_stale_publish_temps, load_registry, publish, registry_path};
 
 pub use child::{CleanupReport, DescendantExit};
 pub use identity::{
@@ -347,6 +347,9 @@ impl Host {
         let listener = runtime.block_on(HostListener::bind(opts.config))?;
         let endpoint = listener.endpoint().clone();
         let path = registry_path(&endpoint)?;
+        if let Some(dir) = path.parent() {
+            clean_stale_publish_temps(dir);
+        }
         let mut registry = load_registry(&endpoint)?;
         let deadline = Instant::now() + STARTUP_CLEANUP_DEADLINE;
         if let Err(err) = recover(

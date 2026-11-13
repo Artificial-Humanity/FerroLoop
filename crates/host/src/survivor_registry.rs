@@ -3,7 +3,9 @@
 //! The durable file is the Task 1 state path. A private temporary file is synced, then
 //! atomically renamed, then the directory is synced. Names starting with `.flh-` are
 //! publication leftovers. Restart does not treat them, or a truncated file, as cleanup
-//! authority. The epoch high-water mark outlives retired sessions.
+//! authority. At daemon start, `clean_stale_publish_temps` removes publish temps whose
+//! owning pid is provably dead; a temp whose pid is alive, is this process, or cannot
+//! be probed is always kept. The epoch high-water mark outlives retired sessions.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -226,6 +228,87 @@ fn file_name_is_temp(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with(".flh-"))
 }
 
+/// Parse a publish temp name `.flh-{pid}-{seq}-{nanos}`. Anything else —
+/// including the random-hex token temps in `fl-host-proto` — is not a
+/// publish temp this cleanup may touch.
+fn parse_publish_temp(name: &str) -> Option<(u32, u64, u128)> {
+    let mut fields = name.strip_prefix(".flh-")?.split('-');
+    let pid: u32 = fields.next()?.parse().ok()?;
+    let seq: u64 = fields.next()?.parse().ok()?;
+    let nanos: u128 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || pid == 0 {
+        return None;
+    }
+    Some((pid, seq, nanos))
+}
+
+/// Map a failed exclusive-create of the publish temp to an error. An
+/// already-existing temp is a stale-name collision, not evidence that the
+/// endpoint state is not a private file; every other failure keeps the
+/// genuine permission/private-file refusal.
+fn publish_temp_create_error(raw_os_error: Option<i32>) -> HostError {
+    #[cfg(unix)]
+    let collision = raw_os_error == Some(libc::EEXIST);
+    #[cfg(windows)]
+    let collision = matches!(
+        raw_os_error.map(|code| code as u32),
+        Some(windows_sys::Win32::Foundation::ERROR_FILE_EXISTS)
+            | Some(windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS)
+    );
+    #[cfg(not(any(unix, windows)))]
+    let collision = {
+        let _ = raw_os_error;
+        false
+    };
+    if collision {
+        HostError::EndpointStateCollision
+    } else {
+        HostError::EndpointStateDenied
+    }
+}
+
+/// True only when `pid` is provably not running. Any probe failure other
+/// than a definitive no-such-process keeps the temp.
+fn pid_provably_dead(pid: u32) -> bool {
+    match crate::identity::process_identity(pid) {
+        Ok(identity) => identity.pid != pid,
+        Err(HostError::Io(text)) => text == "esrch",
+        Err(_) => false,
+    }
+}
+
+/// Best-effort removal of publish temps left by a killed daemon. Called at
+/// daemon start before the registry is loaded. Never fails startup.
+pub fn clean_stale_publish_temps(dir: &Path) {
+    clean_stale_publish_temps_with(dir, std::process::id(), &pid_provably_dead);
+}
+
+fn clean_stale_publish_temps_with(dir: &Path, own_pid: u32, pid_dead: &dyn Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((pid, _, _)) = parse_publish_temp(&name) else {
+            continue;
+        };
+        if pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        // Only a regular file, never a symlink or directory, and re-probe
+        // the pid immediately before unlinking.
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 fn die_for_crash() -> ! {
     // The gated vendor lives only until this process dies. Tests that must sample it
     // set FL_HOST_CRASH_HOLD_MS so the sample happens before the signal.
@@ -290,7 +373,9 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         )
     };
     if fd < 0 {
-        return Err(HostError::EndpointStateDenied);
+        return Err(publish_temp_create_error(
+            std::io::Error::last_os_error().raw_os_error(),
+        ));
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
     // SAFETY: `file` is the descriptor just created. fchmod tightens the mode after umask.
@@ -431,7 +516,7 @@ fn temp_name() -> Result<std::ffi::CString, HostError> {
 #[cfg(windows)]
 fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Result<(), HostError> {
     use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -490,9 +575,17 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
             std::ptr::null_mut(),
         )
     };
+    // Capture the create error before LocalFree can overwrite it.
+    let create_failed =
+        handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    let create_error = if create_failed {
+        Some(unsafe { GetLastError() } as i32)
+    } else {
+        None
+    };
     unsafe { LocalFree(raw_sd) };
-    if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return Err(HostError::EndpointStateDenied);
+    if create_failed {
+        return Err(publish_temp_create_error(create_error));
     }
     let mut file = unsafe { File::from_raw_handle(handle) };
     file.write_all(bytes)?;
@@ -1060,6 +1153,107 @@ mod tests {
             temp_name_text(4242, 1, 1_000),
             temp_name_text(4242, 1, 2_000)
         );
+    }
+
+    #[test]
+    fn publish_temp_collision_is_distinct_from_permission_refusal() {
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                publish_temp_create_error(Some(libc::EEXIST)),
+                HostError::EndpointStateCollision
+            );
+            assert_eq!(
+                publish_temp_create_error(Some(libc::EACCES)),
+                HostError::EndpointStateDenied
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                publish_temp_create_error(Some(
+                    windows_sys::Win32::Foundation::ERROR_FILE_EXISTS as i32
+                )),
+                HostError::EndpointStateCollision
+            );
+            assert_eq!(
+                publish_temp_create_error(Some(
+                    windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS as i32
+                )),
+                HostError::EndpointStateCollision
+            );
+            assert_eq!(
+                publish_temp_create_error(Some(
+                    windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32
+                )),
+                HostError::EndpointStateDenied
+            );
+        }
+        assert_eq!(
+            publish_temp_create_error(None),
+            HostError::EndpointStateDenied
+        );
+        assert_ne!(
+            HostError::EndpointStateCollision.to_string(),
+            HostError::EndpointStateDenied.to_string()
+        );
+    }
+
+    #[test]
+    fn stale_publish_temp_cleanup_keeps_live_own_and_ordinary_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "flh-clean-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let dead = dir.join(".flh-424242-1-1000");
+        let live = dir.join(".flh-434343-1-1000");
+        let own = dir.join(format!(".flh-{}-1-1000", std::process::id()));
+        let ordinary = dir.join("notes.txt");
+        let planted = dir.join(".flh-planted");
+        let hex_temp = dir.join(".flh-0123456789abcdef");
+        let state = dir.join("h.sock.state.json");
+        let dead_dir = dir.join(".flh-424242-2-1000");
+        for file in [&dead, &live, &own, &ordinary, &planted, &hex_temp, &state] {
+            std::fs::write(file, b"x").expect("plant");
+        }
+        std::fs::create_dir(&dead_dir).expect("dead dir");
+        // 424242 is dead, 434343 is alive, everything else must be untouched.
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|pid| pid == 424242);
+        assert!(!dead.exists(), "dead pid temp removed");
+        assert!(live.exists(), "live pid temp preserved");
+        assert!(own.exists(), "current daemon temp preserved");
+        assert!(ordinary.exists());
+        assert!(planted.exists());
+        assert!(hex_temp.exists());
+        assert!(state.exists());
+        assert!(dead_dir.is_dir(), "directories are never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_publish_temp_cleanup_with_real_dead_pid() {
+        // u32::MAX is never a live pid; the real probe must report it dead
+        // on platforms with process identity, and keep the file elsewhere.
+        let dir = std::env::temp_dir().join(format!(
+            "flh-clean-real-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let stale = dir.join(format!(".flh-{}-1-1000", u32::MAX - 1));
+        std::fs::write(&stale, b"x").expect("plant");
+        clean_stale_publish_temps(&dir);
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(!stale.exists(), "provably dead pid temp removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
