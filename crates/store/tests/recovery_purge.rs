@@ -1777,3 +1777,410 @@ fn purge_audit_publication_refuses_collisions_replacements_and_expiry() {
         }
     }
 }
+
+// These controls must fail if either pin refusal/scan, the lease deadline cap,
+// or either resumed-audit sync is removed. Mutation copies prove each separately.
+fn pin_lifecycle_members(
+    f: &Fixture,
+    op: uuid::Uuid,
+) -> std::collections::BTreeMap<std::path::PathBuf, (u64, u64, u64, String)> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    let mut files = std::collections::BTreeMap::new();
+    for directory in [
+        f.backups.join(op.to_string()),
+        f.backups.join(".quarantine").join(op.to_string()),
+    ] {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::metadata(&path).unwrap();
+            assert!(metadata.is_file());
+            let digest = format!("{:x}", Sha256::digest(fs::read(&path).unwrap()));
+            files.insert(
+                path,
+                (metadata.dev(), metadata.ino(), metadata.len(), digest),
+            );
+        }
+    }
+    files
+}
+fn assert_real_restore_pin_lifecycle(abandon: bool) {
+    use fl_store::recovery::{
+        ProfileKind, RecoveryError, ValidationProfile, readiness::*, restore::*,
+    };
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::AtomicUsize;
+    struct PinIo {
+        fail_copy: bool,
+        copy_cuts: AtomicUsize,
+        unlinks: AtomicUsize,
+    }
+    impl RecoveryIo for PinIo {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::Flush(fl_store::recovery::fs::Member::Image)
+                && self.fail_copy
+            {
+                self.copy_cuts.fetch_add(1, Ordering::AcqRel);
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            if event == RecoveryEvent::PurgeUnlink {
+                self.unlinks.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let bundle = f.bundle();
+    let manifest_bytes = fs::read(bundle.path().join("manifest.json")).unwrap();
+    let manifest: BundleManifestV1 = serde_json::from_slice(&manifest_bytes).unwrap();
+    let op = uuid::Uuid::parse_str(&manifest.operation_id).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&manifest_bytes));
+    let identity = f.identity();
+    let l = limits();
+    let restore_binding = f.lease_request(
+        OfflineAction::Restore {
+            bundle_operation: op,
+            bundle_sha256: digest.clone(),
+        },
+        l.operation_id,
+        manifest.validation_profile_sha256.clone(),
+        &f.source,
+    );
+    let mut purge_binding = f.lease_request(
+        OfflineAction::Purge {
+            quarantined_operation: op,
+            manifest_sha256: digest,
+        },
+        op,
+        manifest.validation_profile_sha256,
+        &f.source,
+    );
+    let restore_lease = create_offline_lease(&restore_binding, &f.filesystem(), &l).unwrap();
+    let request = RestoreRequest {
+        operation_id: l.operation_id,
+        store: identity.clone(),
+        destination: f.source.clone(),
+        staging_parent: f.root.path().to_path_buf(),
+        selected_bundle: bundle,
+        limits: l,
+        metadata_byte_limit: 1 << 20,
+        space_margin_bytes: 4096,
+        original_profile: ValidationProfile::new(ProfileKind::SmallEmpty, identity.catalog_key),
+        available_dependencies: vec![],
+    };
+    let hook = Arc::new(PinIo {
+        fail_copy: abandon,
+        copy_cuts: AtomicUsize::new(0),
+        unlinks: AtomicUsize::new(0),
+    });
+    let filesystem = HookFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let journal = if abandon {
+        let error = restore_offline(&request, &restore_lease, &filesystem).unwrap_err();
+        assert_eq!(
+            hook.copy_cuts.load(Ordering::Acquire),
+            1,
+            "real post-guard copy seam not reached"
+        );
+        assert!(f.source.with_extension("fls.restore-guard").exists());
+        let RecoveryError::OutcomeUnknown { .. } = error else {
+            panic!("unexpected copy failure {error:?}")
+        };
+        let guard: RestoreGuardV1 = serde_json::from_slice(
+            &fs::read(f.source.with_extension("fls.restore-guard")).unwrap(),
+        )
+        .unwrap();
+        let j = load_restore_journal(&guard.journal, &restore_lease, &f.filesystem()).unwrap();
+        assert_eq!(j.phase, RestorePhase::Admitted);
+        j
+    } else {
+        let RestoreOutcome::Installed { journal } =
+            restore_offline(&request, &restore_lease, &filesystem).unwrap()
+        else {
+            panic!("restore not installed")
+        };
+        journal
+    };
+    let pin = f
+        .backups
+        .join(".catalog/restore-pins")
+        .join(format!("{}.json", journal.operation_id));
+    assert!(pin.exists());
+    let quarantine = f.backups.join(".quarantine").join(op.to_string());
+    fs::create_dir(&quarantine).unwrap();
+    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(
+        f.backups.join(".catalog").join(format!("{op}.json")),
+        quarantine.join("receipt.json"),
+    )
+    .unwrap();
+    purge_binding.expected_file = inspect_file_binding(&f.source, &limits()).unwrap();
+    let purge_lease = create_offline_lease(&purge_binding, &f.filesystem(), &limits()).unwrap();
+    let before = pin_lifecycle_members(&f, op);
+    // Pin refusal must precede closure comparison. A current digest cannot be
+    // inspected while pinned; after cleanup use a fresh actual inspection.
+    let confirm = PurgeRequest {
+        operation_id: op,
+        confirm: Some(op),
+        reference_closure: Some(ReferenceClosureEvidence {
+            catalog_set_sha256: "a".repeat(64),
+            non_ferroloop_writers_excluded: true,
+            evidence_sha256: "d".repeat(64),
+        }),
+    };
+    let inspected = purge_quarantined(&inspection(op), &purge_lease, &filesystem, &limits());
+    let confirmed = purge_quarantined(&confirm, &purge_lease, &filesystem, &limits());
+    let reason = "selected bundle is pinned by an unfinished restore";
+    eprintln!("pin_lifecycle abandon={abandon} inspect={inspected:?} confirm={confirmed:?}");
+    assert!(
+        matches!(&inspected, Err(RecoveryError::RefusedInput { reason: actual, .. }) if *actual == reason),
+        "inspect must give the specific pinned-bundle refusal: {inspected:?}"
+    );
+    assert!(
+        matches!(&confirmed, Err(RecoveryError::RefusedInput { reason: actual, .. }) if *actual == reason),
+        "confirm must give the specific pinned-bundle refusal: {confirmed:?}"
+    );
+    assert_eq!(hook.unlinks.load(Ordering::Acquire), 0);
+    assert_eq!(pin_lifecycle_members(&f, op), before);
+    if abandon {
+        assert!(matches!(
+            abandon_restore(&journal, &restore_lease, &f.filesystem()).unwrap(),
+            RestoreOutcome::Abandoned { .. }
+        ));
+    } else {
+        let report = journal.verification.as_ref().unwrap();
+        let evidence = ReconciliationRecord {
+            version: 1,
+            operation_id: journal.operation_id,
+            image_sha256: report.image_sha256.clone(),
+            published_sequence: report.published_sequence,
+            operator: restore_binding.operator,
+            recorded_at_unix_ms: f.filesystem().io().unix_ms().unwrap(),
+            affected_scopes: vec!["fixture".into()],
+            identity_confirmed: true,
+            reference_closure_confirmed: true,
+            external_effect_coverage_confirmed: true,
+            source_publication_resolution_sha256: "d".repeat(64),
+            clients: ClientReconciliation {
+                clients_invalidated: true,
+                rpc_sessions_restarted: true,
+                transactions_drained: true,
+                caches_invalidated: true,
+                retry_assumptions_reconciled: true,
+                evidence_sha256: "e".repeat(64),
+            },
+            dependencies: vec![],
+            external_outcomes: vec![],
+            unresolved_items: vec![],
+            index: IndexReadiness::Lexical,
+        };
+        assert!(matches!(
+            finalize_restore(&journal, &restore_lease, &evidence, &f.filesystem()).unwrap(),
+            RestoreOutcome::Finalized { .. }
+        ));
+    }
+    assert!(!pin.exists());
+    assert!(!f.source.with_extension("fls.restore-guard").exists());
+    let current = purge_quarantined(&inspection(op), &purge_lease, &filesystem, &limits()).unwrap();
+    assert_eq!(
+        pin_lifecycle_members(&f, op),
+        before,
+        "terminal cleanup changed selected bundle"
+    );
+    assert!(
+        purge_quarantined(
+            &confirmation(&current),
+            &purge_lease,
+            &filesystem,
+            &limits()
+        )
+        .unwrap()
+        .complete
+    );
+    assert!(hook.unlinks.load(Ordering::Acquire) > 0);
+    assert!(
+        current
+            .members
+            .iter()
+            .all(|m| !f.backups.join(&m.relative_name).exists())
+    );
+}
+#[test]
+fn purge_pin_real_installed_bundle_refuses_inspect_and_confirm_until_finalize() {
+    assert_real_restore_pin_lifecycle(false);
+}
+#[test]
+fn purge_pin_real_admitted_bundle_refuses_inspect_and_confirm_until_abandon() {
+    assert_real_restore_pin_lifecycle(true);
+}
+
+#[test]
+fn purge_frozen_wall_clock_stall_is_stopped_by_lease_deadline_cap() {
+    use fl_store::recovery::RecoveryError;
+    use std::sync::atomic::AtomicUsize;
+    struct FrozenStall {
+        now: u128,
+        unlinks: AtomicUsize,
+    }
+    impl RecoveryIo for FrozenStall {
+        fn unix_ms(&self) -> std::io::Result<u128> {
+            Ok(self.now)
+        }
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::PurgeUnlink
+                && self.unlinks.fetch_add(1, Ordering::AcqRel) == 0
+            {
+                std::thread::sleep(std::time::Duration::from_secs(6));
+            }
+            Ok(())
+        }
+    }
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    let report = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    let binding: OfflineLeaseRequest =
+        serde_json::from_slice(&fs::read(lease.path()).unwrap()).unwrap();
+    let before = pin_lifecycle_members(&f, op);
+    let hook = Arc::new(FrozenStall {
+        now: binding.expires_at_unix_ms - 4000,
+        unlinks: AtomicUsize::new(0),
+    });
+    let result = purge_quarantined(
+        &confirmation(&report),
+        &lease,
+        &HookFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        },
+        &limits(),
+    );
+    assert_eq!(
+        hook.unlinks.load(Ordering::Acquire),
+        1,
+        "the first unlink seam must be reached exactly once"
+    );
+    assert!(
+        matches!(result, Err(RecoveryError::Deadline { .. })),
+        "monotonic cap must stop a frozen-wall-clock stall: {result:?}"
+    );
+    assert_eq!(
+        pin_lifecycle_members(&f, op),
+        before,
+        "deadline must stop before any unlink"
+    );
+    let catalog = f.backups.join(".catalog");
+    assert!(!catalog.join(format!("purge-{op}.complete.json")).exists());
+    for index in 0..report.members.len() {
+        assert!(
+            !catalog
+                .join(format!("purge-{op}.member-{index}.json"))
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn purge_resume_resyncs_existing_audit_file_and_catalog_before_unlink() {
+    use fl_store::recovery::fs::Member;
+    use std::sync::Mutex;
+    struct CutIntentSync {
+        intent: std::path::PathBuf,
+        fired: AtomicBool,
+    }
+    impl RecoveryIo for CutIntentSync {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == RecoveryEvent::Sync(Directory::CatalogParent)
+                && self.intent.exists()
+                && !self.fired.swap(true, Ordering::AcqRel)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        }
+    }
+    #[derive(Default)]
+    struct Trace {
+        events: Mutex<Vec<RecoveryEvent>>,
+    }
+    impl RecoveryIo for Trace {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    let report = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    let intent = f
+        .backups
+        .join(".catalog")
+        .join(format!("purge-{op}.intent.json"));
+    let cut = Arc::new(CutIntentSync {
+        intent: intent.clone(),
+        fired: AtomicBool::new(false),
+    });
+    assert!(
+        purge_quarantined(
+            &confirmation(&report),
+            &lease,
+            &HookFs {
+                f: &f,
+                io: cut.clone(),
+                limits: limits()
+            },
+            &limits()
+        )
+        .is_err()
+    );
+    assert!(
+        cut.fired.load(Ordering::Acquire),
+        "must interrupt the sync after final intent publication"
+    );
+    let audit_before = fs::read(&intent).unwrap();
+    let inspected = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    assert!(inspected.audit_durable);
+    assert!(
+        inspected
+            .members
+            .iter()
+            .all(|m| m.state == PurgeMemberState::Present)
+    );
+    let trace = Arc::new(Trace::default());
+    assert!(
+        purge_quarantined(
+            &confirmation(&inspected),
+            &lease,
+            &HookFs {
+                f: &f,
+                io: trace.clone(),
+                limits: limits()
+            },
+            &limits()
+        )
+        .unwrap()
+        .complete
+    );
+    let events = trace.events.lock().unwrap();
+    let first_unlink = events
+        .iter()
+        .position(|e| *e == RecoveryEvent::PurgeUnlink)
+        .expect("resume must reach the unlink seam");
+    let before_unlink = &events[..first_unlink];
+    let flush = before_unlink
+        .iter()
+        .position(|e| *e == RecoveryEvent::Flush(Member::PurgeAudit))
+        .expect("resume must re-sync the existing audit file before unlink");
+    let sync = before_unlink
+        .iter()
+        .position(|e| *e == RecoveryEvent::Sync(Directory::CatalogParent))
+        .expect("resume must re-sync the catalog before unlink");
+    assert!(
+        flush < sync && sync < first_unlink,
+        "resume must order audit file sync, catalog sync, then unlink"
+    );
+    assert_eq!(fs::read(&intent).unwrap(), audit_before);
+}
