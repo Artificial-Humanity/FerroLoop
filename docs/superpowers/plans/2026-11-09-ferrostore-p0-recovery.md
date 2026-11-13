@@ -214,73 +214,151 @@ The exchange, lease, readiness and purge contracts below incorporate Ferris's 20
 - Reference closure uses bounded verified other live receipts/manifests and typed completed batch records. Any explicit pointer to the target operation ID or bundle name in `reference_dependencies`, shared-config descriptors or completed batch records refuses; equal member digests across independent bundles are not references. A dry-run digest binds confirmation, and closure is recomputed after half-withdrawal. Changed, incomplete or unproven closure refuses. Shared configs and batch records are never deleted.
 - Validation expectations use recovery metadata **format 2**. Finite vector scores persist as canonical 16-character lowercase hexadecimal IEEE-754 bits, so default JSON parse/reserialize preserves exact member checksums. Recomputed score comparison retains the profile's existing `1e-9` tolerance. Engine, snapshot, validation profile, manifest and verification report versions are unchanged; no global JSON parser feature is enabled. Format 1 expectations, including vector-free format 1, are explicitly unsupported with no migration or reinterpretation. No format 1 bundles were produced outside fixtures. The unchanged `Vec<f32>` probe profile is covered by a default-parser digest round-trip test.
 
-### Task 6 R3 design-record update (2026-11-13, PR #481)
+### Task 6 R4 design-record update (2026-11-13, PR #481)
 
 This dated update records the implemented review corrections and current limits;
 it leaves the original task checkboxes and operational gates unchanged.
 **Operational HOLD remains: no deployment, restart, live backup, restore or purge.
 Only isolated local fixture tests are in scope.**
 
-The first post-release change to the accepting operator or exclusion-evidence allowances (O128 and X256 encoded bytes) must add a persisted reservation-policy version. First acceptance from earlier branch journals is unsupported because those journals exist only in fixtures on this unmerged operational HOLD; historically accepted contexts retain their authenticated retry path.
+- Generic resume accepts `Prepared`, `ExchangeIntent`, `RelocateIntent`,
+  `Installed`, `RolledBack` and `OriginalAbsenceRestored`, subject to the existing
+  authority, layout and evidence checks. `ReverseIntent` refuses before an attempt
+  and names `rollback_restore`; a rollback already started never resumes forward.
+  Admitted/abandoned and terminal/finalize-intent phases name their typed action.
+- In post-exchange `RelocateIntent`, an original without a verification report
+  cannot support verified rollback. Resume can finish from the independently
+  verified preserved candidate, on the exchanged or installed layout, even when
+  the selected bundle is unavailable. Pre-exchange forward work still requires
+  the selected bundle. Forensic material remains retained and unverified.
+- Completed resume calls (`Installed`, `RolledBack`, `OriginalAbsenceRestored`)
+  and completed rollback calls (`RolledBack`, `OriginalAbsenceRestored`) append no
+  frame and consume no attempt after the existing authority/layout/evidence
+  checks. Work still needed shares the unchanged 12-attempt resume/finalize limit
+  and separate four-attempt rollback reserve; renewal never resets them.
+- Admission reserves terminal capacity **before staging, lock or journal
+  creation**, using maximum-width placeholder identities. It reuses one owned
+  journal, then installs actual identities and rechecks the exact reservation.
+  Refusal names `metadata_byte_limit`, offered bytes and an at-least required
+  amount, with headroom for serialized budget widths; an impossible reservation
+  states the supported maximum. Neither the metadata cap nor strict restore
+  `2L`, disk/read/memory ceilings or cumulative schedule changes: at most
+  `5 + 12 * 4 + 4 * 4 = 69` writer frames within the 96-frame reservation.
+- Fresh terminal acceptance reserves fixed maxima **O128** for the accepting
+  operator and **X256** for accepting-lease exclusion evidence, measured as JSON
+  encoded bytes including quotes and escapes. Both operator occurrences (lease
+  and reconciliation) are reserved. The reconciliation/absence evidence cap is
+  derived from the saved journal's immutable fields and remaining frame room.
+  One-byte-over new inputs refuse for free and state offered size and limit.
+  Existing shape, working-memory and whole-frame checks can refuse first; this
+  changes refusal priority without increasing any budget or acceptance bound.
+  Authenticated already-accepted evidence bypasses fresh-input limits on retry.
 
-- Admission now reserves the worst-case terminal journal frame before publishing
-  the guard, including both verification reports, the accepting lease, terminal
-  context and reconciliation or absence evidence. Later new inputs have matching
-  caps; retries preserve historically accepted evidence, including records larger
-  than the new-input caps. The `RJR1` format and cumulative frame schedule remain
-  unchanged: at most `5 + 12 * 4 + 4 * 4 = 69` writer frames within the 96-frame
-  reservation. The shared 12-attempt resume/finalize limit and separate four-attempt
-  rollback reserve remain in force; renewal does not reset them or enlarge quotas.
-- Restore pins and purge audit intent/member/completion rows publish through
-  flushed temporary files and atomic `NOREPLACE` rename, followed by directory
-  sync. Typed cleanup/resume handles only the owning operation's proven temporary
-  file under its locks; it does not authorize broad cleanup. Existing guard,
-  phase/generation, forensic retention and strict restore `2L` constraints remain.
-- Read-only restore status exposes `accepted_reconciliation` and
-  `accepted_absence_reconciliation`. The former lets an operator recover a lost
-  selected/original request for an INTENT retry, which requires byte-identical
-  stored reconciliation. The latter reports journal-accepted absence evidence;
-  absence finalization has no separate INTENT phase. Already-terminal cleanup
-  uses persisted evidence and ignores caller replacement evidence for both paths.
-  Status does not change acceptance, consume attempts or mutate artifacts.
+The first post-release change to the accepting operator or exclusion-evidence
+allowances (O128 and X256 encoded bytes) must add a persisted reservation-policy
+version. First acceptance from earlier branch journals is unsupported because
+those journals exist only in fixtures on this unmerged operational HOLD;
+historically accepted contexts retain their authenticated retry path. No fallback
+for a tight earlier fixture journal is provided.
 
-**Purge limitation:** current inspection and confirmed purge both require full
-bundle verification **and a matching receipt**. Consequently they cannot purge
-most corrupt or incomplete quarantine material, including an image digest
-mismatch, missing report, truncated manifest or missing receipt. This fails
-closed; it does not authorize or establish the safety of manual deletion.
-An as-found purge mode is deferred to
-[#514](https://github.com/Artificial-Humanity/FerroLoop/issues/514).
-The restore floor for stores under about 8 MiB is separately deferred to
+Restore pins and purge audit intent/member/completion rows publish through fully
+written, file-synced and hash-checked private temporary files, atomic `NOREPLACE`
+rename and required directory syncs. Existing final names are never overwritten;
+a malformed final pin still fails closed. Typed cleanup/resume handles only the
+owning operation's checked temp under its locks. Four isolated mutations now
+turn the corresponding regressions red: audit temp file sync, post-rename catalog
+sync, unpublished pin hash check and the initial monotonic lease-deadline cap.
+Each exact source restoration passes. The frozen-wall test proves the cap stops
+namespace mutation even when wall time does not advance. The journal-boundary
+expiry regression uses an unfinished forward intent and injected expiry after
+charging, with ample real-time allowance; completed Installed calls are free.
+
+Rollback retains its early `verify_preserved_candidate` check. A corrupt
+preserved candidate refuses with exact journal/frame/attempt and artifact proofs.
+The order-only mutant moving that check after `attempt` remains **green**, as
+Ferris ruled equivalent: `continuation_limits`, rollback's `inspect_layout` and
+`attempt_scoped`'s `inspect_phase_layout` independently hash the candidate before
+charging; journal loading also validates generation/report bindings. No check is
+weakened or private injection added to manufacture a red mutation result.
+
+Read-only status exposes `accepted_reconciliation` and
+`accepted_absence_reconciliation`. Selected/original INTENT retries require
+byte-identical stored reconciliation. Absence finalization has no separate
+INTENT phase; already-terminal cleanup uses persisted evidence and ignores
+caller replacement evidence on both paths. Status does not consume attempts or
+mutate artifacts. The canonical 19,238-byte pin region remains SHA-256
+`7a6196e820b1b09fd77f3caa6f59515d4b0d36d8ab0996210269b28912c59bd0`
+through all R4 code changes.
+
+**Purge limitation:** inspection and confirmed purge require full bundle
+verification **and a matching receipt**. They cannot purge most corrupt or
+incomplete quarantine material, including an image digest mismatch, missing
+report, truncated manifest or missing receipt. A corrupt completed-batch member
+with a quarantined receipt can also block inspection and confirmed purge of an
+unrelated healthy target throughout the approved root. That refusal now names
+the referenced member bundle relative to the root and retains its typed cause;
+it does not accept corrupt material or delete anything. Regression snapshots
+prove retained recovery artifacts and source unchanged with zero unlinks; a
+confirmed request may refresh only existing store-lock timestamp bookkeeping.
+An as-found purge mode remains deferred to
+[#514](https://github.com/Artificial-Humanity/FerroLoop/issues/514), with no manual
+deletion authorization. The restore floor for stores under about 8 MiB remains
 [#515](https://github.com/Artificial-Humanity/FerroLoop/issues/515), and scheduled
-exhaustive CI to [#516](https://github.com/Artificial-Humanity/FerroLoop/issues/516).
-None is implemented by this documentation update.
+exhaustive CI remains [#516](https://github.com/Artificial-Humanity/FerroLoop/issues/516).
 
-**Fixture verification modes:** the workspace dev profile now builds `sha2` at
-`opt-level = 3`. With `FL_RECOVERY_EXHAUSTIVE` unset, each of the two terminal
-matrices runs a 12-case pairwise sample under its existing test name; neither is
-ignored. `FL_RECOVERY_EXHAUSTIVE=1` selects the complete 96-case removal matrix
-and 288-case sync matrix using the same assertions. From the repository root,
-use isolated native Linux ext4/XFS fixture storage; set `FL_RECOVERY_TEST_DIR`
-to an isolated fixture directory there when the default temporary filesystem is
-unsupported. These are portable Cargo commands, with no private wrapper required:
+**Known limits and deferred nits:** zeroing the entire shared 4 KiB block
+containing the previous frame's tail and final frame's header can make the
+journal unloadable; this is outside the tested page old-or-new tear model. An
+orphan pin temp whose staging directory was removed remains harmless but may
+persist until same-operation typed cleanup. Broader stray-entry, forensic-abandon
+and expiry-cause diagnostics, and clarification of the existing op-ID "own temp"
+comment, are deferred; no additional pin exception or repair/unfence path is
+introduced. The oversized parsed-JSON unit fixture now uses the common fixture
+root.
+
+**Fixture verification modes:** the workspace dev profile builds both `sha2` and
+`fl-store` at `opt-level = 3`. Default exchange/reverse and completion/guard-cut
+matrices use deterministic samples retaining event-kind endpoints, semantic
+neighbors and original errno assignments on `journal_fixture`; exhaustive mode
+selects their original complete schedules. The two terminal pairwise matrices
+remain 12 cases each by default, with exact 96-case removal and 288-case sync
+schedules in exhaustive mode. All modes retain their recovery/fencing assertions
+and schedule-coverage tests. The subprocess poll sleeps 5 ms under its existing
+15-second deadline.
+
+From the repository root, use isolated native Linux ext4/XFS fixture storage;
+set `FL_RECOVERY_TEST_DIR` to an isolated directory there when the default
+temporary filesystem is unsupported. Portable commands include:
 
 ```sh
 # Default recovery_restore suite (FL_RECOVERY_EXHAUSTIVE unset).
-cargo test -p fl-store --test recovery_restore -- --test-threads=1
+cargo test --workspace --test recovery_restore -- --test-threads=1
 
-# Exhaustive removal matrix: 96 cases.
-FL_RECOVERY_EXHAUSTIVE=1 cargo test -p fl-store --test recovery_restore restore_terminal_all_generations_are_held_across_removal_and_later_authority_open -- --exact --test-threads=1
-
-# Exhaustive sync matrix: 288 cases.
-FL_RECOVERY_EXHAUSTIVE=1 cargo test -p fl-store --test recovery_restore restore_terminal_absent_guard_and_pin_recheck_authority_and_layout_after_every_sync -- --exact --test-threads=1
+# All four full schedules, using each existing test's exact name as TEST_NAME.
+FL_RECOVERY_EXHAUSTIVE=1 cargo test --workspace --test recovery_restore TEST_NAME -- --exact --test-threads=1
 ```
 
-The default `recovery_restore` CI runtime of **10 minutes or less remains an
-unverified target**. The initial local 75-test baseline took **1714.167 s**;
-it does not establish that target. Final-head full-workspace verification and
-both exhaustive runs remain **pending** for the coordinator after integration.
-This record makes no final-head pass or activation claim.
+The four test names are
+`restore_exchange_and_reverse_exchange_recover_every_cut`,
+`restore_selected_and_original_finalize_recover_every_completion_and_guard_cut`,
+`restore_terminal_all_generations_are_held_across_removal_and_later_authority_open`
+and
+`restore_terminal_absent_guard_and_pin_recheck_authority_and_layout_after_every_sync`.
+
+R4 item 5 focused local harness times were 36.55/17.10 s for the default
+exchange/finalization matrices and 60.91/33.26 s for exhaustive schedules. Cuts
+were forward 49/71, reverse 12/17 and each finalize role 15/21 (default/full).
+A cached unoptimized test-only rebuild took 2.69 s, the first optimized
+package/test rebuild 52.86 s, and a subsequent integration-test rebuild 13.35 s.
+These are different incremental rebuilds with cached dependencies, **not a cold
+compile comparison or measured cold compile delta**.
+
+Each R4 item has focused green checks and fresh scoped review. Final-head main
+integration, workspace/Windows clippy, full workspace tests, exhaustive schedules
+and whole-branch review remain pending for the coordinator. The required **CI
+job <=30 minutes** and **CI recovery_restore <=10 minutes** remain unverified
+until measured on the exact final head. Earlier R3 local results are historical
+and do not establish either R4 target or operational readiness.
 
 ### Task 7: Package reproducible acceptance evidence and rollout gates
 
