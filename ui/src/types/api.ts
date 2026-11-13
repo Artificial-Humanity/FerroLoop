@@ -843,6 +843,8 @@ export interface SetSessionModelResponse {
   live: {
     status: "applied" | "deferred" | "held" | "failed";
     mechanism: string;
+    queued: boolean;
+    model_applied: boolean;
   };
   /**
    * Set only for Antigravity: the effort-suffixed model id stored for the next launch. A

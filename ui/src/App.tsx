@@ -3075,14 +3075,15 @@ export const App: React.FC<AppProps> = ({
     const updatedModel = res.model || model;
     const updatedThinking =
       res.thinking_level !== undefined ? res.thinking_level : thinkingLevel;
-    if (res.persisted || res.live?.status === "applied") {
+    const updateThinking = res.persisted || res.live?.status === "applied";
+    if (updateThinking || res.live?.model_applied) {
       setSessions((prev) =>
         prev.map((sess) =>
           matchesTarget(sess)
             ? {
                 ...sess,
                 model: updatedModel,
-                ...(updatedThinking !== undefined
+                ...(updateThinking && updatedThinking !== undefined
                   ? { thinking_level: updatedThinking }
                   : {}),
               }
@@ -3095,7 +3096,7 @@ export const App: React.FC<AppProps> = ({
             ? {
                 ...sess,
                 model: updatedModel,
-                ...(updatedThinking !== undefined
+                ...(updateThinking && updatedThinking !== undefined
                   ? { thinking_level: updatedThinking }
                   : {}),
               }

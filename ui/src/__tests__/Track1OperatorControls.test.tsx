@@ -376,6 +376,44 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       }
     });
 
+    it.each([undefined, null, {}, { persisted: true }, { persisted: true, live: {} }, { persisted: true, live: { status: "unknown" } }])("restores the previous choice when outcome fields are missing (%s)", async (response) => {
+      const onSetSessionModel = vi.fn().mockResolvedValue(response);
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/status unavailable/i));
+      expect(select.value).toBe("claude-opus-5-5");
+    });
+
+    it.each(["held", "failed"])("reports partial model delivery when the effort is %s", async (status) => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        persisted: false, record_id: null, restart_applies: false,
+        live: { status, mechanism: "terminal_paste", queued: false, model_applied: true },
+      });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const model = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(model, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/model.*applied.*effort/i));
+      expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/not saved/i);
+      expect(model.value).toBe("claude-sonnet-5-5");
+    });
+
+    it("says a held live delivery was not queued and must be retried", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        persisted: true, record_id: "hosted-ada", restart_applies: true,
+        live: { status: "held", mechanism: "terminal_paste", queued: false, model_applied: false },
+      });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/not queued.*retry/i));
+    });
+
     it("restores the previous choice when persistence fails", async () => {
       const onSetSessionModel = vi.fn().mockRejectedValue(new Error("Save failed"));
       render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
@@ -400,6 +438,39 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
       await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/saved.*failed/i));
       expect(select.value).toBe("claude-sonnet-5-5");
+    });
+
+    it("keeps the previous model after App refreshes an unpersisted and unapplied change", async () => {
+      let sessionReads = 0;
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const json = (body: unknown) => new Response(JSON.stringify(body), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+        if (url.endsWith("/api/v1/auth/session")) return json({ authenticated: true, authority: { tier: "owner", login: "test" } });
+        if (url.endsWith("/api/v1/agents")) return json({ agents: [{ name_key: "ferris", display_name: "Ferris", project: "FerroLoop", role: "lead" }], routes: [] });
+        if (url.endsWith("/model")) return json({ session_id: "sess-ferris-live", vendor: "claude", model: "claude-sonnet-5-5", persisted: false, record_id: null, restart_applies: false, live: { status: "held", mechanism: "terminal_paste", queued: false, model_applied: false } });
+        if (url.endsWith("/api/v1/sessions")) {
+          sessionReads++;
+          return json({ sessions: [{ id: "sess-ferris-live", persona: "ferris", adapter: "claude", model: "claude-opus-5-5", thinking_level: "high", status: "running" }] });
+        }
+        return json({});
+      });
+      const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+      const wsClient = {
+        setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(),
+        onStatusChange: () => () => {}, subscribe: () => () => {},
+      } as unknown as HubWsClient;
+      render(<App apiClient={apiClient} wsClient={wsClient} />);
+      fireEvent.click(await screen.findByTestId("agent-settings-btn-ferris"));
+      const select = await screen.findByTestId("session-model-select") as HTMLSelectElement;
+      await waitFor(() => expect(select.value).toBe("claude-opus-5-5"));
+      const readsBefore = sessionReads;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/not saved.*held/i));
+      await waitFor(() => expect(sessionReads).toBeGreaterThan(readsBefore));
+      expect(select.value).toBe("claude-opus-5-5");
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent("claude-opus-5-5");
     });
 
     it("does not fabricate high thinking level when unknown: omits thinking_level on Claude model-only change and blocks Antigravity model-only change until a level is chosen (#351)", async () => {
